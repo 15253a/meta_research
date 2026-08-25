@@ -16,10 +16,15 @@ type ProductStart = {
 type DeterministicProductOptions = {
   legacyState?: "draft" | "recovering";
   manualRoot?: boolean;
-  stagePipeline?: "plan-gap";
+  stagePipeline?:
+    | "plan-gap"
+    | "reasoning-no-evidence"
+    | "reasoning-autonomous"
+    | "quest-completion";
 };
 
 export type PlanProviderPhase = "plan-primary" | "plan-review";
+export type ReasoningProviderPhase = "reasoning-primary" | "reasoning-review";
 
 const supportDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(supportDirectory, "../../..");
@@ -187,8 +192,33 @@ export class DeterministicProduct {
     });
   }
 
+  async waitForReasoningProviderPhase(
+    phase: ReasoningProviderPhase,
+    timeoutMs = 20_000,
+  ): Promise<void> {
+    const marker = this.providerMarker(phase, "started");
+    const deadline = Date.now() + timeoutMs;
+    while (!existsSync(marker)) {
+      if (this.unexpectedExit || this.process.exitCode !== null) {
+        throw new Error(
+          `deterministic product exited while waiting for ${phase}`,
+        );
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for deterministic ${phase}`);
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+    }
+  }
+
+  releaseReasoningProviderPhase(phase: ReasoningProviderPhase): void {
+    writeFileSync(this.providerMarker(phase, "release"), "release\n", {
+      encoding: "utf8",
+    });
+  }
+
   private providerMarker(
-    phase: PlanProviderPhase,
+    phase: PlanProviderPhase | ReasoningProviderPhase,
     state: "started" | "release",
   ): string {
     return join(

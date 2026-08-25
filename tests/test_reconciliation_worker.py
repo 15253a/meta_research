@@ -441,6 +441,9 @@ def test_web_lifespan_stops_provider_before_waiting_for_drafting_worker() -> Non
         bundle_stage=SimpleNamespace(
             configure_resident_mcp_endpoint=lambda _base_url: None,
         ),
+        reasoning_stage=SimpleNamespace(
+            configure_resident_mcp_endpoint=lambda _base_url: None,
+        ),
         target_run_runtime=SimpleNamespace(
             configure_resident_mcp_endpoint=lambda _base_url: None,
         ),

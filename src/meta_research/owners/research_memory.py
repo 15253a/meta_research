@@ -15,7 +15,7 @@ import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 from urllib.parse import quote, unquote, urlsplit
 
 from pypdf import PdfReader
@@ -32,12 +32,28 @@ from meta_research.plan_contract import (
     validate_plan_document,
     validate_plan_review,
 )
+from meta_research.reasoning_contract import (
+    AUTONOMOUS_QUESTION_PROPOSAL_SCHEMA_REF,
+    REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF,
+    REASONING_REVIEW_SCHEMA_REF,
+    SCIENTIFIC_OUTCOMES,
+    ReasoningContractError,
+    VerifiedReasoningCompletionLineage,
+    autonomous_question_proposal_from_scope,
+    completion_milestone_basis_refs,
+    plan_evidence_reuse_metric_leaves,
+    validate_autonomous_question_scope,
+    validate_reasoning_autonomous_checkpoint,
+    validate_reasoning_stage_output,
+    validate_scientific_outcome,
+)
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
     SQLiteOwnerSnapshot,
 )
 from meta_research.owners.common import (
     AcceptedAssetBinding,
+    AcceptedFormalPlanBinding,
     AcceptedIdeaSetBinding,
     AcceptedQuestionBinding,
     AcceptanceReceipt,
@@ -65,9 +81,11 @@ from meta_research.owners.agent_runtime import (
     DEEPFETCH_EXECUTION_RECEIPT_KIND,
     PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND,
     PLAN_ATTEMPT_EXECUTION_SCHEMA,
+    REASONING_ATTEMPT_EXECUTION_RECEIPT_KIND,
+    REASONING_ATTEMPT_EXECUTION_SCHEMA,
     DeepFetchRun,
 )
-from meta_research.owners.research_graph import AcceptedQuest
+from meta_research.owners.research_graph import AcceptedQuest, EvidenceReuseLeaf
 from meta_research.quest_drafting import QUESTION_FIELD_MAX_LENGTHS
 
 
@@ -75,6 +93,13 @@ class ResearchGraphReferenceReader(AssetReferenceReader, Protocol):
     """Read public RG identities in addition to its asset-reference projection."""
 
     def query_quest_by_ref(self, quest_ref: str) -> AcceptedQuest | None: ...
+
+    def resolve_plan_evidence_reuse_leaves(
+        self,
+        *,
+        quest_ref: str,
+        accepted_formal_plan: AcceptedFormalPlanBinding,
+    ) -> tuple[EvidenceReuseLeaf, ...]: ...
 
 
 QUESTION_CONTENT_SCHEMA = "meta-research/formal-question-content/v1"
@@ -84,6 +109,23 @@ CONTENT_RECEIPT_KIND = "question_content_acceptance"
 MANUAL_CONTENT_RECEIPT_KIND = "manual_question_content_acceptance"
 IDEA_CONTENT_RECEIPT_KIND = "idea_outcome_content_acceptance"
 PLAN_CONTENT_RECEIPT_KIND = "plan_document_content_acceptance"
+QUESTION_LITERATURE_REVISION_RECEIPT_KIND = (
+    "question_literature_revision_acceptance"
+)
+REASONING_CONTENT_RECEIPT_KIND = "reasoning_content_acceptance"
+REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND = (
+    "reasoning_scientific_candidate_acceptance"
+)
+REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA = (
+    REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF
+)
+REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND = (
+    "reasoning_autonomous_checkpoint"
+)
+AUTONOMOUS_QUESTION_CONTENT_RECEIPT_KIND = (
+    "autonomous_question_content_acceptance"
+)
+AUTONOMOUS_QUESTION_PROPOSAL_SCHEMA = AUTONOMOUS_QUESTION_PROPOSAL_SCHEMA_REF
 REUSE_SOURCE_VERSION_RECEIPT_KIND = "reuse_source_version_verified"
 IMPLEMENTATION_CONTENT_RECEIPT_KIND = "implementation_revision_content_accepted"
 LITERATURE_SNAPSHOT_RECEIPT_KIND = "literature_snapshot_acceptance"
@@ -517,6 +559,99 @@ class AcceptedPlanDocument:
 
 
 @dataclass(frozen=True)
+class AcceptedReasoningContent:
+    request_ref: str
+    cycle_ref: str
+    foreground_epoch: int
+    context_pack_ref: str
+    context_pack_hash: str
+    context_pack: dict[str, object]
+    stage_request_receipt: AcceptanceReceipt
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    submission_ref: str
+    content_ref: str
+    payload_hash: str
+    outcome_hash: str
+    transition_kind: str
+    transition_ref: str
+    transition_hash: str
+    reviewed_draft_hash: str
+    review_hash: str
+    outcome: dict[str, object]
+    scientific_outcome: dict[str, object]
+    transition: dict[str, object]
+    frozen_evidence_closure: tuple[dict[str, object], ...]
+    reviewed_draft: dict[str, object]
+    review: dict[str, object]
+    execution_receipt: AcceptanceReceipt
+    scientific_candidate_content_receipt: AcceptanceReceipt | None
+    scientific_candidate_domain_receipt: AcceptanceReceipt | None
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class AcceptedReasoningScientificCandidate:
+    request_ref: str
+    cycle_ref: str
+    foreground_epoch: int
+    context_pack_ref: str
+    context_pack_hash: str
+    context_pack: dict[str, object]
+    stage_request_receipt: AcceptanceReceipt
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    submission_ref: str
+    checkpoint_ref: str
+    checkpoint_hash: str
+    content_ref: str
+    scientific_outcome_ref: str
+    outcome_hash: str
+    scientific_disposition: str
+    autonomous_scope_hash: str
+    reviewed_draft_hash: str
+    review_hash: str
+    checkpoint: dict[str, object]
+    scientific_outcome: dict[str, object]
+    autonomous_scope: dict[str, object]
+    frozen_evidence_closure: tuple[dict[str, object], ...]
+    review: dict[str, object]
+    checkpoint_receipt: AcceptanceReceipt
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class AcceptedAutonomousQuestionContent:
+    context_ref: str
+    reasoning_checkpoint_ref: str
+    reasoning_checkpoint_hash: str
+    source_scientific_outcome_ref: str
+    source_stage_request_ref: str
+    source_cycle_ref: str
+    source_foreground_epoch: int
+    source_quest_ref: str
+    source_question_ref: str
+    source_candidate_content_ref: str
+    source_candidate_content_receipt: AcceptanceReceipt
+    source_scientific_domain_receipt: AcceptanceReceipt
+    autonomous_scope_hash: str
+    autonomous_scope: dict[str, object]
+    literature_snapshot_ref: str
+    literature_snapshot_hash: str
+    literature_snapshot_receipt: AcceptanceReceipt
+    proposal_ref: str
+    proposal_hash: str
+    proposal: dict[str, object]
+    content_ref: str
+    content_hash: str
+    schema_ref: str
+    question: dict[str, object]
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
 class AcceptedLiteratureSnapshot:
     snapshot_ref: str
     request_ref: str
@@ -544,6 +679,8 @@ class AcceptedLiteratureSnapshot:
     receipt: AcceptanceReceipt
     creation_context_kind: str
     creation_context_ref: str | None
+    context_generation: int | None
+    context_basis_hash: str | None
     quest_ref: str | None
 
     def as_public_dict(self) -> dict[str, object]:
@@ -569,7 +706,10 @@ class AcceptedLiteratureSnapshot:
             "fulltext_count": self.fulltext_count,
             "receipt": self.receipt.as_public_dict(),
         }
-        if self.creation_context_kind == "manual_question_creation":
+        if self.creation_context_kind in {
+            "manual_question_creation",
+            "autonomous_question_creation",
+        }:
             result.update(
                 {
                     "creation_context_kind": self.creation_context_kind,
@@ -577,6 +717,13 @@ class AcceptedLiteratureSnapshot:
                     "quest_ref": self.quest_ref,
                 }
             )
+            if self.creation_context_kind == "autonomous_question_creation":
+                result.update(
+                    {
+                        "context_generation": self.context_generation,
+                        "context_basis_hash": self.context_basis_hash,
+                    }
+                )
         return result
 
     def as_context_binding(self) -> dict[str, object]:
@@ -591,7 +738,10 @@ class AcceptedLiteratureSnapshot:
             "draft_hash": self.draft_hash,
             "receipt": self.receipt.as_public_dict(),
         }
-        if self.creation_context_kind == "manual_question_creation":
+        if self.creation_context_kind in {
+            "manual_question_creation",
+            "autonomous_question_creation",
+        }:
             result.update(
                 {
                     "creation_context_kind": self.creation_context_kind,
@@ -599,6 +749,13 @@ class AcceptedLiteratureSnapshot:
                     "quest_ref": self.quest_ref,
                 }
             )
+            if self.creation_context_kind == "autonomous_question_creation":
+                result.update(
+                    {
+                        "context_generation": self.context_generation,
+                        "context_basis_hash": self.context_basis_hash,
+                    }
+                )
         return result
 
 
@@ -905,6 +1062,92 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
 
     def verify_plan_content_receipt(self, **values) -> None: ...
 
+    def accept_reasoning_content(
+        self,
+        *,
+        request_ref: str,
+        cycle_ref: str,
+        foreground_epoch: int,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        context_pack: dict[str, object],
+        stage_request_receipt: AcceptanceReceipt,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        outcome: dict[str, object],
+        reviewed_draft: dict[str, object],
+        review: dict[str, object],
+        execution_receipt: AcceptanceReceipt,
+        scientific_candidate_content_receipt: AcceptanceReceipt | None = None,
+        scientific_candidate_domain_receipt: AcceptanceReceipt | None = None,
+    ) -> AcceptedReasoningContent: ...
+
+    def query_reasoning_content(
+        self, submission_ref: str
+    ) -> AcceptedReasoningContent | None: ...
+
+    def verify_reasoning_content_receipt(self, **values) -> None: ...
+
+    def accept_reasoning_scientific_candidate(
+        self,
+        *,
+        request_ref: str,
+        cycle_ref: str,
+        foreground_epoch: int,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        context_pack: dict[str, object],
+        stage_request_receipt: AcceptanceReceipt,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        checkpoint_ref: str,
+        checkpoint: dict[str, object],
+        review: dict[str, object],
+        checkpoint_receipt: AcceptanceReceipt,
+    ) -> AcceptedReasoningScientificCandidate: ...
+
+    def query_reasoning_scientific_candidate(
+        self, submission_ref: str
+    ) -> AcceptedReasoningScientificCandidate | None: ...
+
+    def query_reasoning_scientific_candidate_by_outcome_ref(
+        self, outcome_ref: str
+    ) -> AcceptedReasoningScientificCandidate | None: ...
+
+    def query_reasoning_scientific_candidate_by_checkpoint_ref(
+        self, checkpoint_ref: str
+    ) -> AcceptedReasoningScientificCandidate | None: ...
+
+    def verify_reasoning_scientific_candidate_receipt(
+        self, **values
+    ) -> None: ...
+
+    def accept_autonomous_question_content(
+        self,
+        *,
+        reasoning_checkpoint_ref: str,
+        source_scientific_outcome_ref: str,
+        scientific_decision_receipt: AcceptanceReceipt,
+        literature_snapshot_ref: str,
+        idempotency_key: str,
+    ) -> AcceptedAutonomousQuestionContent: ...
+
+    def query_autonomous_question_content_by_checkpoint_ref(
+        self, checkpoint_ref: str
+    ) -> AcceptedAutonomousQuestionContent | None: ...
+
+    def query_autonomous_question_content(
+        self, content_ref: str
+    ) -> AcceptedAutonomousQuestionContent | None: ...
+
+    def verify_autonomous_question_content_receipt(
+        self, **values
+    ) -> None: ...
+
     def accept_literature_snapshot(
         self,
         request: DeepFetchRunRequest,
@@ -934,17 +1177,42 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
         receipt: AcceptanceReceipt | None = None,
         creation_context_kind: str = "quest_initialization",
         creation_context_ref: str | None = None,
+        context_generation: int | None = None,
+        context_basis_hash: str | None = None,
         quest_ref: str | None = None,
     ) -> None: ...
 
     def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]: ...
+
+    def ensure_question_literature_revision(
+        self,
+        *,
+        question_binding: AcceptedQuestionBinding,
+        source_snapshot_binding: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def query_question_literature_revision(
+        self, question_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def query_current_question_literature_revision(
+        self, question_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def verify_question_literature_revision(
+        self, binding: dict[str, object]
+    ) -> None: ...
 
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=RM_OWNER,
     statement=text(
         "SELECT revision, asset_count, object_count, formal_content_count, "
-        "idea_content_count, plan_content_count, implementation_revision_count, "
+        "idea_content_count, plan_content_count, reasoning_content_count, "
+        "reasoning_scientific_candidate_count, "
+        "autonomous_question_content_count, "
+        "question_literature_revision_count, implementation_revision_count, "
         "asset_version_count, "
         "pending_intake_count, hold_count, "
         "literature_snapshot_count, human_request_count "
@@ -956,6 +1224,10 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "formal_content_count",
         "idea_content_count",
         "plan_content_count",
+        "reasoning_content_count",
+        "reasoning_scientific_candidate_count",
+        "autonomous_question_content_count",
+        "question_literature_revision_count",
         "implementation_revision_count",
         "asset_version_count",
         "pending_intake_count",
@@ -980,6 +1252,30 @@ class SQLiteResearchMemoryReceiptVerifier:
         self._object_store = object_store
         self._execution_verifier = execution_verifier
         self._stage_request_verifier = stage_request_verifier
+        self._reasoning_scientific_decision_verifier = None
+        self._plan_evidence_reuse_verifier = None
+
+    def bind_reasoning_scientific_decision_verifier(self, verifier) -> None:
+        method = getattr(verifier, "verify_reasoning_scientific_decision", None)
+        if not callable(method):
+            return
+        current = self._reasoning_scientific_decision_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict(
+                "reasoning_scientific_decision_verifier_already_bound"
+            )
+        self._reasoning_scientific_decision_verifier = verifier
+
+    def bind_plan_evidence_reuse_verifier(self, verifier) -> None:
+        method = getattr(verifier, "resolve_plan_evidence_reuse_leaves", None)
+        if not callable(method):
+            raise OwnerConflict("plan_evidence_reuse_verifier_invalid")
+        current = self._plan_evidence_reuse_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict(
+                "plan_evidence_reuse_verifier_already_bound"
+            )
+        self._plan_evidence_reuse_verifier = verifier
 
     def verify_reuse_source_version(
         self,
@@ -1284,6 +1580,595 @@ class SQLiteResearchMemoryReceiptVerifier:
                 ),
             )
 
+    def query_current_question_literature_revision(
+        self, question_ref: str
+    ) -> dict[str, object] | None:
+        if not isinstance(question_ref, str) or not question_ref:
+            raise OwnerConflict("question_literature_revision_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_question_literature_revisions WHERE "
+                    "question_ref = :question_ref ORDER BY revision_number DESC "
+                    "LIMIT 1"
+                ),
+                {"question_ref": question_ref},
+            ).first()
+        if row is None:
+            return None
+        binding = _question_literature_revision_binding(row)
+        self.verify_question_literature_revision(binding)
+        return binding
+
+    def verify_question_literature_revision(
+        self, binding: dict[str, object]
+    ) -> None:
+        if not isinstance(binding, dict) or set(binding) != {
+            "kind",
+            "revision_ref",
+            "question_ref",
+            "literature_snapshot_ref",
+            "records",
+            "rm_acceptance_receipt_ref",
+            "rg_question_association_receipt_ref",
+            "receipt",
+        } or binding.get("kind") != "QuestionLiteratureRevision":
+            raise OwnerConflict("question_literature_revision_invalid")
+        if any(
+            not isinstance(binding.get(name), str) or not binding[name]
+            for name in (
+                "revision_ref",
+                "question_ref",
+                "literature_snapshot_ref",
+                "rm_acceptance_receipt_ref",
+                "rg_question_association_receipt_ref",
+            )
+        ) or not isinstance(binding.get("records"), list):
+            raise OwnerConflict("question_literature_revision_invalid")
+        try:
+            receipt = _acceptance_receipt_from_public(binding.get("receipt"))
+        except ValueError as error:
+            raise OwnerConflict("question_literature_revision_invalid") from error
+        if (
+            receipt.issuer != RM_OWNER
+            or receipt.kind != QUESTION_LITERATURE_REVISION_RECEIPT_KIND
+            or receipt.subject_ref != binding.get("revision_ref")
+            or receipt.receipt_ref != binding.get("rm_acceptance_receipt_ref")
+        ):
+            raise OwnerConflict("question_literature_revision_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_question_literature_revisions WHERE "
+                    "revision_ref = :revision_ref"
+                ),
+                {"revision_ref": binding.get("revision_ref")},
+            ).first()
+            source = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rm_literature_snapshots WHERE "
+                        "snapshot_ref = :snapshot_ref"
+                    ),
+                    {"snapshot_ref": row.source_snapshot_ref},
+                ).first()
+            )
+        if row is None or source is None or (
+            binding != _question_literature_revision_binding(row)
+            or row.receipt_ref != binding.get("rm_acceptance_receipt_ref")
+            or row.receipt_hash != receipt.payload_hash
+            or row.question_receipt_ref
+            != binding.get("rg_question_association_receipt_ref")
+            or row.receipt_hash
+            != _question_literature_revision_receipt_hash(row)
+            or row.source_snapshot_ref != source.snapshot_ref
+            or row.source_snapshot_hash != source.snapshot_hash
+            or row.source_snapshot_receipt_ref != source.receipt_ref
+            or row.source_snapshot_receipt_hash != source.receipt_hash
+        ):
+            raise OwnerConflict("question_literature_revision_invalid")
+        _verified_question_literature_records(row)
+        _verify_literature_snapshot_authority_row(
+            source,
+            execution_verifier=self._execution_verifier,
+        )
+
+    def verify_reasoning_content_receipt(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str,
+        content_ref: str,
+        payload_hash: str,
+        outcome_hash: str,
+        transition_hash: str,
+        reviewed_draft_hash: str,
+        review_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != RM_OWNER
+            or receipt.kind != REASONING_CONTENT_RECEIPT_KIND
+            or receipt.subject_ref != content_ref
+        ):
+            raise OwnerConflict("reasoning_content_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_contents WHERE content_ref = "
+                    ":content_ref AND submission_ref = :submission_ref"
+                ),
+                {"content_ref": content_ref, "submission_ref": submission_ref},
+            ).first()
+        if row is None or (
+            row.request_ref != request_ref
+            or row.payload_hash != payload_hash
+            or row.outcome_hash != outcome_hash
+            or row.transition_hash != transition_hash
+            or row.reviewed_draft_hash != reviewed_draft_hash
+            or row.review_hash != review_hash
+            or row.receipt_ref != receipt.receipt_ref
+            or row.receipt_hash != receipt.payload_hash
+            or row.receipt_hash != _reasoning_content_receipt_hash(row)
+        ):
+            raise OwnerConflict("reasoning_content_receipt_invalid")
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        self._stage_request_verifier.verify_stage_run_request(
+            request_ref=row.request_ref,
+            cycle_ref=row.cycle_ref,
+            epoch=int(row.foreground_epoch),
+            context_pack_ref=row.context_pack_ref,
+            context_pack_hash=row.context_pack_hash,
+            receipt=AcceptanceReceipt(
+                issuer="advancement_engine",
+                kind="stage_run_request",
+                receipt_ref=row.stage_request_receipt_ref,
+                subject_ref=row.request_ref,
+                payload_hash=row.stage_request_receipt_hash,
+            ),
+        )
+        _verify_reasoning_object(self._object_store, row)
+        try:
+            context_pack = decoded_object(row.context_pack_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("reasoning_context_pack_invalid") from error
+        _verify_reasoning_plan_evidence_reuse_authority(
+            context_pack,
+            getattr(
+                self._plan_evidence_reuse_verifier,
+                "resolve_plan_evidence_reuse_leaves",
+                None,
+            ),
+        )
+        _verify_reasoning_payload(
+            row,
+            revision_verifier=self.verify_question_literature_revision,
+        )
+        if row.scientific_candidate_content_ref is not None:
+            with self._database.read() as connection:
+                staged_row = connection.execute(
+                    text(
+                        "SELECT * FROM rm_reasoning_scientific_candidates WHERE "
+                        "content_ref = :content_ref"
+                    ),
+                    {"content_ref": row.scientific_candidate_content_ref},
+                ).first()
+            if staged_row is None or (
+                staged_row.request_ref != row.request_ref
+                or staged_row.cycle_ref != row.cycle_ref
+                or int(staged_row.foreground_epoch) != int(row.foreground_epoch)
+                or staged_row.context_pack_ref != row.context_pack_ref
+                or staged_row.context_pack_hash != row.context_pack_hash
+                or staged_row.run_ref != row.run_ref
+                or staged_row.attempt_ref != row.attempt_ref
+                or staged_row.fence_ref != row.fence_ref
+                or staged_row.scientific_outcome_ref
+                != row.scientific_outcome_ref
+                or staged_row.outcome_hash != row.outcome_hash
+                or staged_row.receipt_ref
+                != row.scientific_candidate_content_receipt_ref
+                or staged_row.receipt_hash
+                != row.scientific_candidate_content_receipt_hash
+            ):
+                raise OwnerConflict("reasoning_scientific_candidate_binding_invalid")
+            staged_receipt = AcceptanceReceipt(
+                issuer=RM_OWNER,
+                kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+                receipt_ref=staged_row.receipt_ref,
+                subject_ref=staged_row.content_ref,
+                payload_hash=staged_row.receipt_hash,
+            )
+            self.verify_reasoning_scientific_candidate_receipt(
+                request_ref=staged_row.request_ref,
+                submission_ref=staged_row.submission_ref,
+                content_ref=staged_row.content_ref,
+                checkpoint_ref=staged_row.checkpoint_ref,
+                checkpoint_hash=staged_row.checkpoint_hash,
+                outcome_hash=staged_row.outcome_hash,
+                autonomous_scope_hash=staged_row.autonomous_scope_hash,
+                review_hash=staged_row.review_hash,
+                receipt=staged_receipt,
+            )
+            domain_verifier = self._reasoning_scientific_decision_verifier
+            if domain_verifier is None:
+                raise OwnerConflict(
+                    "reasoning_scientific_decision_verifier_unavailable"
+                )
+            domain_verifier.verify_reasoning_scientific_decision(
+                staged_row.request_ref,
+                staged_row.submission_ref,
+                "accepted",
+                staged_row.scientific_outcome_ref,
+                AcceptanceReceipt(
+                    issuer="research_graph",
+                    kind="reasoning_scientific_candidate_accepted",
+                    receipt_ref=row.scientific_candidate_domain_receipt_ref,
+                    subject_ref=staged_row.scientific_outcome_ref,
+                    payload_hash=row.scientific_candidate_domain_receipt_hash,
+                ),
+            )
+        if self._execution_verifier is not None:
+            self._execution_verifier.verify_attempt_execution_receipt(
+                request_ref=row.request_ref,
+                run_ref=row.run_ref,
+                attempt_ref=row.attempt_ref,
+                fence_ref=row.fence_ref,
+                submission_ref=row.submission_ref,
+                payload_hash=row.payload_hash,
+                receipt=AcceptanceReceipt(
+                    issuer="agent_runtime",
+                    kind=row.execution_receipt_kind,
+                    receipt_ref=row.execution_receipt_ref,
+                    subject_ref=row.submission_ref,
+                    payload_hash=row.execution_receipt_hash,
+                ),
+            )
+
+    def query_reasoning_content(
+        self, submission_ref: str
+    ) -> AcceptedReasoningContent | None:
+        """Public RM read seam for issuer-verified Reasoning content."""
+
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_contents WHERE submission_ref = "
+                    ":submission_ref"
+                ),
+                {"submission_ref": submission_ref},
+            ).first()
+        if row is None:
+            return None
+        accepted = _accepted_reasoning_content(row)
+        self.verify_reasoning_content_receipt(
+            request_ref=row.request_ref,
+            submission_ref=row.submission_ref,
+            content_ref=row.content_ref,
+            payload_hash=row.payload_hash,
+            outcome_hash=row.outcome_hash,
+            transition_hash=row.transition_hash,
+            reviewed_draft_hash=row.reviewed_draft_hash,
+            review_hash=row.review_hash,
+            receipt=accepted.receipt,
+        )
+        return accepted
+
+    def verify_reasoning_completion_lineage(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str,
+        content_ref: str,
+        payload_hash: str,
+        outcome_hash: str,
+        transition_ref: str,
+        transition_hash: str,
+        reviewed_draft_hash: str,
+        review_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> VerifiedReasoningCompletionLineage:
+        """Verify and expose the frozen RM lineage behind one completion."""
+
+        self.verify_reasoning_content_receipt(
+            request_ref=request_ref,
+            submission_ref=submission_ref,
+            content_ref=content_ref,
+            payload_hash=payload_hash,
+            outcome_hash=outcome_hash,
+            transition_hash=transition_hash,
+            reviewed_draft_hash=reviewed_draft_hash,
+            review_hash=review_hash,
+            receipt=receipt,
+        )
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_contents WHERE content_ref = "
+                    ":content_ref AND submission_ref = :submission_ref"
+                ),
+                {"content_ref": content_ref, "submission_ref": submission_ref},
+            ).first()
+        if row is None or (
+            row.transition_kind != "candidate_completion"
+            or row.transition_ref != transition_ref
+        ):
+            raise OwnerConflict("reasoning_completion_lineage_invalid")
+        try:
+            context_pack = decoded_object(row.context_pack_json)
+            scientific_outcome = decoded_object(row.scientific_outcome_json)
+            transition = decoded_object(row.transition_json)
+            research_context = context_pack.get("research_context")
+            basis_refs = completion_milestone_basis_refs(context_pack)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("reasoning_completion_lineage_invalid") from error
+        frozen_goal_revision_ref = (
+            research_context.get("goal_revision_ref")
+            if isinstance(research_context, dict)
+            else None
+        )
+        if (
+            not isinstance(frozen_goal_revision_ref, str)
+            or not frozen_goal_revision_ref
+            or scientific_outcome.get("goal_revision_ref")
+            != frozen_goal_revision_ref
+            or transition.get("current_goal_revision_ref")
+            != frozen_goal_revision_ref
+            or transition.get("completion_milestone_basis_refs")
+            != list(basis_refs)
+        ):
+            raise OwnerConflict("reasoning_completion_lineage_invalid")
+        return VerifiedReasoningCompletionLineage(
+            request_ref=row.request_ref,
+            content_ref=row.content_ref,
+            content_receipt_ref=row.receipt_ref,
+            context_pack_ref=row.context_pack_ref,
+            context_pack_hash=row.context_pack_hash,
+            source_outcome_ref=row.scientific_outcome_ref,
+            transition_ref=row.transition_ref,
+            transition_hash=row.transition_hash,
+            quest_ref=str(scientific_outcome["quest_ref"]),
+            goal_revision_ref=frozen_goal_revision_ref,
+            completion_milestone_basis_refs=basis_refs,
+        )
+
+    def verify_reasoning_scientific_candidate_receipt(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str,
+        content_ref: str,
+        checkpoint_ref: str,
+        checkpoint_hash: str,
+        outcome_hash: str,
+        autonomous_scope_hash: str,
+        review_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != RM_OWNER
+            or receipt.kind != REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND
+            or receipt.subject_ref != content_ref
+        ):
+            raise OwnerConflict(
+                "reasoning_scientific_candidate_receipt_issuer_invalid"
+            )
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_scientific_candidates WHERE "
+                    "content_ref = :content_ref AND submission_ref = "
+                    ":submission_ref"
+                ),
+                {"content_ref": content_ref, "submission_ref": submission_ref},
+            ).first()
+        if row is None or (
+            row.request_ref != request_ref
+            or row.checkpoint_ref != checkpoint_ref
+            or row.checkpoint_hash != checkpoint_hash
+            or row.outcome_hash != outcome_hash
+            or row.autonomous_scope_hash != autonomous_scope_hash
+            or row.review_hash != review_hash
+            or row.receipt_ref != receipt.receipt_ref
+            or row.receipt_hash != receipt.payload_hash
+            or row.receipt_hash
+            != _reasoning_scientific_candidate_receipt_hash(row)
+        ):
+            raise OwnerConflict("reasoning_scientific_candidate_receipt_invalid")
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        self._stage_request_verifier.verify_stage_run_request(
+            request_ref=row.request_ref,
+            cycle_ref=row.cycle_ref,
+            epoch=int(row.foreground_epoch),
+            context_pack_ref=row.context_pack_ref,
+            context_pack_hash=row.context_pack_hash,
+            receipt=AcceptanceReceipt(
+                issuer="advancement_engine",
+                kind="stage_run_request",
+                receipt_ref=row.stage_request_receipt_ref,
+                subject_ref=row.request_ref,
+                payload_hash=row.stage_request_receipt_hash,
+            ),
+        )
+        _verify_reasoning_scientific_candidate_object(self._object_store, row)
+        try:
+            context_pack = decoded_object(row.context_pack_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("reasoning_context_pack_invalid") from error
+        _verify_reasoning_plan_evidence_reuse_authority(
+            context_pack,
+            getattr(
+                self._plan_evidence_reuse_verifier,
+                "resolve_plan_evidence_reuse_leaves",
+                None,
+            ),
+        )
+        _verify_reasoning_scientific_candidate_payload(
+            row,
+            revision_verifier=self.verify_question_literature_revision,
+        )
+        verifier = getattr(
+            self._execution_verifier,
+            "verify_reasoning_autonomous_checkpoint_receipt",
+            None,
+        )
+        if not callable(verifier):
+            raise OwnerConflict(
+                "reasoning_autonomous_checkpoint_verifier_unavailable"
+            )
+        verifier(
+            request_ref=row.request_ref,
+            run_ref=row.run_ref,
+            attempt_ref=row.attempt_ref,
+            fence_ref=row.fence_ref,
+            checkpoint_ref=row.checkpoint_ref,
+            checkpoint_hash=row.checkpoint_hash,
+            review_hash=row.review_hash,
+            receipt=AcceptanceReceipt(
+                issuer="agent_runtime",
+                kind=row.checkpoint_receipt_kind,
+                receipt_ref=row.checkpoint_receipt_ref,
+                subject_ref=row.checkpoint_ref,
+                payload_hash=row.checkpoint_receipt_hash,
+            ),
+        )
+
+    def verify_autonomous_question_content_receipt(
+        self,
+        *,
+        reasoning_checkpoint_ref: str,
+        content_ref: str,
+        content_hash: str,
+        receipt: AcceptanceReceipt,
+        context_ref: str | None = None,
+        reasoning_checkpoint_hash: str | None = None,
+        source_scientific_outcome_ref: str | None = None,
+        literature_snapshot_ref: str | None = None,
+    ) -> None:
+        if (
+            receipt.issuer != RM_OWNER
+            or receipt.kind != AUTONOMOUS_QUESTION_CONTENT_RECEIPT_KIND
+            or receipt.subject_ref != content_ref
+        ):
+            raise OwnerConflict(
+                "autonomous_question_content_receipt_issuer_invalid"
+            )
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_autonomous_question_contents WHERE "
+                    "content_ref = :content_ref"
+                ),
+                {"content_ref": content_ref},
+            ).first()
+            candidate = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rm_reasoning_scientific_candidates "
+                        "WHERE content_ref = :content_ref"
+                    ),
+                    {"content_ref": row.source_candidate_content_ref},
+                ).first()
+            )
+            snapshot = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rm_literature_snapshots WHERE "
+                        "snapshot_ref = :snapshot_ref"
+                    ),
+                    {"snapshot_ref": row.literature_snapshot_ref},
+                ).first()
+            )
+        if row is None or candidate is None or snapshot is None or (
+            (context_ref is not None and row.context_ref != context_ref)
+            or row.reasoning_checkpoint_ref != reasoning_checkpoint_ref
+            or (
+                reasoning_checkpoint_hash is not None
+                and row.reasoning_checkpoint_hash != reasoning_checkpoint_hash
+            )
+            or (
+                source_scientific_outcome_ref is not None
+                and row.source_scientific_outcome_ref
+                != source_scientific_outcome_ref
+            )
+            or row.question_hash != content_hash
+            or (
+                literature_snapshot_ref is not None
+                and row.literature_snapshot_ref != literature_snapshot_ref
+            )
+            or row.receipt_ref != receipt.receipt_ref
+            or row.receipt_hash != receipt.payload_hash
+            or row.receipt_hash
+            != _autonomous_question_content_receipt_hash(row)
+            or row.source_candidate_content_ref != candidate.content_ref
+            or row.source_candidate_receipt_ref != candidate.receipt_ref
+            or row.source_candidate_receipt_hash != candidate.receipt_hash
+            or row.reasoning_checkpoint_ref != candidate.checkpoint_ref
+            or row.reasoning_checkpoint_hash != candidate.checkpoint_hash
+            or row.source_scientific_outcome_ref
+            != candidate.scientific_outcome_ref
+            or row.autonomous_scope_hash != candidate.autonomous_scope_hash
+            or row.literature_snapshot_ref != snapshot.snapshot_ref
+            or row.literature_snapshot_hash != snapshot.snapshot_hash
+            or row.literature_snapshot_receipt_ref != snapshot.receipt_ref
+            or row.literature_snapshot_receipt_hash != snapshot.receipt_hash
+            or row.context_ref != snapshot.creation_context_ref
+            or snapshot.creation_context_kind
+            != "autonomous_question_creation"
+            or snapshot.context_basis_hash
+            != _autonomous_question_source_basis_hash(
+                _accepted_reasoning_scientific_candidate(candidate)
+            )
+        ):
+            raise OwnerConflict("autonomous_question_content_receipt_invalid")
+        self.verify_reasoning_scientific_candidate_receipt(
+            request_ref=candidate.request_ref,
+            submission_ref=candidate.submission_ref,
+            content_ref=candidate.content_ref,
+            checkpoint_ref=candidate.checkpoint_ref,
+            checkpoint_hash=candidate.checkpoint_hash,
+            outcome_hash=candidate.outcome_hash,
+            autonomous_scope_hash=candidate.autonomous_scope_hash,
+            review_hash=candidate.review_hash,
+            receipt=AcceptanceReceipt(
+                issuer=RM_OWNER,
+                kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+                receipt_ref=candidate.receipt_ref,
+                subject_ref=candidate.content_ref,
+                payload_hash=candidate.receipt_hash,
+            ),
+        )
+        if self._reasoning_scientific_decision_verifier is None:
+            raise OwnerConflict(
+                "reasoning_scientific_decision_verifier_unavailable"
+            )
+        self._reasoning_scientific_decision_verifier.verify_reasoning_scientific_decision(
+            candidate.request_ref,
+            candidate.submission_ref,
+            "accepted",
+            candidate.scientific_outcome_ref,
+            AcceptanceReceipt(
+                issuer="research_graph",
+                kind="reasoning_scientific_candidate_accepted",
+                receipt_ref=row.source_scientific_receipt_ref,
+                subject_ref=candidate.scientific_outcome_ref,
+                payload_hash=row.source_scientific_receipt_hash,
+            ),
+        )
+        _verify_literature_snapshot_authority_row(
+            snapshot,
+            execution_verifier=self._execution_verifier,
+        )
+        _verify_autonomous_question_content_object(self._object_store, row)
+        _verify_autonomous_question_content_payload(row, candidate)
+
     def query_plan_selected_evidence_refs(
         self,
         *,
@@ -1379,6 +2264,34 @@ class SQLiteResearchMemoryReceiptVerifier:
                 or manual.receipt_hash != _manual_content_receipt_hash(manual)
             ):
                 raise OwnerConflict("asset_receipt_invalid")
+        elif row.acceptance_kind == AUTONOMOUS_QUESTION_CONTENT_RECEIPT_KIND:
+            autonomous = _autonomous_question_content_row(
+                self._database, version_ref
+            )
+            if (
+                autonomous.question_hash != content_hash
+                or autonomous.receipt_ref != receipt.receipt_ref
+                or autonomous.receipt_hash != receipt.payload_hash
+                or autonomous.receipt_hash
+                != _autonomous_question_content_receipt_hash(autonomous)
+            ):
+                raise OwnerConflict("asset_receipt_invalid")
+            self.verify_autonomous_question_content_receipt(
+                context_ref=autonomous.context_ref,
+                reasoning_checkpoint_ref=(
+                    autonomous.reasoning_checkpoint_ref
+                ),
+                reasoning_checkpoint_hash=(
+                    autonomous.reasoning_checkpoint_hash
+                ),
+                source_scientific_outcome_ref=(
+                    autonomous.source_scientific_outcome_ref
+                ),
+                content_ref=autonomous.content_ref,
+                content_hash=autonomous.question_hash,
+                literature_snapshot_ref=autonomous.literature_snapshot_ref,
+                receipt=receipt,
+            )
         elif row.acceptance_kind == IDEA_CONTENT_RECEIPT_KIND:
             legacy = _legacy_idea_row(self._database, version_ref)
             if (
@@ -1429,6 +2342,77 @@ class SQLiteResearchMemoryReceiptVerifier:
                         receipt_ref=plan.execution_receipt_ref,
                         subject_ref=plan.submission_ref,
                         payload_hash=plan.execution_receipt_hash,
+                    ),
+                )
+        elif row.acceptance_kind == REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND:
+            candidate = _reasoning_scientific_candidate_row(
+                self._database, version_ref
+            )
+            if (
+                candidate.checkpoint_hash != content_hash
+                or candidate.receipt_ref != receipt.receipt_ref
+                or candidate.receipt_hash != receipt.payload_hash
+                or candidate.receipt_hash
+                != _reasoning_scientific_candidate_receipt_hash(candidate)
+            ):
+                raise OwnerConflict("asset_receipt_invalid")
+            _verify_reasoning_scientific_candidate_payload(
+                candidate,
+                revision_verifier=self.verify_question_literature_revision,
+            )
+            verifier = getattr(
+                self._execution_verifier,
+                "verify_reasoning_autonomous_checkpoint_receipt",
+                None,
+            )
+            if not callable(verifier):
+                raise OwnerConflict(
+                    "reasoning_autonomous_checkpoint_verifier_unavailable"
+                )
+            verifier(
+                request_ref=candidate.request_ref,
+                run_ref=candidate.run_ref,
+                attempt_ref=candidate.attempt_ref,
+                fence_ref=candidate.fence_ref,
+                checkpoint_ref=candidate.checkpoint_ref,
+                checkpoint_hash=candidate.checkpoint_hash,
+                review_hash=candidate.review_hash,
+                receipt=AcceptanceReceipt(
+                    issuer="agent_runtime",
+                    kind=candidate.checkpoint_receipt_kind,
+                    receipt_ref=candidate.checkpoint_receipt_ref,
+                    subject_ref=candidate.checkpoint_ref,
+                    payload_hash=candidate.checkpoint_receipt_hash,
+                ),
+            )
+        elif row.acceptance_kind == REASONING_CONTENT_RECEIPT_KIND:
+            reasoning = _reasoning_row(self._database, version_ref)
+            if (
+                reasoning.payload_hash != content_hash
+                or reasoning.receipt_ref != receipt.receipt_ref
+                or reasoning.receipt_hash != receipt.payload_hash
+                or reasoning.receipt_hash
+                != _reasoning_content_receipt_hash(reasoning)
+            ):
+                raise OwnerConflict("asset_receipt_invalid")
+            _verify_reasoning_payload(
+                reasoning,
+                revision_verifier=self.verify_question_literature_revision,
+            )
+            if self._execution_verifier is not None:
+                self._execution_verifier.verify_attempt_execution_receipt(
+                    request_ref=reasoning.request_ref,
+                    run_ref=reasoning.run_ref,
+                    attempt_ref=reasoning.attempt_ref,
+                    fence_ref=reasoning.fence_ref,
+                    submission_ref=reasoning.submission_ref,
+                    payload_hash=reasoning.payload_hash,
+                    receipt=AcceptanceReceipt(
+                        issuer="agent_runtime",
+                        kind=reasoning.execution_receipt_kind,
+                        receipt_ref=reasoning.execution_receipt_ref,
+                        subject_ref=reasoning.submission_ref,
+                        payload_hash=reasoning.execution_receipt_hash,
                     ),
                 )
         else:
@@ -4261,6 +5245,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 owner_reference_refs = (
                     f"rm-idea-content:{memory_ref}",
                 )
+            elif asset.acceptance_kind == REASONING_CONTENT_RECEIPT_KIND:
+                owner_reference_refs = (
+                    f"rm-reasoning-content:{memory_ref}",
+                )
             active_reference_refs = owner_reference_refs
             observed_reference_revision: int | None = None
             if expected_reference_revision is None:
@@ -4596,6 +5584,18 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 _verify_idea_object(self._object_store, row)
                 _verify_idea_payload(row)
             with self._database.read() as connection:
+                reasoning_rows = connection.execute(
+                    text("SELECT * FROM rm_reasoning_contents")
+                ).all()
+            for row in reasoning_rows:
+                _verify_reasoning_object(self._object_store, row)
+                _verify_reasoning_payload(
+                    row,
+                    revision_verifier=(
+                        self._receipt_verifier.verify_question_literature_revision
+                    ),
+                )
+            with self._database.read() as connection:
                 asset_rows = connection.execute(
                     text("SELECT * FROM rm_asset_versions")
                 ).all()
@@ -4740,6 +5740,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         self, content_ref: str, expected_hash: str
     ) -> dict[str, object]:
         manual = False
+        autonomous = False
         with self._database.read() as connection:
             row = connection.execute(
                 text(
@@ -4757,10 +5758,29 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     {"content_ref": content_ref},
                 ).first()
                 manual = row is not None
-        if row is None or row.content_hash != expected_hash:
+            if row is None:
+                row = connection.execute(
+                    text(
+                        "SELECT * FROM rm_autonomous_question_contents WHERE "
+                        "content_ref = :content_ref"
+                    ),
+                    {"content_ref": content_ref},
+                ).first()
+                autonomous = row is not None
+        stored_hash = None if row is None else (
+            row.question_hash if autonomous else row.content_hash
+        )
+        if row is None or stored_hash != expected_hash:
             raise OwnerConflict("question_content_not_found")
-        _verify_object(self._object_store, row)
-        if manual:
+        if autonomous:
+            _verify_autonomous_question_content_object(self._object_store, row)
+        else:
+            _verify_object(self._object_store, row)
+        if autonomous:
+            accepted = self.query_autonomous_question_content(content_ref)
+            if accepted is None:
+                raise OwnerConflict("question_content_not_found")
+        elif manual:
             accepted = self.query_manual_question_content(row.context_ref)
             if accepted is None or accepted.content_ref != content_ref:
                 raise OwnerConflict("question_content_not_found")
@@ -4776,7 +5796,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 receipt=_accepted_content(row).receipt,
             )
         try:
-            content = decoded_object(row.content_json)
+            content = decoded_object(
+                row.question_json if autonomous else row.content_json
+            )
         except (TypeError, ValueError) as error:
             raise OwnerConflict("question_content_custody_unavailable") from error
         if canonical_hash(content) != expected_hash:
@@ -5697,6 +6719,1211 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
     def verify_plan_content_receipt(self, **values) -> None:
         self._receipt_verifier.verify_plan_content_receipt(**values)
 
+    def accept_reasoning_scientific_candidate(
+        self,
+        *,
+        request_ref: str,
+        cycle_ref: str,
+        foreground_epoch: int,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        context_pack: dict[str, object],
+        stage_request_receipt: AcceptanceReceipt,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        checkpoint_ref: str,
+        checkpoint: dict[str, object],
+        review: dict[str, object],
+        checkpoint_receipt: AcceptanceReceipt,
+    ) -> AcceptedReasoningScientificCandidate:
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        checkpoint_verifier = getattr(
+            self._execution_verifier,
+            "verify_reasoning_autonomous_checkpoint_receipt",
+            None,
+        )
+        if not callable(checkpoint_verifier):
+            raise OwnerConflict(
+                "reasoning_autonomous_checkpoint_verifier_unavailable"
+            )
+        if (
+            any(
+                not isinstance(value, str) or not value
+                for value in (
+                    request_ref,
+                    cycle_ref,
+                    context_pack_ref,
+                    run_ref,
+                    attempt_ref,
+                    fence_ref,
+                    submission_ref,
+                    checkpoint_ref,
+                )
+            )
+            or type(foreground_epoch) is not int
+            or foreground_epoch < 1
+            or not isinstance(context_pack, dict)
+            or canonical_hash(context_pack) != context_pack_hash
+            or checkpoint_receipt.issuer != "agent_runtime"
+            or checkpoint_receipt.kind
+            != REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND
+            or checkpoint_receipt.subject_ref != checkpoint_ref
+        ):
+            raise OwnerConflict("reasoning_scientific_candidate_lineage_invalid")
+        if (
+            context_pack.get("schema_ref")
+            != "meta-research/reasoning-context-pack/v1"
+            or context_pack.get("cycle_ref") != cycle_ref
+            or context_pack.get("foreground_epoch") != foreground_epoch
+        ):
+            raise OwnerConflict("reasoning_context_pack_invalid")
+        accepted_question = context_pack.get("accepted_question_binding")
+        if not isinstance(accepted_question, dict):
+            raise OwnerConflict("reasoning_context_pack_invalid")
+        self._stage_request_verifier.verify_stage_run_request(
+            request_ref=request_ref,
+            cycle_ref=cycle_ref,
+            epoch=foreground_epoch,
+            context_pack_ref=context_pack_ref,
+            context_pack_hash=context_pack_hash,
+            receipt=stage_request_receipt,
+        )
+        _verify_reasoning_plan_evidence_reuse_authority(
+            context_pack,
+            getattr(
+                self._reference_reader,
+                "resolve_plan_evidence_reuse_leaves",
+                None,
+            ),
+        )
+        frozen_evidence_closure = _frozen_reasoning_evidence_closure(
+            context_pack,
+            revision_verifier=(
+                self._receipt_verifier.verify_question_literature_revision
+            ),
+        )
+        if not isinstance(checkpoint, dict) or set(checkpoint) != {
+            "schema_ref",
+            "scientific_outcome",
+            "autonomous_scope",
+        } or checkpoint.get("schema_ref") != REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA:
+            raise OwnerConflict("reasoning_autonomous_checkpoint_invalid")
+        scientific_outcome = checkpoint.get("scientific_outcome")
+        autonomous_scope = checkpoint.get("autonomous_scope")
+        if not isinstance(scientific_outcome, dict) or not isinstance(
+            autonomous_scope, dict
+        ):
+            raise OwnerConflict("reasoning_autonomous_checkpoint_invalid")
+        try:
+            checkpoint_hash, outcome_hash, autonomous_scope_hash = (
+                validate_reasoning_autonomous_checkpoint(
+                    checkpoint,
+                    frozen_evidence_closure=frozen_evidence_closure,
+                    frozen_research_context=cast(
+                        dict[str, object], context_pack["research_context"]
+                    ),
+                )
+            )
+            if validate_autonomous_question_scope(
+                autonomous_scope,
+                source_outcome=scientific_outcome,
+            ) != autonomous_scope_hash:
+                raise ReasoningContractError(
+                    "autonomous_question_scope_invalid"
+                )
+            if validate_scientific_outcome(
+                scientific_outcome,
+                frozen_evidence_closure=frozen_evidence_closure,
+                frozen_research_context=cast(
+                    dict[str, object], context_pack["research_context"]
+                ),
+            ) != outcome_hash:
+                raise ReasoningContractError("scientific_outcome_invalid")
+            reviewed_draft_hash = review.get("reviewed_draft_hash")
+            if (
+                not isinstance(reviewed_draft_hash, str)
+                or len(reviewed_draft_hash) != 64
+            ):
+                raise ReasoningContractError("reasoning_review_binding_invalid")
+            review_hash = _validate_reasoning_review(
+                review,
+                reviewed_draft_hash=reviewed_draft_hash,
+                final_output_hash=checkpoint_hash,
+            )
+        except ReasoningContractError as error:
+            raise OwnerConflict(str(error)) from error
+        if (
+            scientific_outcome.get("stage_run_request_ref") != request_ref
+            or scientific_outcome.get("cycle_ref") != cycle_ref
+            or scientific_outcome.get("foreground_epoch") != foreground_epoch
+            or scientific_outcome.get("question_ref")
+            != accepted_question.get("question_ref")
+            or scientific_outcome.get("quest_ref")
+            != accepted_question.get("quest_ref")
+        ):
+            raise OwnerConflict("scientific_outcome_binding_invalid")
+        scientific_outcome_ref = scientific_outcome.get("outcome_ref")
+        scientific_disposition = scientific_outcome.get("disposition")
+        if (
+            not isinstance(scientific_outcome_ref, str)
+            or not scientific_outcome_ref
+            or scientific_disposition not in SCIENTIFIC_OUTCOMES
+        ):
+            raise OwnerConflict("scientific_outcome_binding_invalid")
+        checkpoint_verifier(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_hash=checkpoint_hash,
+            review_hash=review_hash,
+            receipt=checkpoint_receipt,
+        )
+        context_pack_json = canonical_json(context_pack)
+        checkpoint_json = canonical_json(checkpoint)
+        scientific_outcome_json = canonical_json(scientific_outcome)
+        autonomous_scope_json = canonical_json(autonomous_scope)
+        evidence_closure_json = canonical_json(frozen_evidence_closure)
+        evidence_closure_hash = canonical_hash(frozen_evidence_closure)
+        review_json = canonical_json(review)
+        object_path = self._store_reasoning_scientific_candidate(
+            checkpoint_hash,
+            checkpoint_json,
+        )
+        bindings = {
+            "request_ref": request_ref,
+            "cycle_ref": cycle_ref,
+            "foreground_epoch": foreground_epoch,
+            "context_pack_ref": context_pack_ref,
+            "context_pack_hash": context_pack_hash,
+            "stage_request_receipt_ref": stage_request_receipt.receipt_ref,
+            "stage_request_receipt_hash": stage_request_receipt.payload_hash,
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "fence_ref": fence_ref,
+            "submission_ref": submission_ref,
+            "checkpoint_ref": checkpoint_ref,
+            "checkpoint_hash": checkpoint_hash,
+            "scientific_outcome_ref": scientific_outcome_ref,
+            "outcome_hash": outcome_hash,
+            "scientific_disposition": scientific_disposition,
+            "autonomous_scope_hash": autonomous_scope_hash,
+            "evidence_closure_hash": evidence_closure_hash,
+            "reviewed_draft_hash": reviewed_draft_hash,
+            "review_hash": review_hash,
+            "checkpoint_receipt_kind": checkpoint_receipt.kind,
+            "checkpoint_receipt_ref": checkpoint_receipt.receipt_ref,
+            "checkpoint_receipt_hash": checkpoint_receipt.payload_hash,
+        }
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_scientific_candidates WHERE "
+                    "submission_ref = :submission_ref"
+                ),
+                {"submission_ref": submission_ref},
+            ).first()
+            if existing is not None:
+                if any(
+                    getattr(existing, key) != value
+                    for key, value in bindings.items()
+                ):
+                    raise OwnerConflict(
+                        "reasoning_scientific_candidate_acceptance_conflict"
+                    )
+                _verify_reasoning_scientific_candidate_object(
+                    self._object_store, existing
+                )
+                _verify_reasoning_scientific_candidate_payload(
+                    existing,
+                    revision_verifier=(
+                        self._receipt_verifier.verify_question_literature_revision
+                    ),
+                )
+                if existing.receipt_hash != (
+                    _reasoning_scientific_candidate_receipt_hash(existing)
+                ):
+                    raise OwnerConflict(
+                        "reasoning_scientific_candidate_receipt_invalid"
+                    )
+                return _accepted_reasoning_scientific_candidate(existing)
+            content_ref = new_ref("reasoning_scientific_candidate")
+            receipt_ref = new_ref("rm_reasoning_scientific_candidate_receipt")
+            receipt_hash = _receipt_hash(
+                REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+                content_ref,
+                bindings,
+            )
+            accepted_at = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO rm_reasoning_scientific_candidates "
+                    "(content_ref, request_ref, cycle_ref, foreground_epoch, "
+                    "context_pack_ref, context_pack_json, context_pack_hash, "
+                    "stage_request_receipt_ref, stage_request_receipt_hash, "
+                    "run_ref, attempt_ref, fence_ref, submission_ref, "
+                    "checkpoint_ref, checkpoint_json, checkpoint_hash, "
+                    "scientific_outcome_ref, scientific_outcome_json, "
+                    "outcome_hash, scientific_disposition, "
+                    "autonomous_scope_json, autonomous_scope_hash, "
+                    "evidence_closure_json, evidence_closure_hash, review_json, "
+                    "reviewed_draft_hash, review_hash, object_path, "
+                    "checkpoint_receipt_kind, "
+                    "checkpoint_receipt_ref, checkpoint_receipt_hash, "
+                    "receipt_ref, receipt_hash, accepted_at) VALUES "
+                    "(:content_ref, :request_ref, :cycle_ref, "
+                    ":foreground_epoch, :context_pack_ref, :context_pack_json, "
+                    ":context_pack_hash, :stage_request_receipt_ref, "
+                    ":stage_request_receipt_hash, :run_ref, :attempt_ref, "
+                    ":fence_ref, :submission_ref, :checkpoint_ref, "
+                    ":checkpoint_json, :checkpoint_hash, "
+                    ":scientific_outcome_ref, :scientific_outcome_json, "
+                    ":outcome_hash, :scientific_disposition, "
+                    ":autonomous_scope_json, :autonomous_scope_hash, "
+                    ":evidence_closure_json, :evidence_closure_hash, "
+                    ":review_json, :reviewed_draft_hash, :review_hash, "
+                    ":object_path, "
+                    ":checkpoint_receipt_kind, :checkpoint_receipt_ref, "
+                    ":checkpoint_receipt_hash, :receipt_ref, :receipt_hash, "
+                    ":accepted_at)"
+                ),
+                {
+                    **bindings,
+                    "content_ref": content_ref,
+                    "context_pack_json": context_pack_json,
+                    "checkpoint_json": checkpoint_json,
+                    "scientific_outcome_json": scientific_outcome_json,
+                    "autonomous_scope_json": autonomous_scope_json,
+                    "evidence_closure_json": evidence_closure_json,
+                    "review_json": review_json,
+                    "object_path": object_path,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "accepted_at": accepted_at,
+                },
+            )
+            _insert_managed_content_asset(
+                connection,
+                version_ref=content_ref,
+                source_kind="system_artifact",
+                display_name="Accepted Reasoning scientific candidate",
+                content_hash=checkpoint_hash,
+                content_json=checkpoint_json,
+                object_path=object_path,
+                provenance={
+                    "source_table": "rm_reasoning_scientific_candidates",
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "checkpoint_ref": checkpoint_ref,
+                },
+                acceptance_kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+                receipt_ref=receipt_ref,
+                receipt_hash=receipt_hash,
+                accepted_at=accepted_at,
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_memory_state SET revision = revision + 1, "
+                    "asset_count = (SELECT COUNT(*) FROM rm_assets), "
+                    "asset_version_count = (SELECT COUNT(*) FROM "
+                    "rm_asset_versions), object_count = :object_count, "
+                    "reasoning_scientific_candidate_count = "
+                    "reasoning_scientific_candidate_count + 1 WHERE "
+                    "singleton = 'owner'"
+                ),
+                {"object_count": _managed_object_count(connection)},
+            )
+            self._feed.record(
+                connection,
+                "research_memory.reasoning_scientific_candidate_accepted",
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "checkpoint_ref": checkpoint_ref,
+                    "content_ref": content_ref,
+                    "scientific_outcome_ref": scientific_outcome_ref,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        accepted = self.query_reasoning_scientific_candidate(submission_ref)
+        if accepted is None:
+            raise OwnerConflict(
+                "reasoning_scientific_candidate_missing_after_commit"
+            )
+        return accepted
+
+    def query_reasoning_scientific_candidate(
+        self, submission_ref: str
+    ) -> AcceptedReasoningScientificCandidate | None:
+        return self._query_reasoning_scientific_candidate(
+            "submission_ref", submission_ref
+        )
+
+    def query_reasoning_scientific_candidate_by_outcome_ref(
+        self, outcome_ref: str
+    ) -> AcceptedReasoningScientificCandidate | None:
+        return self._query_reasoning_scientific_candidate(
+            "scientific_outcome_ref", outcome_ref
+        )
+
+    def query_reasoning_scientific_candidate_by_checkpoint_ref(
+        self, checkpoint_ref: str
+    ) -> AcceptedReasoningScientificCandidate | None:
+        return self._query_reasoning_scientific_candidate(
+            "checkpoint_ref", checkpoint_ref
+        )
+
+    def _query_reasoning_scientific_candidate(
+        self, field: str, value: str
+    ) -> AcceptedReasoningScientificCandidate | None:
+        if field not in {
+            "submission_ref",
+            "scientific_outcome_ref",
+            "checkpoint_ref",
+        } or not isinstance(value, str) or not value:
+            raise OwnerConflict("reasoning_scientific_candidate_query_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_scientific_candidates WHERE "
+                    f"{field} = :value"
+                ),
+                {"value": value},
+            ).first()
+        if row is None:
+            return None
+        accepted = _accepted_reasoning_scientific_candidate(row)
+        self._receipt_verifier.verify_reasoning_scientific_candidate_receipt(
+            request_ref=row.request_ref,
+            submission_ref=row.submission_ref,
+            content_ref=row.content_ref,
+            checkpoint_ref=row.checkpoint_ref,
+            checkpoint_hash=row.checkpoint_hash,
+            outcome_hash=row.outcome_hash,
+            autonomous_scope_hash=row.autonomous_scope_hash,
+            review_hash=row.review_hash,
+            receipt=accepted.receipt,
+        )
+        return accepted
+
+    def verify_reasoning_scientific_candidate_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_reasoning_scientific_candidate_receipt(
+            **values
+        )
+
+    def accept_autonomous_question_content(
+        self,
+        *,
+        reasoning_checkpoint_ref: str,
+        source_scientific_outcome_ref: str,
+        scientific_decision_receipt: AcceptanceReceipt,
+        literature_snapshot_ref: str,
+        idempotency_key: str,
+    ) -> AcceptedAutonomousQuestionContent:
+        if any(
+            not isinstance(value, str) or not value
+            for value in (
+                reasoning_checkpoint_ref,
+                source_scientific_outcome_ref,
+                literature_snapshot_ref,
+                idempotency_key,
+            )
+        ) or len(idempotency_key) > 128:
+            raise OwnerConflict("autonomous_question_content_request_invalid")
+        candidate = self.query_reasoning_scientific_candidate_by_checkpoint_ref(
+            reasoning_checkpoint_ref
+        )
+        if candidate is None or (
+            candidate.scientific_outcome_ref != source_scientific_outcome_ref
+            or candidate.checkpoint_ref != reasoning_checkpoint_ref
+        ):
+            raise OwnerConflict("autonomous_question_source_invalid")
+        scientific_verifier = getattr(
+            self._quest_verifier,
+            "verify_reasoning_scientific_decision",
+            None,
+        )
+        if not callable(scientific_verifier):
+            raise OwnerConflict(
+                "reasoning_scientific_decision_verifier_unavailable"
+            )
+        scientific_verifier(
+            candidate.request_ref,
+            candidate.submission_ref,
+            "accepted",
+            candidate.scientific_outcome_ref,
+            scientific_decision_receipt,
+        )
+        snapshot = self.query_literature_snapshot(literature_snapshot_ref)
+        accepted_question = candidate.context_pack.get(
+            "accepted_question_binding"
+        )
+        if not isinstance(accepted_question, dict):
+            raise OwnerConflict("autonomous_question_source_invalid")
+        source_basis_hash = _autonomous_question_source_basis_hash(candidate)
+        if snapshot is None or (
+            snapshot.creation_context_kind != "autonomous_question_creation"
+            or not snapshot.creation_context_ref
+            or snapshot.context_generation is None
+            or snapshot.context_basis_hash != source_basis_hash
+            or snapshot.quest_ref != candidate.scientific_outcome.get("quest_ref")
+            or snapshot.quest_ref != accepted_question.get("quest_ref")
+        ):
+            raise OwnerConflict("autonomous_question_literature_snapshot_invalid")
+        blueprint = candidate.autonomous_scope.get("question_blueprint")
+        if not isinstance(blueprint, dict):
+            raise OwnerConflict("autonomous_question_scope_invalid")
+        question = _normalized_question_content(blueprint)
+        content_hash = canonical_hash(question)
+        try:
+            proposal = autonomous_question_proposal_from_scope(
+                candidate.autonomous_scope,
+                source_outcome=candidate.scientific_outcome,
+            )
+        except ReasoningContractError as error:
+            raise OwnerConflict(str(error)) from error
+        if proposal.get("question") != question:
+            raise OwnerConflict("autonomous_question_scope_invalid")
+        proposal_hash = canonical_hash(proposal)
+        proposal_ref = f"autonomous_question_proposal_{proposal_hash[:32]}"
+        request = {
+            "reasoning_checkpoint_ref": candidate.checkpoint_ref,
+            "reasoning_checkpoint_hash": candidate.checkpoint_hash,
+            "source_scientific_outcome_ref": candidate.scientific_outcome_ref,
+            "source_candidate_content_receipt": candidate.receipt.as_public_dict(),
+            "source_scientific_domain_receipt": (
+                scientific_decision_receipt.as_public_dict()
+            ),
+            "literature_snapshot_ref": snapshot.snapshot_ref,
+            "literature_snapshot_hash": snapshot.snapshot_hash,
+            "literature_snapshot_receipt": snapshot.receipt.as_public_dict(),
+            "proposal_hash": proposal_hash,
+            "question_hash": content_hash,
+        }
+        request_hash = canonical_hash(request)
+        bindings = {
+            "context_ref": snapshot.creation_context_ref,
+            "reasoning_checkpoint_ref": candidate.checkpoint_ref,
+            "reasoning_checkpoint_hash": candidate.checkpoint_hash,
+            "source_scientific_outcome_ref": candidate.scientific_outcome_ref,
+            "source_candidate_content_ref": candidate.content_ref,
+            "source_candidate_receipt_ref": candidate.receipt.receipt_ref,
+            "source_candidate_receipt_hash": candidate.receipt.payload_hash,
+            "source_scientific_receipt_ref": (
+                scientific_decision_receipt.receipt_ref
+            ),
+            "source_scientific_receipt_hash": (
+                scientific_decision_receipt.payload_hash
+            ),
+            "source_stage_request_ref": candidate.request_ref,
+            "source_cycle_ref": candidate.cycle_ref,
+            "source_foreground_epoch": candidate.foreground_epoch,
+            "source_quest_ref": str(candidate.scientific_outcome["quest_ref"]),
+            "source_question_ref": str(
+                candidate.scientific_outcome["question_ref"]
+            ),
+            "autonomous_scope_hash": candidate.autonomous_scope_hash,
+            "literature_snapshot_ref": snapshot.snapshot_ref,
+            "literature_snapshot_hash": snapshot.snapshot_hash,
+            "literature_snapshot_receipt_ref": snapshot.receipt.receipt_ref,
+            "literature_snapshot_receipt_hash": snapshot.receipt.payload_hash,
+            "proposal_hash": proposal_hash,
+            "question_hash": content_hash,
+            "schema_ref": QUESTION_CONTENT_SCHEMA,
+            "request_hash": request_hash,
+        }
+        question_json = canonical_json(question)
+        proposal_json = canonical_json(proposal)
+        object_path = self._store_content(content_hash, question_json)
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM rm_autonomous_question_contents WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if existing is None:
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM rm_autonomous_question_contents WHERE "
+                        "reasoning_checkpoint_ref = :checkpoint_ref"
+                    ),
+                    {"checkpoint_ref": candidate.checkpoint_ref},
+                ).first()
+            if existing is not None:
+                if (
+                    existing.idempotency_key != idempotency_key
+                    or any(
+                        getattr(existing, key) != value
+                        for key, value in bindings.items()
+                    )
+                    or existing.receipt_hash
+                    != _autonomous_question_content_receipt_hash(existing)
+                ):
+                    raise OwnerConflict(
+                        "autonomous_question_content_acceptance_conflict"
+                    )
+                return _accepted_autonomous_question_content(
+                    existing, candidate
+                )
+            content_ref = new_ref("autonomous_question_content")
+            receipt_ref = new_ref("rm_autonomous_question_content_receipt")
+            receipt_hash = _receipt_hash(
+                AUTONOMOUS_QUESTION_CONTENT_RECEIPT_KIND,
+                content_ref,
+                bindings,
+            )
+            accepted_at = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO rm_autonomous_question_contents "
+                    "(content_ref, context_ref, reasoning_checkpoint_ref, "
+                    "reasoning_checkpoint_hash, source_scientific_outcome_ref, "
+                    "source_candidate_content_ref, source_candidate_receipt_ref, "
+                    "source_candidate_receipt_hash, source_scientific_receipt_ref, "
+                    "source_scientific_receipt_hash, source_stage_request_ref, "
+                    "source_cycle_ref, source_foreground_epoch, source_quest_ref, "
+                    "source_question_ref, autonomous_scope_hash, "
+                    "literature_snapshot_ref, literature_snapshot_hash, "
+                    "literature_snapshot_receipt_ref, "
+                    "literature_snapshot_receipt_hash, proposal_json, "
+                    "proposal_hash, question_json, question_hash, schema_ref, "
+                    "object_path, idempotency_key, request_hash, receipt_ref, "
+                    "receipt_hash, accepted_at) VALUES (:content_ref, "
+                    ":context_ref, :reasoning_checkpoint_ref, "
+                    ":reasoning_checkpoint_hash, :source_scientific_outcome_ref, "
+                    ":source_candidate_content_ref, :source_candidate_receipt_ref, "
+                    ":source_candidate_receipt_hash, "
+                    ":source_scientific_receipt_ref, "
+                    ":source_scientific_receipt_hash, :source_stage_request_ref, "
+                    ":source_cycle_ref, :source_foreground_epoch, "
+                    ":source_quest_ref, :source_question_ref, "
+                    ":autonomous_scope_hash, :literature_snapshot_ref, "
+                    ":literature_snapshot_hash, :literature_snapshot_receipt_ref, "
+                    ":literature_snapshot_receipt_hash, :proposal_json, "
+                    ":proposal_hash, :question_json, :question_hash, :schema_ref, "
+                    ":object_path, :idempotency_key, :request_hash, :receipt_ref, "
+                    ":receipt_hash, :accepted_at)"
+                ),
+                {
+                    **bindings,
+                    "content_ref": content_ref,
+                    "proposal_json": proposal_json,
+                    "question_json": question_json,
+                    "object_path": object_path,
+                    "idempotency_key": idempotency_key,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "accepted_at": accepted_at,
+                },
+            )
+            _insert_managed_content_asset(
+                connection,
+                version_ref=content_ref,
+                source_kind="formal_question",
+                display_name="Accepted Autonomous Question content",
+                content_hash=content_hash,
+                content_json=question_json,
+                object_path=object_path,
+                provenance={
+                    "source_table": "rm_autonomous_question_contents",
+                    "context_ref": snapshot.creation_context_ref,
+                    "reasoning_checkpoint_ref": candidate.checkpoint_ref,
+                    "source_scientific_outcome_ref": (
+                        candidate.scientific_outcome_ref
+                    ),
+                },
+                acceptance_kind=AUTONOMOUS_QUESTION_CONTENT_RECEIPT_KIND,
+                receipt_ref=receipt_ref,
+                receipt_hash=receipt_hash,
+                accepted_at=accepted_at,
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_memory_state SET revision = revision + 1, "
+                    "asset_count = (SELECT COUNT(*) FROM rm_assets), "
+                    "asset_version_count = (SELECT COUNT(*) FROM "
+                    "rm_asset_versions), object_count = :object_count, "
+                    "autonomous_question_content_count = "
+                    "autonomous_question_content_count + 1 WHERE "
+                    "singleton = 'owner'"
+                ),
+                {"object_count": _managed_object_count(connection)},
+            )
+            self._feed.record(
+                connection,
+                "research_memory.autonomous_question_content_accepted",
+                {
+                    "context_ref": snapshot.creation_context_ref,
+                    "reasoning_checkpoint_ref": candidate.checkpoint_ref,
+                    "content_ref": content_ref,
+                    "content_hash": content_hash,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        accepted = self.query_autonomous_question_content(content_ref)
+        if accepted is None:
+            raise OwnerConflict(
+                "autonomous_question_content_missing_after_commit"
+            )
+        return accepted
+
+    def query_autonomous_question_content_by_checkpoint_ref(
+        self, checkpoint_ref: str
+    ) -> AcceptedAutonomousQuestionContent | None:
+        return self._query_autonomous_question_content(
+            "reasoning_checkpoint_ref", checkpoint_ref
+        )
+
+    def query_autonomous_question_content(
+        self, content_ref: str
+    ) -> AcceptedAutonomousQuestionContent | None:
+        return self._query_autonomous_question_content("content_ref", content_ref)
+
+    def _query_autonomous_question_content(
+        self, field: str, value: str
+    ) -> AcceptedAutonomousQuestionContent | None:
+        if field not in {"content_ref", "reasoning_checkpoint_ref"} or (
+            not isinstance(value, str) or not value
+        ):
+            raise OwnerConflict("autonomous_question_content_query_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_autonomous_question_contents WHERE "
+                    f"{field} = :value"
+                ),
+                {"value": value},
+            ).first()
+            candidate_row = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rm_reasoning_scientific_candidates "
+                        "WHERE content_ref = :content_ref"
+                    ),
+                    {"content_ref": row.source_candidate_content_ref},
+                ).first()
+            )
+        if row is None:
+            return None
+        if candidate_row is None:
+            raise OwnerConflict("autonomous_question_content_invalid")
+        accepted = _accepted_autonomous_question_content(
+            row, _accepted_reasoning_scientific_candidate(candidate_row)
+        )
+        self._receipt_verifier.verify_autonomous_question_content_receipt(
+            context_ref=row.context_ref,
+            reasoning_checkpoint_ref=row.reasoning_checkpoint_ref,
+            reasoning_checkpoint_hash=row.reasoning_checkpoint_hash,
+            source_scientific_outcome_ref=row.source_scientific_outcome_ref,
+            content_ref=row.content_ref,
+            content_hash=row.question_hash,
+            literature_snapshot_ref=row.literature_snapshot_ref,
+            receipt=accepted.receipt,
+        )
+        return accepted
+
+    def verify_autonomous_question_content_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_autonomous_question_content_receipt(
+            **values
+        )
+
+    def accept_reasoning_content(
+        self,
+        *,
+        request_ref: str,
+        cycle_ref: str,
+        foreground_epoch: int,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        context_pack: dict[str, object],
+        stage_request_receipt: AcceptanceReceipt,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        outcome: dict[str, object],
+        reviewed_draft: dict[str, object],
+        review: dict[str, object],
+        execution_receipt: AcceptanceReceipt,
+        scientific_candidate_content_receipt: AcceptanceReceipt | None = None,
+        scientific_candidate_domain_receipt: AcceptanceReceipt | None = None,
+    ) -> AcceptedReasoningContent:
+        if self._execution_verifier is None:
+            raise OwnerConflict("attempt_execution_verifier_unavailable")
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        if (
+            any(
+                not isinstance(value, str) or not value
+                for value in (
+                    request_ref,
+                    cycle_ref,
+                    context_pack_ref,
+                    run_ref,
+                    attempt_ref,
+                    fence_ref,
+                    submission_ref,
+                )
+            )
+            or type(foreground_epoch) is not int
+            or foreground_epoch < 1
+            or not isinstance(context_pack, dict)
+            or canonical_hash(context_pack) != context_pack_hash
+            or execution_receipt.kind
+            != REASONING_ATTEMPT_EXECUTION_RECEIPT_KIND
+        ):
+            raise OwnerConflict("reasoning_content_lineage_invalid")
+        if (
+            context_pack.get("schema_ref")
+            != "meta-research/reasoning-context-pack/v1"
+            or context_pack.get("cycle_ref") != cycle_ref
+            or context_pack.get("foreground_epoch") != foreground_epoch
+        ):
+            raise OwnerConflict("reasoning_context_pack_invalid")
+        accepted_question = context_pack.get("accepted_question_binding")
+        if not isinstance(accepted_question, dict):
+            raise OwnerConflict("reasoning_context_pack_invalid")
+        self._stage_request_verifier.verify_stage_run_request(
+            request_ref=request_ref,
+            cycle_ref=cycle_ref,
+            epoch=foreground_epoch,
+            context_pack_ref=context_pack_ref,
+            context_pack_hash=context_pack_hash,
+            receipt=stage_request_receipt,
+        )
+        _verify_reasoning_plan_evidence_reuse_authority(
+            context_pack,
+            getattr(
+                self._reference_reader,
+                "resolve_plan_evidence_reuse_leaves",
+                None,
+            ),
+        )
+        frozen_evidence_closure = _frozen_reasoning_evidence_closure(
+            context_pack,
+            revision_verifier=(
+                self._receipt_verifier.verify_question_literature_revision
+            ),
+        )
+        staged_resume = (
+            scientific_candidate_content_receipt is not None
+            and scientific_candidate_domain_receipt is not None
+        )
+        if (
+            scientific_candidate_content_receipt is None
+        ) != (scientific_candidate_domain_receipt is None):
+            raise OwnerConflict("reasoning_scientific_candidate_binding_invalid")
+        try:
+            expected_completion_basis = (
+                completion_milestone_basis_refs(context_pack)
+                if outcome.get("candidate_completion") is not None
+                or reviewed_draft.get("candidate_completion") is not None
+                else None
+            )
+            _output_hash, outcome_hash, transition_hash = (
+                validate_reasoning_stage_output(
+                    outcome,
+                    frozen_evidence_closure=frozen_evidence_closure,
+                    frozen_research_context=cast(
+                        dict[str, object], context_pack["research_context"]
+                    ),
+                    expected_completion_milestone_basis_refs=(
+                        expected_completion_basis
+                    ),
+                )
+            )
+            if staged_resume:
+                (
+                    reviewed_draft_hash,
+                    _draft_outcome_hash,
+                    _draft_scope_hash,
+                ) = validate_reasoning_autonomous_checkpoint(
+                    reviewed_draft,
+                    frozen_evidence_closure=frozen_evidence_closure,
+                    frozen_research_context=cast(
+                        dict[str, object], context_pack["research_context"]
+                    ),
+                )
+            else:
+                (
+                    reviewed_draft_hash,
+                    _draft_outcome_hash,
+                    _draft_transition_hash,
+                ) = validate_reasoning_stage_output(
+                    reviewed_draft,
+                    frozen_evidence_closure=frozen_evidence_closure,
+                    frozen_research_context=cast(
+                        dict[str, object], context_pack["research_context"]
+                    ),
+                    expected_completion_milestone_basis_refs=(
+                        expected_completion_basis
+                    ),
+                )
+            review_hash = _validate_reasoning_review(
+                review,
+                reviewed_draft_hash=reviewed_draft_hash,
+                final_output_hash=canonical_hash(outcome),
+            )
+        except ReasoningContractError as error:
+            raise OwnerConflict(str(error)) from error
+        scientific_outcome = outcome.get("scientific_outcome")
+        if not isinstance(scientific_outcome, dict):
+            raise OwnerConflict("scientific_outcome_invalid")
+        if (
+            scientific_outcome.get("stage_run_request_ref") != request_ref
+            or scientific_outcome.get("cycle_ref") != cycle_ref
+            or scientific_outcome.get("foreground_epoch") != foreground_epoch
+            or scientific_outcome.get("question_ref")
+            != accepted_question.get("question_ref")
+            or scientific_outcome.get("quest_ref")
+            != accepted_question.get("quest_ref")
+        ):
+            raise OwnerConflict("scientific_outcome_binding_invalid")
+        scientific_outcome_ref = scientific_outcome.get("outcome_ref")
+        scientific_disposition = scientific_outcome.get("disposition")
+        if (
+            not isinstance(scientific_outcome_ref, str)
+            or not scientific_outcome_ref
+            or scientific_disposition not in SCIENTIFIC_OUTCOMES
+        ):
+            raise OwnerConflict("scientific_outcome_binding_invalid")
+        with self._database.read() as connection:
+            staged_row = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_scientific_candidates WHERE "
+                    "scientific_outcome_ref = :outcome_ref"
+                ),
+                {"outcome_ref": scientific_outcome_ref},
+            ).first()
+        if staged_row is None:
+            if (
+                scientific_candidate_content_receipt is not None
+                or scientific_candidate_domain_receipt is not None
+            ):
+                raise OwnerConflict("reasoning_scientific_candidate_binding_invalid")
+            scientific_candidate_content_ref = None
+            scientific_candidate_content_receipt_ref = None
+            scientific_candidate_content_receipt_hash = None
+            scientific_candidate_domain_receipt_ref = None
+            scientific_candidate_domain_receipt_hash = None
+        else:
+            if (
+                scientific_candidate_content_receipt is None
+                or scientific_candidate_domain_receipt is None
+            ):
+                raise OwnerConflict("reasoning_scientific_candidate_required")
+            staged = _accepted_reasoning_scientific_candidate(staged_row)
+            self._receipt_verifier.verify_reasoning_scientific_candidate_receipt(
+                request_ref=staged.request_ref,
+                submission_ref=staged.submission_ref,
+                content_ref=staged.content_ref,
+                checkpoint_ref=staged.checkpoint_ref,
+                checkpoint_hash=staged.checkpoint_hash,
+                outcome_hash=staged.outcome_hash,
+                autonomous_scope_hash=staged.autonomous_scope_hash,
+                review_hash=staged.review_hash,
+                receipt=scientific_candidate_content_receipt,
+            )
+            staged_verifier = getattr(
+                self._quest_verifier,
+                "verify_reasoning_scientific_decision",
+                None,
+            )
+            if not callable(staged_verifier):
+                raise OwnerConflict(
+                    "reasoning_scientific_decision_verifier_unavailable"
+                )
+            staged_verifier(
+                request_ref=staged.request_ref,
+                submission_ref=staged.submission_ref,
+                decision="accepted",
+                outcome_ref=staged.scientific_outcome_ref,
+                receipt=scientific_candidate_domain_receipt,
+            )
+            if (
+                staged.request_ref != request_ref
+                or staged.cycle_ref != cycle_ref
+                or staged.foreground_epoch != foreground_epoch
+                or staged.context_pack_ref != context_pack_ref
+                or staged.context_pack_hash != context_pack_hash
+                or staged.run_ref != run_ref
+                or staged.attempt_ref != attempt_ref
+                or staged.fence_ref != fence_ref
+                or staged.checkpoint != reviewed_draft
+                or staged.checkpoint_hash != reviewed_draft_hash
+                or staged.scientific_outcome != scientific_outcome
+                or canonical_json(staged.scientific_outcome)
+                != canonical_json(scientific_outcome)
+                or staged.outcome_hash != outcome_hash
+                or staged.receipt != scientific_candidate_content_receipt
+            ):
+                raise OwnerConflict("reasoning_scientific_candidate_binding_invalid")
+            scientific_candidate_content_ref = staged.content_ref
+            scientific_candidate_content_receipt_ref = staged.receipt.receipt_ref
+            scientific_candidate_content_receipt_hash = staged.receipt.payload_hash
+            scientific_candidate_domain_receipt_ref = (
+                scientific_candidate_domain_receipt.receipt_ref
+            )
+            scientific_candidate_domain_receipt_hash = (
+                scientific_candidate_domain_receipt.payload_hash
+            )
+        next_cycle = outcome.get("next_cycle_proposal")
+        candidate_completion = outcome.get("candidate_completion")
+        if next_cycle is not None:
+            transition_kind = "next_cycle_proposal"
+            transition = next_cycle
+        else:
+            transition_kind = "candidate_completion"
+            transition = candidate_completion
+        if not isinstance(transition, dict):
+            raise OwnerConflict("reasoning_transition_invalid")
+        transition_ref = f"reasoning_transition_{transition_hash[:32]}"
+        payload = {
+            "schema_ref": REASONING_ATTEMPT_EXECUTION_SCHEMA,
+            "outcome": outcome,
+            "reviewed_draft": reviewed_draft,
+            "review": review,
+        }
+        payload_json = canonical_json(payload)
+        payload_hash = canonical_hash(payload)
+        self._execution_verifier.verify_attempt_execution_receipt(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            submission_ref=submission_ref,
+            payload_hash=payload_hash,
+            receipt=execution_receipt,
+        )
+        context_pack_json = canonical_json(context_pack)
+        outcome_json = canonical_json(outcome)
+        scientific_outcome_json = canonical_json(scientific_outcome)
+        transition_json = canonical_json(transition)
+        evidence_closure_json = canonical_json(frozen_evidence_closure)
+        evidence_closure_hash = canonical_hash(frozen_evidence_closure)
+        reviewed_draft_json = canonical_json(reviewed_draft)
+        review_json = canonical_json(review)
+        object_path = self._store_reasoning_content(payload_hash, payload_json)
+        bindings = {
+            "request_ref": request_ref,
+            "cycle_ref": cycle_ref,
+            "foreground_epoch": foreground_epoch,
+            "context_pack_ref": context_pack_ref,
+            "context_pack_hash": context_pack_hash,
+            "stage_request_receipt_ref": stage_request_receipt.receipt_ref,
+            "stage_request_receipt_hash": stage_request_receipt.payload_hash,
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "fence_ref": fence_ref,
+            "submission_ref": submission_ref,
+            "payload_hash": payload_hash,
+            "scientific_outcome_ref": scientific_outcome_ref,
+            "outcome_hash": outcome_hash,
+            "scientific_disposition": scientific_disposition,
+            "transition_kind": transition_kind,
+            "transition_ref": transition_ref,
+            "transition_hash": transition_hash,
+            "evidence_closure_hash": evidence_closure_hash,
+            "reviewed_draft_hash": reviewed_draft_hash,
+            "review_hash": review_hash,
+            "scientific_candidate_content_ref": (
+                scientific_candidate_content_ref
+            ),
+            "scientific_candidate_content_receipt_ref": (
+                scientific_candidate_content_receipt_ref
+            ),
+            "scientific_candidate_content_receipt_hash": (
+                scientific_candidate_content_receipt_hash
+            ),
+            "scientific_candidate_domain_receipt_ref": (
+                scientific_candidate_domain_receipt_ref
+            ),
+            "scientific_candidate_domain_receipt_hash": (
+                scientific_candidate_domain_receipt_hash
+            ),
+            "execution_receipt_kind": execution_receipt.kind,
+            "execution_receipt_ref": execution_receipt.receipt_ref,
+            "execution_receipt_hash": execution_receipt.payload_hash,
+        }
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_contents WHERE submission_ref = "
+                    ":submission_ref"
+                ),
+                {"submission_ref": submission_ref},
+            ).first()
+            if existing is not None:
+                if any(
+                    getattr(existing, key) != value
+                    for key, value in bindings.items()
+                ):
+                    raise OwnerConflict("reasoning_content_acceptance_conflict")
+                _verify_reasoning_object(self._object_store, existing)
+                _verify_reasoning_payload(
+                    existing,
+                    revision_verifier=(
+                        self._receipt_verifier.verify_question_literature_revision
+                    ),
+                )
+                if existing.receipt_hash != _reasoning_content_receipt_hash(
+                    existing
+                ):
+                    raise OwnerConflict("reasoning_content_receipt_invalid")
+                return _accepted_reasoning_content(existing)
+
+            content_ref = new_ref("reasoning_content")
+            receipt_ref = new_ref("rm_reasoning_content_receipt")
+            receipt_hash = _receipt_hash(
+                REASONING_CONTENT_RECEIPT_KIND,
+                content_ref,
+                bindings,
+            )
+            accepted_at = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO rm_reasoning_contents (content_ref, request_ref, "
+                    "cycle_ref, foreground_epoch, context_pack_ref, "
+                    "context_pack_json, context_pack_hash, "
+                    "stage_request_receipt_ref, stage_request_receipt_hash, "
+                    "run_ref, attempt_ref, fence_ref, submission_ref, "
+                    "outcome_json, payload_json, payload_hash, "
+                    "scientific_outcome_ref, scientific_outcome_json, "
+                    "outcome_hash, scientific_disposition, transition_kind, "
+                    "transition_ref, transition_json, transition_hash, "
+                    "evidence_closure_json, evidence_closure_hash, "
+                    "reviewed_draft_json, reviewed_draft_hash, review_json, "
+                    "review_hash, scientific_candidate_content_ref, "
+                    "scientific_candidate_content_receipt_ref, "
+                    "scientific_candidate_content_receipt_hash, "
+                    "scientific_candidate_domain_receipt_ref, "
+                    "scientific_candidate_domain_receipt_hash, object_path, "
+                    "execution_receipt_kind, "
+                    "execution_receipt_ref, execution_receipt_hash, receipt_ref, "
+                    "receipt_hash, accepted_at) VALUES (:content_ref, "
+                    ":request_ref, :cycle_ref, :foreground_epoch, "
+                    ":context_pack_ref, :context_pack_json, :context_pack_hash, "
+                    ":stage_request_receipt_ref, :stage_request_receipt_hash, "
+                    ":run_ref, :attempt_ref, :fence_ref, :submission_ref, "
+                    ":outcome_json, :payload_json, :payload_hash, "
+                    ":scientific_outcome_ref, :scientific_outcome_json, "
+                    ":outcome_hash, :scientific_disposition, :transition_kind, "
+                    ":transition_ref, :transition_json, :transition_hash, "
+                    ":evidence_closure_json, :evidence_closure_hash, "
+                    ":reviewed_draft_json, :reviewed_draft_hash, :review_json, "
+                    ":review_hash, :scientific_candidate_content_ref, "
+                    ":scientific_candidate_content_receipt_ref, "
+                    ":scientific_candidate_content_receipt_hash, "
+                    ":scientific_candidate_domain_receipt_ref, "
+                    ":scientific_candidate_domain_receipt_hash, :object_path, "
+                    ":execution_receipt_kind, "
+                    ":execution_receipt_ref, :execution_receipt_hash, "
+                    ":receipt_ref, :receipt_hash, :accepted_at)"
+                ),
+                {
+                    **bindings,
+                    "content_ref": content_ref,
+                    "context_pack_json": context_pack_json,
+                    "outcome_json": outcome_json,
+                    "payload_json": payload_json,
+                    "scientific_outcome_json": scientific_outcome_json,
+                    "transition_json": transition_json,
+                    "evidence_closure_json": evidence_closure_json,
+                    "reviewed_draft_json": reviewed_draft_json,
+                    "review_json": review_json,
+                    "object_path": object_path,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "accepted_at": accepted_at,
+                },
+            )
+            _insert_managed_content_asset(
+                connection,
+                version_ref=content_ref,
+                source_kind="system_artifact",
+                display_name="Accepted Reasoning content",
+                content_hash=payload_hash,
+                content_json=payload_json,
+                object_path=object_path,
+                provenance={
+                    "source_table": "rm_reasoning_contents",
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "submission_ref": submission_ref,
+                },
+                acceptance_kind=REASONING_CONTENT_RECEIPT_KIND,
+                receipt_ref=receipt_ref,
+                receipt_hash=receipt_hash,
+                accepted_at=accepted_at,
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_memory_state SET revision = revision + 1, "
+                    "asset_count = (SELECT COUNT(*) FROM rm_assets), "
+                    "asset_version_count = (SELECT COUNT(*) FROM "
+                    "rm_asset_versions), object_count = :object_count, "
+                    "reasoning_content_count = reasoning_content_count + 1 "
+                    "WHERE singleton = 'owner'"
+                ),
+                {"object_count": _managed_object_count(connection)},
+            )
+            self._feed.record(
+                connection,
+                "research_memory.reasoning_content_accepted",
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "submission_ref": submission_ref,
+                    "content_ref": content_ref,
+                    "scientific_outcome_ref": scientific_outcome_ref,
+                    "transition_ref": transition_ref,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        accepted = self.query_reasoning_content(submission_ref)
+        if accepted is None:
+            raise OwnerConflict("reasoning_content_missing_after_commit")
+        return accepted
+
+    def query_reasoning_content(
+        self, submission_ref: str
+    ) -> AcceptedReasoningContent | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_reasoning_contents WHERE submission_ref = "
+                    ":submission_ref"
+                ),
+                {"submission_ref": submission_ref},
+            ).first()
+        if row is None:
+            return None
+        accepted = _accepted_reasoning_content(row)
+        self._receipt_verifier.verify_reasoning_content_receipt(
+            request_ref=row.request_ref,
+            submission_ref=row.submission_ref,
+            content_ref=row.content_ref,
+            payload_hash=row.payload_hash,
+            outcome_hash=row.outcome_hash,
+            transition_hash=row.transition_hash,
+            reviewed_draft_hash=row.reviewed_draft_hash,
+            review_hash=row.review_hash,
+            receipt=accepted.receipt,
+        )
+        return accepted
+
+    def verify_reasoning_content_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_reasoning_content_receipt(**values)
+
     def accept_literature_snapshot(
         self,
         request: DeepFetchRunRequest,
@@ -5705,11 +7932,29 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         creation_context_kind = request.creation_context_kind
         if creation_context_kind == "quest_initialization":
             creation_context_ref = None
+            context_generation = None
+            context_basis_hash = None
             quest_ref = None
         elif creation_context_kind == "manual_question_creation":
             creation_context_ref = request.creation_context_ref
+            context_generation = None
+            context_basis_hash = None
             quest_ref = request.quest_ref
             if not creation_context_ref or not quest_ref:
+                raise OwnerConflict("literature_snapshot_context_invalid")
+        elif creation_context_kind == "autonomous_question_creation":
+            creation_context_ref = request.creation_context_ref
+            context_generation = request.context_generation
+            context_basis_hash = request.context_basis_hash
+            quest_ref = request.quest_ref
+            if (
+                not creation_context_ref
+                or not quest_ref
+                or type(context_generation) is not int
+                or context_generation < 1
+                or not isinstance(context_basis_hash, str)
+                or len(context_basis_hash) != 64
+            ):
                 raise OwnerConflict("literature_snapshot_context_invalid")
         else:
             raise OwnerConflict("literature_snapshot_context_invalid")
@@ -5744,11 +7989,16 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 or existing.fence_ref != run.fence_ref
                 or existing.creation_context_kind != creation_context_kind
                 or existing.creation_context_ref != creation_context_ref
+                or existing.context_generation != context_generation
+                or existing.context_basis_hash != context_basis_hash
                 or existing.quest_ref != quest_ref
             ):
                 raise OwnerConflict("literature_snapshot_identity_conflict")
             return existing
-        if creation_context_kind == "manual_question_creation":
+        if creation_context_kind in {
+            "manual_question_creation",
+            "autonomous_question_creation",
+        }:
             existing = self._query_literature_snapshot_for_context(
                 creation_context_kind, creation_context_ref
             )
@@ -5824,7 +8074,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             "limitations_hash": limitations_hash,
             "web_evidence_hash": web_evidence_hash,
         }
-        if creation_context_kind == "manual_question_creation":
+        if creation_context_kind in {
+            "manual_question_creation",
+            "autonomous_question_creation",
+        }:
             snapshot_binding.update(
                 {
                     "creation_context_kind": creation_context_kind,
@@ -5832,6 +8085,13 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     "quest_ref": quest_ref,
                 }
             )
+            if creation_context_kind == "autonomous_question_creation":
+                snapshot_binding.update(
+                    {
+                        "context_generation": context_generation,
+                        "context_basis_hash": context_basis_hash,
+                    }
+                )
         snapshot_hash = canonical_hash(snapshot_binding)
         receipt_ref = new_ref("rm_receipt")
         receipt_hash = _literature_snapshot_receipt_hash(
@@ -5842,6 +8102,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             execution_receipt=run.execution_receipt,
             creation_context_kind=creation_context_kind,
             creation_context_ref=creation_context_ref,
+            context_generation=context_generation,
+            context_basis_hash=context_basis_hash,
             quest_ref=quest_ref,
         )
         now = time.time()
@@ -5855,7 +8117,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             ).first()
             if (
                 existing_row is None
-                and creation_context_kind == "manual_question_creation"
+                and creation_context_kind
+                in {"manual_question_creation", "autonomous_question_creation"}
             ):
                 context_row = connection.execute(
                     text(
@@ -5875,7 +8138,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     text(
                         "INSERT INTO rm_literature_snapshots (snapshot_ref, "
                         "request_ref, creation_context_kind, creation_context_ref, "
-                        "quest_ref, initialization_id, draft_revision, draft_hash, "
+                        "context_generation, context_basis_hash, quest_ref, "
+                        "initialization_id, draft_revision, draft_hash, "
                         "scope_hash, run_ref, attempt_ref, fence_ref, result_hash, "
                         "execution_receipt_ref, execution_receipt_hash, completion, "
                         "summary_ref, summary_hash, summary_object_path, papers_ref, "
@@ -5885,7 +8149,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                         "web_evidence_json, web_evidence_hash, "
                         "snapshot_hash, receipt_ref, receipt_hash, accepted_at) VALUES "
                         "(:snapshot_ref, :request_ref, :creation_context_kind, "
-                        ":creation_context_ref, :quest_ref, :initialization_id, "
+                        ":creation_context_ref, :context_generation, "
+                        ":context_basis_hash, :quest_ref, :initialization_id, "
                         ":draft_revision, :draft_hash, :scope_hash, :run_ref, "
                         ":attempt_ref, :fence_ref, :result_hash, "
                         ":execution_receipt_ref, :execution_receipt_hash, "
@@ -5902,6 +8167,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                         **snapshot_binding,
                         "creation_context_kind": creation_context_kind,
                         "creation_context_ref": creation_context_ref,
+                        "context_generation": context_generation,
+                        "context_basis_hash": context_basis_hash,
                         "quest_ref": quest_ref,
                         "execution_receipt_ref": run.execution_receipt.receipt_ref,
                         "execution_receipt_hash": run.execution_receipt.payload_hash,
@@ -5945,6 +8212,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             or accepted.result_hash != run.result_hash
             or accepted.creation_context_kind != creation_context_kind
             or accepted.creation_context_ref != creation_context_ref
+            or accepted.context_generation != context_generation
+            or accepted.context_basis_hash != context_basis_hash
             or accepted.quest_ref != quest_ref
         ):
             raise OwnerConflict("literature_snapshot_identity_conflict")
@@ -6024,6 +8293,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         receipt: AcceptanceReceipt | None = None,
         creation_context_kind: str = "quest_initialization",
         creation_context_ref: str | None = None,
+        context_generation: int | None = None,
+        context_basis_hash: str | None = None,
         quest_ref: str | None = None,
     ) -> None:
         snapshot = self.query_literature_snapshot(snapshot_ref)
@@ -6034,6 +8305,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             or snapshot.draft_hash != draft_hash
             or snapshot.creation_context_kind != creation_context_kind
             or snapshot.creation_context_ref != creation_context_ref
+            or snapshot.context_generation != context_generation
+            or snapshot.context_basis_hash != context_basis_hash
             or snapshot.quest_ref != quest_ref
             or receipt is not None
             and snapshot.receipt != receipt
@@ -6080,6 +8353,22 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             if not row.creation_context_ref or not row.quest_ref:
                 raise OwnerConflict("literature_snapshot_invalid")
             creation_context_ref = str(row.creation_context_ref)
+            context_generation = None
+            context_basis_hash = None
+            quest_ref = str(row.quest_ref)
+        elif creation_context_kind == "autonomous_question_creation":
+            if (
+                not row.creation_context_ref
+                or not row.quest_ref
+                or type(row.context_generation) is not int
+                or int(row.context_generation) < 1
+                or not isinstance(row.context_basis_hash, str)
+                or len(row.context_basis_hash) != 64
+            ):
+                raise OwnerConflict("literature_snapshot_invalid")
+            creation_context_ref = str(row.creation_context_ref)
+            context_generation = int(row.context_generation)
+            context_basis_hash = str(row.context_basis_hash)
             quest_ref = str(row.quest_ref)
         elif creation_context_kind == "quest_initialization":
             if (
@@ -6089,6 +8378,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 raise OwnerConflict("literature_snapshot_invalid")
             # Root request objects historically have no explicit context ref.
             creation_context_ref = None
+            context_generation = None
+            context_basis_hash = None
             quest_ref = None
         else:
             raise OwnerConflict("literature_snapshot_invalid")
@@ -6114,7 +8405,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             "limitations_hash": row.limitations_hash,
             "web_evidence_hash": row.web_evidence_hash,
         }
-        if creation_context_kind == "manual_question_creation":
+        if creation_context_kind in {
+            "manual_question_creation",
+            "autonomous_question_creation",
+        }:
             snapshot_binding.update(
                 {
                     "creation_context_kind": creation_context_kind,
@@ -6122,6 +8416,13 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     "quest_ref": quest_ref,
                 }
             )
+            if creation_context_kind == "autonomous_question_creation":
+                snapshot_binding.update(
+                    {
+                        "context_generation": context_generation,
+                        "context_basis_hash": context_basis_hash,
+                    }
+                )
         execution_receipt = AcceptanceReceipt(
             issuer="agent_runtime",
             kind=DEEPFETCH_EXECUTION_RECEIPT_KIND,
@@ -6147,6 +8448,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 execution_receipt=execution_receipt,
                 creation_context_kind=creation_context_kind,
                 creation_context_ref=creation_context_ref,
+                context_generation=context_generation,
+                context_basis_hash=context_basis_hash,
                 quest_ref=quest_ref,
             )
         ):
@@ -6187,6 +8490,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             receipt=receipt,
             creation_context_kind=creation_context_kind,
             creation_context_ref=creation_context_ref,
+            context_generation=context_generation,
+            context_basis_hash=context_basis_hash,
             quest_ref=quest_ref,
         )
 
@@ -6232,6 +8537,204 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             "fulltexts": fulltexts,
             "web_evidence": web_evidence,
         }
+
+    def ensure_question_literature_revision(
+        self,
+        *,
+        question_binding: AcceptedQuestionBinding,
+        source_snapshot_binding: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        if (
+            not isinstance(question_binding, AcceptedQuestionBinding)
+            or not question_binding.question_ref
+            or not question_binding.quest_ref
+            or not question_binding.content_ref
+            or len(question_binding.content_hash) != 64
+            or not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or len(idempotency_key) > 128
+        ):
+            raise OwnerConflict("question_literature_revision_invalid")
+        question_verifier = getattr(
+            self._quest_verifier,
+            "verify_accepted_question_binding",
+            None,
+        )
+        if not callable(question_verifier):
+            raise OwnerConflict("accepted_question_binding_verifier_unavailable")
+        question_verifier(question_binding)
+        source_values = _validated_source_snapshot_binding(
+            source_snapshot_binding
+        )
+        source = self.query_literature_snapshot(source_values["snapshot_ref"])
+        if source is None or (
+            source.snapshot_hash != source_values["snapshot_hash"]
+            or source.initialization_id != source_values["initialization_id"]
+            or source.draft_revision != source_values["draft_revision"]
+            or source.draft_hash != source_values["draft_hash"]
+            or source.receipt != source_values["receipt"]
+            or source.creation_context_kind
+            != source_values["creation_context_kind"]
+            or source.creation_context_ref
+            != source_values["creation_context_ref"]
+            or source.context_generation != source_values["context_generation"]
+            or source.context_basis_hash != source_values["context_basis_hash"]
+            or source.quest_ref != source_values["quest_ref"]
+            or (
+                "public_binding" in source_values
+                and source.as_public_dict() != source_values["public_binding"]
+            )
+        ):
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+        if source.quest_ref is not None and source.quest_ref != question_binding.quest_ref:
+            raise OwnerConflict("question_literature_source_snapshot_foreign")
+        snapshot_document = self.read_literature_snapshot(source.snapshot_ref)
+        records = _question_literature_records(snapshot_document)
+        records_json = canonical_json(records)
+        records_hash = canonical_hash(records)
+        request_hash = canonical_hash(
+            {
+                "question_binding": question_binding.as_dict(),
+                "source_snapshot_binding": source_snapshot_binding,
+                "records_hash": records_hash,
+            }
+        )
+        bindings = {
+            "question_ref": question_binding.question_ref,
+            "quest_ref": question_binding.quest_ref,
+            "question_content_ref": question_binding.content_ref,
+            "question_content_hash": question_binding.content_hash,
+            "question_receipt_ref": (
+                question_binding.question_receipt.receipt_ref
+            ),
+            "question_receipt_hash": (
+                question_binding.question_receipt.payload_hash
+            ),
+            "source_snapshot_ref": source.snapshot_ref,
+            "source_snapshot_hash": source.snapshot_hash,
+            "source_snapshot_receipt_ref": source.receipt.receipt_ref,
+            "source_snapshot_receipt_hash": source.receipt.payload_hash,
+            "records_hash": records_hash,
+            "request_hash": request_hash,
+        }
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM rm_question_literature_revisions WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if replay is not None:
+                if replay.request_hash != request_hash:
+                    raise OwnerConflict(
+                        "question_literature_revision_idempotency_conflict"
+                    )
+                accepted = _question_literature_revision_binding(replay)
+                self._receipt_verifier.verify_question_literature_revision(
+                    accepted
+                )
+                return accepted
+            current = connection.execute(
+                text(
+                    "SELECT * FROM rm_question_literature_revisions WHERE "
+                    "question_ref = :question_ref ORDER BY revision_number DESC "
+                    "LIMIT 1"
+                ),
+                {"question_ref": question_binding.question_ref},
+            ).first()
+            if current is not None and all(
+                getattr(current, name) == value
+                for name, value in bindings.items()
+                if name != "request_hash"
+            ):
+                accepted = _question_literature_revision_binding(current)
+                self._receipt_verifier.verify_question_literature_revision(
+                    accepted
+                )
+                return accepted
+            revision_number = 1 if current is None else int(current.revision_number) + 1
+            revision_ref = new_ref("question_literature_revision")
+            receipt_ref = new_ref("rm_question_literature_revision_receipt")
+            now = time.time()
+            values = {
+                **bindings,
+                "revision_ref": revision_ref,
+                "revision_number": revision_number,
+                "records_json": records_json,
+                "idempotency_key": idempotency_key,
+                "receipt_ref": receipt_ref,
+                "accepted_at": now,
+            }
+            values["receipt_hash"] = _receipt_hash(
+                QUESTION_LITERATURE_REVISION_RECEIPT_KIND,
+                revision_ref,
+                _question_literature_revision_bindings(values),
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO rm_question_literature_revisions "
+                    "(revision_ref, question_ref, quest_ref, "
+                    "question_content_ref, question_content_hash, "
+                    "question_receipt_ref, question_receipt_hash, "
+                    "revision_number, source_snapshot_ref, "
+                    "source_snapshot_hash, source_snapshot_receipt_ref, "
+                    "source_snapshot_receipt_hash, records_json, records_hash, "
+                    "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                    "accepted_at) VALUES (:revision_ref, :question_ref, "
+                    ":quest_ref, :question_content_ref, :question_content_hash, "
+                    ":question_receipt_ref, :question_receipt_hash, "
+                    ":revision_number, :source_snapshot_ref, "
+                    ":source_snapshot_hash, :source_snapshot_receipt_ref, "
+                    ":source_snapshot_receipt_hash, :records_json, "
+                    ":records_hash, :idempotency_key, :request_hash, "
+                    ":receipt_ref, :receipt_hash, :accepted_at)"
+                ),
+                values,
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_memory_state SET revision = revision + 1, "
+                    "question_literature_revision_count = "
+                    "question_literature_revision_count + 1 WHERE singleton = "
+                    "'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "research_memory.question_literature_revision_accepted",
+                {
+                    "revision_ref": revision_ref,
+                    "question_ref": question_binding.question_ref,
+                    "source_snapshot_ref": source.snapshot_ref,
+                    "records_hash": records_hash,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        accepted = self.query_question_literature_revision(
+            question_binding.question_ref
+        )
+        if accepted is None:
+            raise OwnerConflict("question_literature_revision_missing_after_commit")
+        return accepted
+
+    def query_question_literature_revision(
+        self, question_ref: str
+    ) -> dict[str, object] | None:
+        return self._receipt_verifier.query_current_question_literature_revision(
+            question_ref
+        )
+
+    def query_current_question_literature_revision(
+        self, question_ref: str
+    ) -> dict[str, object] | None:
+        return self.query_question_literature_revision(question_ref)
+
+    def verify_question_literature_revision(
+        self, binding: dict[str, object]
+    ) -> None:
+        self._receipt_verifier.verify_question_literature_revision(binding)
 
     def _store_literature_object(
         self, kind: str, content_hash: str, content_json: str
@@ -6351,6 +8854,78 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         if destination.is_file():
             if destination.read_bytes() != expected_bytes:
                 raise OwnerConflict("plan_content_custody_conflict")
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{payload_hash}.", dir=directory
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(expected_bytes)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary.chmod(0o600)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        directory_descriptor = os.open(
+            directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        return str(destination.relative_to(self._object_store))
+
+    def _store_reasoning_scientific_candidate(
+        self, checkpoint_hash: str, checkpoint_json: str
+    ) -> str:
+        directory = (
+            self._object_store
+            / "reasoning-scientific-candidate"
+            / checkpoint_hash[:2]
+        )
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = directory / f"{checkpoint_hash}.json"
+        expected_bytes = checkpoint_json.encode("utf-8")
+        if destination.is_file():
+            if destination.read_bytes() != expected_bytes:
+                raise OwnerConflict(
+                    "reasoning_scientific_candidate_custody_conflict"
+                )
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{checkpoint_hash}.", dir=directory
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(expected_bytes)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary.chmod(0o600)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        directory_descriptor = os.open(
+            directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        return str(destination.relative_to(self._object_store))
+
+    def _store_reasoning_content(
+        self, payload_hash: str, payload_json: str
+    ) -> str:
+        directory = self._object_store / "reasoning-content" / payload_hash[:2]
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = directory / f"{payload_hash}.json"
+        expected_bytes = payload_json.encode("utf-8")
+        if destination.is_file():
+            if destination.read_bytes() != expected_bytes:
+                raise OwnerConflict("reasoning_content_custody_conflict")
         else:
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{payload_hash}.", dir=directory
@@ -6524,6 +9099,8 @@ def _literature_snapshot_receipt_hash(
     execution_receipt: AcceptanceReceipt,
     creation_context_kind: str = "quest_initialization",
     creation_context_ref: str | None = None,
+    context_generation: int | None = None,
+    context_basis_hash: str | None = None,
     quest_ref: str | None = None,
 ) -> str:
     bindings: dict[str, object] = {
@@ -6532,7 +9109,10 @@ def _literature_snapshot_receipt_hash(
         "result_hash": result_hash,
         "execution_receipt": execution_receipt.as_public_dict(),
     }
-    if creation_context_kind == "manual_question_creation":
+    if creation_context_kind in {
+        "manual_question_creation",
+        "autonomous_question_creation",
+    }:
         bindings.update(
             {
                 "creation_context_kind": creation_context_kind,
@@ -6540,6 +9120,13 @@ def _literature_snapshot_receipt_hash(
                 "quest_ref": quest_ref,
             }
         )
+        if creation_context_kind == "autonomous_question_creation":
+            bindings.update(
+                {
+                    "context_generation": context_generation,
+                    "context_basis_hash": context_basis_hash,
+                }
+            )
     return canonical_hash(
         {
             "schema_ref": RECEIPT_SCHEMA,
@@ -6549,6 +9136,412 @@ def _literature_snapshot_receipt_hash(
             "bindings": bindings,
         }
     )
+
+
+def _acceptance_receipt_from_public(value: object) -> AcceptanceReceipt:
+    if not isinstance(value, dict) or set(value) != {
+        "status",
+        "issuer",
+        "kind",
+        "receipt_ref",
+        "subject_ref",
+        "payload_hash",
+    } or value.get("status") != "accepted":
+        raise ValueError("acceptance receipt invalid")
+    fields = (
+        value.get("issuer"),
+        value.get("kind"),
+        value.get("receipt_ref"),
+        value.get("subject_ref"),
+        value.get("payload_hash"),
+    )
+    if any(not isinstance(item, str) or not item for item in fields):
+        raise ValueError("acceptance receipt invalid")
+    issuer, kind, receipt_ref, subject_ref, payload_hash = fields
+    return AcceptanceReceipt(
+        issuer=issuer,
+        kind=kind,
+        receipt_ref=receipt_ref,
+        subject_ref=subject_ref,
+        payload_hash=payload_hash,
+    )
+
+
+def _validated_source_snapshot_binding(
+    binding: dict[str, object],
+) -> dict[str, object]:
+    root_fields = {
+        "schema_ref",
+        "snapshot_ref",
+        "snapshot_hash",
+        "initialization_id",
+        "draft_revision",
+        "draft_hash",
+        "receipt",
+    }
+    manual_fields = root_fields | {
+        "creation_context_kind",
+        "creation_context_ref",
+        "quest_ref",
+    }
+    autonomous_fields = manual_fields | {
+        "context_generation",
+        "context_basis_hash",
+    }
+    public_root_fields = {
+        "status",
+        "snapshot_ref",
+        "request_ref",
+        "initialization_id",
+        "draft_revision",
+        "draft_hash",
+        "scope_hash",
+        "completion",
+        "summary_ref",
+        "summary_hash",
+        "papers_ref",
+        "papers_hash",
+        "fulltexts_ref",
+        "fulltexts_hash",
+        "limitations",
+        "web_evidence_hash",
+        "snapshot_hash",
+        "paper_count",
+        "fulltext_count",
+        "receipt",
+    }
+    public_manual_fields = public_root_fields | {
+        "creation_context_kind",
+        "creation_context_ref",
+        "quest_ref",
+    }
+    public_autonomous_fields = public_manual_fields | {
+        "context_generation",
+        "context_basis_hash",
+    }
+    if isinstance(binding, dict) and frozenset(binding) in {
+        frozenset(public_root_fields),
+        frozenset(public_manual_fields),
+        frozenset(public_autonomous_fields),
+    }:
+        if binding.get("status") != "accepted":
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+        compact: dict[str, object] = {
+            "schema_ref": "meta-research/idea-literature-binding/v1",
+            "snapshot_ref": binding.get("snapshot_ref"),
+            "snapshot_hash": binding.get("snapshot_hash"),
+            "initialization_id": binding.get("initialization_id"),
+            "draft_revision": binding.get("draft_revision"),
+            "draft_hash": binding.get("draft_hash"),
+            "receipt": binding.get("receipt"),
+        }
+        if set(binding) in {public_manual_fields, public_autonomous_fields}:
+            compact.update(
+                {
+                    "creation_context_kind": binding.get(
+                        "creation_context_kind"
+                    ),
+                    "creation_context_ref": binding.get(
+                        "creation_context_ref"
+                    ),
+                    "quest_ref": binding.get("quest_ref"),
+                }
+            )
+        if set(binding) == public_autonomous_fields:
+            compact.update(
+                {
+                    "context_generation": binding.get("context_generation"),
+                    "context_basis_hash": binding.get("context_basis_hash"),
+                }
+            )
+        result = _validated_source_snapshot_binding(compact)
+        result["public_binding"] = dict(binding)
+        return result
+    if not isinstance(binding, dict) or frozenset(binding) not in {
+        frozenset(root_fields),
+        frozenset(manual_fields),
+        frozenset(autonomous_fields),
+    }:
+        raise OwnerConflict("question_literature_source_snapshot_invalid")
+    if (
+        binding.get("schema_ref") != "meta-research/idea-literature-binding/v1"
+        or not isinstance(binding.get("snapshot_ref"), str)
+        or not binding["snapshot_ref"]
+        or not isinstance(binding.get("snapshot_hash"), str)
+        or len(binding["snapshot_hash"]) != 64
+        or not isinstance(binding.get("initialization_id"), str)
+        or not binding["initialization_id"]
+        or type(binding.get("draft_revision")) is not int
+        or int(binding["draft_revision"]) < 1
+        or not isinstance(binding.get("draft_hash"), str)
+        or len(binding["draft_hash"]) != 64
+    ):
+        raise OwnerConflict("question_literature_source_snapshot_invalid")
+    try:
+        receipt = _acceptance_receipt_from_public(binding.get("receipt"))
+    except ValueError as error:
+        raise OwnerConflict("question_literature_source_snapshot_invalid") from error
+    binding_fields = set(binding)
+    if binding_fields == manual_fields or binding_fields == autonomous_fields:
+        if (
+            binding.get("creation_context_kind")
+            not in {
+                "manual_question_creation",
+                "autonomous_question_creation",
+            }
+            or not isinstance(binding.get("creation_context_ref"), str)
+            or not binding["creation_context_ref"]
+            or not isinstance(binding.get("quest_ref"), str)
+            or not binding["quest_ref"]
+        ):
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+        creation_context_kind = str(binding["creation_context_kind"])
+        creation_context_ref = binding["creation_context_ref"]
+        quest_ref = binding["quest_ref"]
+        if creation_context_kind == "autonomous_question_creation":
+            if (
+                set(binding) != autonomous_fields
+                or type(binding.get("context_generation")) is not int
+                or int(binding["context_generation"]) < 1
+                or not isinstance(binding.get("context_basis_hash"), str)
+                or len(binding["context_basis_hash"]) != 64
+            ):
+                raise OwnerConflict(
+                    "question_literature_source_snapshot_invalid"
+                )
+            context_generation = binding["context_generation"]
+            context_basis_hash = binding["context_basis_hash"]
+        else:
+            if set(binding) != manual_fields:
+                raise OwnerConflict(
+                    "question_literature_source_snapshot_invalid"
+                )
+            context_generation = None
+            context_basis_hash = None
+    else:
+        creation_context_kind = "quest_initialization"
+        creation_context_ref = None
+        context_generation = None
+        context_basis_hash = None
+        quest_ref = None
+    return {
+        "snapshot_ref": binding["snapshot_ref"],
+        "snapshot_hash": binding["snapshot_hash"],
+        "initialization_id": binding["initialization_id"],
+        "draft_revision": binding["draft_revision"],
+        "draft_hash": binding["draft_hash"],
+        "receipt": receipt,
+        "creation_context_kind": creation_context_kind,
+        "creation_context_ref": creation_context_ref,
+        "context_generation": context_generation,
+        "context_basis_hash": context_basis_hash,
+        "quest_ref": quest_ref,
+    }
+
+
+def _question_literature_records(
+    snapshot: dict[str, object],
+) -> list[dict[str, object]]:
+    papers = snapshot.get("papers")
+    fulltexts = snapshot.get("fulltexts")
+    if not isinstance(papers, list) or not isinstance(fulltexts, list):
+        raise OwnerConflict("question_literature_source_snapshot_invalid")
+    fulltext_by_url: dict[str, dict[str, object]] = {}
+    for value in fulltexts:
+        if not isinstance(value, dict):
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+        paper_url = value.get("paper_url")
+        content_hash = value.get("content_hash")
+        if (
+            not isinstance(paper_url, str)
+            or not paper_url
+            or not isinstance(content_hash, str)
+            or len(content_hash) != 64
+        ):
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+        fulltext_by_url[paper_url] = value
+    records: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for paper in papers:
+        if not isinstance(paper, dict):
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+        doi = paper.get("doi")
+        url = paper.get("url")
+        if isinstance(doi, str) and doi.strip():
+            record_ref = f"doi:{doi.strip().lower()}"
+        elif isinstance(url, str) and url.strip():
+            record_ref = f"url:{canonical_hash(url.strip())[:32]}"
+        else:
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+        if record_ref in seen:
+            raise OwnerConflict("question_literature_record_duplicate")
+        seen.add(record_ref)
+        fulltext = fulltext_by_url.get(url) if isinstance(url, str) else None
+        if fulltext is not None:
+            record = {
+                "ref": record_ref,
+                "evidence_basis": "verified_fulltext",
+                "evidence_basis_ref": fulltext["content_hash"],
+            }
+        else:
+            record = {
+                "ref": record_ref,
+                "evidence_basis": "title_lead",
+                "evidence_basis_ref": record_ref,
+            }
+        records.append(record)
+    return records
+
+
+def _verified_question_literature_records(row) -> list[dict[str, object]]:
+    try:
+        records = json.loads(row.records_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise OwnerConflict("question_literature_revision_invalid") from error
+    if not isinstance(records, list):
+        raise OwnerConflict("question_literature_revision_invalid")
+    seen: set[str] = set()
+    for record in records:
+        expected = {"ref", "evidence_basis", "evidence_basis_ref"}
+        if isinstance(record, dict) and "reading_result_ref" in record:
+            expected.add("reading_result_ref")
+        if not isinstance(record, dict) or set(record) != expected:
+            raise OwnerConflict("question_literature_revision_invalid")
+        if (
+            record.get("evidence_basis")
+            not in {"title_lead", "citation_context", "abstract", "verified_fulltext"}
+            or any(
+                not isinstance(record.get(name), str) or not record[name]
+                for name in expected
+                if name != "evidence_basis"
+            )
+            or record["ref"] in seen
+        ):
+            raise OwnerConflict("question_literature_revision_invalid")
+        seen.add(record["ref"])
+    if (
+        canonical_json(records) != row.records_json
+        or canonical_hash(records) != row.records_hash
+    ):
+        raise OwnerConflict("question_literature_revision_invalid")
+    return records
+
+
+def _question_literature_revision_bindings(row) -> dict[str, object]:
+    return {
+        name: _stored_value(row, name)
+        for name in (
+            "question_ref",
+            "quest_ref",
+            "question_content_ref",
+            "question_content_hash",
+            "question_receipt_ref",
+            "question_receipt_hash",
+            "revision_number",
+            "source_snapshot_ref",
+            "source_snapshot_hash",
+            "source_snapshot_receipt_ref",
+            "source_snapshot_receipt_hash",
+            "records_hash",
+            "request_hash",
+        )
+    }
+
+
+def _question_literature_revision_receipt_hash(row) -> str:
+    return _receipt_hash(
+        QUESTION_LITERATURE_REVISION_RECEIPT_KIND,
+        _stored_value(row, "revision_ref"),
+        _question_literature_revision_bindings(row),
+    )
+
+
+def _question_literature_revision_binding(row) -> dict[str, object]:
+    records = _verified_question_literature_records(row)
+    return {
+        "kind": "QuestionLiteratureRevision",
+        "revision_ref": row.revision_ref,
+        "question_ref": row.question_ref,
+        "literature_snapshot_ref": row.source_snapshot_ref,
+        "records": records,
+        "rm_acceptance_receipt_ref": row.receipt_ref,
+        "rg_question_association_receipt_ref": row.question_receipt_ref,
+        "receipt": AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=QUESTION_LITERATURE_REVISION_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.revision_ref,
+            payload_hash=row.receipt_hash,
+        ).as_public_dict(),
+    }
+
+
+def _verify_literature_snapshot_authority_row(
+    row,
+    *,
+    execution_verifier: AttemptExecutionReceiptVerifier | None,
+) -> None:
+    stored_context_kind = row.creation_context_kind
+    if stored_context_kind in (None, "quest_initialization"):
+        creation_context_kind = "quest_initialization"
+        creation_context_ref = None
+        context_generation = None
+        context_basis_hash = None
+        quest_ref = None
+    elif stored_context_kind == "manual_question_creation":
+        creation_context_kind = "manual_question_creation"
+        creation_context_ref = row.creation_context_ref
+        context_generation = None
+        context_basis_hash = None
+        quest_ref = row.quest_ref
+        if not creation_context_ref or not quest_ref:
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+    elif stored_context_kind == "autonomous_question_creation":
+        creation_context_kind = "autonomous_question_creation"
+        creation_context_ref = row.creation_context_ref
+        context_generation = row.context_generation
+        context_basis_hash = row.context_basis_hash
+        quest_ref = row.quest_ref
+        if (
+            not creation_context_ref
+            or not quest_ref
+            or type(context_generation) is not int
+            or int(context_generation) < 1
+            or not isinstance(context_basis_hash, str)
+            or len(context_basis_hash) != 64
+        ):
+            raise OwnerConflict("question_literature_source_snapshot_invalid")
+    else:
+        raise OwnerConflict("question_literature_source_snapshot_invalid")
+    execution_receipt = AcceptanceReceipt(
+        issuer="agent_runtime",
+        kind=DEEPFETCH_EXECUTION_RECEIPT_KIND,
+        receipt_ref=row.execution_receipt_ref,
+        subject_ref=row.run_ref,
+        payload_hash=row.execution_receipt_hash,
+    )
+    if row.receipt_hash != _literature_snapshot_receipt_hash(
+        snapshot_ref=row.snapshot_ref,
+        snapshot_hash=row.snapshot_hash,
+        request_ref=row.request_ref,
+        result_hash=row.result_hash,
+        execution_receipt=execution_receipt,
+        creation_context_kind=creation_context_kind,
+        creation_context_ref=creation_context_ref,
+        context_generation=context_generation,
+        context_basis_hash=context_basis_hash,
+        quest_ref=quest_ref,
+    ):
+        raise OwnerConflict("question_literature_source_snapshot_invalid")
+    if execution_verifier is not None:
+        execution_verifier.verify_deepfetch_execution_receipt(
+            request_ref=row.request_ref,
+            run_ref=row.run_ref,
+            attempt_ref=row.attempt_ref,
+            fence_ref=row.fence_ref,
+            result_hash=row.result_hash,
+            receipt=execution_receipt,
+        )
 
 
 def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
@@ -8058,6 +11051,50 @@ def _plan_row(database: Database, content_ref: str):
     return row
 
 
+def _reasoning_row(database: Database, content_ref: str):
+    with database.read() as connection:
+        row = connection.execute(
+            text(
+                "SELECT * FROM rm_reasoning_contents WHERE content_ref = "
+                ":content_ref"
+            ),
+            {"content_ref": content_ref},
+        ).first()
+    if row is None:
+        raise OwnerConflict("asset_receipt_invalid")
+    return row
+
+
+def _reasoning_scientific_candidate_row(
+    database: Database, content_ref: str
+):
+    with database.read() as connection:
+        row = connection.execute(
+            text(
+                "SELECT * FROM rm_reasoning_scientific_candidates WHERE "
+                "content_ref = :content_ref"
+            ),
+            {"content_ref": content_ref},
+        ).first()
+    if row is None:
+        raise OwnerConflict("asset_receipt_invalid")
+    return row
+
+
+def _autonomous_question_content_row(database: Database, content_ref: str):
+    with database.read() as connection:
+        row = connection.execute(
+            text(
+                "SELECT * FROM rm_autonomous_question_contents WHERE "
+                "content_ref = :content_ref"
+            ),
+            {"content_ref": content_ref},
+        ).first()
+    if row is None:
+        raise OwnerConflict("asset_receipt_invalid")
+    return row
+
+
 def _plan_evidence_provenance(
     row,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
@@ -8354,6 +11391,509 @@ def _verify_plan_payload(
     except PlanContractError as error:
         raise OwnerConflict(str(error)) from error
     return plan_document, reviewed_draft, review
+
+
+def _frozen_reasoning_evidence_closure(
+    context_pack: dict[str, object],
+    *,
+    revision_verifier,
+) -> list[dict[str, object]]:
+    literature_input = context_pack.get("question_literature_input")
+    if not isinstance(literature_input, dict) or literature_input.get(
+        "kind"
+    ) not in {"none", "revision"}:
+        raise OwnerConflict("reasoning_literature_binding_invalid")
+    evidence: list[dict[str, object]] = []
+    if literature_input.get("kind") == "none":
+        if set(literature_input) != {"kind"}:
+            raise OwnerConflict("reasoning_literature_binding_invalid")
+    else:
+        if set(literature_input) != {"kind", "revision_ref", "binding"}:
+            raise OwnerConflict("reasoning_literature_binding_invalid")
+        revision = literature_input.get("binding")
+        if (
+            not isinstance(revision, dict)
+            or revision.get("revision_ref")
+            != literature_input.get("revision_ref")
+        ):
+            raise OwnerConflict("question_literature_revision_invalid")
+        revision_verifier(revision)
+        records = revision.get("records")
+        if not isinstance(records, list):
+            raise OwnerConflict("reasoning_literature_binding_invalid")
+        for record in records:
+            if not isinstance(record, dict):
+                raise OwnerConflict("reasoning_literature_binding_invalid")
+            evidence.append(
+                {
+                    "kind": "LiteratureRecord",
+                    "ref": record.get("ref"),
+                    "evidence_basis": record.get("evidence_basis"),
+                    "evidence_basis_ref": record.get("evidence_basis_ref"),
+                }
+            )
+    try:
+        evidence.extend(plan_evidence_reuse_metric_leaves(context_pack))
+    except ReasoningContractError as error:
+        raise OwnerConflict(str(error)) from error
+    target_closures = context_pack.get("accepted_target_commit_closures")
+    if not isinstance(target_closures, list):
+        raise OwnerConflict("reasoning_target_closure_invalid")
+    for closure in target_closures:
+        if not isinstance(closure, dict):
+            raise OwnerConflict("reasoning_target_closure_invalid")
+        metric_ref = closure.get("metric_result_ref")
+        attempt_ref = closure.get("evaluation_attempt_ref")
+        target_receipt = closure.get("rg_target_commit_receipt")
+        measurement_receipt = closure.get("rg_formal_measurement_receipt")
+        if not all(
+            isinstance(value, str) and value
+            for value in (metric_ref, attempt_ref)
+        ) or not isinstance(target_receipt, dict) or not isinstance(
+            measurement_receipt, dict
+        ):
+            raise OwnerConflict("reasoning_target_closure_invalid")
+        target_receipt_ref = target_receipt.get("receipt_ref")
+        measurement_receipt_ref = measurement_receipt.get("receipt_ref")
+        if not all(
+            isinstance(value, str) and value
+            for value in (target_receipt_ref, measurement_receipt_ref)
+        ):
+            raise OwnerConflict("reasoning_target_closure_invalid")
+        evidence.append(
+            {
+                "kind": "MetricResult",
+                "ref": metric_ref,
+                "source_evaluation_attempt_ref": attempt_ref,
+                "research_graph_acceptance_receipt_ref": target_receipt_ref,
+                "formal_measurement_acceptance_receipt_ref": (
+                    measurement_receipt_ref
+                ),
+            }
+        )
+    refs = [item.get("ref") for item in evidence]
+    if any(not isinstance(value, str) or not value for value in refs) or len(
+        refs
+    ) != len(set(refs)):
+        raise OwnerConflict("reasoning_evidence_closure_invalid")
+    return evidence
+
+
+def _verify_reasoning_plan_evidence_reuse_authority(
+    context_pack: dict[str, object],
+    resolver,
+) -> None:
+    """Compare the frozen leaf documents with the public issuer rebuild."""
+
+    try:
+        plan_evidence_reuse_metric_leaves(context_pack)
+    except ReasoningContractError as error:
+        raise OwnerConflict(str(error)) from error
+    plan_input = context_pack.get("plan_evidence_input")
+    if not isinstance(plan_input, dict) or plan_input.get("kind") == "none":
+        return
+    reuse_set = plan_input.get("evidence_reuse_set")
+    frozen_leaves = plan_input.get("evidence_reuse_closure")
+    if not isinstance(reuse_set, list) or not isinstance(frozen_leaves, list):
+        raise OwnerConflict("reasoning_plan_evidence_closure_invalid")
+    if not reuse_set:
+        if frozen_leaves:
+            raise OwnerConflict("reasoning_plan_evidence_closure_invalid")
+        return
+    if not callable(resolver):
+        raise OwnerConflict("plan_evidence_reuse_verifier_unavailable")
+    accepted_question = context_pack.get("accepted_question_binding")
+    formal_value = plan_input.get("formal_plan_binding")
+    if not isinstance(accepted_question, dict) or not isinstance(
+        formal_value, dict
+    ):
+        raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
+    plan_document = formal_value.get("plan_document")
+    if not isinstance(plan_document, dict):
+        raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
+    try:
+        formal = AcceptedFormalPlanBinding(
+            formal_plan_ref=str(formal_value["formal_plan_ref"]),
+            content_ref=str(formal_value["content_ref"]),
+            plan_document_hash=str(formal_value["plan_document_hash"]),
+            answer_contract_hash=str(formal_value["answer_contract_hash"]),
+            content_receipt=_acceptance_receipt_from_public(
+                formal_value["content_receipt"]
+            ),
+            formal_plan_receipt=_acceptance_receipt_from_public(
+                formal_value["formal_plan_receipt"]
+            ),
+            stage_commit_ref=str(formal_value["stage_commit_ref"]),
+            stage_commit_receipt=_acceptance_receipt_from_public(
+                formal_value["stage_commit_receipt"]
+            ),
+            plan_document=plan_document,
+        )
+        quest_ref = str(accepted_question["quest_ref"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise OwnerConflict("reasoning_plan_evidence_binding_invalid") from error
+    rebuilt = resolver(
+        quest_ref=quest_ref,
+        accepted_formal_plan=formal,
+    )
+    if (
+        not isinstance(rebuilt, tuple)
+        or not all(type(leaf) is EvidenceReuseLeaf for leaf in rebuilt)
+        or [leaf.as_public_dict() for leaf in rebuilt] != frozen_leaves
+    ):
+        raise OwnerConflict("reasoning_plan_evidence_closure_invalid")
+
+
+def _validate_reasoning_review(
+    review: dict[str, object],
+    *,
+    reviewed_draft_hash: str,
+    final_output_hash: str,
+) -> str:
+    if not isinstance(review, dict) or set(review) != {
+        "schema_ref",
+        "review_mode",
+        "reviewer_agent_ref",
+        "reviewed_draft_hash",
+        "findings",
+        "dispositions",
+        "final_output_hash",
+        "independent",
+        "advisory_only",
+    } or (
+        review.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
+        or review.get("review_mode") != "harness_child_agent"
+        or not isinstance(review.get("reviewer_agent_ref"), str)
+        or not str(review["reviewer_agent_ref"]).strip()
+        or review.get("reviewed_draft_hash") != reviewed_draft_hash
+        or review.get("final_output_hash") != final_output_hash
+        or review.get("independent") is not True
+        or review.get("advisory_only") is not True
+    ):
+        raise ReasoningContractError("reasoning_review_invalid")
+    findings = review.get("findings")
+    dispositions = review.get("dispositions")
+    if not isinstance(findings, list) or not isinstance(dispositions, list):
+        raise ReasoningContractError("reasoning_review_invalid")
+    categories = {
+        "source_binding",
+        "evidence_boundary",
+        "disposition_boundary",
+        "transition_boundary",
+        "owner_boundary",
+        "research_synthesis",
+    }
+    finding_ids: list[str] = []
+    for finding in findings:
+        if not isinstance(finding, dict) or set(finding) != {
+            "finding_id",
+            "category",
+            "message",
+        } or (
+            not isinstance(finding.get("finding_id"), str)
+            or not finding["finding_id"]
+            or finding.get("category") not in categories
+            or not isinstance(finding.get("message"), str)
+            or not finding["message"]
+        ):
+            raise ReasoningContractError("reasoning_review_finding_invalid")
+        finding_ids.append(finding["finding_id"])
+    if len(finding_ids) != len(set(finding_ids)):
+        raise ReasoningContractError("reasoning_review_finding_invalid")
+    disposition_ids: list[str] = []
+    revised = False
+    for disposition in dispositions:
+        if not isinstance(disposition, dict) or set(disposition) != {
+            "finding_id",
+            "action",
+            "rationale",
+        } or (
+            not isinstance(disposition.get("finding_id"), str)
+            or disposition.get("action") not in {"revised", "not_adopted"}
+            or not isinstance(disposition.get("rationale"), str)
+            or not disposition["rationale"]
+        ):
+            raise ReasoningContractError(
+                "reasoning_review_disposition_invalid"
+            )
+        disposition_ids.append(disposition["finding_id"])
+        revised = revised or disposition["action"] == "revised"
+    if disposition_ids != finding_ids or (
+        reviewed_draft_hash != final_output_hash
+    ) != revised:
+        raise ReasoningContractError("reasoning_review_disposition_invalid")
+    return canonical_hash(review)
+
+
+def _verify_reasoning_scientific_candidate_object(object_store: Path, row) -> None:
+    root = object_store.resolve()
+    candidate = (root / row.object_path).resolve()
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        raise OwnerConflict("reasoning_scientific_candidate_custody_unavailable")
+    try:
+        payload = candidate.read_bytes()
+    except OSError as error:
+        raise OwnerConflict(
+            "reasoning_scientific_candidate_custody_unavailable"
+        ) from error
+    if (
+        hashlib.sha256(payload).hexdigest() != row.checkpoint_hash
+        or payload != row.checkpoint_json.encode("utf-8")
+    ):
+        raise OwnerConflict("reasoning_scientific_candidate_custody_unavailable")
+
+
+def _verify_reasoning_scientific_candidate_payload(
+    row,
+    *,
+    revision_verifier,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    list[dict[str, object]],
+    dict[str, object],
+]:
+    try:
+        context_pack = decoded_object(row.context_pack_json)
+        checkpoint = decoded_object(row.checkpoint_json)
+        scientific_outcome = decoded_object(row.scientific_outcome_json)
+        autonomous_scope = decoded_object(row.autonomous_scope_json)
+        evidence_closure = json.loads(row.evidence_closure_json)
+        review = decoded_object(row.review_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("reasoning_scientific_candidate_invalid") from error
+    if not isinstance(evidence_closure, list):
+        raise OwnerConflict("reasoning_scientific_candidate_invalid")
+    if (
+        checkpoint
+        != {
+            "schema_ref": REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA,
+            "scientific_outcome": scientific_outcome,
+            "autonomous_scope": autonomous_scope,
+        }
+        or canonical_json(context_pack) != row.context_pack_json
+        or canonical_json(checkpoint) != row.checkpoint_json
+        or canonical_json(scientific_outcome) != row.scientific_outcome_json
+        or canonical_json(autonomous_scope) != row.autonomous_scope_json
+        or canonical_json(evidence_closure) != row.evidence_closure_json
+        or canonical_json(review) != row.review_json
+        or canonical_hash(context_pack) != row.context_pack_hash
+        or canonical_hash(checkpoint) != row.checkpoint_hash
+        or canonical_hash(scientific_outcome) != row.outcome_hash
+        or canonical_hash(autonomous_scope) != row.autonomous_scope_hash
+        or canonical_hash(evidence_closure) != row.evidence_closure_hash
+        or canonical_hash(review) != row.review_hash
+        or scientific_outcome.get("outcome_ref") != row.scientific_outcome_ref
+        or scientific_outcome.get("disposition") != row.scientific_disposition
+        or scientific_outcome.get("stage_run_request_ref") != row.request_ref
+        or scientific_outcome.get("cycle_ref") != row.cycle_ref
+        or scientific_outcome.get("foreground_epoch")
+        != int(row.foreground_epoch)
+        or row.checkpoint_receipt_kind
+        != REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND
+    ):
+        raise OwnerConflict("reasoning_scientific_candidate_invalid")
+    rebuilt_closure = _frozen_reasoning_evidence_closure(
+        context_pack,
+        revision_verifier=revision_verifier,
+    )
+    if rebuilt_closure != evidence_closure:
+        raise OwnerConflict("reasoning_evidence_closure_invalid")
+    try:
+        checkpoint_hash, outcome_hash, scope_hash = (
+            validate_reasoning_autonomous_checkpoint(
+                checkpoint,
+                frozen_evidence_closure=evidence_closure,
+                frozen_research_context=cast(
+                    dict[str, object], context_pack["research_context"]
+                ),
+            )
+        )
+        if validate_autonomous_question_scope(
+            autonomous_scope,
+            source_outcome=scientific_outcome,
+        ) != scope_hash:
+            raise ReasoningContractError("autonomous_question_scope_invalid")
+        review_hash = _validate_reasoning_review(
+            review,
+            reviewed_draft_hash=row.reviewed_draft_hash,
+            final_output_hash=checkpoint_hash,
+        )
+    except ReasoningContractError as error:
+        raise OwnerConflict(str(error)) from error
+    if (
+        checkpoint_hash != row.checkpoint_hash
+        or outcome_hash != row.outcome_hash
+        or scope_hash != row.autonomous_scope_hash
+        or review.get("reviewed_draft_hash") != row.reviewed_draft_hash
+        or review_hash != row.review_hash
+    ):
+        raise OwnerConflict("reasoning_scientific_candidate_invalid")
+    return (
+        checkpoint,
+        scientific_outcome,
+        autonomous_scope,
+        evidence_closure,
+        review,
+    )
+
+
+def _verify_reasoning_object(object_store: Path, row) -> None:
+    root = object_store.resolve()
+    candidate = (root / row.object_path).resolve()
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        raise OwnerConflict("reasoning_content_custody_unavailable")
+    try:
+        payload = candidate.read_bytes()
+    except OSError as error:
+        raise OwnerConflict("reasoning_content_custody_unavailable") from error
+    if (
+        hashlib.sha256(payload).hexdigest() != row.payload_hash
+        or payload != row.payload_json.encode("utf-8")
+    ):
+        raise OwnerConflict("reasoning_content_custody_unavailable")
+
+
+def _verify_reasoning_payload(
+    row,
+    *,
+    revision_verifier,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    list[dict[str, object]],
+    dict[str, object],
+    dict[str, object],
+]:
+    try:
+        payload = decoded_object(row.payload_json)
+        context_pack = decoded_object(row.context_pack_json)
+        outcome = decoded_object(row.outcome_json)
+        scientific_outcome = decoded_object(row.scientific_outcome_json)
+        transition = decoded_object(row.transition_json)
+        reviewed_draft = decoded_object(row.reviewed_draft_json)
+        review = decoded_object(row.review_json)
+        evidence_closure = json.loads(row.evidence_closure_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("reasoning_content_invalid") from error
+    if not isinstance(evidence_closure, list):
+        raise OwnerConflict("reasoning_content_invalid")
+    expected_transition = (
+        outcome.get("next_cycle_proposal")
+        if row.transition_kind == "next_cycle_proposal"
+        else outcome.get("candidate_completion")
+    )
+    if (
+        payload
+        != {
+            "schema_ref": REASONING_ATTEMPT_EXECUTION_SCHEMA,
+            "outcome": outcome,
+            "reviewed_draft": reviewed_draft,
+            "review": review,
+        }
+        or canonical_json(payload) != row.payload_json
+        or canonical_json(context_pack) != row.context_pack_json
+        or canonical_json(outcome) != row.outcome_json
+        or canonical_json(scientific_outcome) != row.scientific_outcome_json
+        or canonical_json(transition) != row.transition_json
+        or canonical_json(evidence_closure) != row.evidence_closure_json
+        or canonical_json(reviewed_draft) != row.reviewed_draft_json
+        or canonical_json(review) != row.review_json
+        or canonical_hash(payload) != row.payload_hash
+        or canonical_hash(context_pack) != row.context_pack_hash
+        or canonical_hash(scientific_outcome) != row.outcome_hash
+        or canonical_hash(transition) != row.transition_hash
+        or canonical_hash(evidence_closure) != row.evidence_closure_hash
+        or canonical_hash(reviewed_draft) != row.reviewed_draft_hash
+        or canonical_hash(review) != row.review_hash
+        or outcome.get("scientific_outcome") != scientific_outcome
+        or expected_transition != transition
+        or scientific_outcome.get("outcome_ref")
+        != row.scientific_outcome_ref
+        or scientific_outcome.get("disposition")
+        != row.scientific_disposition
+        or scientific_outcome.get("stage_run_request_ref") != row.request_ref
+        or scientific_outcome.get("cycle_ref") != row.cycle_ref
+        or scientific_outcome.get("foreground_epoch")
+        != int(row.foreground_epoch)
+        or row.transition_ref
+        != f"reasoning_transition_{row.transition_hash[:32]}"
+        or row.execution_receipt_kind
+        != REASONING_ATTEMPT_EXECUTION_RECEIPT_KIND
+    ):
+        raise OwnerConflict("reasoning_content_invalid")
+    rebuilt_closure = _frozen_reasoning_evidence_closure(
+        context_pack,
+        revision_verifier=revision_verifier,
+    )
+    if rebuilt_closure != evidence_closure:
+        raise OwnerConflict("reasoning_evidence_closure_invalid")
+    try:
+        expected_completion_basis = (
+            completion_milestone_basis_refs(context_pack)
+            if outcome.get("candidate_completion") is not None
+            or reviewed_draft.get("candidate_completion") is not None
+            else None
+        )
+        _final_hash, outcome_hash, transition_hash = (
+            validate_reasoning_stage_output(
+                outcome,
+                frozen_evidence_closure=evidence_closure,
+                frozen_research_context=cast(
+                    dict[str, object], context_pack["research_context"]
+                ),
+                expected_completion_milestone_basis_refs=(
+                    expected_completion_basis
+                ),
+            )
+        )
+        if row.scientific_candidate_content_ref is not None:
+            draft_hash, _draft_outcome_hash, _draft_scope_hash = (
+                validate_reasoning_autonomous_checkpoint(
+                    reviewed_draft,
+                    frozen_evidence_closure=evidence_closure,
+                    frozen_research_context=cast(
+                        dict[str, object], context_pack["research_context"]
+                    ),
+                )
+            )
+        else:
+            draft_hash, _draft_outcome_hash, _draft_transition_hash = (
+                validate_reasoning_stage_output(
+                    reviewed_draft,
+                    frozen_evidence_closure=evidence_closure,
+                    frozen_research_context=cast(
+                        dict[str, object], context_pack["research_context"]
+                    ),
+                    expected_completion_milestone_basis_refs=(
+                        expected_completion_basis
+                    ),
+                )
+            )
+        review_hash = _validate_reasoning_review(
+            review,
+            reviewed_draft_hash=draft_hash,
+            final_output_hash=canonical_hash(outcome),
+        )
+    except ReasoningContractError as error:
+        raise OwnerConflict(str(error)) from error
+    if (
+        outcome_hash != row.outcome_hash
+        or transition_hash != row.transition_hash
+        or draft_hash != row.reviewed_draft_hash
+        or review_hash != row.review_hash
+    ):
+        raise OwnerConflict("reasoning_content_invalid")
+    return (
+        outcome,
+        scientific_outcome,
+        transition,
+        evidence_closure,
+        reviewed_draft,
+        review,
+    )
 
 
 def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> str:
@@ -8725,6 +12265,181 @@ def _plan_content_receipt_hash(row) -> str:
     )
 
 
+def _reasoning_scientific_candidate_bindings(row) -> dict[str, object]:
+    return {
+        name: _stored_value(row, name)
+        for name in (
+            "request_ref",
+            "cycle_ref",
+            "foreground_epoch",
+            "context_pack_ref",
+            "context_pack_hash",
+            "stage_request_receipt_ref",
+            "stage_request_receipt_hash",
+            "run_ref",
+            "attempt_ref",
+            "fence_ref",
+            "submission_ref",
+            "checkpoint_ref",
+            "checkpoint_hash",
+            "scientific_outcome_ref",
+            "outcome_hash",
+            "scientific_disposition",
+            "autonomous_scope_hash",
+            "evidence_closure_hash",
+            "reviewed_draft_hash",
+            "review_hash",
+            "checkpoint_receipt_kind",
+            "checkpoint_receipt_ref",
+            "checkpoint_receipt_hash",
+        )
+    }
+
+
+def _reasoning_scientific_candidate_receipt_hash(row) -> str:
+    return _receipt_hash(
+        REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+        _stored_value(row, "content_ref"),
+        _reasoning_scientific_candidate_bindings(row),
+    )
+
+
+def _autonomous_question_source_basis_hash(
+    candidate: AcceptedReasoningScientificCandidate,
+) -> str:
+    return canonical_hash(
+        {
+            "reasoning_checkpoint_ref": candidate.checkpoint_ref,
+            "reasoning_checkpoint_hash": candidate.checkpoint_hash,
+            "source_scientific_outcome_ref": (
+                candidate.scientific_outcome_ref
+            ),
+            "autonomous_scope_hash": candidate.autonomous_scope_hash,
+        }
+    )
+
+
+def _autonomous_question_content_bindings(row) -> dict[str, object]:
+    return {
+        name: _stored_value(row, name)
+        for name in (
+            "context_ref",
+            "reasoning_checkpoint_ref",
+            "reasoning_checkpoint_hash",
+            "source_scientific_outcome_ref",
+            "source_candidate_content_ref",
+            "source_candidate_receipt_ref",
+            "source_candidate_receipt_hash",
+            "source_scientific_receipt_ref",
+            "source_scientific_receipt_hash",
+            "source_stage_request_ref",
+            "source_cycle_ref",
+            "source_foreground_epoch",
+            "source_quest_ref",
+            "source_question_ref",
+            "autonomous_scope_hash",
+            "literature_snapshot_ref",
+            "literature_snapshot_hash",
+            "literature_snapshot_receipt_ref",
+            "literature_snapshot_receipt_hash",
+            "proposal_hash",
+            "question_hash",
+            "schema_ref",
+            "request_hash",
+        )
+    }
+
+
+def _autonomous_question_content_receipt_hash(row) -> str:
+    return _receipt_hash(
+        AUTONOMOUS_QUESTION_CONTENT_RECEIPT_KIND,
+        _stored_value(row, "content_ref"),
+        _autonomous_question_content_bindings(row),
+    )
+
+
+def _autonomous_question_content_request_hash(row) -> str:
+    return canonical_hash(
+        {
+            "reasoning_checkpoint_ref": row.reasoning_checkpoint_ref,
+            "reasoning_checkpoint_hash": row.reasoning_checkpoint_hash,
+            "source_scientific_outcome_ref": (
+                row.source_scientific_outcome_ref
+            ),
+            "source_candidate_content_receipt": AcceptanceReceipt(
+                issuer=RM_OWNER,
+                kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+                receipt_ref=row.source_candidate_receipt_ref,
+                subject_ref=row.source_candidate_content_ref,
+                payload_hash=row.source_candidate_receipt_hash,
+            ).as_public_dict(),
+            "source_scientific_domain_receipt": AcceptanceReceipt(
+                issuer="research_graph",
+                kind="reasoning_scientific_candidate_accepted",
+                receipt_ref=row.source_scientific_receipt_ref,
+                subject_ref=row.source_scientific_outcome_ref,
+                payload_hash=row.source_scientific_receipt_hash,
+            ).as_public_dict(),
+            "literature_snapshot_ref": row.literature_snapshot_ref,
+            "literature_snapshot_hash": row.literature_snapshot_hash,
+            "literature_snapshot_receipt": AcceptanceReceipt(
+                issuer=RM_OWNER,
+                kind=LITERATURE_SNAPSHOT_RECEIPT_KIND,
+                receipt_ref=row.literature_snapshot_receipt_ref,
+                subject_ref=row.literature_snapshot_ref,
+                payload_hash=row.literature_snapshot_receipt_hash,
+            ).as_public_dict(),
+            "proposal_hash": row.proposal_hash,
+            "question_hash": row.question_hash,
+        }
+    )
+
+
+def _reasoning_content_bindings(row) -> dict[str, object]:
+    return {
+        name: _stored_value(row, name)
+        for name in (
+            "request_ref",
+            "cycle_ref",
+            "foreground_epoch",
+            "context_pack_ref",
+            "context_pack_hash",
+            "stage_request_receipt_ref",
+            "stage_request_receipt_hash",
+            "run_ref",
+            "attempt_ref",
+            "fence_ref",
+            "submission_ref",
+            "payload_hash",
+            "scientific_outcome_ref",
+            "outcome_hash",
+            "scientific_disposition",
+            "transition_kind",
+            "transition_ref",
+            "transition_hash",
+            "evidence_closure_hash",
+            "reviewed_draft_hash",
+            "review_hash",
+            "scientific_candidate_content_ref",
+            "scientific_candidate_content_receipt_ref",
+            "scientific_candidate_content_receipt_hash",
+            "scientific_candidate_domain_receipt_ref",
+            "scientific_candidate_domain_receipt_hash",
+            "execution_receipt_kind",
+            "execution_receipt_ref",
+            "execution_receipt_hash",
+        )
+    }
+
+
+def _reasoning_content_receipt_hash(row) -> str:
+    return _receipt_hash(
+        REASONING_CONTENT_RECEIPT_KIND,
+        _stored_value(row, "content_ref"),
+        _reasoning_content_bindings(row),
+    )
+
+
 def _accepted_content(row) -> AcceptedQuestionContent:
     return AcceptedQuestionContent(
         initialization_id=row.initialization_id,
@@ -8881,6 +12596,259 @@ def _accepted_plan_document(row) -> AcceptedPlanDocument:
     )
 
 
+def _accepted_reasoning_scientific_candidate(
+    row,
+) -> AcceptedReasoningScientificCandidate:
+    (
+        checkpoint,
+        scientific_outcome,
+        autonomous_scope,
+        evidence_closure,
+        review,
+    ) = _verify_reasoning_scientific_candidate_payload(
+        row,
+        revision_verifier=lambda _binding: None,
+    )
+    _verify_reasoning_scientific_candidate_object_path_shape(row)
+    return AcceptedReasoningScientificCandidate(
+        request_ref=row.request_ref,
+        cycle_ref=row.cycle_ref,
+        foreground_epoch=int(row.foreground_epoch),
+        context_pack_ref=row.context_pack_ref,
+        context_pack_hash=row.context_pack_hash,
+        context_pack=decoded_object(row.context_pack_json),
+        stage_request_receipt=AcceptanceReceipt(
+            issuer="advancement_engine",
+            kind="stage_run_request",
+            receipt_ref=row.stage_request_receipt_ref,
+            subject_ref=row.request_ref,
+            payload_hash=row.stage_request_receipt_hash,
+        ),
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        submission_ref=row.submission_ref,
+        checkpoint_ref=row.checkpoint_ref,
+        checkpoint_hash=row.checkpoint_hash,
+        content_ref=row.content_ref,
+        scientific_outcome_ref=row.scientific_outcome_ref,
+        outcome_hash=row.outcome_hash,
+        scientific_disposition=row.scientific_disposition,
+        autonomous_scope_hash=row.autonomous_scope_hash,
+        reviewed_draft_hash=row.reviewed_draft_hash,
+        review_hash=row.review_hash,
+        checkpoint=checkpoint,
+        scientific_outcome=scientific_outcome,
+        autonomous_scope=autonomous_scope,
+        frozen_evidence_closure=tuple(evidence_closure),
+        review=review,
+        checkpoint_receipt=AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind=row.checkpoint_receipt_kind,
+            receipt_ref=row.checkpoint_receipt_ref,
+            subject_ref=row.checkpoint_ref,
+            payload_hash=row.checkpoint_receipt_hash,
+        ),
+        receipt=AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.content_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
+def _verify_autonomous_question_content_payload(
+    row,
+    candidate_row,
+) -> tuple[dict[str, object], dict[str, object]]:
+    try:
+        proposal = decoded_object(row.proposal_json)
+        question = decoded_object(row.question_json)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("autonomous_question_content_invalid") from error
+    candidate = (
+        candidate_row
+        if isinstance(candidate_row, AcceptedReasoningScientificCandidate)
+        else _accepted_reasoning_scientific_candidate(candidate_row)
+    )
+    try:
+        expected_proposal = autonomous_question_proposal_from_scope(
+            candidate.autonomous_scope,
+            source_outcome=candidate.scientific_outcome,
+        )
+    except ReasoningContractError as error:
+        raise OwnerConflict(str(error)) from error
+    expected_question = _normalized_question_content(
+        candidate.autonomous_scope.get("question_blueprint", {})
+    )
+    if (
+        canonical_json(proposal) != row.proposal_json
+        or canonical_json(question) != row.question_json
+        or proposal != expected_proposal
+        or proposal.get("question") != question
+        or question != expected_question
+        or row.proposal_hash != canonical_hash(proposal)
+        or row.question_hash != canonical_hash(question)
+        or row.schema_ref != QUESTION_CONTENT_SCHEMA
+        or row.source_stage_request_ref != candidate.request_ref
+        or row.source_cycle_ref != candidate.cycle_ref
+        or int(row.source_foreground_epoch) != candidate.foreground_epoch
+        or row.source_quest_ref != candidate.scientific_outcome.get("quest_ref")
+        or row.source_question_ref
+        != candidate.scientific_outcome.get("question_ref")
+        or row.request_hash != _autonomous_question_content_request_hash(row)
+    ):
+        raise OwnerConflict("autonomous_question_content_invalid")
+    return proposal, question
+
+
+def _accepted_autonomous_question_content(
+    row,
+    candidate: AcceptedReasoningScientificCandidate,
+) -> AcceptedAutonomousQuestionContent:
+    proposal, question = _verify_autonomous_question_content_payload(
+        row, candidate
+    )
+    _verify_autonomous_question_content_object_path_shape(row)
+    return AcceptedAutonomousQuestionContent(
+        context_ref=row.context_ref,
+        reasoning_checkpoint_ref=row.reasoning_checkpoint_ref,
+        reasoning_checkpoint_hash=row.reasoning_checkpoint_hash,
+        source_scientific_outcome_ref=row.source_scientific_outcome_ref,
+        source_stage_request_ref=row.source_stage_request_ref,
+        source_cycle_ref=row.source_cycle_ref,
+        source_foreground_epoch=int(row.source_foreground_epoch),
+        source_quest_ref=row.source_quest_ref,
+        source_question_ref=row.source_question_ref,
+        source_candidate_content_ref=row.source_candidate_content_ref,
+        source_candidate_content_receipt=AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+            receipt_ref=row.source_candidate_receipt_ref,
+            subject_ref=row.source_candidate_content_ref,
+            payload_hash=row.source_candidate_receipt_hash,
+        ),
+        source_scientific_domain_receipt=AcceptanceReceipt(
+            issuer="research_graph",
+            kind="reasoning_scientific_candidate_accepted",
+            receipt_ref=row.source_scientific_receipt_ref,
+            subject_ref=row.source_scientific_outcome_ref,
+            payload_hash=row.source_scientific_receipt_hash,
+        ),
+        autonomous_scope_hash=row.autonomous_scope_hash,
+        autonomous_scope=candidate.autonomous_scope,
+        literature_snapshot_ref=row.literature_snapshot_ref,
+        literature_snapshot_hash=row.literature_snapshot_hash,
+        literature_snapshot_receipt=AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=LITERATURE_SNAPSHOT_RECEIPT_KIND,
+            receipt_ref=row.literature_snapshot_receipt_ref,
+            subject_ref=row.literature_snapshot_ref,
+            payload_hash=row.literature_snapshot_receipt_hash,
+        ),
+        proposal_ref=f"autonomous_question_proposal_{row.proposal_hash[:32]}",
+        proposal_hash=row.proposal_hash,
+        proposal=proposal,
+        content_ref=row.content_ref,
+        content_hash=row.question_hash,
+        schema_ref=row.schema_ref,
+        question=question,
+        receipt=AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=AUTONOMOUS_QUESTION_CONTENT_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.content_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
+def _accepted_reasoning_content(row) -> AcceptedReasoningContent:
+    (
+        outcome,
+        scientific_outcome,
+        transition,
+        evidence_closure,
+        reviewed_draft,
+        review,
+    ) = _verify_reasoning_payload(
+        row,
+        revision_verifier=lambda _binding: None,
+    )
+    _verify_reasoning_object_path_shape(row)
+    return AcceptedReasoningContent(
+        request_ref=row.request_ref,
+        cycle_ref=row.cycle_ref,
+        foreground_epoch=int(row.foreground_epoch),
+        context_pack_ref=row.context_pack_ref,
+        context_pack_hash=row.context_pack_hash,
+        context_pack=decoded_object(row.context_pack_json),
+        stage_request_receipt=AcceptanceReceipt(
+            issuer="advancement_engine",
+            kind="stage_run_request",
+            receipt_ref=row.stage_request_receipt_ref,
+            subject_ref=row.request_ref,
+            payload_hash=row.stage_request_receipt_hash,
+        ),
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        submission_ref=row.submission_ref,
+        content_ref=row.content_ref,
+        payload_hash=row.payload_hash,
+        outcome_hash=row.outcome_hash,
+        transition_kind=row.transition_kind,
+        transition_ref=row.transition_ref,
+        transition_hash=row.transition_hash,
+        reviewed_draft_hash=row.reviewed_draft_hash,
+        review_hash=row.review_hash,
+        outcome=outcome,
+        scientific_outcome=scientific_outcome,
+        transition=transition,
+        frozen_evidence_closure=tuple(evidence_closure),
+        reviewed_draft=reviewed_draft,
+        review=review,
+        execution_receipt=AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind=row.execution_receipt_kind,
+            receipt_ref=row.execution_receipt_ref,
+            subject_ref=row.submission_ref,
+            payload_hash=row.execution_receipt_hash,
+        ),
+        scientific_candidate_content_receipt=(
+            None
+            if row.scientific_candidate_content_ref is None
+            else AcceptanceReceipt(
+                issuer=RM_OWNER,
+                kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+                receipt_ref=row.scientific_candidate_content_receipt_ref,
+                subject_ref=row.scientific_candidate_content_ref,
+                payload_hash=row.scientific_candidate_content_receipt_hash,
+            )
+        ),
+        scientific_candidate_domain_receipt=(
+            None
+            if row.scientific_candidate_content_ref is None
+            else AcceptanceReceipt(
+                issuer="research_graph",
+                kind="reasoning_scientific_candidate_accepted",
+                receipt_ref=row.scientific_candidate_domain_receipt_ref,
+                subject_ref=row.scientific_outcome_ref,
+                payload_hash=row.scientific_candidate_domain_receipt_hash,
+            )
+        ),
+        receipt=AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=REASONING_CONTENT_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.content_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
 def _verify_idea_object_path_shape(row) -> None:
     expected = f"idea-outcome-content/{row.payload_hash[:2]}/{row.payload_hash}.json"
     if row.object_path != expected:
@@ -8891,6 +12859,51 @@ def _verify_plan_object_path_shape(row) -> None:
     expected = f"plan-document-content/{row.payload_hash[:2]}/{row.payload_hash}.json"
     if row.object_path != expected:
         raise OwnerConflict("plan_content_custody_unavailable")
+
+
+def _verify_reasoning_object_path_shape(row) -> None:
+    expected = f"reasoning-content/{row.payload_hash[:2]}/{row.payload_hash}.json"
+    if row.object_path != expected:
+        raise OwnerConflict("reasoning_content_custody_unavailable")
+
+
+def _verify_reasoning_scientific_candidate_object_path_shape(row) -> None:
+    expected = (
+        "reasoning-scientific-candidate/"
+        f"{row.checkpoint_hash[:2]}/{row.checkpoint_hash}.json"
+    )
+    if row.object_path != expected:
+        raise OwnerConflict("reasoning_scientific_candidate_custody_unavailable")
+
+
+def _verify_autonomous_question_content_object_path_shape(row) -> None:
+    expected = (
+        "formal-question-content/"
+        f"{row.question_hash[:2]}/{row.question_hash}.json"
+    )
+    if row.object_path != expected:
+        raise OwnerConflict("autonomous_question_content_custody_unavailable")
+
+
+def _verify_autonomous_question_content_object(
+    object_store: Path, row
+) -> None:
+    _verify_autonomous_question_content_object_path_shape(row)
+    root = object_store.resolve()
+    candidate = (root / row.object_path).resolve()
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        raise OwnerConflict("autonomous_question_content_custody_unavailable")
+    try:
+        payload = candidate.read_bytes()
+    except OSError as error:
+        raise OwnerConflict(
+            "autonomous_question_content_custody_unavailable"
+        ) from error
+    if (
+        hashlib.sha256(payload).hexdigest() != row.question_hash
+        or payload != row.question_json.encode("utf-8")
+    ):
+        raise OwnerConflict("autonomous_question_content_custody_unavailable")
 
 
 def create_research_memory_receipt_verifier(
@@ -8920,6 +12933,9 @@ def create_research_memory_interface(
     human_response_verifier: HumanResponseVerifier | None = None,
     stage_request_verifier: StageRunRequestVerifier | None = None,
 ) -> ResearchMemoryInterface:
+    receipt_verifier.bind_reasoning_scientific_decision_verifier(
+        quest_verifier
+    )
     return SQLiteResearchMemory(
         database,
         object_store,

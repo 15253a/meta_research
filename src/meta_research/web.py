@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
-from typing import AsyncIterator, Callable, Literal, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
 from urllib.parse import parse_qs, quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -61,10 +61,13 @@ DRAFTING_WORKER_WATCHDOG_SECONDS = 190.0
 IDEA_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 PLAN_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
+REASONING_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
+REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS = 30.0
 DEEPFETCH_WORKER_WATCHDOG_SECONDS = 1810.0
 EXPERIMENT_WORKER_WATCHDOG_SECONDS = 30.0
 WRITING_WORKER_WATCHDOG_SECONDS = 910.0
 HARNESS_CONFORMANCE_WORKER_WATCHDOG_SECONDS = 310.0
+BACKGROUND_WORKER_STARTUP_GRACE_SECONDS = 0.1
 # ``BundleStage.transient_error`` predates the durable pause/wait contract and
 # carries both actual failures and normal no-progress states.  Keep this list
 # closed: an unfamiliar code must remain fail-closed as worker-unavailable.
@@ -553,10 +556,26 @@ class WritingRevisionRequest(BaseModel):
     feedback: list[str] = Field(min_length=1, max_length=64)
 
 
+class StartQuestCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_outcome_ref: str = Field(min_length=1, max_length=128)
+    candidate_completion_ref: str = Field(min_length=1, max_length=128)
+
+
+class QuestCompletionDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preview_ref: str = Field(min_length=1, max_length=128)
+    preview_hash: str = Field(min_length=64, max_length=64)
+    decision: Literal["confirmed", "rejected"]
+
+
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
     runtime.bundle_stage.configure_resident_mcp_endpoint(base_url)
+    runtime.reasoning_stage.configure_resident_mcp_endpoint(base_url)
     runtime.target_run_runtime.configure_resident_mcp_endpoint(base_url)
     harness_conformance_task: asyncio.Task[None] | None = None
     reconciliation_task: asyncio.Task[None] | None = None
@@ -565,6 +584,9 @@ def create_app(
     idea_stage_task: asyncio.Task[None] | None = None
     plan_stage_task: asyncio.Task[None] | None = None
     bundle_stage_task: asyncio.Task[None] | None = None
+    reasoning_stage_task: asyncio.Task[None] | None = None
+    autonomous_creation_task: asyncio.Task[None] | None = None
+    quest_completion_task: asyncio.Task[None] | None = None
     target_run_task: asyncio.Task[None] | None = None
     experiment_task: asyncio.Task[None] | None = None
     writing_task: asyncio.Task[None] | None = None
@@ -576,6 +598,9 @@ def create_app(
     idea_stage_health = ReconciliationHealth()
     plan_stage_health = ReconciliationHealth()
     bundle_stage_health = ReconciliationHealth()
+    reasoning_stage_health = ReconciliationHealth()
+    autonomous_creation_health = ReconciliationHealth()
+    quest_completion_health = ReconciliationHealth()
     target_run_health = ReconciliationHealth()
     experiment_health = ReconciliationHealth()
     writing_health = ReconciliationHealth()
@@ -591,101 +616,112 @@ def create_app(
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         nonlocal harness_conformance_task
         nonlocal reconciliation_task, drafting_task, deepfetch_task, idea_stage_task
-        nonlocal plan_stage_task, bundle_stage_task, target_run_task
+        nonlocal plan_stage_task, bundle_stage_task, reasoning_stage_task
+        nonlocal autonomous_creation_task, quest_completion_task
+        nonlocal target_run_task
         nonlocal experiment_task, writing_task
         nonlocal research_asset_task, research_asset_verification_task
-        harness_conformance_task = asyncio.create_task(
-            _process_harness_conformance(runtime, base_url)
+        harness_conformance_task = _start_background_worker(
+            lambda: _process_harness_conformance(runtime, base_url)
         )
-        harness_conformance_task.add_done_callback(_log_reconciliation_exit)
-        reconciliation_task = asyncio.create_task(
-            _reconcile_quest_initializations(
+        reconciliation_task = _start_background_worker(
+            lambda: _reconcile_quest_initializations(
                 runtime,
                 reconciliation_health,
                 worker_health_updates.publish,
             )
         )
-        reconciliation_task.add_done_callback(_log_reconciliation_exit)
-        drafting_task = asyncio.create_task(
-            _process_quest_drafting(
+        drafting_task = _start_background_worker(
+            lambda: _process_quest_drafting(
                 runtime,
                 drafting_health,
                 worker_health_updates.publish,
             )
         )
-        drafting_task.add_done_callback(_log_reconciliation_exit)
-        deepfetch_task = asyncio.create_task(
-            _process_first_question_deepfetch(
+        deepfetch_task = _start_background_worker(
+            lambda: _process_first_question_deepfetch(
                 runtime,
                 deepfetch_health,
                 worker_health_updates.publish,
             )
         )
-        deepfetch_task.add_done_callback(_log_reconciliation_exit)
-        idea_stage_task = asyncio.create_task(
-            _process_idea_stage(
+        idea_stage_task = _start_background_worker(
+            lambda: _process_idea_stage(
                 runtime,
                 idea_stage_health,
                 worker_health_updates.publish,
             )
         )
-        idea_stage_task.add_done_callback(_log_reconciliation_exit)
-        plan_stage_task = asyncio.create_task(
-            _process_plan_stage(
+        plan_stage_task = _start_background_worker(
+            lambda: _process_plan_stage(
                 runtime,
                 plan_stage_health,
                 worker_health_updates.publish,
             )
         )
-        plan_stage_task.add_done_callback(_log_reconciliation_exit)
-        bundle_stage_task = asyncio.create_task(
-            _process_bundle_stage(
+        bundle_stage_task = _start_background_worker(
+            lambda: _process_bundle_stage(
                 runtime,
                 bundle_stage_health,
                 worker_health_updates.publish,
             )
         )
-        bundle_stage_task.add_done_callback(_log_reconciliation_exit)
-        target_run_task = asyncio.create_task(
-            _process_target_runs(
+        reasoning_stage_task = _start_background_worker(
+            lambda: _process_reasoning_stage(
+                runtime,
+                reasoning_stage_health,
+                worker_health_updates.publish,
+            )
+        )
+        autonomous_creation_task = _start_background_worker(
+            lambda: _process_autonomous_creation(
+                runtime,
+                autonomous_creation_health,
+                worker_health_updates.publish,
+            )
+        )
+        quest_completion_task = _start_background_worker(
+            lambda: _process_quest_completion(
+                runtime,
+                quest_completion_health,
+                worker_health_updates.publish,
+            )
+        )
+        target_run_task = _start_background_worker(
+            lambda: _process_target_runs(
                 runtime,
                 target_run_health,
                 worker_health_updates.publish,
             )
         )
-        target_run_task.add_done_callback(_log_reconciliation_exit)
-        experiment_task = asyncio.create_task(
-            _process_experiments(
+        experiment_task = _start_background_worker(
+            lambda: _process_experiments(
                 runtime,
                 experiment_health,
                 worker_health_updates.publish,
             )
         )
-        experiment_task.add_done_callback(_log_reconciliation_exit)
-        writing_task = asyncio.create_task(
-            _process_writing(
+        writing_task = _start_background_worker(
+            lambda: _process_writing(
                 runtime,
                 writing_health,
                 worker_health_updates.publish,
             )
         )
-        writing_task.add_done_callback(_log_reconciliation_exit)
-        research_asset_task = asyncio.create_task(
-            _process_research_assets(
+        research_asset_task = _start_background_worker(
+            lambda: _process_research_assets(
                 runtime,
                 research_asset_health,
                 worker_health_updates.publish,
             )
         )
-        research_asset_task.add_done_callback(_log_reconciliation_exit)
-        research_asset_verification_task = asyncio.create_task(
-            _verify_research_assets(
+        research_asset_verification_task = _start_background_worker(
+            lambda: _verify_research_assets(
                 runtime,
                 research_asset_verification_health,
                 worker_health_updates.publish,
             )
         )
-        research_asset_verification_task.add_done_callback(_log_reconciliation_exit)
         try:
             yield
         finally:
@@ -699,6 +735,9 @@ def create_app(
                     idea_stage_task,
                     plan_stage_task,
                     bundle_stage_task,
+                    reasoning_stage_task,
+                    autonomous_creation_task,
+                    quest_completion_task,
                     target_run_task,
                     experiment_task,
                     writing_task,
@@ -768,6 +807,21 @@ def create_app(
             worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
             worker_check("plan_stage_worker", plan_stage_task, plan_stage_health),
             worker_check("bundle_stage_worker", bundle_stage_task, bundle_stage_health),
+            worker_check(
+                "reasoning_stage_worker",
+                reasoning_stage_task,
+                reasoning_stage_health,
+            ),
+            worker_check(
+                "autonomous_creation_worker",
+                autonomous_creation_task,
+                autonomous_creation_health,
+            ),
+            worker_check(
+                "quest_completion_worker",
+                quest_completion_task,
+                quest_completion_health,
+            ),
             worker_check("target_run_worker", target_run_task, target_run_health),
             worker_check(
                 "experiment_worker",
@@ -794,6 +848,9 @@ def create_app(
                 "idea_stage_worker",
                 "plan_stage_worker",
                 "bundle_stage_worker",
+                "reasoning_stage_worker",
+                "autonomous_creation_worker",
+                "quest_completion_worker",
                 "target_run_worker",
                 "writing_worker",
                 "research_asset_intake_worker",
@@ -1023,6 +1080,21 @@ def create_app(
         bundle_stage = worker_check(
             "bundle_stage_worker", bundle_stage_task, bundle_stage_health
         )
+        reasoning_stage = worker_check(
+            "reasoning_stage_worker",
+            reasoning_stage_task,
+            reasoning_stage_health,
+        )
+        autonomous_creation = worker_check(
+            "autonomous_creation_worker",
+            autonomous_creation_task,
+            autonomous_creation_health,
+        )
+        quest_completion = worker_check(
+            "quest_completion_worker",
+            quest_completion_task,
+            quest_completion_health,
+        )
         target_runs = worker_check(
             "target_run_worker", target_run_task, target_run_health
         )
@@ -1067,6 +1139,18 @@ def create_app(
             "bundle_stage": {
                 "status": bundle_stage["status"],
                 "last_error": bundle_stage_health.last_error,
+            },
+            "reasoning_stage": {
+                "status": reasoning_stage["status"],
+                "last_error": reasoning_stage_health.last_error,
+            },
+            "autonomous_creation": {
+                "status": autonomous_creation["status"],
+                "last_error": autonomous_creation_health.last_error,
+            },
+            "quest_completion": {
+                "status": quest_completion["status"],
+                "last_error": quest_completion_health.last_error,
             },
             "target_runs": {
                 "status": target_runs["status"],
@@ -2253,6 +2337,61 @@ def create_app(
     def query_current_bundle_stage() -> dict[str, object]:
         return runtime.bundle_stage.query_current()
 
+    @app.get("/api/v1/reasoning-stage/current")
+    def query_current_reasoning_stage() -> dict[str, object]:
+        return runtime.reasoning_stage.query_current()
+
+    @app.get("/api/v1/autonomous-creations/current")
+    def query_current_autonomous_creation() -> dict[str, object] | None:
+        return runtime.autonomous_creation.query_current()
+
+    @app.get("/api/v1/quest-completions/current")
+    def query_current_quest_completion() -> dict[str, object] | None:
+        return runtime.quest_completion.query_current()
+
+    @app.post("/api/v1/quest-completions", status_code=201)
+    def start_quest_completion(
+        request: Request,
+        command: StartQuestCompletionRequest,
+    ) -> dict[str, object]:
+        return runtime.quest_completion.start(
+            source_outcome_ref=command.source_outcome_ref,
+            candidate_completion_ref=command.candidate_completion_ref,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/quest-completions/{context_ref}/decision"
+    )
+    def decide_quest_completion(
+        request: Request,
+        context_ref: str,
+        command: QuestCompletionDecisionRequest,
+    ) -> dict[str, object]:
+        current = runtime.quest_completion.query(context_ref)
+        if current is None:
+            raise OwnerConflict("quest_completion_context_unavailable")
+        human = current.get("human_confirmation")
+        preview = human.get("preview") if isinstance(human, dict) else None
+        if (
+            current.get("status") in {"stale", "ended"}
+            or not isinstance(preview, dict)
+            or preview.get("status") != "current"
+            or preview.get("ref") != command.preview_ref
+            or preview.get("hash") != command.preview_hash
+        ):
+            raise OwnerConflict("quest_completion_preview_stale")
+        runtime.owners.human_collaboration.decide_quest_completion(
+            preview_ref=command.preview_ref,
+            preview_hash=command.preview_hash,
+            decision=command.decision,
+            idempotency_key=_idempotency_key(request),
+        )
+        refreshed = runtime.quest_completion.query(context_ref)
+        if refreshed is None:
+            raise OwnerConflict("quest_completion_context_unavailable")
+        return refreshed
+
     @app.get(
         "/api/v1/bundle/targets/{target_ref}/root-observations"
     )
@@ -2983,6 +3122,25 @@ def _daemon_thread_call(call: Callable[[], _T]) -> asyncio.Future[_T]:
     return result
 
 
+async def _run_after_background_worker_startup_grace(
+    worker_factory: Callable[[], Awaitable[None]],
+) -> None:
+    """Let the public server accept work before daemon polling begins."""
+
+    await asyncio.sleep(BACKGROUND_WORKER_STARTUP_GRACE_SECONDS)
+    await worker_factory()
+
+
+def _start_background_worker(
+    worker_factory: Callable[[], Awaitable[None]],
+) -> asyncio.Task[None]:
+    task = asyncio.create_task(
+        _run_after_background_worker_startup_grace(worker_factory)
+    )
+    task.add_done_callback(_log_reconciliation_exit)
+    return task
+
+
 async def _process_harness_conformance(
     runtime: ProductionRuntime, base_url: str
 ) -> None:
@@ -3301,6 +3459,147 @@ async def _process_bundle_stage(
             await asyncio.sleep(0 if advanced else 0.2)
 
 
+async def _process_reasoning_stage(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Advance one verified Reasoning boundary at a time under daemon ownership."""
+
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                runtime.reasoning_stage.process_once,
+                health=health,
+                timeout_code="reasoning_stage_operation_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=REASONING_STAGE_WORKER_WATCHDOG_SECONDS,
+            )
+            transient_error = runtime.reasoning_stage.transient_error
+            if transient_error is not None:
+                raise _ReasoningStageTransientError(transient_error)
+        except Exception as error:
+            if not isinstance(
+                error,
+                (
+                    OSError,
+                    OwnerConflict,
+                    SQLAlchemyError,
+                    _ReasoningStageTransientError,
+                ),
+            ):
+                LOGGER.exception("reasoning stage attempt failed unexpectedly")
+            error_code = (
+                error.code
+                if isinstance(
+                    error,
+                    (OwnerConflict, _ReasoningStageTransientError),
+                )
+                else type(error).__name__
+            )
+            changed = (
+                health.status != "unavailable"
+                or health.last_error != error_code
+            )
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(
+                2.0,
+                0.2 * (2 ** min(health.retry_count - 1, 4)),
+            )
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
+def _advance_autonomous_creation(runtime: ProductionRuntime) -> bool:
+    """Start or advance one automatic post-Reasoning Owner boundary."""
+    return runtime.autonomous_creation.process_once()
+
+
+async def _process_autonomous_creation(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    await _process_reasoning_followup(
+        lambda: _advance_autonomous_creation(runtime),
+        health=health,
+        worker_label="autonomous creation",
+        timeout_code="autonomous_creation_operation_timeout",
+        on_health_change=on_health_change,
+    )
+
+
+async def _process_quest_completion(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    await _process_reasoning_followup(
+        runtime.quest_completion.process_once,
+        health=health,
+        worker_label="quest completion",
+        timeout_code="quest_completion_operation_timeout",
+        on_health_change=on_health_change,
+    )
+
+
+async def _process_reasoning_followup(
+    operation: Callable[[], bool],
+    *,
+    health: ReconciliationHealth,
+    worker_label: str,
+    timeout_code: str,
+    on_health_change: Callable[[], None] | None,
+) -> None:
+    """Drive a recoverable follow-up without crossing two Owner writes/tick."""
+
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                operation,
+                health=health,
+                timeout_code=timeout_code,
+                on_health_change=on_health_change,
+                timeout_seconds=REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS,
+            )
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("%s attempt failed unexpectedly", worker_label)
+            error_code = (
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            )
+            changed = (
+                health.status != "unavailable" or health.last_error != error_code
+            )
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(
+                min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            )
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
 class _IdeaStageTransientError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -3314,6 +3613,12 @@ class _PlanStageTransientError(RuntimeError):
 
 
 class _BundleStageTransientError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _ReasoningStageTransientError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code

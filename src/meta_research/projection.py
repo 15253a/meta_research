@@ -18,11 +18,14 @@ from meta_research.owners.research_memory import (
 )
 
 if TYPE_CHECKING:
+    from meta_research.autonomous_creation import AutonomousCreationService
     from meta_research.bundle_stage import BundleStageWorker
     from meta_research.experiment import ExperimentService
     from meta_research.harness import HarnessRuntime
     from meta_research.idea_stage import IdeaStageWorker
     from meta_research.plan_stage import PlanStageWorker
+    from meta_research.quest_completion import QuestCompletionService
+    from meta_research.reasoning_stage import ReasoningStageWorker
     from meta_research.writing import WritingReportService
 
 
@@ -53,6 +56,9 @@ class PublicProjection:
         plan_stage: PlanStageWorker | None = None,
         experiment: ExperimentService | None = None,
         bundle_stage: BundleStageWorker | None = None,
+        reasoning_stage: ReasoningStageWorker | None = None,
+        autonomous_creation: AutonomousCreationService | None = None,
+        quest_completion: QuestCompletionService | None = None,
         writing: WritingReportService | None = None,
         harnesses: HarnessRuntime | None = None,
     ) -> None:
@@ -66,6 +72,9 @@ class PublicProjection:
         self._idea_stage = idea_stage
         self._plan_stage = plan_stage
         self._bundle_stage = bundle_stage
+        self._reasoning_stage = reasoning_stage
+        self._autonomous_creation = autonomous_creation
+        self._quest_completion = quest_completion
         self._experiment = experiment
         self._writing = writing
         self._harnesses = harnesses
@@ -174,6 +183,21 @@ class PublicProjection:
                 None
                 if self._bundle_stage is None
                 else self._bundle_stage.query_current()
+            )
+            reasoning_stage = (
+                None
+                if self._reasoning_stage is None
+                else self._reasoning_stage.query_current()
+            )
+            autonomous_creation = (
+                None
+                if self._autonomous_creation is None
+                else self._autonomous_creation.query_current()
+            )
+            quest_completion = (
+                None
+                if self._quest_completion is None
+                else self._quest_completion.query_current()
             )
             current_experiment = (
                 None if self._experiment is None else self._experiment.query_current()
@@ -467,6 +491,21 @@ class PublicProjection:
             snapshot["plan_stage"] = plan_stage
         if bundle_stage is not None and _bundle_stage_is_public(bundle_stage):
             snapshot["bundle_stage"] = bundle_stage
+        if reasoning_stage is not None and _reasoning_stage_is_public(
+            reasoning_stage
+        ):
+            snapshot["reasoning_stage"] = reasoning_stage
+        if self._autonomous_creation is not None:
+            snapshot["autonomous_creation"] = {
+                "status": "ready",
+                "creation_mode": "AutonomousCreation",
+                "current": autonomous_creation,
+            }
+        if self._quest_completion is not None:
+            snapshot["quest_completion"] = {
+                "status": "ready",
+                "current": quest_completion,
+            }
         return snapshot
 
 
@@ -519,6 +558,28 @@ def _bundle_stage_is_public(projection: dict[str, object]) -> bool:
         )
         or bool(projection.get("target_commits"))
     )
+
+
+def _reasoning_stage_is_public(projection: dict[str, object]) -> bool:
+    """Publish Reasoning only once the routed closure is actionable."""
+
+    eligibility = projection.get("eligibility")
+    if isinstance(eligibility, dict) and eligibility.get("status") in {
+        "eligible",
+        "requested",
+        "consumed",
+    }:
+        return True
+    if any(
+        projection.get(field) is not None
+        for field in ("stage_run_request", "run", "stage_commit")
+    ):
+        return True
+    acceptance = projection.get("reasoning_acceptance")
+    return isinstance(acceptance, dict) and acceptance.get("status") not in {
+        None,
+        "not_attempted",
+    }
 
 
 def _query_bounded_inventory(query, *, offset: int, limit: int):

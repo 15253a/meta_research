@@ -22,7 +22,11 @@ from meta_research.idea_skill import (
     IdeaSkillRequest,
     IdeaSkillResult,
 )
-from meta_research.owners.agent_runtime import IdeaRuntimeBinding, PlanRuntimeBinding
+from meta_research.owners.agent_runtime import (
+    IdeaRuntimeBinding,
+    PlanRuntimeBinding,
+    ReasoningRuntimeBinding,
+)
 from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.plan_contract import PLAN_DOCUMENT_SCHEMA_REF
@@ -31,6 +35,21 @@ from meta_research.plan_skill import (
     PlanSkillRequest,
     PlanSkillResult,
     PlanSkillUnavailable,
+)
+from meta_research.reasoning_contract import (
+    AUTONOMOUS_QUESTION_SCOPE_SCHEMA_REF,
+    CANDIDATE_COMPLETION_SCHEMA_REF,
+    NEXT_CYCLE_PROPOSAL_SCHEMA_REF,
+    REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF,
+    REASONING_STAGE_OUTPUT_SCHEMA_REF,
+    SCIENTIFIC_OUTCOME_SCHEMA_REF,
+    completion_milestone_basis_refs,
+)
+from meta_research.reasoning_skill import (
+    ReasoningAutonomousCheckpointResult,
+    ReasoningSkillDraft,
+    ReasoningSkillRequest,
+    ReasoningSkillResult,
 )
 from meta_research.quest_drafting import (
     DraftingUnavailable,
@@ -51,6 +70,65 @@ from meta_research.writing_skill import (
 )
 
 
+def _reasoning_research_synthesis(
+    request: ReasoningSkillRequest,
+) -> dict[str, object]:
+    research_context = request.context_pack["research_context"]
+    assert isinstance(research_context, dict)
+    graph = research_context["graph_binding"]
+    assert isinstance(graph, dict)
+    parents = graph["parent_question_bindings"]
+    prior = graph["prior_current_question_outcomes"]
+    assert isinstance(parents, list) and isinstance(prior, list)
+    return {
+        "cycle": {
+            "cycle_ref": request.cycle_ref,
+            "impact": "The current Cycle closes one bounded evidence assessment.",
+        },
+        "current_question": {
+            "question_ref": request.question_ref,
+            "prior_accepted_outcome_refs": [item["outcome_ref"] for item in prior],
+            "progress": "The frozen evidence remains insufficient for a claim.",
+        },
+        "parent_questions": [
+            {
+                "question_ref": item["question_ref"],
+                "impact": "unknown",
+                "statement": "No additional parent-level claim is supported.",
+            }
+            for item in parents
+        ],
+        "quest": {
+            "quest_ref": request.quest_ref,
+            "goal_revision_ref": request.goal_revision_ref,
+            "graph_revision_ref": graph["graph_revision_ref"],
+            "impact": "The Quest records an explicit evidence gap.",
+        },
+    }
+
+
+def _insufficient_outcome_scope(
+    request: ReasoningSkillRequest,
+) -> dict[str, object]:
+    research_context = request.context_pack["research_context"]
+    assert isinstance(research_context, dict)
+    causal_context = research_context["causal_context"]
+    assert isinstance(causal_context, dict)
+    return {
+        "support_scope": ["Only the exact frozen Question and Cycle context."],
+        "limitations": ["No substantive evidence supports a scientific claim."],
+        "causal_interpretation": {
+            **causal_context,
+            "attribution_basis_refs": [],
+            "claim_scope": "No causal claim is made.",
+            "statement": "The frozen closure is insufficient for attribution.",
+            "sufficiency_rationale": "No substantive cited basis is available.",
+            "confounders": ["The required intervention evidence is absent."],
+        },
+        "research_synthesis": _reasoning_research_synthesis(request),
+    }
+
+
 QUESTION = {
     "title": "低照度显微图像中的稀有形态保真",
     "unknown_statement": "尚不明确哪种自监督去噪条件能保留稀有形态。",
@@ -58,6 +136,22 @@ QUESTION = {
     "applicability_scope": "低照度荧光显微公开数据。",
     "background_context": "研究稀有细胞形态。",
     "requirements_constraints": "两周内，使用获准 GPU。",
+}
+
+AUTONOMOUS_QUESTION = {
+    "title": "跨数据域的稀有形态保持边界",
+    "unknown_statement": (
+        "尚不明确低照度去噪的稀有形态保持结论"
+        "能否跨显微数据域成立。"
+    ),
+    "answer_shape": "形成带反例和迁移边界的跨域比较结论。",
+    "applicability_scope": "两个获准的低照度荧光显微公开数据域。",
+    "background_context": (
+        "来源 Reasoning 只形成当前数据域内的有界判断。"
+    ),
+    "requirements_constraints": (
+        "保持原标注口径，并显式报告域偏移限制。"
+    ),
 }
 
 
@@ -155,8 +249,17 @@ class DeterministicDeepFetchProvider:
         )
 
     def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
-        assert request.scope.get("goal") or request.scope.get("quest_goal")
-        assert request.authorization_receipt.issuer == "human_collaboration"
+        autonomous = (
+            request.scope.get("schema_ref")
+            == "meta-research/autonomous-question-deepfetch-scope/v1"
+        )
+        if autonomous:
+            assert request.scope.get("question_blueprint")
+        else:
+            assert request.scope.get("goal") or request.scope.get("quest_goal")
+        assert request.authorization_receipt.issuer == (
+            "advancement_engine" if autonomous else "human_collaboration"
+        )
         time.sleep(1.4)
         return DeepFetchResult(
             completion="limited",
@@ -187,13 +290,20 @@ class DeterministicDeepFetchProvider:
                 },
             ),
             limitations=("第二篇论文没有可合法获取的开放全文。",),
-            native_session_ref="chrome-deepfetch-native-session",
+            native_session_ref=(
+                "chrome-autonomous-deepfetch-native-session"
+                if autonomous
+                else "chrome-deepfetch-native-session"
+            ),
             adapter_kind="chrome_deterministic_deepfetch",
         )
 
 
 class DeterministicIdeaSkill:
     """The real Idea worker consumes this deterministic external-provider seam."""
+
+    def __init__(self, *, no_viable: bool = False) -> None:
+        self._no_viable = no_viable
 
     def runtime_binding(self) -> IdeaRuntimeBinding:
         return IdeaRuntimeBinding(
@@ -212,6 +322,26 @@ class DeterministicIdeaSkill:
 
     def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
         outcome = {
+            "kind": "NoViableCandidate",
+            "question_ref": request.question_ref,
+            "context_pack_ref": request.context_pack_ref,
+            "exploration_scope": "比较当前证据支持的结构保持机制。",
+            "candidate_families_considered": [
+                {
+                    "family": "跨增强结构一致性",
+                    "why_not_viable": "当前证据没有可识别稀有形态的代理信号。",
+                    "evidence_refs": [],
+                }
+            ],
+            "evidence_boundary": {
+                "accepted_evidence_refs": [],
+                "supported": "Accepted Question 只固定了低照度场景。",
+                "inferred": "现有代理目标不足以支持负责的候选。",
+                "unknown": "补充形态标注后能否形成候选仍未知。",
+            },
+            "overturn_conditions": ["接纳包含稀有形态标注的新 Evidence。"],
+            "why_plan_cannot_proceed": "当前没有可冻结为实验承诺的机制。",
+        } if self._no_viable else {
             "kind": "IdeaSet",
             "question_ref": request.question_ref,
             "context_pack_ref": request.context_pack_ref,
@@ -244,7 +374,10 @@ class DeterministicIdeaSkill:
         return IdeaSkillDraft(
             draft=outcome,
             primary_session_ref=request.native_session_ref
-            or "chrome-idea-primary-session",
+            or "chrome-idea-primary-session:"
+            + canonical_hash(
+                {"stage_request_ref": request.stage_request_ref}
+            )[:20],
             adapter_kind="chrome_deterministic_idea",
         )
 
@@ -264,6 +397,285 @@ class DeterministicIdeaSkill:
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
         return self.review_draft(request, self.generate_draft(request))
+
+
+class ControlledDeterministicReasoningSkill:
+    """A controlled provider used through the production Reasoning worker."""
+
+    def __init__(self, control: ProviderPhaseControl) -> None:
+        self._control = control
+
+    def request_stop(self) -> None:
+        self._control.request_stop()
+
+    def runtime_binding(self) -> ReasoningRuntimeBinding:
+        return ReasoningRuntimeBinding(
+            packaged_skill_bundle_hash=canonical_hash(
+                {"skill": "chrome-production-reasoning"}
+            ),
+            instruction_set_hash=canonical_hash(
+                {"instructions": "chrome-production-reasoning"}
+            ),
+            model_ref="chrome-test-model",
+            harness_adapter_ref="chrome-deterministic-reasoning-v1",
+            mcp_bindings=(),
+            capability_bindings=(),
+            resource_bindings=(),
+        )
+
+    def _output(self, request: ReasoningSkillRequest) -> dict[str, object]:
+        outcome_ref = "scientific-outcome:" + canonical_hash(
+            {
+                "stage_request_ref": request.stage_request_ref,
+                "attempt_ref": request.attempt_ref,
+            }
+        )[:24]
+        scientific_outcome: dict[str, object] = {
+            "schema_ref": SCIENTIFIC_OUTCOME_SCHEMA_REF,
+            "kind": "ScientificOutcomeCandidate",
+            "outcome_ref": outcome_ref,
+            "stage_run_request_ref": request.stage_request_ref,
+            "cycle_ref": request.cycle_ref,
+            "question_ref": request.question_ref,
+            "quest_ref": request.quest_ref,
+            "goal_revision_ref": request.goal_revision_ref,
+            "foreground_epoch": request.foreground_epoch,
+            "disposition": "insufficient_evidence",
+            "claim": None,
+            "evidence": [],
+            "missing_evidence": [
+                "缺少可回答稀有形态保真的 substantive evidence。"
+            ],
+            "uncertainty_basis": [],
+            **_insufficient_outcome_scope(request),
+            "is_authoritative": False,
+        }
+        return {
+            "schema_ref": REASONING_STAGE_OUTPUT_SCHEMA_REF,
+            "scientific_outcome": scientific_outcome,
+            "next_cycle_proposal": None,
+            "candidate_completion": {
+                "schema_ref": CANDIDATE_COMPLETION_SCHEMA_REF,
+                "kind": "CandidateCompletion",
+                "source_quest_ref": request.quest_ref,
+                "source_cycle_ref": request.cycle_ref,
+                "source_reasoning_stage_run_request_ref": (
+                    request.stage_request_ref
+                ),
+                "source_scientific_outcome_ref": outcome_ref,
+                "source_question_ref": request.question_ref,
+                "source_foreground_epoch": request.foreground_epoch,
+                "current_quest_ref": request.quest_ref,
+                "current_goal_revision_ref": request.goal_revision_ref,
+                "completion_milestone_basis_refs": list(
+                    completion_milestone_basis_refs(request.context_pack)
+                ),
+                "rationale": (
+                    "当前冻结路线没有 substantive evidence；提交给用户主权下的"
+                    " completion preview 决定是否结束。"
+                ),
+                "is_authoritative": False,
+            },
+        }
+
+    def generate_draft(
+        self, request: ReasoningSkillRequest
+    ) -> ReasoningSkillDraft:
+        self._control.wait_for_release("reasoning-primary")
+        return ReasoningSkillDraft(
+            draft=self._output(request),
+            primary_session_ref=request.native_session_ref
+            or "chrome-reasoning-primary-session",
+            adapter_kind="chrome_deterministic_reasoning",
+        )
+
+    def review_draft(
+        self,
+        request: ReasoningSkillRequest,
+        draft: ReasoningSkillDraft,
+    ) -> ReasoningSkillResult:
+        self._control.wait_for_release("reasoning-review")
+        output = self._output(request)
+        return ReasoningSkillResult(
+            reviewed_draft=draft.draft,
+            scientific_outcome=output["scientific_outcome"],
+            next_cycle_proposal=None,
+            candidate_completion=output["candidate_completion"],
+            findings=(),
+            dispositions=(),
+            primary_session_ref=draft.primary_session_ref,
+            review_mode="harness_child_agent",
+            reviewer_agent_ref="chrome-reasoning-child-reviewer",
+            adapter_kind=draft.adapter_kind,
+        )
+
+    def execute(self, request: ReasoningSkillRequest) -> ReasoningSkillResult:
+        draft = self.generate_draft(request)
+        return self.review_draft(request, draft)
+
+
+class ControlledAutonomousReasoningSkill:
+    """A real resumable Reasoning provider with an autonomous checkpoint."""
+
+    def __init__(self, control: ProviderPhaseControl) -> None:
+        self._control = control
+
+    def request_stop(self) -> None:
+        self._control.request_stop()
+
+    def runtime_binding(self) -> ReasoningRuntimeBinding:
+        return ReasoningRuntimeBinding(
+            packaged_skill_bundle_hash=canonical_hash(
+                {"skill": "chrome-production-reasoning-autonomous"}
+            ),
+            instruction_set_hash=canonical_hash(
+                {"instructions": "chrome-production-reasoning-autonomous"}
+            ),
+            model_ref="chrome-test-model",
+            harness_adapter_ref="chrome-deterministic-reasoning-v1",
+            mcp_bindings=(),
+            capability_bindings=(),
+            resource_bindings=(),
+        )
+
+    def _checkpoint(self, request: ReasoningSkillRequest) -> dict[str, object]:
+        outcome_ref = "scientific-outcome:" + canonical_hash(
+            {
+                "stage_request_ref": request.stage_request_ref,
+                "attempt_ref": request.attempt_ref,
+                "route": "autonomous",
+            }
+        )[:24]
+        outcome: dict[str, object] = {
+            "schema_ref": SCIENTIFIC_OUTCOME_SCHEMA_REF,
+            "kind": "ScientificOutcomeCandidate",
+            "outcome_ref": outcome_ref,
+            "stage_run_request_ref": request.stage_request_ref,
+            "cycle_ref": request.cycle_ref,
+            "question_ref": request.question_ref,
+            "quest_ref": request.quest_ref,
+            "goal_revision_ref": request.goal_revision_ref,
+            "foreground_epoch": request.foreground_epoch,
+            "disposition": "insufficient_evidence",
+            "claim": None,
+            "evidence": [],
+            "missing_evidence": [
+                "需要针对跨域适用边界形成一个新的正式 Question。"
+            ],
+            "uncertainty_basis": [],
+            **_insufficient_outcome_scope(request),
+            "is_authoritative": False,
+        }
+        scope = {
+            "schema_ref": AUTONOMOUS_QUESTION_SCOPE_SCHEMA_REF,
+            "kind": "AutonomousQuestionScope",
+            "creation_mode": "AutonomousCreation",
+            "mode": "new",
+            "source_quest_ref": request.quest_ref,
+            "source_cycle_ref": request.cycle_ref,
+            "source_reasoning_stage_run_request_ref": request.stage_request_ref,
+            "source_scientific_outcome_ref": outcome_ref,
+            "source_question_ref": request.question_ref,
+            "source_foreground_epoch": request.foreground_epoch,
+            "question_blueprint": dict(AUTONOMOUS_QUESTION),
+            "parent_question_ref": None,
+            "decomposition_basis_refs": [],
+            "entry_stage": "idea",
+            "typed_skip_basis_refs_by_stage": {},
+            "is_authoritative": False,
+        }
+        return {
+            "schema_ref": REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF,
+            "scientific_outcome": outcome,
+            "autonomous_scope": scope,
+        }
+
+    def generate_draft(
+        self, request: ReasoningSkillRequest
+    ) -> ReasoningSkillDraft:
+        self._control.wait_for_release("reasoning-primary")
+        return ReasoningSkillDraft(
+            draft=self._checkpoint(request),
+            primary_session_ref=request.native_session_ref
+            or "chrome-reasoning-autonomous-primary-session",
+            adapter_kind="chrome_deterministic_reasoning",
+        )
+
+    def review_draft(
+        self,
+        request: ReasoningSkillRequest,
+        draft: ReasoningSkillDraft,
+    ) -> ReasoningAutonomousCheckpointResult:
+        self._control.wait_for_release("reasoning-review")
+        return ReasoningAutonomousCheckpointResult(
+            primary_draft=draft.draft,
+            reviewed_checkpoint=draft.draft,
+            findings=(),
+            dispositions=(),
+            primary_session_ref=draft.primary_session_ref,
+            review_mode="harness_child_agent",
+            reviewer_agent_ref="chrome-reasoning-autonomous-scope-reviewer",
+            adapter_kind=draft.adapter_kind,
+        )
+
+    def resume_after_autonomous_creation(
+        self,
+        request: ReasoningSkillRequest,
+        checkpoint: dict[str, object],
+        creation_result: dict[str, object],
+    ) -> ReasoningSkillResult:
+        outcome = checkpoint["scientific_outcome"]
+        anchor = creation_result["question_anchor"]
+        transition = {
+            "schema_ref": NEXT_CYCLE_PROPOSAL_SCHEMA_REF,
+            "kind": "NextCycleProposal",
+            "source_quest_ref": outcome["quest_ref"],
+            "source_cycle_ref": outcome["cycle_ref"],
+            "source_reasoning_stage_run_request_ref": outcome[
+                "stage_run_request_ref"
+            ],
+            "source_scientific_outcome_ref": outcome["outcome_ref"],
+            "source_question_ref": outcome["question_ref"],
+            "source_foreground_epoch": outcome["foreground_epoch"],
+            "target_question_ref": anchor["question_ref"],
+            "target_question_anchor_ref": anchor["ref"],
+            "entry_stage": "idea",
+            "typed_skip_basis_refs_by_stage": {},
+            "is_authoritative": False,
+        }
+        return ReasoningSkillResult(
+            reviewed_draft=checkpoint,
+            scientific_outcome=outcome,
+            next_cycle_proposal=transition,
+            candidate_completion=None,
+            findings=(
+                {
+                    "finding_id": "autonomous-target-owner-facts",
+                    "category": "transition_boundary",
+                    "message": (
+                        "Bind the final transition to the accepted target."
+                    ),
+                },
+            ),
+            dispositions=(
+                {
+                    "finding_id": "autonomous-target-owner-facts",
+                    "action": "revised",
+                    "rationale": (
+                        "The accepted Anchor and current graph facts are now "
+                        "available."
+                    ),
+                },
+            ),
+            primary_session_ref=request.native_session_ref
+            or "chrome-reasoning-autonomous-primary-session",
+            review_mode="harness_child_agent",
+            reviewer_agent_ref="chrome-reasoning-autonomous-reviewer",
+            adapter_kind="chrome_deterministic_reasoning",
+        )
+
+    def execute(self, request: ReasoningSkillRequest) -> ReasoningSkillResult:
+        raise AssertionError("autonomous Reasoning must preserve its checkpoint")
 
 
 class DeterministicWritingSkill:
@@ -682,9 +1094,24 @@ async def serve(
     prepared_data_root = prepare_data_root(data_root)
     idea_skill = None
     plan_skill = None
+    reasoning_skill = None
     if stage_pipeline == "plan-gap":
         idea_skill = DeterministicIdeaSkill()
         plan_skill = ControlledDeterministicPlanSkill(
+            ProviderPhaseControl(
+                prepared_data_root.run / "chrome-provider-control"
+            )
+        )
+    elif stage_pipeline in {"reasoning-no-evidence", "quest-completion"}:
+        idea_skill = DeterministicIdeaSkill(no_viable=True)
+        reasoning_skill = ControlledDeterministicReasoningSkill(
+            ProviderPhaseControl(
+                prepared_data_root.run / "chrome-provider-control"
+            )
+        )
+    elif stage_pipeline == "reasoning-autonomous":
+        idea_skill = DeterministicIdeaSkill(no_viable=True)
+        reasoning_skill = ControlledAutonomousReasoningSkill(
             ProviderPhaseControl(
                 prepared_data_root.run / "chrome-provider-control"
             )
@@ -696,6 +1123,7 @@ async def serve(
         host_compute_probe=SequencedHostProbe(intent_started),
         idea_skill_provider=idea_skill,
         plan_skill_provider=plan_skill,
+        reasoning_skill_provider=reasoning_skill,
         writing_skill_provider=DeterministicWritingSkill(),
         deepfetch_provider=DeterministicDeepFetchProvider(),
     )
@@ -770,7 +1198,15 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--legacy-state", choices=("draft", "recovering"))
     parser.add_argument("--manual-root", action="store_true")
-    parser.add_argument("--stage-pipeline", choices=("plan-gap",))
+    parser.add_argument(
+        "--stage-pipeline",
+        choices=(
+            "plan-gap",
+            "reasoning-no-evidence",
+            "reasoning-autonomous",
+            "quest-completion",
+        ),
+    )
     parser.add_argument("--web-root", type=Path)
     args = parser.parse_args()
     asyncio.run(

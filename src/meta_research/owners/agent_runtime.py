@@ -132,6 +132,15 @@ from meta_research.plan_contract import (
     PLAN_REVIEW_SCHEMA_REF,
     material_plan_hash,
 )
+from meta_research.reasoning_contract import (
+    ReasoningContractError,
+    REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF,
+    REASONING_REVIEW_SCHEMA_REF,
+    REASONING_STAGE_OUTPUT_SCHEMA_REF,
+    SCIENTIFIC_OUTCOME_SCHEMA_REF,
+    SCIENTIFIC_OUTCOMES,
+    validate_autonomous_question_scope,
+)
 from meta_research.bundle_contract import (
     TARGET_PLAN_REVIEW_SCHEMA_REF,
     material_target_plan_hash,
@@ -161,6 +170,7 @@ from meta_research.owners.common import (
     VerifiedBundleReplanRunRetirement,
     DeepFetchRunRequestVerifier,
     FormalPlanDecisionVerifier,
+    ReasoningOutcomeDecisionVerifier,
     ExperimentInputBindingVerifier,
     IdeaOutcomeDecisionVerifier,
     OwnerConflict,
@@ -239,6 +249,14 @@ PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND = "plan_attempt_execution"
 BUNDLE_ATTEMPT_EXECUTION_SCHEMA = "meta-research/bundle-attempt-execution/v1"
 BUNDLE_RUNTIME_BINDING_SCHEMA = "meta-research/bundle-runtime-binding/v1"
 BUNDLE_ATTEMPT_EXECUTION_RECEIPT_KIND = "bundle_attempt_execution"
+REASONING_ATTEMPT_EXECUTION_SCHEMA = (
+    "meta-research/reasoning-attempt-execution/v1"
+)
+REASONING_RUNTIME_BINDING_SCHEMA = "meta-research/reasoning-runtime-binding/v1"
+REASONING_ATTEMPT_EXECUTION_RECEIPT_KIND = "reasoning_attempt_execution"
+REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND = (
+    "reasoning_autonomous_checkpoint"
+)
 BUNDLE_INBOX_CHECKPOINT_SCHEMA = "meta-research/bundle-inbox-checkpoint/v1"
 BUNDLE_INBOX_CHECKPOINT_RECEIPT_KIND = "bundle_inbox_checkpoint"
 BUNDLE_INBOX_OPERATION_CHECKPOINT_RECEIPT_KIND = (
@@ -365,6 +383,30 @@ class BundleRuntimeBinding:
 
 
 @dataclass(frozen=True)
+class ReasoningRuntimeBinding:
+    packaged_skill_bundle_hash: str
+    instruction_set_hash: str
+    model_ref: str
+    harness_adapter_ref: str
+    mcp_bindings: tuple[str, ...]
+    capability_bindings: tuple[str, ...]
+    resource_bindings: tuple[str, ...]
+    schema_ref: str = REASONING_RUNTIME_BINDING_SCHEMA
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_ref": self.schema_ref,
+            "packaged_skill_bundle_hash": self.packaged_skill_bundle_hash,
+            "instruction_set_hash": self.instruction_set_hash,
+            "model_ref": self.model_ref,
+            "harness_adapter_ref": self.harness_adapter_ref,
+            "mcp_bindings": list(self.mcp_bindings),
+            "capability_bindings": list(self.capability_bindings),
+            "resource_bindings": list(self.resource_bindings),
+        }
+
+
+@dataclass(frozen=True)
 class AttemptExecution:
     stage: str
     request_ref: str
@@ -373,7 +415,12 @@ class AttemptExecution:
     fence_ref: str
     submission_ref: str
     native_session_ref: str
-    runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding | BundleRuntimeBinding
+    runtime_binding: (
+        IdeaRuntimeBinding
+        | PlanRuntimeBinding
+        | BundleRuntimeBinding
+        | ReasoningRuntimeBinding
+    )
     runtime_binding_hash: str
     payload_hash: str
     payload_json: str
@@ -602,6 +649,26 @@ class IdeaPrimaryDraft:
 
 
 @dataclass(frozen=True)
+class ReasoningAutonomousCheckpoint:
+    """AR-owned non-terminal Reasoning checkpoint for AutonomousCreation."""
+
+    checkpoint_ref: str
+    request_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    native_session_ref: str
+    runtime_binding: ReasoningRuntimeBinding
+    runtime_binding_hash: str
+    primary_draft_hash: str
+    checkpoint: dict[str, object]
+    checkpoint_hash: str
+    review: dict[str, object]
+    review_hash: str
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
 class RunCompletion:
     request_ref: str
     run_ref: str
@@ -623,7 +690,12 @@ class IdeaStageRun:
     attempt_generation: int
     root_session_ref: str
     native_session_ref: str | None
-    runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding | BundleRuntimeBinding
+    runtime_binding: (
+        IdeaRuntimeBinding
+        | PlanRuntimeBinding
+        | BundleRuntimeBinding
+        | ReasoningRuntimeBinding
+    )
     runtime_binding_hash: str
     fence_ref: str
     primary_invocation: IdeaProviderInvocation
@@ -634,6 +706,7 @@ class IdeaStageRun:
     technical_predecessor_attempt_ref: str | None
     rejection_receipt: AcceptanceReceipt | None
     completion: RunCompletion | None
+    autonomous_checkpoint: ReasoningAutonomousCheckpoint | None = None
 
     @property
     def attempt_execution_receipt(self) -> AcceptanceReceipt | None:
@@ -646,6 +719,7 @@ class IdeaStageRun:
 
 PlanStageRun = IdeaStageRun
 BundleStageRun = IdeaStageRun
+ReasoningStageRun = IdeaStageRun
 
 
 @dataclass(frozen=True)
@@ -982,6 +1056,15 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         quest_ref: str | None = None,
     ) -> AcquisitionSession | None: ...
 
+    def verify_acquisition_session_binding(
+        self,
+        *,
+        session_ref: str,
+        quest_ref: str,
+        config_hash: str,
+        runtime_binding_hash: str,
+    ) -> None: ...
+
     def reconcile_human_request(self, request_ref: str) -> dict[str, object] | None: ...
 
     def acquire_literature(
@@ -1134,6 +1217,115 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     ) -> RunCompletion: ...
 
     def query_plan_run_completion(self, run_ref: str) -> RunCompletion | None: ...
+
+    def admit_reasoning_stage(
+        self,
+        request: StageRunRequest,
+        idempotency_key: str,
+        *,
+        runtime_binding: ReasoningRuntimeBinding,
+    ) -> ReasoningStageRun: ...
+
+    def query_reasoning_stage_run(
+        self, request_ref: str
+    ) -> ReasoningStageRun | None: ...
+
+    def verify_reasoning_runtime_scope(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> None: ...
+
+    def record_reasoning_primary_draft(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding: ReasoningRuntimeBinding,
+        draft: dict[str, object],
+        adapter_kind: str,
+        idempotency_key: str,
+    ) -> IdeaPrimaryDraft: ...
+
+    def record_reasoning_autonomous_checkpoint(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding: ReasoningRuntimeBinding,
+        checkpoint: dict[str, object],
+        review: dict[str, object],
+        idempotency_key: str,
+    ) -> ReasoningAutonomousCheckpoint: ...
+
+    def query_reasoning_autonomous_checkpoint(
+        self, checkpoint_ref: str
+    ) -> ReasoningAutonomousCheckpoint | None: ...
+
+    def verify_reasoning_autonomous_checkpoint_receipt(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        checkpoint_ref: str,
+        checkpoint_hash: str,
+        review_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def record_reasoning_attempt_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        native_session_ref: str,
+        runtime_binding: ReasoningRuntimeBinding,
+        outcome: dict[str, object],
+        review: dict[str, object],
+        idempotency_key: str,
+        reviewed_draft: dict[str, object] | None = None,
+    ) -> AttemptExecution: ...
+
+    def query_reasoning_attempt_execution(
+        self, submission_ref: str
+    ) -> AttemptExecution | None: ...
+
+    def continue_after_reasoning_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> ReasoningStageRun: ...
+
+    def complete_reasoning_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        outcome_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> RunCompletion: ...
+
+    def query_reasoning_run_completion(
+        self, run_ref: str
+    ) -> RunCompletion | None: ...
 
     def admit_bundle_stage(
         self,
@@ -1816,6 +2008,8 @@ _PROVIDER_UNIT_KINDS = frozenset(
         "plan_review",
         "bundle_primary",
         "bundle_review",
+        "reasoning_primary",
+        "reasoning_review",
         "deepfetch",
         "experiment",
         "writing_primary",
@@ -1829,6 +2023,8 @@ _PROVIDER_UNIT_RUN_KINDS = {
     "plan_review": "plan_stage",
     "bundle_primary": "bundle_stage",
     "bundle_review": "bundle_stage",
+    "reasoning_primary": "reasoning_stage",
+    "reasoning_review": "reasoning_stage",
     "deepfetch": "deepfetch",
     "experiment": "experiment",
     "writing_primary": "writing",
@@ -5283,6 +5479,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         bundle_report_disposition_verifier: (
             BundleReportDispositionReceiptVerifier | None
         ) = None,
+        reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -5290,6 +5487,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
         self._formal_plan_verifier = formal_plan_verifier
+        self._reasoning_outcome_verifier = reasoning_outcome_verifier
         self._target_graph_verifier = target_graph_verifier
         self._bundle_report_evidence_verifier = bundle_report_evidence_verifier
         self._target_run_harness_verifier = target_run_harness_verifier
@@ -9647,6 +9845,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ).first()
         return None if row is None else _acquisition_session_from_row(row)
 
+    def verify_acquisition_session_binding(
+        self,
+        *,
+        session_ref: str,
+        quest_ref: str,
+        config_hash: str,
+        runtime_binding_hash: str,
+    ) -> None:
+        self._receipt_verifier.verify_acquisition_session_binding(
+            session_ref=session_ref,
+            quest_ref=quest_ref,
+            config_hash=config_hash,
+            runtime_binding_hash=runtime_binding_hash,
+        )
+
     def _current_acquisition_human_target(
         self,
         target: dict[str, object],
@@ -11192,18 +11405,30 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             not in {
                 "same_quest_initialization_proposal",
                 "same_manual_question_creation_proposal",
+                "same_autonomous_question_creation",
             }
             or canonical_hash(request.scope) != request.scope_hash
             or request.draft_revision < 1
             or canonical_hash(request.draft) != request.draft_hash
-            or request.creation_context_kind == "manual_question_creation"
+            or request.creation_context_kind
+            in {"manual_question_creation", "autonomous_question_creation"}
             and (
-                request.result_route != "same_manual_question_creation_proposal"
+                request.result_route
+                != (
+                    "same_manual_question_creation_proposal"
+                    if request.creation_context_kind
+                    == "manual_question_creation"
+                    else "same_autonomous_question_creation"
+                )
                 or request.creation_context_ref is None
                 or request.context_generation is None
                 or request.context_generation < 1
                 or request.quest_ref is None
-                or request.parent_question_ref is None
+                or (
+                    request.creation_context_kind
+                    == "manual_question_creation"
+                    and request.parent_question_ref is None
+                )
                 or request.context_basis_hash is None
             )
         ):
@@ -12284,6 +12509,20 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             idempotency_key,
             runtime_binding=runtime_binding,
             expected_stage="plan",
+        )
+
+    def admit_reasoning_stage(
+        self,
+        request: StageRunRequest,
+        idempotency_key: str,
+        *,
+        runtime_binding: ReasoningRuntimeBinding,
+    ) -> ReasoningStageRun:
+        return self._admit_stage(
+            request,
+            idempotency_key,
+            runtime_binding=runtime_binding,
+            expected_stage="reasoning",
         )
 
     def build_bundle_report_candidate(
@@ -13681,7 +13920,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         request: StageRunRequest,
         idempotency_key: str,
         *,
-        runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding | BundleRuntimeBinding,
+        runtime_binding: (
+            IdeaRuntimeBinding
+            | PlanRuntimeBinding
+            | BundleRuntimeBinding
+            | ReasoningRuntimeBinding
+        ),
         expected_stage: str,
     ) -> IdeaStageRun:
         _validate_stage_idempotency_key(idempotency_key)
@@ -14107,6 +14351,41 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     def query_plan_stage_run(self, request_ref: str) -> PlanStageRun | None:
         return self._query_stage_run(request_ref, "plan")
 
+    def query_reasoning_stage_run(
+        self, request_ref: str
+    ) -> ReasoningStageRun | None:
+        return self._query_stage_run(request_ref, "reasoning")
+
+    def query_reasoning_autonomous_checkpoint(
+        self, checkpoint_ref: str
+    ) -> ReasoningAutonomousCheckpoint | None:
+        if not _runtime_ref(checkpoint_ref):
+            raise OwnerConflict("reasoning_autonomous_checkpoint_ref_invalid")
+        with self._database.read() as connection:
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_attempts WHERE "
+                    "reasoning_checkpoint_ref = :checkpoint_ref"
+                ),
+                {"checkpoint_ref": checkpoint_ref},
+            ).first()
+            if attempt is None:
+                return None
+            run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": attempt.run_ref},
+            ).first()
+            session = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_sessions WHERE session_ref = "
+                    ":session_ref"
+                ),
+                {"session_ref": attempt.root_session_ref},
+            ).first()
+        if run is None or session is None:
+            raise OwnerConflict("reasoning_autonomous_checkpoint_integrity_invalid")
+        return _reasoning_autonomous_checkpoint(run, attempt, session)
+
     def query_bundle_stage_run(self, request_ref: str) -> BundleStageRun | None:
         return self._query_stage_run(request_ref, "bundle")
 
@@ -14121,8 +14400,48 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     ) -> None:
         """Verify an exact current Bundle Run scope before MCP credential issue."""
 
+        self._verify_formal_runtime_scope(
+            stage="bundle",
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            root_session_ref=root_session_ref,
+            fence_ref=fence_ref,
+            runtime_binding_hash=runtime_binding_hash,
+        )
+
+    def verify_reasoning_runtime_scope(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> None:
+        """Verify the current Reasoning Run before MCP credential issue."""
+
+        self._verify_formal_runtime_scope(
+            stage="reasoning",
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            root_session_ref=root_session_ref,
+            fence_ref=fence_ref,
+            runtime_binding_hash=runtime_binding_hash,
+        )
+
+    def _verify_formal_runtime_scope(
+        self,
+        *,
+        stage: str,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> None:
+
         if not _is_sha256(runtime_binding_hash):
-            raise OwnerConflict("bundle_runtime_scope_invalid")
+            raise OwnerConflict(f"{stage}_runtime_scope_invalid")
         with self._database.read() as connection:
             run, attempt, session, fence = _load_stage_fence(
                 connection,
@@ -14148,16 +14467,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "submitted",
                 )
             else:
-                raise OwnerConflict("bundle_runtime_scope_stale")
+                raise OwnerConflict(f"{stage}_runtime_scope_stale")
             if (
-                run.stage != "bundle"
+                run.stage != stage
                 or run.root_session_ref != root_session_ref
                 or attempt.root_session_ref != root_session_ref
                 or session.session_ref != root_session_ref
                 or session.status != "active"
                 or run.runtime_binding_hash != runtime_binding_hash
             ):
-                raise OwnerConflict("bundle_runtime_scope_invalid")
+                raise OwnerConflict(f"{stage}_runtime_scope_invalid")
 
     def _query_stage_run(
         self, request_ref: str, expected_stage: str
@@ -14310,6 +14629,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         ):
             raise OwnerConflict("idea_provider_invocation_invalid")
+        autonomous_checkpoint = _reasoning_autonomous_checkpoint(
+            run, attempt, session
+        )
+        if expected_stage != "reasoning" and autonomous_checkpoint is not None:
+            raise OwnerConflict("stage_run_integrity_invalid")
         if execution is None:
             review_is_accepted_exhaustion = (
                 exhaustion_review is not None
@@ -14422,6 +14746,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ),
             rejection_receipt=rejection_receipt,
             completion=completion,
+            autonomous_checkpoint=autonomous_checkpoint,
         )
 
     def record_idea_primary_draft(
@@ -14472,6 +14797,253 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             expected_stage="plan",
         )
 
+    def complete_reasoning_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        outcome_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> RunCompletion:
+        return self._complete_stage_run(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            outcome_ref=outcome_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="reasoning",
+        )
+
+    def record_reasoning_primary_draft(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding: ReasoningRuntimeBinding,
+        draft: dict[str, object],
+        adapter_kind: str,
+        idempotency_key: str,
+    ) -> IdeaPrimaryDraft:
+        return self._record_stage_primary_draft(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            native_session_ref=native_session_ref,
+            runtime_binding=runtime_binding,
+            draft=draft,
+            adapter_kind=adapter_kind,
+            idempotency_key=idempotency_key,
+            expected_stage="reasoning",
+        )
+
+    def record_reasoning_autonomous_checkpoint(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding: ReasoningRuntimeBinding,
+        checkpoint: dict[str, object],
+        review: dict[str, object],
+        idempotency_key: str,
+    ) -> ReasoningAutonomousCheckpoint:
+        """Persist one reviewed, non-terminal AutonomousCreation checkpoint."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        if (
+            not _runtime_ref(run_ref)
+            or not _runtime_ref(attempt_ref)
+            or not _runtime_ref(fence_ref)
+            or not _runtime_ref(native_session_ref)
+            or not isinstance(checkpoint, dict)
+            or not isinstance(review, dict)
+        ):
+            raise OwnerConflict("reasoning_autonomous_checkpoint_invalid")
+        runtime_binding, _binding_json, runtime_binding_hash = (
+            _validated_runtime_binding(runtime_binding, stage="reasoning")
+        )
+        try:
+            checkpoint_json = canonical_json(checkpoint)
+            checkpoint_hash = canonical_hash(checkpoint)
+            review_json = canonical_json(review)
+            review_hash = canonical_hash(review)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("reasoning_autonomous_checkpoint_invalid") from error
+        command_kind = "record_reasoning_autonomous_checkpoint"
+        command_hash = canonical_hash(
+            {
+                "command": command_kind,
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+                "native_session_ref": native_session_ref,
+                "runtime_binding_hash": runtime_binding_hash,
+                "checkpoint_hash": checkpoint_hash,
+                "review_hash": review_hash,
+            }
+        )
+        _query_stage_command(
+            self._database,
+            idempotency_key,
+            command_kind,
+            command_hash,
+        )
+        with self._database.write() as connection:
+            replay_ref = _stage_command_replay(
+                connection,
+                idempotency_key,
+                command_kind,
+                command_hash,
+            )
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref
+            )
+            if (
+                run.stage != "reasoning"
+                or _runtime_binding_from_row(run) != runtime_binding
+                or run.runtime_binding_hash != runtime_binding_hash
+            ):
+                raise OwnerConflict("idea_runtime_binding_drift")
+            primary_draft = _primary_draft(run, attempt, session)
+            if primary_draft is None:
+                raise OwnerConflict("idea_primary_draft_required")
+            _validate_reasoning_autonomous_checkpoint_material(
+                run,
+                attempt,
+                session,
+                primary_draft=primary_draft,
+                native_session_ref=native_session_ref,
+                checkpoint=checkpoint,
+                checkpoint_hash=checkpoint_hash,
+                review=review,
+                review_hash=review_hash,
+            )
+            existing = _reasoning_autonomous_checkpoint(run, attempt, session)
+            if replay_ref is not None:
+                if (
+                    existing is None
+                    or replay_ref != existing.checkpoint_ref
+                    or existing.checkpoint_hash != checkpoint_hash
+                    or existing.review_hash != review_hash
+                ):
+                    raise OwnerConflict("stage_command_result_missing")
+                result_ref = replay_ref
+            else:
+                _assert_runtime_control_allows(connection, run_ref, fence_ref)
+                _require_current_fence(run, attempt, fence, "running", "current")
+                if existing is not None:
+                    if (
+                        existing.native_session_ref != native_session_ref
+                        or existing.runtime_binding_hash != runtime_binding_hash
+                        or existing.primary_draft_hash != primary_draft.draft_hash
+                        or existing.checkpoint_hash != checkpoint_hash
+                        or existing.review_hash != review_hash
+                    ):
+                        raise OwnerConflict(
+                            "reasoning_autonomous_checkpoint_conflict"
+                        )
+                    result_ref = existing.checkpoint_ref
+                    _record_stage_command(
+                        connection,
+                        idempotency_key,
+                        command_kind,
+                        command_hash,
+                        result_ref,
+                    )
+                else:
+                    checkpoint_ref = new_ref("reasoning_autonomous_checkpoint")
+                    receipt_ref = new_ref(
+                        "ar_reasoning_autonomous_checkpoint_receipt"
+                    )
+                    bindings = _reasoning_autonomous_checkpoint_bindings(
+                        request_ref=run.request_ref,
+                        run_ref=run_ref,
+                        attempt_ref=attempt_ref,
+                        fence_ref=fence_ref,
+                        root_session_ref=session.session_ref,
+                        native_session_ref=native_session_ref,
+                        runtime_binding_hash=runtime_binding_hash,
+                        primary_draft_hash=primary_draft.draft_hash,
+                        checkpoint_hash=checkpoint_hash,
+                        review_hash=review_hash,
+                    )
+                    receipt_hash = _owner_receipt_hash(
+                        REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND,
+                        checkpoint_ref,
+                        bindings,
+                    )
+                    now = time.time()
+                    updated = connection.execute(
+                        text(
+                            "UPDATE ar_stage_attempts SET "
+                            "reasoning_checkpoint_ref = :checkpoint_ref, "
+                            "reasoning_checkpoint_json = :checkpoint_json, "
+                            "reasoning_checkpoint_hash = :checkpoint_hash, "
+                            "reasoning_checkpoint_review_json = :review_json, "
+                            "reasoning_checkpoint_review_hash = :review_hash, "
+                            "reasoning_checkpoint_receipt_ref = :receipt_ref, "
+                            "reasoning_checkpoint_receipt_hash = :receipt_hash, "
+                            "reasoning_checkpoint_recorded_at = :recorded_at "
+                            "WHERE attempt_ref = :attempt_ref AND "
+                            "reasoning_checkpoint_ref IS NULL"
+                        ),
+                        {
+                            "checkpoint_ref": checkpoint_ref,
+                            "checkpoint_json": checkpoint_json,
+                            "checkpoint_hash": checkpoint_hash,
+                            "review_json": review_json,
+                            "review_hash": review_hash,
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "recorded_at": now,
+                            "attempt_ref": attempt_ref,
+                        },
+                    )
+                    if updated.rowcount != 1:
+                        raise OwnerConflict(
+                            "reasoning_autonomous_checkpoint_conflict"
+                        )
+                    _record_stage_command(
+                        connection,
+                        idempotency_key,
+                        command_kind,
+                        command_hash,
+                        checkpoint_ref,
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE agent_runtime_state SET revision = "
+                            "revision + 1 WHERE singleton = 'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "agent_runtime.reasoning_autonomous_checkpoint_recorded",
+                        {
+                            "request_ref": run.request_ref,
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "fence_ref": fence_ref,
+                            "checkpoint_ref": checkpoint_ref,
+                            "checkpoint_hash": checkpoint_hash,
+                            "review_hash": review_hash,
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+                    result_ref = checkpoint_ref
+        recorded = self.query_reasoning_autonomous_checkpoint(result_ref)
+        if recorded is None:
+            raise OwnerConflict(
+                "reasoning_autonomous_checkpoint_missing_after_commit"
+            )
+        return recorded
+
     def record_bundle_primary_draft(
         self,
         *,
@@ -14503,7 +15075,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         attempt_ref: str,
         fence_ref: str,
         native_session_ref: str,
-        runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding | BundleRuntimeBinding,
+        runtime_binding: (
+            IdeaRuntimeBinding
+            | PlanRuntimeBinding
+            | BundleRuntimeBinding
+            | ReasoningRuntimeBinding
+        ),
         draft: dict[str, object],
         adapter_kind: str,
         idempotency_key: str,
@@ -14741,6 +15318,34 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             expected_stage="plan",
         )
 
+    def record_reasoning_attempt_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        native_session_ref: str,
+        runtime_binding: ReasoningRuntimeBinding,
+        outcome: dict[str, object],
+        review: dict[str, object],
+        idempotency_key: str,
+        reviewed_draft: dict[str, object] | None = None,
+    ) -> AttemptExecution:
+        return self._record_stage_attempt_execution(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            submission_ref=submission_ref,
+            native_session_ref=native_session_ref,
+            runtime_binding=runtime_binding,
+            outcome=outcome,
+            review=review,
+            idempotency_key=idempotency_key,
+            reviewed_draft=reviewed_draft,
+            expected_stage="reasoning",
+        )
+
     def record_bundle_attempt_execution(
         self,
         *,
@@ -14777,7 +15382,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         fence_ref: str,
         submission_ref: str,
         native_session_ref: str,
-        runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding | BundleRuntimeBinding,
+        runtime_binding: (
+            IdeaRuntimeBinding
+            | PlanRuntimeBinding
+            | BundleRuntimeBinding
+            | ReasoningRuntimeBinding
+        ),
         outcome: dict[str, object],
         review: dict[str, object],
         idempotency_key: str,
@@ -14856,7 +15466,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 raise OwnerConflict("idea_primary_draft_required")
             if (
                 primary_draft.native_session_ref != native_session_ref
-                or primary_draft.draft_hash != canonical_hash(reviewed_draft)
+                or not _stage_reviewed_draft_matches(
+                    preview_run,
+                    preview_attempt,
+                    preview_session,
+                    primary_draft=primary_draft,
+                    reviewed_draft_hash=canonical_hash(reviewed_draft),
+                )
             ):
                 raise OwnerConflict("idea_primary_draft_conflict")
             primary_invocation, review_invocation = _provider_invocations(
@@ -14923,7 +15539,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 raise OwnerConflict("idea_primary_draft_required")
             if (
                 current_primary_draft.native_session_ref != native_session_ref
-                or current_primary_draft.draft_hash != canonical_hash(reviewed_draft)
+                or not _stage_reviewed_draft_matches(
+                    run,
+                    attempt,
+                    session,
+                    primary_draft=current_primary_draft,
+                    reviewed_draft_hash=canonical_hash(reviewed_draft),
+                )
             ):
                 raise OwnerConflict("idea_primary_draft_conflict")
             _complete_provider_invocation(
@@ -15108,6 +15730,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self, submission_ref: str
     ) -> AttemptExecution | None:
         return self._query_stage_attempt_execution(submission_ref, "plan")
+
+    def query_reasoning_attempt_execution(
+        self, submission_ref: str
+    ) -> AttemptExecution | None:
+        return self._query_stage_attempt_execution(submission_ref, "reasoning")
 
     def query_bundle_attempt_execution(
         self, submission_ref: str
@@ -15596,6 +16223,24 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             expected_stage="plan",
         )
 
+    def continue_after_reasoning_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> ReasoningStageRun:
+        return self._continue_after_stage_rejection(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="reasoning",
+        )
+
     def continue_after_bundle_rejection(
         self,
         *,
@@ -16047,6 +16692,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     def query_plan_run_completion(self, run_ref: str) -> RunCompletion | None:
         return self._query_stage_run_completion(run_ref, "plan")
 
+    def query_reasoning_run_completion(self, run_ref: str) -> RunCompletion | None:
+        return self._query_stage_run_completion(run_ref, "reasoning")
+
     def query_bundle_run_completion(self, run_ref: str) -> RunCompletion | None:
         return self._query_stage_run_completion(run_ref, "bundle")
 
@@ -16174,6 +16822,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 submission_ref=submission_ref,
                 decision=decision,
                 formal_plan_ref=outcome_ref,
+                receipt=receipt,
+            )
+            return
+        if stage == "reasoning":
+            if self._reasoning_outcome_verifier is None:
+                raise OwnerConflict("reasoning_outcome_verifier_unavailable")
+            self._reasoning_outcome_verifier.verify_reasoning_outcome_decision(
+                request_ref=request_ref,
+                submission_ref=submission_ref,
+                decision=decision,
+                outcome_ref=outcome_ref,
                 receipt=receipt,
             )
             return
@@ -17876,6 +18535,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     def verify_attempt_execution_receipt(self, **values) -> str:
         return self._receipt_verifier.verify_attempt_execution_receipt(**values)
 
+    def verify_reasoning_autonomous_checkpoint_receipt(
+        self, **values
+    ) -> None:
+        self._receipt_verifier.verify_reasoning_autonomous_checkpoint_receipt(
+            **values
+        )
+
     def verify_target_run_admission_receipt(self, **values) -> None:
         self._receipt_verifier.verify_target_run_admission_receipt(**values)
 
@@ -17957,6 +18623,44 @@ class SQLiteAgentRuntimeReceiptVerifier:
                 "bundle_report_disposition_verifier_already_bound"
             )
         self._bundle_report_disposition_verifier = verifier
+
+    def verify_acquisition_session_binding(
+        self,
+        *,
+        session_ref: str,
+        quest_ref: str,
+        config_hash: str,
+        runtime_binding_hash: str,
+    ) -> None:
+        if (
+            not _runtime_ref(session_ref)
+            or not _runtime_ref(quest_ref)
+            or not _is_sha256(config_hash)
+            or not _is_sha256(runtime_binding_hash)
+        ):
+            raise OwnerConflict("acquisition_session_binding_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_acquisition_sessions WHERE "
+                    "session_ref = :session_ref"
+                ),
+                {"session_ref": session_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("acquisition_session_binding_invalid")
+        try:
+            session = _acquisition_session_from_row(row)
+        except OwnerConflict as error:
+            raise OwnerConflict("acquisition_session_binding_invalid") from error
+        if (
+            session.status != "ready"
+            or session.quest_ref != quest_ref
+            or session.config_hash != config_hash
+            or session.runtime_binding_hash != runtime_binding_hash
+            or session.slot_held
+        ):
+            raise OwnerConflict("acquisition_session_binding_invalid")
 
     def verify_runtime_control_receipt(
         self,
@@ -18069,6 +18773,7 @@ class SQLiteAgentRuntimeReceiptVerifier:
                 ATTEMPT_EXECUTION_RECEIPT_KIND,
                 PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND,
                 BUNDLE_ATTEMPT_EXECUTION_RECEIPT_KIND,
+                REASONING_ATTEMPT_EXECUTION_RECEIPT_KIND,
             }
             or receipt.subject_ref != submission_ref
         ):
@@ -18120,6 +18825,87 @@ class SQLiteAgentRuntimeReceiptVerifier:
                 ),
             )
         return executed.material_outcome_hash
+
+    def verify_reasoning_autonomous_checkpoint_receipt(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        checkpoint_ref: str,
+        checkpoint_hash: str,
+        review_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != AR_OWNER
+            or receipt.kind
+            != REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND
+            or receipt.subject_ref != checkpoint_ref
+        ):
+            raise OwnerConflict(
+                "reasoning_autonomous_checkpoint_receipt_invalid"
+            )
+        with self._database.read() as connection:
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_attempts WHERE "
+                    "reasoning_checkpoint_receipt_ref = :receipt_ref"
+                ),
+                {"receipt_ref": receipt.receipt_ref},
+            ).first()
+            if attempt is None:
+                raise OwnerConflict(
+                    "reasoning_autonomous_checkpoint_receipt_invalid"
+                )
+            try:
+                # This verifies immutable issuance, including after the same
+                # Attempt has consumed the checkpoint into a final execution.
+                # New effects use the separate current-fence verifier.
+                run, current_attempt, session, _fence = _load_stage_fence(
+                    connection,
+                    run_ref,
+                    attempt_ref,
+                    fence_ref,
+                )
+                persisted = _reasoning_autonomous_checkpoint(
+                    run, current_attempt, session
+                )
+            except OwnerConflict as error:
+                raise OwnerConflict(
+                    "reasoning_autonomous_checkpoint_receipt_invalid"
+                ) from error
+        if persisted is None or (
+            attempt.attempt_ref != current_attempt.attempt_ref
+            or run.stage != "reasoning"
+            or run.request_ref != request_ref
+            or run.run_ref != run_ref
+            or current_attempt.attempt_ref != attempt_ref
+            or current_attempt.fence_ref != fence_ref
+            or persisted.checkpoint_ref != checkpoint_ref
+            or persisted.checkpoint_hash != checkpoint_hash
+            or persisted.review_hash != review_hash
+            or persisted.receipt != receipt
+        ):
+            raise OwnerConflict(
+                "reasoning_autonomous_checkpoint_receipt_invalid"
+            )
+        if self._stage_request_verifier is not None:
+            self._stage_request_verifier.verify_stage_run_request(
+                request_ref=run.request_ref,
+                cycle_ref=run.cycle_ref,
+                epoch=int(run.epoch),
+                context_pack_ref=run.context_pack_ref,
+                context_pack_hash=run.context_pack_hash,
+                receipt=AcceptanceReceipt(
+                    issuer="advancement_engine",
+                    kind="stage_run_request",
+                    receipt_ref=run.request_receipt_ref,
+                    subject_ref=run.request_ref,
+                    payload_hash=run.request_receipt_hash,
+                ),
+            )
 
     def verify_target_run_admission_receipt(
         self,
@@ -19414,6 +20200,8 @@ def _stage_execution_schema(stage: str) -> str:
         return PLAN_ATTEMPT_EXECUTION_SCHEMA
     if stage == "bundle":
         return BUNDLE_ATTEMPT_EXECUTION_SCHEMA
+    if stage == "reasoning":
+        return REASONING_ATTEMPT_EXECUTION_SCHEMA
     raise OwnerConflict("stage_run_integrity_invalid")
 
 
@@ -19424,6 +20212,8 @@ def _stage_execution_receipt_kind(stage: str) -> str:
         return PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND
     if stage == "bundle":
         return BUNDLE_ATTEMPT_EXECUTION_RECEIPT_KIND
+    if stage == "reasoning":
+        return REASONING_ATTEMPT_EXECUTION_RECEIPT_KIND
     raise OwnerConflict("stage_run_integrity_invalid")
 
 
@@ -19434,6 +20224,12 @@ def _stage_decision_receipt_kind(stage: str, *, accepted: bool) -> str:
         return "formal_plan_accepted" if accepted else "formal_plan_rejected"
     if stage == "bundle":
         return "target_graph_accepted" if accepted else "target_graph_rejected"
+    if stage == "reasoning":
+        return (
+            "reasoning_outcome_accepted"
+            if accepted
+            else "reasoning_outcome_rejected"
+        )
     raise OwnerConflict("stage_run_integrity_invalid")
 
 
@@ -19444,6 +20240,15 @@ def _stage_material_hash(stage: str, outcome: dict[str, object]) -> str:
         return material_plan_hash(outcome)
     if stage == "bundle":
         return material_target_plan_hash(outcome)
+    if stage == "reasoning":
+        if set(outcome) != {
+            "schema_ref",
+            "scientific_outcome",
+            "next_cycle_proposal",
+            "candidate_completion",
+        } or outcome.get("schema_ref") != REASONING_STAGE_OUTPUT_SCHEMA_REF:
+            raise OwnerConflict("reasoning_stage_output_invalid")
+        return canonical_hash(outcome)
     raise OwnerConflict("stage_run_integrity_invalid")
 
 
@@ -19527,6 +20332,311 @@ def _verify_execution_row(
     return outcome, reviewed_draft, review
 
 
+def _reasoning_autonomous_checkpoint_bindings(
+    *,
+    request_ref: str,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+    root_session_ref: str,
+    native_session_ref: str,
+    runtime_binding_hash: str,
+    primary_draft_hash: str,
+    checkpoint_hash: str,
+    review_hash: str,
+) -> dict[str, object]:
+    return {
+        "request_ref": request_ref,
+        "run_ref": run_ref,
+        "attempt_ref": attempt_ref,
+        "fence_ref": fence_ref,
+        "root_session_ref": root_session_ref,
+        "native_session_ref": native_session_ref,
+        "runtime_binding_hash": runtime_binding_hash,
+        "primary_draft_hash": primary_draft_hash,
+        "checkpoint_hash": checkpoint_hash,
+        "review_hash": review_hash,
+    }
+
+
+def _validate_reasoning_checkpoint_review(
+    review: dict[str, object],
+    *,
+    native_session_ref: str,
+    primary_draft_hash: str,
+    checkpoint_hash: str,
+) -> None:
+    _validate_attempt_review_for_write(
+        review,
+        native_session_ref=native_session_ref,
+        stage="reasoning",
+    )
+    if set(review) != {
+        "schema_ref",
+        "review_mode",
+        "reviewer_agent_ref",
+        "reviewed_draft_hash",
+        "findings",
+        "dispositions",
+        "final_output_hash",
+        "independent",
+        "advisory_only",
+    } or (
+        review.get("reviewed_draft_hash") != primary_draft_hash
+        or review.get("final_output_hash") != checkpoint_hash
+    ):
+        raise OwnerConflict("reasoning_review_invalid")
+    findings = review.get("findings")
+    dispositions = review.get("dispositions")
+    if not isinstance(findings, list) or not isinstance(dispositions, list):
+        raise OwnerConflict("reasoning_review_invalid")
+    finding_ids: list[str] = []
+    for finding in findings:
+        if (
+            not isinstance(finding, dict)
+            or set(finding) != {"finding_id", "category", "message"}
+            or not _runtime_ref(finding.get("finding_id"))
+            or finding.get("category")
+            not in {
+                "source_binding",
+                "evidence_boundary",
+                "disposition_boundary",
+                "transition_boundary",
+                "owner_boundary",
+                "research_synthesis",
+            }
+            or not isinstance(finding.get("message"), str)
+            or not cast(str, finding["message"]).strip()
+        ):
+            raise OwnerConflict("reasoning_review_finding_invalid")
+        finding_ids.append(cast(str, finding["finding_id"]))
+    if len(finding_ids) != len(set(finding_ids)):
+        raise OwnerConflict("reasoning_review_finding_invalid")
+    disposition_ids: list[str] = []
+    revised = False
+    for disposition in dispositions:
+        if (
+            not isinstance(disposition, dict)
+            or set(disposition) != {"finding_id", "action", "rationale"}
+            or not _runtime_ref(disposition.get("finding_id"))
+            or disposition.get("action") not in {"revised", "not_adopted"}
+            or not isinstance(disposition.get("rationale"), str)
+            or not cast(str, disposition["rationale"]).strip()
+        ):
+            raise OwnerConflict("reasoning_review_disposition_invalid")
+        disposition_ids.append(cast(str, disposition["finding_id"]))
+        revised = revised or disposition["action"] == "revised"
+    if disposition_ids != finding_ids:
+        raise OwnerConflict("reasoning_review_disposition_invalid")
+    if (primary_draft_hash != checkpoint_hash) != revised:
+        raise OwnerConflict("reasoning_review_revision_invalid")
+
+
+def _validate_reasoning_autonomous_checkpoint_material(
+    run,
+    attempt,
+    session,
+    *,
+    primary_draft: IdeaPrimaryDraft,
+    native_session_ref: str,
+    checkpoint: dict[str, object],
+    checkpoint_hash: str,
+    review: dict[str, object],
+    review_hash: str,
+) -> None:
+    # AR owns transport identity and the canonical checkpoint envelope, not the
+    # frozen evidence closure carried by AE's context pack.  RM re-runs the
+    # complete scientific validator before issuing content acceptance; reading
+    # AE's private request row here would collapse those Owner boundaries.
+    if (
+        run.stage != "reasoning"
+        or primary_draft.attempt_ref != attempt.attempt_ref
+        or primary_draft.fence_ref != attempt.fence_ref
+        or primary_draft.native_session_ref != native_session_ref
+        or session.native_session_ref != native_session_ref
+        or primary_draft.runtime_binding_hash != run.runtime_binding_hash
+        or checkpoint_hash != canonical_hash(checkpoint)
+        or review_hash != canonical_hash(review)
+    ):
+        raise OwnerConflict("reasoning_autonomous_checkpoint_binding_invalid")
+    try:
+        scientific_outcome = checkpoint["scientific_outcome"]
+        autonomous_scope = checkpoint["autonomous_scope"]
+    except (KeyError, TypeError) as error:
+        raise OwnerConflict(
+            "reasoning_autonomous_checkpoint_binding_invalid"
+        ) from error
+    if (
+        set(checkpoint)
+        != {"schema_ref", "scientific_outcome", "autonomous_scope"}
+        or checkpoint.get("schema_ref")
+        != REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF
+        or not isinstance(scientific_outcome, dict)
+        or not isinstance(autonomous_scope, dict)
+        or set(scientific_outcome)
+        != {
+            "schema_ref",
+            "kind",
+            "outcome_ref",
+            "stage_run_request_ref",
+            "cycle_ref",
+            "question_ref",
+            "quest_ref",
+            "goal_revision_ref",
+            "foreground_epoch",
+            "disposition",
+            "claim",
+            "evidence",
+                "missing_evidence",
+                "uncertainty_basis",
+                "support_scope",
+                "limitations",
+                "causal_interpretation",
+                "research_synthesis",
+                "is_authoritative",
+        }
+        or scientific_outcome.get("schema_ref")
+        != SCIENTIFIC_OUTCOME_SCHEMA_REF
+        or scientific_outcome.get("kind") != "ScientificOutcomeCandidate"
+        or scientific_outcome.get("disposition") not in SCIENTIFIC_OUTCOMES
+        or scientific_outcome.get("is_authoritative") is not False
+        or scientific_outcome.get("stage_run_request_ref") != run.request_ref
+        or scientific_outcome.get("cycle_ref") != run.cycle_ref
+        or scientific_outcome.get("foreground_epoch") != int(run.epoch)
+        or any(
+            not _runtime_ref(scientific_outcome.get(field))
+            for field in (
+                "outcome_ref",
+                "stage_run_request_ref",
+                "cycle_ref",
+                "question_ref",
+                "quest_ref",
+                "goal_revision_ref",
+            )
+        )
+        or not isinstance(scientific_outcome.get("evidence"), list)
+        or not isinstance(scientific_outcome.get("missing_evidence"), list)
+        or not isinstance(scientific_outcome.get("uncertainty_basis"), list)
+        or not isinstance(scientific_outcome.get("support_scope"), list)
+        or not isinstance(scientific_outcome.get("limitations"), list)
+        or not isinstance(
+            scientific_outcome.get("causal_interpretation"), dict
+        )
+        or not isinstance(scientific_outcome.get("research_synthesis"), dict)
+    ):
+        raise OwnerConflict("reasoning_autonomous_checkpoint_binding_invalid")
+    try:
+        validate_autonomous_question_scope(
+            autonomous_scope,
+            source_outcome=scientific_outcome,
+        )
+    except ReasoningContractError as error:
+        raise OwnerConflict(str(error)) from error
+    _validate_reasoning_checkpoint_review(
+        review,
+        native_session_ref=native_session_ref,
+        primary_draft_hash=primary_draft.draft_hash,
+        checkpoint_hash=checkpoint_hash,
+    )
+
+
+def _reasoning_autonomous_checkpoint(
+    run, attempt, session
+) -> ReasoningAutonomousCheckpoint | None:
+    values = (
+        attempt.reasoning_checkpoint_ref,
+        attempt.reasoning_checkpoint_json,
+        attempt.reasoning_checkpoint_hash,
+        attempt.reasoning_checkpoint_review_json,
+        attempt.reasoning_checkpoint_review_hash,
+        attempt.reasoning_checkpoint_receipt_ref,
+        attempt.reasoning_checkpoint_receipt_hash,
+        attempt.reasoning_checkpoint_recorded_at,
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise OwnerConflict("reasoning_autonomous_checkpoint_integrity_invalid")
+    primary_draft = _primary_draft(run, attempt, session)
+    if primary_draft is None:
+        raise OwnerConflict("reasoning_autonomous_checkpoint_integrity_invalid")
+    try:
+        checkpoint = decoded_object(attempt.reasoning_checkpoint_json)
+        review = decoded_object(attempt.reasoning_checkpoint_review_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict(
+            "reasoning_autonomous_checkpoint_integrity_invalid"
+        ) from error
+    if (
+        not isinstance(checkpoint, dict)
+        or not isinstance(review, dict)
+        or canonical_json(checkpoint) != attempt.reasoning_checkpoint_json
+        or canonical_json(review) != attempt.reasoning_checkpoint_review_json
+        or canonical_hash(checkpoint) != attempt.reasoning_checkpoint_hash
+        or canonical_hash(review) != attempt.reasoning_checkpoint_review_hash
+        or not _runtime_ref(attempt.reasoning_checkpoint_ref)
+        or not _runtime_ref(attempt.reasoning_checkpoint_receipt_ref)
+        or not _is_sha256(attempt.reasoning_checkpoint_hash)
+        or not _is_sha256(attempt.reasoning_checkpoint_review_hash)
+        or not _is_sha256(attempt.reasoning_checkpoint_receipt_hash)
+        or not isinstance(attempt.reasoning_checkpoint_recorded_at, (int, float))
+        or not math.isfinite(float(attempt.reasoning_checkpoint_recorded_at))
+        or float(attempt.reasoning_checkpoint_recorded_at) <= 0
+    ):
+        raise OwnerConflict("reasoning_autonomous_checkpoint_integrity_invalid")
+    _validate_reasoning_autonomous_checkpoint_material(
+        run,
+        attempt,
+        session,
+        primary_draft=primary_draft,
+        native_session_ref=primary_draft.native_session_ref,
+        checkpoint=checkpoint,
+        checkpoint_hash=attempt.reasoning_checkpoint_hash,
+        review=review,
+        review_hash=attempt.reasoning_checkpoint_review_hash,
+    )
+    bindings = _reasoning_autonomous_checkpoint_bindings(
+        request_ref=run.request_ref,
+        run_ref=run.run_ref,
+        attempt_ref=attempt.attempt_ref,
+        fence_ref=attempt.fence_ref,
+        root_session_ref=session.session_ref,
+        native_session_ref=primary_draft.native_session_ref,
+        runtime_binding_hash=run.runtime_binding_hash,
+        primary_draft_hash=primary_draft.draft_hash,
+        checkpoint_hash=attempt.reasoning_checkpoint_hash,
+        review_hash=attempt.reasoning_checkpoint_review_hash,
+    )
+    if attempt.reasoning_checkpoint_receipt_hash != _owner_receipt_hash(
+        REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND,
+        attempt.reasoning_checkpoint_ref,
+        bindings,
+    ):
+        raise OwnerConflict("reasoning_autonomous_checkpoint_integrity_invalid")
+    return ReasoningAutonomousCheckpoint(
+        checkpoint_ref=attempt.reasoning_checkpoint_ref,
+        request_ref=run.request_ref,
+        run_ref=run.run_ref,
+        attempt_ref=attempt.attempt_ref,
+        fence_ref=attempt.fence_ref,
+        native_session_ref=primary_draft.native_session_ref,
+        runtime_binding=cast(ReasoningRuntimeBinding, _runtime_binding_from_row(run)),
+        runtime_binding_hash=run.runtime_binding_hash,
+        primary_draft_hash=primary_draft.draft_hash,
+        checkpoint=checkpoint,
+        checkpoint_hash=attempt.reasoning_checkpoint_hash,
+        review=review,
+        review_hash=attempt.reasoning_checkpoint_review_hash,
+        receipt=AcceptanceReceipt(
+            issuer=AR_OWNER,
+            kind=REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND,
+            receipt_ref=attempt.reasoning_checkpoint_receipt_ref,
+            subject_ref=attempt.reasoning_checkpoint_ref,
+            payload_hash=attempt.reasoning_checkpoint_receipt_hash,
+        ),
+    )
+
+
 def _primary_draft(run, attempt, session) -> IdeaPrimaryDraft | None:
     values = (
         attempt.primary_draft_json,
@@ -19560,6 +20670,35 @@ def _primary_draft(run, attempt, session) -> IdeaPrimaryDraft | None:
         draft=draft,
         draft_hash=attempt.primary_draft_hash,
         adapter_kind=attempt.primary_adapter_kind,
+    )
+
+
+def _stage_reviewed_draft_matches(
+    run,
+    attempt,
+    session,
+    *,
+    primary_draft: IdeaPrimaryDraft,
+    reviewed_draft_hash: str,
+) -> bool:
+    """Accept either the primary draft or AR's reviewed autonomous checkpoint.
+
+    A Reasoning child review may revise a non-terminal AutonomousCreation
+    checkpoint before AR records it.  The eventual final review resumes from
+    that exact durable checkpoint, while the original primary hash remains
+    immutable provenance on the same Attempt.
+    """
+
+    if primary_draft.draft_hash == reviewed_draft_hash:
+        return True
+    if run.stage != "reasoning":
+        return False
+    checkpoint = _reasoning_autonomous_checkpoint(run, attempt, session)
+    return bool(
+        checkpoint is not None
+        and checkpoint.primary_draft_hash == primary_draft.draft_hash
+        and checkpoint.native_session_ref == primary_draft.native_session_ref
+        and checkpoint.checkpoint_hash == reviewed_draft_hash
     )
 
 
@@ -20673,14 +21812,30 @@ def _writing_execution_from_row(row) -> WritingExecution | None:
 
 
 def _validated_runtime_binding(
-    binding: IdeaRuntimeBinding | PlanRuntimeBinding | BundleRuntimeBinding,
+    binding: (
+        IdeaRuntimeBinding
+        | PlanRuntimeBinding
+        | BundleRuntimeBinding
+        | ReasoningRuntimeBinding
+    ),
     *,
     stage: str | None = None,
-) -> tuple[IdeaRuntimeBinding | PlanRuntimeBinding | BundleRuntimeBinding, str, str]:
+) -> tuple[
+    IdeaRuntimeBinding
+    | PlanRuntimeBinding
+    | BundleRuntimeBinding
+    | ReasoningRuntimeBinding,
+    str,
+    str,
+]:
     expected = {
         "idea": (IdeaRuntimeBinding, IDEA_RUNTIME_BINDING_SCHEMA),
         "plan": (PlanRuntimeBinding, PLAN_RUNTIME_BINDING_SCHEMA),
         "bundle": (BundleRuntimeBinding, BUNDLE_RUNTIME_BINDING_SCHEMA),
+        "reasoning": (
+            ReasoningRuntimeBinding,
+            REASONING_RUNTIME_BINDING_SCHEMA,
+        ),
     }
     expected_type, expected_schema = expected.get(
         stage or "idea", (IdeaRuntimeBinding, IDEA_RUNTIME_BINDING_SCHEMA)
@@ -20723,8 +21878,8 @@ def _validated_runtime_binding(
         for resource in binding.resource_bindings
         if resource.startswith("harness-artifact:full-conformance-")
     )
-    bundle_full_conformance_valid = (
-        stage == "bundle"
+    full_conformance_valid = (
+        stage in {"bundle", "reasoning"}
         and "harness-full-conformance-v1" in binding.capability_bindings
         and "semantic-mcp-resident" in binding.capability_bindings
         and "mcp-config-empty" not in binding.capability_bindings
@@ -20773,14 +21928,27 @@ def _validated_runtime_binding(
             for item in full_conformance_resources
         )
     )
-    if (
-        (stage == "bundle" and not bundle_full_conformance_valid)
-        or (stage != "bundle" and binding.mcp_bindings)
+    reasoning_binding_valid = stage == "reasoning" and (
+        full_conformance_valid
         or (
-            stage != "bundle"
+            not binding.mcp_bindings
+            and "harness-full-conformance-v1"
+            not in binding.capability_bindings
+            and not full_conformance_resources
+        )
+    )
+    if (
+        (stage == "bundle" and not full_conformance_valid)
+        or (stage == "reasoning" and not reasoning_binding_valid)
+        or (stage not in {"bundle", "reasoning"} and binding.mcp_bindings)
+        or (
+            stage not in {"bundle", "reasoning"}
             and "harness-full-conformance-v1" in binding.capability_bindings
         )
-        or (stage != "bundle" and full_conformance_resources)
+        or (
+            stage not in {"bundle", "reasoning"}
+            and full_conformance_resources
+        )
         or any(
             capability not in _IDEA_SAFE_CAPABILITIES
             for capability in binding.capability_bindings
@@ -20831,6 +21999,7 @@ def _validate_attempt_review_for_write(
         "idea": IDEA_REVIEW_SCHEMA_REF,
         "plan": PLAN_REVIEW_SCHEMA_REF,
         "bundle": TARGET_PLAN_REVIEW_SCHEMA_REF,
+        "reasoning": REASONING_REVIEW_SCHEMA_REF,
     }.get(stage)
     if expected_schema is None:
         raise OwnerConflict("stage_run_integrity_invalid")
@@ -20851,7 +22020,12 @@ def _validate_attempt_review_for_write(
 
 def _runtime_binding_from_row(
     row,
-) -> IdeaRuntimeBinding | PlanRuntimeBinding | BundleRuntimeBinding:
+) -> (
+    IdeaRuntimeBinding
+    | PlanRuntimeBinding
+    | BundleRuntimeBinding
+    | ReasoningRuntimeBinding
+):
     try:
         value = decoded_object(row.runtime_binding_json)
         if set(value) != {
@@ -20876,6 +22050,7 @@ def _runtime_binding_from_row(
             "idea": IdeaRuntimeBinding,
             "plan": PlanRuntimeBinding,
             "bundle": BundleRuntimeBinding,
+            "reasoning": ReasoningRuntimeBinding,
         }.get(row.stage)
         if binding_type is None:
             raise TypeError("stage")
@@ -24807,6 +25982,7 @@ def create_agent_runtime_interface(
     bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
     target_run_harness_verifier: TargetRunHarnessVerifier | None = None,
     bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
+    reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
         database,
@@ -24823,6 +25999,7 @@ def create_agent_runtime_interface(
         bundle_report_evidence_verifier,
         target_run_harness_verifier,
         bundle_exhaustion_verifier,
+        reasoning_outcome_verifier=reasoning_outcome_verifier,
     )
 
 

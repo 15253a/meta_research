@@ -19,6 +19,7 @@ IDEA_REVIEW_SCHEMA_V1_REF = "meta-research/idea-advisory-review/v1"
 IDEA_REVIEW_SCHEMA_REF = "meta-research/idea-advisory-review/v2"
 IDEA_CONTEXT_PACK_SCHEMA_REF = "meta-research/idea-context-pack/v1"
 IDEA_CONTEXT_PACK_SCHEMA_V2_REF = "meta-research/idea-context-pack/v2"
+IDEA_CONTEXT_PACK_SCHEMA_V3_REF = "meta-research/idea-context-pack/v3"
 MAX_IDEA_CONTEXT_EVIDENCE_REFS = 100
 MAX_IDEA_CONTEXT_GUIDANCE_BINDINGS = 100
 _IDEA_CONTEXT_PACK_V1_FIELDS = {
@@ -32,6 +33,22 @@ _IDEA_CONTEXT_PACK_V1_FIELDS = {
 }
 _IDEA_CONTEXT_PACK_V2_FIELDS = _IDEA_CONTEXT_PACK_V1_FIELDS | {
     "evidence_reference_revision"
+}
+_IDEA_CONTEXT_PACK_V3_FIELDS = _IDEA_CONTEXT_PACK_V2_FIELDS
+_PRIOR_REASONING_BINDING_FIELDS = {
+    "stage",
+    "commit_ref",
+    "cycle_ref",
+    "epoch",
+    "disposition",
+    "receipt",
+    "request_ref",
+    "run_ref",
+    "outcome_ref",
+    "outcome_kind",
+    "run_completion_receipt",
+    "outcome_receipt",
+    "closure",
 }
 _MATERIAL_IDENTITY_FIELDS = {
     "candidate_key",
@@ -227,27 +244,50 @@ def validate_idea_context_pack(
         raise IdeaContractError("idea_context_pack_invalid")
     schema_ref = context_pack.get("schema_ref")
     expected_fields = (
-        _IDEA_CONTEXT_PACK_V2_FIELDS
-        if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V2_REF
-        else _IDEA_CONTEXT_PACK_V1_FIELDS
+        _IDEA_CONTEXT_PACK_V3_FIELDS
+        if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V3_REF
+        else (
+            _IDEA_CONTEXT_PACK_V2_FIELDS
+            if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V2_REF
+            else _IDEA_CONTEXT_PACK_V1_FIELDS
+        )
     )
     if set(context_pack) != expected_fields:
         raise IdeaContractError("idea_context_pack_invalid")
     if (
         schema_ref
-        not in {IDEA_CONTEXT_PACK_SCHEMA_REF, IDEA_CONTEXT_PACK_SCHEMA_V2_REF}
+        not in {
+            IDEA_CONTEXT_PACK_SCHEMA_REF,
+            IDEA_CONTEXT_PACK_SCHEMA_V2_REF,
+            IDEA_CONTEXT_PACK_SCHEMA_V3_REF,
+        }
         or context_pack["cycle_ref"] != cycle_ref
         or context_pack["accepted_question_binding"] != accepted_question_binding
-        or context_pack["prior_accepted_bindings"] != []
     ):
         raise IdeaContractError("idea_context_pack_invalid")
     literature = context_pack["literature_binding"]
     if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_REF:
-        if literature is not None:
+        if literature is not None or context_pack["prior_accepted_bindings"] != []:
             raise IdeaContractError("idea_context_pack_invalid")
-    elif literature is not None:
-        _validate_literature_binding(literature)
-    if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V2_REF:
+    elif schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V2_REF:
+        if context_pack["prior_accepted_bindings"] != []:
+            raise IdeaContractError("idea_context_pack_invalid")
+        if literature is not None:
+            _validate_literature_binding(literature)
+    else:
+        _validate_question_literature_revision_binding(
+            literature,
+            question_ref=cast(dict[str, object], accepted_question_binding).get(
+                "question_ref"
+            ),
+        )
+        _validate_prior_reasoning_bindings(
+            context_pack["prior_accepted_bindings"]
+        )
+    if schema_ref in {
+        IDEA_CONTEXT_PACK_SCHEMA_V2_REF,
+        IDEA_CONTEXT_PACK_SCHEMA_V3_REF,
+    }:
         revision = context_pack["evidence_reference_revision"]
         if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
             raise IdeaContractError("idea_context_pack_invalid")
@@ -324,8 +364,137 @@ def literature_binding(
     value = context_pack.get("literature_binding")
     if value is None:
         return None
-    _validate_literature_binding(value)
+    if context_pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V3_REF:
+        accepted = context_pack.get("accepted_question_binding")
+        question_ref = (
+            accepted.get("question_ref") if isinstance(accepted, dict) else None
+        )
+        _validate_question_literature_revision_binding(
+            value, question_ref=question_ref
+        )
+    else:
+        _validate_literature_binding(value)
     return cast(dict[str, object], value)
+
+
+def _validate_question_literature_revision_binding(
+    value: object, *, question_ref: object
+) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "revision_ref",
+        "question_ref",
+        "literature_snapshot_ref",
+        "records",
+        "rm_acceptance_receipt_ref",
+        "rg_question_association_receipt_ref",
+        "receipt",
+    }:
+        raise IdeaContractError("idea_context_pack_invalid")
+    receipt = value.get("receipt")
+    if (
+        value.get("kind") != "QuestionLiteratureRevision"
+        or value.get("question_ref") != question_ref
+        or not isinstance(value.get("records"), list)
+        or not all(
+            isinstance(value.get(field), str) and value.get(field)
+            for field in (
+                "revision_ref",
+                "question_ref",
+                "literature_snapshot_ref",
+                "rm_acceptance_receipt_ref",
+                "rg_question_association_receipt_ref",
+            )
+        )
+        or not isinstance(receipt, dict)
+        or receipt.get("status") != "accepted"
+        or receipt.get("issuer") != "research_memory"
+        or receipt.get("kind") != "question_literature_revision_acceptance"
+        or receipt.get("subject_ref") != value.get("revision_ref")
+        or receipt.get("receipt_ref") != value.get("rm_acceptance_receipt_ref")
+        or not _is_hash(receipt.get("payload_hash"))
+    ):
+        raise IdeaContractError("idea_context_pack_invalid")
+
+
+def _validate_prior_reasoning_bindings(value: object) -> None:
+    if not isinstance(value, list) or not value:
+        raise IdeaContractError("idea_context_pack_invalid")
+    identities: list[tuple[str, int]] = []
+    for binding in value:
+        if not isinstance(binding, dict) or set(binding) != (
+            _PRIOR_REASONING_BINDING_FIELDS
+        ):
+            raise IdeaContractError("idea_context_pack_invalid")
+        closure = binding.get("closure")
+        if (
+            binding.get("stage") != "reasoning"
+            or binding.get("disposition") != "completed"
+            or binding.get("outcome_kind") != "reasoning_outcome"
+            or not isinstance(binding.get("epoch"), int)
+            or isinstance(binding.get("epoch"), bool)
+            or cast(int, binding["epoch"]) < 1
+            or not all(
+                isinstance(binding.get(field), str) and binding.get(field)
+                for field in (
+                    "commit_ref",
+                    "cycle_ref",
+                    "request_ref",
+                    "run_ref",
+                    "outcome_ref",
+                )
+            )
+            or not isinstance(closure, dict)
+            or closure.get("transition_kind")
+            not in {"next_cycle_proposal", "candidate_completion"}
+        ):
+            raise IdeaContractError("idea_context_pack_invalid")
+        _validate_public_receipt(
+            binding.get("run_completion_receipt"),
+            issuer="agent_runtime",
+            subject_ref=binding.get("run_ref"),
+        )
+        _validate_public_receipt(
+            binding.get("outcome_receipt"),
+            issuer="research_graph",
+            subject_ref=binding.get("outcome_ref"),
+        )
+        _validate_public_receipt(
+            binding.get("receipt"),
+            issuer="advancement_engine",
+            subject_ref=binding.get("commit_ref"),
+        )
+        identities.append(
+            (cast(str, binding["cycle_ref"]), cast(int, binding["epoch"]))
+        )
+    if identities != sorted(set(identities), key=lambda item: item[1]):
+        raise IdeaContractError("idea_context_pack_invalid")
+
+
+def _validate_public_receipt(
+    value: object, *, issuer: str, subject_ref: object
+) -> None:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "status",
+            "issuer",
+            "kind",
+            "receipt_ref",
+            "subject_ref",
+            "payload_hash",
+        }
+        or value.get("status") != "accepted"
+        or value.get("issuer") != issuer
+        or value.get("subject_ref") != subject_ref
+        or not isinstance(value.get("kind"), str)
+        or not value.get("kind")
+        or not isinstance(value.get("receipt_ref"), str)
+        or not value.get("receipt_ref")
+        or not _is_hash(value.get("payload_hash"))
+    ):
+        raise IdeaContractError("idea_context_pack_invalid")
 
 
 def _validate_literature_binding(value: object) -> None:

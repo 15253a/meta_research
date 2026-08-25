@@ -923,7 +923,7 @@ def test_target_run_inbox_migration_is_atomic_and_retryable(
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0029_target_root_lifecycle",)
+        ).fetchone() == ("0033_reasoning_successor_context",)
         tables = {
             row[0]
             for row in connection.execute(

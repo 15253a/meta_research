@@ -71,7 +71,7 @@ def test_existing_0015_data_upgrades_to_one_durable_harness_run_model(
         ).fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
 
-        assert version == ("0029_target_root_lifecycle",)
+        assert version == ("0033_reasoning_successor_context",)
         assert _HARNESS_TABLES <= tables
         assert "ar_harness_sessions" not in tables
         assert "ar_harness_attempts" not in tables

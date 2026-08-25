@@ -72,6 +72,12 @@ BUNDLE_ROOT_SEMANTIC_OPERATION_IDS = (
     "agent_runtime.bundle_inbox.read",
 )
 
+REASONING_ROOT_SEMANTIC_OPERATION_IDS = (
+    "advancement_engine.reasoning_stage_run.observe",
+    "research_memory.reasoning_evidence.read",
+    "research_graph.reasoning_context.read",
+)
+
 # These boundaries are intentionally not Semantic MCP tools.  The Bundle
 # daemon deterministically reconstructs the fixed report from issuer-owned
 # facts and then advances one idempotent Owner transaction per tick.  Listing
@@ -299,11 +305,17 @@ def create_semantic_owner_gateway(
         if research_memory is None:
             raise ValueError("formal semantic catalog requires research memory")
         operations.extend(
-            _bundle_target_operations(
-                advancement_engine=advancement_engine,
-                research_graph=research_graph,
-                research_memory=research_memory,
-                agent_runtime=agent_runtime,
+            (
+                *_bundle_target_operations(
+                    advancement_engine=advancement_engine,
+                    research_graph=research_graph,
+                    research_memory=research_memory,
+                    agent_runtime=agent_runtime,
+                ),
+                *_reasoning_operations(
+                    advancement_engine=advancement_engine,
+                    agent_runtime=agent_runtime,
+                ),
             )
         )
     if target_run_agent is not None:
@@ -411,6 +423,65 @@ def _bundle_target_operations(
             output_schema=_bundle_inbox_output_schema(),
             handler=lambda context, arguments: _read_bundle_inbox(
                 agent_runtime, context, arguments
+            ),
+        ),
+    )
+
+
+def _reasoning_operations(
+    *,
+    advancement_engine: AdvancementEngineInterface,
+    agent_runtime: AgentRuntimeInterface,
+) -> tuple[SemanticOperation, ...]:
+    return (
+        SemanticOperation(
+            semantic_operation_id=(
+                "advancement_engine.reasoning_stage_run.observe"
+            ),
+            owning_module="advancement_engine",
+            description=(
+                "Observe the exact current AE Reasoning StageRunRequest and "
+                "its AR scope."
+            ),
+            input_schema=_empty_schema(),
+            output_schema=_reasoning_stage_run_output_schema(),
+            handler=lambda context, arguments: _observe_reasoning_stage_run(
+                advancement_engine,
+                agent_runtime,
+                context,
+                arguments,
+            ),
+        ),
+        SemanticOperation(
+            semantic_operation_id="research_memory.reasoning_evidence.read",
+            owning_module="research_memory",
+            description=(
+                "Read the issuer-frozen literature, Plan, and accepted Target "
+                "evidence inputs for the current Reasoning Run."
+            ),
+            input_schema=_empty_schema(),
+            output_schema=_reasoning_evidence_output_schema(),
+            handler=lambda context, arguments: _read_reasoning_evidence(
+                advancement_engine,
+                agent_runtime,
+                context,
+                arguments,
+            ),
+        ),
+        SemanticOperation(
+            semantic_operation_id="research_graph.reasoning_context.read",
+            owning_module="research_graph",
+            description=(
+                "Read the accepted Question, upstream closure, and frozen "
+                "research context for the current Reasoning Run."
+            ),
+            input_schema=_empty_schema(),
+            output_schema=_reasoning_context_output_schema(),
+            handler=lambda context, arguments: _read_reasoning_context(
+                advancement_engine,
+                agent_runtime,
+                context,
+                arguments,
             ),
         ),
     )
@@ -675,6 +746,115 @@ def _observe_bundle_run_binding(
         "run_status": run.status,
         "runtime_binding_hash": run.runtime_binding_hash,
         "runtime_binding": run.runtime_binding.as_dict(),
+    }
+
+
+def _reasoning_stage_run(
+    advancement_engine: AdvancementEngineInterface,
+    agent_runtime: AgentRuntimeInterface,
+    context: SemanticCallContext,
+):
+    try:
+        agent_runtime.verify_reasoning_runtime_scope(
+            run_ref=context.run_ref,
+            attempt_ref=context.attempt_ref,
+            root_session_ref=context.root_session_ref,
+            fence_ref=context.fence_ref,
+            runtime_binding_hash=context.capability_binding_hash,
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError("semantic_call_scope_stale") from error
+    managed = agent_runtime.query_managed_run(context.run_ref)
+    cycle_ref = None if managed is None else managed.get("cycle_ref")
+    if (
+        managed is None
+        or managed.get("run_kind") != "reasoning_stage"
+        or managed.get("attempt_ref") != context.attempt_ref
+        or managed.get("root_session_ref") != context.root_session_ref
+        or managed.get("fence_ref") != context.fence_ref
+        or not isinstance(cycle_ref, str)
+    ):
+        raise SemanticMcpError("semantic_call_scope_stale")
+    request = advancement_engine.query_reasoning_stage_request(cycle_ref)
+    if request is None:
+        raise SemanticMcpError("reasoning_stage_run_unavailable")
+    run = agent_runtime.query_reasoning_stage_run(request.request_ref)
+    if run is None or (
+        run.run_ref != context.run_ref
+        or run.attempt_ref != context.attempt_ref
+        or run.root_session_ref != context.root_session_ref
+        or run.fence_ref != context.fence_ref
+        or run.runtime_binding_hash != context.capability_binding_hash
+    ):
+        raise SemanticMcpError("semantic_call_scope_stale")
+    return request, run
+
+
+def _observe_reasoning_stage_run(
+    advancement_engine: AdvancementEngineInterface,
+    agent_runtime: AgentRuntimeInterface,
+    context: SemanticCallContext,
+    _arguments: dict[str, object],
+) -> dict[str, object]:
+    request, run = _reasoning_stage_run(
+        advancement_engine, agent_runtime, context
+    )
+    return {
+        "status": "current",
+        "request_ref": request.request_ref,
+        "cycle_ref": request.cycle_ref,
+        "stage": request.stage,
+        "epoch": request.epoch,
+        "context_pack_ref": request.context_pack_ref,
+        "context_pack_hash": request.context_pack_hash,
+        "request_receipt": request.receipt.as_public_dict(),
+        "run_ref": run.run_ref,
+        "attempt_ref": run.attempt_ref,
+        "root_session_ref": run.root_session_ref,
+        "fence_ref": run.fence_ref,
+        "runtime_binding_hash": run.runtime_binding_hash,
+    }
+
+
+def _read_reasoning_evidence(
+    advancement_engine: AdvancementEngineInterface,
+    agent_runtime: AgentRuntimeInterface,
+    context: SemanticCallContext,
+    _arguments: dict[str, object],
+) -> dict[str, object]:
+    request, _run = _reasoning_stage_run(
+        advancement_engine, agent_runtime, context
+    )
+    pack = request.context_pack
+    return {
+        "status": "current",
+        "request_ref": request.request_ref,
+        "context_pack_hash": request.context_pack_hash,
+        "question_literature_input": pack["question_literature_input"],
+        "plan_evidence_input": pack["plan_evidence_input"],
+        "accepted_target_commit_closures": pack[
+            "accepted_target_commit_closures"
+        ],
+    }
+
+
+def _read_reasoning_context(
+    advancement_engine: AdvancementEngineInterface,
+    agent_runtime: AgentRuntimeInterface,
+    context: SemanticCallContext,
+    _arguments: dict[str, object],
+) -> dict[str, object]:
+    request, _run = _reasoning_stage_run(
+        advancement_engine, agent_runtime, context
+    )
+    pack = request.context_pack
+    return {
+        "status": "current",
+        "request_ref": request.request_ref,
+        "context_pack_hash": request.context_pack_hash,
+        "accepted_question_binding": pack["accepted_question_binding"],
+        "upstream_stage_closure": pack["upstream_stage_closure"],
+        "research_context": pack["research_context"],
     }
 
 
@@ -1865,6 +2045,89 @@ def _bundle_run_binding_output_schema() -> dict[str, object]:
     )
 
 
+def _reasoning_stage_run_output_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "status": _string(enum=("current",)),
+            "request_ref": _string(),
+            "cycle_ref": _string(),
+            "stage": _string(enum=("reasoning",)),
+            "epoch": {"type": "integer", "minimum": 1},
+            "context_pack_ref": _string(),
+            "context_pack_hash": _hash_schema(),
+            "request_receipt": _receipt_schema(),
+            "run_ref": _string(),
+            "attempt_ref": _string(),
+            "root_session_ref": _string(),
+            "fence_ref": _string(),
+            "runtime_binding_hash": _hash_schema(),
+        },
+        required=(
+            "status",
+            "request_ref",
+            "cycle_ref",
+            "stage",
+            "epoch",
+            "context_pack_ref",
+            "context_pack_hash",
+            "request_receipt",
+            "run_ref",
+            "attempt_ref",
+            "root_session_ref",
+            "fence_ref",
+            "runtime_binding_hash",
+        ),
+    )
+
+
+def _reasoning_evidence_output_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "status": _string(enum=("current",)),
+            "request_ref": _string(),
+            "context_pack_hash": _hash_schema(),
+            "question_literature_input": {"type": "object"},
+            "plan_evidence_input": {"type": "object"},
+            "accepted_target_commit_closures": {
+                "type": "array",
+                "items": {"type": "object"},
+            },
+        },
+        required=(
+            "status",
+            "request_ref",
+            "context_pack_hash",
+            "question_literature_input",
+            "plan_evidence_input",
+            "accepted_target_commit_closures",
+        ),
+    )
+
+
+def _reasoning_context_output_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "status": _string(enum=("current",)),
+            "request_ref": _string(),
+            "context_pack_hash": _hash_schema(),
+            "accepted_question_binding": {"type": "object"},
+            "upstream_stage_closure": {
+                "type": "array",
+                "items": {"type": "object"},
+            },
+            "research_context": {"type": "object"},
+        },
+        required=(
+            "status",
+            "request_ref",
+            "context_pack_hash",
+            "accepted_question_binding",
+            "upstream_stage_closure",
+            "research_context",
+        ),
+    )
+
+
 def _target_ref_schema() -> dict[str, object]:
     return _closed_object({"target_ref": _string()}, required=("target_ref",))
 
@@ -2164,6 +2427,7 @@ def _string_array() -> dict[str, object]:
 __all__ = [
     "BUNDLE_DAEMON_COMPLETION_BOUNDARIES",
     "BUNDLE_ROOT_SEMANTIC_OPERATION_IDS",
+    "REASONING_ROOT_SEMANTIC_OPERATION_IDS",
     "BUNDLE_TARGET_SEMANTIC_MISSING_MATRIX",
     "MissingSemanticOwnerOperation",
     "TARGET_RUN_DAEMON_BOUNDARIES",

@@ -111,6 +111,9 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "idea_stage_worker",
             "plan_stage_worker",
             "bundle_stage_worker",
+            "reasoning_stage_worker",
+            "autonomous_creation_worker",
+            "quest_completion_worker",
             "target_run_worker",
             "target_root_lifecycle",
             "research_asset_intake_worker",
@@ -118,9 +121,9 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "quest_drafting_worker",
             "first_question_deepfetch_worker",
             "quest_reconciliation_worker",
-                "experiment_worker",
-                "writing_worker",
-            }
+            "experiment_worker",
+            "writing_worker",
+        }
         assert snapshot["research_space"] == {
             "status": "empty",
             "quest_count": 0,
