@@ -902,7 +902,7 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert version == ("0033_reasoning_successor_context",)
+    assert version == ("0034_writing_delivery",)
     assert "formal_content_count" in columns
     assert "hc_quest_initializations" in tables
     assert "hc_proposal_generation_attempts" in tables
@@ -967,7 +967,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0033_reasoning_successor_context",)
+        ).fetchone() == ("0034_writing_delivery",)
 
 
 def test_process_exit_mid_0003_ddl_recovers_on_the_next_upgrade(
@@ -1025,7 +1025,7 @@ upgrade_database(Path(sys.argv[1]))
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0033_reasoning_successor_context",)
+        ).fetchone() == ("0034_writing_delivery",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -1147,7 +1147,7 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 ("d" * 64,),
             )
 
-    assert version == ("0033_reasoning_successor_context",)
+    assert version == ("0034_writing_delivery",)
     assert feed == ("legacy.event", '{"kept":true}', 17.0)
     assert auth == ("a" * 64, "b" * 64, 18.0, 1800.0, None)
     assert initialization == (
@@ -1237,7 +1237,7 @@ def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0033_reasoning_successor_context",)
+        ).fetchone() == ("0034_writing_delivery",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -1292,7 +1292,7 @@ def test_interrupted_0005_rolls_back_and_converges_on_retry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0033_reasoning_successor_context",)
+        ).fetchone() == ("0034_writing_delivery",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -1368,7 +1368,7 @@ def test_0005_backfills_existing_rm_contents_without_changing_identity_or_receip
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0033_reasoning_successor_context",)
+        ).fetchone() == ("0034_writing_delivery",)
         original_formal = connection.execute(
             "SELECT content_ref, content_hash, object_path, receipt_ref, "
             "receipt_hash FROM rm_formal_question_contents"
@@ -1562,7 +1562,7 @@ def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0033_reasoning_successor_context",)
+        ).fetchone() == ("0034_writing_delivery",)
         assert connection.execute(
             "SELECT object_path, content_hash, byte_count FROM rm_managed_objects"
         ).fetchone() == (object_path, digest, len(payload))
@@ -1898,7 +1898,7 @@ def test_interrupted_0007_rolls_back_typed_runs_and_snapshot_bindings(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0033_reasoning_successor_context",)
+        ).fetchone() == ("0034_writing_delivery",)
         tables = {
             row[0]
             for row in connection.execute(
@@ -2013,7 +2013,7 @@ def test_interrupted_0008_rolls_back_acquisition_sessions_and_converges(
         }
         foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
-    assert version == ("0033_reasoning_successor_context",)
+    assert version == ("0034_writing_delivery",)
     assert {
         "ar_acquisition_sessions",
         "ar_acquisition_requests",
@@ -2435,7 +2435,7 @@ def test_interrupted_0009_rolls_back_whole_revision_and_converges(
         foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA quick_check").fetchone()
 
-    assert version == ("0033_reasoning_successor_context",)
+    assert version == ("0034_writing_delivery",)
     assert {
         "owner_human_requests",
         "hc_command_previews",
@@ -2700,7 +2700,7 @@ def test_interrupted_0009_restores_literature_identity_and_converges(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0033_reasoning_successor_context",)
+        ).fetchone() == ("0034_writing_delivery",)
         backfilled = connection.execute(
             "SELECT creation_context_kind, creation_context_ref, quest_ref "
             "FROM rm_literature_snapshots WHERE snapshot_ref = 'snapshot_before_0009'"

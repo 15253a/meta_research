@@ -188,6 +188,10 @@ from meta_research.owners.human_requests import (
     HumanRequestOwnerMixin,
     HumanResponseVerifier,
 )
+from meta_research.owners.writing_delivery_runtime import (
+    SQLiteWritingDeliveryRuntime,
+    WritingDeliveryAuthority,
+)
 from meta_research.owners.advancement_engine import StageRunRequest
 from meta_research.bundle_protocol import StageRunRequest as BundleCompletionRequest
 from meta_research.provider_supervisor import (
@@ -205,9 +209,14 @@ from meta_research.writing_contract import (
     WritingCitationDecisionVerifier,
     WritingIntentBinding,
     WritingRuntimeBinding,
-    normalize_report_intent,
+    normalize_writing_intent,
+    validate_writing_document,
     validate_writing_execution_budget,
     writing_child_review_task_hash,
+)
+from meta_research.writing_delivery import (
+    WritingDeliveryProviderRegistry,
+    default_writing_delivery_registry,
 )
 
 
@@ -876,6 +885,7 @@ class WritingRun:
     run_ref: str
     intent_id: str
     quest_ref: str
+    document_type: str
     status: str
     attempt_ref: str
     attempt_generation: int
@@ -920,6 +930,9 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
 
     @property
     def harness_runs(self) -> AgentRuntimeHarnessInterface: ...
+
+    @property
+    def writing_delivery(self) -> WritingDeliveryAuthority: ...
 
     def query_snapshot(self) -> OwnerSnapshot: ...
 
@@ -1958,7 +1971,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "active_experiment_run_count, control_operation_count, safe_point_count, "
         "fenced_attempt_count, writing_run_count, writing_attempt_count, "
         "writing_session_count, "
-        "active_writing_run_count "
+        "active_writing_run_count, writing_delivery_operation_count, "
+        "writing_delivery_completed_count, writing_delivery_reconciliation_count "
         "FROM agent_runtime_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -1990,6 +2004,9 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "writing_attempt_count",
         "writing_session_count",
         "active_writing_run_count",
+        "writing_delivery_operation_count",
+        "writing_delivery_completed_count",
+        "writing_delivery_reconciliation_count",
     ),
 )
 
@@ -5480,6 +5497,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             BundleReportDispositionReceiptVerifier | None
         ) = None,
         reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
+        writing_delivery_provider_registry: (
+            WritingDeliveryProviderRegistry | None
+        ) = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -5512,6 +5532,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self._configure_human_request_owner(
             database, feed, AR_OWNER, human_response_verifier
         )
+        self._writing_delivery = SQLiteWritingDeliveryRuntime(
+            database,
+            feed,
+            human_response_verifier,
+            (
+                writing_delivery_provider_registry
+                or default_writing_delivery_registry()
+            ),
+        )
         self._acquisition_private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._receipt_verifier = SQLiteAgentRuntimeReceiptVerifier(
             database,
@@ -5543,6 +5572,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     @property
     def harness_runs(self) -> AgentRuntimeHarnessInterface:
         return self._harness_runs
+
+    @property
+    def writing_delivery(self) -> WritingDeliveryAuthority:
+        return self._writing_delivery
 
     def bind_target_run_harness_verifier(
         self, verifier: TargetRunHarnessVerifier
@@ -5911,7 +5944,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 ).first()
                 if existing is not None:
                     if (
-                        existing.intent_hash != binding.intent_hash
+                        existing.document_type != binding.document_type
+                        or existing.intent_hash != binding.intent_hash
                         or existing.snapshot_ref != binding.snapshot_ref
                         or existing.snapshot_hash != binding.snapshot_hash
                         or existing.confirmation_ref
@@ -5940,7 +5974,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                             "attempt_ref, attempt_generation, root_session_ref, "
                             "native_session_ref, fence_ref, runtime_binding_json, "
                             "runtime_binding_hash, created_at, updated_at) VALUES "
-                            "(:run_ref, :intent_id, :quest_ref, 'report', "
+                            "(:run_ref, :intent_id, :quest_ref, :document_type, "
                             ":intent_json, :intent_hash, :snapshot_ref, "
                             ":snapshot_json, :snapshot_hash, :confirmation_ref, "
                             ":confirmation_hash, 'active', NULL, "
@@ -5953,6 +5987,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                             "run_ref": run_ref,
                             "intent_id": binding.intent_id,
                             "quest_ref": binding.quest_ref,
+                            "document_type": binding.document_type,
                             "intent_json": canonical_json(binding.intent),
                             "intent_hash": binding.intent_hash,
                             "snapshot_ref": binding.snapshot_ref,
@@ -6028,6 +6063,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                             "run_ref": run_ref,
                             "intent_id": binding.intent_id,
                             "quest_ref": binding.quest_ref,
+                            "document_type": binding.document_type,
                             "attempt_ref": attempt_ref,
                             "fence_ref": fence_ref,
                         },
@@ -6521,6 +6557,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     != citations_hash
                 ):
                     raise OwnerConflict("writing_execution_invalid")
+                if run.document_type != "report":
+                    validate_writing_document(
+                        run.document_type,
+                        final_markdown,
+                        citations,
+                    )
                 _validate_writing_review_contract(
                     review=review,
                     run=run,
@@ -7337,7 +7379,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         try:
             intent = decoded_object(row.intent_json)
             snapshot = decoded_object(row.snapshot_json)
-            normalized_intent = normalize_report_intent(intent)
+            normalized_intent = normalize_writing_intent(
+                row.document_type, intent
+            )
             snapshot_without_hash = dict(snapshot)
             embedded_snapshot_hash = snapshot_without_hash.pop(
                 "snapshot_hash", None
@@ -7345,8 +7389,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         except (TypeError, ValueError, OwnerConflict) as error:
             raise OwnerConflict("writing_run_integrity_invalid") from error
         if (
-            row.document_type != "report"
-            or normalized_intent != intent
+            normalized_intent != intent
             or canonical_hash(intent) != row.intent_hash
             or snapshot.get("quest_ref") != row.quest_ref
             or snapshot.get("snapshot_ref") != row.snapshot_ref
@@ -7454,6 +7497,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             run_ref=row.run_ref,
             intent_id=row.intent_id,
             quest_ref=row.quest_ref,
+            document_type=row.document_type,
             status=row.status,
             attempt_ref=row.attempt_ref,
             attempt_generation=int(row.attempt_generation),
@@ -21419,6 +21463,7 @@ def _validate_writing_review_contract(
         feedback_hash=attempt.feedback_hash,
         reviewed_markdown_hash=checkpoint.markdown_hash,
         reviewed_citations_hash=checkpoint.citations_hash,
+        document_type=run.document_type,
     )
     review_basis = dict(review)
     review_basis.pop("review_hash")
@@ -25983,6 +26028,7 @@ def create_agent_runtime_interface(
     target_run_harness_verifier: TargetRunHarnessVerifier | None = None,
     bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
     reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
+    writing_delivery_provider_registry: WritingDeliveryProviderRegistry | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
         database,
@@ -26000,6 +26046,7 @@ def create_agent_runtime_interface(
         target_run_harness_verifier,
         bundle_exhaustion_verifier,
         reasoning_outcome_verifier=reasoning_outcome_verifier,
+        writing_delivery_provider_registry=writing_delivery_provider_registry,
     )
 
 

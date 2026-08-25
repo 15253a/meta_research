@@ -107,6 +107,8 @@ from meta_research.reasoning_skill import (
 from meta_research.reasoning_stage import ReasoningStageWorker
 from meta_research.quest_completion import QuestCompletionService
 from meta_research.writing import WritingReportService
+from meta_research.writing_delivery import WritingDeliveryProviderRegistry
+from meta_research.writing_renderer import WritingRendererRegistry
 from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillProvider
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
 
@@ -293,6 +295,8 @@ def build_production_runtime(
     acquisition_provider: AcquisitionProvider | None = None,
     experiment_provider: ExperimentProvider | None = None,
     writing_skill_provider: WritingSkillProvider | None = None,
+    writing_delivery_provider_registry: WritingDeliveryProviderRegistry | None = None,
+    writing_renderer_registry: WritingRendererRegistry | None = None,
     harness_adapters: tuple[HarnessAdapter, ...] | None = None,
     target_root_timeout_seconds: float = TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS,
 ) -> ProductionRuntime:
@@ -395,6 +399,7 @@ def build_production_runtime(
         experiment_binding_verifier=research_graph_receipts,
         bundle_report_evidence_verifier=research_graph_receipts,
         reasoning_outcome_verifier=research_graph_receipts,
+        writing_delivery_provider_registry=writing_delivery_provider_registry,
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
@@ -743,7 +748,12 @@ def build_production_runtime(
         agent_runtime,
         human_collaboration,
         writing_skill_provider,
+        writing_renderer_registry,
     )
+    human_collaboration.bind_writing_delivery_binding_validator(
+        writing.verify_writing_delivery_binding
+    )
+    agent_runtime.writing_delivery.bind_binding_verifier(writing)
     projection = PublicProjection(
         feed,
         data_root.objects,

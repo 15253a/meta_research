@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
+from importlib.resources import files
 import json
 from pathlib import Path
 import subprocess
@@ -10,8 +12,11 @@ import pytest
 
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.writing_contract import (
+    WRITING_PAPER_INTENT_SCHEMA,
+    WRITING_PRESENTATION_INTENT_SCHEMA,
     WRITING_REPORT_INTENT_SCHEMA,
     WRITING_RESEARCH_SNAPSHOT_SCHEMA,
+    writing_child_review_task_hash,
 )
 from meta_research.writing_skill import (
     CodexWritingSkillAdapter,
@@ -190,6 +195,174 @@ def _draft_output() -> dict[str, object]:
     }
 
 
+def _paper_output() -> dict[str, object]:
+    sections = []
+    for role, heading in (
+        ("abstract", "Abstract"),
+        ("framing", "Introduction"),
+        ("methods", "Methods"),
+        ("results", "Results"),
+        ("discussion", "Discussion"),
+        ("conclusion", "Conclusion"),
+    ):
+        sections.extend(
+            (
+                "<!-- meta-research-paper-section "
+                f"role={role} -->\n## {heading}",
+                (
+                    "<!-- meta-research-claim:uncertainty -->\n"
+                    f"**Uncertainty:** {heading} is bounded by the snapshot."
+                ),
+            )
+        )
+    sections[3] = (
+        "<!-- meta-research-claim:supported refs=citation:source-1 -->\n"
+        "rare morphology remains visible [[citation:citation:source-1]]"
+    )
+    return {
+        "markdown": "# Morphology paper\n\n" + "\n\n".join(sections) + "\n",
+        "citations": _draft_output()["citations"],
+    }
+
+
+def _presentation_output() -> dict[str, object]:
+    return {
+        "markdown": (
+            "# Morphology deck\n\n"
+            "<!-- meta-research-structure -->\n"
+            "## Slide 1: Evidence boundary\n\n"
+            "<!-- meta-research-claim:supported refs=citation:source-1 -->\n"
+            "rare morphology remains visible "
+            "[[citation:citation:source-1]]\n\n"
+            "<!-- meta-research-structure -->\n"
+            "## Slide 2: Decision\n\n"
+            "<!-- meta-research-claim:uncertainty -->\n"
+            "**Uncertainty:** No external decision is justified yet.\n"
+        ),
+        "citations": _draft_output()["citations"],
+    }
+
+
+@pytest.mark.parametrize(
+    (
+        "document_type",
+        "profile_ref",
+        "intent_schema_ref",
+        "draft_factory",
+        "profile_heading",
+    ),
+    (
+        (
+            "paper",
+            "paper-v1",
+            WRITING_PAPER_INTENT_SCHEMA,
+            _paper_output,
+            "Paper profile",
+        ),
+        (
+            "presentation",
+            "presentation-v1",
+            WRITING_PRESENTATION_INTENT_SCHEMA,
+            _presentation_output,
+            "Presentation profile",
+        ),
+    ),
+)
+def test_type_specific_skill_resource_uses_the_same_resumable_session_seam(
+    tmp_path: Path,
+    document_type: str,
+    profile_ref: str,
+    intent_schema_ref: str,
+    draft_factory: Callable[[], dict[str, object]],
+    profile_heading: str,
+) -> None:
+    draft = draft_factory()
+    runner = _SequenceRunner(
+        [
+            draft,
+            {
+                "reviewer_agent_ref": (
+                    f"codex-writing-reviewer:{document_type}"
+                ),
+                "findings": [],
+                "dispositions": [],
+                "final_markdown": draft["markdown"],
+                "citations": draft["citations"],
+            },
+        ]
+    )
+    adapter = CodexWritingSkillAdapter(
+        tmp_path / "provider",
+        executable=str(_fake_codex(tmp_path / "codex")),
+        model_ref="test-model",
+        process_runner=runner,
+    )
+    request = replace(
+        _request(adapter),
+        document_type=document_type,
+        profile_ref=profile_ref,
+        intent={
+            "schema_ref": intent_schema_ref,
+            "title": f"Morphology {document_type}",
+            "audience": "researchers",
+            "purpose": "communicate bounded evidence",
+            "instructions": "",
+        },
+        runtime_binding=adapter.runtime_binding(document_type),
+    )
+
+    result = adapter.execute(request)
+
+    assert result.primary_session_ref == "codex-writing-primary:1"
+    assert runner.calls[1][0][-3:] == [
+        "resume",
+        "codex-writing-primary:1",
+        "-",
+    ]
+    assert profile_heading in runner.calls[0][1]
+    assert f'"document_type":"{document_type}"' in runner.calls[1][1]
+    child_task = json.loads(
+        runner.calls[1][1]
+        .split("\nreview_task=", 1)[1]
+        .split("\nresponse_schema_ref=", 1)[0]
+    )
+    profile_content = (
+        files("meta_research")
+        / "skills"
+        / "writing-report"
+        / "references"
+        / f"{profile_ref}.md"
+    ).read_text(encoding="utf-8")
+    assert child_task["document_profile"] == {
+        "content": profile_content,
+        "content_sha256": hashlib.sha256(
+            profile_content.encode("utf-8")
+        ).hexdigest(),
+        "document_type": document_type,
+        "profile_ref": profile_ref,
+    }
+    unprofiled_hash = writing_child_review_task_hash(
+        run_ref=request.run_ref,
+        provider_job_ref=request.job_ref,
+        root_session_ref=request.root_session_ref,
+        primary_session_ref=result.primary_session_ref,
+        intent_hash=canonical_hash(request.intent),
+        snapshot_hash=str(request.snapshot["snapshot_hash"]),
+        predecessor_version_ref=request.predecessor_version_ref,
+        predecessor_markdown_hash=request.predecessor_markdown_hash,
+        feedback_hash=canonical_hash(list(request.feedback)),
+        reviewed_markdown_hash=hashlib.sha256(
+            str(draft["markdown"]).encode("utf-8")
+        ).hexdigest(),
+        reviewed_citations_hash=canonical_hash(draft["citations"]),
+    )
+    assert child_task["review_task_hash"] != unprofiled_hash
+    assert (
+        adapter.runtime_binding("report").packaged_skill_bundle_hash
+        != request.runtime_binding.packaged_skill_bundle_hash
+    )
+
+
 def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     tmp_path: Path,
 ) -> None:
@@ -236,6 +409,7 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     assert "accepted_source_manifest=" in primary_prompt
     assert '"accepted_source_manifest":' in review_prompt
     assert 'fresh_context_mode":"fork_turns:none"' in review_prompt
+    assert '"document_profile":' not in review_prompt
     assert "root_context_canary=" in review_prompt
     assert "attempt_ref=" not in primary_prompt
     assert "fence_ref=" not in primary_prompt
@@ -278,6 +452,30 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     assert staged.read_bytes() == _SOURCE
     assert not staged.is_relative_to(
         tmp_path / "provider" / "research-workspace"
+    )
+
+
+def test_report_review_task_hash_remains_pre_profile_extension_compatible(
+    tmp_path: Path,
+) -> None:
+    adapter = CodexWritingSkillAdapter(
+        tmp_path / "provider",
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=_SequenceRunner([]),
+    )
+    request = replace(
+        _request(adapter), native_session_ref="codex-writing-primary:1"
+    )
+    output = _draft_output()
+    draft = WritingSkillDraft(
+        markdown=str(output["markdown"]),
+        citations=tuple(output["citations"]),
+        primary_session_ref="codex-writing-primary:1",
+        adapter_kind="persisted_checkpoint",
+    )
+
+    assert writing_review_task_hash(request, draft) == (
+        "821ea7efbecb3e0f316d426674b810f61901b94319f56a82d8729940bb6f3e2a"
     )
 
 

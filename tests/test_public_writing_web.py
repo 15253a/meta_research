@@ -269,3 +269,171 @@ def test_web_writing_controls_reject_unknown_actions_without_mutating_run(
     finally:
         client.close()
         runtime.close()
+
+
+def test_web_writing_delivery_rejects_non_exact_local_targets_before_service(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "writing-web-delivery-validation")
+    client, write_headers = _authenticated_client(runtime)
+    before = runtime.owners.agent_runtime.query_snapshot()
+    route = "/api/v1/writing/runs/writing-run:missing/delivery-intents"
+    valid = {
+        "action": "publish",
+        "provider_ref": "local-filesystem",
+        "target": {
+            "path": str((tmp_path / "output.md").resolve()),
+            "permissions": 0o600,
+            "expected_existing_hash": None,
+        },
+        "output_format": "markdown",
+    }
+    try:
+        for index, body in enumerate(
+            (
+                {**valid, "unexpected": True},
+                {
+                    **valid,
+                    "target": {
+                        **valid["target"],
+                        "path": "relative/output.md",
+                    },
+                },
+                {**valid, "action": "overwrite"},
+                {
+                    **valid,
+                    "target": {**valid["target"], "permissions": 0o644},
+                },
+            )
+        ):
+            response = client.post(
+                route,
+                headers={
+                    **write_headers,
+                    "Idempotency-Key": f"web-delivery-invalid-{index}",
+                },
+                json=body,
+            )
+            assert response.status_code == 422
+        assert runtime.owners.agent_runtime.query_snapshot() == before
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_web_writing_delivery_requires_exact_preview_then_projects_owner_receipts(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "writing-web-external-delivery")
+    client: TestClient | None = None
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            "writing-web-external-delivery",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        for _step in range(8):
+            if runtime.writing.query_writing_report(run_ref)["citation"][
+                "status"
+            ] == "accepted":
+                break
+            assert runtime.writing.process_once()
+        assert runtime.writing.query_writing_report(run_ref)["renderer"] == {
+            "status": "ready"
+        }
+
+        client, write_headers = _authenticated_client(runtime)
+        target = (tmp_path / "published-report.md").resolve()
+        created = client.post(
+            f"/api/v1/writing/runs/{run_ref}/delivery-intents",
+            headers={
+                **write_headers,
+                "Idempotency-Key": "web-delivery-create",
+            },
+            json={
+                "action": "publish",
+                "provider_ref": "local-filesystem",
+                "target": {
+                    "path": str(target),
+                    "permissions": 0o600,
+                    "expected_existing_hash": None,
+                },
+                "output_format": "markdown",
+            },
+        )
+        assert created.status_code == 201
+        drafted = created.json()
+        assert drafted["status"] == "not_attempted"
+        assert drafted["confirmation_status"] == "draft"
+        assert drafted["operation"] is None
+        assert not target.exists()
+
+        previewed_response = client.post(
+            f"/api/v1/writing/delivery-intents/{drafted['intent_id']}/preview",
+            headers={
+                **write_headers,
+                "Idempotency-Key": "web-delivery-preview",
+            },
+            json={},
+        )
+        assert previewed_response.status_code == 200
+        previewed = previewed_response.json()
+        preview = previewed["impact_preview"]
+        assertion = preview["target_assertion"]
+        assert assertion["operation_ref"] == drafted["payload"]["operation_ref"]
+        assert assertion["target"] == drafted["payload"]["target"]
+        assert assertion["effects"] == drafted["payload"]["effects"]
+        assert not target.exists()
+
+        confirmed_response = client.post(
+            f"/api/v1/writing/delivery-intents/{drafted['intent_id']}/confirmation",
+            headers={
+                **write_headers,
+                "Idempotency-Key": "web-delivery-confirm",
+            },
+            json={
+                "draft_revision": previewed["draft_revision"],
+                "draft_hash": previewed["draft_hash"],
+                "preview_ref": preview["preview_ref"],
+                "preview_hash": preview["preview_hash"],
+            },
+        )
+        assert confirmed_response.status_code == 200
+        confirmed = confirmed_response.json()
+        assert confirmed["confirmation_status"] == "confirmed"
+        assert confirmed["status"] == "not_attempted"
+        assert confirmed["confirmation_receipt"]["issuer"] == "human_collaboration"
+        assert confirmed["operation"]["operation_receipt"]["issuer"] == "agent_runtime"
+        assert confirmed["operation"]["execution_receipt"] is None
+        assert confirmed["operation"]["provider_observations"] == []
+        assert not target.exists()
+
+        operation_ref = drafted["payload"]["operation_ref"]
+        with client:
+            deadline = time.monotonic() + 5
+            operation = None
+            while time.monotonic() < deadline:
+                operation_response = client.get(
+                    f"/api/v1/writing/deliveries/{operation_ref}"
+                )
+                assert operation_response.status_code == 200
+                operation = operation_response.json()
+                if operation["status"] == "completed":
+                    break
+                time.sleep(0.02)
+        assert operation is not None
+        assert operation["status"] == "completed"
+        assert operation["authority_status"] == "completed"
+        assert operation["execution_receipt"]["issuer"] == "agent_runtime"
+        assert operation["reconciliation_receipt"] is None
+        assert len(operation["provider_observations"]) == 1
+        assert operation["provider_observations"][0]["outcome"] == "completed"
+        assert target.read_bytes() == runtime.writing.render_report(
+            run_ref, format="markdown"
+        )["content"]
+    finally:
+        if client is not None:
+            client.close()
+        runtime.close()

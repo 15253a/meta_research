@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from meta_research.composition import build_production_runtime
 from meta_research.feed import DurableEvent, FeedPage
+from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
 from meta_research.web import (
     _AssetIOSingleFlight,
@@ -342,6 +343,18 @@ def test_writing_worker_quarantines_an_unretired_claim_and_advances_the_next(
             assert (run_ref, attempt_ref, fence_ref) == stuck_claim
             release_retirement.wait(timeout=2)
 
+        def next_runnable_delivery_operation_ref(
+            self,
+            *,
+            excluded_operation_refs: frozenset[str] = frozenset(),
+        ) -> str | None:
+            return None
+
+        def process_delivery_once(
+            self, *, expected_operation_ref: str | None = None
+        ) -> bool:
+            raise AssertionError("there is no runnable delivery")
+
     runtime = SimpleNamespace(writing=FakeWriting())
     health = ReconciliationHealth()
     monkeypatch.setattr(
@@ -365,6 +378,397 @@ def test_writing_worker_quarantines_an_unretired_claim_and_advances_the_next(
     finally:
         release_operation.set()
         release_retirement.set()
+
+
+def test_writing_worker_quarantines_a_stuck_delivery_without_starving_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delivery_started = threading.Event()
+    later_completed = threading.Event()
+    release_delivery = threading.Event()
+    delivery_completed = threading.Event()
+    later_claim = ("writing_run:later", "attempt:later", "fence:later")
+    delivery_operation_ref = "writing_delivery:" + "0" * 48
+    claim_checks = 0
+    delivery_calls = 0
+
+    class FakeWriting:
+        def next_runnable_claim(
+            self,
+            *,
+            excluded_claims: frozenset[tuple[str, str, str]] = frozenset(),
+        ) -> tuple[str, str, str] | None:
+            nonlocal claim_checks
+            claim_checks += 1
+            if claim_checks >= 2 and not later_completed.is_set():
+                return later_claim
+            return None
+
+        def process_once(
+            self,
+            *,
+            expected_run_ref: str,
+            expected_attempt_ref: str,
+            expected_fence_ref: str,
+        ) -> bool:
+            assert (
+                expected_run_ref,
+                expected_attempt_ref,
+                expected_fence_ref,
+            ) == later_claim
+            later_completed.set()
+            return True
+
+        def block_writing_claim(
+            self, *, run_ref: str, attempt_ref: str, fence_ref: str
+        ) -> None:
+            raise AssertionError("the later claim must not time out")
+
+        def next_runnable_delivery_operation_ref(
+            self,
+            *,
+            excluded_operation_refs: frozenset[str] = frozenset(),
+        ) -> str | None:
+            if (
+                delivery_operation_ref in excluded_operation_refs
+                or delivery_completed.is_set()
+            ):
+                return None
+            return delivery_operation_ref
+
+        def process_delivery_once(
+            self, *, expected_operation_ref: str | None = None
+        ) -> bool:
+            nonlocal delivery_calls
+            assert expected_operation_ref == delivery_operation_ref
+            delivery_calls += 1
+            delivery_started.set()
+            release_delivery.wait()
+            delivery_completed.set()
+            return True
+
+    runtime = SimpleNamespace(writing=FakeWriting())
+    health = ReconciliationHealth()
+    monkeypatch.setattr(
+        "meta_research.web.WRITING_WORKER_WATCHDOG_SECONDS", 0.02
+    )
+
+    async def exercise() -> None:
+        worker = asyncio.create_task(_process_writing(runtime, health))
+        assert await asyncio.to_thread(delivery_started.wait, 0.5)
+        assert await asyncio.to_thread(later_completed.wait, 0.6)
+        assert delivery_calls == 1
+        assert health.status == "unavailable"
+        assert health.last_error == "writing_delivery_operation_timeout"
+
+        release_delivery.set()
+        deadline = time.monotonic() + 0.8
+        while health.status != "ready" and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert health.status == "ready"
+        assert health.last_error is None
+        assert delivery_calls == 1
+
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_delivery.set()
+
+
+def test_writing_worker_quarantines_exact_stuck_delivery_and_advances_later_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_operation_ref = "writing_delivery:" + "1" * 48
+    second_operation_ref = "writing_delivery:" + "2" * 48
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_completed = threading.Event()
+    later_claim_completed = threading.Event()
+    later_claim = ("writing_run:later", "attempt:later", "fence:later")
+    completed_operations: set[str] = set()
+    delivery_calls = {
+        first_operation_ref: 0,
+        second_operation_ref: 0,
+    }
+    claim_checks = 0
+
+    class FakeWriting:
+        def next_runnable_claim(
+            self,
+            *,
+            excluded_claims: frozenset[tuple[str, str, str]] = frozenset(),
+        ) -> tuple[str, str, str] | None:
+            nonlocal claim_checks
+            claim_checks += 1
+            if first_started.is_set() and not later_claim_completed.is_set():
+                return later_claim
+            return None
+
+        def process_once(
+            self,
+            *,
+            expected_run_ref: str,
+            expected_attempt_ref: str,
+            expected_fence_ref: str,
+        ) -> bool:
+            assert (
+                expected_run_ref,
+                expected_attempt_ref,
+                expected_fence_ref,
+            ) == later_claim
+            later_claim_completed.set()
+            return True
+
+        def block_writing_claim(
+            self, *, run_ref: str, attempt_ref: str, fence_ref: str
+        ) -> None:
+            raise AssertionError("the later claim must not time out")
+
+        def next_runnable_delivery_operation_ref(
+            self,
+            *,
+            excluded_operation_refs: frozenset[str] = frozenset(),
+        ) -> str | None:
+            for operation_ref in (first_operation_ref, second_operation_ref):
+                if (
+                    operation_ref not in excluded_operation_refs
+                    and operation_ref not in completed_operations
+                ):
+                    return operation_ref
+            return None
+
+        def process_delivery_once(
+            self, *, expected_operation_ref: str | None = None
+        ) -> bool:
+            operation_ref = expected_operation_ref or first_operation_ref
+            delivery_calls[operation_ref] += 1
+            if operation_ref == first_operation_ref:
+                first_started.set()
+                release_first.wait()
+                return False
+            second_completed.set()
+            completed_operations.add(operation_ref)
+            return True
+
+    runtime = SimpleNamespace(writing=FakeWriting())
+    health = ReconciliationHealth()
+    monkeypatch.setattr(
+        "meta_research.web.WRITING_WORKER_WATCHDOG_SECONDS", 0.02
+    )
+
+    async def exercise() -> None:
+        worker = asyncio.create_task(_process_writing(runtime, health))
+        assert await asyncio.to_thread(first_started.wait, 0.5)
+        assert await asyncio.to_thread(later_claim_completed.wait, 0.6)
+        assert await asyncio.to_thread(second_completed.wait, 0.6)
+        assert delivery_calls == {
+            first_operation_ref: 1,
+            second_operation_ref: 1,
+        }
+        assert health.status == "unavailable"
+        assert health.last_error == "writing_delivery_operation_timeout"
+
+        release_first.set()
+        deadline = time.monotonic() + 0.8
+        while health.status != "ready" and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert health.status == "ready"
+        assert health.last_error is None
+        assert delivery_calls == {
+            first_operation_ref: 1,
+            second_operation_ref: 1,
+        }
+
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_first.set()
+
+
+def test_writing_worker_sweeps_past_an_expired_permanent_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial_operation_ref = "writing_delivery:" + "3" * 48
+    later_operation_ref = "writing_delivery:" + "4" * 48
+    partial_checked = threading.Event()
+    later_available = threading.Event()
+    later_completed = threading.Event()
+    internal_claim_started = threading.Event()
+    busy_claim = ("writing_run:busy", "attempt:busy", "fence:busy")
+    completed_operations: set[str] = set()
+    delivery_calls = {
+        partial_operation_ref: 0,
+        later_operation_ref: 0,
+    }
+
+    class FakeWriting:
+        def next_runnable_claim(
+            self,
+            *,
+            excluded_claims: frozenset[tuple[str, str, str]] = frozenset(),
+        ) -> tuple[str, str, str] | None:
+            return busy_claim if later_completed.is_set() else None
+
+        def process_once(
+            self,
+            *,
+            expected_run_ref: str,
+            expected_attempt_ref: str,
+            expected_fence_ref: str,
+        ) -> bool:
+            assert (
+                expected_run_ref,
+                expected_attempt_ref,
+                expected_fence_ref,
+            ) == busy_claim
+            internal_claim_started.set()
+            return True
+
+        def block_writing_claim(
+            self, *, run_ref: str, attempt_ref: str, fence_ref: str
+        ) -> None:
+            raise AssertionError("there is no runnable Writing claim")
+
+        def next_runnable_delivery_operation_ref(
+            self,
+            *,
+            excluded_operation_refs: frozenset[str] = frozenset(),
+        ) -> str | None:
+            if partial_operation_ref not in excluded_operation_refs:
+                return partial_operation_ref
+            if (
+                later_available.is_set()
+                and later_operation_ref not in excluded_operation_refs
+                and later_operation_ref not in completed_operations
+            ):
+                return later_operation_ref
+            return None
+
+        def process_delivery_once(
+            self, *, expected_operation_ref: str | None = None
+        ) -> bool:
+            assert expected_operation_ref is not None
+            delivery_calls[expected_operation_ref] += 1
+            if expected_operation_ref == partial_operation_ref:
+                # Model an expired partial whose unchanged preflight failure
+                # makes the exact service call report no durable progress.
+                later_available.set()
+                partial_checked.set()
+                return False
+            assert expected_operation_ref == later_operation_ref
+            completed_operations.add(expected_operation_ref)
+            later_completed.set()
+            return True
+
+    runtime = SimpleNamespace(writing=FakeWriting())
+    health = ReconciliationHealth()
+
+    async def exercise() -> None:
+        worker = asyncio.create_task(_process_writing(runtime, health))
+        assert await asyncio.to_thread(partial_checked.wait, 0.5)
+        assert await asyncio.to_thread(later_completed.wait, 0.6)
+        assert delivery_calls == {
+            partial_operation_ref: 1,
+            later_operation_ref: 1,
+        }
+        assert await asyncio.to_thread(internal_claim_started.wait, 0.5)
+        await asyncio.sleep(0.05)
+        assert delivery_calls[partial_operation_ref] == 1
+
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    asyncio.run(exercise())
+
+
+def test_writing_worker_sweeps_past_an_operation_local_delivery_error() -> None:
+    unavailable_operation_ref = "writing_delivery:" + "5" * 48
+    later_operation_ref = "writing_delivery:" + "6" * 48
+    later_completed = threading.Event()
+    completed_operations: set[str] = set()
+    delivery_calls = {
+        unavailable_operation_ref: 0,
+        later_operation_ref: 0,
+    }
+
+    class FakeWriting:
+        def next_runnable_claim(
+            self,
+            *,
+            excluded_claims: frozenset[tuple[str, str, str]] = frozenset(),
+        ) -> tuple[str, str, str] | None:
+            return None
+
+        def process_once(
+            self,
+            *,
+            expected_run_ref: str,
+            expected_attempt_ref: str,
+            expected_fence_ref: str,
+        ) -> bool:
+            raise AssertionError("there is no runnable Writing claim")
+
+        def block_writing_claim(
+            self, *, run_ref: str, attempt_ref: str, fence_ref: str
+        ) -> None:
+            raise AssertionError("there is no runnable Writing claim")
+
+        def next_runnable_delivery_operation_ref(
+            self,
+            *,
+            excluded_operation_refs: frozenset[str] = frozenset(),
+        ) -> str | None:
+            for operation_ref in (
+                unavailable_operation_ref,
+                later_operation_ref,
+            ):
+                if (
+                    operation_ref not in excluded_operation_refs
+                    and operation_ref not in completed_operations
+                ):
+                    return operation_ref
+            return None
+
+        def process_delivery_once(
+            self, *, expected_operation_ref: str | None = None
+        ) -> bool:
+            assert expected_operation_ref is not None
+            delivery_calls[expected_operation_ref] += 1
+            if expected_operation_ref == unavailable_operation_ref:
+                raise OwnerConflict("writing_delivery_provider_unavailable")
+            assert expected_operation_ref == later_operation_ref
+            completed_operations.add(expected_operation_ref)
+            later_completed.set()
+            return True
+
+    runtime = SimpleNamespace(writing=FakeWriting())
+    health = ReconciliationHealth()
+
+    async def exercise() -> None:
+        worker = asyncio.create_task(_process_writing(runtime, health))
+        assert await asyncio.to_thread(later_completed.wait, 0.8)
+        await asyncio.sleep(0.05)
+        assert delivery_calls == {
+            unavailable_operation_ref: 1,
+            later_operation_ref: 1,
+        }
+        assert health.status == "unavailable"
+        assert health.last_error == "writing_delivery_provider_unavailable"
+
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    asyncio.run(exercise())
 
 
 def test_reconciliation_worker_is_non_blocking_and_recovers_after_io_failure() -> None:

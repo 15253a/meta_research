@@ -1254,6 +1254,106 @@ export type PublicExperimentProjection = {
 };
 
 export type WritingReceipt = AssetReceipt & { status?: "accepted" };
+export type WritingDocumentType = "report" | "paper" | "presentation";
+
+export type WritingProviderCapability = {
+  provider_ref: string;
+  production_ready: boolean;
+  supported_actions: Array<"publish" | "overwrite" | "delete" | "send" | "submit">;
+};
+
+export type WritingDeliveryTarget = {
+  path: string;
+  permissions: 384;
+  expected_existing_hash: string | null;
+} | {
+  target_ref: string;
+  permissions: string[];
+  expected_existing_hash: string | null;
+};
+
+export type WritingDeliveryPayload = {
+  schema_ref: string;
+  request_nonce: string;
+  operation_ref: string;
+  action: "publish" | "overwrite" | "delete" | "send" | "submit";
+  provider_ref: string;
+  target: WritingDeliveryTarget;
+  effects: Array<Record<string, unknown>>;
+  run_ref: string;
+  document_type: WritingDocumentType;
+  asset_ref: string;
+  version_ref: string;
+  content_hash: string;
+  manifest_hash: string;
+  version_receipt: WritingReceipt;
+  citation_decision_ref: string;
+  citation_receipt: WritingReceipt;
+  renderer_asset_ref: string;
+  renderer_version_ref: string;
+  renderer_content_hash: string;
+  renderer_manifest_hash: string;
+  renderer_artifact_sha256: string;
+  renderer_format: string;
+  renderer_media_type: string;
+  renderer_receipt: WritingReceipt;
+};
+
+export type WritingDeliveryOperation = {
+  operation_ref: string;
+  payload: WritingDeliveryPayload;
+  payload_hash: string;
+  status: "not_attempted" | "partial" | "outcome_unknown" | "completed";
+  authority_status: "admitted" | "executing" | "partial" | "outcome_unknown" | "completed";
+  attempt_count: number;
+  provider_operation_ref: string;
+  provider_request_hash: string | null;
+  operation_receipt: WritingReceipt;
+  execution_receipt: WritingReceipt | null;
+  reconciliation_receipt: WritingReceipt | null;
+  provider_observations: Array<{
+    observation_ref: string;
+    provider_ref: string;
+    provider_operation_ref: string;
+    outcome: string;
+    observed_at: number;
+    details: Record<string, unknown>;
+    observation_hash: string;
+  }>;
+  failure?: { code: string };
+};
+
+export type WritingDeliveryView = {
+  intent_id: string;
+  status: "not_attempted" | "partial" | "outcome_unknown" | "completed";
+  confirmation_status: "draft" | "previewed" | "confirmed";
+  draft_revision: number;
+  draft_hash: string;
+  payload: WritingDeliveryPayload;
+  impact_preview?: null | {
+    preview_ref: string;
+    preview_hash: string;
+    draft_revision?: number;
+    draft_hash?: string;
+    status?: string;
+    owner_previews?: Array<{
+      source_owner: string;
+      target_assertion: Record<string, unknown>;
+      will_happen: string[];
+      will_not_happen: string[];
+      risks: string[];
+      stale_conditions: string[];
+      digest?: string;
+    }>;
+    target_assertion?: Record<string, unknown>;
+    will_happen?: string[];
+    will_not_happen?: string[];
+    risks?: string[];
+    stale_conditions?: string[];
+  };
+  confirmation_receipt?: WritingReceipt | null;
+  operation?: WritingDeliveryOperation | null;
+};
 
 export type WritingVersion = {
   version_ref: string;
@@ -1279,7 +1379,7 @@ export type WritingVersion = {
 export type WritingReportView = {
   intent_id: string;
   status: "draft" | "previewed" | "confirmed" | "running" | "paused" | "blocked" | "cancelled" | "completed";
-  document_type: "report";
+  document_type: WritingDocumentType;
   draft_revision: number;
   draft_hash: string;
   intent: {
@@ -1311,6 +1411,7 @@ export type WritingReportView = {
   confirmation_receipt: WritingReceipt | null;
   run: null | {
     run_ref: string;
+    document_type: WritingDocumentType;
     status: "active" | "paused" | "blocked" | "cancelled" | "completed";
     attempt_ref: string;
     attempt_generation: number;
@@ -1337,13 +1438,32 @@ export type WritingReportView = {
     feedback?: string[];
     receipt?: WritingReceipt;
   };
-  renderer: { status: string; reason?: { code: string } };
+  renderer: {
+    status: string;
+    reason?: { code: string };
+    default_format?: string;
+    formats?: string[];
+    artifact?: Record<string, unknown> & {
+      version_ref?: string;
+      content_hash?: string;
+      artifact_sha256?: string;
+    };
+  };
+  deliveries?: WritingDeliveryView[];
   versions?: WritingVersion[];
 };
 
 export type WritingOverview = {
   status: "ready";
-  document_types: ["report"];
+  document_types: WritingDocumentType[];
+  delivery_capabilities?: {
+    providers: WritingProviderCapability[];
+    renderers: Array<{
+      document_type: WritingDocumentType;
+      default_format: string;
+      formats: string[];
+    }>;
+  };
   runs: WritingReportView[];
 };
 
@@ -2165,6 +2285,7 @@ export function fetchWriting(signal?: AbortSignal): Promise<WritingOverview> {
 }
 
 export function createWritingIntent(input: {
+  document_type?: WritingDocumentType;
   quest_ref: string;
   title: string;
   audience: string;
@@ -2255,6 +2376,59 @@ export function reviseWritingRun(
   );
 }
 
+export function createWritingDeliveryIntent(
+  runRef: string,
+  input: {
+    action: WritingDeliveryPayload["action"];
+    provider_ref: string;
+    target: WritingDeliveryTarget;
+    output_format?: string;
+  },
+): Promise<WritingDeliveryView> {
+  return writeJson(
+    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/delivery-intents`,
+    "POST",
+    input,
+  );
+}
+
+export function previewWritingDeliveryIntent(
+  intentId: string,
+): Promise<WritingDeliveryView> {
+  return writeJson(
+    `/api/v1/writing/delivery-intents/${encodeURIComponent(intentId)}/preview`,
+    "POST",
+    {},
+  );
+}
+
+export function confirmWritingDeliveryIntent(
+  delivery: WritingDeliveryView,
+): Promise<WritingDeliveryView> {
+  const preview = delivery.impact_preview;
+  if (!preview) throw new ProductError("writing_delivery_preview_required");
+  return writeJson(
+    `/api/v1/writing/delivery-intents/${encodeURIComponent(delivery.intent_id)}/confirmation`,
+    "POST",
+    {
+      draft_revision: delivery.draft_revision,
+      draft_hash: delivery.draft_hash,
+      preview_ref: preview.preview_ref,
+      preview_hash: preview.preview_hash,
+    },
+  );
+}
+
+export function fetchWritingDeliveryOperation(
+  operationRef: string,
+  signal?: AbortSignal,
+): Promise<WritingDeliveryOperation> {
+  return readJson(
+    `/api/v1/writing/deliveries/${encodeURIComponent(operationRef)}`,
+    signal,
+  );
+}
+
 export function compareWritingVersions(
   runRef: string,
   leftVersionRef: string,
@@ -2271,8 +2445,12 @@ export function compareWritingVersions(
   );
 }
 
-export function writingRenderUrl(runRef: string, versionRef?: string): string {
-  const parameters = new URLSearchParams({ format: "markdown" });
+export function writingRenderUrl(
+  runRef: string,
+  versionRef?: string,
+  outputFormat?: string,
+): string {
+  const parameters = new URLSearchParams({ format: outputFormat ?? "markdown" });
   if (versionRef) parameters.set("version_ref", versionRef);
   return `/api/v1/writing/runs/${encodeURIComponent(runRef)}/render?${parameters}`;
 }
@@ -2280,9 +2458,10 @@ export function writingRenderUrl(runRef: string, versionRef?: string): string {
 export async function fetchWritingRender(
   runRef: string,
   versionRef?: string,
+  outputFormat?: string,
   signal?: AbortSignal,
 ): Promise<WritingRender> {
-  const response = await fetch(writingRenderUrl(runRef, versionRef), {
+  const response = await fetch(writingRenderUrl(runRef, versionRef, outputFormat), {
     credentials: "same-origin",
     headers: { Accept: "text/markdown" },
     signal,

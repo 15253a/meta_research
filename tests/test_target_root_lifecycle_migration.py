@@ -54,7 +54,7 @@ def test_target_root_lifecycle_migration_is_single_head_and_adds_owner_tables(
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "0033_reasoning_successor_context"
+            ).scalar_one() == "0034_writing_delivery"
             ar = connection.execute(
                 text(
                     "SELECT target_root_lifecycle_count, "

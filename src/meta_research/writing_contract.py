@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+from importlib.resources import files
 import re
 from typing import Protocol
 
@@ -8,6 +10,10 @@ from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canoni
 
 
 WRITING_REPORT_INTENT_SCHEMA = "meta-research/writing-report-intent/v1"
+WRITING_PAPER_INTENT_SCHEMA = "meta-research/writing-paper-intent/v1"
+WRITING_PRESENTATION_INTENT_SCHEMA = (
+    "meta-research/writing-presentation-intent/v1"
+)
 WRITING_RESEARCH_SNAPSHOT_SCHEMA = "meta-research/writing-research-snapshot/v1"
 WRITING_RUNTIME_BINDING_SCHEMA = "meta-research/writing-runtime-binding/v1"
 WRITING_EXECUTION_BUDGET_SCHEMA = "meta-research/writing-execution-budget/v1"
@@ -35,6 +41,12 @@ _CLASSIFIED_CLAIM_MARKER = re.compile(
 )
 _STRUCTURE_MARKER = re.compile(
     r"\A<!-- meta-research-structure -->\n(#{2,6} [^\n]+)\Z"
+)
+_PAPER_SECTION_MARKER = re.compile(
+    r"\A<!-- meta-research-paper-section role="
+    r"(abstract|framing|related-work|methods|model|evidence|results|analysis|"
+    r"synthesis|evaluation|discussion|limitations|implications|conclusion|appendix)"
+    r" -->\n(## [^\n]+)\Z"
 )
 _DOCUMENT_TITLE = re.compile(r"\A# [^\n]+\Z")
 _CITATION_ANCHOR = re.compile(
@@ -78,6 +90,103 @@ _WRITING_SAFE_RESOURCE_PREFIXES = (
     "writing-run-limits:",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_PRESENTATION_HEADING = re.compile(r"## Slide ([1-9][0-9]?): ([^\n]+)\Z")
+
+WRITING_DOCUMENT_TYPES = ("report", "paper", "presentation")
+
+
+@dataclass(frozen=True)
+class WritingDocumentProfile:
+    """Canonical authoring and default-render contract for one document type.
+
+    The registry of concrete renderers remains open.  These defaults identify
+    the product's built-in profile; they are not a closed list of formats or
+    providers.
+    """
+
+    document_type: str
+    profile_ref: str
+    intent_schema_ref: str
+    default_format: str
+    canonical_extension: str
+    media_type: str
+
+    @property
+    def canonical_media_type(self) -> str:
+        return self.media_type
+
+
+_DOCUMENT_PROFILES = {
+    "report": WritingDocumentProfile(
+        document_type="report",
+        profile_ref="report-v1",
+        intent_schema_ref=WRITING_REPORT_INTENT_SCHEMA,
+        default_format="markdown",
+        canonical_extension=".md",
+        media_type="text/markdown; charset=utf-8",
+    ),
+    "paper": WritingDocumentProfile(
+        document_type="paper",
+        profile_ref="paper-v1",
+        intent_schema_ref=WRITING_PAPER_INTENT_SCHEMA,
+        default_format="docx",
+        canonical_extension=".docx",
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+    ),
+    "presentation": WritingDocumentProfile(
+        document_type="presentation",
+        profile_ref="presentation-v1",
+        intent_schema_ref=WRITING_PRESENTATION_INTENT_SCHEMA,
+        default_format="pptx",
+        canonical_extension=".pptx",
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "presentationml.presentation"
+        ),
+    ),
+}
+
+
+def writing_document_profile(document_type: str) -> WritingDocumentProfile:
+    try:
+        return _DOCUMENT_PROFILES[document_type]
+    except (KeyError, TypeError) as error:
+        raise OwnerConflict("writing_document_type_invalid") from error
+
+
+def writing_child_review_document_profile(
+    document_type: str,
+) -> dict[str, str] | None:
+    """Return the exact type profile available to a fresh-context reviewer.
+
+    Report review predates document profiles and intentionally keeps its
+    historical task bytes.  New document types bind the packaged reference
+    text and its digest into both the child task and its durable effect hash.
+    """
+
+    profile = writing_document_profile(document_type)
+    if document_type == "report":
+        return None
+    reference_name = f"references/{profile.profile_ref}.md"
+    content = (
+        files("meta_research")
+        / "skills"
+        / "writing-report"
+        / reference_name
+    ).read_text(encoding="utf-8")
+    return {
+        "document_type": profile.document_type,
+        "profile_ref": profile.profile_ref,
+        "content": content,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+
+
+def writing_intent_schema(document_type: str) -> str:
+    return writing_document_profile(document_type).intent_schema_ref
 
 
 @dataclass(frozen=True)
@@ -174,6 +283,7 @@ def writing_child_review_task_hash(
     feedback_hash: str,
     reviewed_markdown_hash: str,
     reviewed_citations_hash: str,
+    document_type: str = "report",
 ) -> str:
     """Bind one durable advisory operation independently of a crash Fence.
 
@@ -183,24 +293,26 @@ def writing_child_review_task_hash(
     be reconciled without running the native Session turn again.
     """
 
-    return canonical_hash(
-        {
-            "schema_ref": WRITING_CHILD_REVIEW_TASK_SCHEMA,
-            "run_ref": run_ref,
-            "provider_job_ref": provider_job_ref,
-            "root_session_ref": root_session_ref,
-            "primary_session_ref": primary_session_ref,
-            "intent_hash": intent_hash,
-            "snapshot_hash": snapshot_hash,
-            "predecessor_version_ref": predecessor_version_ref,
-            "predecessor_markdown_hash": predecessor_markdown_hash,
-            "feedback_hash": feedback_hash,
-            "reviewed_markdown_hash": reviewed_markdown_hash,
-            "reviewed_citations_hash": reviewed_citations_hash,
-            "rubric": list(WRITING_CHILD_REVIEW_RUBRIC),
-            "fresh_context_mode": "fork_turns:none",
-        }
-    )
+    task = {
+        "schema_ref": WRITING_CHILD_REVIEW_TASK_SCHEMA,
+        "run_ref": run_ref,
+        "provider_job_ref": provider_job_ref,
+        "root_session_ref": root_session_ref,
+        "primary_session_ref": primary_session_ref,
+        "intent_hash": intent_hash,
+        "snapshot_hash": snapshot_hash,
+        "predecessor_version_ref": predecessor_version_ref,
+        "predecessor_markdown_hash": predecessor_markdown_hash,
+        "feedback_hash": feedback_hash,
+        "reviewed_markdown_hash": reviewed_markdown_hash,
+        "reviewed_citations_hash": reviewed_citations_hash,
+        "rubric": list(WRITING_CHILD_REVIEW_RUBRIC),
+        "fresh_context_mode": "fork_turns:none",
+    }
+    document_profile = writing_child_review_document_profile(document_type)
+    if document_profile is not None:
+        task["document_profile"] = document_profile
+    return canonical_hash(task)
 
 
 def validate_writing_claim_inventory(
@@ -240,6 +352,10 @@ def validate_writing_claim_inventory(
         structure_match = _STRUCTURE_MARKER.fullmatch(block)
         if structure_match is not None:
             structures.append(structure_match.group(1))
+            continue
+        paper_section_match = _PAPER_SECTION_MARKER.fullmatch(block)
+        if paper_section_match is not None:
+            structures.append(paper_section_match.group(2))
             continue
         supported_match = _SUPPORTED_CLAIM_MARKER.fullmatch(block)
         if supported_match is not None:
@@ -306,6 +422,126 @@ def validate_writing_claim_inventory(
     }
 
 
+def validate_writing_document(
+    document_type: str,
+    markdown: str,
+    citations: tuple[dict[str, str], ...],
+) -> dict[str, object]:
+    """Validate canonical content semantics before an Owner records execution.
+
+    A paper and a presentation share the report-v1 claim/citation ledger, but
+    they do not share its unconstrained outline.  Their authoring structures
+    are validated here, before any renderer turns the semantic source into an
+    Office package.  A renderer is consequently incapable of making a report
+    masquerade as another document type by changing only its extension.
+    """
+
+    profile = writing_document_profile(document_type)
+    inventory = validate_writing_claim_inventory(markdown, citations)
+    result = {
+        **inventory,
+        "document_type": profile.document_type,
+        "profile_ref": profile.profile_ref,
+    }
+    if document_type == "report":
+        return result
+    blocks = tuple(
+        block.strip()
+        for block in re.split(r"\n[ \t]*\n", markdown.strip())
+        if block.strip()
+    )
+    if document_type == "paper":
+        paper = _validate_paper_structure(blocks)
+        return {**result, **paper}
+    if document_type == "presentation":
+        slide_count = _validate_presentation_structure(blocks)
+        return {**result, "slide_count": slide_count}
+    raise OwnerConflict("writing_document_type_invalid")
+
+
+def _validate_paper_structure(
+    blocks: tuple[str, ...]
+) -> dict[str, object]:
+    roles: list[str] = []
+    headings: list[str] = []
+    content_counts: list[int] = []
+    for block in blocks[1:]:
+        match = _PAPER_SECTION_MARKER.fullmatch(block)
+        if match is not None:
+            roles.append(match.group(1))
+            headings.append(match.group(2)[3:].strip())
+            content_counts.append(0)
+        elif _STRUCTURE_MARKER.fullmatch(block) is not None:
+            raise OwnerConflict("writing_paper_structure_invalid")
+        elif not content_counts:
+            raise OwnerConflict("writing_paper_structure_invalid")
+        else:
+            content_counts[-1] += 1
+    core_roles = {
+        "methods",
+        "model",
+        "evidence",
+        "results",
+        "analysis",
+        "synthesis",
+        "evaluation",
+    }
+    qualification_roles = {"discussion", "limitations", "implications"}
+    conclusion_index = next(
+        (index for index, role in enumerate(roles) if role == "conclusion"),
+        -1,
+    )
+    if (
+        not 5 <= len(roles) <= 24
+        or roles[:2] != ["abstract", "framing"]
+        or roles.count("abstract") != 1
+        or roles.count("framing") != 1
+        or roles.count("conclusion") != 1
+        or conclusion_index < 0
+        or "appendix" in roles[:conclusion_index]
+        or any(role != "appendix" for role in roles[conclusion_index + 1 :])
+        or not core_roles.intersection(roles)
+        or not qualification_roles.intersection(roles)
+        or len(set(headings)) != len(headings)
+        or any(not heading for heading in headings)
+        or not all(content_counts)
+    ):
+        raise OwnerConflict("writing_paper_structure_invalid")
+    return {
+        "section_count": len(roles),
+        "section_roles": list(roles),
+    }
+
+
+def _validate_presentation_structure(blocks: tuple[str, ...]) -> int:
+    headings: list[tuple[int, str]] = []
+    content_counts: list[int] = []
+    for block in blocks[1:]:
+        structure = _STRUCTURE_MARKER.fullmatch(block)
+        if structure is not None:
+            match = _PRESENTATION_HEADING.fullmatch(structure.group(1))
+            if match is None:
+                raise OwnerConflict("writing_presentation_structure_invalid")
+            headings.append((int(match.group(1)), match.group(2).strip()))
+            content_counts.append(0)
+        elif _PAPER_SECTION_MARKER.fullmatch(block) is not None:
+            raise OwnerConflict("writing_presentation_structure_invalid")
+        elif not content_counts:
+            raise OwnerConflict("writing_presentation_structure_invalid")
+        else:
+            content_counts[-1] += 1
+    if (
+        not 2 <= len(headings) <= 40
+        or tuple(number for number, _title in headings)
+        != tuple(range(1, len(headings) + 1))
+        or any(not title for _number, title in headings)
+        or len({title for _number, title in headings}) != len(headings)
+        or not all(content_counts)
+    ):
+        raise OwnerConflict("writing_presentation_structure_invalid")
+    return len(headings)
+
+
 def _normalize_claim_text(value: str) -> str:
     return " ".join(value.split())
 
@@ -346,9 +582,7 @@ class WritingIntentBinding:
         }
 
     def validate(self) -> None:
-        if self.document_type != "report":
-            raise OwnerConflict("writing_document_type_invalid")
-        if normalize_report_intent(self.intent) != self.intent:
+        if normalize_writing_intent(self.document_type, self.intent) != self.intent:
             raise OwnerConflict("writing_intent_invalid")
         if canonical_hash(self.intent) != self.intent_hash:
             raise OwnerConflict("writing_intent_hash_mismatch")
@@ -484,13 +718,16 @@ class WritingCitationDecisionVerifier(Protocol):
     ) -> dict[str, object]: ...
 
 
-def normalize_report_intent(value: dict[str, object]) -> dict[str, object]:
+def normalize_writing_intent(
+    document_type: str, value: dict[str, object]
+) -> dict[str, object]:
+    profile = writing_document_profile(document_type)
     if set(value) != {"schema_ref", "title", "audience", "purpose", "instructions"}:
         raise OwnerConflict("writing_intent_invalid")
-    if value.get("schema_ref") != WRITING_REPORT_INTENT_SCHEMA:
+    if value.get("schema_ref") != profile.intent_schema_ref:
         raise OwnerConflict("writing_intent_invalid")
     return {
-        "schema_ref": WRITING_REPORT_INTENT_SCHEMA,
+        "schema_ref": profile.intent_schema_ref,
         "title": _text(value.get("title"), "writing_title_invalid", 512),
         "audience": _text(value.get("audience"), "writing_audience_invalid", 2000),
         "purpose": _text(value.get("purpose"), "writing_purpose_invalid", 4000),
@@ -498,6 +735,12 @@ def normalize_report_intent(value: dict[str, object]) -> dict[str, object]:
             value.get("instructions"), "writing_instructions_invalid", 12000, empty=True
         ),
     }
+
+
+def normalize_report_intent(value: dict[str, object]) -> dict[str, object]:
+    """Compatibility wrapper retaining the report-v1 intent contract."""
+
+    return normalize_writing_intent("report", value)
 
 
 def _text(value: object, code: str, maximum: int, *, empty: bool = False) -> str:
