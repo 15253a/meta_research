@@ -561,6 +561,10 @@ a:focus-visible,
   display: none;
 }
 
+.lumen-shell[inert] .lumen-return-summary {
+  visibility: hidden;
+}
+
 @media (min-width: 1161px) {
   .lumen-return-summary {
     right: clamp(28px, 4vw, 58px);
