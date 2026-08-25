@@ -1,10 +1,28 @@
 from __future__ import annotations
 
+from typing import Protocol
+
 from meta_research.deepfetch import DeepFetchProvider, DeepFetchUnavailable
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.common import OwnerConflict
-from meta_research.owners.human_collaboration import HumanCollaborationInterface
 from meta_research.owners.research_memory import ResearchMemoryInterface
+
+
+class DeepFetchRequestAuthority(Protocol):
+    def query_next_deepfetch_request(
+        self, excluded_request_refs: tuple[str, ...] = ()
+    ): ...
+
+    def record_deepfetch_succeeded(
+        self, request_ref: str, run_ref: str, snapshot: object
+    ) -> None: ...
+
+    def record_deepfetch_failed(
+        self,
+        request_ref: str,
+        failure_code: str,
+        run_ref: str | None = None,
+    ) -> None: ...
 
 
 class FirstQuestionDeepFetchWorker:
@@ -12,12 +30,12 @@ class FirstQuestionDeepFetchWorker:
 
     def __init__(
         self,
-        human_collaboration: HumanCollaborationInterface,
+        request_authority: DeepFetchRequestAuthority,
         agent_runtime: AgentRuntimeInterface,
         research_memory: ResearchMemoryInterface,
         provider: DeepFetchProvider,
     ) -> None:
-        self._human_collaboration = human_collaboration
+        self._request_authority = request_authority
         self._agent_runtime = agent_runtime
         self._research_memory = research_memory
         self._provider = provider
@@ -30,7 +48,7 @@ class FirstQuestionDeepFetchWorker:
             return True
         blocked_request_refs: set[str] = set()
         while True:
-            request = self._human_collaboration.query_next_deepfetch_request(
+            request = self._request_authority.query_next_deepfetch_request(
                 tuple(sorted(blocked_request_refs))
             )
             if request is None:
@@ -38,7 +56,7 @@ class FirstQuestionDeepFetchWorker:
             try:
                 run = self._agent_runtime.execute_deepfetch(request, self._provider)
                 snapshot = self._research_memory.accept_literature_snapshot(request, run)
-                self._human_collaboration.record_deepfetch_succeeded(
+                self._request_authority.record_deepfetch_succeeded(
                     request.request_ref,
                     run.run_ref,
                     snapshot,
@@ -53,7 +71,7 @@ class FirstQuestionDeepFetchWorker:
                 if error.code == "deepfetch_provider_stopped":
                     return True
                 run = self._agent_runtime.query_deepfetch_run(request.request_ref)
-                self._human_collaboration.record_deepfetch_failed(
+                self._request_authority.record_deepfetch_failed(
                     request.request_ref,
                     error.code,
                     None if run is None else run.run_ref,
@@ -81,7 +99,7 @@ class FirstQuestionDeepFetchWorker:
                     # completion must not write failure state onto the successor.
                     return True
                 run = self._agent_runtime.query_deepfetch_run(request.request_ref)
-                self._human_collaboration.record_deepfetch_failed(
+                self._request_authority.record_deepfetch_failed(
                     request.request_ref,
                     error.code,
                     None if run is None else run.run_ref,

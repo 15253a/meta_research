@@ -46,6 +46,9 @@ if TYPE_CHECKING:
 
 DEEPFETCH_REQUEST_SCHEMA = "meta-research/first-question-deepfetch-request/v1"
 QUESTION_DEEPFETCH_REQUEST_SCHEMA = "meta-research/question-deepfetch-request/v1"
+AUTONOMOUS_QUESTION_DEEPFETCH_REQUEST_SCHEMA = (
+    "meta-research/autonomous-question-deepfetch-request/v1"
+)
 DEEPFETCH_RESULT_SCHEMA = "meta-research/first-question-deepfetch-result/v2"
 DEEPFETCH_RUNTIME_BINDING_SCHEMA = "meta-research/deepfetch-runtime-binding/v1"
 DEEPFETCH_WEB_EVIDENCE_SCHEMA = "meta-research/deepfetch-web-evidence/v1"
@@ -141,7 +144,9 @@ class DeepFetchRunRequest:
     result_route: str
     authorization_receipt: AcceptanceReceipt
     creation_context_kind: Literal[
-        "quest_initialization", "manual_question_creation"
+        "quest_initialization",
+        "manual_question_creation",
+        "autonomous_question_creation",
     ] = "quest_initialization"
     creation_context_ref: str | None = None
     context_generation: int | None = None
@@ -154,7 +159,11 @@ class DeepFetchRunRequest:
             "schema_ref": (
                 DEEPFETCH_REQUEST_SCHEMA
                 if self.creation_context_kind == "quest_initialization"
-                else QUESTION_DEEPFETCH_REQUEST_SCHEMA
+                else (
+                    QUESTION_DEEPFETCH_REQUEST_SCHEMA
+                    if self.creation_context_kind == "manual_question_creation"
+                    else AUTONOMOUS_QUESTION_DEEPFETCH_REQUEST_SCHEMA
+                )
             ),
             "request_ref": self.request_ref,
             "initialization_id": self.initialization_id,
@@ -173,17 +182,18 @@ class DeepFetchRunRequest:
             "accepted_material_bindings": list(self.accepted_material_bindings),
             "result_route": self.result_route,
         }
-        if self.creation_context_kind == "manual_question_creation":
+        if self.creation_context_kind != "quest_initialization":
             payload.update(
                 {
                     "creation_context_kind": self.creation_context_kind,
                     "creation_context_ref": self.creation_context_ref,
                     "context_generation": self.context_generation,
                     "quest_ref": self.quest_ref,
-                    "parent_question_ref": self.parent_question_ref,
                     "context_basis_hash": self.context_basis_hash,
                 }
             )
+            if self.creation_context_kind == "manual_question_creation":
+                payload["parent_question_ref"] = self.parent_question_ref
         return payload
 
 

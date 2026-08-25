@@ -18,6 +18,7 @@ from meta_research.owners.common import canonical_hash, canonical_json
 
 
 BUNDLE_CONTEXT_PACK_SCHEMA_REF = "meta-research/bundle-context-pack/v1"
+BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF = "meta-research/bundle-context-pack/v2"
 LEGACY_TARGET_PLAN_SCHEMA_REF = "meta-research/target-plan/v2"
 TARGET_PLAN_SCHEMA_REF = "meta-research/target-plan/v3"
 TARGET_PLAN_REVIEW_SCHEMA_REF = "meta-research/target-plan-review/v1"
@@ -84,23 +85,49 @@ def validate_bundle_context_pack(
     cycle_ref: str,
     accepted_question_binding: dict[str, object],
     accepted_formal_plan_binding: dict[str, object],
+    accepted_idea_set_binding: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    schema_ref = context_pack.get("schema_ref")
+    expected_keys = {
+        "schema_ref",
+        "cycle_ref",
+        "accepted_question_binding",
+        "accepted_formal_plan_binding",
+    }
+    if schema_ref == BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF:
+        expected_keys.add("accepted_idea_set_binding")
     _exact_keys(
         context_pack,
-        {
-            "schema_ref",
-            "cycle_ref",
-            "accepted_question_binding",
-            "accepted_formal_plan_binding",
-        },
+        expected_keys,
         "bundle_context_pack_invalid",
     )
     if (
-        context_pack.get("schema_ref") != BUNDLE_CONTEXT_PACK_SCHEMA_REF
+        schema_ref
+        not in {
+            BUNDLE_CONTEXT_PACK_SCHEMA_REF,
+            BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF,
+        }
         or context_pack.get("cycle_ref") != cycle_ref
         or context_pack.get("accepted_question_binding") != accepted_question_binding
         or context_pack.get("accepted_formal_plan_binding")
         != accepted_formal_plan_binding
+        or (
+            schema_ref == BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF
+            and (
+                not isinstance(
+                    context_pack.get("accepted_idea_set_binding"), dict
+                )
+                or (
+                    accepted_idea_set_binding is not None
+                    and context_pack.get("accepted_idea_set_binding")
+                    != accepted_idea_set_binding
+                )
+            )
+        )
+        or (
+            schema_ref == BUNDLE_CONTEXT_PACK_SCHEMA_REF
+            and accepted_idea_set_binding is not None
+        )
     ):
         raise BundleContractError("bundle_context_pack_invalid")
     plan = accepted_formal_plan_binding.get("plan_document")
@@ -121,6 +148,19 @@ def validate_bundle_context_pack(
         "answer_contract_hash"
     ) != accepted_formal_plan_binding.get("answer_contract_hash"):
         raise BundleContractError("bundle_formal_plan_binding_invalid")
+    if schema_ref == BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF:
+        idea_binding = cast(
+            dict[str, object], context_pack["accepted_idea_set_binding"]
+        )
+        idea_set = idea_binding.get("idea_set")
+        if (
+            not isinstance(idea_set, dict)
+            or idea_set.get("question_ref")
+            != accepted_question_binding.get("question_ref")
+            or contract.get("source_idea_set_ref")
+            != idea_binding.get("outcome_ref")
+        ):
+            raise BundleContractError("bundle_context_pack_invalid")
     gaps = cast(list[object], plan["gap_set"])
     expected = "experiments_required" if gaps else "no_new_experiment_required"
     if plan["bundle_disposition"] != expected:

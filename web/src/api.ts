@@ -988,6 +988,202 @@ export type BundleStageProjection = {
   [key: string]: unknown;
 };
 
+export type ReasoningStageProjection = {
+  eligibility: {
+    status: string;
+    cycle_ref?: string | null;
+    question_ref?: string | null;
+    reason?: null | { code?: string; message?: string; [key: string]: unknown };
+    next_stage?: string | null;
+    [key: string]: unknown;
+  };
+  stage_run_request: null | {
+    status?: string;
+    request_ref?: string;
+    cycle_ref?: string;
+    stage?: string;
+    epoch?: number;
+    accepted_question_binding?: NonNullable<
+      IdeaStageProjection["stage_run_request"]
+    >["accepted_question_binding"];
+    context_pack_ref?: string;
+    context_pack_hash?: string;
+    context_pack?: {
+      question_literature_input?: Record<string, unknown>;
+      upstream_stage_closure?: Array<Record<string, unknown>>;
+      plan_evidence_input?: Record<string, unknown>;
+      accepted_target_commit_closures?: Array<Record<string, unknown>>;
+      research_context?: Record<string, unknown>;
+      [key: string]: unknown;
+    };
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  run: IdeaStageProjection["run"];
+  reasoning_acceptance: {
+    status: string;
+    disposition?:
+      | "affirmed"
+      | "denied"
+      | "uncertain"
+      | "insufficient_evidence"
+      | string;
+    outcome_ref?: string | null;
+    content: IdeaAcceptanceFact;
+    domain: IdeaAcceptanceFact;
+    [key: string]: unknown;
+  };
+  transition: {
+    status: string;
+    schema_ref?: string;
+    kind?: "NextCycleProposal" | "CandidateCompletion" | string;
+    ref?: string;
+    hash?: string;
+    is_authoritative?: boolean;
+    [key: string]: unknown;
+  };
+  stage_commit: null | (NonNullable<IdeaStageProjection["stage_commit"]> & {
+    disposition?: string;
+    transition_kind?: string;
+    transition_ref?: string;
+  });
+  [key: string]: unknown;
+};
+
+export type AutonomousCreationView = {
+  context_ref: string;
+  generation: number;
+  creation_mode: "AutonomousCreation";
+  status: string;
+  checkpoint: { ref: string; hash: string };
+  source: {
+    quest_ref?: string;
+    cycle_ref?: string;
+    reasoning_stage_run_request_ref?: string;
+    scientific_outcome_ref?: string;
+    question_ref?: string;
+    foreground_epoch?: number;
+    reasoning_checkpoint_ref?: string;
+    reasoning_checkpoint_hash?: string;
+    autonomous_scope_content_acceptance_receipt_ref?: string;
+    preliminary_scientific_acceptance_receipt_ref?: string;
+    [key: string]: unknown;
+  };
+  scope: {
+    creation_mode?: "AutonomousCreation";
+    question_blueprint?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  proposal: null | {
+    creation_mode?: "AutonomousCreation";
+    question?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  deepfetch: {
+    required: true;
+    waiver_allowed: false;
+    human_authorization_required: false;
+    authorization_receipt_ref?: string | null;
+    status: string;
+    request_ref?: string | null;
+    run_ref?: string | null;
+    literature_snapshot_ref?: string | null;
+    request_receipt?: IdeaReceipt | null;
+    literature_snapshot_receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  waiver: null;
+  human_confirmation: null;
+  human_request?: Record<string, unknown> | null;
+  content_acceptance: {
+    status: string;
+    content_ref?: string;
+    content_hash?: string;
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  dispatch_eligibility?: Record<string, unknown>;
+  question_anchor: Record<string, unknown> | null;
+  graph_presence_fact: Record<string, unknown> | null;
+  question_research_state_fact: Record<string, unknown> | null;
+  literature_revision: Record<string, unknown> | null;
+  next_cycle_proposal: null;
+  successor_cycle: null;
+  [key: string]: unknown;
+};
+
+export type AutonomousCreationProjection = {
+  status: "ready";
+  creation_mode: "AutonomousCreation";
+  current: AutonomousCreationView | null;
+};
+
+export type QuestCompletionView = {
+  context_ref: string;
+  status: string;
+  quest: { quest_ref: string; status: "active" | "ended" };
+  candidate_completion_ref: string;
+  candidate_completion_hash: string;
+  candidate_completion: {
+    completion_milestone_basis_refs?: string[];
+    [key: string]: unknown;
+  };
+  source: {
+    quest_ref?: string;
+    cycle_ref?: string;
+    reasoning_stage_run_request_ref?: string;
+    scientific_outcome_ref?: string;
+    foreground_epoch?: number;
+    reasoning_content_acceptance_receipt_ref?: string;
+    reasoning_domain_acceptance_receipt_ref?: string;
+    [key: string]: unknown;
+  };
+  goal_revision: {
+    goal_revision_ref?: string;
+    goal?: string;
+    completion_criteria?: string;
+    [key: string]: unknown;
+  };
+  human_confirmation: {
+    status: string;
+    preview: null | {
+      status: "current" | string;
+      ref: string;
+      hash: string;
+      candidate_completion_ref?: string;
+      candidate_completion_hash?: string;
+      quest_ref?: string;
+      goal_revision_ref?: string;
+      completion_milestone_basis_refs?: string[];
+      [key: string]: unknown;
+    };
+    decision: null | {
+      decision: "confirmed" | "rejected" | string;
+      receipt?: IdeaReceipt | null;
+      [key: string]: unknown;
+    };
+  };
+  domain_acceptance: {
+    status: string;
+    completion_ref?: string;
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  ending_transition: null | {
+    status?: string;
+    transition_ref?: string;
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  successor_cycle: null;
+  [key: string]: unknown;
+};
+
+export type QuestCompletionProjection = {
+  status: "ready";
+  current: QuestCompletionView | null;
+};
+
 export type ExperimentObservation = {
   event_ref: string;
   sequence: number;
@@ -1315,6 +1511,9 @@ export type PublicSnapshot = {
   research_control: ResearchControlProjection;
   plan_stage?: PlanStageProjection | null;
   bundle_stage?: BundleStageProjection | null;
+  reasoning_stage?: ReasoningStageProjection | null;
+  autonomous_creation: AutonomousCreationProjection;
+  quest_completion: QuestCompletionProjection;
   experiment: PublicExperimentProjection;
   writing: WritingOverview;
   harnesses: HarnessStatus;
@@ -1904,6 +2103,40 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
     throw new ProductError(`snapshot_unavailable:${response.status}`);
   }
   return (await response.json()) as PublicSnapshot;
+}
+
+export function fetchCurrentAutonomousCreation(
+  signal?: AbortSignal,
+): Promise<AutonomousCreationView | null> {
+  return readJson("/api/v1/autonomous-creations/current", signal);
+}
+
+export function fetchCurrentQuestCompletion(
+  signal?: AbortSignal,
+): Promise<QuestCompletionView | null> {
+  return readJson("/api/v1/quest-completions/current", signal);
+}
+
+export function startQuestCompletion(input: {
+  source_outcome_ref: string;
+  candidate_completion_ref: string;
+}): Promise<QuestCompletionView> {
+  return writeJson("/api/v1/quest-completions", "POST", input);
+}
+
+export function decideQuestCompletion(
+  contextRef: string,
+  input: {
+    preview_ref: string;
+    preview_hash: string;
+    decision: "confirmed" | "rejected";
+  },
+): Promise<QuestCompletionView> {
+  return writeJson(
+    `/api/v1/quest-completions/${encodeURIComponent(contextRef)}/decision`,
+    "POST",
+    input,
+  );
 }
 
 export function fetchTargetRootObservations(

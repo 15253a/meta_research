@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reasoning Stage"
+  short_description: "综合冻结证据并提出唯一下一周期或完成候选"
+  default_prompt: "使用 $reasoning-stage 从 current Reasoning 闭包形成诚实 ScientificOutcomeCandidate。"

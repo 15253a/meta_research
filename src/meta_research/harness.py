@@ -37,6 +37,7 @@ from meta_research.semantic_mcp import (
 )
 from meta_research.semantic_owner_gateway import (
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+    REASONING_ROOT_SEMANTIC_OPERATION_IDS,
     TARGET_RUN_SEMANTIC_OPERATION_IDS,
 )
 from meta_research.target_run_runtime_contract import TargetCompletionHandoff
@@ -62,6 +63,7 @@ FULL_CONFORMANCE_OPERATION_IDS = tuple(
             "research_graph.snapshot.read",
             "research_memory.snapshot.read",
             *BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+            *REASONING_ROOT_SEMANTIC_OPERATION_IDS,
             *TARGET_RUN_SEMANTIC_OPERATION_IDS,
         }
     )
@@ -98,6 +100,16 @@ class HarnessAdmissionError(RuntimeError):
 
 class ResidentMcpScopeVerifier(Protocol):
     def verify_bundle_runtime_scope(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> None: ...
+
+    def verify_reasoning_runtime_scope(
         self,
         *,
         run_ref: str,
@@ -222,6 +234,7 @@ class _ResidentMcpScope:
     root_session_ref: str
     fence_ref: str
     capability_binding_hash: str
+    operation_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -401,7 +414,12 @@ class HarnessRuntime:
         if verifier is None:
             raise HarnessAdmissionError("mcp_scope_verifier_unavailable")
         try:
-            verifier.verify_bundle_runtime_scope(
+            verify_scope = (
+                verifier.verify_reasoning_runtime_scope
+                if operation_ids == REASONING_ROOT_SEMANTIC_OPERATION_IDS
+                else verifier.verify_bundle_runtime_scope
+            )
+            verify_scope(
                 run_ref=run_ref,
                 attempt_ref=attempt_ref,
                 root_session_ref=root_session_ref,
@@ -429,6 +447,7 @@ class HarnessRuntime:
                 root_session_ref=root_session_ref,
                 fence_ref=fence_ref,
                 capability_binding_hash=capability_binding_hash,
+                operation_ids=operation_ids,
             )
         )
         return ResidentMcpChannel(connection=connection, binding=binding)
@@ -1853,7 +1872,13 @@ class HarnessRuntime:
                 current = False
             else:
                 try:
-                    verifier.verify_bundle_runtime_scope(
+                    verify_scope = (
+                        verifier.verify_reasoning_runtime_scope
+                        if resident_scope.operation_ids
+                        == REASONING_ROOT_SEMANTIC_OPERATION_IDS
+                        else verifier.verify_bundle_runtime_scope
+                    )
+                    verify_scope(
                         run_ref=resident_scope.run_ref,
                         attempt_ref=resident_scope.attempt_ref,
                         root_session_ref=resident_scope.root_session_ref,

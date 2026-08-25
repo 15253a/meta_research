@@ -18,7 +18,10 @@ if TYPE_CHECKING:
         TargetLaunchRequest,
     )
     from meta_research.experiment_contract import ExperimentResultComponentManifest
-    from meta_research.owners.research_graph import TargetLaunchVerification
+    from meta_research.owners.research_graph import (
+        EvidenceReuseLeaf,
+        TargetLaunchVerification,
+    )
 
 
 OwnerFact: TypeAlias = int | str | bool | None
@@ -222,6 +225,10 @@ class AssetBindingVerifier(Protocol):
 
 
 class EvidenceRefVerifier(Protocol):
+    def query_evidence_reference_state(
+        self, quest_ref: str
+    ) -> tuple[int, tuple[str, ...]]: ...
+
     def verify_evidence_refs(
         self,
         *,
@@ -249,6 +256,20 @@ class EvidenceRefVerifier(Protocol):
         require_complete: bool = True,
         selected_evidence_refs: frozenset[str] | None = None,
     ) -> None: ...
+
+    def resolve_plan_evidence_reuse_leaves(
+        self,
+        *,
+        quest_ref: str,
+        accepted_formal_plan: AcceptedFormalPlanBinding,
+    ) -> tuple["EvidenceReuseLeaf", ...]: ...
+
+    def resolve_reasoning_target_evidence_leaves(
+        self,
+        *,
+        quest_ref: str,
+        target_commit_refs: tuple[str, ...],
+    ) -> tuple["EvidenceReuseLeaf", ...]: ...
 
 
 class AssetReferenceReader(Protocol):
@@ -554,6 +575,18 @@ class StageRunRequestVerifier(Protocol):
         context_pack_ref: str,
     ) -> VerifiedStageRunRequestBinding: ...
 
+    def query_reasoning_stage_entry_assets(
+        self,
+        *,
+        source_cycle_ref: str,
+        target_question_ref: str,
+        entry_stage: str,
+        typed_skip_basis_refs_by_stage: dict[str, list[str]],
+    ) -> tuple[
+        AcceptedIdeaSetBinding | None,
+        AcceptedFormalPlanBinding | None,
+    ]: ...
+
 
 class DeepFetchRunRequestVerifier(Protocol):
     def verify_deepfetch_run_request(
@@ -752,6 +785,62 @@ class FormalPlanDecisionVerifier(Protocol):
         decision: str,
         formal_plan_ref: str | None,
         receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
+class ReasoningOutcomeDecisionVerifier(Protocol):
+    """RG decision seam consumed by AR for one Reasoning Attempt."""
+
+    def verify_reasoning_outcome_decision(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str | None,
+        decision: str,
+        outcome_ref: str | None,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def query_reasoning_transition_binding(
+        self,
+        *,
+        outcome_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> dict[str, object]: ...
+
+    def query_reasoning_next_cycle_target(
+        self,
+        *,
+        outcome_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> dict[str, object] | None: ...
+
+    def query_current_quest_goal_revision(
+        self, quest_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def verify_quest_goal_revision(
+        self, binding: dict[str, object]
+    ) -> None: ...
+
+    def query_reasoning_research_context(
+        self, *, quest_ref: str, question_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def verify_reasoning_research_context(
+        self, binding: dict[str, object]
+    ) -> None: ...
+
+
+class QuestionLiteratureRevisionVerifier(Protocol):
+    """RM current-revision seam used by AE at Reasoning request issuance."""
+
+    def query_current_question_literature_revision(
+        self, question_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def verify_question_literature_revision(
+        self, binding: dict[str, object]
     ) -> None: ...
 
 

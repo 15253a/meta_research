@@ -76,6 +76,11 @@ from meta_research.quest_drafting import (
     ProposalDraftRequest,
     QUESTION_FIELD_MAX_LENGTHS,
 )
+from meta_research.reasoning_contract import (
+    autonomous_question_proposal_from_scope,
+    validate_autonomous_question_proposal,
+    validate_autonomous_question_scope,
+)
 from meta_research.writing_contract import validate_frozen_writing_snapshot
 
 
@@ -94,6 +99,10 @@ RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 HC_OWNER = "human_collaboration"
 CONFIRMATION_RECEIPT_KIND = "quest_bundle_confirmation"
 DEEPFETCH_REQUEST_RECEIPT_KIND = "deepfetch_run_request"
+AUTONOMOUS_CONTEXT_RECEIPT_KIND = "autonomous_creation_context"
+AUTONOMOUS_PROPOSAL_RECEIPT_KIND = "autonomous_question_proposal"
+AUTONOMOUS_SELECTION_RECEIPT_KIND = "autonomous_question_selection"
+QUEST_COMPLETION_CONFIRMATION_RECEIPT_KIND = "quest_completion_confirmation"
 _DRAFTING_CLAIM_LEASE_SECONDS = 5 * 60
 _COMPLETED_CUSTODY_AUDIT_SECONDS = 60
 _PREVIEW_REFRESH_RETRY_SECONDS = 60.0
@@ -284,6 +293,85 @@ class HumanCollaborationInterface(Protocol):
     def query_broad_research_authorization(
         self, quest_ref: str
     ) -> dict[str, object] | None: ...
+
+    def prepare_autonomous_creation(
+        self,
+        *,
+        source: dict[str, object],
+        scientific_outcome: dict[str, object],
+        reasoning_checkpoint_ref: str,
+        reasoning_checkpoint_hash: str,
+        autonomous_scope: dict[str, object],
+        autonomous_scope_hash: str,
+        broad_authorization: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def query_autonomous_creation(
+        self, reasoning_checkpoint_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def query_autonomous_creation_context(
+        self, context_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def query_autonomous_creation_contexts(
+        self,
+    ) -> tuple[dict[str, object], ...]: ...
+
+    def query_current_autonomous_creation(self) -> dict[str, object] | None: ...
+
+    def form_autonomous_question_proposal(
+        self,
+        context_ref: str,
+        *,
+        literature_snapshot_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def select_autonomous_question_content(
+        self,
+        context_ref: str,
+        *,
+        content_ref: str,
+        content_hash: str,
+        content_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def prepare_quest_completion(
+        self,
+        *,
+        source: dict[str, object],
+        candidate_completion: dict[str, object],
+        candidate_completion_ref: str,
+        candidate_completion_hash: str,
+        goal_revision: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def query_current_quest_completion(self) -> dict[str, object] | None: ...
+
+    def query_quest_completion(
+        self, context_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def query_quest_completion_contexts(
+        self,
+    ) -> tuple[dict[str, object], ...]: ...
+
+    def preview_quest_completion(
+        self, context_ref: str, *, idempotency_key: str
+    ) -> dict[str, object]: ...
+
+    def decide_quest_completion(
+        self,
+        *,
+        preview_ref: str,
+        preview_hash: str,
+        decision: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
 
     def create_quest(
         self, draft: dict[str, object], idempotency_key: str
@@ -759,6 +847,30 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         if bindings != current:
             raise OwnerConflict("guidance_bindings_stale")
 
+    def query_active_guidance_bindings(
+        self, scope_ref: str
+    ) -> list[dict[str, object]]:
+        if not isinstance(scope_ref, str) or not scope_ref:
+            raise OwnerConflict("guidance_bindings_stale")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM hc_soft_constraints WHERE scope_ref = "
+                    ":scope_ref AND status = 'active' ORDER BY scope_ref, "
+                    "constraint_ref, revision"
+                ),
+                {"scope_ref": scope_ref},
+            ).all()
+        return [guidance_binding_from_row(row) for row in rows]
+
+    def verify_guidance_binding(self, binding: dict[str, object]) -> None:
+        scope_ref = binding.get("scope_ref")
+        if not isinstance(scope_ref, str) or not scope_ref:
+            raise OwnerConflict("guidance_binding_invalid")
+        current = self.query_active_guidance_bindings(scope_ref)
+        if binding not in current:
+            raise OwnerConflict("guidance_binding_invalid")
+
     def verify_capability_authorization(
         self,
         *,
@@ -998,6 +1110,190 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         return self._verified_broad_research_authorization(
             quest_ref=quest_ref, require_effective_grant=False
         )
+
+    def verify_quest_completion_decision(
+        self,
+        *,
+        context_ref: str,
+        preview_ref: str,
+        preview_hash: str,
+        candidate_completion_ref: str,
+        candidate_completion_hash: str,
+        goal_revision_ref: str,
+        decision: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        """Verify the exact current HC completion decision for RG."""
+
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_quest_completion_contexts WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("quest_completion_confirmation_invalid")
+        bindings = {
+            "context_ref": context_ref,
+            "preview_ref": preview_ref,
+            "preview_hash": preview_hash,
+            "candidate_completion_ref": candidate_completion_ref,
+            "candidate_completion_hash": candidate_completion_hash,
+            "goal_revision_ref": goal_revision_ref,
+            "decision": decision,
+        }
+        expected_hash = _owner_receipt_hash(
+            QUEST_COMPLETION_CONFIRMATION_RECEIPT_KIND,
+            preview_ref,
+            bindings,
+        )
+        if (
+            row.preview_ref != preview_ref
+            or row.preview_hash != preview_hash
+            or row.candidate_completion_ref != candidate_completion_ref
+            or row.candidate_completion_hash != candidate_completion_hash
+            or row.goal_revision_ref != goal_revision_ref
+            or row.decision != decision
+            or row.decision_receipt_ref != receipt.receipt_ref
+            or row.decision_receipt_hash != receipt.payload_hash
+            or receipt.issuer != HC_OWNER
+            or receipt.kind != QUEST_COMPLETION_CONFIRMATION_RECEIPT_KIND
+            or receipt.subject_ref != preview_ref
+            or receipt.payload_hash != expected_hash
+        ):
+            raise OwnerConflict("quest_completion_confirmation_invalid")
+
+    def verify_autonomous_creation_context(
+        self,
+        *,
+        context_ref: str,
+        generation: int,
+        source_hash: str,
+        reasoning_checkpoint_ref: str,
+        reasoning_checkpoint_hash: str,
+        autonomous_scope_hash: str,
+        broad_authorization_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        """Verify HC's immutable AutonomousCreation correlation receipt."""
+
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("autonomous_creation_context_invalid")
+        try:
+            source = _decoded_mapping(
+                row.source_json, "autonomous_creation_source"
+            )
+            scope = _decoded_mapping(
+                row.autonomous_scope_json, "autonomous_creation_scope"
+            )
+            authorization = _decoded_mapping(
+                row.broad_authorization_json,
+                "broad_research_authorization",
+            )
+        except OwnerConflict as error:
+            raise OwnerConflict("autonomous_creation_context_invalid") from error
+        bindings = {
+            "context_ref": context_ref,
+            "generation": generation,
+            "source_hash": source_hash,
+            "reasoning_checkpoint_ref": reasoning_checkpoint_ref,
+            "reasoning_checkpoint_hash": reasoning_checkpoint_hash,
+            "autonomous_scope_hash": autonomous_scope_hash,
+            "broad_authorization_hash": broad_authorization_hash,
+        }
+        expected_hash = _owner_receipt_hash(
+            AUTONOMOUS_CONTEXT_RECEIPT_KIND,
+            context_ref,
+            bindings,
+        )
+        if (
+            type(generation) is not int
+            or generation < 1
+            or int(row.generation) != generation
+            or canonical_json(source) != row.source_json
+            or canonical_hash(source) != row.source_hash
+            or row.source_hash != source_hash
+            or row.reasoning_checkpoint_ref != reasoning_checkpoint_ref
+            or row.reasoning_checkpoint_hash != reasoning_checkpoint_hash
+            or canonical_json(scope) != row.autonomous_scope_json
+            or canonical_hash(scope) != row.autonomous_scope_hash
+            or row.autonomous_scope_hash != autonomous_scope_hash
+            or canonical_json(authorization) != row.broad_authorization_json
+            or canonical_hash(authorization) != row.broad_authorization_hash
+            or row.broad_authorization_hash != broad_authorization_hash
+            or row.context_receipt_ref != receipt.receipt_ref
+            or row.context_receipt_hash != receipt.payload_hash
+            or receipt.issuer != HC_OWNER
+            or receipt.kind != AUTONOMOUS_CONTEXT_RECEIPT_KIND
+            or receipt.subject_ref != context_ref
+            or receipt.payload_hash != expected_hash
+        ):
+            raise OwnerConflict("autonomous_creation_context_invalid")
+
+    def verify_autonomous_question_selection(
+        self,
+        *,
+        context_ref: str,
+        generation: int,
+        proposal_ref: str,
+        proposal_hash: str,
+        content_ref: str,
+        content_hash: str,
+        content_receipt: AcceptanceReceipt,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("autonomous_question_selection_invalid")
+        bindings = {
+            "context_ref": context_ref,
+            "generation": generation,
+            "proposal_ref": proposal_ref,
+            "proposal_hash": proposal_hash,
+            "content_ref": content_ref,
+            "content_hash": content_hash,
+            "content_receipt_ref": content_receipt.receipt_ref,
+            "content_receipt_hash": content_receipt.payload_hash,
+        }
+        expected_hash = _owner_receipt_hash(
+            AUTONOMOUS_SELECTION_RECEIPT_KIND,
+            context_ref,
+            bindings,
+        )
+        if (
+            int(row.generation) != generation
+            or row.proposal_ref != proposal_ref
+            or row.proposal_hash != proposal_hash
+            or row.selected_content_ref != content_ref
+            or row.selected_content_hash != content_hash
+            or row.selected_content_receipt_hash != content_receipt.payload_hash
+            or row.selection_receipt_ref != receipt.receipt_ref
+            or row.selection_receipt_hash != receipt.payload_hash
+            or content_receipt.issuer != "research_memory"
+            or content_receipt.subject_ref != content_ref
+            or receipt.issuer != HC_OWNER
+            or receipt.kind != AUTONOMOUS_SELECTION_RECEIPT_KIND
+            or receipt.subject_ref != context_ref
+            or receipt.payload_hash != expected_hash
+        ):
+            raise OwnerConflict("autonomous_question_selection_invalid")
 
     def _verified_broad_research_authorization(
         self, *, quest_ref: str, require_effective_grant: bool
@@ -2299,6 +2595,761 @@ class SQLiteHumanCollaboration:
             return None
         return self._fact_verifier.inspect_broad_research_authorization(
             quest_ref=quest_ref
+        )
+
+    def prepare_autonomous_creation(
+        self,
+        *,
+        source: dict[str, object],
+        scientific_outcome: dict[str, object],
+        reasoning_checkpoint_ref: str,
+        reasoning_checkpoint_hash: str,
+        autonomous_scope: dict[str, object],
+        autonomous_scope_hash: str,
+        broad_authorization: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        """Freeze HC correlation for a reviewed Reasoning checkpoint.
+
+        This is not a user confirmation and it does not create a Question.  It
+        records only the autonomous correlation/generation and the already
+        accepted source bindings so restart recovery cannot substitute a later
+        model proposal or foreground epoch.
+        """
+
+        _require_nonempty_ref(reasoning_checkpoint_ref, "reasoning_checkpoint_ref")
+        _require_hash(reasoning_checkpoint_hash, "reasoning_checkpoint_hash")
+        _require_idempotency_key(idempotency_key)
+        source_outcome = scientific_outcome
+        if (
+            source.get("reasoning_checkpoint_ref") != reasoning_checkpoint_ref
+            or source.get("reasoning_checkpoint_hash")
+            != reasoning_checkpoint_hash
+            or source.get("scientific_outcome_ref")
+            != source_outcome.get("outcome_ref")
+        ):
+            raise OwnerConflict("autonomous_creation_source_invalid")
+        try:
+            verified_scope_hash = validate_autonomous_question_scope(
+                autonomous_scope,
+                source_outcome=source_outcome,
+            )
+        except Exception as error:
+            raise OwnerConflict("autonomous_creation_scope_invalid") from error
+        if verified_scope_hash != autonomous_scope_hash:
+            raise OwnerConflict("autonomous_creation_scope_invalid")
+        quest_ref = cast(str, source["quest_ref"])
+        current_authorization = self.query_broad_research_authorization(quest_ref)
+        if (
+            current_authorization is None
+            or current_authorization != broad_authorization
+            or current_authorization.get("status") != "granted"
+        ):
+            raise OwnerConflict("broad_research_authorization_required")
+
+        source_json = canonical_json(source)
+        source_hash = canonical_hash(source)
+        scope_json = canonical_json(autonomous_scope)
+        authorization_json = canonical_json(broad_authorization)
+        authorization_hash = canonical_hash(broad_authorization)
+        request = {
+            "source": source,
+            "scientific_outcome": source_outcome,
+            "reasoning_checkpoint_ref": reasoning_checkpoint_ref,
+            "reasoning_checkpoint_hash": reasoning_checkpoint_hash,
+            "autonomous_scope": autonomous_scope,
+            "autonomous_scope_hash": autonomous_scope_hash,
+            "broad_authorization": broad_authorization,
+        }
+        request_hash = canonical_hash(request)
+        now = time.time()
+        with self._database.write() as connection:
+            by_key = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            by_checkpoint = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts WHERE "
+                    "reasoning_checkpoint_ref = :checkpoint_ref"
+                ),
+                {"checkpoint_ref": reasoning_checkpoint_ref},
+            ).first()
+            existing = by_key or by_checkpoint
+            if existing is not None:
+                if existing.request_hash != request_hash:
+                    raise OwnerConflict("autonomous_creation_identity_conflict")
+                context_ref = str(existing.context_ref)
+            else:
+                context_ref = new_ref("autonomous_creation")
+                receipt_ref = new_ref("hc_receipt")
+                bindings = {
+                    "context_ref": context_ref,
+                    "generation": 1,
+                    "source_hash": source_hash,
+                    "reasoning_checkpoint_ref": reasoning_checkpoint_ref,
+                    "reasoning_checkpoint_hash": reasoning_checkpoint_hash,
+                    "autonomous_scope_hash": autonomous_scope_hash,
+                    "broad_authorization_hash": authorization_hash,
+                }
+                receipt_hash = _owner_receipt_hash(
+                    AUTONOMOUS_CONTEXT_RECEIPT_KIND,
+                    context_ref,
+                    bindings,
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO hc_autonomous_creation_contexts "
+                        "(context_ref, generation, reasoning_checkpoint_ref, "
+                        "reasoning_checkpoint_hash, source_outcome_ref, "
+                        "source_json, source_hash, scientific_outcome_json, "
+                        "scientific_outcome_hash, autonomous_scope_json, "
+                        "autonomous_scope_hash, broad_authorization_json, "
+                        "broad_authorization_hash, context_receipt_ref, "
+                        "context_receipt_hash, idempotency_key, request_hash, "
+                        "created_at, updated_at) VALUES (:context_ref, 1, "
+                        ":reasoning_checkpoint_ref, :reasoning_checkpoint_hash, "
+                        ":source_outcome_ref, :source_json, :source_hash, "
+                        ":outcome_json, :outcome_hash, :scope_json, :scope_hash, "
+                        ":authorization_json, "
+                        ":authorization_hash, :receipt_ref, :receipt_hash, "
+                        ":idempotency_key, :request_hash, :now, :now)"
+                    ),
+                    {
+                        "context_ref": context_ref,
+                        "reasoning_checkpoint_ref": reasoning_checkpoint_ref,
+                        "reasoning_checkpoint_hash": reasoning_checkpoint_hash,
+                        "source_outcome_ref": source["scientific_outcome_ref"],
+                        "source_json": source_json,
+                        "source_hash": source_hash,
+                        "outcome_json": canonical_json(source_outcome),
+                        "outcome_hash": canonical_hash(source_outcome),
+                        "scope_json": scope_json,
+                        "scope_hash": autonomous_scope_hash,
+                        "authorization_json": authorization_json,
+                        "authorization_hash": authorization_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = "
+                        "revision + 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "human_collaboration.autonomous_creation_prepared",
+                    {
+                        "context_ref": context_ref,
+                        "reasoning_checkpoint_ref": reasoning_checkpoint_ref,
+                        "source_scientific_outcome_ref": source[
+                            "scientific_outcome_ref"
+                        ],
+                    },
+                )
+        current = self.query_autonomous_creation(reasoning_checkpoint_ref)
+        if current is None:
+            raise OwnerConflict("autonomous_creation_missing_after_prepare")
+        return current
+
+    def query_autonomous_creation(
+        self, reasoning_checkpoint_ref: str
+    ) -> dict[str, object] | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts WHERE "
+                    "reasoning_checkpoint_ref = :checkpoint_ref"
+                ),
+                {"checkpoint_ref": reasoning_checkpoint_ref},
+            ).first()
+        return None if row is None else _public_autonomous_context(row)
+
+    def query_autonomous_creation_context(
+        self, context_ref: str
+    ) -> dict[str, object] | None:
+        _require_nonempty_ref(context_ref, "autonomous_context_ref")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+        return None if row is None else _public_autonomous_context(row)
+
+    def query_autonomous_creation_contexts(
+        self,
+    ) -> tuple[dict[str, object], ...]:
+        """Enumerate every durable context in stable scheduling order."""
+
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts ORDER BY "
+                    "created_at, context_ref"
+                )
+            ).all()
+        return tuple(_public_autonomous_context(row) for row in rows)
+
+    def query_current_autonomous_creation(self) -> dict[str, object] | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts ORDER BY "
+                    "created_at DESC, context_ref DESC LIMIT 1"
+                )
+            ).first()
+        return None if row is None else _public_autonomous_context(row)
+
+    def form_autonomous_question_proposal(
+        self,
+        context_ref: str,
+        *,
+        literature_snapshot_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        _require_nonempty_ref(context_ref, "autonomous_context_ref")
+        _require_nonempty_ref(literature_snapshot_ref, "literature_snapshot_ref")
+        _require_idempotency_key(idempotency_key)
+        snapshot = self._research_memory.query_literature_snapshot(
+            literature_snapshot_ref
+        )
+        if (
+            snapshot is None
+            or snapshot.creation_context_kind != "autonomous_question_creation"
+            or snapshot.creation_context_ref != context_ref
+        ):
+            raise OwnerConflict("autonomous_literature_snapshot_invalid")
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+            if row is None:
+                raise OwnerConflict("autonomous_creation_context_unavailable")
+            source = _decoded_mapping(row.source_json, "autonomous_creation_source")
+            source_outcome = _decoded_mapping(
+                row.scientific_outcome_json, "autonomous_scientific_outcome"
+            )
+            scope = _decoded_mapping(
+                row.autonomous_scope_json, "autonomous_creation_scope"
+            )
+            proposal = autonomous_question_proposal_from_scope(
+                scope,
+                source_outcome=source_outcome,
+            )
+            proposal_hash = validate_autonomous_question_proposal(
+                proposal,
+                source_outcome=source_outcome,
+            )
+            request_hash = canonical_hash(
+                {
+                    "context_ref": context_ref,
+                    "literature_snapshot_ref": literature_snapshot_ref,
+                    "proposal_hash": proposal_hash,
+                }
+            )
+            if row.proposal_ref is not None:
+                if (
+                    row.proposal_hash != proposal_hash
+                    or row.proposal_snapshot_ref != literature_snapshot_ref
+                    or row.proposal_request_hash != request_hash
+                ):
+                    raise OwnerConflict("autonomous_proposal_identity_conflict")
+            else:
+                proposal_ref = "autonomous_question_proposal_" + proposal_hash[:32]
+                receipt_ref = new_ref("hc_receipt")
+                receipt_hash = _owner_receipt_hash(
+                    AUTONOMOUS_PROPOSAL_RECEIPT_KIND,
+                    proposal_ref,
+                    {
+                        "context_ref": context_ref,
+                        "generation": int(row.generation),
+                        "proposal_hash": proposal_hash,
+                        "literature_snapshot_ref": literature_snapshot_ref,
+                        "literature_snapshot_hash": snapshot.snapshot_hash,
+                        "literature_snapshot_receipt_ref": (
+                            snapshot.receipt.receipt_ref
+                        ),
+                    },
+                )
+                now = time.time()
+                connection.execute(
+                    text(
+                        "UPDATE hc_autonomous_creation_contexts SET "
+                        "proposal_ref = :proposal_ref, proposal_json = "
+                        ":proposal_json, proposal_hash = :proposal_hash, "
+                        "proposal_snapshot_ref = :snapshot_ref, "
+                        "proposal_request_hash = :request_hash, "
+                        "proposal_receipt_ref = :receipt_ref, "
+                        "proposal_receipt_hash = :receipt_hash, updated_at = "
+                        ":now WHERE context_ref = :context_ref AND proposal_ref "
+                        "IS NULL"
+                    ),
+                    {
+                        "context_ref": context_ref,
+                        "proposal_ref": proposal_ref,
+                        "proposal_json": canonical_json(proposal),
+                        "proposal_hash": proposal_hash,
+                        "snapshot_ref": literature_snapshot_ref,
+                        "request_hash": request_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = "
+                        "revision + 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "human_collaboration.autonomous_question_proposed",
+                    {
+                        "context_ref": context_ref,
+                        "proposal_ref": proposal_ref,
+                        "literature_snapshot_ref": literature_snapshot_ref,
+                    },
+                )
+        current = self.query_autonomous_creation(str(row.reasoning_checkpoint_ref))
+        if current is None or current["proposal"] is None:
+            raise OwnerConflict("autonomous_proposal_missing_after_commit")
+        return cast(dict[str, object], current["proposal"])
+
+    def select_autonomous_question_content(
+        self,
+        context_ref: str,
+        *,
+        content_ref: str,
+        content_hash: str,
+        content_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        _require_idempotency_key(idempotency_key)
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_autonomous_creation_contexts WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+            if row is None or row.proposal_ref is None:
+                raise OwnerConflict("autonomous_proposal_unavailable")
+            if (
+                content_receipt.issuer != "research_memory"
+                or content_receipt.subject_ref != content_ref
+            ):
+                raise OwnerConflict("autonomous_question_content_receipt_invalid")
+            request_hash = canonical_hash(
+                {
+                    "context_ref": context_ref,
+                    "generation": int(row.generation),
+                    "proposal_ref": row.proposal_ref,
+                    "proposal_hash": row.proposal_hash,
+                    "content_ref": content_ref,
+                    "content_hash": content_hash,
+                    "content_receipt_ref": content_receipt.receipt_ref,
+                    "content_receipt_hash": content_receipt.payload_hash,
+                }
+            )
+            if row.selected_content_ref is not None:
+                if (
+                    row.selected_content_ref != content_ref
+                    or row.selected_content_hash != content_hash
+                    or row.selection_request_hash != request_hash
+                ):
+                    raise OwnerConflict("autonomous_question_selection_conflict")
+            else:
+                receipt_ref = new_ref("hc_receipt")
+                receipt_hash = _owner_receipt_hash(
+                    AUTONOMOUS_SELECTION_RECEIPT_KIND,
+                    context_ref,
+                    {
+                        "context_ref": context_ref,
+                        "generation": int(row.generation),
+                        "proposal_ref": row.proposal_ref,
+                        "proposal_hash": row.proposal_hash,
+                        "content_ref": content_ref,
+                        "content_hash": content_hash,
+                        "content_receipt_ref": content_receipt.receipt_ref,
+                        "content_receipt_hash": content_receipt.payload_hash,
+                    },
+                )
+                now = time.time()
+                connection.execute(
+                    text(
+                        "UPDATE hc_autonomous_creation_contexts SET "
+                        "selected_content_ref = :content_ref, "
+                        "selected_content_hash = :content_hash, "
+                        "selected_content_receipt_json = :content_receipt_json, "
+                        "selected_content_receipt_hash = :content_receipt_hash, "
+                        "selection_request_hash = :request_hash, "
+                        "selection_receipt_ref = :receipt_ref, "
+                        "selection_receipt_hash = :receipt_hash, updated_at = "
+                        ":now WHERE context_ref = :context_ref AND "
+                        "selected_content_ref IS NULL"
+                    ),
+                    {
+                        "context_ref": context_ref,
+                        "content_ref": content_ref,
+                        "content_hash": content_hash,
+                        "content_receipt_json": canonical_json(
+                            content_receipt.as_public_dict()
+                        ),
+                        "content_receipt_hash": content_receipt.payload_hash,
+                        "request_hash": request_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = "
+                        "revision + 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "human_collaboration.autonomous_question_selected",
+                    {
+                        "context_ref": context_ref,
+                        "content_ref": content_ref,
+                    },
+                )
+        current = self.query_autonomous_creation(str(row.reasoning_checkpoint_ref))
+        if current is None:
+            raise OwnerConflict("autonomous_creation_context_unavailable")
+        return current
+
+    def prepare_quest_completion(
+        self,
+        *,
+        source: dict[str, object],
+        candidate_completion: dict[str, object],
+        candidate_completion_ref: str,
+        candidate_completion_hash: str,
+        goal_revision: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        _require_idempotency_key(idempotency_key)
+        if (
+            canonical_hash(candidate_completion) != candidate_completion_hash
+            or candidate_completion.get("current_quest_ref")
+            != source.get("quest_ref")
+            or candidate_completion.get("source_scientific_outcome_ref")
+            != source.get("scientific_outcome_ref")
+            or goal_revision.get("goal_revision_ref")
+            != candidate_completion.get("current_goal_revision_ref")
+        ):
+            raise OwnerConflict("candidate_completion_binding_invalid")
+        request = {
+            "source": source,
+            "candidate_completion": candidate_completion,
+            "candidate_completion_ref": candidate_completion_ref,
+            "candidate_completion_hash": candidate_completion_hash,
+            "goal_revision": goal_revision,
+        }
+        request_hash = canonical_hash(request)
+        now = time.time()
+        with self._database.write() as connection:
+            by_key = connection.execute(
+                text(
+                    "SELECT * FROM hc_quest_completion_contexts WHERE "
+                    "idempotency_key = :key"
+                ),
+                {"key": idempotency_key},
+            ).first()
+            by_candidate = connection.execute(
+                text(
+                    "SELECT * FROM hc_quest_completion_contexts WHERE "
+                    "candidate_completion_ref = :candidate_ref"
+                ),
+                {"candidate_ref": candidate_completion_ref},
+            ).first()
+            existing = by_key or by_candidate
+            if existing is not None:
+                if existing.request_hash != request_hash:
+                    raise OwnerConflict("quest_completion_identity_conflict")
+                context_ref = str(existing.context_ref)
+            else:
+                context_ref = new_ref("quest_completion")
+                connection.execute(
+                    text(
+                        "INSERT INTO hc_quest_completion_contexts "
+                        "(context_ref, source_json, source_hash, "
+                        "candidate_completion_ref, candidate_completion_json, "
+                        "candidate_completion_hash, quest_ref, "
+                        "goal_revision_ref, goal_revision_json, "
+                        "goal_revision_hash, idempotency_key, request_hash, "
+                        "created_at, updated_at) VALUES (:context_ref, "
+                        ":source_json, :source_hash, :candidate_ref, "
+                        ":candidate_json, :candidate_hash, :quest_ref, "
+                        ":goal_ref, :goal_json, :goal_hash, :key, "
+                        ":request_hash, :now, :now)"
+                    ),
+                    {
+                        "context_ref": context_ref,
+                        "source_json": canonical_json(source),
+                        "source_hash": canonical_hash(source),
+                        "candidate_ref": candidate_completion_ref,
+                        "candidate_json": canonical_json(candidate_completion),
+                        "candidate_hash": candidate_completion_hash,
+                        "quest_ref": source["quest_ref"],
+                        "goal_ref": goal_revision["goal_revision_ref"],
+                        "goal_json": canonical_json(goal_revision),
+                        "goal_hash": canonical_hash(goal_revision),
+                        "key": idempotency_key,
+                        "request_hash": request_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = "
+                        "revision + 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "human_collaboration.quest_completion_prepared",
+                    {
+                        "context_ref": context_ref,
+                        "candidate_completion_ref": candidate_completion_ref,
+                    },
+                )
+        current = self.query_quest_completion(context_ref)
+        if current is None:
+            raise OwnerConflict("quest_completion_context_missing_after_prepare")
+        return current
+
+    def query_quest_completion(
+        self, context_ref: str
+    ) -> dict[str, object] | None:
+        _require_nonempty_ref(context_ref, "quest_completion_context_ref")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_quest_completion_contexts WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+        return None if row is None else _public_quest_completion_context(row)
+
+    def query_quest_completion_contexts(
+        self,
+    ) -> tuple[dict[str, object], ...]:
+        """Enumerate every durable context in stable scheduling order."""
+
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM hc_quest_completion_contexts ORDER BY "
+                    "created_at, context_ref"
+                )
+            ).all()
+        return tuple(_public_quest_completion_context(row) for row in rows)
+
+    def query_current_quest_completion(self) -> dict[str, object] | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_quest_completion_contexts ORDER BY "
+                    "created_at DESC, context_ref DESC LIMIT 1"
+                )
+            ).first()
+        return None if row is None else _public_quest_completion_context(row)
+
+    def preview_quest_completion(
+        self, context_ref: str, *, idempotency_key: str
+    ) -> dict[str, object]:
+        _require_idempotency_key(idempotency_key)
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_quest_completion_contexts WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+            if row is None:
+                raise OwnerConflict("quest_completion_context_unavailable")
+            candidate = _decoded_mapping(
+                row.candidate_completion_json, "candidate_completion"
+            )
+            preview_document = {
+                "candidate_completion_ref": row.candidate_completion_ref,
+                "candidate_completion_hash": row.candidate_completion_hash,
+                "quest_ref": row.quest_ref,
+                "goal_revision_ref": row.goal_revision_ref,
+                "completion_milestone_basis_refs": candidate[
+                    "completion_milestone_basis_refs"
+                ],
+            }
+            preview_hash = canonical_hash(preview_document)
+            request_hash = canonical_hash(
+                {"context_ref": context_ref, "preview_hash": preview_hash}
+            )
+            if row.preview_ref is not None:
+                if (
+                    row.preview_hash != preview_hash
+                    or row.preview_request_hash != request_hash
+                ):
+                    raise OwnerConflict("quest_completion_preview_conflict")
+                return cast(
+                    dict[str, object],
+                    _public_quest_completion_context(row)["human_confirmation"][
+                        "preview"
+                    ],
+                )
+            preview_ref = new_ref("quest_completion_preview")
+            now = time.time()
+            connection.execute(
+                text(
+                    "UPDATE hc_quest_completion_contexts SET preview_ref = "
+                    ":preview_ref, preview_json = :preview_json, preview_hash = "
+                    ":preview_hash, preview_request_hash = :request_hash, "
+                    "preview_idempotency_key = :key, updated_at = :now WHERE "
+                    "context_ref = :context_ref AND preview_ref IS NULL"
+                ),
+                {
+                    "context_ref": context_ref,
+                    "preview_ref": preview_ref,
+                    "preview_json": canonical_json(preview_document),
+                    "preview_hash": preview_hash,
+                    "request_hash": request_hash,
+                    "key": idempotency_key,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE human_collaboration_state SET revision = revision + "
+                    "1 WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "human_collaboration.quest_completion_previewed",
+                {"context_ref": context_ref, "preview_ref": preview_ref},
+            )
+        current = self.query_quest_completion(context_ref)
+        assert current is not None
+        return cast(
+            dict[str, object], current["human_confirmation"]["preview"]
+        )
+
+    def decide_quest_completion(
+        self,
+        *,
+        preview_ref: str,
+        preview_hash: str,
+        decision: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        _require_idempotency_key(idempotency_key)
+        if decision not in {"confirmed", "rejected"}:
+            raise OwnerConflict("quest_completion_decision_invalid")
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_quest_completion_contexts WHERE "
+                    "preview_ref = :preview_ref"
+                ),
+                {"preview_ref": preview_ref},
+            ).first()
+            if row is None or row.preview_hash != preview_hash:
+                raise OwnerConflict("quest_completion_preview_stale")
+            current_goal = self._research_graph.query_current_quest_goal_revision(
+                str(row.quest_ref)
+            )
+            if (
+                current_goal is None
+                or current_goal.get("goal_revision_ref") != row.goal_revision_ref
+                or canonical_hash(current_goal) != row.goal_revision_hash
+            ):
+                raise OwnerConflict("quest_completion_preview_stale")
+            bindings = {
+                "context_ref": row.context_ref,
+                "preview_ref": preview_ref,
+                "preview_hash": preview_hash,
+                "candidate_completion_ref": row.candidate_completion_ref,
+                "candidate_completion_hash": row.candidate_completion_hash,
+                "goal_revision_ref": row.goal_revision_ref,
+                "decision": decision,
+            }
+            request_hash = canonical_hash(bindings)
+            if row.decision is not None:
+                if (
+                    row.decision != decision
+                    or row.decision_request_hash != request_hash
+                    or row.decision_idempotency_key != idempotency_key
+                ):
+                    raise OwnerConflict("quest_completion_decision_conflict")
+            else:
+                receipt_ref = new_ref("hc_receipt")
+                receipt_hash = _owner_receipt_hash(
+                    QUEST_COMPLETION_CONFIRMATION_RECEIPT_KIND,
+                    preview_ref,
+                    bindings,
+                )
+                now = time.time()
+                connection.execute(
+                    text(
+                        "UPDATE hc_quest_completion_contexts SET decision = "
+                        ":decision, decision_request_hash = :request_hash, "
+                        "decision_idempotency_key = :key, decision_receipt_ref "
+                        "= :receipt_ref, decision_receipt_hash = :receipt_hash, "
+                        "decided_at = :now, updated_at = :now WHERE context_ref "
+                        "= :context_ref AND decision IS NULL"
+                    ),
+                    {
+                        "context_ref": row.context_ref,
+                        "decision": decision,
+                        "request_hash": request_hash,
+                        "key": idempotency_key,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = "
+                        "revision + 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "human_collaboration.quest_completion_decided",
+                    {
+                        "context_ref": row.context_ref,
+                        "preview_ref": preview_ref,
+                        "decision": decision,
+                    },
+                )
+        current = self.query_quest_completion(str(row.context_ref))
+        if current is None:
+            raise OwnerConflict("quest_completion_context_unavailable")
+        return cast(
+            dict[str, object], current["human_confirmation"]["decision"]
         )
 
     def respond_to_human_request(
@@ -6697,6 +7748,55 @@ class SQLiteHumanCollaboration:
             return True
         self._clear_dispatch_failure(initialization_id, "question_identity")
 
+        # DeepFetch custody and the Question-scoped literature revision are
+        # distinct RM facts.  Once RG has accepted the Question identity, bind
+        # the already accepted initialization snapshot to that Question before
+        # AE can activate work that may eventually reach Reasoning.  Direct
+        # (non-DeepFetch) Quest creation honestly has no such revision.
+        try:
+            literature_snapshot = (
+                self._research_memory.query_literature_snapshot_for_basis(
+                    initialization_id,
+                    quest.draft_revision,
+                    quest.draft_hash,
+                )
+            )
+            if literature_snapshot is not None:
+                literature_revision = (
+                    self._research_memory.query_current_question_literature_revision(
+                        question.question_ref
+                    )
+                )
+                if literature_revision is None:
+                    self._research_memory.ensure_question_literature_revision(
+                        question_binding=question.as_binding(),
+                        source_snapshot_binding=(
+                            literature_snapshot.as_context_binding()
+                        ),
+                        idempotency_key=(
+                            "initial-question-literature:"
+                            + canonical_hash(
+                                {
+                                    "question_ref": question.question_ref,
+                                    "snapshot_ref": literature_snapshot.snapshot_ref,
+                                }
+                            )
+                        ),
+                    )
+                    return True
+        except (OwnerConflict, OSError) as error:
+            self._record_dispatch_failure(
+                initialization_id,
+                "question_literature_revision",
+                _dispatch_failure_reason(
+                    error, "question_literature_revision_unavailable"
+                ),
+            )
+            return False
+        self._clear_dispatch_failure(
+            initialization_id, "question_literature_revision"
+        )
+
         try:
             cycle = self._advancement_engine.query_initial_cycle(initialization_id)
         except (OwnerConflict, OSError) as error:
@@ -9137,6 +10237,154 @@ def _validate_question_content(
             raise OwnerConflict(f"{field}_required")
         normalized[field] = value
     return normalized
+
+
+def _require_nonempty_ref(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 512:
+        raise OwnerConflict(f"{field}_invalid")
+    return value
+
+
+def _require_hash(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise OwnerConflict(f"{field}_invalid")
+    return value
+
+
+def _require_idempotency_key(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 200:
+        raise OwnerConflict("idempotency_key_invalid")
+    return value
+
+
+def _decoded_mapping(value: object, kind: str) -> dict[str, object]:
+    try:
+        decoded = decoded_object(value)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict(f"{kind}_invalid") from error
+    if not isinstance(decoded, dict):
+        raise OwnerConflict(f"{kind}_invalid")
+    return cast(dict[str, object], decoded)
+
+
+def _acceptance_receipt(
+    *, issuer: str, kind: str, receipt_ref: str, subject_ref: str, payload_hash: str
+) -> dict[str, str]:
+    return AcceptanceReceipt(
+        issuer=issuer,
+        kind=kind,
+        receipt_ref=receipt_ref,
+        subject_ref=subject_ref,
+        payload_hash=payload_hash,
+    ).as_public_dict()
+
+
+def _public_autonomous_context(row: Row) -> dict[str, object]:
+    source = _decoded_mapping(row.source_json, "autonomous_creation_source")
+    scope = _decoded_mapping(row.autonomous_scope_json, "autonomous_creation_scope")
+    authorization = _decoded_mapping(
+        row.broad_authorization_json, "broad_research_authorization"
+    )
+    proposal: dict[str, object] | None = None
+    if row.proposal_ref is not None:
+        proposal = _decoded_mapping(row.proposal_json, "autonomous_question_proposal")
+        proposal.update(
+            {
+                "ref": row.proposal_ref,
+                "hash": row.proposal_hash,
+                "literature_snapshot_ref": row.proposal_snapshot_ref,
+                "receipt": _acceptance_receipt(
+                    issuer=HC_OWNER,
+                    kind=AUTONOMOUS_PROPOSAL_RECEIPT_KIND,
+                    receipt_ref=str(row.proposal_receipt_ref),
+                    subject_ref=str(row.proposal_ref),
+                    payload_hash=str(row.proposal_receipt_hash),
+                ),
+            }
+        )
+    selection: dict[str, object] | None = None
+    if row.selected_content_ref is not None:
+        selection = {
+            "content_ref": row.selected_content_ref,
+            "content_hash": row.selected_content_hash,
+            "content_receipt": _decoded_mapping(
+                row.selected_content_receipt_json,
+                "autonomous_question_content_receipt",
+            ),
+            "receipt": _acceptance_receipt(
+                issuer=HC_OWNER,
+                kind=AUTONOMOUS_SELECTION_RECEIPT_KIND,
+                receipt_ref=str(row.selection_receipt_ref),
+                subject_ref=str(row.context_ref),
+                payload_hash=str(row.selection_receipt_hash),
+            ),
+        }
+    return {
+        "context_ref": row.context_ref,
+        "generation": int(row.generation),
+        "checkpoint": {
+            "ref": row.reasoning_checkpoint_ref,
+            "hash": row.reasoning_checkpoint_hash,
+        },
+        "source": source,
+        "scientific_outcome": _decoded_mapping(
+            row.scientific_outcome_json, "autonomous_scientific_outcome"
+        ),
+        "scope": scope,
+        "scope_hash": row.autonomous_scope_hash,
+        "broad_authorization": authorization,
+        "proposal": proposal,
+        "selection": selection,
+        "receipt": _acceptance_receipt(
+            issuer=HC_OWNER,
+            kind=AUTONOMOUS_CONTEXT_RECEIPT_KIND,
+            receipt_ref=str(row.context_receipt_ref),
+            subject_ref=str(row.context_ref),
+            payload_hash=str(row.context_receipt_hash),
+        ),
+    }
+
+
+def _public_quest_completion_context(row: Row) -> dict[str, object]:
+    preview: dict[str, object] | None = None
+    if row.preview_ref is not None:
+        preview = _decoded_mapping(row.preview_json, "quest_completion_preview")
+        preview.update(
+            {
+                "status": "current",
+                "ref": row.preview_ref,
+                "hash": row.preview_hash,
+            }
+        )
+    decision: dict[str, object] | None = None
+    if row.decision is not None:
+        decision = {
+            "decision": row.decision,
+            "receipt": _acceptance_receipt(
+                issuer=HC_OWNER,
+                kind=QUEST_COMPLETION_CONFIRMATION_RECEIPT_KIND,
+                receipt_ref=str(row.decision_receipt_ref),
+                subject_ref=str(row.preview_ref),
+                payload_hash=str(row.decision_receipt_hash),
+            ),
+        }
+    return {
+        "context_ref": row.context_ref,
+        "source": _decoded_mapping(row.source_json, "quest_completion_source"),
+        "candidate_completion_ref": row.candidate_completion_ref,
+        "candidate_completion_hash": row.candidate_completion_hash,
+        "candidate_completion": _decoded_mapping(
+            row.candidate_completion_json, "candidate_completion"
+        ),
+        "goal_revision": _decoded_mapping(
+            row.goal_revision_json, "quest_goal_revision"
+        ),
+        "human_confirmation": {"preview": preview, "decision": decision},
+    }
 
 
 def create_bundle_confirmation_verifier(

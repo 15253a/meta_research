@@ -9,6 +9,7 @@ from meta_research.acquisition import (
     NatureDownloaderAdapter,
 )
 from meta_research.auth import Authentication
+from meta_research.autonomous_creation import AutonomousCreationService
 from meta_research.bundle_exhaustion import BundleExhaustionOwnerProofVerifier
 from meta_research.bundle_stage import BundleStageWorker
 from meta_research.bundle_skill import CodexBundleSkillAdapter, BundleSkillProvider
@@ -20,6 +21,7 @@ from meta_research.deepfetch import (
     CodexDeepFetchAdapter,
     DeepFetchAcquisitionClient,
     DeepFetchProvider,
+    DeepFetchRunRequest,
 )
 from meta_research.feed import DurableFeed
 from meta_research.experiment import (
@@ -98,6 +100,12 @@ from meta_research.target_run_finalizer import (
     TargetRunFinalizer,
 )
 from meta_research.target_run_runtime import TargetRunRuntime
+from meta_research.reasoning_skill import (
+    CodexReasoningSkillAdapter,
+    ReasoningSkillProvider,
+)
+from meta_research.reasoning_stage import ReasoningStageWorker
+from meta_research.quest_completion import QuestCompletionService
 from meta_research.writing import WritingReportService
 from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillProvider
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
@@ -119,6 +127,91 @@ class TargetRunAuthorities:
     agent_runtime: SQLiteTargetRunAgentAuthority
 
 
+class _DeepFetchRequestVerifierRouter:
+    """Late-bound issuer router used while AR is composed before AE."""
+
+    def __init__(self, human_verifier: object) -> None:
+        self._human_verifier = human_verifier
+        self._advancement_engine: AdvancementEngineInterface | None = None
+
+    def bind_advancement_engine(
+        self, advancement_engine: AdvancementEngineInterface
+    ) -> None:
+        self._advancement_engine = advancement_engine
+
+    def verify_deepfetch_run_request(self, **values: object) -> None:
+        if values.get("creation_context_kind") == "autonomous_question_creation":
+            if self._advancement_engine is None:
+                raise RuntimeError("autonomous deepfetch verifier is not bound")
+            self._advancement_engine.verify_autonomous_deepfetch_run_request(
+                **values
+            )
+            return
+        verify = getattr(self._human_verifier, "verify_deepfetch_run_request")
+        verify(**values)
+
+
+class _DeepFetchRequestAuthorityRouter:
+    def __init__(
+        self,
+        human_collaboration: HumanCollaborationInterface,
+        advancement_engine: AdvancementEngineInterface,
+    ) -> None:
+        self._human_collaboration = human_collaboration
+        self._advancement_engine = advancement_engine
+
+    def query_next_deepfetch_request(
+        self, excluded_request_refs: tuple[str, ...] = ()
+    ) -> DeepFetchRunRequest | None:
+        request = self._human_collaboration.query_next_deepfetch_request(
+            excluded_request_refs
+        )
+        if request is not None:
+            return request
+        return self._advancement_engine.query_next_autonomous_deepfetch_request(
+            excluded_request_refs
+        )
+
+    def record_deepfetch_succeeded(
+        self, request_ref: str, run_ref: str, snapshot: object
+    ) -> None:
+        if (
+            getattr(snapshot, "creation_context_kind", None)
+            == "autonomous_question_creation"
+        ):
+            self._advancement_engine.record_autonomous_deepfetch_succeeded(
+                request_ref=request_ref,
+                run_ref=run_ref,
+                snapshot=snapshot,
+            )
+            return
+        self._human_collaboration.record_deepfetch_succeeded(
+            request_ref, run_ref, snapshot  # type: ignore[arg-type]
+        )
+
+    def record_deepfetch_failed(
+        self,
+        request_ref: str,
+        failure_code: str,
+        run_ref: str | None = None,
+    ) -> None:
+        autonomous = (
+            self._advancement_engine.query_autonomous_deepfetch_request_by_ref(
+                request_ref
+            )
+        )
+        if autonomous is not None:
+            self._advancement_engine.record_autonomous_deepfetch_failed(
+                request_ref=request_ref,
+                failure_code=failure_code,
+                run_ref=run_ref,
+            )
+            return
+        self._human_collaboration.record_deepfetch_failed(
+            request_ref, failure_code, run_ref
+        )
+
+
 @dataclass
 class ProductionRuntime:
     data_root: DataRoot
@@ -129,6 +222,9 @@ class ProductionRuntime:
     idea_stage: IdeaStageWorker
     plan_stage: PlanStageWorker
     bundle_stage: BundleStageWorker
+    reasoning_stage: ReasoningStageWorker
+    autonomous_creation: AutonomousCreationService
+    quest_completion: QuestCompletionService
     deepfetch: FirstQuestionDeepFetchWorker
     experiment: ExperimentService
     writing: WritingReportService
@@ -191,6 +287,7 @@ def build_production_runtime(
     idea_skill_provider: IdeaSkillProvider | None = None,
     plan_skill_provider: PlanSkillProvider | None = None,
     bundle_skill_provider: BundleSkillProvider | None = None,
+    reasoning_skill_provider: ReasoningSkillProvider | None = None,
     target_commit_evidence_authority: TargetCommitEvidenceAuthority | None = None,
     deepfetch_provider: DeepFetchProvider | None = None,
     acquisition_provider: AcquisitionProvider | None = None,
@@ -226,6 +323,13 @@ def build_production_runtime(
         data_root.root / "bundle-skill-provider",
         process_runner=shared_provider_runner,
     )
+    reasoning_skill_provider = (
+        reasoning_skill_provider
+        or CodexReasoningSkillAdapter(
+            data_root.root / "reasoning-skill-provider",
+            process_runner=shared_provider_runner,
+        )
+    )
     acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
     experiment_provider = experiment_provider or BuiltinMicroExperimentProvider(
         data_root.run / "experiment-provider"
@@ -244,7 +348,9 @@ def build_production_runtime(
     stage_request_receipts = create_advancement_engine_receipt_verifier(
         database=database
     )
-    deepfetch_request_receipts = create_deepfetch_request_verifier(database=database)
+    deepfetch_request_receipts = _DeepFetchRequestVerifierRouter(
+        create_deepfetch_request_verifier(database=database)
+    )
     attempt_receipts = create_agent_runtime_receipt_verifier(
         database=database,
         stage_request_verifier=stage_request_receipts,
@@ -269,6 +375,7 @@ def build_production_runtime(
         stage_request_verifier=stage_request_receipts,
         manual_confirmation_verifier=manual_question_confirmations,
         plan_content_verifier=research_memory_receipts,
+        reasoning_content_verifier=research_memory_receipts,
     )
     attempt_receipts.bind_bundle_report_evidence_verifier(
         research_graph_receipts
@@ -287,6 +394,7 @@ def build_production_runtime(
         human_response_verifier=human_response_verifier,
         experiment_binding_verifier=research_graph_receipts,
         bundle_report_evidence_verifier=research_graph_receipts,
+        reasoning_outcome_verifier=research_graph_receipts,
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
@@ -307,6 +415,10 @@ def build_production_runtime(
     agent_runtime.bind_provider_quiescence_driver(
         bundle_skill_provider,
         unit_kinds=("bundle_primary", "bundle_review"),
+    )
+    agent_runtime.bind_provider_quiescence_driver(
+        reasoning_skill_provider,
+        unit_kinds=("reasoning_primary", "reasoning_review"),
     )
     agent_runtime.bind_provider_quiescence_driver(
         deepfetch_provider,
@@ -334,6 +446,7 @@ def build_production_runtime(
         human_response_verifier=human_response_verifier,
         plan_content_verifier=research_memory_receipts,
         runtime_control_verifier=attempt_receipts,
+        reasoning_content_verifier=research_memory_receipts,
     )
     agent_runtime.bind_writing_citation_verifier(research_graph_receipts)
     research_memory = create_research_memory_interface(
@@ -377,9 +490,15 @@ def build_production_runtime(
             research_graph,
         )
     )
-    research_graph_receipts.bind_target_commit_evidence_authority(
+    resolved_target_commit_evidence_authority = (
         target_commit_evidence_authority
         or TargetCommitEvidenceCatalog(research_graph, research_memory)
+    )
+    research_graph_receipts.bind_target_commit_evidence_authority(
+        resolved_target_commit_evidence_authority
+    )
+    research_memory_receipts.bind_plan_evidence_reuse_verifier(
+        research_graph_receipts
     )
     manual_question_confirmations.bind_research_memory_verifier(research_memory)
     agent_runtime.bind_research_material_resolver(research_memory)
@@ -405,7 +524,15 @@ def build_production_runtime(
         current_question_verifier=research_graph_receipts,
         bundle_report_verifier=attempt_receipts,
         bundle_report_evidence_verifier=research_graph_receipts,
+        reasoning_outcome_verifier=research_graph_receipts,
+        question_literature_revision_verifier=research_memory_receipts,
     )
+    deepfetch_request_receipts.bind_advancement_engine(advancement_engine)
+    bind_dispatch_verifier = getattr(
+        research_graph, "bind_autonomous_question_dispatch_verifier", None
+    )
+    if callable(bind_dispatch_verifier):
+        bind_dispatch_verifier(advancement_engine)
     attempt_receipts.bind_bundle_exhaustion_verifier(advancement_engine)
     attempt_receipts.bind_bundle_report_disposition_verifier(
         advancement_engine
@@ -438,6 +565,19 @@ def build_production_runtime(
         research_memory=research_memory,
         agent_runtime=agent_runtime,
         human_collaboration=human_collaboration,
+    )
+    autonomous_creation = AutonomousCreationService(
+        human_collaboration,
+        advancement_engine,
+        agent_runtime,
+        research_memory,
+        research_graph,
+        acquisition_provider,
+    )
+    quest_completion = QuestCompletionService(
+        human_collaboration,
+        research_graph,
+        advancement_engine,
     )
     target_run_agent = SQLiteTargetRunAgentAuthority(
         database,
@@ -522,6 +662,11 @@ def build_production_runtime(
     )
     if callable(bind_bundle_conformance):
         bind_bundle_conformance(harnesses)
+    bind_reasoning_conformance = getattr(
+        reasoning_skill_provider, "bind_full_conformance_authority", None
+    )
+    if callable(bind_reasoning_conformance):
+        bind_reasoning_conformance(harnesses)
     verify_bundle_exhaustion_trace = getattr(
         bundle_skill_provider,
         "verify_bundle_exhaustion_review_trace",
@@ -548,8 +693,20 @@ def build_production_runtime(
         owners.research_graph,
         plan_skill_provider,
     )
+    reasoning_stage = ReasoningStageWorker(
+        feed,
+        owners.advancement_engine,
+        owners.agent_runtime,
+        owners.research_memory,
+        owners.research_graph,
+        reasoning_skill_provider,
+        autonomous_creation=autonomous_creation,
+    )
     deepfetch = FirstQuestionDeepFetchWorker(
-        human_collaboration,
+        _DeepFetchRequestAuthorityRouter(
+            human_collaboration,
+            advancement_engine,
+        ),
         agent_runtime,
         research_memory,
         deepfetch_provider,
@@ -598,6 +755,9 @@ def build_production_runtime(
         idea_stage=idea_stage,
         plan_stage=plan_stage,
         bundle_stage=bundle_stage,
+        reasoning_stage=reasoning_stage,
+        autonomous_creation=autonomous_creation,
+        quest_completion=quest_completion,
         experiment=experiment,
         writing=writing,
         harnesses=harnesses,
@@ -610,6 +770,7 @@ def build_production_runtime(
         idea_skill_provider,
         plan_skill_provider,
         bundle_skill_provider,
+        reasoning_skill_provider,
         deepfetch_provider,
         acquisition_provider,
         experiment_provider,
@@ -628,6 +789,9 @@ def build_production_runtime(
         idea_stage=idea_stage,
         plan_stage=plan_stage,
         bundle_stage=bundle_stage,
+        reasoning_stage=reasoning_stage,
+        autonomous_creation=autonomous_creation,
+        quest_completion=quest_completion,
         deepfetch=deepfetch,
         experiment=experiment,
         writing=writing,

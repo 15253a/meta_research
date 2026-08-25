@@ -110,8 +110,9 @@ reconciliation. These ledgers and the current Foreground projection are rebuilt
 from SQLite after browser, daemon, worker, or host interruption.
 
 The generic `stage_execution` capability remains unavailable as a catch-all;
-the delivered Idea, Plan, and Bundle paths are reported only through their
-explicit Stage facts, while Reasoning and Writing remain later slices.
+the delivered Idea, Plan, Bundle, and Reasoning paths are reported only through
+their explicit Stage facts. Writing remains a separate user-invoked capability,
+not another Stage.
 
 Research Asset is now a production vertical slice. The authenticated Web can
 submit text, uploaded files, directories, local paths, repositories, links,
@@ -284,3 +285,80 @@ workspace file nor handoff candidate can complete the Stage. Advancement Engine
 alone verifies the current request, BundleReport and Owner receipts before
 forming StageCommit. Negative, zero and non-significant accepted results remain
 realized facts for Reasoning; technical or semantic blockers remain explicit.
+
+## 2026-08-25 Reasoning and follow-up closure
+
+Reasoning is the mandatory final Stage of every normal Cycle. Advancement
+Engine freezes the current AcceptedQuestionBinding, exact
+`QuestionLiteratureRevision | none`, Foreground epoch, and the issuer-owned
+Idea/Plan/Bundle route closure into one versioned ContextPack. A direct accepted
+`NoViableCandidate`, a no-gap typed skip, and an execution-backed Exhausted
+closure remain different facts; an absent Plan, Bundle Run, Target, or evidence
+binding is not replaced by an empty object or `not_applicable` placeholder.
+
+The packaged Reasoning Skill uses the current managed Run, Attempt, Fence, root
+and native Session plus a scope-bound resident Semantic MCP channel. It returns
+one non-authoritative `ScientificOutcomeCandidate` with disposition
+`affirmed | denied | uncertain | insufficient_evidence` and exactly one
+`NextCycleProposal | CandidateCompletion`. Substantive claims cite only frozen
+LiteratureRecord or MetricResult facts; diagnostic assets stay diagnostic. AR
+execution, RM content custody, RG scientific acceptance, AR completion, and AE
+StageCommit remain independent recoverable boundaries.
+
+When Reasoning needs a new or decomposed Question, it first records a reviewed,
+non-terminal checkpoint in the same Run. AutonomousCreation then reuses the
+Quest's broad research authorization to require one real DeepFetch, accepts RM
+Question content, records HC selection and AE dispatch eligibility, and lets RG
+atomically create the QuestionAnchor plus current `present` and `open` facts.
+Only after RM binds an independent QuestionLiteratureRevision to that accepted
+Question does the same Reasoning native Session resume and emit its sole outward
+NextCycleProposal. There is no waiver, per-Run confirmation, silent Manual
+fallback, provisional QuestionRef, or duplicate successor Cycle.
+
+A CandidateCompletion is only a model proposal. Human Collaboration first
+shows a current Web preview and records an exact explicit decision; Research
+Graph then independently accepts the completion against the current Quest Goal
+revision and frozen milestone basis. Advancement Engine may end the Quest only
+after the matching Reasoning StageCommit and RG receipt both verify. Rejection,
+no response, stale preview, stale Goal/epoch, or model output alone never ends a
+Quest and never creates a successor Cycle.
+
+The authenticated Lumen projection exposes Reasoning eligibility, request,
+Run/Attempt, preliminary autonomous checkpoint, RM/RG acceptance layers,
+transition, StageCommit, AutonomousCreation progress, and Quest completion as
+separate on-demand facts. Its commands write only completion intent and the
+exact HC decision; daemon workers resume every workflow from the first missing
+Owner receipt after response loss or restart. Workers enumerate durable HC
+contexts through public Owner queries and round-robin across Quests, so an
+ended, stale, failed, or human-blocked context cannot hide another actionable
+one; Web decisions address the exact completion context and preview rather than
+the global newest projection.
+
+### Reasoning prototype delta
+
+This slice is bound to the Reasoning logic prototype at
+`f2d3f3f0d77a6f50ab535d50d6d404a525c09757`. The production adaptation keeps
+its scientific dispositions, evidence roles, multi-owner acceptance boundary,
+AutonomousCreation lifecycle, and sole outward transition. The following
+integration changes are intentional:
+
+- Prototype fixture DTOs and fake receipts are replaced by versioned Context
+  Packs and receipts issued by AE, AR, RM, RG, and HC. The root/native Session
+  remains an AR runtime binding rather than a caller-authored AE request field.
+- A new Question direction is held as a reviewed, non-terminal checkpoint in
+  the current Reasoning Attempt. This is required by the accepted #85/#104
+  lifecycle so that Question creation can finish before the one outward
+  `NextCycleProposal` is formed; the checkpoint is not a second transition or
+  a scientific acceptance.
+- The prototype permits `Idea | Plan | Bundle | Reasoning` entry with typed
+  skip bases. Production additionally applies the current #112 Stage input
+  contracts: direct Plan requires the target Question's exact accepted
+  IdeaSet, and direct Bundle requires its exact accepted FormalPlan. A newly
+  created Question cannot already own either fact, so such a route is rejected
+  before DeepFetch or Question-creation effects instead of substituting a
+  Reasoning outcome, empty object, or synthetic upstream artifact. Direct
+  Reasoning retains the prototype's explicit absent-input route.
+- Prototype `TODO-CONTRACT` ports for scientific and completion acceptance are
+  realized as separate RM custody, RG semantic acceptance, HC exact human
+  confirmation, and AE advancement/ending operations. No Skill-side call is
+  treated as Owner acceptance or Stage/Quest advancement.

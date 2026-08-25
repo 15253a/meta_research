@@ -6,6 +6,7 @@ from typing import cast
 
 from meta_research.bundle_contract import (
     BUNDLE_CONTEXT_PACK_SCHEMA_REF,
+    BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF,
     target_execution_assertion,
     target_execution_authorization_requirement,
 )
@@ -60,6 +61,7 @@ from meta_research.owners.agent_runtime import (
 )
 from meta_research.owners.common import (
     AcceptedFormalPlanBinding,
+    AcceptedIdeaSetBinding,
     AcceptanceReceipt,
     OwnerConflict,
     VerifiedBundleReportReceipt,
@@ -100,22 +102,11 @@ class _CurrentCycle:
 @dataclass(frozen=True)
 class _EligibleBundle:
     current: _CurrentCycle
-    formal_plan: FormalPlanDecision
-    plan_document: AcceptedPlanDocument
-    plan_commit: StageCommit
+    binding: AcceptedFormalPlanBinding
+    accepted_idea_set: AcceptedIdeaSetBinding | None = None
 
     def accepted_formal_plan(self) -> AcceptedFormalPlanBinding:
-        return AcceptedFormalPlanBinding(
-            formal_plan_ref=cast(str, self.formal_plan.formal_plan_ref),
-            content_ref=self.plan_document.content_ref,
-            plan_document_hash=self.plan_document.plan_document_hash,
-            answer_contract_hash=self.plan_document.answer_contract_hash,
-            content_receipt=self.plan_document.receipt,
-            formal_plan_receipt=self.formal_plan.receipt,
-            stage_commit_ref=self.plan_commit.commit_ref,
-            stage_commit_receipt=self.plan_commit.receipt,
-            plan_document=self.plan_document.plan_document,
-        )
+        return self.binding
 
 
 @dataclass(frozen=True)
@@ -198,15 +189,28 @@ class BundleStageWorker:
             ):
                 raise OwnerConflict("bundle_foreground_epoch_stale")
             accepted_formal_plan = eligible.accepted_formal_plan()
+            accepted_idea_set = eligible.accepted_idea_set
             self._advancement_engine.ensure_bundle_stage_request(
                 cycle_ref=current.cycle_ref,
                 accepted_question=current.question.as_binding(),
                 accepted_formal_plan=accepted_formal_plan,
+                accepted_idea_set=accepted_idea_set,
                 context_pack={
-                    "schema_ref": BUNDLE_CONTEXT_PACK_SCHEMA_REF,
+                    "schema_ref": (
+                        BUNDLE_CONTEXT_PACK_SCHEMA_REF
+                        if accepted_idea_set is None
+                        else BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF
+                    ),
                     "cycle_ref": current.cycle_ref,
                     "accepted_question_binding": current.question.as_binding().as_dict(),
                     "accepted_formal_plan_binding": accepted_formal_plan.as_dict(),
+                    **(
+                        {}
+                        if accepted_idea_set is None
+                        else {
+                            "accepted_idea_set_binding": accepted_idea_set.as_dict()
+                        }
+                    ),
                 },
                 idempotency_key=_operation_key(
                     "bundle-request", current.cycle_ref, str(epoch)
@@ -1650,7 +1654,7 @@ class BundleStageWorker:
                 "status": "eligible",
                 "cycle_ref": current.cycle_ref,
                 "question_ref": current.question.question_ref,
-                "formal_plan_ref": eligible.formal_plan.formal_plan_ref,
+                "formal_plan_ref": eligible.binding.formal_plan_ref,
                 "reason": None,
                 "next_stage": "Bundle",
             },
@@ -1674,7 +1678,33 @@ class BundleStageWorker:
     def _qualify(
         self, current: _CurrentCycle
     ) -> tuple[_EligibleBundle | None, str | None, str | None]:
-        request = self._advancement_engine.query_plan_stage_request(current.cycle_ref)
+        successor = self._advancement_engine.query_reasoning_successor_context(
+            current.cycle_ref
+        )
+        if successor is not None and successor.get("entry_stage") == "bundle":
+            raw_idea_binding = successor.get("accepted_idea_set_binding")
+            raw_binding = successor.get("accepted_formal_plan_binding")
+            if not isinstance(raw_idea_binding, dict) or not isinstance(
+                raw_binding, dict
+            ):
+                raise OwnerConflict("accepted_formal_plan_lineage_invalid")
+            idea_binding = _accepted_idea_set_binding_from_public(raw_idea_binding)
+            binding = _accepted_formal_plan_binding_from_public(raw_binding)
+            answer_contract = binding.plan_document.get("answer_contract")
+            if (
+                not isinstance(answer_contract, dict)
+                or answer_contract.get("source_question_ref")
+                != current.question.question_ref
+                or answer_contract.get("source_idea_set_ref")
+                != idea_binding.outcome_ref
+            ):
+                raise OwnerConflict("accepted_formal_plan_lineage_invalid")
+            self._research_graph.verify_accepted_idea_set_binding(idea_binding)
+            self._research_graph.verify_accepted_formal_plan_binding(binding)
+            return _EligibleBundle(current, binding, idea_binding), None, "Bundle"
+
+        basis_cycle_ref = current.cycle_ref
+        request = self._advancement_engine.query_plan_stage_request(basis_cycle_ref)
         if request is None:
             return None, "accepted_formal_plan_unavailable", "Plan"
         commit = self._advancement_engine.query_plan_stage_commit(request.request_ref)
@@ -1684,7 +1714,7 @@ class BundleStageWorker:
         if (
             request.stage != "plan"
             or commit.stage != "plan"
-            or commit.cycle_ref != current.cycle_ref
+            or commit.cycle_ref != basis_cycle_ref
             or commit.request_ref != request.request_ref
             or commit.outcome_kind != "formal_plan"
             or commit.disposition != "completed"
@@ -1711,7 +1741,21 @@ class BundleStageWorker:
             or content.execution_receipt != run.execution.receipt
         ):
             raise OwnerConflict("accepted_formal_plan_lineage_invalid")
-        return _EligibleBundle(current, decision, content, commit), None, "Bundle"
+        eligible = _EligibleBundle(
+            current,
+            AcceptedFormalPlanBinding(
+                formal_plan_ref=cast(str, decision.formal_plan_ref),
+                content_ref=content.content_ref,
+                plan_document_hash=content.plan_document_hash,
+                answer_contract_hash=content.answer_contract_hash,
+                content_receipt=content.receipt,
+                formal_plan_receipt=decision.receipt,
+                stage_commit_ref=commit.commit_ref,
+                stage_commit_receipt=commit.receipt,
+                plan_document=content.plan_document,
+            ),
+        )
+        return eligible, None, "Bundle"
 
     def _assert_request(
         self, request: StageRunRequest, eligible: _EligibleBundle
@@ -1720,6 +1764,7 @@ class BundleStageWorker:
             request.stage != "bundle"
             or request.cycle_ref != eligible.current.cycle_ref
             or request.accepted_question != eligible.current.question.as_binding()
+            or request.accepted_idea_set != eligible.accepted_idea_set
             or request.accepted_formal_plan != eligible.accepted_formal_plan()
         ):
             raise OwnerConflict("bundle_stage_request_lineage_invalid")
@@ -2282,6 +2327,25 @@ class BundleStageWorker:
             finish_job(job_ref)
 
     def _discover_current_cycle(self) -> _CurrentCycle | None:
+        active: list[_CurrentCycle] = []
+        for foreground in self._advancement_engine.query_active_foregrounds(
+            stage="bundle"
+        ):
+            question = self._research_graph.query_question_by_ref(
+                cast(str, foreground["question_ref"])
+            )
+            if question is None or question.quest_ref != foreground.get("quest_ref"):
+                raise OwnerConflict("bundle_cycle_index_invalid")
+            active.append(
+                _CurrentCycle(
+                    cast(int, foreground["epoch"]),
+                    cast(str, foreground["cycle_ref"]),
+                    question,
+                )
+            )
+        if active:
+            return max(active, key=lambda item: (item.revision, item.cycle_ref))
+
         candidates: dict[str, _CurrentCycle] = {}
         for event in self._feed.read_event_type(_CYCLE_EVENT):
             payload = event.payload
@@ -2461,3 +2525,141 @@ def _target_authorization_requirement(
 def _operation_key(*parts: str) -> str:
     prefix, *values = parts
     return f"{prefix}:{canonical_hash(values)}"
+
+
+def _accepted_formal_plan_binding_from_public(
+    value: dict[str, object],
+) -> AcceptedFormalPlanBinding:
+    expected_fields = {
+        "formal_plan_ref",
+        "content_ref",
+        "plan_document_hash",
+        "answer_contract_hash",
+        "content_receipt",
+        "formal_plan_receipt",
+        "stage_commit_ref",
+        "stage_commit_receipt",
+        "plan_document",
+    }
+    try:
+        plan_document = value["plan_document"]
+        if set(value) != expected_fields or not isinstance(plan_document, dict):
+            raise TypeError("accepted_formal_plan")
+        refs = {
+            field: value[field]
+            for field in (
+                "formal_plan_ref",
+                "content_ref",
+                "plan_document_hash",
+                "answer_contract_hash",
+                "stage_commit_ref",
+            )
+        }
+        if any(not isinstance(item, str) or not item for item in refs.values()):
+            raise TypeError("accepted_formal_plan")
+        binding = AcceptedFormalPlanBinding(
+            formal_plan_ref=cast(str, refs["formal_plan_ref"]),
+            content_ref=cast(str, refs["content_ref"]),
+            plan_document_hash=cast(str, refs["plan_document_hash"]),
+            answer_contract_hash=cast(str, refs["answer_contract_hash"]),
+            content_receipt=_acceptance_receipt_from_public(
+                value["content_receipt"]
+            ),
+            formal_plan_receipt=_acceptance_receipt_from_public(
+                value["formal_plan_receipt"]
+            ),
+            stage_commit_ref=cast(str, refs["stage_commit_ref"]),
+            stage_commit_receipt=_acceptance_receipt_from_public(
+                value["stage_commit_receipt"]
+            ),
+            plan_document=plan_document,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise OwnerConflict("accepted_formal_plan_lineage_invalid") from error
+    if binding.as_dict() != value:
+        raise OwnerConflict("accepted_formal_plan_lineage_invalid")
+    return binding
+
+
+def _accepted_idea_set_binding_from_public(
+    value: dict[str, object],
+) -> AcceptedIdeaSetBinding:
+    expected_fields = {
+        "outcome_ref",
+        "outcome_kind",
+        "content_ref",
+        "payload_hash",
+        "outcome_hash",
+        "content_receipt",
+        "outcome_receipt",
+        "stage_commit_ref",
+        "stage_commit_receipt",
+        "idea_set",
+    }
+    try:
+        idea_set = value["idea_set"]
+        if set(value) != expected_fields or not isinstance(idea_set, dict):
+            raise TypeError("accepted_idea_set")
+        refs = {
+            field: value[field]
+            for field in (
+                "outcome_ref",
+                "content_ref",
+                "payload_hash",
+                "outcome_hash",
+                "stage_commit_ref",
+            )
+        }
+        if any(not isinstance(item, str) or not item for item in refs.values()):
+            raise TypeError("accepted_idea_set")
+        binding = AcceptedIdeaSetBinding(
+            outcome_ref=cast(str, refs["outcome_ref"]),
+            outcome_kind=str(value["outcome_kind"]),
+            content_ref=cast(str, refs["content_ref"]),
+            payload_hash=cast(str, refs["payload_hash"]),
+            outcome_hash=cast(str, refs["outcome_hash"]),
+            content_receipt=_acceptance_receipt_from_public(
+                value["content_receipt"]
+            ),
+            outcome_receipt=_acceptance_receipt_from_public(
+                value["outcome_receipt"]
+            ),
+            stage_commit_ref=cast(str, refs["stage_commit_ref"]),
+            stage_commit_receipt=_acceptance_receipt_from_public(
+                value["stage_commit_receipt"]
+            ),
+            idea_set=idea_set,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise OwnerConflict("accepted_idea_set_lineage_invalid") from error
+    if binding.as_dict() != value:
+        raise OwnerConflict("accepted_idea_set_lineage_invalid")
+    return binding
+
+
+def _acceptance_receipt_from_public(value: object) -> AcceptanceReceipt:
+    expected_fields = {
+        "status",
+        "issuer",
+        "kind",
+        "receipt_ref",
+        "subject_ref",
+        "payload_hash",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_fields
+        or value.get("status") != "accepted"
+        or any(
+            not isinstance(value.get(field), str) or not value.get(field)
+            for field in expected_fields - {"status"}
+        )
+    ):
+        raise TypeError("receipt")
+    return AcceptanceReceipt(
+        issuer=cast(str, value["issuer"]),
+        kind=cast(str, value["kind"]),
+        receipt_ref=cast(str, value["receipt_ref"]),
+        subject_ref=cast(str, value["subject_ref"]),
+        payload_hash=cast(str, value["payload_hash"]),
+    )

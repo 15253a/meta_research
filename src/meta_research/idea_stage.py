@@ -14,7 +14,10 @@ from meta_research.idea_skill import (
     validate_idea_skill_draft,
     validate_idea_skill_result,
 )
-from meta_research.idea_contract import material_outcome_hash
+from meta_research.idea_contract import (
+    IDEA_CONTEXT_PACK_SCHEMA_V3_REF,
+    material_outcome_hash,
+)
 from meta_research.owners.advancement_engine import (
     AdvancementEngineInterface,
     StageCommit,
@@ -601,11 +604,51 @@ class IdeaStageWorker:
         )
         if quest is None or quest.quest_ref != current.question.quest_ref:
             raise OwnerConflict("idea_question_quest_binding_invalid")
-        snapshot = self._research_memory.query_literature_snapshot_for_basis(
-            quest.initialization_id,
-            quest.draft_revision,
-            quest.draft_hash,
+        successor_query = getattr(
+            self._advancement_engine,
+            "query_reasoning_successor_context",
+            None,
         )
+        successor = (
+            successor_query(current.cycle_ref)
+            if callable(successor_query)
+            else None
+        )
+        if successor is None:
+            snapshot = self._research_memory.query_literature_snapshot_for_basis(
+                quest.initialization_id,
+                quest.draft_revision,
+                quest.draft_hash,
+            )
+            schema_ref = IDEA_CONTEXT_PACK_SCHEMA_REF
+            literature_value = (
+                None if snapshot is None else snapshot.as_context_binding()
+            )
+            prior_accepted_bindings: list[dict[str, object]] = []
+        else:
+            if (
+                successor.get("cycle_ref") != current.cycle_ref
+                or successor.get("target_question_ref")
+                != current.question.question_ref
+                or successor.get("entry_stage") != "idea"
+            ):
+                raise OwnerConflict("reasoning_successor_context_invalid")
+            frozen = successor.get("idea_context_pack")
+            if not isinstance(frozen, dict) or frozen.get("schema_ref") != (
+                IDEA_CONTEXT_PACK_SCHEMA_V3_REF
+            ):
+                raise OwnerConflict("reasoning_successor_context_invalid")
+            literature_value = frozen.get("literature_binding")
+            if not isinstance(literature_value, dict):
+                raise OwnerConflict("question_literature_revision_unavailable")
+            self._research_memory.verify_question_literature_revision(
+                literature_value
+            )
+            if frozen.get("prior_accepted_bindings") != successor.get(
+                "prior_accepted_bindings"
+            ):
+                raise OwnerConflict("reasoning_successor_context_invalid")
+            return dict(frozen)
         guidance_bindings: list[dict[str, object]] = []
         if self._human_collaboration is not None:
             guidance_bindings = (
@@ -623,15 +666,13 @@ class IdeaStageWorker:
                 )
             )
         return {
-            "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_REF,
+            "schema_ref": schema_ref,
             "cycle_ref": current.cycle_ref,
             "accepted_question_binding": current.question.as_binding().as_dict(),
             "accepted_evidence_refs": list(evidence_refs),
             "evidence_reference_revision": evidence_revision,
-            "literature_binding": (
-                None if snapshot is None else snapshot.as_context_binding()
-            ),
-            "prior_accepted_bindings": [],
+            "literature_binding": literature_value,
+            "prior_accepted_bindings": prior_accepted_bindings,
             "active_guidance_bindings": guidance_bindings,
         }
 

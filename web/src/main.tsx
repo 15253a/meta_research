@@ -17,6 +17,7 @@ import {
   confirmManualDeepFetchWaiver,
   confirmManualQuestionProposal,
   createHumanCommand,
+  decideQuestCompletion,
   fetchAssetIntake,
   fetchCurrentManualQuestionCreation,
   fetchLiteratureSnapshot,
@@ -29,10 +30,12 @@ import {
   saveManualQuestionProposal,
   sendManualDraftingMessage,
   startManualCreationDeepFetch,
+  startQuestCompletion,
   submitAssetIntake,
   type AssetIntakeRequest,
   type AssetIntakeResult,
   type AssetReceipt,
+  type AutonomousCreationView,
   type BundleStageProjection,
   type BundleTargetCommitProjection,
   type BundleTargetProjection,
@@ -45,6 +48,8 @@ import {
   type PlanStageProjection,
   type PublicSnapshot,
   type QuestionTreeItem,
+  type QuestCompletionView,
+  type ReasoningStageProjection,
   type ResearchControlAction,
   type TargetRootObservationPage,
   type TargetRootObservationPointer,
@@ -365,6 +370,7 @@ function questCreationReady(snapshot: PublicSnapshot | null): boolean {
         "idea_stage_worker",
         "plan_stage_worker",
         "bundle_stage_worker",
+        "reasoning_stage_worker",
         "experiment_worker",
         "writing_worker",
         "research_asset_intake_worker",
@@ -535,13 +541,38 @@ function FirstErrorHero({ retry }: { retry: () => void }) {
   );
 }
 
+type CurrentStageSurface =
+  | { kind: "Idea"; projection: IdeaStageProjection }
+  | { kind: "Plan"; projection: PlanStageProjection }
+  | { kind: "Bundle"; projection: BundleStageProjection }
+  | { kind: "Reasoning"; projection: ReasoningStageProjection };
+
+function currentStageSurface(snapshot: PublicSnapshot): CurrentStageSurface | null {
+  const candidates: CurrentStageSurface[] = [];
+  if (snapshot.reasoning_stage) {
+    candidates.push({ kind: "Reasoning", projection: snapshot.reasoning_stage });
+  }
+  if (snapshot.bundle_stage) {
+    candidates.push({ kind: "Bundle", projection: snapshot.bundle_stage });
+  }
+  if (snapshot.plan_stage) {
+    candidates.push({ kind: "Plan", projection: snapshot.plan_stage });
+  }
+  if (snapshot.idea_stage) {
+    candidates.push({ kind: "Idea", projection: snapshot.idea_stage });
+  }
+  return candidates.find(
+    (candidate) => ["eligible", "requested"].includes(
+      candidate.projection.eligibility.status,
+    ),
+  ) ?? candidates[0] ?? null;
+}
+
 function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
   const ready = snapshot.readiness.status === "ready";
   const empty = snapshot.research_space.status === "empty";
   const creation = snapshot.quest_creation.current;
-  const ideaStage = snapshot.idea_stage ?? null;
-  const planStage = snapshot.plan_stage ?? null;
-  const bundleStage = snapshot.bundle_stage ?? null;
+  const stageSurface = currentStageSurface(snapshot);
 
   if (!ready) {
     const failedChecks = snapshot.readiness.checks
@@ -591,29 +622,38 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
     );
   }
 
-  if (bundleStage) {
+  if (stageSurface?.kind === "Reasoning") {
+    return (
+      <ReasoningStageHero
+        reasoningStage={stageSurface.projection}
+        question={reasoningQuestion(stageSurface.projection, snapshot)}
+      />
+    );
+  }
+
+  if (stageSurface?.kind === "Bundle") {
     return (
       <BundleStageHero
-        bundleStage={bundleStage}
-        question={bundleQuestion(bundleStage, snapshot)}
+        bundleStage={stageSurface.projection}
+        question={bundleQuestion(stageSurface.projection, snapshot)}
       />
     );
   }
 
-  if (planStage) {
+  if (stageSurface?.kind === "Plan") {
     return (
       <PlanStageHero
-        planStage={planStage}
-        question={planQuestion(planStage, snapshot)}
+        planStage={stageSurface.projection}
+        question={planQuestion(stageSurface.projection, snapshot)}
       />
     );
   }
 
-  if (ideaStage) {
+  if (stageSurface?.kind === "Idea") {
     return (
       <IdeaStageHero
-        ideaStage={ideaStage}
-        question={ideaQuestion(ideaStage, snapshot)}
+        ideaStage={stageSurface.projection}
+        question={ideaQuestion(stageSurface.projection, snapshot)}
       />
     );
   }
@@ -713,6 +753,22 @@ function bundleQuestion(
     graph_revision: snapshot?.owners.research_graph?.revision,
     ...(creation?.proposal?.content ?? {}),
     ...(bundleStage.stage_run_request?.accepted_question_binding ?? {}),
+    ...(snapshot?.research_space.current_question ?? {}),
+  };
+}
+
+function reasoningQuestion(
+  reasoningStage: ReasoningStageProjection,
+  snapshot?: PublicSnapshot,
+): IdeaQuestionSummary {
+  const creation = snapshot?.quest_creation.current;
+  return {
+    quest_ref: creation?.quest_ref,
+    question_ref: reasoningStage.eligibility.question_ref
+      ?? creation?.question_ref,
+    graph_revision: snapshot?.owners.research_graph?.revision,
+    ...(creation?.proposal?.content ?? {}),
+    ...(reasoningStage.stage_run_request?.accepted_question_binding ?? {}),
     ...(snapshot?.research_space.current_question ?? {}),
   };
 }
@@ -891,13 +947,65 @@ function BundleStageHero({
   );
 }
 
+function ReasoningStageHero({
+  reasoningStage,
+  question,
+}: {
+  reasoningStage: ReasoningStageProjection;
+  question: IdeaQuestionSummary;
+}) {
+  const committed = Boolean(reasoningStage.stage_commit);
+  const disposition = reasoningStage.reasoning_acceptance.disposition;
+  const transitionKind = reasoningStage.transition.kind;
+  const upstreamClosure = reasoningStage.stage_run_request?.context_pack
+    ?.upstream_stage_closure;
+  const upstreamDisposition = (stage: string): string => {
+    const closure = upstreamClosure?.find((item) => item.stage === stage);
+    return typeof closure?.disposition === "string"
+      ? closure.disposition.toUpperCase()
+      : "CLOSED";
+  };
+
+  return (
+    <>
+      <p className="lumen-eyebrow">Research cycle · Reasoning Projection</p>
+      <h1 id="workspace-title">
+        {committed
+          ? "Reasoning 已形成正式交接。"
+          : "从冻结的路线与证据 closure 出发。"}<br />
+        <em>
+          {committed
+            ? `${disposition ?? "ScientificOutcome"} 与 ${transitionKind ?? "successor"} 仍是分层事实。`
+            : "科学判断正在形成。"}
+        </em>
+      </h1>
+      <p>
+        {question.unknown_statement
+          ?? "Reasoning 只提出 ScientificOutcome 与唯一后继候选；RM、RG、AR、AE 分别接纳和推进。"}
+      </p>
+      <ol className="lumen-stage-strip" aria-label="当前研究周期的四个 Stage">
+        <li className="done"><small>01 · {upstreamDisposition("idea")}</small><b>Idea</b></li>
+        <li className="done"><small>02 · {upstreamDisposition("plan")}</small><b>Plan</b></li>
+        <li className="done"><small>03 · {upstreamDisposition("bundle")}</small><b>Bundle</b></li>
+        <li
+          className={committed ? "done" : "current"}
+          aria-current={committed ? undefined : "step"}
+        >
+          <small>{committed ? "04 · COMMITTED" : "04 · NOW"}</small>
+          <b>Reasoning</b>
+        </li>
+      </ol>
+    </>
+  );
+}
+
 function CurrentQuestionCard({
   stage,
   question,
   experiment,
   onOpenExperiment,
 }: {
-  stage: "Idea" | "Plan" | "Bundle";
+  stage: "Idea" | "Plan" | "Bundle" | "Reasoning";
   question: IdeaQuestionSummary;
   experiment: ExperimentProjection | null;
   onOpenExperiment: (trigger: HTMLElement) => void;
@@ -2137,6 +2245,590 @@ function BundleStageCard({
   );
 }
 
+type ReasoningStageState =
+  | "eligibility"
+  | "stage-run-request"
+  | "run"
+  | "content-acceptance"
+  | "domain-acceptance"
+  | "successor"
+  | "stage-commit";
+
+function reasoningStageHealthBlocker(
+  snapshot: PublicSnapshot | null,
+): IdeaStageHealthBlocker | null {
+  const worker = snapshot?.readiness.checks.find(
+    (check) => check.name === "reasoning_stage_worker" && check.status !== "ready",
+  );
+  if (!worker) return null;
+  return {
+    code: worker.reason?.code ?? `reasoning_stage_worker_${worker.status}`,
+  };
+}
+
+function currentReasoningStageState(
+  reasoningStage: ReasoningStageProjection,
+): ReasoningStageState {
+  if (reasoningStage.stage_commit) return "stage-commit";
+  if (reasoningStage.transition.status !== "not_attempted") return "successor";
+  if (reasoningStage.reasoning_acceptance.status === "accepted") {
+    return "successor";
+  }
+  if (reasoningStage.reasoning_acceptance.status === "awaiting_domain") {
+    return "domain-acceptance";
+  }
+  if (reasoningStage.reasoning_acceptance.status === "awaiting_content") {
+    return "content-acceptance";
+  }
+  if (reasoningStage.run) return "run";
+  if (reasoningStage.stage_run_request) return "stage-run-request";
+  return "eligibility";
+}
+
+function reasoningFactRows(
+  reasoningStage: ReasoningStageProjection,
+  phase: ReasoningStageState,
+): ReturnType<typeof ideaFactRows> {
+  const request = reasoningStage.stage_run_request;
+  const run = reasoningStage.run;
+  const acceptance = reasoningStage.reasoning_acceptance;
+  const content = acceptance.content;
+  const domain = acceptance.domain;
+  const transition = reasoningStage.transition;
+  const commit = reasoningStage.stage_commit;
+  const eligibilityBlocked = !["eligible", "requested", "consumed"].includes(
+    reasoningStage.eligibility.status,
+  );
+  const contentAccepted = content.status === "accepted";
+  const domainAccepted = domain.status === "accepted";
+  const domainBlocked = ["rejected", "stale", "needs_input"].includes(
+    domain.status,
+  );
+
+  return [
+    {
+      slot: "eligibility",
+      label: "Reasoning eligibility",
+      owner: "AE",
+      state: eligibilityBlocked
+        ? "blocked"
+        : phase === "eligibility" ? "current" : "done",
+      title: reasoningStage.eligibility.status === "eligible"
+        ? "上游路线 closure 已由 Advancement Engine 证明可收口"
+        : reasoningStage.eligibility.status === "requested"
+          ? "资格已由 current Reasoning StageRunRequest 消费"
+          : `Reasoning eligibility · ${reasoningStage.eligibility.status}`,
+      status: reasoningStage.eligibility.status,
+    },
+    {
+      slot: "stage-run-request",
+      label: "StageRunRequest",
+      owner: "AE",
+      state: request
+        ? phase === "stage-run-request" ? "current" : "done"
+        : "pending",
+      title: request
+        ? "已冻结 AcceptedQuestion、Foreground epoch、route closure 与证据输入"
+        : "等待 Advancement Engine 签发冻结请求",
+      status: request ? request.status ?? "issued" : "not_issued",
+    },
+    {
+      slot: "run",
+      label: "Run / Attempt",
+      owner: "AR",
+      state: run
+        ? isRunBlocked(run.status)
+          ? "blocked"
+          : run.status === "completed" ? "done" : "current"
+        : "pending",
+      title: !run
+        ? "等待 Agent Runtime admission"
+        : isRunBlocked(run.status)
+          ? "Run 被类型化 blocker 阻塞；不会伪造 ScientificOutcome"
+          : run.status === "admitted" && !run.attempt_execution_receipt
+            ? "Agent Runtime 已 admission；实际 Reasoning Skill 尚未形成 Attempt 执行证据"
+            : run.status === "completed"
+              ? "领域接纳已验证，Run completion 已独立形成"
+              : "Attempt 执行证据已形成；等待 Owner 分层接纳",
+      status: run?.status ?? "not_created",
+    },
+    {
+      slot: "content-acceptance",
+      label: "Content acceptance",
+      owner: "RM",
+      state: contentAccepted
+        ? "done"
+        : phase === "content-acceptance" ? "current" : "pending",
+      title: contentAccepted
+        ? "ScientificOutcome 与唯一 transition 已作为不可变内容接纳"
+        : "等待 Research Memory 校验 evidence role 与闭合内容",
+      status: content.status,
+    },
+    {
+      slot: "domain-acceptance",
+      label: "Domain acceptance",
+      owner: "RG",
+      state: domainBlocked
+        ? "blocked"
+        : domainAccepted
+          ? "done"
+          : phase === "domain-acceptance" ? "current" : "pending",
+      title: domainBlocked
+        ? "正式科学语义被拒绝；current Session 将按结构化依据修订"
+        : domainAccepted
+          ? "Research Graph 已独立接纳正式科学语义"
+          : "等待 Research Graph 形成独立 domain decision",
+      status: domain.status,
+    },
+    {
+      slot: "successor",
+      label: "Successor candidate",
+      owner: "RG / AE / HC",
+      state: commit
+        ? "done"
+        : transition.status === "proposed" ? "current" : "pending",
+      title: transition.status === "proposed"
+        ? `${transition.kind ?? "Transition"} 已提出，但尚不等于后继已接纳或 Quest 已结束`
+        : "等待唯一 NextCycleProposal 或 CandidateCompletion",
+      status: transition.status,
+    },
+    {
+      slot: "stage-commit",
+      label: "StageCommit",
+      owner: "AE",
+      state: commit
+        ? "done"
+        : domainAccepted ? "current" : "pending",
+      title: commit
+        ? "Reasoning StageCommit 已验证 execution、content 与 domain receipts"
+        : "尚无 StageCommit；前三层完成不等于 Stage 已推进",
+      status: commit?.status ?? "not_committed",
+    },
+  ];
+}
+
+function reasoningRouteClosure(
+  request: ReasoningStageProjection["stage_run_request"],
+): string | null {
+  const closure = request?.context_pack?.upstream_stage_closure;
+  if (!Array.isArray(closure) || !closure.length) return null;
+  return closure.map((item) => {
+    const stage = typeof item.stage === "string" ? item.stage : "unknown";
+    const disposition = typeof item.disposition === "string"
+      ? item.disposition
+      : "unknown";
+    return `${stage}:${disposition}`;
+  }).join(" · ");
+}
+
+function ReasoningStageCard({
+  reasoningStage,
+  healthBlocker,
+}: {
+  reasoningStage: ReasoningStageProjection;
+  healthBlocker: IdeaStageHealthBlocker | null;
+}) {
+  const phase = currentReasoningStageState(reasoningStage);
+  const rows = reasoningFactRows(reasoningStage, phase);
+  const request = reasoningStage.stage_run_request;
+  const run = reasoningStage.run;
+  const acceptance = reasoningStage.reasoning_acceptance;
+  const transition = reasoningStage.transition;
+  const commit = reasoningStage.stage_commit;
+  const literature = request?.context_pack?.question_literature_input;
+  const planEvidence = request?.context_pack?.plan_evidence_input;
+  const targetClosures = request?.context_pack?.accepted_target_commit_closures;
+
+  return (
+    <section
+      className="lumen-card lumen-idea-card lumen-reasoning-card"
+      aria-labelledby="reasoning-stage-title"
+      data-testid="reasoning-stage-card"
+      data-reasoning-stage-state={phase}
+    >
+      <header className="lumen-card-head">
+        <b id="reasoning-stage-title">Reasoning 的七层事实</b>
+        <small>execution ≠ content ≠ domain ≠ advancement</small>
+      </header>
+      {healthBlocker ? (
+        <div
+          className="lumen-idea-health-blocker"
+          data-testid="reasoning-stage-health-blocker"
+          role="status"
+        >
+          <span aria-hidden="true">!</span>
+          <div>
+            <b>Reasoning 自动推进暂时不可用</b>
+            <small>已形成的 request、execution 与 Owner receipt 保持可见；恢复后从首个缺口继续。</small>
+          </div>
+          <code>{healthBlocker.code}</code>
+        </div>
+      ) : null}
+      {acceptance.disposition || transition.kind ? (
+        <div className="lumen-reasoning-summary">
+          <span data-testid="reasoning-outcome">
+            <small>ScientificOutcome</small>
+            <b>{acceptance.disposition ?? "pending"}</b>
+          </span>
+          <i aria-hidden="true">→</i>
+          <span data-testid="reasoning-transition">
+            <small>唯一后继候选</small>
+            <b>{transition.kind ?? "pending"}</b>
+          </span>
+        </div>
+      ) : null}
+      <div className="lumen-idea-facts" role="list">
+        {rows.map((row) => (
+          <article
+            key={row.slot}
+            className="lumen-idea-fact"
+            data-reasoning-slot={row.slot}
+            data-state={row.state}
+            role="listitem"
+          >
+            <span className="lumen-idea-fact-mark" aria-hidden="true">
+              {row.state === "done" ? "✓" : row.state === "blocked" ? "!" : "→"}
+            </span>
+            <div><small>{row.label}</small><b>{row.title}</b><code>{row.status}</code></div>
+            <span>{row.owner}</span>
+          </article>
+        ))}
+      </div>
+      <details className="lumen-idea-details">
+        <summary>查看 Reasoning closure、运行身份与 receipt</summary>
+        <dl>
+          <IdeaDetail label="Cycle" value={reasoningStage.eligibility.cycle_ref} />
+          <IdeaDetail label="StageRunRequest" value={request?.request_ref} />
+          <IdeaDetail label="StageRunRequest receipt" value={receiptRef(request?.receipt)} />
+          <IdeaDetail label="Foreground epoch" value={request?.epoch} />
+          <IdeaDetail label="Accepted Question" value={request?.accepted_question_binding?.question_ref} />
+          <IdeaDetail label="Question content receipt" value={receiptRef(
+            request?.accepted_question_binding?.content_receipt,
+          )} />
+          <IdeaDetail label="Question identity receipt" value={receiptRef(
+            request?.accepted_question_binding?.question_receipt,
+          )} />
+          <IdeaDetail label="Question literature" value={recordText(
+            literature ?? {},
+            "kind",
+          )} />
+          <IdeaDetail label="Question literature revision" value={recordText(
+            literature ?? {},
+            "revision_ref",
+          )} />
+          <IdeaDetail label="Upstream route closure" value={reasoningRouteClosure(request)} />
+          <IdeaDetail label="Plan evidence" value={recordText(planEvidence ?? {}, "kind")} />
+          <IdeaDetail label="Accepted TargetCommit closures" value={
+            Array.isArray(targetClosures) ? targetClosures.length : undefined
+          } />
+          <IdeaDetail label="ContextPack" value={request?.context_pack_ref} />
+          <IdeaDetail label="ContextPack hash" value={request?.context_pack_hash} />
+          <IdeaDetail label="Run" value={run?.run_ref} />
+          <IdeaDetail label="Attempt" value={run?.attempt_ref
+            ? `${run.attempt_ref}${run.attempt_generation === undefined ? "" : ` · generation ${run.attempt_generation}`}`
+            : null
+          } />
+          <IdeaDetail label="Root Session" value={run?.root_session_ref} />
+          <IdeaDetail label="Native Session" value={run?.native_session_ref} />
+          <IdeaDetail label="Execution Fence" value={run?.fence_ref} />
+          <IdeaDetail label="Attempt execution receipt" value={receiptRef(run?.attempt_execution_receipt)} />
+          <IdeaDetail label="Run completion receipt" value={receiptRef(run?.completion_receipt)} />
+          <IdeaDetail label="Child reviewer agent" value={run?.review?.reviewer_agent_ref} />
+          <IdeaDetail label="Scientific disposition" value={acceptance.disposition} />
+          <IdeaDetail label="Reasoning content" value={recordText(acceptance.content, "content_ref")} />
+          <IdeaDetail label="Content receipt" value={receiptRef(
+            acceptance.content.receipt ?? acceptance.content,
+          )} />
+          <IdeaDetail label="Scientific outcome" value={acceptance.outcome_ref} />
+          <IdeaDetail label="Domain receipt" value={receiptRef(
+            acceptance.domain.receipt ?? acceptance.domain,
+          )} />
+          <IdeaDetail label="Transition" value={transition.ref} />
+          <IdeaDetail label="Transition kind" value={transition.kind} />
+          <IdeaDetail label="StageCommit" value={commit?.commit_ref ?? commit?.stage_commit_ref} />
+          <IdeaDetail label="StageCommit receipt" value={receiptRef(commit?.receipt)} />
+        </dl>
+      </details>
+    </section>
+  );
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function autonomousCheckpoint(
+  reasoningStage: ReasoningStageProjection | null,
+): Record<string, unknown> | null {
+  return objectValue(reasoningStage?.autonomous_creation_checkpoint);
+}
+
+function autonomousStatusCopy(current: AutonomousCreationView | null): string {
+  if (!current) return "等待 preliminary science 与自动创建范围完成 Owner 接纳";
+  if (current.human_request) return "自动路径已停止；类型化 HumanRequest 保持可见";
+  if (current.status === "ready_for_reasoning_resume") {
+    return "新 Question 与文献 revision 已接纳；同一 Reasoning Run 可以恢复";
+  }
+  if (current.content_acceptance.status === "accepted") {
+    return "Question 内容已接纳；等待 RG identity 与 RM literature revision";
+  }
+  if (current.deepfetch.status === "succeeded") {
+    return "DeepFetch 已形成快照；正在接纳自动生成的正式 Question";
+  }
+  if (["queued", "running"].includes(current.deepfetch.status)) {
+    return "强制 DeepFetch 正在运行；这条路径没有人工确认或 waiver";
+  }
+  return "已固定自动创建范围；等待强制 DeepFetch";
+}
+
+function completionStatusCopy(current: QuestCompletionView | null): string {
+  if (!current) return "CandidateCompletion 只是候选；需要人类确认才可进入领域接纳";
+  if (current.status === "ended") return "RG 已接纳完成语义，AE 已正式结束当前 Quest";
+  if (current.status === "rejected") return "人类已选择暂不结束；不会形成 RG completion 或 AE ending";
+  if (current.status === "stale") return "Goal 或来源已变化；陈旧候选不能结束 Quest";
+  if (current.human_confirmation.status === "confirmed") {
+    return "人类确认已记录；RG 与 AE 将在各自边界继续核验";
+  }
+  if (current.human_confirmation.preview?.status === "current") {
+    return "当前 Goal、里程碑与候选已冻结，等待你的明确决定";
+  }
+  return "结束上下文已准备；daemon 正在形成可核验的 Impact Preview";
+}
+
+function ReasoningFollowupDock({
+  reasoningStage,
+  autonomousCreation,
+  questCompletion,
+  onChanged,
+}: {
+  reasoningStage: ReasoningStageProjection | null;
+  autonomousCreation: AutonomousCreationView | null;
+  questCompletion: QuestCompletionView | null;
+  onChanged: () => void;
+}) {
+  const checkpoint = autonomousCheckpoint(reasoningStage);
+  const transition = reasoningStage?.transition;
+  const completionCandidate = transition?.kind === "CandidateCompletion"
+    && typeof transition.ref === "string"
+    && typeof reasoningStage?.reasoning_acceptance.outcome_ref === "string";
+  const showAutonomous = autonomousCreation !== null || checkpoint !== null;
+  const showCompletion = questCompletion !== null || completionCandidate;
+  const [busy, setBusy] = useState<"start" | "confirmed" | "rejected" | null>(null);
+  const [commandError, setCommandError] = useState<string | null>(null);
+
+  if (!showAutonomous && !showCompletion) return null;
+
+  const beginCompletion = async () => {
+    if (
+      !completionCandidate
+      || typeof transition?.ref !== "string"
+      || typeof reasoningStage?.reasoning_acceptance.outcome_ref !== "string"
+    ) return;
+    setBusy("start");
+    setCommandError(null);
+    try {
+      await startQuestCompletion({
+        source_outcome_ref: reasoningStage.reasoning_acceptance.outcome_ref,
+        candidate_completion_ref: transition.ref,
+      });
+      onChanged();
+    } catch (caught) {
+      setCommandError(
+        caught instanceof ProductError
+          ? caught.code
+          : "quest_completion_start_unavailable",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const decide = async (decision: "confirmed" | "rejected") => {
+    const preview = questCompletion?.human_confirmation.preview;
+    if (!questCompletion || !preview || preview.status !== "current") return;
+    setBusy(decision);
+    setCommandError(null);
+    try {
+      await decideQuestCompletion(questCompletion.context_ref, {
+        preview_ref: preview.ref,
+        preview_hash: preview.hash,
+        decision,
+      });
+      onChanged();
+    } catch (caught) {
+      setCommandError(
+        caught instanceof ProductError
+          ? caught.code
+          : "quest_completion_decision_unavailable",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const preview = questCompletion?.human_confirmation.preview;
+  const decision = questCompletion?.human_confirmation.decision;
+  const checkpointStatus = recordText(checkpoint ?? {}, "status") ?? "checkpoint";
+  const autonomousQuestion = objectValue(autonomousCreation?.proposal?.question);
+  const anchor = objectValue(autonomousCreation?.question_anchor);
+  const autonomousRequested = Boolean(autonomousCreation?.deepfetch.request_ref);
+  const autonomousFetched = Boolean(
+    autonomousCreation?.deepfetch.literature_snapshot_ref,
+  );
+  const autonomousContentAccepted =
+    autonomousCreation?.content_acceptance.status === "accepted";
+  const completionConfirmed = decision?.decision === "confirmed";
+  const completionDomainAccepted =
+    questCompletion?.domain_acceptance.status === "accepted";
+  const milestoneBasis = questCompletion?.candidate_completion
+    .completion_milestone_basis_refs ?? [];
+
+  return (
+    <section
+      className="lumen-followup-dock"
+      data-testid="reasoning-followup-dock"
+      aria-labelledby="reasoning-followup-title"
+    >
+      <header className="lumen-followup-head">
+        <span aria-hidden="true">↗</span>
+        <div>
+          <small>REASONING / VERIFIED FOLLOW-UP</small>
+          <b id="reasoning-followup-title">唯一后继正在跨过自己的 Owner 边界</b>
+        </div>
+        <p>StageCommit 不代替 Question 接纳、人类确认或 Quest ending。</p>
+      </header>
+
+      <div className="lumen-followup-grid">
+        {showAutonomous ? (
+          <article
+            className="lumen-followup-card autonomous"
+            data-testid="autonomous-creation-card"
+            data-autonomous-creation-state={autonomousCreation?.status ?? checkpointStatus}
+          >
+            <header>
+              <div>
+                <small>AUTONOMOUS QUESTION</small>
+                <h2>自动形成下一问题</h2>
+              </div>
+              <code>{autonomousCreation?.status ?? checkpointStatus}</code>
+            </header>
+            <p>{autonomousStatusCopy(autonomousCreation)}</p>
+            <ol className="lumen-boundary-beam" aria-label="自动创建的 Owner 边界">
+              <li data-state={checkpoint ? "done" : "current"}><b>HC</b><small>scope</small></li>
+              <li data-state={autonomousRequested ? "done" : "current"}><b>AE</b><small>request</small></li>
+              <li data-state={autonomousFetched ? "done" : autonomousRequested ? "current" : "pending"}><b>AR</b><small>DeepFetch</small></li>
+              <li data-state={autonomousContentAccepted ? "done" : autonomousFetched ? "current" : "pending"}><b>RM</b><small>content</small></li>
+              <li data-state={anchor ? "done" : autonomousContentAccepted ? "current" : "pending"}><b>RG</b><small>identity</small></li>
+            </ol>
+            <div className="lumen-followup-rule">
+              <span aria-hidden="true">✓</span>
+              <p><b>DeepFetch 必须执行</b><small>无额外人工确认 · 无 waiver</small></p>
+            </div>
+            <details>
+              <summary>查看创建来源、DeepFetch 与 Owner receipt</summary>
+              <dl>
+                <IdeaDetail label="Creation mode" value="AutonomousCreation" />
+                <IdeaDetail label="Checkpoint" value={autonomousCreation?.checkpoint.ref ?? recordText(checkpoint ?? {}, "checkpoint_ref")} />
+                <IdeaDetail label="Checkpoint hash" value={autonomousCreation?.checkpoint.hash ?? recordText(checkpoint ?? {}, "checkpoint_hash")} />
+                <IdeaDetail label="Source outcome" value={recordText(autonomousCreation?.source ?? {}, "scientific_outcome_ref")} />
+                <IdeaDetail label="Preliminary science receipt" value={recordText(autonomousCreation?.source ?? {}, "preliminary_scientific_acceptance_receipt_ref")} />
+                <IdeaDetail label="Question" value={recordText(autonomousQuestion ?? {}, "title", "unknown_statement")} />
+                <IdeaDetail label="DeepFetch request" value={autonomousCreation?.deepfetch.request_ref} />
+                <IdeaDetail label="DeepFetch run" value={autonomousCreation?.deepfetch.run_ref} />
+                <IdeaDetail label="Literature snapshot" value={autonomousCreation?.deepfetch.literature_snapshot_ref} />
+                <IdeaDetail label="Content receipt" value={receiptRef(autonomousCreation?.content_acceptance.receipt)} />
+                <IdeaDetail label="Question anchor" value={recordText(anchor ?? {}, "ref", "question_ref")} />
+                <IdeaDetail label="Literature revision" value={recordText(autonomousCreation?.literature_revision ?? {}, "revision_ref")} />
+              </dl>
+            </details>
+          </article>
+        ) : null}
+
+        {showCompletion ? (
+          <article
+            className="lumen-followup-card completion"
+            data-testid="quest-completion-card"
+            data-quest-completion-state={questCompletion?.status ?? "candidate"}
+          >
+            <header>
+              <div>
+                <small>CANDIDATE COMPLETION</small>
+                <h2>{questCompletion?.status === "ended" ? "Quest 已结束" : "审阅 Quest 结束提案"}</h2>
+              </div>
+              <code>{questCompletion?.status ?? "candidate"}</code>
+            </header>
+            <p>{completionStatusCopy(questCompletion)}</p>
+            <ol className="lumen-boundary-beam compact" aria-label="Quest 结束的 Owner 边界">
+              <li data-state={decision ? "done" : preview ? "current" : "pending"}><b>HC</b><small>decision</small></li>
+              <li data-state={completionDomainAccepted ? "done" : completionConfirmed ? "current" : "pending"}><b>RG</b><small>semantics</small></li>
+              <li data-state={questCompletion?.ending_transition ? "done" : completionDomainAccepted ? "current" : "pending"}><b>AE</b><small>ending</small></li>
+            </ol>
+
+            {!questCompletion && completionCandidate ? (
+              <button
+                className="lumen-followup-primary"
+                type="button"
+                disabled={busy !== null}
+                onClick={() => void beginCompletion()}
+              >
+                {busy === "start" ? "正在准备审阅…" : "审阅 Quest 结束提案"}
+              </button>
+            ) : null}
+
+            {questCompletion && preview?.status === "current" && !decision ? (
+              <div className="lumen-completion-decision" role="group" aria-label="Quest 结束决定">
+                <div>
+                  <small>EXPLICIT HUMAN DECISION</small>
+                  <b>当前 preview 已绑定 Goal 与里程碑</b>
+                </div>
+                <button
+                  className="lumen-followup-primary"
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={() => void decide("confirmed")}
+                >
+                  {busy === "confirmed" ? "正在确认…" : "确认结束 Quest"}
+                </button>
+                <button
+                  className="lumen-followup-secondary"
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={() => void decide("rejected")}
+                >
+                  {busy === "rejected" ? "正在记录…" : "暂不结束"}
+                </button>
+              </div>
+            ) : null}
+
+            {commandError ? <p className="lumen-followup-error" role="alert">{commandError}</p> : null}
+            <details>
+              <summary>查看 Goal、里程碑与 Owner receipt</summary>
+              <dl>
+                <IdeaDetail label="Completion context" value={questCompletion?.context_ref} />
+                <IdeaDetail label="Candidate" value={questCompletion?.candidate_completion_ref ?? transition?.ref} />
+                <IdeaDetail label="Candidate hash" value={questCompletion?.candidate_completion_hash ?? transition?.hash} />
+                <IdeaDetail label="Source outcome" value={recordText(questCompletion?.source ?? {}, "scientific_outcome_ref") ?? reasoningStage?.reasoning_acceptance.outcome_ref} />
+                <IdeaDetail label="Goal revision" value={recordText(questCompletion?.goal_revision ?? {}, "goal_revision_ref")} />
+                <IdeaDetail label="Goal" value={recordText(questCompletion?.goal_revision ?? {}, "goal")} />
+                <IdeaDetail label="Completion criteria" value={recordText(questCompletion?.goal_revision ?? {}, "completion_criteria")} />
+                <IdeaDetail label="Milestone basis" value={milestoneBasis.length ? milestoneBasis.join(" · ") : null} />
+                <IdeaDetail label="Preview" value={preview?.ref} />
+                <IdeaDetail label="Human receipt" value={receiptRef(decision?.receipt)} />
+                <IdeaDetail label="RG completion" value={recordText(questCompletion?.domain_acceptance ?? {}, "completion_ref")} />
+                <IdeaDetail label="RG receipt" value={receiptRef(questCompletion?.domain_acceptance.receipt)} />
+                <IdeaDetail label="AE ending" value={recordText(questCompletion?.ending_transition ?? {}, "transition_ref")} />
+                <IdeaDetail label="AE receipt" value={receiptRef(questCompletion?.ending_transition?.receipt)} />
+              </dl>
+            </details>
+          </article>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function WorkspaceMain({
   snapshot,
   state,
@@ -2157,20 +2849,29 @@ function WorkspaceMain({
   onExperimentStarted: (experiment: ExperimentProjection) => void;
 }) {
   const unavailable = uniqueCapabilities(snapshot);
-  const ideaStage = snapshot?.research_space.status === "active"
-    ? snapshot.idea_stage ?? null
+  const stageSurface = snapshot?.research_space.status === "active"
+    ? currentStageSurface(snapshot)
     : null;
-  const planStage = snapshot?.research_space.status === "active"
-    ? snapshot.plan_stage ?? null
+  const ideaStage = stageSurface?.kind === "Idea"
+    ? stageSurface.projection
     : null;
-  const bundleStage = snapshot?.research_space.status === "active"
-    ? snapshot.bundle_stage ?? null
+  const planStage = stageSurface?.kind === "Plan"
+    ? stageSurface.projection
+    : null;
+  const bundleStage = stageSurface?.kind === "Bundle"
+    ? stageSurface.projection
+    : null;
+  const reasoningStage = stageSurface?.kind === "Reasoning"
+    ? stageSurface.projection
     : null;
   const ideaHealthBlocker = ideaStageHealthBlocker(snapshot);
   const planHealthBlocker = planStageHealthBlocker(snapshot);
   const bundleHealthBlocker = bundleStageHealthBlocker(snapshot);
+  const reasoningHealthBlocker = reasoningStageHealthBlocker(snapshot);
   const experiment = snapshot?.experiment?.current ?? null;
-  const question = bundleStage
+  const question = reasoningStage
+    ? reasoningQuestion(reasoningStage, snapshot ?? undefined)
+    : bundleStage
     ? bundleQuestion(bundleStage, snapshot ?? undefined)
     : planStage
     ? planQuestion(planStage, snapshot ?? undefined)
@@ -2208,7 +2909,14 @@ function WorkspaceMain({
       </section>
 
       <div className="lumen-lower">
-        {bundleStage ? (
+        {reasoningStage ? (
+          <CurrentQuestionCard
+            stage="Reasoning"
+            question={question!}
+            experiment={experiment}
+            onOpenExperiment={onOpenExperiment}
+          />
+        ) : bundleStage ? (
           <CurrentQuestionCard
             stage="Bundle"
             question={question!}
@@ -2245,7 +2953,12 @@ function WorkspaceMain({
           </section>
         )}
 
-        {bundleStage ? (
+        {reasoningStage ? (
+          <ReasoningStageCard
+            reasoningStage={reasoningStage}
+            healthBlocker={reasoningHealthBlocker}
+          />
+        ) : bundleStage ? (
           <BundleStageCard
             bundleStage={bundleStage}
             healthBlocker={bundleHealthBlocker}
@@ -2328,6 +3041,14 @@ function WorkspaceMain({
           </section>
         )}
       </div>
+      {snapshot ? (
+        <ReasoningFollowupDock
+          reasoningStage={snapshot.reasoning_stage ?? null}
+          autonomousCreation={snapshot.autonomous_creation.current}
+          questCompletion={snapshot.quest_completion.current}
+          onChanged={retry}
+        />
+      ) : null}
     </main>
   );
 }

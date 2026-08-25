@@ -421,6 +421,7 @@ def test_target_root_observation_web_page_is_authenticated_bounded_and_redacted(
     )
     runtime = SimpleNamespace(
         bundle_stage=configurable,
+        reasoning_stage=configurable,
         target_run_runtime=configurable,
         harnesses=SimpleNamespace(
             query_target_root_observations=query_observations
@@ -517,6 +518,7 @@ def test_long_target_root_output_emits_gaps_and_keeps_web_cursor_advancing(
     )
     runtime = SimpleNamespace(
         bundle_stage=configurable,
+        reasoning_stage=configurable,
         target_run_runtime=configurable,
         harnesses=SimpleNamespace(
             query_target_root_observations=(

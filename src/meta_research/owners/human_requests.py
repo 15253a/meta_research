@@ -90,6 +90,12 @@ class HumanResponseVerifier(Protocol):
         bindings: list[dict[str, object]],
     ) -> None: ...
 
+    def query_active_guidance_bindings(
+        self, scope_ref: str
+    ) -> list[dict[str, object]]: ...
+
+    def verify_guidance_binding(self, binding: dict[str, object]) -> None: ...
+
 
 class HumanRequestOwnerInterface(Protocol):
     """The HumanRequest portion of each State Owner's whole Interface."""

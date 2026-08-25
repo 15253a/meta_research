@@ -34,8 +34,10 @@ from meta_research.control_contract import (
     validate_control_payload,
 )
 from meta_research.database import Database
+from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import (
+    IDEA_CONTEXT_PACK_SCHEMA_V3_REF,
     IdeaContractError,
     evidence_reference_revision,
     literature_binding,
@@ -65,6 +67,8 @@ from meta_research.owners.common import (
     FormalPlanDecisionVerifier,
     IdeaOutcomeDecisionVerifier,
     LiteratureSnapshotVerifier,
+    QuestionLiteratureRevisionVerifier,
+    ReasoningOutcomeDecisionVerifier,
     OwnerConflict,
     OwnerSnapshot,
     QuestReceiptVerifier,
@@ -84,7 +88,11 @@ from meta_research.owners.human_requests import (
     HumanRequestOwnerMixin,
     HumanResponseVerifier,
 )
-from meta_research.owners.research_graph import AcceptedQuestion, AcceptedQuest
+from meta_research.owners.research_graph import (
+    AcceptedQuestion,
+    AcceptedQuest,
+    EvidenceReuseLeaf,
+)
 
 
 AE_OWNER = "advancement_engine"
@@ -94,11 +102,22 @@ STAGE_COMMIT_RECEIPT_KIND = "stage_commit"
 IDEA_STAGE = "idea"
 PLAN_STAGE = "plan"
 BUNDLE_STAGE = "bundle"
+REASONING_STAGE = "reasoning"
 IDEA_SET_OUTCOME_KIND = "idea_set"
 NO_VIABLE_CANDIDATE_OUTCOME_KIND = "no_viable_candidate"
 FORMAL_PLAN_OUTCOME_KIND = "formal_plan"
 TARGET_GRAPH_OUTCOME_KIND = "target_graph"
 BUNDLE_REPORT_OUTCOME_KIND = "bundle_report"
+REASONING_OUTCOME_KIND = "reasoning_outcome"
+AUTONOMOUS_REASONING_SKIP_BASIS_KIND = (
+    "autonomous_reasoning_outcome_stage_skip"
+)
+PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND = (
+    "prior_accepted_idea_set_stage_commit"
+)
+PRIOR_ACCEPTED_FORMAL_PLAN_SKIP_BASIS_KIND = (
+    "prior_accepted_formal_plan_stage_commit"
+)
 BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND = "bundle_report_disposition_recorded"
 BUNDLE_REPLAN_ACTIVATED_RECEIPT_KIND = "bundle_replan_activated"
 BUNDLE_SKIP_OUTCOME_KIND = "bundle_skip"
@@ -117,6 +136,9 @@ COMPLETABLE_IDEA_OUTCOME_KINDS = {
     NO_VIABLE_CANDIDATE_OUTCOME_KIND,
 }
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
+AUTONOMOUS_DEEPFETCH_RECEIPT_KIND = "autonomous_deepfetch_run_request"
+AUTONOMOUS_DISPATCH_RECEIPT_KIND = "autonomous_question_dispatch_eligibility"
+QUEST_ENDING_RECEIPT_KIND = "quest_ending"
 
 
 class RuntimeControlReceiptVerifier(Protocol):
@@ -295,6 +317,10 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
 
     def query_foreground(self, quest_ref: str) -> dict[str, object] | None: ...
 
+    def query_reasoning_successor_context(
+        self, cycle_ref: str
+    ) -> dict[str, object] | None: ...
+
     def query_active_foregrounds(
         self, *, stage: str | None = None
     ) -> tuple[dict[str, object], ...]: ...
@@ -381,11 +407,24 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
         cycle_ref: str,
         accepted_question: AcceptedQuestionBinding,
         accepted_formal_plan: AcceptedFormalPlanBinding,
+        accepted_idea_set: AcceptedIdeaSetBinding | None = None,
         context_pack: dict[str, object],
         idempotency_key: str,
     ) -> StageRunRequest: ...
 
     def query_bundle_stage_request(self, cycle_ref: str) -> StageRunRequest | None: ...
+
+    def ensure_reasoning_stage_request(
+        self,
+        *,
+        cycle_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        idempotency_key: str,
+    ) -> StageRunRequest: ...
+
+    def query_reasoning_stage_request(
+        self, cycle_ref: str
+    ) -> StageRunRequest | None: ...
 
     def commit_stage_disposition(
         self,
@@ -475,6 +514,7 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     def query_bundle_replan_activation(
         self, disposition_ref: str
     ) -> BundleReplanActivation | None: ...
+
     def skip_bundle_stage(
         self,
         *,
@@ -485,6 +525,103 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     ) -> StageCommit: ...
 
     def query_bundle_stage_commit(self, request_ref: str) -> StageCommit | None: ...
+
+
+    def commit_reasoning_stage(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        outcome_ref: str,
+        run_completion_receipt: AcceptanceReceipt,
+        outcome_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> StageCommit: ...
+
+    def query_reasoning_stage_commit(
+        self, request_ref: str
+    ) -> StageCommit | None: ...
+
+    def issue_autonomous_deepfetch_request(
+        self,
+        *,
+        context: dict[str, object],
+        acquisition_session: object,
+        idempotency_key: str,
+    ) -> DeepFetchRunRequest: ...
+
+    def query_autonomous_deepfetch_request(
+        self, context_ref: str
+    ) -> DeepFetchRunRequest | None: ...
+
+    def query_autonomous_deepfetch_request_by_ref(
+        self, request_ref: str
+    ) -> DeepFetchRunRequest | None: ...
+
+    def query_next_autonomous_deepfetch_request(
+        self, excluded_request_refs: tuple[str, ...] = ()
+    ) -> DeepFetchRunRequest | None: ...
+
+    def record_autonomous_deepfetch_succeeded(
+        self, *, request_ref: str, run_ref: str, snapshot: object
+    ) -> None: ...
+
+    def record_autonomous_deepfetch_failed(
+        self, *, request_ref: str, failure_code: str, run_ref: str | None
+    ) -> None: ...
+
+    def verify_autonomous_deepfetch_run_request(self, **values: object) -> None: ...
+
+    def authorize_autonomous_question_dispatch(
+        self,
+        *,
+        context: dict[str, object],
+        content: object,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def query_autonomous_question_dispatch(
+        self, context_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def verify_autonomous_question_dispatch_eligibility(
+        self,
+        context_ref: str,
+        reasoning_checkpoint_ref: str,
+        reasoning_checkpoint_hash: str,
+        reasoning_stage_run_request_ref: str,
+        foreground_epoch: int,
+        content_ref: str,
+        content_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_autonomous_question_dispatch_currentness(
+        self,
+        context_ref: str,
+        reasoning_checkpoint_ref: str,
+        reasoning_checkpoint_hash: str,
+        reasoning_stage_run_request_ref: str,
+        foreground_epoch: int,
+        content_ref: str,
+        content_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def end_quest(
+        self,
+        *,
+        quest_ref: str,
+        cycle_ref: str,
+        foreground_epoch: int,
+        reasoning_stage_run_request_ref: str,
+        candidate_completion_ref: str,
+        completion_ref: str,
+        completion_receipt: AcceptanceReceipt | dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def query_quest_ending(self, quest_ref: str) -> dict[str, object] | None: ...
 
     def submit_bundle_exhaustion_proposal(
         self,
@@ -529,6 +666,1387 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     ) -> None: ...
 
 
+class _SQLiteAutonomousAdvancementLifecycle:
+    """SQLite-only implementation fragment for #123 lifecycle boundaries.
+
+    ``AdvancementEngineInterface`` below remains the sole public seam.  This
+    private fragment only keeps the already-large concrete Owner navigable; it
+    is not an alternate interface or a separately composable adapter.
+    """
+
+    def issue_autonomous_deepfetch_request(
+        self,
+        *,
+        context: dict[str, object],
+        acquisition_session: object,
+        idempotency_key: str,
+    ) -> DeepFetchRunRequest:
+        """Issue the mandatory DeepFetch request for one current checkpoint."""
+
+        _validate_idempotency_key(idempotency_key)
+        context_ref = _required_mapping_ref(
+            context, "context_ref", "autonomous_creation_context_invalid"
+        )
+        generation = context.get("generation")
+        source = _required_mapping(
+            context.get("source"), "autonomous_creation_source_invalid"
+        )
+        scope = _required_mapping(
+            context.get("scope"), "autonomous_creation_scope_invalid"
+        )
+        scientific_outcome = _required_mapping(
+            context.get("scientific_outcome"),
+            "autonomous_creation_source_invalid",
+        )
+        autonomous_scope_hash = _required_mapping_ref(
+            context, "scope_hash", "autonomous_creation_scope_invalid"
+        )
+        checkpoint = _required_mapping(
+            context.get("checkpoint"), "autonomous_creation_checkpoint_invalid"
+        )
+        if type(generation) is not int or cast(int, generation) < 1:
+            raise OwnerConflict("autonomous_creation_context_invalid")
+        quest_ref = _required_mapping_ref(
+            source, "quest_ref", "autonomous_creation_source_invalid"
+        )
+        cycle_ref = _required_mapping_ref(
+            source, "cycle_ref", "autonomous_creation_source_invalid"
+        )
+        request_ref_source = _required_mapping_ref(
+            source,
+            "reasoning_stage_run_request_ref",
+            "autonomous_creation_source_invalid",
+        )
+        checkpoint_ref = _required_mapping_ref(
+            checkpoint, "ref", "autonomous_creation_checkpoint_invalid"
+        )
+        checkpoint_hash = _required_mapping_ref(
+            checkpoint, "hash", "autonomous_creation_checkpoint_invalid"
+        )
+        epoch = source.get("foreground_epoch")
+        if type(epoch) is not int or cast(int, epoch) < 1:
+            raise OwnerConflict("autonomous_creation_source_invalid")
+        request = self._query_stage_request_by_ref(request_ref_source)
+        if (
+            request.stage != REASONING_STAGE
+            or request.cycle_ref != cycle_ref
+            or request.epoch != epoch
+            or request.accepted_question.quest_ref != quest_ref
+            or request.accepted_question.question_ref
+            != source.get("question_ref")
+            or source.get("reasoning_checkpoint_ref") != checkpoint_ref
+            or source.get("reasoning_checkpoint_hash") != checkpoint_hash
+            or source.get("scientific_outcome_ref")
+            != scientific_outcome.get("outcome_ref")
+            or scientific_outcome.get("stage_run_request_ref")
+            != request_ref_source
+            or scientific_outcome.get("cycle_ref") != cycle_ref
+            or scientific_outcome.get("question_ref")
+            != request.accepted_question.question_ref
+            or scientific_outcome.get("quest_ref") != quest_ref
+            or scientific_outcome.get("foreground_epoch") != epoch
+            or canonical_hash(scope) != autonomous_scope_hash
+            or scope.get("source_reasoning_stage_run_request_ref")
+            != request_ref_source
+            or scope.get("source_cycle_ref") != cycle_ref
+            or scope.get("source_question_ref")
+            != request.accepted_question.question_ref
+            or scope.get("source_quest_ref") != quest_ref
+            or scope.get("source_foreground_epoch") != epoch
+            or scope.get("source_scientific_outcome_ref")
+            != scientific_outcome.get("outcome_ref")
+        ):
+            raise OwnerConflict("autonomous_creation_source_invalid")
+        self._assert_stage_request_current(request)
+
+        authorization = _required_mapping(
+            context.get("broad_authorization"),
+            "broad_research_authorization_invalid",
+        )
+        if self._authorization_verifier is None:
+            raise OwnerConflict("broad_research_authorization_verifier_unavailable")
+        context_receipt = _receipt_from_object(
+            context.get("receipt"), "human_collaboration"
+        )
+        verify_context = getattr(
+            self._authorization_verifier,
+            "verify_autonomous_creation_context",
+            None,
+        )
+        if not callable(verify_context):
+            raise OwnerConflict("autonomous_creation_context_verifier_unavailable")
+        verify_context(
+            context_ref=context_ref,
+            generation=cast(int, generation),
+            source_hash=canonical_hash(source),
+            reasoning_checkpoint_ref=checkpoint_ref,
+            reasoning_checkpoint_hash=checkpoint_hash,
+            autonomous_scope_hash=autonomous_scope_hash,
+            broad_authorization_hash=canonical_hash(authorization),
+            receipt=context_receipt,
+        )
+        verified_authorization = (
+            self._authorization_verifier.verify_broad_research_authorization(
+                quest_ref=quest_ref
+            )
+        )
+        if verified_authorization != authorization:
+            raise OwnerConflict("broad_research_authorization_invalid")
+
+        # This is the last Owner boundary before create_question can perform
+        # any acquisition, content, or graph side effect.  HC's immutable
+        # context receipt binds the coordinator-verified RM/RG checkpoint;
+        # validate that exact typed route before issuing a DeepFetch command.
+        outcome_ref = _required_mapping_ref(
+            scientific_outcome,
+            "outcome_ref",
+            "autonomous_creation_source_invalid",
+        )
+        entry_stage, _typed_skip = _validated_autonomous_successor_route(
+            scope,
+            outcome_ref=outcome_ref,
+            require_asset_bindings=False,
+        )
+        if entry_stage == PLAN_STAGE:
+            raise OwnerConflict("reasoning_next_cycle_plan_basis_unavailable")
+        if entry_stage == BUNDLE_STAGE:
+            raise OwnerConflict("reasoning_next_cycle_bundle_basis_unavailable")
+
+        session_ref = _required_object_ref(
+            acquisition_session,
+            "session_ref",
+            "autonomous_acquisition_session_invalid",
+        )
+        initialization_id = _required_object_ref(
+            acquisition_session,
+            "initialization_id",
+            "autonomous_acquisition_session_invalid",
+        )
+        session_quest_ref = _required_object_ref(
+            acquisition_session,
+            "quest_ref",
+            "autonomous_acquisition_session_invalid",
+        )
+        config_hash = _required_object_ref(
+            acquisition_session,
+            "config_hash",
+            "autonomous_acquisition_session_invalid",
+        )
+        runtime_binding_hash = _required_object_ref(
+            acquisition_session,
+            "runtime_binding_hash",
+            "autonomous_acquisition_session_invalid",
+        )
+        if session_quest_ref != quest_ref or _object_field(
+            acquisition_session, "status"
+        ) != "ready":
+            raise OwnerConflict("autonomous_acquisition_session_invalid")
+        verifier = self._runtime_control_verifier
+        verify_session = getattr(verifier, "verify_acquisition_session_binding", None)
+        if not callable(verify_session):
+            raise OwnerConflict("acquisition_session_verifier_unavailable")
+        verify_session(
+            session_ref=session_ref,
+            quest_ref=quest_ref,
+            config_hash=config_hash,
+            runtime_binding_hash=runtime_binding_hash,
+        )
+
+        blueprint = _required_mapping(
+            scope.get("question_blueprint"), "autonomous_question_scope_invalid"
+        )
+        deepfetch_scope = {
+            "schema_ref": "meta-research/autonomous-question-deepfetch-scope/v1",
+            "context_ref": context_ref,
+            "generation": generation,
+            "reasoning_checkpoint_ref": checkpoint_ref,
+            "reasoning_checkpoint_hash": checkpoint_hash,
+            "source_scientific_outcome_ref": source[
+                "scientific_outcome_ref"
+            ],
+            "question_blueprint": blueprint,
+        }
+        resource_envelope = {
+            "schema_ref": "meta-research/autonomous-resource-envelope/v1",
+            "quest_ref": quest_ref,
+            "context_ref": context_ref,
+            "broad_authorization_receipt_ref": _authorization_receipt_ref(
+                authorization
+            ),
+        }
+        scope_hash = canonical_hash(deepfetch_scope)
+        draft_hash = canonical_hash(blueprint)
+        resource_envelope_hash = canonical_hash(resource_envelope)
+        context_basis_hash = canonical_hash(
+            {
+                "reasoning_checkpoint_ref": checkpoint_ref,
+                "reasoning_checkpoint_hash": checkpoint_hash,
+                "source_scientific_outcome_ref": source[
+                    "scientific_outcome_ref"
+                ],
+                "autonomous_scope_hash": autonomous_scope_hash,
+            }
+        )
+        command_hash = canonical_hash(
+            {
+                "context_ref": context_ref,
+                "generation": generation,
+                "source": source,
+                "checkpoint": checkpoint,
+                "scope_hash": scope_hash,
+                "draft_hash": draft_hash,
+                "resource_envelope_hash": resource_envelope_hash,
+                "session_ref": session_ref,
+                "config_hash": config_hash,
+                "runtime_binding_hash": runtime_binding_hash,
+            }
+        )
+        now = time.time()
+        with self._database.write() as connection:
+            existing_key = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_deepfetch_requests WHERE "
+                    "idempotency_key = :key"
+                ),
+                {"key": idempotency_key},
+            ).first()
+            existing_context = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_deepfetch_requests WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+            existing = existing_key or existing_context
+            if (
+                existing_key is not None
+                and existing_context is not None
+                and existing_key.request_ref != existing_context.request_ref
+            ):
+                raise OwnerConflict("autonomous_deepfetch_identity_conflict")
+            if existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("autonomous_deepfetch_identity_conflict")
+                result_ref = str(existing.request_ref)
+            else:
+                request_ref = new_ref("autonomous_deepfetch_request")
+                receipt_ref = new_ref("ae_receipt")
+                provisional = DeepFetchRunRequest(
+                    request_ref=request_ref,
+                    initialization_id=initialization_id,
+                    correlation_ref=context_ref,
+                    draft_revision=cast(int, generation),
+                    draft_hash=draft_hash,
+                    draft=blueprint,
+                    scope=deepfetch_scope,
+                    scope_hash=scope_hash,
+                    resource_envelope_ref=(
+                        "autonomous_resource_envelope_"
+                        + resource_envelope_hash[:32]
+                    ),
+                    resource_envelope_hash=resource_envelope_hash,
+                    acquisition_session_ref=session_ref,
+                    acquisition_config_hash=config_hash,
+                    acquisition_runtime_binding_hash=runtime_binding_hash,
+                    accepted_material_bindings=(),
+                    result_route="same_autonomous_question_creation",
+                    authorization_receipt=AcceptanceReceipt(
+                        issuer=AE_OWNER,
+                        kind=AUTONOMOUS_DEEPFETCH_RECEIPT_KIND,
+                        receipt_ref=receipt_ref,
+                        subject_ref=request_ref,
+                        payload_hash="",
+                    ),
+                    creation_context_kind="autonomous_question_creation",
+                    creation_context_ref=context_ref,
+                    context_generation=cast(int, generation),
+                    quest_ref=quest_ref,
+                    parent_question_ref=None,
+                    context_basis_hash=context_basis_hash,
+                )
+                receipt_hash = _receipt_hash(
+                    AUTONOMOUS_DEEPFETCH_RECEIPT_KIND,
+                    request_ref,
+                    _autonomous_deepfetch_receipt_bindings(provisional),
+                )
+                authorized = DeepFetchRunRequest(
+                    **{
+                        **provisional.__dict__,
+                        "authorization_receipt": AcceptanceReceipt(
+                            issuer=AE_OWNER,
+                            kind=AUTONOMOUS_DEEPFETCH_RECEIPT_KIND,
+                            receipt_ref=receipt_ref,
+                            subject_ref=request_ref,
+                            payload_hash=receipt_hash,
+                        ),
+                    }
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_autonomous_deepfetch_requests "
+                        "(request_ref, context_ref, request_json, status, "
+                        "reasoning_stage_run_request_ref, cycle_ref, quest_ref, "
+                        "foreground_epoch, reasoning_checkpoint_ref, "
+                        "reasoning_checkpoint_hash, idempotency_key, "
+                        "request_hash, receipt_ref, receipt_hash, created_at, "
+                        "updated_at) VALUES (:request_ref, :context_ref, "
+                        ":request_json, 'queued', :stage_request_ref, :cycle_ref, "
+                        ":quest_ref, :epoch, :checkpoint_ref, :checkpoint_hash, "
+                        ":key, :request_hash, :receipt_ref, :receipt_hash, :now, "
+                        ":now)"
+                    ),
+                    {
+                        "request_ref": request_ref,
+                        "context_ref": context_ref,
+                        "request_json": canonical_json(
+                            _autonomous_deepfetch_document(authorized)
+                        ),
+                        "stage_request_ref": request_ref_source,
+                        "cycle_ref": cycle_ref,
+                        "quest_ref": quest_ref,
+                        "epoch": epoch,
+                        "checkpoint_ref": checkpoint_ref,
+                        "checkpoint_hash": checkpoint_hash,
+                        "key": idempotency_key,
+                        "request_hash": command_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE advancement_engine_state SET revision = revision "
+                        "+ 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "advancement_engine.autonomous_deepfetch_requested",
+                    {
+                        "request_ref": request_ref,
+                        "context_ref": context_ref,
+                        "reasoning_checkpoint_ref": checkpoint_ref,
+                        "foreground_epoch": epoch,
+                    },
+                )
+                result_ref = request_ref
+        result = self._query_autonomous_deepfetch_request_by_ref(result_ref)
+        if result is None:
+            raise OwnerConflict("autonomous_deepfetch_missing_after_issue")
+        return result
+
+    def query_autonomous_deepfetch_request(
+        self, context_ref: str
+    ) -> DeepFetchRunRequest | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT request_ref FROM ae_autonomous_deepfetch_requests "
+                    "WHERE context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+        return (
+            None
+            if row is None
+            else self._query_autonomous_deepfetch_request_by_ref(str(row.request_ref))
+        )
+
+    def query_autonomous_deepfetch_request_by_ref(
+        self, request_ref: str
+    ) -> DeepFetchRunRequest | None:
+        return self._query_autonomous_deepfetch_request_by_ref(request_ref)
+
+    def query_next_autonomous_deepfetch_request(
+        self, excluded_request_refs: tuple[str, ...] = ()
+    ) -> DeepFetchRunRequest | None:
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT request_ref FROM ae_autonomous_deepfetch_requests "
+                    "WHERE status = 'queued' ORDER BY created_at, request_ref"
+                )
+            ).all()
+        excluded = set(excluded_request_refs)
+        for row in rows:
+            if row.request_ref not in excluded:
+                return self._query_autonomous_deepfetch_request_by_ref(
+                    str(row.request_ref)
+                )
+        return None
+
+    def _query_autonomous_deepfetch_request_by_ref(
+        self, request_ref: str
+    ) -> DeepFetchRunRequest | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            return None
+        return self._validated_autonomous_deepfetch_request(row)
+
+    def _validated_autonomous_deepfetch_request(self, row) -> DeepFetchRunRequest:
+        """Rebuild one durable command without conflating query and execution.
+
+        A failed command remains queryable after restart, while the narrow AR
+        verifier below still refuses to execute it.  All stored identity
+        columns are checked against the canonical command before either seam
+        returns it.
+        """
+
+        document = decoded_object(row.request_json)
+        if not isinstance(document, dict):
+            raise OwnerConflict("autonomous_deepfetch_request_invalid")
+        request = _autonomous_deepfetch_from_document(document)
+        scope = request.scope
+        receipt = request.authorization_receipt
+        stage_request = self._query_stage_request_by_ref(
+            str(row.reasoning_stage_run_request_ref)
+        )
+        status_facts_valid = (
+            row.status == "queued"
+            and row.run_ref is None
+            and row.snapshot_ref is None
+            and row.failure_code is None
+        ) or (
+            row.status == "succeeded"
+            and isinstance(row.run_ref, str)
+            and bool(row.run_ref)
+            and isinstance(row.snapshot_ref, str)
+            and bool(row.snapshot_ref)
+            and row.failure_code is None
+        ) or (
+            row.status == "failed"
+            and row.snapshot_ref is None
+            and isinstance(row.failure_code, str)
+            and bool(row.failure_code)
+        )
+        if (
+            canonical_json(document) != row.request_json
+            or _autonomous_deepfetch_document(request) != document
+            or not isinstance(scope, dict)
+            or request.request_ref != row.request_ref
+            or request.correlation_ref != row.context_ref
+            or request.creation_context_kind != "autonomous_question_creation"
+            or request.creation_context_ref != row.context_ref
+            or request.context_generation is None
+            or int(request.context_generation) < 1
+            or int(request.context_generation) != int(request.draft_revision)
+            or request.quest_ref != row.quest_ref
+            or request.parent_question_ref is not None
+            or request.result_route != "same_autonomous_question_creation"
+            or request.accepted_material_bindings != ()
+            or canonical_hash(request.draft) != request.draft_hash
+            or canonical_hash(scope) != request.scope_hash
+            or scope.get("context_ref") != row.context_ref
+            or scope.get("generation") != int(request.context_generation)
+            or scope.get("reasoning_checkpoint_ref")
+            != row.reasoning_checkpoint_ref
+            or scope.get("reasoning_checkpoint_hash")
+            != row.reasoning_checkpoint_hash
+            or stage_request.request_ref != row.reasoning_stage_run_request_ref
+            or stage_request.stage != REASONING_STAGE
+            or stage_request.cycle_ref != row.cycle_ref
+            or stage_request.epoch != int(row.foreground_epoch)
+            or stage_request.accepted_question.quest_ref != row.quest_ref
+            or receipt.issuer != AE_OWNER
+            or receipt.kind != AUTONOMOUS_DEEPFETCH_RECEIPT_KIND
+            or receipt.subject_ref != row.request_ref
+            or receipt.receipt_ref != row.receipt_ref
+            or receipt.payload_hash != row.receipt_hash
+            or receipt.payload_hash
+            != _receipt_hash(
+                AUTONOMOUS_DEEPFETCH_RECEIPT_KIND,
+                str(row.request_ref),
+                _autonomous_deepfetch_receipt_bindings(request),
+            )
+            or not status_facts_valid
+            or any(
+                not isinstance(value, str) or len(value) != 64
+                for value in (
+                    row.request_hash,
+                    row.reasoning_checkpoint_hash,
+                    row.receipt_hash,
+                    request.context_basis_hash,
+                )
+            )
+        ):
+            raise OwnerConflict("autonomous_deepfetch_request_invalid")
+        return request
+
+    def verify_autonomous_deepfetch_run_request(self, **values: object) -> None:
+        request_ref = cast(str, values.get("request_ref"))
+        receipt = values.get("receipt")
+        if not isinstance(receipt, AcceptanceReceipt):
+            raise OwnerConflict("autonomous_deepfetch_receipt_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("autonomous_deepfetch_request_invalid")
+        request = self._validated_autonomous_deepfetch_request(row)
+        if row.status not in {"queued", "succeeded"}:
+            raise OwnerConflict("autonomous_deepfetch_request_invalid")
+        if values.get("require_active") and row.status != "queued":
+            raise OwnerConflict("deepfetch_request_not_active")
+        expected = _autonomous_deepfetch_verifier_values(request)
+        compared_fields = set(expected) - {"receipt"}
+        if (
+            any(values.get(field) != expected[field] for field in compared_fields)
+            or receipt != request.authorization_receipt
+            or receipt.issuer != AE_OWNER
+            or receipt.kind != AUTONOMOUS_DEEPFETCH_RECEIPT_KIND
+            or receipt.subject_ref != request_ref
+            or receipt.receipt_ref != row.receipt_ref
+            or receipt.payload_hash != row.receipt_hash
+            or receipt.payload_hash
+            != _receipt_hash(
+                AUTONOMOUS_DEEPFETCH_RECEIPT_KIND,
+                request_ref,
+                _autonomous_deepfetch_receipt_bindings(request),
+            )
+        ):
+            raise OwnerConflict("autonomous_deepfetch_request_invalid")
+
+    def record_autonomous_deepfetch_succeeded(
+        self, *, request_ref: str, run_ref: str, snapshot: object
+    ) -> None:
+        if not isinstance(run_ref, str) or not run_ref or len(run_ref) > 96:
+            raise OwnerConflict("autonomous_deepfetch_run_ref_invalid")
+        snapshot_ref = _required_object_ref(
+            snapshot, "snapshot_ref", "autonomous_literature_snapshot_invalid"
+        )
+        snapshot_hash = _required_object_ref(
+            snapshot, "snapshot_hash", "autonomous_literature_snapshot_invalid"
+        )
+        snapshot_receipt = _receipt_from_object(
+            _object_field(snapshot, "receipt"), "research_memory"
+        )
+        with self._database.read() as connection:
+            stored = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if stored is None:
+            raise OwnerConflict("autonomous_deepfetch_request_invalid")
+        request = self._validated_autonomous_deepfetch_request(stored)
+        if (
+            _object_field(snapshot, "creation_context_kind")
+            != "autonomous_question_creation"
+            or _object_field(snapshot, "request_ref") != request_ref
+            or _object_field(snapshot, "run_ref") != run_ref
+            or _object_field(snapshot, "initialization_id")
+            != request.initialization_id
+            or _object_field(snapshot, "draft_revision") != request.draft_revision
+            or _object_field(snapshot, "draft_hash") != request.draft_hash
+            or _object_field(snapshot, "scope_hash") != request.scope_hash
+            or _object_field(snapshot, "creation_context_ref")
+            != request.creation_context_ref
+            or _object_field(snapshot, "context_generation")
+            != request.context_generation
+            or _object_field(snapshot, "context_basis_hash")
+            != request.context_basis_hash
+            or _object_field(snapshot, "quest_ref") != request.quest_ref
+        ):
+            raise OwnerConflict("autonomous_literature_snapshot_invalid")
+        verifier = getattr(
+            self._literature_snapshot_verifier,
+            "verify_literature_snapshot_binding",
+            None,
+        )
+        if not callable(verifier):
+            raise OwnerConflict("literature_snapshot_verifier_unavailable")
+        verifier(
+            snapshot_ref=snapshot_ref,
+            snapshot_hash=snapshot_hash,
+            initialization_id=request.initialization_id,
+            draft_revision=request.draft_revision,
+            draft_hash=request.draft_hash,
+            receipt=snapshot_receipt,
+            creation_context_kind="autonomous_question_creation",
+            creation_context_ref=request.creation_context_ref,
+            context_generation=request.context_generation,
+            context_basis_hash=request.context_basis_hash,
+            quest_ref=request.quest_ref,
+        )
+        now = time.time()
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+            if row is None:
+                raise OwnerConflict("autonomous_deepfetch_request_invalid")
+            if row.status == "succeeded":
+                if row.run_ref != run_ref or row.snapshot_ref != snapshot_ref:
+                    raise OwnerConflict("autonomous_deepfetch_result_conflict")
+                return
+            if row.status != "queued":
+                raise OwnerConflict("autonomous_deepfetch_request_not_active")
+            changed = connection.execute(
+                text(
+                    "UPDATE ae_autonomous_deepfetch_requests SET status = "
+                    "'succeeded', run_ref = :run_ref, snapshot_ref = "
+                    ":snapshot_ref, updated_at = :now WHERE request_ref = "
+                    ":request_ref AND status = 'queued'"
+                ),
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "snapshot_ref": snapshot_ref,
+                    "now": now,
+                },
+            )
+            if changed.rowcount != 1:
+                raise OwnerConflict("autonomous_deepfetch_request_not_active")
+            connection.execute(
+                text(
+                    "UPDATE advancement_engine_state SET revision = revision + "
+                    "1 WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "advancement_engine.autonomous_deepfetch_succeeded",
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "snapshot_ref": snapshot_ref,
+                },
+            )
+
+    def record_autonomous_deepfetch_failed(
+        self, *, request_ref: str, failure_code: str, run_ref: str | None
+    ) -> None:
+        if (
+            not isinstance(failure_code, str)
+            or not failure_code
+            or len(failure_code) > 96
+            or run_ref is not None
+            and (
+                not isinstance(run_ref, str)
+                or not run_ref
+                or len(run_ref) > 96
+            )
+        ):
+            raise OwnerConflict("autonomous_deepfetch_failure_invalid")
+        with self._database.read() as connection:
+            stored = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if stored is None:
+            raise OwnerConflict("autonomous_deepfetch_request_invalid")
+        self._validated_autonomous_deepfetch_request(stored)
+        now = time.time()
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+            if row is None:
+                raise OwnerConflict("autonomous_deepfetch_request_invalid")
+            if row.status == "failed":
+                if row.failure_code != failure_code or row.run_ref != run_ref:
+                    raise OwnerConflict("autonomous_deepfetch_result_conflict")
+                return
+            if row.status != "queued":
+                raise OwnerConflict("autonomous_deepfetch_result_conflict")
+            changed = connection.execute(
+                text(
+                    "UPDATE ae_autonomous_deepfetch_requests SET status = "
+                    "'failed', run_ref = :run_ref, failure_code = :failure_code, "
+                    "updated_at = :now WHERE request_ref = :request_ref AND "
+                    "status = 'queued'"
+                ),
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "failure_code": failure_code,
+                    "now": now,
+                },
+            )
+            if changed.rowcount != 1:
+                raise OwnerConflict("autonomous_deepfetch_result_conflict")
+            connection.execute(
+                text(
+                    "UPDATE advancement_engine_state SET revision = revision "
+                    "+ 1 WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "advancement_engine.autonomous_deepfetch_failed",
+                {"request_ref": request_ref, "failure_code": failure_code},
+            )
+
+    def authorize_autonomous_question_dispatch(
+        self,
+        *,
+        context: dict[str, object],
+        content: object,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        _validate_idempotency_key(idempotency_key)
+        context_ref = _required_mapping_ref(
+            context, "context_ref", "autonomous_creation_context_invalid"
+        )
+        generation = context.get("generation")
+        source = _required_mapping(
+            context.get("source"), "autonomous_creation_source_invalid"
+        )
+        checkpoint = _required_mapping(
+            context.get("checkpoint"), "autonomous_creation_checkpoint_invalid"
+        )
+        proposal = _required_mapping(
+            context.get("proposal"), "autonomous_question_proposal_invalid"
+        )
+        selection = _required_mapping(
+            context.get("selection"), "autonomous_question_selection_invalid"
+        )
+        if type(generation) is not int or cast(int, generation) < 1:
+            raise OwnerConflict("autonomous_creation_context_invalid")
+        request_ref = _required_mapping_ref(
+            source,
+            "reasoning_stage_run_request_ref",
+            "autonomous_creation_source_invalid",
+        )
+        request = self._query_stage_request_by_ref(request_ref)
+        epoch = source.get("foreground_epoch")
+        if (
+            request.stage != REASONING_STAGE
+            or request.cycle_ref != source.get("cycle_ref")
+            or request.epoch != epoch
+            or request.accepted_question.quest_ref != source.get("quest_ref")
+            or request.accepted_question.question_ref
+            != source.get("question_ref")
+        ):
+            raise OwnerConflict("autonomous_creation_source_invalid")
+        content_ref = _required_object_ref(
+            content, "content_ref", "autonomous_question_content_invalid"
+        )
+        content_hash = _required_object_ref(
+            content, "content_hash", "autonomous_question_content_invalid"
+        )
+        content_receipt = _receipt_from_object(
+            _object_field(content, "receipt"), "research_memory"
+        )
+        if (
+            _object_field(content, "context_ref") != context_ref
+            or _object_field(content, "reasoning_checkpoint_ref")
+            != checkpoint.get("ref")
+            or _object_field(content, "reasoning_checkpoint_hash")
+            != checkpoint.get("hash")
+            or _object_field(content, "source_scientific_outcome_ref")
+            != source.get("scientific_outcome_ref")
+            or _object_field(content, "source_stage_request_ref") != request_ref
+            or _object_field(content, "source_cycle_ref")
+            != source.get("cycle_ref")
+            or _object_field(content, "source_foreground_epoch") != epoch
+            or _object_field(content, "source_quest_ref")
+            != source.get("quest_ref")
+            or _object_field(content, "source_question_ref")
+            != source.get("question_ref")
+            or _object_field(content, "autonomous_scope_hash")
+            != context.get("scope_hash")
+            or _object_field(content, "proposal_ref") != proposal.get("ref")
+            or _object_field(content, "proposal_hash") != proposal.get("hash")
+            or _object_field(content, "question") != proposal.get("question")
+        ):
+            raise OwnerConflict("autonomous_question_content_invalid")
+        selection_content_receipt = _receipt_from_public(
+            selection["content_receipt"]
+        )
+        selection_receipt = _receipt_from_public(selection["receipt"])
+        if self._authorization_verifier is None:
+            raise OwnerConflict("autonomous_selection_verifier_unavailable")
+        verify_selection = getattr(
+            self._authorization_verifier,
+            "verify_autonomous_question_selection",
+            None,
+        )
+        if not callable(verify_selection):
+            raise OwnerConflict("autonomous_selection_verifier_unavailable")
+        verify_selection(
+            context_ref=context_ref,
+            generation=generation,
+            proposal_ref=proposal["ref"],
+            proposal_hash=proposal["hash"],
+            content_ref=content_ref,
+            content_hash=content_hash,
+            content_receipt=selection_content_receipt,
+            receipt=selection_receipt,
+        )
+        if selection_content_receipt != content_receipt:
+            raise OwnerConflict("autonomous_question_selection_invalid")
+        memory_verifier = self._question_literature_revision_verifier
+        verify_content = getattr(
+            memory_verifier, "verify_autonomous_question_content_receipt", None
+        )
+        if not callable(verify_content):
+            raise OwnerConflict("autonomous_question_content_verifier_unavailable")
+        verify_content(
+            context_ref=context_ref,
+            reasoning_checkpoint_ref=checkpoint["ref"],
+            reasoning_checkpoint_hash=checkpoint["hash"],
+            source_scientific_outcome_ref=source["scientific_outcome_ref"],
+            content_ref=content_ref,
+            content_hash=content_hash,
+            literature_snapshot_ref=_object_field(
+                content, "literature_snapshot_ref"
+            ),
+            receipt=content_receipt,
+        )
+        bindings = {
+            "context_ref": context_ref,
+            "reasoning_checkpoint_ref": checkpoint["ref"],
+            "reasoning_checkpoint_hash": checkpoint["hash"],
+            "reasoning_stage_run_request_ref": request_ref,
+            "foreground_epoch": epoch,
+            "content_ref": content_ref,
+            "content_hash": content_hash,
+            "selection_receipt_ref": selection_receipt.receipt_ref,
+            "selection_receipt_hash": selection_receipt.payload_hash,
+        }
+        command_hash = canonical_hash(bindings)
+        now = time.time()
+        with self._database.fenced_write() as connection:
+            existing_key = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_question_dispatches WHERE "
+                    "idempotency_key = :key"
+                ),
+                {"key": idempotency_key},
+            ).first()
+            existing_context = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_question_dispatches WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+            existing = existing_key or existing_context
+            if (
+                existing_key is not None
+                and existing_context is not None
+                and existing_key.dispatch_ref != existing_context.dispatch_ref
+            ):
+                raise OwnerConflict("autonomous_question_dispatch_conflict")
+            if existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("autonomous_question_dispatch_conflict")
+            else:
+                self._assert_stage_head_current(
+                    connection,
+                    cycle_ref=request.cycle_ref,
+                    quest_ref=request.accepted_question.quest_ref,
+                    stage=REASONING_STAGE,
+                    epoch=request.epoch,
+                )
+                dispatch_ref = new_ref("autonomous_dispatch")
+                receipt_ref = new_ref("ae_receipt")
+                receipt_hash = _receipt_hash(
+                    AUTONOMOUS_DISPATCH_RECEIPT_KIND,
+                    dispatch_ref,
+                    bindings,
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_autonomous_question_dispatches "
+                        "(dispatch_ref, context_ref, reasoning_checkpoint_ref, "
+                        "reasoning_checkpoint_hash, "
+                        "reasoning_stage_run_request_ref, foreground_epoch, "
+                        "content_ref, content_hash, selection_receipt_ref, "
+                        "selection_receipt_hash, idempotency_key, request_hash, "
+                        "receipt_ref, receipt_hash, authorized_at) VALUES "
+                        "(:dispatch_ref, :context_ref, :reasoning_checkpoint_ref, "
+                        ":reasoning_checkpoint_hash, :stage_request_ref, :epoch, "
+                        ":content_ref, :content_hash, :selection_receipt_ref, "
+                        ":selection_receipt_hash, :key, :request_hash, "
+                        ":receipt_ref, :receipt_hash, :now)"
+                    ),
+                    {
+                        **bindings,
+                        "dispatch_ref": dispatch_ref,
+                        "stage_request_ref": request_ref,
+                        "epoch": epoch,
+                        "key": idempotency_key,
+                        "request_hash": command_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE advancement_engine_state SET revision = revision "
+                        "+ 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "advancement_engine.autonomous_question_dispatch_authorized",
+                    {
+                        "dispatch_ref": dispatch_ref,
+                        "context_ref": context_ref,
+                        "content_ref": content_ref,
+                    },
+                )
+        result = self.query_autonomous_question_dispatch(context_ref)
+        if result is None:
+            raise OwnerConflict("autonomous_question_dispatch_missing")
+        return result
+
+    def query_autonomous_question_dispatch(
+        self, context_ref: str
+    ) -> dict[str, object] | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_question_dispatches WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+        if row is None:
+            return None
+        receipt = AcceptanceReceipt(
+            issuer=AE_OWNER,
+            kind=AUTONOMOUS_DISPATCH_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.dispatch_ref,
+            payload_hash=row.receipt_hash,
+        )
+        self.verify_autonomous_question_dispatch_eligibility(
+            context_ref=row.context_ref,
+            reasoning_checkpoint_ref=row.reasoning_checkpoint_ref,
+            reasoning_checkpoint_hash=row.reasoning_checkpoint_hash,
+            reasoning_stage_run_request_ref=row.reasoning_stage_run_request_ref,
+            foreground_epoch=int(row.foreground_epoch),
+            content_ref=row.content_ref,
+            content_hash=row.content_hash,
+            receipt=receipt,
+        )
+        return {
+            "status": "authorized",
+            "dispatch_ref": row.dispatch_ref,
+            "context_ref": row.context_ref,
+            "reasoning_checkpoint_ref": row.reasoning_checkpoint_ref,
+            "reasoning_checkpoint_hash": row.reasoning_checkpoint_hash,
+            "reasoning_stage_run_request_ref": row.reasoning_stage_run_request_ref,
+            "foreground_epoch": int(row.foreground_epoch),
+            "content_ref": row.content_ref,
+            "content_hash": row.content_hash,
+            "receipt": receipt,
+        }
+
+    def verify_autonomous_question_dispatch_eligibility(
+        self,
+        context_ref: str,
+        reasoning_checkpoint_ref: str,
+        reasoning_checkpoint_hash: str,
+        reasoning_stage_run_request_ref: str,
+        foreground_epoch: int,
+        content_ref: str,
+        content_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_autonomous_question_dispatches WHERE "
+                    "receipt_ref = :receipt_ref"
+                ),
+                {"receipt_ref": receipt.receipt_ref},
+            ).first()
+        bindings = {
+            "context_ref": context_ref,
+            "reasoning_checkpoint_ref": reasoning_checkpoint_ref,
+            "reasoning_checkpoint_hash": reasoning_checkpoint_hash,
+            "reasoning_stage_run_request_ref": reasoning_stage_run_request_ref,
+            "foreground_epoch": foreground_epoch,
+            "content_ref": content_ref,
+            "content_hash": content_hash,
+            "selection_receipt_ref": None if row is None else row.selection_receipt_ref,
+            "selection_receipt_hash": None
+            if row is None
+            else row.selection_receipt_hash,
+        }
+        if (
+            row is None
+            or row.context_ref != context_ref
+            or row.reasoning_checkpoint_ref != reasoning_checkpoint_ref
+            or row.reasoning_checkpoint_hash != reasoning_checkpoint_hash
+            or row.reasoning_stage_run_request_ref
+            != reasoning_stage_run_request_ref
+            or int(row.foreground_epoch) != foreground_epoch
+            or row.content_ref != content_ref
+            or row.content_hash != content_hash
+            or receipt.issuer != AE_OWNER
+            or receipt.kind != AUTONOMOUS_DISPATCH_RECEIPT_KIND
+            or receipt.subject_ref != row.dispatch_ref
+            or receipt.payload_hash != row.receipt_hash
+            or receipt.payload_hash
+            != _receipt_hash(
+                AUTONOMOUS_DISPATCH_RECEIPT_KIND,
+                row.dispatch_ref,
+                bindings,
+            )
+        ):
+            raise OwnerConflict("autonomous_question_dispatch_invalid")
+
+    def verify_autonomous_question_dispatch_currentness(
+        self,
+        context_ref: str,
+        reasoning_checkpoint_ref: str,
+        reasoning_checkpoint_hash: str,
+        reasoning_stage_run_request_ref: str,
+        foreground_epoch: int,
+        content_ref: str,
+        content_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        """Revalidate an immutable dispatch against the live AE foreground."""
+
+        self.verify_autonomous_question_dispatch_eligibility(
+            context_ref,
+            reasoning_checkpoint_ref,
+            reasoning_checkpoint_hash,
+            reasoning_stage_run_request_ref,
+            foreground_epoch,
+            content_ref,
+            content_hash,
+            receipt,
+        )
+        request = self._query_stage_request_by_ref(
+            reasoning_stage_run_request_ref
+        )
+        if request.epoch != foreground_epoch:
+            raise OwnerConflict("autonomous_question_dispatch_stale")
+        try:
+            self._assert_stage_request_current(request)
+        except OwnerConflict as error:
+            raise OwnerConflict("autonomous_question_dispatch_stale") from error
+
+    def end_quest(
+        self,
+        *,
+        quest_ref: str,
+        cycle_ref: str,
+        foreground_epoch: int,
+        reasoning_stage_run_request_ref: str,
+        candidate_completion_ref: str,
+        completion_ref: str,
+        completion_receipt: AcceptanceReceipt | dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        """Publish the sole Quest-ending transition after HC and RG acceptance."""
+
+        _validate_idempotency_key(idempotency_key)
+        receipt = _receipt_from_object(completion_receipt, "research_graph")
+        request = self._query_stage_request_by_ref(reasoning_stage_run_request_ref)
+        commit = self.query_reasoning_stage_commit(reasoning_stage_run_request_ref)
+        if (
+            request.stage != REASONING_STAGE
+            or request.cycle_ref != cycle_ref
+            or request.epoch != foreground_epoch
+            or request.accepted_question.quest_ref != quest_ref
+            or commit is None
+            or not isinstance(commit.closure, dict)
+            or commit.closure.get("transition_kind") != "candidate_completion"
+            or commit.closure.get("transition_ref") != candidate_completion_ref
+        ):
+            raise OwnerConflict("quest_completion_stage_commit_invalid")
+        verifier = self._reasoning_outcome_verifier
+        verify_completion = getattr(verifier, "verify_quest_completion_acceptance", None)
+        if not callable(verify_completion):
+            raise OwnerConflict("quest_completion_verifier_unavailable")
+        verify_completion(
+            completion_ref=completion_ref,
+            candidate_completion_ref=candidate_completion_ref,
+            quest_ref=quest_ref,
+            goal_revision_ref=commit.closure["transition"][
+                "current_goal_revision_ref"
+            ],
+            receipt=receipt,
+        )
+        bindings = {
+            "quest_ref": quest_ref,
+            "cycle_ref": cycle_ref,
+            "foreground_epoch": foreground_epoch,
+            "reasoning_stage_run_request_ref": reasoning_stage_run_request_ref,
+            "candidate_completion_ref": candidate_completion_ref,
+            "completion_ref": completion_ref,
+            "completion_receipt_ref": receipt.receipt_ref,
+            "completion_receipt_hash": receipt.payload_hash,
+        }
+        request_hash = canonical_hash(bindings)
+        now = time.time()
+        with self._database.write() as connection:
+            existing_key = connection.execute(
+                text(
+                    "SELECT * FROM ae_quest_endings WHERE idempotency_key = :key"
+                ),
+                {"key": idempotency_key},
+            ).first()
+            existing_quest = connection.execute(
+                text(
+                    "SELECT * FROM ae_quest_endings WHERE quest_ref = :quest_ref"
+                ),
+                {"quest_ref": quest_ref},
+            ).first()
+            existing = existing_key or existing_quest
+            if (
+                existing_key is not None
+                and existing_quest is not None
+                and existing_key.transition_ref != existing_quest.transition_ref
+            ):
+                raise OwnerConflict("quest_ending_conflict")
+            if existing is not None:
+                if existing.request_hash != request_hash:
+                    raise OwnerConflict("quest_ending_conflict")
+            else:
+                head = connection.execute(
+                    text(
+                        "SELECT * FROM ae_foreground_heads WHERE quest_ref = "
+                        ":quest_ref"
+                    ),
+                    {"quest_ref": quest_ref},
+                ).first()
+                if (
+                    head is None
+                    or head.cycle_ref != cycle_ref
+                    or head.stage != REASONING_STAGE
+                    or int(head.epoch) != foreground_epoch
+                    or head.status not in {"active", "awaiting_quest_completion"}
+                ):
+                    raise OwnerConflict("quest_completion_foreground_stale")
+                transition_ref = new_ref("quest_ending")
+                ending_receipt_ref = new_ref("ae_receipt")
+                ending_receipt_hash = _receipt_hash(
+                    QUEST_ENDING_RECEIPT_KIND,
+                    transition_ref,
+                    bindings,
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_quest_endings (transition_ref, quest_ref, "
+                        "cycle_ref, foreground_epoch, "
+                        "reasoning_stage_run_request_ref, "
+                        "candidate_completion_ref, completion_ref, "
+                        "completion_receipt_ref, completion_receipt_hash, "
+                        "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                        "ended_at) VALUES (:transition_ref, :quest_ref, :cycle_ref, "
+                        ":foreground_epoch, :reasoning_stage_run_request_ref, "
+                        ":candidate_completion_ref, :completion_ref, "
+                        ":completion_receipt_ref, :completion_receipt_hash, :key, "
+                        ":request_hash, :receipt_ref, :receipt_hash, :now)"
+                    ),
+                    {
+                        **bindings,
+                        "transition_ref": transition_ref,
+                        "key": idempotency_key,
+                        "request_hash": request_hash,
+                        "receipt_ref": ending_receipt_ref,
+                        "receipt_hash": ending_receipt_hash,
+                        "now": now,
+                    },
+                )
+                changed = connection.execute(
+                    text(
+                        "UPDATE ae_foreground_heads SET status = 'completed', "
+                        "updated_at = :now WHERE quest_ref = :quest_ref AND "
+                        "cycle_ref = :cycle_ref AND epoch = :epoch AND stage = "
+                        "'reasoning' AND status IN ('active', "
+                        "'awaiting_quest_completion')"
+                    ),
+                    {
+                        "now": now,
+                        "quest_ref": quest_ref,
+                        "cycle_ref": cycle_ref,
+                        "epoch": foreground_epoch,
+                    },
+                )
+                if changed.rowcount != 1:
+                    raise OwnerConflict("quest_completion_foreground_stale")
+                grant_changed = connection.execute(
+                    text(
+                        "UPDATE ae_foreground_grants SET status = 'completed', "
+                        "revoked_at = COALESCE(revoked_at, :now) WHERE quest_ref "
+                        "= :quest_ref AND cycle_ref = :cycle_ref AND epoch = "
+                        ":epoch AND status = 'active'"
+                    ),
+                    {
+                        "now": now,
+                        "quest_ref": quest_ref,
+                        "cycle_ref": cycle_ref,
+                        "epoch": foreground_epoch,
+                    },
+                )
+                if grant_changed.rowcount != 1:
+                    raise OwnerConflict("quest_completion_foreground_stale")
+                cycle_changed = connection.execute(
+                    text(
+                        "UPDATE ae_cycles SET status = 'completed', "
+                        "suspension_reason = NULL, updated_at = :now WHERE "
+                        "cycle_ref = :cycle_ref AND status = 'ongoing' AND "
+                        "successor_cycle_ref IS NULL"
+                    ),
+                    {"now": now, "cycle_ref": cycle_ref},
+                )
+                if cycle_changed.rowcount != 1:
+                    raise OwnerConflict("quest_completion_foreground_stale")
+                connection.execute(
+                    text(
+                        "UPDATE advancement_engine_state SET revision = revision "
+                        "+ 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "advancement_engine.quest_ended",
+                    {
+                        "transition_ref": transition_ref,
+                        "quest_ref": quest_ref,
+                        "cycle_ref": cycle_ref,
+                        "candidate_completion_ref": candidate_completion_ref,
+                        "completion_ref": completion_ref,
+                    },
+                )
+        ending = self.query_quest_ending(quest_ref)
+        if ending is None:
+            raise OwnerConflict("quest_ending_missing_after_commit")
+        return ending
+
+    def query_quest_ending(self, quest_ref: str) -> dict[str, object] | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text("SELECT * FROM ae_quest_endings WHERE quest_ref = :quest_ref"),
+                {"quest_ref": quest_ref},
+            ).first()
+            cycle = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT status, successor_cycle_ref FROM ae_cycles WHERE "
+                        "cycle_ref = :cycle_ref"
+                    ),
+                    {"cycle_ref": row.cycle_ref},
+                ).first()
+            )
+        if row is None:
+            return None
+        bindings = {
+            "quest_ref": row.quest_ref,
+            "cycle_ref": row.cycle_ref,
+            "foreground_epoch": int(row.foreground_epoch),
+            "reasoning_stage_run_request_ref": row.reasoning_stage_run_request_ref,
+            "candidate_completion_ref": row.candidate_completion_ref,
+            "completion_ref": row.completion_ref,
+            "completion_receipt_ref": row.completion_receipt_ref,
+            "completion_receipt_hash": row.completion_receipt_hash,
+        }
+        commit = self.query_reasoning_stage_commit(
+            str(row.reasoning_stage_run_request_ref)
+        )
+        request = self._query_stage_request_by_ref(
+            str(row.reasoning_stage_run_request_ref)
+        )
+        closure = None if commit is None else commit.closure
+        foreground = self.query_foreground(str(row.quest_ref))
+        completion_receipt = AcceptanceReceipt(
+            issuer="research_graph",
+            kind="quest_completion_acceptance",
+            receipt_ref=str(row.completion_receipt_ref),
+            subject_ref=str(row.completion_ref),
+            payload_hash=str(row.completion_receipt_hash),
+        )
+        verifier = getattr(
+            self._reasoning_outcome_verifier,
+            "verify_quest_completion_acceptance",
+            None,
+        )
+        if not callable(verifier):
+            raise OwnerConflict("quest_completion_verifier_unavailable")
+        if (
+            request.stage != REASONING_STAGE
+            or request.cycle_ref != row.cycle_ref
+            or request.epoch != int(row.foreground_epoch)
+            or request.accepted_question.quest_ref != row.quest_ref
+            or not isinstance(closure, dict)
+            or closure.get("transition_kind") != "candidate_completion"
+            or closure.get("transition_ref") != row.candidate_completion_ref
+            or not isinstance(closure.get("transition"), dict)
+            or cycle is None
+            or cycle.status != "completed"
+            or cycle.successor_cycle_ref is not None
+            or not isinstance(foreground, dict)
+            or foreground.get("cycle_ref") != row.cycle_ref
+            or foreground.get("epoch") != int(row.foreground_epoch)
+            or foreground.get("stage") != REASONING_STAGE
+            or foreground.get("status") != "completed"
+            or foreground.get("grant_status") != "completed"
+            or row.request_hash != canonical_hash(bindings)
+            or row.receipt_hash
+            != _receipt_hash(
+                QUEST_ENDING_RECEIPT_KIND, row.transition_ref, bindings
+            )
+        ):
+            raise OwnerConflict("quest_ending_invalid")
+        transition = cast(dict[str, object], closure["transition"])
+        goal_revision_ref = _required_mapping_ref(
+            transition, "current_goal_revision_ref", "quest_ending_invalid"
+        )
+        verifier(
+            completion_ref=str(row.completion_ref),
+            candidate_completion_ref=str(row.candidate_completion_ref),
+            quest_ref=str(row.quest_ref),
+            goal_revision_ref=goal_revision_ref,
+            receipt=completion_receipt,
+        )
+        return {
+            "status": "ended",
+            "transition_ref": row.transition_ref,
+            "quest_ref": row.quest_ref,
+            "cycle_ref": row.cycle_ref,
+            "foreground_epoch": int(row.foreground_epoch),
+            "reasoning_stage_run_request_ref": row.reasoning_stage_run_request_ref,
+            "candidate_completion_ref": row.candidate_completion_ref,
+            "completion_ref": row.completion_ref,
+            "receipt": AcceptanceReceipt(
+                issuer=AE_OWNER,
+                kind=QUEST_ENDING_RECEIPT_KIND,
+                receipt_ref=row.receipt_ref,
+                subject_ref=row.transition_ref,
+                payload_hash=row.receipt_hash,
+            ).as_public_dict(),
+        }
+
+
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=AE_OWNER,
     statement=text(
@@ -554,7 +2072,9 @@ _SNAPSHOT = OwnerSnapshotQuery(
 )
 
 
-class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
+class SQLiteAdvancementEngine(
+    HumanRequestOwnerMixin, _SQLiteAutonomousAdvancementLifecycle
+):
     def __init__(
         self,
         database: Database,
@@ -578,6 +2098,10 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         current_question_verifier: CurrentQuestionVerifier | None = None,
         bundle_report_verifier: BundleReportReceiptVerifier | None = None,
         bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
+        reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
+        question_literature_revision_verifier: (
+            QuestionLiteratureRevisionVerifier | None
+        ) = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -599,6 +2123,10 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         self._current_question_verifier = current_question_verifier
         self._bundle_report_verifier = bundle_report_verifier
         self._bundle_report_evidence_verifier = bundle_report_evidence_verifier
+        self._reasoning_outcome_verifier = reasoning_outcome_verifier
+        self._question_literature_revision_verifier = (
+            question_literature_revision_verifier
+        )
         self._bundle_exhaustion_verifier: (
             BundleExhaustionEvidenceVerifier | None
         ) = None
@@ -654,6 +2182,181 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             "safe_point_ref": row.safe_point_ref,
             "pending_operation_ref": row.pending_operation_ref,
             "owner_revision": int(row.owner_revision),
+        }
+
+    def query_reasoning_successor_context(
+        self, cycle_ref: str
+    ) -> dict[str, object] | None:
+        """Return the immutable Owner-authenticated basis of a Reasoning successor."""
+
+        _control_ref(cycle_ref, "cycle_ref")
+        with self._database.read() as connection:
+            cycle = connection.execute(
+                text("SELECT * FROM ae_cycles WHERE cycle_ref = :cycle_ref"),
+                {"cycle_ref": cycle_ref},
+            ).first()
+            source = (
+                None
+                if (
+                    cycle is None
+                    or cycle.idea_context_pack_json is None
+                    or cycle.predecessor_cycle_ref is None
+                )
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_commits WHERE cycle_ref = "
+                        ":cycle_ref AND stage = 'reasoning' AND disposition = "
+                        "'completed' ORDER BY committed_at DESC LIMIT 1"
+                    ),
+                    {"cycle_ref": cycle.predecessor_cycle_ref},
+                ).first()
+            )
+        if cycle is None or source is None:
+            return None
+
+        committed = self._stage_commit_from_row(source)
+        closure = committed.closure
+        outcome_receipt = committed.outcome_receipt
+        if (
+            committed.request_ref is None
+            or committed.outcome_ref is None
+            or closure is None
+            or outcome_receipt is None
+            or closure.get("transition_kind") != "next_cycle_proposal"
+        ):
+            raise OwnerConflict("reasoning_successor_context_invalid")
+        transition = closure.get("transition")
+        if not isinstance(transition, dict):
+            raise OwnerConflict("reasoning_successor_context_invalid")
+        target_question_ref = transition.get("target_question_ref")
+        if target_question_ref != cycle.question_ref:
+            raise OwnerConflict("reasoning_successor_context_invalid")
+
+        verifier = self._reasoning_outcome_verifier
+        if verifier is None:
+            raise OwnerConflict("reasoning_next_cycle_target_verifier_unavailable")
+        target = verifier.query_reasoning_next_cycle_target(
+            outcome_ref=committed.outcome_ref,
+            receipt=outcome_receipt,
+        )
+        accepted = (
+            target.get("accepted_question_binding")
+            if isinstance(target, dict)
+            else None
+        )
+        if (
+            not isinstance(accepted, dict)
+            or accepted.get("question_ref") != cycle.question_ref
+            or accepted.get("quest_ref") != cycle.quest_ref
+        ):
+            raise OwnerConflict("reasoning_successor_context_invalid")
+        target_binding = accepted
+        entry_stage, typed_skip = _validated_autonomous_successor_route(
+            target,
+            outcome_ref=committed.outcome_ref,
+        )
+        accepted_idea_set = None
+        accepted_formal_plan = None
+        if entry_stage in {PLAN_STAGE, BUNDLE_STAGE}:
+            accepted_idea_set, accepted_formal_plan = _successor_asset_bindings(
+                target,
+                entry_stage=entry_stage,
+            )
+
+        idea_context_pack = None
+        idea_context_pack_hash = cycle.idea_context_pack_hash
+        if cycle.idea_context_pack_json is not None:
+            try:
+                idea_context_pack = decoded_object(cycle.idea_context_pack_json)
+                validate_idea_context_pack(
+                    idea_context_pack,
+                    cycle_ref=cycle_ref,
+                    accepted_question_binding=target_binding,
+                )
+            except (TypeError, ValueError, IdeaContractError) as error:
+                raise OwnerConflict("reasoning_successor_context_invalid") from error
+            if (
+                canonical_json(idea_context_pack)
+                != cycle.idea_context_pack_json
+                or canonical_hash(idea_context_pack) != idea_context_pack_hash
+            ):
+                raise OwnerConflict("reasoning_successor_context_invalid")
+        else:
+            raise OwnerConflict("reasoning_successor_context_invalid")
+
+        expected_skipped = tuple(STAGES[: STAGES.index(entry_stage)])
+        with self._database.read() as connection:
+            skip_rows = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_commits WHERE cycle_ref = :cycle_ref "
+                    "AND epoch = :epoch AND disposition = 'skipped' ORDER BY "
+                    "committed_at, stage"
+                ),
+                {"cycle_ref": cycle_ref, "epoch": int(source.epoch) + 1},
+            ).all()
+        if {str(row.stage) for row in skip_rows} != set(expected_skipped):
+            if skip_rows or expected_skipped:
+                raise OwnerConflict("reasoning_successor_skip_commits_invalid")
+        skipped_documents: list[dict[str, object]] = []
+        for row in sorted(skip_rows, key=lambda item: STAGES.index(str(item.stage))):
+            skipped = self._stage_commit_from_row(row)
+            if row.stage == IDEA_STAGE and accepted_idea_set is not None:
+                expected_kind = PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND
+                expected_ref = accepted_idea_set.stage_commit_ref
+                expected_receipt = accepted_idea_set.stage_commit_receipt
+                expected_typed_ref = accepted_idea_set.outcome_ref
+            elif row.stage == PLAN_STAGE and accepted_formal_plan is not None:
+                expected_kind = PRIOR_ACCEPTED_FORMAL_PLAN_SKIP_BASIS_KIND
+                expected_ref = accepted_formal_plan.stage_commit_ref
+                expected_receipt = accepted_formal_plan.stage_commit_receipt
+                expected_typed_ref = accepted_formal_plan.formal_plan_ref
+            else:
+                expected_kind = AUTONOMOUS_REASONING_SKIP_BASIS_KIND
+                expected_ref = committed.outcome_ref
+                expected_receipt = outcome_receipt
+                expected_typed_ref = committed.outcome_ref
+            if (
+                skipped.basis_kind != expected_kind
+                or skipped.basis_ref != expected_ref
+                or skipped.basis_receipt != expected_receipt
+                or typed_skip.get(str(row.stage)) != [expected_typed_ref]
+            ):
+                raise OwnerConflict("reasoning_successor_skip_commits_invalid")
+            skipped_documents.append(
+                {
+                    **_reasoning_commit_document(skipped),
+                    "cycle_ref": skipped.cycle_ref,
+                }
+            )
+
+        prior = {
+            **_reasoning_commit_document(committed),
+            "cycle_ref": committed.cycle_ref,
+        }
+        return {
+            "schema_ref": "meta-research/reasoning-successor-context/v1",
+            "cycle_ref": cycle_ref,
+            "source_cycle_ref": committed.cycle_ref,
+            "source_stage_run_request_ref": committed.request_ref,
+            "target_question_ref": target_question_ref,
+            "entry_stage": entry_stage,
+            "typed_skip_basis_refs_by_stage": typed_skip,
+            "prior_accepted_bindings": [prior],
+            "skipped_stage_commits": skipped_documents,
+            "idea_context_pack": idea_context_pack,
+            "idea_context_pack_hash": idea_context_pack_hash,
+            **(
+                {}
+                if accepted_idea_set is None
+                else {"accepted_idea_set_binding": accepted_idea_set.as_dict()}
+            ),
+            **(
+                {}
+                if accepted_formal_plan is None
+                else {
+                    "accepted_formal_plan_binding": accepted_formal_plan.as_dict()
+                }
+            ),
         }
 
     def query_active_foregrounds(
@@ -2099,7 +3802,10 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         except IdeaContractError as error:
             raise OwnerConflict(str(error)) from error
         self._verify_cycle_question(cycle_ref, accepted_question)
-        self._verify_context_literature(accepted_question, context_pack)
+        self._verify_context_literature(
+            accepted_question, context_pack, require_current=True
+        )
+        self._verify_idea_successor_context(cycle_ref, context_pack)
 
         # Natural-key replay is a historical receipt lookup. It must not
         # pursue today's Evidence set or current custody.
@@ -2609,6 +4315,7 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         cycle_ref: str,
         accepted_question: AcceptedQuestionBinding,
         accepted_formal_plan: AcceptedFormalPlanBinding,
+        accepted_idea_set: AcceptedIdeaSetBinding | None = None,
         context_pack: dict[str, object],
         idempotency_key: str,
     ) -> StageRunRequest:
@@ -2628,6 +4335,11 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             "epoch": epoch,
             "accepted_question": accepted_question.as_dict(),
             "accepted_formal_plan": accepted_formal_plan.as_dict(),
+            **(
+                {}
+                if accepted_idea_set is None
+                else {"accepted_idea_set": accepted_idea_set.as_dict()}
+            ),
             "context_pack_hash": context_pack_hash,
         }
         request_hash = canonical_hash(request_input)
@@ -2642,10 +4354,17 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 cycle_ref=cycle_ref,
                 accepted_question_binding=accepted_question.as_dict(),
                 accepted_formal_plan_binding=accepted_formal_plan.as_dict(),
+                accepted_idea_set_binding=(
+                    None
+                    if accepted_idea_set is None
+                    else accepted_idea_set.as_dict()
+                ),
             )
         except BundleContractError as error:
             raise OwnerConflict(str(error)) from error
         self._verify_cycle_question(cycle_ref, accepted_question)
+        if accepted_idea_set is not None:
+            self._verify_plan_idea_set(cycle_ref, accepted_idea_set)
         self._verify_bundle_formal_plan(cycle_ref, accepted_formal_plan)
 
         with self._database.write() as connection:
@@ -2787,6 +4506,454 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 ).first()
         return None if row is None else self._stage_request_from_row(row)
 
+    def ensure_reasoning_stage_request(
+        self,
+        *,
+        cycle_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        idempotency_key: str,
+    ) -> StageRunRequest:
+        """Freeze the exact completed upstream route for current Reasoning.
+
+        The caller supplies only the already accepted Question identity.  AE
+        rebuilds the route from its own StageCommit ledger and materializes any
+        route-implied ``Skipped`` positions itself.  This keeps a direct
+        NoViableCandidate or an upstream Exhausted fact from turning into a
+        caller-authored placeholder Plan/Bundle input.
+        """
+
+        _validate_idempotency_key(idempotency_key)
+        if self._authorization_verifier is None:
+            raise OwnerConflict("broad_research_authorization_verifier_unavailable")
+        self._authorization_verifier.verify_broad_research_authorization(
+            quest_ref=accepted_question.quest_ref
+        )
+        self._verify_cycle_question(cycle_ref, accepted_question)
+        epoch = self._current_stage_epoch(
+            cycle_ref, accepted_question.quest_ref, REASONING_STAGE
+        )
+        question_literature_revision = None
+        if self._question_literature_revision_verifier is not None:
+            question_literature_revision = (
+                self._question_literature_revision_verifier.query_current_question_literature_revision(
+                    accepted_question.question_ref
+                )
+            )
+            if question_literature_revision is not None:
+                self._question_literature_revision_verifier.verify_question_literature_revision(
+                    question_literature_revision
+                )
+        if self._reasoning_outcome_verifier is None:
+            raise OwnerConflict("quest_goal_revision_verifier_unavailable")
+        quest_goal_revision = (
+            self._reasoning_outcome_verifier.query_current_quest_goal_revision(
+                accepted_question.quest_ref
+            )
+        )
+        if quest_goal_revision is None:
+            raise OwnerConflict("quest_goal_revision_unavailable")
+        self._reasoning_outcome_verifier.verify_quest_goal_revision(
+            quest_goal_revision
+        )
+        reasoning_graph_context = (
+            self._reasoning_outcome_verifier.query_reasoning_research_context(
+                quest_ref=accepted_question.quest_ref,
+                question_ref=accepted_question.question_ref,
+            )
+        )
+        if reasoning_graph_context is None:
+            raise OwnerConflict("reasoning_research_context_unavailable")
+        self._reasoning_outcome_verifier.verify_reasoning_research_context(
+            reasoning_graph_context
+        )
+        command_kind = "ensure_reasoning_stage_request"
+
+        # Reject a globally reused key before AE creates the route-derived
+        # skipped facts that are part of this command's atomic result.
+        with self._database.read() as connection:
+            prior_command = connection.execute(
+                text(
+                    "SELECT command_kind, result_ref FROM ae_stage_commands "
+                    "WHERE idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        if prior_command is not None and prior_command.command_kind != command_kind:
+            raise OwnerConflict("idempotency_conflict")
+
+        result_ref: str | None = None
+        with self._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE advancement_engine_state SET revision = revision "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._assert_stage_head_current(
+                connection,
+                cycle_ref=cycle_ref,
+                quest_ref=accepted_question.quest_ref,
+                stage=REASONING_STAGE,
+                epoch=epoch,
+            )
+            derived_commits = self._ensure_reasoning_route_closure(
+                connection,
+                cycle_ref=cycle_ref,
+                quest_ref=accepted_question.quest_ref,
+                epoch=epoch,
+            )
+            evidence_reuse_closure = (
+                self._resolve_reasoning_plan_evidence_reuse(
+                    connection,
+                    cycle_ref=cycle_ref,
+                    epoch=epoch,
+                    accepted_question=accepted_question,
+                )
+            )
+            current_target_evidence_closure = (
+                self._resolve_reasoning_current_target_evidence(
+                    connection,
+                    cycle_ref=cycle_ref,
+                    epoch=epoch,
+                    quest_ref=accepted_question.quest_ref,
+                )
+            )
+            context_pack = _reasoning_context_pack_from_rows(
+                connection,
+                cycle_ref=cycle_ref,
+                epoch=epoch,
+                accepted_question=accepted_question,
+                question_literature_revision=question_literature_revision,
+                quest_goal_revision=quest_goal_revision,
+                reasoning_graph_context=reasoning_graph_context,
+                evidence_reuse_closure=evidence_reuse_closure,
+                current_target_evidence_closure=(
+                    current_target_evidence_closure
+                ),
+            )
+            context_pack_json = canonical_json(context_pack)
+            context_pack_hash = canonical_hash(context_pack)
+            request_input = {
+                "command": command_kind,
+                "cycle_ref": cycle_ref,
+                "stage": REASONING_STAGE,
+                "epoch": epoch,
+                "accepted_question": accepted_question.as_dict(),
+                "context_pack_hash": context_pack_hash,
+            }
+            request_hash = canonical_hash(request_input)
+            replay_ref = _ae_command_replay(
+                connection,
+                idempotency_key,
+                command_kind,
+                request_hash,
+            )
+            if replay_ref is not None:
+                result_ref = replay_ref
+            else:
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                        ":cycle_ref AND stage = 'reasoning' AND epoch = :epoch"
+                    ),
+                    {"cycle_ref": cycle_ref, "epoch": epoch},
+                ).first()
+                if existing is not None:
+                    if (
+                        existing.request_hash != request_hash
+                        or existing.context_pack_json != context_pack_json
+                    ):
+                        raise OwnerConflict("stage_run_request_conflict")
+                    _record_ae_command(
+                        connection,
+                        idempotency_key,
+                        command_kind,
+                        request_hash,
+                        existing.request_ref,
+                    )
+                    result_ref = str(existing.request_ref)
+                else:
+                    request_ref = new_ref("stage_request")
+                    context_pack_ref = new_ref("context_pack")
+                    receipt_ref = new_ref("ae_stage_request_receipt")
+                    bindings = {
+                        **_question_binding_columns(accepted_question),
+                        "cycle_ref": cycle_ref,
+                        "stage": REASONING_STAGE,
+                        "epoch": epoch,
+                        "context_pack_ref": context_pack_ref,
+                        "context_pack_hash": context_pack_hash,
+                    }
+                    receipt_hash = _receipt_hash(
+                        STAGE_REQUEST_RECEIPT_KIND,
+                        request_ref,
+                        bindings,
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO ae_stage_run_requests (request_ref, "
+                            "cycle_ref, stage, epoch, initialization_id, quest_ref, "
+                            "question_ref, content_ref, content_hash, schema_ref, "
+                            "content_receipt_ref, content_receipt_hash, "
+                            "question_receipt_ref, question_receipt_hash, "
+                            "context_pack_ref, context_pack_json, context_pack_hash, "
+                            "idempotency_key, request_hash, receipt_ref, "
+                            "receipt_hash, created_at) VALUES (:request_ref, "
+                            ":cycle_ref, :stage, :epoch, :initialization_id, "
+                            ":quest_ref, :question_ref, :content_ref, :content_hash, "
+                            ":schema_ref, :content_receipt_ref, "
+                            ":content_receipt_hash, :question_receipt_ref, "
+                            ":question_receipt_hash, :context_pack_ref, "
+                            ":context_pack_json, :context_pack_hash, "
+                            ":idempotency_key, :request_hash, :receipt_ref, "
+                            ":receipt_hash, :created_at)"
+                        ),
+                        {
+                            **bindings,
+                            "request_ref": request_ref,
+                            "context_pack_json": context_pack_json,
+                            "idempotency_key": idempotency_key,
+                            "request_hash": request_hash,
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "created_at": time.time(),
+                        },
+                    )
+                    _record_ae_command(
+                        connection,
+                        idempotency_key,
+                        command_kind,
+                        request_hash,
+                        request_ref,
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE advancement_engine_state SET revision = "
+                            "revision + 1, stage_request_count = "
+                            "stage_request_count + 1, stage_commit_count = "
+                            "stage_commit_count + :derived_commits WHERE "
+                            "singleton = 'owner'"
+                        ),
+                        {"derived_commits": derived_commits},
+                    )
+                    self._feed.record(
+                        connection,
+                        "advancement_engine.stage_run_requested",
+                        {
+                            "request_ref": request_ref,
+                            "cycle_ref": cycle_ref,
+                            "stage": REASONING_STAGE,
+                            "epoch": epoch,
+                            "context_pack_ref": context_pack_ref,
+                            "context_pack_hash": context_pack_hash,
+                            "route_closure_refs": [
+                                item["commit_ref"]
+                                for item in cast(
+                                    list[dict[str, object]],
+                                    context_pack["upstream_stage_closure"],
+                                )
+                            ],
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+                    result_ref = request_ref
+        if result_ref is None:
+            raise OwnerConflict("stage_command_result_missing")
+        return self._query_stage_request_ref(result_ref)
+
+    def query_reasoning_stage_request(
+        self, cycle_ref: str
+    ) -> StageRunRequest | None:
+        with self._database.read() as connection:
+            head = connection.execute(
+                text(
+                    "SELECT * FROM ae_foreground_heads WHERE cycle_ref = :cycle_ref"
+                ),
+                {"cycle_ref": cycle_ref},
+            ).first()
+            if (
+                head is not None
+                and head.status == "active"
+                and head.stage == REASONING_STAGE
+            ):
+                row = connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                        ":cycle_ref AND stage = 'reasoning' AND epoch = :epoch"
+                    ),
+                    {"cycle_ref": cycle_ref, "epoch": int(head.epoch)},
+                ).first()
+            else:
+                row = connection.execute(
+                    text(
+                        "SELECT requests.* FROM ae_stage_run_requests requests JOIN "
+                        "ae_stage_commits commits ON commits.request_ref = "
+                        "requests.request_ref WHERE requests.cycle_ref = :cycle_ref "
+                        "AND requests.stage = 'reasoning' ORDER BY requests.epoch "
+                        "DESC LIMIT 1"
+                    ),
+                    {"cycle_ref": cycle_ref},
+                ).first()
+        return None if row is None else self._stage_request_from_row(row)
+
+    def _ensure_reasoning_route_closure(
+        self,
+        connection,
+        *,
+        cycle_ref: str,
+        quest_ref: str,
+        epoch: int,
+    ) -> int:
+        rows = _reasoning_route_rows_for_epoch(
+            connection,
+            cycle_ref=cycle_ref,
+            epoch=epoch,
+        )
+        by_stage = {str(row.stage): row for row in rows}
+        if rows and all(int(row.epoch) != epoch for row in rows):
+            if set(by_stage) != {IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE}:
+                raise OwnerConflict("reasoning_upstream_closure_incomplete")
+            _validate_reasoning_route_rows(by_stage)
+            return 0
+        idea = by_stage.get(IDEA_STAGE)
+        if idea is None:
+            raise OwnerConflict("reasoning_upstream_closure_incomplete")
+
+        source = None
+        basis_kind = None
+        if (
+            idea.disposition == COMPLETED_DISPOSITION
+            and idea.outcome_kind == NO_VIABLE_CANDIDATE_OUTCOME_KIND
+        ):
+            source = idea
+            basis_kind = "upstream_no_viable_candidate_stage_commit"
+        else:
+            for stage in (IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE):
+                candidate = by_stage.get(stage)
+                if candidate is not None and candidate.disposition == EXHAUSTED_DISPOSITION:
+                    source = candidate
+                    basis_kind = "upstream_stage_exhausted_commit"
+                    break
+
+        inserted = 0
+        if source is not None:
+            source_index = STAGES.index(str(source.stage))
+            source_receipt = AcceptanceReceipt(
+                issuer=AE_OWNER,
+                kind=STAGE_COMMIT_RECEIPT_KIND,
+                receipt_ref=str(source.receipt_ref),
+                subject_ref=str(source.commit_ref),
+                payload_hash=str(source.receipt_hash),
+            )
+            if source.receipt_hash != _stage_commit_receipt_hash(source):
+                raise OwnerConflict("reasoning_upstream_closure_invalid")
+            for stage in STAGES[source_index + 1 : STAGES.index(REASONING_STAGE)]:
+                existing = by_stage.get(stage)
+                if existing is not None:
+                    if not _is_exact_derived_skip(
+                        existing,
+                        source_commit_ref=str(source.commit_ref),
+                        basis_kind=cast(str, basis_kind),
+                        source_receipt=source_receipt,
+                    ):
+                        raise OwnerConflict("reasoning_upstream_closure_conflict")
+                    continue
+                commit_ref = "stage_commit_" + canonical_hash(
+                    {
+                        "kind": "reasoning_route_skip",
+                        "source_commit_ref": source.commit_ref,
+                        "stage": stage,
+                    }
+                )[:32]
+                receipt_ref = "ae_stage_commit_receipt_" + canonical_hash(
+                    {"commit_ref": commit_ref}
+                )[:32]
+                command_key = "reasoning-route-skip-" + canonical_hash(
+                    {"cycle_ref": cycle_ref, "epoch": epoch, "stage": stage}
+                )[:48]
+                bindings = {
+                    "request_ref": None,
+                    "cycle_ref": cycle_ref,
+                    "stage": stage,
+                    "epoch": epoch,
+                    "disposition": SKIPPED_DISPOSITION,
+                    "basis_kind": basis_kind,
+                    "basis_ref": source.commit_ref,
+                    "basis_receipt_issuer": source_receipt.issuer,
+                    "basis_receipt_kind": source_receipt.kind,
+                    "basis_receipt_subject_ref": source_receipt.subject_ref,
+                    "basis_receipt_ref": source_receipt.receipt_ref,
+                    "basis_receipt_hash": source_receipt.payload_hash,
+                }
+                command_hash = canonical_hash(
+                    {
+                        "command": "ensure_reasoning_route_skip",
+                        **bindings,
+                    }
+                )
+                receipt_hash = _receipt_hash(
+                    STAGE_COMMIT_RECEIPT_KIND,
+                    commit_ref,
+                    bindings,
+                )
+                now = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_stage_commits (commit_ref, request_ref, "
+                        "cycle_ref, stage, epoch, run_ref, outcome_ref, "
+                        "outcome_kind, disposition, run_completion_receipt_ref, "
+                        "run_completion_receipt_hash, outcome_receipt_ref, "
+                        "outcome_receipt_hash, closure_json, closure_hash, "
+                        "basis_kind, basis_ref, basis_receipt_issuer, "
+                        "basis_receipt_kind, basis_receipt_subject_ref, "
+                        "basis_receipt_ref, basis_receipt_hash, idempotency_key, "
+                        "request_hash, receipt_ref, receipt_hash, committed_at) "
+                        "VALUES (:commit_ref, NULL, :cycle_ref, :stage, :epoch, "
+                        "NULL, NULL, NULL, 'skipped', NULL, NULL, NULL, NULL, "
+                        "NULL, NULL, :basis_kind, :basis_ref, "
+                        ":basis_receipt_issuer, :basis_receipt_kind, "
+                        ":basis_receipt_subject_ref, :basis_receipt_ref, "
+                        ":basis_receipt_hash, :idempotency_key, :request_hash, "
+                        ":receipt_ref, :receipt_hash, :committed_at)"
+                    ),
+                    {
+                        **bindings,
+                        "commit_ref": commit_ref,
+                        "idempotency_key": command_key,
+                        "request_hash": command_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "committed_at": now,
+                    },
+                )
+                self._feed.record(
+                    connection,
+                    "advancement_engine.stage_committed",
+                    {
+                        "commit_ref": commit_ref,
+                        "request_ref": None,
+                        "disposition": SKIPPED_DISPOSITION,
+                        "basis_kind": basis_kind,
+                        "basis_ref": source.commit_ref,
+                        "stage": stage,
+                        "epoch": epoch,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+                by_stage[stage] = connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_commits WHERE commit_ref = "
+                        ":commit_ref"
+                    ),
+                    {"commit_ref": commit_ref},
+                ).one()
+                inserted += 1
+
+        if set(by_stage) != {IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE}:
+            raise OwnerConflict("reasoning_upstream_closure_incomplete")
+        _validate_reasoning_route_rows(by_stage)
+        return inserted
+
     def _verify_bundle_formal_plan(
         self, cycle_ref: str, binding: AcceptedFormalPlanBinding
     ) -> None:
@@ -2804,8 +4971,18 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         if row is None:
             raise OwnerConflict("bundle_formal_plan_stage_commit_invalid")
         commit = self._stage_commit_from_row(row)
+        reusable = False
+        if commit.cycle_ref != cycle_ref:
+            successor = self.query_reasoning_successor_context(cycle_ref)
+            reusable = bool(
+                successor is not None
+                and successor.get("entry_stage") == BUNDLE_STAGE
+                and successor.get("source_cycle_ref") == commit.cycle_ref
+                and successor.get("accepted_formal_plan_binding")
+                == binding.as_dict()
+            )
         if (
-            commit.cycle_ref != cycle_ref
+            (commit.cycle_ref != cycle_ref and not reusable)
             or commit.outcome_ref != binding.formal_plan_ref
             or commit.outcome_receipt != binding.formal_plan_receipt
             or commit.receipt != binding.stage_commit_receipt
@@ -2844,7 +5021,12 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 require_current=False,
             )
             self._verify_context_literature(
-                requested.accepted_question, requested.context_pack
+                requested.accepted_question,
+                requested.context_pack,
+                require_current=False,
+            )
+            self._verify_idea_successor_context(
+                requested.cycle_ref, requested.context_pack
             )
         elif requested.stage == PLAN_STAGE and requested.accepted_idea_set is not None:
             self._verify_plan_idea_set(
@@ -2877,12 +5059,24 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                     accepted_formal_plan_binding=(
                         requested.accepted_formal_plan.as_dict()
                     ),
+                    accepted_idea_set_binding=(
+                        None
+                        if requested.accepted_idea_set is None
+                        else requested.accepted_idea_set.as_dict()
+                    ),
                 )
             except BundleContractError as error:
                 raise OwnerConflict(str(error)) from error
+            if requested.accepted_idea_set is not None:
+                self._verify_plan_idea_set(
+                    requested.cycle_ref,
+                    requested.accepted_idea_set,
+                )
             self._verify_bundle_formal_plan(
                 requested.cycle_ref, requested.accepted_formal_plan
             )
+        elif requested.stage == REASONING_STAGE:
+            self._verify_reasoning_request_closure(requested)
         else:
             raise OwnerConflict("stage_run_request_invalid")
         self._stage_request_verifier.verify_stage_run_request(
@@ -2894,6 +5088,226 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             receipt=requested.receipt,
         )
         return requested
+
+    def _verify_reasoning_request_closure(
+        self, requested: StageRunRequest
+    ) -> None:
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_commits WHERE cycle_ref = :cycle_ref "
+                    "AND epoch = :epoch AND stage IN ('idea', 'plan', 'bundle')"
+                ),
+                {"cycle_ref": requested.cycle_ref, "epoch": requested.epoch},
+            ).all()
+            literature_input = requested.context_pack.get(
+                "question_literature_input"
+            )
+            frozen_revision = (
+                literature_input.get("binding")
+                if isinstance(literature_input, dict)
+                and literature_input.get("kind") == "revision"
+                else None
+            )
+            if frozen_revision is not None and not isinstance(
+                frozen_revision, dict
+            ):
+                raise OwnerConflict("reasoning_literature_binding_invalid")
+            evidence_reuse_closure = (
+                self._resolve_reasoning_plan_evidence_reuse(
+                    connection,
+                    cycle_ref=requested.cycle_ref,
+                    epoch=requested.epoch,
+                    accepted_question=requested.accepted_question,
+                )
+            )
+            current_target_evidence_closure = (
+                self._resolve_reasoning_current_target_evidence(
+                    connection,
+                    cycle_ref=requested.cycle_ref,
+                    epoch=requested.epoch,
+                    quest_ref=requested.accepted_question.quest_ref,
+                )
+            )
+            rebuilt = _reasoning_context_pack_from_rows(
+                connection,
+                cycle_ref=requested.cycle_ref,
+                epoch=requested.epoch,
+                accepted_question=requested.accepted_question,
+                question_literature_revision=cast(
+                    dict[str, object] | None, frozen_revision
+                ),
+                quest_goal_revision=cast(
+                    dict[str, object],
+                    requested.context_pack["research_context"],
+                )["quest_goal_revision"],
+                reasoning_graph_context=cast(
+                    dict[str, object],
+                    cast(
+                        dict[str, object],
+                        requested.context_pack["research_context"],
+                    )["graph_binding"],
+                ),
+                evidence_reuse_closure=evidence_reuse_closure,
+                current_target_evidence_closure=(
+                    current_target_evidence_closure
+                ),
+            )
+        if rebuilt != requested.context_pack:
+            raise OwnerConflict("reasoning_upstream_closure_stale")
+        for row in rows:
+            self._stage_commit_from_row(row)
+
+        if frozen_revision is not None:
+            if self._question_literature_revision_verifier is None:
+                raise OwnerConflict(
+                    "question_literature_revision_verifier_unavailable"
+                )
+            self._question_literature_revision_verifier.verify_question_literature_revision(
+                cast(dict[str, object], frozen_revision)
+            )
+        research_context = requested.context_pack.get("research_context")
+        goal_revision = (
+            research_context.get("quest_goal_revision")
+            if isinstance(research_context, dict)
+            else None
+        )
+        if (
+            not isinstance(goal_revision, dict)
+            or self._reasoning_outcome_verifier is None
+        ):
+            raise OwnerConflict("quest_goal_revision_verifier_unavailable")
+        self._reasoning_outcome_verifier.verify_quest_goal_revision(goal_revision)
+        graph_binding = (
+            research_context.get("graph_binding")
+            if isinstance(research_context, dict)
+            else None
+        )
+        if not isinstance(graph_binding, dict):
+            raise OwnerConflict("reasoning_research_context_invalid")
+        self._reasoning_outcome_verifier.verify_reasoning_research_context(
+            graph_binding
+        )
+
+    def _resolve_reasoning_plan_evidence_reuse(
+        self,
+        connection,
+        *,
+        cycle_ref: str,
+        epoch: int,
+        accepted_question: AcceptedQuestionBinding,
+    ) -> tuple[EvidenceReuseLeaf, ...]:
+        plan_row = connection.execute(
+            text(
+                "SELECT * FROM ae_stage_commits WHERE cycle_ref = :cycle_ref "
+                "AND stage = 'plan' AND epoch = :epoch"
+            ),
+            {"cycle_ref": cycle_ref, "epoch": epoch},
+        ).first()
+        if plan_row is None or plan_row.disposition != COMPLETED_DISPOSITION:
+            return ()
+        bundle_request = connection.execute(
+            text(
+                "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                ":cycle_ref AND stage = 'bundle' AND epoch = :epoch"
+            ),
+            {"cycle_ref": cycle_ref, "epoch": epoch},
+        ).first()
+        if bundle_request is None:
+            raise OwnerConflict("reasoning_plan_evidence_binding_missing")
+        bundle_context, bundle_question = _verify_stage_request_integrity(
+            bundle_request
+        )
+        if bundle_question != accepted_question:
+            raise OwnerConflict("reasoning_question_binding_mismatch")
+        formal_plan = _formal_plan_binding_from_context(bundle_context)
+        evidence_reuse_set = formal_plan.plan_document.get(
+            "evidence_reuse_set"
+        )
+        if not isinstance(evidence_reuse_set, list):
+            raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
+        if not evidence_reuse_set:
+            return ()
+        verifier = self._evidence_verifier
+        resolver = getattr(
+            verifier, "resolve_plan_evidence_reuse_leaves", None
+        )
+        if not callable(resolver):
+            raise OwnerConflict(
+                "target_commit_evidence_reuse_resolver_unavailable"
+            )
+        leaves = resolver(
+            quest_ref=accepted_question.quest_ref,
+            accepted_formal_plan=formal_plan,
+        )
+        if not isinstance(leaves, tuple) or not all(
+            type(leaf) is EvidenceReuseLeaf for leaf in leaves
+        ):
+            raise OwnerConflict("reasoning_plan_evidence_closure_invalid")
+        return leaves
+
+    def _resolve_reasoning_current_target_evidence(
+        self,
+        connection,
+        *,
+        cycle_ref: str,
+        epoch: int,
+        quest_ref: str,
+    ) -> tuple[EvidenceReuseLeaf, ...]:
+        # Consume the same exact immutable route closure used to build the
+        # ContextPack.  A restored foreground may intentionally reuse its one
+        # prior complete route; resolving an unrelated latest Bundle is never
+        # allowed.
+        bundle_row = next(
+            (
+                row
+                for row in _reasoning_route_rows_for_epoch(
+                    connection,
+                    cycle_ref=cycle_ref,
+                    epoch=epoch,
+                )
+                if row.stage == BUNDLE_STAGE
+            ),
+            None,
+        )
+        if bundle_row is None:
+            raise OwnerConflict("reasoning_upstream_closure_incomplete")
+        bundle = self._stage_commit_from_row(bundle_row)
+        if bundle.disposition != COMPLETED_DISPOSITION:
+            return ()
+        closure = bundle.closure
+        measurements = (
+            closure.get("accepted_measurement_closures")
+            if isinstance(closure, dict)
+            else None
+        )
+        if not isinstance(measurements, list):
+            raise OwnerConflict("reasoning_target_closure_invalid")
+        target_commit_refs = tuple(
+            str(value["target_commit_ref"])
+            for value in measurements
+            if isinstance(value, dict)
+            and isinstance(value.get("target_commit_ref"), str)
+        )
+        if len(target_commit_refs) != len(measurements):
+            raise OwnerConflict("reasoning_target_closure_invalid")
+        if not target_commit_refs:
+            return ()
+        if self._evidence_verifier is None:
+            raise OwnerConflict("target_commit_evidence_authority_unavailable")
+        leaves = self._evidence_verifier.resolve_reasoning_target_evidence_leaves(
+            quest_ref=quest_ref,
+            target_commit_refs=target_commit_refs,
+        )
+        if (
+            not isinstance(leaves, tuple)
+            or not all(type(leaf) is EvidenceReuseLeaf for leaf in leaves)
+            or {leaf.target_commit_ref for leaf in leaves}
+            != set(target_commit_refs)
+            or any(leaf.evidence_use_hashes for leaf in leaves)
+        ):
+            raise OwnerConflict("reasoning_target_evidence_closure_invalid")
+        return leaves
 
     def _verify_plan_idea_set(
         self,
@@ -2911,8 +5325,18 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         if row is None:
             raise OwnerConflict("plan_idea_set_stage_commit_invalid")
         commit = self._stage_commit_from_row(row)
+        reusable = False
+        if commit.cycle_ref != cycle_ref:
+            successor = self.query_reasoning_successor_context(cycle_ref)
+            reusable = bool(
+                successor is not None
+                and successor.get("entry_stage") in {PLAN_STAGE, BUNDLE_STAGE}
+                and successor.get("source_cycle_ref") == commit.cycle_ref
+                and successor.get("accepted_idea_set_binding")
+                == binding.as_dict()
+            )
         if (
-            commit.cycle_ref != cycle_ref
+            (commit.cycle_ref != cycle_ref and not reusable)
             or commit.stage != IDEA_STAGE
             or commit.outcome_kind != IDEA_SET_OUTCOME_KIND
             or commit.outcome_ref != binding.outcome_ref
@@ -2970,12 +5394,29 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         self,
         accepted_question: AcceptedQuestionBinding,
         context_pack: dict[str, object],
+        *,
+        require_current: bool,
     ) -> None:
         try:
             binding = literature_binding(context_pack)
         except IdeaContractError as error:
             raise OwnerConflict(str(error)) from error
         if binding is None:
+            return
+        if context_pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V3_REF:
+            verifier = self._question_literature_revision_verifier
+            if verifier is None or binding.get("question_ref") != (
+                accepted_question.question_ref
+            ):
+                raise OwnerConflict("question_literature_revision_invalid")
+            verifier.verify_question_literature_revision(binding)
+            if require_current and (
+                verifier.query_current_question_literature_revision(
+                    accepted_question.question_ref
+                )
+                != binding
+            ):
+                raise OwnerConflict("question_literature_revision_stale")
             return
         if self._literature_snapshot_verifier is None:
             raise OwnerConflict("literature_snapshot_verifier_unavailable")
@@ -2998,6 +5439,23 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             draft_hash=str(binding["draft_hash"]),
             receipt=receipt,
         )
+
+    def _verify_idea_successor_context(
+        self, cycle_ref: str, context_pack: dict[str, object]
+    ) -> None:
+        successor = self.query_reasoning_successor_context(cycle_ref)
+        schema_ref = context_pack.get("schema_ref")
+        if successor is None:
+            if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V3_REF:
+                raise OwnerConflict("reasoning_successor_context_invalid")
+            return
+        if (
+            successor.get("entry_stage") != IDEA_STAGE
+            or schema_ref != IDEA_CONTEXT_PACK_SCHEMA_V3_REF
+            or context_pack.get("prior_accepted_bindings")
+            != successor.get("prior_accepted_bindings")
+        ):
+            raise OwnerConflict("reasoning_successor_context_invalid")
 
     def _verify_cycle_question(
         self, cycle_ref: str, accepted_question: AcceptedQuestionBinding
@@ -3775,6 +6233,274 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 text(
                     "SELECT * FROM ae_stage_commits WHERE request_ref = "
                     ":request_ref AND stage = 'plan'"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            return None
+        return self._stage_commit_from_row(row)
+
+    def commit_reasoning_stage(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        outcome_ref: str,
+        run_completion_receipt: AcceptanceReceipt,
+        outcome_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> StageCommit:
+        """Commit Reasoning only after RG acceptance and AR completion."""
+
+        _validate_idempotency_key(idempotency_key)
+        request = self._query_stage_request_by_ref(request_ref)
+        if request.stage != REASONING_STAGE:
+            raise OwnerConflict("reasoning_stage_request_invalid")
+        if self.query_reasoning_stage_commit(request_ref) is None:
+            self._assert_stage_request_current(request)
+        verifier = self._reasoning_outcome_verifier
+        if self._run_completion_verifier is None or verifier is None:
+            raise OwnerConflict("reasoning_stage_verifier_unavailable")
+        self._run_completion_verifier.verify_run_completion_receipt(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=None,
+            outcome_ref=outcome_ref,
+            receipt=run_completion_receipt,
+        )
+        verifier.verify_reasoning_outcome_decision(
+            request_ref=request_ref,
+            submission_ref=None,
+            decision="accepted",
+            outcome_ref=outcome_ref,
+            receipt=outcome_receipt,
+        )
+        closure = verifier.query_reasoning_transition_binding(
+            outcome_ref=outcome_ref,
+            receipt=outcome_receipt,
+        )
+        if set(closure) != {
+            "scientific_disposition",
+            "scientific_outcome_hash",
+            "transition_kind",
+            "transition_ref",
+            "transition_hash",
+            "transition",
+        } or closure.get("scientific_disposition") not in {
+            "affirmed",
+            "denied",
+            "uncertain",
+            "insufficient_evidence",
+        }:
+            raise OwnerConflict("reasoning_transition_binding_invalid")
+        closure_json = canonical_json(closure)
+        closure_hash = canonical_hash(closure)
+        command_kind = "commit_reasoning_stage"
+        command_hash = canonical_hash(
+            {
+                "command": command_kind,
+                "request_ref": request_ref,
+                "run_ref": run_ref,
+                "outcome_ref": outcome_ref,
+                "outcome_kind": REASONING_OUTCOME_KIND,
+                "disposition": COMPLETED_DISPOSITION,
+                "closure_hash": closure_hash,
+                "run_completion_receipt": (
+                    run_completion_receipt.as_public_dict()
+                ),
+                "outcome_receipt": outcome_receipt.as_public_dict(),
+            }
+        )
+        _query_ae_command(
+            self._database,
+            idempotency_key,
+            command_kind,
+            command_hash,
+        )
+        with self._database.write() as connection:
+            replay_ref = _ae_command_replay(
+                connection,
+                idempotency_key,
+                command_kind,
+                command_hash,
+            )
+            if replay_ref is not None:
+                replay = connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_commits WHERE commit_ref = "
+                        ":commit_ref"
+                    ),
+                    {"commit_ref": replay_ref},
+                ).first()
+                if replay is None:
+                    raise OwnerConflict("stage_command_result_missing")
+                return self._stage_commit_from_row(replay)
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_commits WHERE request_ref = "
+                    ":request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+            if existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("stage_commit_conflict")
+                _record_ae_command(
+                    connection,
+                    idempotency_key,
+                    command_kind,
+                    command_hash,
+                    existing.commit_ref,
+                )
+                return self._stage_commit_from_row(existing)
+
+            commit_ref = new_ref("stage_commit")
+            receipt_ref = new_ref("ae_stage_commit_receipt")
+            bindings = {
+                "request_ref": request_ref,
+                "cycle_ref": request.cycle_ref,
+                "stage": REASONING_STAGE,
+                "epoch": request.epoch,
+                "run_ref": run_ref,
+                "outcome_ref": outcome_ref,
+                "outcome_kind": REASONING_OUTCOME_KIND,
+                "disposition": COMPLETED_DISPOSITION,
+                "run_completion_receipt_ref": (
+                    run_completion_receipt.receipt_ref
+                ),
+                "run_completion_receipt_hash": (
+                    run_completion_receipt.payload_hash
+                ),
+                "outcome_receipt_ref": outcome_receipt.receipt_ref,
+                "outcome_receipt_hash": outcome_receipt.payload_hash,
+                "closure_hash": closure_hash,
+            }
+            receipt_hash = _receipt_hash(
+                STAGE_COMMIT_RECEIPT_KIND,
+                commit_ref,
+                bindings,
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO ae_stage_commits (commit_ref, request_ref, "
+                    "cycle_ref, stage, epoch, run_ref, outcome_ref, outcome_kind, "
+                    "disposition, run_completion_receipt_ref, "
+                    "run_completion_receipt_hash, outcome_receipt_ref, "
+                    "outcome_receipt_hash, closure_json, closure_hash, "
+                    "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                    "committed_at) VALUES (:commit_ref, :request_ref, "
+                    ":cycle_ref, :stage, :epoch, :run_ref, :outcome_ref, "
+                    ":outcome_kind, :disposition, :run_completion_receipt_ref, "
+                    ":run_completion_receipt_hash, :outcome_receipt_ref, "
+                    ":outcome_receipt_hash, :closure_json, :closure_hash, "
+                    ":idempotency_key, :request_hash, :receipt_ref, "
+                    ":receipt_hash, :committed_at)"
+                ),
+                {
+                    **bindings,
+                    "commit_ref": commit_ref,
+                    "closure_json": closure_json,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": command_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "committed_at": time.time(),
+                },
+            )
+            _record_ae_command(
+                connection,
+                idempotency_key,
+                command_kind,
+                command_hash,
+                commit_ref,
+            )
+            successor_skip_count = 0
+            if closure["transition_kind"] == "next_cycle_proposal":
+                source_commit = StageCommit(
+                    commit_ref=commit_ref,
+                    request_ref=request_ref,
+                    cycle_ref=request.cycle_ref,
+                    stage=REASONING_STAGE,
+                    epoch=request.epoch,
+                    run_ref=run_ref,
+                    outcome_ref=outcome_ref,
+                    outcome_kind=REASONING_OUTCOME_KIND,
+                    disposition=COMPLETED_DISPOSITION,
+                    run_completion_receipt=run_completion_receipt,
+                    outcome_receipt=outcome_receipt,
+                    basis_kind=None,
+                    basis_ref=None,
+                    basis_receipt=None,
+                    receipt=AcceptanceReceipt(
+                        issuer=AE_OWNER,
+                        kind=STAGE_COMMIT_RECEIPT_KIND,
+                        receipt_ref=receipt_ref,
+                        subject_ref=commit_ref,
+                        payload_hash=receipt_hash,
+                    ),
+                    closure=closure,
+                )
+                successor_skip_count = self._activate_reasoning_successor(
+                    connection,
+                    request=request,
+                    outcome_ref=outcome_ref,
+                    outcome_receipt=outcome_receipt,
+                    transition=cast(dict[str, object], closure["transition"]),
+                    source_commit=source_commit,
+                )
+            elif closure["transition_kind"] != "candidate_completion":
+                raise OwnerConflict("reasoning_transition_binding_invalid")
+            connection.execute(
+                text(
+                    "UPDATE advancement_engine_state SET revision = revision + "
+                    "1, stage_commit_count = stage_commit_count + "
+                    ":stage_commit_delta, "
+                    "foreground_cycle_count = foreground_cycle_count + "
+                    ":successor_delta WHERE "
+                    "singleton = 'owner'"
+                ),
+                {
+                    "stage_commit_delta": 1 + successor_skip_count,
+                    "successor_delta": (
+                        1
+                        if closure["transition_kind"] == "next_cycle_proposal"
+                        else 0
+                    )
+                },
+            )
+            self._feed.record(
+                connection,
+                "advancement_engine.stage_committed",
+                {
+                    "commit_ref": commit_ref,
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "outcome_ref": outcome_ref,
+                    "outcome_kind": REASONING_OUTCOME_KIND,
+                    "disposition": COMPLETED_DISPOSITION,
+                    "scientific_disposition": closure[
+                        "scientific_disposition"
+                    ],
+                    "transition_kind": closure["transition_kind"],
+                    "transition_ref": closure["transition_ref"],
+                    "stage": REASONING_STAGE,
+                    "epoch": request.epoch,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        committed = self.query_reasoning_stage_commit(request_ref)
+        if committed is None:
+            raise OwnerConflict("stage_commit_missing_after_commit")
+        return committed
+
+    def query_reasoning_stage_commit(
+        self, request_ref: str
+    ) -> StageCommit | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_commits WHERE request_ref = "
+                    ":request_ref AND stage = 'reasoning'"
                 ),
                 {"request_ref": request_ref},
             ).first()
@@ -5266,6 +7992,450 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             ),
         )
 
+    def _activate_reasoning_successor(
+        self,
+        connection,
+        *,
+        request: StageRunRequest,
+        outcome_ref: str,
+        outcome_receipt: AcceptanceReceipt,
+        transition: dict[str, object],
+        source_commit: StageCommit,
+    ) -> int:
+        target_question_ref = _required_mapping_ref(
+            transition, "target_question_ref", "reasoning_next_cycle_invalid"
+        )
+        verifier = self._reasoning_outcome_verifier
+        if verifier is None:
+            raise OwnerConflict("reasoning_next_cycle_target_verifier_unavailable")
+        target_document = verifier.query_reasoning_next_cycle_target(
+            outcome_ref=outcome_ref, receipt=outcome_receipt
+        )
+        if not isinstance(target_document, dict):
+            raise OwnerConflict("reasoning_next_cycle_target_invalid")
+        raw_binding = target_document.get("accepted_question_binding")
+        if not isinstance(raw_binding, dict):
+            raise OwnerConflict("reasoning_next_cycle_target_invalid")
+        try:
+            target = AcceptedQuestionBinding(
+                initialization_id=str(raw_binding["initialization_id"]),
+                quest_ref=str(raw_binding["quest_ref"]),
+                question_ref=str(raw_binding["question_ref"]),
+                content_ref=str(raw_binding["content_ref"]),
+                content_hash=str(raw_binding["content_hash"]),
+                schema_ref=str(raw_binding["schema_ref"]),
+                content_receipt=_receipt_from_public(
+                    raw_binding["content_receipt"]
+                ),
+                question_receipt=_receipt_from_public(
+                    raw_binding["question_receipt"]
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise OwnerConflict("reasoning_next_cycle_target_invalid") from error
+        if (
+            target.question_ref != target_question_ref
+            or target.quest_ref != request.accepted_question.quest_ref
+            or (
+                target_question_ref == request.accepted_question.question_ref
+                and target != request.accepted_question
+            )
+        ):
+            raise OwnerConflict("reasoning_next_cycle_target_invalid")
+        entry_stage, typed_skip = _validated_autonomous_successor_route(
+            target_document,
+            outcome_ref=outcome_ref,
+        )
+        accepted_idea_set = None
+        accepted_formal_plan = None
+        if entry_stage in {PLAN_STAGE, BUNDLE_STAGE}:
+            accepted_idea_set, accepted_formal_plan = _successor_asset_bindings(
+                target_document,
+                entry_stage=entry_stage,
+            )
+        if self._accepted_question_verifier is None:
+            raise OwnerConflict("accepted_question_verifier_unavailable")
+        self._accepted_question_verifier.verify_accepted_question_binding(target)
+
+        quest_ref = request.accepted_question.quest_ref
+        now = time.time()
+        head = connection.execute(
+            text(
+                "SELECT * FROM ae_foreground_heads WHERE quest_ref = :quest_ref"
+            ),
+            {"quest_ref": quest_ref},
+        ).first()
+        grant = connection.execute(
+            text(
+                "SELECT * FROM ae_foreground_grants WHERE quest_ref = :quest_ref "
+                "AND cycle_ref = :cycle_ref AND epoch = :epoch AND status = "
+                "'active'"
+            ),
+            {
+                "quest_ref": quest_ref,
+                "cycle_ref": request.cycle_ref,
+                "epoch": request.epoch,
+            },
+        ).first()
+        if (
+            head is None
+            or head.cycle_ref != request.cycle_ref
+            or head.stage != REASONING_STAGE
+            or int(head.epoch) != request.epoch
+            or head.status != "active"
+            or grant is None
+        ):
+            raise OwnerConflict("reasoning_next_cycle_foreground_stale")
+        next_epoch = request.epoch + 1
+        next_cycle_ref = "cycle_" + canonical_hash(
+            {
+                "source_cycle_ref": request.cycle_ref,
+                "source_request_ref": request.request_ref,
+                "outcome_ref": outcome_ref,
+                "target_question_ref": target.question_ref,
+                "entry_stage": entry_stage,
+            }
+        )[:32]
+        idea_context_pack = self._freeze_reasoning_successor_idea_context(
+            cycle_ref=next_cycle_ref,
+            accepted_question=target,
+            source_commit=source_commit,
+        )
+        idea_context_pack_json = (
+            None if idea_context_pack is None else canonical_json(idea_context_pack)
+        )
+        idea_context_pack_hash = (
+            None if idea_context_pack is None else canonical_hash(idea_context_pack)
+        )
+        connection.execute(
+            text(
+                "INSERT INTO ae_cycles (cycle_ref, quest_ref, question_ref, "
+                "question_receipt_ref, question_receipt_hash, stage, status, "
+                "predecessor_cycle_ref, idea_context_pack_json, "
+                "idea_context_pack_hash, created_at, updated_at) VALUES "
+                "(:cycle_ref, :quest_ref, "
+                ":question_ref, :question_receipt_ref, :question_receipt_hash, "
+                ":stage, 'ongoing', :predecessor_cycle_ref, "
+                ":idea_context_pack_json, :idea_context_pack_hash, :now, :now)"
+            ),
+            {
+                "cycle_ref": next_cycle_ref,
+                "quest_ref": quest_ref,
+                "question_ref": target.question_ref,
+                "question_receipt_ref": target.question_receipt.receipt_ref,
+                "question_receipt_hash": target.question_receipt.payload_hash,
+                "stage": entry_stage,
+                "predecessor_cycle_ref": request.cycle_ref,
+                "idea_context_pack_json": idea_context_pack_json,
+                "idea_context_pack_hash": idea_context_pack_hash,
+                "now": now,
+            },
+        )
+        successor_skip_count = self._insert_autonomous_successor_skips(
+            connection,
+            cycle_ref=next_cycle_ref,
+            epoch=next_epoch,
+            entry_stage=entry_stage,
+            typed_skip=typed_skip,
+            outcome_ref=outcome_ref,
+            outcome_receipt=outcome_receipt,
+            accepted_idea_set=accepted_idea_set,
+            accepted_formal_plan=accepted_formal_plan,
+            committed_at=now,
+        )
+        completed = connection.execute(
+            text(
+                "UPDATE ae_cycles SET status = 'completed', successor_cycle_ref "
+                "= :successor_cycle_ref, updated_at = :now WHERE cycle_ref = "
+                ":cycle_ref AND status = 'ongoing' AND successor_cycle_ref IS NULL"
+            ),
+            {
+                "now": now,
+                "cycle_ref": request.cycle_ref,
+                "successor_cycle_ref": next_cycle_ref,
+            },
+        )
+        if completed.rowcount != 1:
+            raise OwnerConflict("reasoning_next_cycle_foreground_stale")
+        revoked = connection.execute(
+            text(
+                "UPDATE ae_foreground_grants SET status = 'completed', revoked_at "
+                "= :now WHERE grant_ref = :grant_ref AND status = 'active'"
+            ),
+            {"now": now, "grant_ref": grant.grant_ref},
+        )
+        if revoked.rowcount != 1:
+            raise OwnerConflict("reasoning_next_cycle_foreground_stale")
+        connection.execute(
+            text(
+                "INSERT INTO ae_foreground_grants (grant_ref, quest_ref, "
+                "cycle_ref, question_ref, stage, epoch, status, "
+                "predecessor_grant_ref, safe_point_ref, granted_at, revoked_at) "
+                "VALUES (:grant_ref, :quest_ref, :cycle_ref, :question_ref, "
+                ":stage, :epoch, 'active', :predecessor, NULL, :now, NULL)"
+            ),
+            {
+                "grant_ref": new_ref("foreground_grant"),
+                "quest_ref": quest_ref,
+                "cycle_ref": next_cycle_ref,
+                "question_ref": target.question_ref,
+                "stage": entry_stage,
+                "epoch": next_epoch,
+                "predecessor": grant.grant_ref,
+                "now": now,
+            },
+        )
+        changed = connection.execute(
+            text(
+                "UPDATE ae_foreground_heads SET cycle_ref = :next_cycle_ref, "
+                "question_ref = :question_ref, stage = :stage, epoch = :next_epoch, "
+                "status = 'active', pending_operation_ref = NULL, updated_at = "
+                ":now WHERE quest_ref = :quest_ref AND cycle_ref = "
+                ":source_cycle_ref AND epoch = :source_epoch AND stage = "
+                "'reasoning' AND status = 'active'"
+            ),
+            {
+                "next_cycle_ref": next_cycle_ref,
+                "question_ref": target.question_ref,
+                "stage": entry_stage,
+                "next_epoch": next_epoch,
+                "now": now,
+                "quest_ref": quest_ref,
+                "source_cycle_ref": request.cycle_ref,
+                "source_epoch": request.epoch,
+            },
+        )
+        if changed.rowcount != 1:
+            raise OwnerConflict("reasoning_next_cycle_foreground_stale")
+        self._feed.record(
+            connection,
+            "advancement_engine.reasoning_successor_activated",
+            {
+                "source_cycle_ref": request.cycle_ref,
+                "cycle_ref": next_cycle_ref,
+                "quest_ref": quest_ref,
+                "question_ref": target.question_ref,
+                "stage": entry_stage,
+                "epoch": next_epoch,
+            },
+        )
+        return successor_skip_count
+
+    def _freeze_reasoning_successor_idea_context(
+        self,
+        *,
+        cycle_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        source_commit: StageCommit,
+    ) -> dict[str, object]:
+        evidence = self._evidence_verifier
+        literature = self._question_literature_revision_verifier
+        collaboration = self._authorization_verifier
+        if evidence is None or literature is None or collaboration is None:
+            raise OwnerConflict("reasoning_successor_context_verifier_unavailable")
+
+        evidence_revision, evidence_refs = (
+            evidence.query_evidence_reference_state(
+                accepted_question.quest_ref
+            )
+        )
+        evidence.verify_evidence_refs(
+            quest_ref=accepted_question.quest_ref,
+            version_refs=tuple(sorted(evidence_refs)),
+            expected_reference_revision=evidence_revision,
+            require_current=True,
+        )
+        literature_revision = (
+            literature.query_current_question_literature_revision(
+                accepted_question.question_ref
+            )
+        )
+        if literature_revision is None:
+            raise OwnerConflict("question_literature_revision_unavailable")
+        literature.verify_question_literature_revision(literature_revision)
+
+        scope_ref = f"quest:{accepted_question.quest_ref}"
+        guidance = collaboration.query_active_guidance_bindings(scope_ref)
+        for binding in guidance:
+            collaboration.verify_guidance_binding(binding)
+        guidance.sort(
+            key=lambda item: (
+                str(item["scope_ref"]),
+                str(item["constraint_ref"]),
+                int(cast(int, item["revision"])),
+            )
+        )
+        collaboration.verify_guidance_snapshot(
+            scope_ref=scope_ref,
+            bindings=guidance,
+        )
+
+        prior = {
+            **_reasoning_commit_document(source_commit),
+            "cycle_ref": source_commit.cycle_ref,
+        }
+        context_pack: dict[str, object] = {
+            "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_V3_REF,
+            "cycle_ref": cycle_ref,
+            "accepted_question_binding": accepted_question.as_dict(),
+            "accepted_evidence_refs": list(sorted(evidence_refs)),
+            "evidence_reference_revision": evidence_revision,
+            "literature_binding": literature_revision,
+            "prior_accepted_bindings": [prior],
+            "active_guidance_bindings": guidance,
+        }
+        try:
+            validate_idea_context_pack(
+                context_pack,
+                cycle_ref=cycle_ref,
+                accepted_question_binding=accepted_question.as_dict(),
+            )
+        except IdeaContractError as error:
+            raise OwnerConflict(str(error)) from error
+        return context_pack
+
+    def _insert_autonomous_successor_skips(
+        self,
+        connection,
+        *,
+        cycle_ref: str,
+        epoch: int,
+        entry_stage: str,
+        typed_skip: dict[str, list[str]],
+        outcome_ref: str,
+        outcome_receipt: AcceptanceReceipt,
+        accepted_idea_set: AcceptedIdeaSetBinding | None,
+        accepted_formal_plan: AcceptedFormalPlanBinding | None,
+        committed_at: float,
+    ) -> int:
+        """Materialize RG-authorized prior-stage skips with the successor.
+
+        These are AE-owned StageCommits, not caller-authored placeholders.  The
+        source RG receipt is immutable and the whole set is inserted in the
+        same transaction that advances the foreground to the successor.
+        """
+
+        expected_stages = tuple(STAGES[: STAGES.index(entry_stage)])
+        if (
+            set(typed_skip) != set(expected_stages)
+            or outcome_receipt.issuer != "research_graph"
+            or outcome_receipt.kind != "reasoning_outcome_accepted"
+            or outcome_receipt.subject_ref != outcome_ref
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+        if entry_stage in {PLAN_STAGE, BUNDLE_STAGE}:
+            if (
+                accepted_idea_set is None
+                or typed_skip.get(IDEA_STAGE)
+                != [accepted_idea_set.outcome_ref]
+                or (
+                    entry_stage == BUNDLE_STAGE
+                    and (
+                        accepted_formal_plan is None
+                        or typed_skip.get(PLAN_STAGE)
+                        != [accepted_formal_plan.formal_plan_ref]
+                    )
+                )
+            ):
+                raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+        elif any(typed_skip.get(stage) != [outcome_ref] for stage in expected_stages):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+
+        for stage in expected_stages:
+            if stage == IDEA_STAGE and accepted_idea_set is not None:
+                basis_kind = PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND
+                basis_ref = accepted_idea_set.stage_commit_ref
+                basis_receipt = accepted_idea_set.stage_commit_receipt
+            elif stage == PLAN_STAGE and accepted_formal_plan is not None:
+                basis_kind = PRIOR_ACCEPTED_FORMAL_PLAN_SKIP_BASIS_KIND
+                basis_ref = accepted_formal_plan.stage_commit_ref
+                basis_receipt = accepted_formal_plan.stage_commit_receipt
+            else:
+                basis_kind = AUTONOMOUS_REASONING_SKIP_BASIS_KIND
+                basis_ref = outcome_ref
+                basis_receipt = outcome_receipt
+            command_input = {
+                "command": "record_autonomous_reasoning_successor_skip",
+                "cycle_ref": cycle_ref,
+                "stage": stage,
+                "epoch": epoch,
+                "disposition": SKIPPED_DISPOSITION,
+                "basis_kind": basis_kind,
+                "basis_ref": basis_ref,
+                "basis_receipt": basis_receipt.as_public_dict(),
+            }
+            command_hash = canonical_hash(command_input)
+            commit_ref = "stage_commit_" + canonical_hash(command_input)[:32]
+            receipt_ref = "ae_stage_commit_receipt_" + canonical_hash(
+                {"commit_ref": commit_ref}
+            )[:32]
+            idempotency_key = "autonomous-successor-skip-" + canonical_hash(
+                {"cycle_ref": cycle_ref, "stage": stage, "epoch": epoch}
+            )[:48]
+            bindings = {
+                "request_ref": None,
+                "cycle_ref": cycle_ref,
+                "stage": stage,
+                "epoch": epoch,
+                "disposition": SKIPPED_DISPOSITION,
+                "basis_kind": basis_kind,
+                "basis_ref": basis_ref,
+                "basis_receipt_issuer": basis_receipt.issuer,
+                "basis_receipt_kind": basis_receipt.kind,
+                "basis_receipt_subject_ref": basis_receipt.subject_ref,
+                "basis_receipt_ref": basis_receipt.receipt_ref,
+                "basis_receipt_hash": basis_receipt.payload_hash,
+            }
+            receipt_hash = _receipt_hash(
+                STAGE_COMMIT_RECEIPT_KIND,
+                commit_ref,
+                bindings,
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO ae_stage_commits (commit_ref, request_ref, "
+                    "cycle_ref, stage, epoch, run_ref, outcome_ref, "
+                    "outcome_kind, disposition, run_completion_receipt_ref, "
+                    "run_completion_receipt_hash, outcome_receipt_ref, "
+                    "outcome_receipt_hash, closure_json, closure_hash, "
+                    "basis_kind, basis_ref, basis_receipt_issuer, "
+                    "basis_receipt_kind, basis_receipt_subject_ref, "
+                    "basis_receipt_ref, basis_receipt_hash, idempotency_key, "
+                    "request_hash, receipt_ref, receipt_hash, committed_at) "
+                    "VALUES (:commit_ref, NULL, :cycle_ref, :stage, :epoch, "
+                    "NULL, NULL, NULL, 'skipped', NULL, NULL, NULL, NULL, "
+                    "NULL, NULL, :basis_kind, :basis_ref, "
+                    ":basis_receipt_issuer, :basis_receipt_kind, "
+                    ":basis_receipt_subject_ref, :basis_receipt_ref, "
+                    ":basis_receipt_hash, :idempotency_key, :request_hash, "
+                    ":receipt_ref, :receipt_hash, :committed_at)"
+                ),
+                {
+                    **bindings,
+                    "commit_ref": commit_ref,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": command_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "committed_at": committed_at,
+                },
+            )
+            self._feed.record(
+                connection,
+                "advancement_engine.stage_committed",
+                {
+                    "commit_ref": commit_ref,
+                    "request_ref": None,
+                    "disposition": SKIPPED_DISPOSITION,
+                    "basis_kind": basis_kind,
+                    "basis_ref": basis_ref,
+                    "stage": stage,
+                    "epoch": epoch,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        return len(expected_stages)
+
     def _advance_cycle_after_stage_commit(
         self,
         connection,
@@ -5621,6 +8791,31 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 formal_plan_ref=row.outcome_ref,
                 receipt=committed.outcome_receipt,
             )
+        elif (
+            row.disposition == COMPLETED_DISPOSITION
+            and row.stage == REASONING_STAGE
+        ):
+            if (
+                self._reasoning_outcome_verifier is None
+                or committed.outcome_receipt is None
+                or committed.closure is None
+            ):
+                raise OwnerConflict("reasoning_stage_verifier_unavailable")
+            self._reasoning_outcome_verifier.verify_reasoning_outcome_decision(
+                request_ref=row.request_ref,
+                submission_ref=None,
+                decision="accepted",
+                outcome_ref=row.outcome_ref,
+                receipt=committed.outcome_receipt,
+            )
+            closure = (
+                self._reasoning_outcome_verifier.query_reasoning_transition_binding(
+                    outcome_ref=row.outcome_ref,
+                    receipt=committed.outcome_receipt,
+                )
+            )
+            if committed.closure != closure:
+                raise OwnerConflict("reasoning_stage_closure_invalid")
         elif row.stage == BUNDLE_STAGE:
             if row.disposition == COMPLETED_DISPOSITION:
                 if row.run_ref is None or committed.closure is None:
@@ -5727,6 +8922,22 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                     or proposal.run_ref != row.run_ref
                 ):
                     raise OwnerConflict("bundle_exhaustion_basis_binding_invalid")
+            elif row.basis_kind == AUTONOMOUS_REASONING_SKIP_BASIS_KIND:
+                self._verify_autonomous_reasoning_skip_basis(
+                    row, committed.basis_receipt
+                )
+            elif row.basis_kind in {
+                PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND,
+                PRIOR_ACCEPTED_FORMAL_PLAN_SKIP_BASIS_KIND,
+            }:
+                self._verify_reused_stage_asset_skip_basis(
+                    row, committed.basis_receipt
+                )
+            elif row.basis_kind in {
+                "upstream_no_viable_candidate_stage_commit",
+                "upstream_stage_exhausted_commit",
+            }:
+                self._verify_reasoning_route_skip_basis(row, committed.basis_receipt)
             else:
                 if self._stage_disposition_basis_verifier is None:
                     raise OwnerConflict(
@@ -5744,6 +8955,268 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                     receipt=committed.basis_receipt,
                 )
         return committed
+
+    def _verify_autonomous_reasoning_skip_basis(
+        self, row, basis_receipt: AcceptanceReceipt
+    ) -> None:
+        if (
+            row.disposition != SKIPPED_DISPOSITION
+            or row.stage not in STAGES[:-1]
+            or basis_receipt.issuer != "research_graph"
+            or basis_receipt.kind != "reasoning_outcome_accepted"
+            or basis_receipt.subject_ref != row.basis_ref
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+        with self._database.read() as connection:
+            cycle = connection.execute(
+                text(
+                    "SELECT quest_ref, question_ref, predecessor_cycle_ref FROM "
+                    "ae_cycles WHERE cycle_ref = :cycle_ref"
+                ),
+                {"cycle_ref": row.cycle_ref},
+            ).first()
+            source = (
+                None
+                if cycle is None or cycle.predecessor_cycle_ref is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_commits WHERE cycle_ref = "
+                        ":cycle_ref AND stage = 'reasoning' AND disposition = "
+                        "'completed' ORDER BY committed_at DESC LIMIT 1"
+                    ),
+                    {"cycle_ref": cycle.predecessor_cycle_ref},
+                ).first()
+            )
+        if cycle is None or source is None:
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+        source_commit = self._stage_commit_from_row(source)
+        if (
+            source_commit.outcome_ref != row.basis_ref
+            or source_commit.outcome_receipt != basis_receipt
+            or int(row.epoch) != source_commit.epoch + 1
+            or source_commit.closure is None
+            or source_commit.closure.get("transition_kind")
+            != "next_cycle_proposal"
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+        transition = source_commit.closure.get("transition")
+        if (
+            not isinstance(transition, dict)
+            or transition.get("target_question_ref") != cycle.question_ref
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+
+        verifier = self._reasoning_outcome_verifier
+        if verifier is None:
+            raise OwnerConflict("reasoning_next_cycle_target_verifier_unavailable")
+        target = verifier.query_reasoning_next_cycle_target(
+            outcome_ref=str(row.basis_ref),
+            receipt=basis_receipt,
+        )
+        accepted = (
+            target.get("accepted_question_binding")
+            if isinstance(target, dict)
+            else None
+        )
+        if (
+            not isinstance(target, dict)
+            or not isinstance(accepted, dict)
+            or accepted.get("question_ref") != cycle.question_ref
+            or accepted.get("quest_ref") != cycle.quest_ref
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+        entry_stage, typed_skip = _validated_autonomous_successor_route(
+            target,
+            outcome_ref=str(row.basis_ref),
+        )
+        if (
+            row.stage not in STAGES[: STAGES.index(entry_stage)]
+            or typed_skip.get(str(row.stage)) != [row.basis_ref]
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+
+        command_input = {
+            "command": "record_autonomous_reasoning_successor_skip",
+            "cycle_ref": row.cycle_ref,
+            "stage": row.stage,
+            "epoch": int(row.epoch),
+            "disposition": SKIPPED_DISPOSITION,
+            "basis_kind": AUTONOMOUS_REASONING_SKIP_BASIS_KIND,
+            "basis_ref": row.basis_ref,
+            "basis_receipt": basis_receipt.as_public_dict(),
+        }
+        expected_commit_ref = "stage_commit_" + canonical_hash(command_input)[:32]
+        expected_receipt_ref = "ae_stage_commit_receipt_" + canonical_hash(
+            {"commit_ref": expected_commit_ref}
+        )[:32]
+        if (
+            row.commit_ref != expected_commit_ref
+            or row.receipt_ref != expected_receipt_ref
+            or row.request_hash != canonical_hash(command_input)
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+
+    def _verify_reused_stage_asset_skip_basis(
+        self, row, basis_receipt: AcceptanceReceipt
+    ) -> None:
+        expected_kind = {
+            IDEA_STAGE: PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND,
+            PLAN_STAGE: PRIOR_ACCEPTED_FORMAL_PLAN_SKIP_BASIS_KIND,
+        }.get(str(row.stage))
+        if (
+            expected_kind is None
+            or row.disposition != SKIPPED_DISPOSITION
+            or row.basis_kind != expected_kind
+            or basis_receipt.issuer != AE_OWNER
+            or basis_receipt.kind != STAGE_COMMIT_RECEIPT_KIND
+            or basis_receipt.subject_ref != row.basis_ref
+        ):
+            raise OwnerConflict("autonomous_successor_asset_skip_invalid")
+        with self._database.read() as connection:
+            cycle = connection.execute(
+                text(
+                    "SELECT quest_ref, question_ref, predecessor_cycle_ref FROM "
+                    "ae_cycles WHERE cycle_ref = :cycle_ref"
+                ),
+                {"cycle_ref": row.cycle_ref},
+            ).first()
+            source_asset = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_commits WHERE commit_ref = :commit_ref"
+                ),
+                {"commit_ref": row.basis_ref},
+            ).first()
+            asset_cycle = (
+                None
+                if source_asset is None
+                else connection.execute(
+                    text(
+                        "SELECT quest_ref, question_ref FROM ae_cycles WHERE "
+                        "cycle_ref = :cycle_ref"
+                    ),
+                    {"cycle_ref": source_asset.cycle_ref},
+                ).first()
+            )
+            reasoning = (
+                None
+                if cycle is None or cycle.predecessor_cycle_ref is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_commits WHERE cycle_ref = "
+                        ":cycle_ref AND stage = 'reasoning' AND disposition = "
+                        "'completed'"
+                    ),
+                    {"cycle_ref": cycle.predecessor_cycle_ref},
+                ).first()
+            )
+        if (
+            cycle is None
+            or source_asset is None
+            or asset_cycle is None
+            or reasoning is None
+        ):
+            raise OwnerConflict("autonomous_successor_asset_skip_invalid")
+        asset_commit = self._stage_commit_from_row(source_asset)
+        source_commit = self._stage_commit_from_row(reasoning)
+        if (
+            asset_commit.stage != row.stage
+            or asset_commit.disposition != COMPLETED_DISPOSITION
+            or asset_commit.receipt != basis_receipt
+            or asset_cycle.quest_ref != cycle.quest_ref
+            or asset_cycle.question_ref != cycle.question_ref
+            or int(row.epoch) != source_commit.epoch + 1
+            or source_commit.outcome_ref is None
+            or source_commit.outcome_receipt is None
+        ):
+            raise OwnerConflict("autonomous_successor_asset_skip_invalid")
+        verifier = self._reasoning_outcome_verifier
+        if verifier is None:
+            raise OwnerConflict("reasoning_next_cycle_target_verifier_unavailable")
+        target = verifier.query_reasoning_next_cycle_target(
+            outcome_ref=source_commit.outcome_ref,
+            receipt=source_commit.outcome_receipt,
+        )
+        if not isinstance(target, dict):
+            raise OwnerConflict("autonomous_successor_asset_skip_invalid")
+        entry_stage, typed_skip = _validated_autonomous_successor_route(
+            target,
+            outcome_ref=source_commit.outcome_ref,
+        )
+        accepted_idea_set, accepted_formal_plan = _successor_asset_bindings(
+            target,
+            entry_stage=entry_stage,
+        )
+        if row.stage == IDEA_STAGE:
+            expected_ref = accepted_idea_set.stage_commit_ref
+            typed_ref = accepted_idea_set.outcome_ref
+        else:
+            if accepted_formal_plan is None:
+                raise OwnerConflict("autonomous_successor_asset_skip_invalid")
+            expected_ref = accepted_formal_plan.stage_commit_ref
+            typed_ref = accepted_formal_plan.formal_plan_ref
+        if (
+            row.basis_ref != expected_ref
+            or typed_skip.get(str(row.stage)) != [typed_ref]
+            or row.stage not in STAGES[: STAGES.index(entry_stage)]
+        ):
+            raise OwnerConflict("autonomous_successor_asset_skip_invalid")
+        command_input = {
+            "command": "record_autonomous_reasoning_successor_skip",
+            "cycle_ref": row.cycle_ref,
+            "stage": row.stage,
+            "epoch": int(row.epoch),
+            "disposition": SKIPPED_DISPOSITION,
+            "basis_kind": row.basis_kind,
+            "basis_ref": row.basis_ref,
+            "basis_receipt": basis_receipt.as_public_dict(),
+        }
+        expected_commit_ref = "stage_commit_" + canonical_hash(command_input)[:32]
+        expected_receipt_ref = "ae_stage_commit_receipt_" + canonical_hash(
+            {"commit_ref": expected_commit_ref}
+        )[:32]
+        if (
+            row.commit_ref != expected_commit_ref
+            or row.receipt_ref != expected_receipt_ref
+            or row.request_hash != canonical_hash(command_input)
+        ):
+            raise OwnerConflict("autonomous_successor_asset_skip_invalid")
+
+    def _verify_reasoning_route_skip_basis(
+        self, row, basis_receipt: AcceptanceReceipt
+    ) -> None:
+        if (
+            row.disposition != SKIPPED_DISPOSITION
+            or basis_receipt.issuer != AE_OWNER
+            or basis_receipt.kind != STAGE_COMMIT_RECEIPT_KIND
+            or basis_receipt.subject_ref != row.basis_ref
+        ):
+            raise OwnerConflict("stage_commit_basis_invalid")
+        with self._database.read() as connection:
+            source = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_commits WHERE commit_ref = :commit_ref"
+                ),
+                {"commit_ref": row.basis_ref},
+            ).first()
+        if source is None or (
+            source.cycle_ref != row.cycle_ref
+            or int(source.epoch) != int(row.epoch)
+            or STAGES.index(str(source.stage)) >= STAGES.index(str(row.stage))
+            or source.receipt_ref != basis_receipt.receipt_ref
+            or source.receipt_hash != basis_receipt.payload_hash
+            or source.receipt_hash != _stage_commit_receipt_hash(source)
+        ):
+            raise OwnerConflict("stage_commit_basis_invalid")
+        if row.basis_kind == "upstream_no_viable_candidate_stage_commit":
+            valid_source = (
+                source.stage == IDEA_STAGE
+                and source.disposition == COMPLETED_DISPOSITION
+                and source.outcome_kind == NO_VIABLE_CANDIDATE_OUTCOME_KIND
+            )
+        else:
+            valid_source = source.disposition == EXHAUSTED_DISPOSITION
+        if not valid_source:
+            raise OwnerConflict("stage_commit_basis_invalid")
 
     def _query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest:
         with self._database.read() as connection:
@@ -6077,6 +9550,182 @@ class SQLiteAdvancementEngineReceiptVerifier:
             receipt=requested.receipt,
         )
 
+    def query_reasoning_stage_entry_assets(
+        self,
+        *,
+        source_cycle_ref: str,
+        target_question_ref: str,
+        entry_stage: str,
+        typed_skip_basis_refs_by_stage: dict[str, list[str]],
+    ) -> tuple[
+        AcceptedIdeaSetBinding | None,
+        AcceptedFormalPlanBinding | None,
+    ]:
+        """Resolve exact prior accepted assets without a latest-row fallback."""
+
+        if entry_stage not in {PLAN_STAGE, BUNDLE_STAGE}:
+            return None, None
+        idea_refs = typed_skip_basis_refs_by_stage.get(IDEA_STAGE)
+        plan_refs = typed_skip_basis_refs_by_stage.get(PLAN_STAGE)
+        if (
+            not isinstance(idea_refs, list)
+            or len(idea_refs) != 1
+            or not isinstance(idea_refs[0], str)
+            or not idea_refs[0]
+            or (
+                entry_stage == BUNDLE_STAGE
+                and (
+                    not isinstance(plan_refs, list)
+                    or len(plan_refs) != 1
+                    or not isinstance(plan_refs[0], str)
+                    or not plan_refs[0]
+                )
+            )
+        ):
+            raise OwnerConflict("reasoning_next_cycle_route_invalid")
+        with self._database.read() as connection:
+            cycle = connection.execute(
+                text(
+                    "SELECT quest_ref, question_ref FROM ae_cycles WHERE cycle_ref = "
+                    ":cycle_ref"
+                ),
+                {"cycle_ref": source_cycle_ref},
+            ).first()
+            plan_rows = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE question_ref = "
+                    ":question_ref AND stage = 'plan' ORDER BY request_ref"
+                ),
+                {"question_ref": target_question_ref},
+            ).all()
+            bundle_rows = (
+                []
+                if entry_stage != BUNDLE_STAGE
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_run_requests WHERE question_ref = "
+                        ":question_ref AND stage = 'bundle' ORDER BY request_ref"
+                    ),
+                    {"question_ref": target_question_ref},
+                ).all()
+            )
+        if cycle is None:
+            raise OwnerConflict("reasoning_next_cycle_source_invalid")
+
+        plan_requests = [_stage_request(row) for row in plan_rows]
+        idea_candidates = {
+            canonical_hash(request.accepted_idea_set.as_dict()): (
+                request.accepted_idea_set
+            )
+            for request in plan_requests
+            if request.accepted_question.question_ref == target_question_ref
+            and request.accepted_idea_set is not None
+            and request.accepted_idea_set.outcome_ref == idea_refs[0]
+        }
+        if len(idea_candidates) != 1:
+            raise OwnerConflict(
+                "reasoning_next_cycle_bundle_basis_unavailable"
+                if entry_stage == BUNDLE_STAGE
+                else "reasoning_next_cycle_plan_basis_unavailable"
+            )
+        accepted_idea_set = next(iter(idea_candidates.values()))
+        self._verify_reusable_stage_asset(
+            source_cycle_ref=source_cycle_ref,
+            target_question_ref=target_question_ref,
+            stage=IDEA_STAGE,
+            outcome_ref=accepted_idea_set.outcome_ref,
+            stage_commit_ref=accepted_idea_set.stage_commit_ref,
+            outcome_receipt=accepted_idea_set.outcome_receipt,
+            stage_commit_receipt=accepted_idea_set.stage_commit_receipt,
+        )
+        if entry_stage == PLAN_STAGE:
+            return accepted_idea_set, None
+
+        bundle_requests = [_stage_request(row) for row in bundle_rows]
+        formal_candidates = {
+            canonical_hash(request.accepted_formal_plan.as_dict()): (
+                request.accepted_formal_plan
+            )
+            for request in bundle_requests
+            if request.accepted_question.question_ref == target_question_ref
+            and request.accepted_formal_plan is not None
+            and request.accepted_formal_plan.formal_plan_ref == plan_refs[0]
+        }
+        if len(formal_candidates) != 1:
+            raise OwnerConflict("reasoning_next_cycle_bundle_basis_unavailable")
+        accepted_formal_plan = next(iter(formal_candidates.values()))
+        answer_contract = accepted_formal_plan.plan_document.get("answer_contract")
+        if (
+            not isinstance(answer_contract, dict)
+            or answer_contract.get("source_question_ref") != target_question_ref
+            or answer_contract.get("source_idea_set_ref")
+            != accepted_idea_set.outcome_ref
+        ):
+            raise OwnerConflict("reasoning_next_cycle_bundle_basis_invalid")
+        self._verify_reusable_stage_asset(
+            source_cycle_ref=source_cycle_ref,
+            target_question_ref=target_question_ref,
+            stage=PLAN_STAGE,
+            outcome_ref=accepted_formal_plan.formal_plan_ref,
+            stage_commit_ref=accepted_formal_plan.stage_commit_ref,
+            outcome_receipt=accepted_formal_plan.formal_plan_receipt,
+            stage_commit_receipt=accepted_formal_plan.stage_commit_receipt,
+        )
+        return accepted_idea_set, accepted_formal_plan
+
+    def _verify_reusable_stage_asset(
+        self,
+        *,
+        source_cycle_ref: str,
+        target_question_ref: str,
+        stage: str,
+        outcome_ref: str,
+        stage_commit_ref: str,
+        outcome_receipt: AcceptanceReceipt,
+        stage_commit_receipt: AcceptanceReceipt,
+    ) -> None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT commits.*, requests.question_ref AS "
+                    "asset_question_ref, cycles.quest_ref AS asset_quest_ref "
+                    "FROM ae_stage_commits commits JOIN "
+                    "ae_stage_run_requests requests ON requests.request_ref = "
+                    "commits.request_ref JOIN ae_cycles cycles ON "
+                    "cycles.cycle_ref = commits.cycle_ref WHERE "
+                    "commits.commit_ref = :commit_ref AND commits.stage = "
+                    ":stage AND requests.question_ref = :question_ref"
+                ),
+                {
+                    "commit_ref": stage_commit_ref,
+                    "stage": stage,
+                    "question_ref": target_question_ref,
+                },
+            ).first()
+            source_cycle = connection.execute(
+                text(
+                    "SELECT quest_ref FROM ae_cycles WHERE cycle_ref = "
+                    ":cycle_ref"
+                ),
+                {"cycle_ref": source_cycle_ref},
+            ).first()
+        if (
+            row is None
+            or source_cycle is None
+            or row.asset_question_ref != target_question_ref
+            or row.asset_quest_ref != source_cycle.quest_ref
+        ):
+            raise OwnerConflict("reasoning_next_cycle_asset_commit_invalid")
+        commit = _stage_commit(row)
+        if (
+            commit.disposition != COMPLETED_DISPOSITION
+            or commit.outcome_ref != outcome_ref
+            or commit.outcome_receipt != outcome_receipt
+            or commit.receipt != stage_commit_receipt
+            or row.receipt_hash != _stage_commit_receipt_hash(row)
+        ):
+            raise OwnerConflict("reasoning_next_cycle_asset_commit_invalid")
+
 
 def _control_ref(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or len(value) > 128:
@@ -6168,6 +9817,294 @@ def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> s
             "bindings": bindings,
         }
     )
+
+
+def _object_field(value: object, field: str) -> object:
+    if isinstance(value, dict):
+        return value.get(field)
+    return getattr(value, field, None)
+
+
+def _required_object_ref(value: object, field: str, code: str) -> str:
+    result = _object_field(value, field)
+    if not isinstance(result, str) or not result:
+        raise OwnerConflict(code)
+    return result
+
+
+def _required_mapping(value: object, code: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise OwnerConflict(code)
+    return value
+
+
+def _required_mapping_ref(
+    value: dict[str, object], field: str, code: str
+) -> str:
+    result = value.get(field)
+    if not isinstance(result, str) or not result:
+        raise OwnerConflict(code)
+    return result
+
+
+def _validated_autonomous_successor_route(
+    target: dict[str, object],
+    *,
+    outcome_ref: str,
+    require_asset_bindings: bool = True,
+) -> tuple[str, dict[str, list[str]]]:
+    """Validate the RG-accepted entry route without trusting caller DTO fields."""
+
+    entry_stage = target.get("entry_stage")
+    raw_skip = target.get("typed_skip_basis_refs_by_stage")
+    if not isinstance(entry_stage, str) or entry_stage not in STAGES:
+        raise OwnerConflict("reasoning_next_cycle_target_invalid")
+    if not isinstance(raw_skip, dict):
+        raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+    expected_stages = set(STAGES[: STAGES.index(entry_stage)])
+    if set(raw_skip) != expected_stages:
+        raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+    typed_skip: dict[str, list[str]] = {}
+    for stage, refs in sorted(raw_skip.items()):
+        if (
+            not isinstance(stage, str)
+            or not isinstance(refs, list)
+            or not refs
+            or len(refs) != len(set(refs))
+            or any(not isinstance(ref, str) or not ref for ref in refs)
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+        typed_skip[stage] = list(refs)
+    if entry_stage == REASONING_STAGE and any(
+        refs != [outcome_ref] for refs in typed_skip.values()
+    ):
+        raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+    if (
+        entry_stage in {PLAN_STAGE, BUNDLE_STAGE}
+        and not require_asset_bindings
+        and any(refs != [outcome_ref] for refs in typed_skip.values())
+    ):
+        # A new Question cannot yet own the accepted upstream assets needed by
+        # Plan or Bundle.  At this pre-creation boundary, only the exact
+        # checkpoint outcome may express that unresolved route; arbitrary refs
+        # must fail before the more specific basis-availability error.
+        raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+    if entry_stage in {PLAN_STAGE, BUNDLE_STAGE} and require_asset_bindings:
+        accepted_idea_set, accepted_formal_plan = _successor_asset_bindings(
+            target, entry_stage=entry_stage
+        )
+        if typed_skip.get(IDEA_STAGE) != [accepted_idea_set.outcome_ref]:
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+        if entry_stage == BUNDLE_STAGE and (
+            accepted_formal_plan is None
+            or typed_skip.get(PLAN_STAGE)
+            != [accepted_formal_plan.formal_plan_ref]
+        ):
+            raise OwnerConflict("autonomous_successor_skip_basis_invalid")
+    return entry_stage, typed_skip
+
+
+def _successor_asset_bindings(
+    target: dict[str, object], *, entry_stage: str
+) -> tuple[AcceptedIdeaSetBinding, AcceptedFormalPlanBinding | None]:
+    try:
+        accepted_idea_set = _idea_set_binding_from_context(
+            {
+                "accepted_idea_set_binding": target[
+                    "accepted_idea_set_binding"
+                ]
+            }
+        )
+        accepted_formal_plan = (
+            None
+            if entry_stage != BUNDLE_STAGE
+            else _formal_plan_binding_from_context(
+                {
+                    "accepted_formal_plan_binding": target[
+                        "accepted_formal_plan_binding"
+                    ]
+                }
+            )
+        )
+    except (KeyError, OwnerConflict) as error:
+        raise OwnerConflict("autonomous_successor_asset_binding_invalid") from error
+    if entry_stage == BUNDLE_STAGE:
+        answer_contract = (
+            None
+            if accepted_formal_plan is None
+            else accepted_formal_plan.plan_document.get("answer_contract")
+        )
+        if (
+            not isinstance(answer_contract, dict)
+            or answer_contract.get("source_idea_set_ref")
+            != accepted_idea_set.outcome_ref
+        ):
+            raise OwnerConflict("autonomous_successor_asset_binding_invalid")
+    return accepted_idea_set, accepted_formal_plan
+
+
+def _authorization_receipt_ref(authorization: dict[str, object]) -> str:
+    direct = authorization.get("receipt_ref")
+    if isinstance(direct, str) and direct:
+        return direct
+    receipt = authorization.get("receipt")
+    if isinstance(receipt, dict):
+        return _required_mapping_ref(
+            receipt, "receipt_ref", "broad_research_authorization_invalid"
+        )
+    raise OwnerConflict("broad_research_authorization_invalid")
+
+
+def _receipt_from_object(value: object, issuer: str) -> AcceptanceReceipt:
+    if isinstance(value, AcceptanceReceipt):
+        receipt = value
+    elif isinstance(value, dict):
+        try:
+            receipt = AcceptanceReceipt(
+                issuer=str(value["issuer"]),
+                kind=str(value["kind"]),
+                receipt_ref=str(value["receipt_ref"]),
+                subject_ref=str(value["subject_ref"]),
+                payload_hash=str(value["payload_hash"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise OwnerConflict("owner_receipt_invalid") from error
+    else:
+        raise OwnerConflict("owner_receipt_invalid")
+    if receipt.issuer != issuer:
+        raise OwnerConflict("owner_receipt_invalid")
+    return receipt
+
+
+def _autonomous_deepfetch_receipt_bindings(
+    request: DeepFetchRunRequest,
+) -> dict[str, object]:
+    return {
+        "initialization_id": request.initialization_id,
+        "correlation_ref": request.correlation_ref,
+        "draft_revision": request.draft_revision,
+        "draft_hash": request.draft_hash,
+        "scope_hash": request.scope_hash,
+        "material_bindings_hash": canonical_hash(
+            list(request.accepted_material_bindings)
+        ),
+        "resource_envelope_ref": request.resource_envelope_ref,
+        "resource_envelope_hash": request.resource_envelope_hash,
+        "acquisition_session_ref": request.acquisition_session_ref,
+        "acquisition_config_hash": request.acquisition_config_hash,
+        "acquisition_runtime_binding_hash": (
+            request.acquisition_runtime_binding_hash
+        ),
+        "result_route": request.result_route,
+        "creation_context_kind": request.creation_context_kind,
+        "creation_context_ref": request.creation_context_ref,
+        "context_generation": request.context_generation,
+        "quest_ref": request.quest_ref,
+        "context_basis_hash": request.context_basis_hash,
+    }
+
+
+def _autonomous_deepfetch_document(
+    request: DeepFetchRunRequest,
+) -> dict[str, object]:
+    return {
+        "request_ref": request.request_ref,
+        "initialization_id": request.initialization_id,
+        "correlation_ref": request.correlation_ref,
+        "draft_revision": request.draft_revision,
+        "draft_hash": request.draft_hash,
+        "draft": request.draft,
+        "scope": request.scope,
+        "scope_hash": request.scope_hash,
+        "resource_envelope_ref": request.resource_envelope_ref,
+        "resource_envelope_hash": request.resource_envelope_hash,
+        "acquisition_session_ref": request.acquisition_session_ref,
+        "acquisition_config_hash": request.acquisition_config_hash,
+        "acquisition_runtime_binding_hash": (
+            request.acquisition_runtime_binding_hash
+        ),
+        "accepted_material_bindings": list(request.accepted_material_bindings),
+        "result_route": request.result_route,
+        "authorization_receipt": request.authorization_receipt.as_public_dict(),
+        "creation_context_kind": request.creation_context_kind,
+        "creation_context_ref": request.creation_context_ref,
+        "context_generation": request.context_generation,
+        "quest_ref": request.quest_ref,
+        "parent_question_ref": request.parent_question_ref,
+        "context_basis_hash": request.context_basis_hash,
+    }
+
+
+def _autonomous_deepfetch_from_document(
+    value: dict[str, object],
+) -> DeepFetchRunRequest:
+    try:
+        bindings = value["accepted_material_bindings"]
+        if not isinstance(bindings, list) or any(
+            not isinstance(item, dict) for item in bindings
+        ):
+            raise TypeError("accepted_material_bindings")
+        return DeepFetchRunRequest(
+            request_ref=str(value["request_ref"]),
+            initialization_id=str(value["initialization_id"]),
+            correlation_ref=str(value["correlation_ref"]),
+            draft_revision=int(value["draft_revision"]),
+            draft_hash=str(value["draft_hash"]),
+            draft=cast(dict[str, object], value["draft"]),
+            scope=cast(dict[str, object], value["scope"]),
+            scope_hash=str(value["scope_hash"]),
+            resource_envelope_ref=str(value["resource_envelope_ref"]),
+            resource_envelope_hash=str(value["resource_envelope_hash"]),
+            acquisition_session_ref=str(value["acquisition_session_ref"]),
+            acquisition_config_hash=str(value["acquisition_config_hash"]),
+            acquisition_runtime_binding_hash=str(
+                value["acquisition_runtime_binding_hash"]
+            ),
+            accepted_material_bindings=tuple(cast(list[dict[str, object]], bindings)),
+            result_route=str(value["result_route"]),
+            authorization_receipt=_receipt_from_public(
+                value["authorization_receipt"]
+            ),
+            creation_context_kind="autonomous_question_creation",
+            creation_context_ref=str(value["creation_context_ref"]),
+            context_generation=int(value["context_generation"]),
+            quest_ref=str(value["quest_ref"]),
+            parent_question_ref=None,
+            context_basis_hash=str(value["context_basis_hash"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise OwnerConflict("autonomous_deepfetch_request_invalid") from error
+
+
+def _autonomous_deepfetch_verifier_values(
+    request: DeepFetchRunRequest,
+) -> dict[str, object]:
+    return {
+        "request_ref": request.request_ref,
+        "initialization_id": request.initialization_id,
+        "correlation_ref": request.correlation_ref,
+        "draft_revision": request.draft_revision,
+        "draft_hash": request.draft_hash,
+        "scope_hash": request.scope_hash,
+        "material_bindings_hash": canonical_hash(
+            list(request.accepted_material_bindings)
+        ),
+        "resource_envelope_ref": request.resource_envelope_ref,
+        "resource_envelope_hash": request.resource_envelope_hash,
+        "acquisition_session_ref": request.acquisition_session_ref,
+        "acquisition_config_hash": request.acquisition_config_hash,
+        "acquisition_runtime_binding_hash": (
+            request.acquisition_runtime_binding_hash
+        ),
+        "result_route": request.result_route,
+        "receipt": request.authorization_receipt,
+        "creation_context_kind": request.creation_context_kind,
+        "creation_context_ref": request.creation_context_ref,
+        "context_generation": request.context_generation,
+        "quest_ref": request.quest_ref,
+        "parent_question_ref": request.parent_question_ref,
+        "context_basis_hash": request.context_basis_hash,
+    }
 
 
 _BUNDLE_EXHAUSTION_OPERATION_QUERY = (
@@ -6295,6 +10232,553 @@ def _activated_cycle(row) -> ActivatedCycle:
     )
 
 
+def _is_exact_derived_skip(
+    row,
+    *,
+    source_commit_ref: str,
+    basis_kind: str,
+    source_receipt: AcceptanceReceipt,
+) -> bool:
+    return bool(
+        row.disposition == SKIPPED_DISPOSITION
+        and row.request_ref is None
+        and row.run_ref is None
+        and row.outcome_ref is None
+        and row.outcome_kind is None
+        and row.basis_kind == basis_kind
+        and row.basis_ref == source_commit_ref
+        and row.basis_receipt_issuer == source_receipt.issuer
+        and row.basis_receipt_kind == source_receipt.kind
+        and row.basis_receipt_subject_ref == source_receipt.subject_ref
+        and row.basis_receipt_ref == source_receipt.receipt_ref
+        and row.basis_receipt_hash == source_receipt.payload_hash
+        and row.receipt_hash == _stage_commit_receipt_hash(row)
+    )
+
+
+def _validate_reasoning_route_rows(by_stage: dict[str, object]) -> None:
+    ordered = [by_stage[stage] for stage in (IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE)]
+    if any(
+        row.stage != stage or int(row.epoch) < 1
+        for stage, row in zip((IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE), ordered)
+    ):
+        raise OwnerConflict("reasoning_upstream_closure_invalid")
+    if any(row.receipt_hash != _stage_commit_receipt_hash(row) for row in ordered):
+        raise OwnerConflict("reasoning_upstream_closure_invalid")
+
+    if all(row.disposition == SKIPPED_DISPOSITION for row in ordered):
+        source_outcome_ref = ordered[0].basis_ref
+        source_receipt_ref = ordered[0].basis_receipt_ref
+        source_receipt_hash = ordered[0].basis_receipt_hash
+        if (
+            not isinstance(source_outcome_ref, str)
+            or not source_outcome_ref
+            or any(
+                row.basis_kind != AUTONOMOUS_REASONING_SKIP_BASIS_KIND
+                or row.basis_ref != source_outcome_ref
+                or row.basis_receipt_issuer != "research_graph"
+                or row.basis_receipt_kind != "reasoning_outcome_accepted"
+                or row.basis_receipt_subject_ref != source_outcome_ref
+                or row.basis_receipt_ref != source_receipt_ref
+                or row.basis_receipt_hash != source_receipt_hash
+                for row in ordered
+            )
+        ):
+            raise OwnerConflict("reasoning_upstream_closure_invalid")
+        return
+
+    exhausted = [row for row in ordered if row.disposition == EXHAUSTED_DISPOSITION]
+    if len(exhausted) > 1:
+        raise OwnerConflict("reasoning_upstream_closure_invalid")
+    idea = ordered[0]
+    if (
+        idea.disposition == COMPLETED_DISPOSITION
+        and idea.outcome_kind == NO_VIABLE_CANDIDATE_OUTCOME_KIND
+    ):
+        if any(
+            not _is_exact_derived_skip(
+                row,
+                source_commit_ref=str(idea.commit_ref),
+                basis_kind="upstream_no_viable_candidate_stage_commit",
+                source_receipt=AcceptanceReceipt(
+                    issuer=AE_OWNER,
+                    kind=STAGE_COMMIT_RECEIPT_KIND,
+                    receipt_ref=str(idea.receipt_ref),
+                    subject_ref=str(idea.commit_ref),
+                    payload_hash=str(idea.receipt_hash),
+                ),
+            )
+            for row in ordered[1:]
+        ):
+            raise OwnerConflict("reasoning_upstream_closure_invalid")
+        return
+
+    if exhausted:
+        source = exhausted[0]
+        source_index = ordered.index(source)
+        source_receipt = AcceptanceReceipt(
+            issuer=AE_OWNER,
+            kind=STAGE_COMMIT_RECEIPT_KIND,
+            receipt_ref=str(source.receipt_ref),
+            subject_ref=str(source.commit_ref),
+            payload_hash=str(source.receipt_hash),
+        )
+        if any(
+            not _is_exact_derived_skip(
+                row,
+                source_commit_ref=str(source.commit_ref),
+                basis_kind="upstream_stage_exhausted_commit",
+                source_receipt=source_receipt,
+            )
+            for row in ordered[source_index + 1 :]
+        ):
+            raise OwnerConflict("reasoning_upstream_closure_invalid")
+        return
+
+    if idea.disposition != COMPLETED_DISPOSITION or idea.outcome_kind != IDEA_SET_OUTCOME_KIND:
+        raise OwnerConflict("reasoning_upstream_closure_invalid")
+    plan, bundle = ordered[1:]
+    if plan.disposition not in {COMPLETED_DISPOSITION, SKIPPED_DISPOSITION}:
+        raise OwnerConflict("reasoning_upstream_closure_invalid")
+    if bundle.disposition not in {COMPLETED_DISPOSITION, SKIPPED_DISPOSITION}:
+        raise OwnerConflict("reasoning_upstream_closure_invalid")
+
+
+def _reasoning_commit_document(commit: StageCommit) -> dict[str, object]:
+    value: dict[str, object] = {
+        "stage": commit.stage,
+        "commit_ref": commit.commit_ref,
+        "epoch": commit.epoch,
+        "disposition": commit.disposition,
+        "receipt": commit.receipt.as_public_dict(),
+    }
+    optional = {
+        "request_ref": commit.request_ref,
+        "run_ref": commit.run_ref,
+        "outcome_ref": commit.outcome_ref,
+        "outcome_kind": commit.outcome_kind,
+        "basis_kind": commit.basis_kind,
+        "basis_ref": commit.basis_ref,
+    }
+    value.update({key: item for key, item in optional.items() if item is not None})
+    if commit.run_completion_receipt is not None:
+        value["run_completion_receipt"] = (
+            commit.run_completion_receipt.as_public_dict()
+        )
+    if commit.outcome_receipt is not None:
+        value["outcome_receipt"] = commit.outcome_receipt.as_public_dict()
+    if commit.basis_receipt is not None:
+        value["basis_receipt"] = commit.basis_receipt.as_public_dict()
+        if (
+            commit.basis_receipt.issuer == AE_OWNER
+            and commit.basis_receipt.kind == STAGE_COMMIT_RECEIPT_KIND
+            and commit.basis_ref == commit.basis_receipt.subject_ref
+        ):
+            value["basis_stage_commit_ref"] = commit.basis_ref
+    if commit.closure is not None:
+        value["closure"] = commit.closure
+    return value
+
+
+def _reasoning_context_pack_from_rows(
+    connection,
+    *,
+    cycle_ref: str,
+    epoch: int,
+    accepted_question: AcceptedQuestionBinding,
+    question_literature_revision: dict[str, object] | None = None,
+    quest_goal_revision: dict[str, object] | None = None,
+    reasoning_graph_context: dict[str, object] | None = None,
+    evidence_reuse_closure: tuple[EvidenceReuseLeaf, ...] = (),
+    current_target_evidence_closure: tuple[EvidenceReuseLeaf, ...] = (),
+) -> dict[str, object]:
+    rows = _reasoning_route_rows_for_epoch(
+        connection,
+        cycle_ref=cycle_ref,
+        epoch=epoch,
+    )
+    by_stage = {str(row.stage): row for row in rows}
+    if set(by_stage) != {IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE}:
+        raise OwnerConflict("reasoning_upstream_closure_incomplete")
+    _validate_reasoning_route_rows(by_stage)
+    commits = tuple(
+        _stage_commit(by_stage[stage])
+        for stage in (IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE)
+    )
+    closure = [_reasoning_commit_document(commit) for commit in commits]
+
+    question_literature_input = (
+        {"kind": "none"}
+        if question_literature_revision is None
+        else {
+            "kind": "revision",
+            "revision_ref": question_literature_revision.get("revision_ref"),
+            "binding": question_literature_revision,
+        }
+    )
+    if (
+        question_literature_input["kind"] == "revision"
+        and not question_literature_input.get("revision_ref")
+    ):
+        raise OwnerConflict("reasoning_literature_binding_invalid")
+
+    plan = commits[1]
+    if plan.disposition == COMPLETED_DISPOSITION:
+        bundle_request = connection.execute(
+            text(
+                "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = :cycle_ref "
+                "AND stage = 'bundle' AND epoch = :epoch"
+            ),
+            {"cycle_ref": cycle_ref, "epoch": epoch},
+        ).first()
+        if bundle_request is None:
+            raise OwnerConflict("reasoning_plan_evidence_binding_missing")
+        bundle_context, bundle_question = _verify_stage_request_integrity(
+            bundle_request
+        )
+        if bundle_question != accepted_question:
+            raise OwnerConflict("reasoning_question_binding_mismatch")
+        formal_plan = _formal_plan_binding_from_context(bundle_context)
+        evidence_reuse_set = formal_plan.plan_document.get("evidence_reuse_set")
+        if not isinstance(evidence_reuse_set, list):
+            raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
+        selected_refs = {
+            item.get("evidence_ref")
+            for item in evidence_reuse_set
+            if isinstance(item, dict)
+        }
+        if (
+            len(selected_refs) != len(
+                {
+                    leaf.evidence_ref
+                    for leaf in evidence_reuse_closure
+                }
+            )
+            or selected_refs
+            != {leaf.evidence_ref for leaf in evidence_reuse_closure}
+        ):
+            raise OwnerConflict("reasoning_plan_evidence_closure_invalid")
+        plan_evidence_input: dict[str, object] = {
+            "kind": "accepted",
+            "formal_plan_binding": formal_plan.as_dict(),
+            "evidence_reuse_set": evidence_reuse_set,
+            "evidence_reuse_closure": [
+                leaf.as_public_dict() for leaf in evidence_reuse_closure
+            ],
+        }
+    else:
+        if evidence_reuse_closure:
+            raise OwnerConflict("reasoning_plan_evidence_closure_invalid")
+        plan_evidence_input = {
+            "kind": "none",
+            "basis_stage_commit_refs": [commit.commit_ref for commit in commits],
+        }
+
+    bundle = commits[2]
+    accepted_target_commit_closures: list[object] = []
+    if bundle.disposition == COMPLETED_DISPOSITION:
+        if not isinstance(bundle.closure, dict):
+            raise OwnerConflict("reasoning_target_closure_invalid")
+        target_closures = bundle.closure.get("accepted_measurement_closures")
+        if not isinstance(target_closures, list):
+            raise OwnerConflict("reasoning_target_closure_invalid")
+        accepted_target_commit_closures = target_closures
+    causal_context = {
+        "target_commit_refs": sorted(
+            {
+                str(value["target_commit_ref"])
+                for value in accepted_target_commit_closures
+                if isinstance(value, dict)
+                and isinstance(value.get("target_commit_ref"), str)
+            }
+        ),
+        "changed_axis_fact_refs": [],
+        "held_fixed_fact_refs": sorted(
+            {
+                "held_fixed_fact_" + canonical_hash(binding)[:32]
+                for value in accepted_target_commit_closures
+                if isinstance(value, dict)
+                for binding in cast(list[object], value.get("held_fixed_bindings", []))
+                if isinstance(binding, dict)
+            }
+        ),
+        "provenance_refs": sorted(
+            {
+                str(provenance_ref)
+                for value in accepted_target_commit_closures
+                if isinstance(value, dict)
+                for provenance_ref in cast(
+                    list[object], value.get("implementation_provenance_refs", [])
+                )
+                if isinstance(provenance_ref, str)
+            }
+        ),
+    }
+
+    context_pack: dict[str, object] = {
+        "schema_ref": "meta-research/reasoning-context-pack/v1",
+        "cycle_ref": cycle_ref,
+        "foreground_epoch": epoch,
+        "accepted_question_binding": accepted_question.as_dict(),
+        "question_literature_input": question_literature_input,
+        "upstream_stage_closure": closure,
+        "plan_evidence_input": plan_evidence_input,
+        "accepted_target_commit_closures": accepted_target_commit_closures,
+        "current_target_evidence_closure": [
+            leaf.as_public_dict() for leaf in current_target_evidence_closure
+        ],
+        "research_context": {
+            "schema_ref": "meta-research/reasoning-research-context/v2",
+            "cycle_ref": cycle_ref,
+            "quest_ref": accepted_question.quest_ref,
+            "question_ref": accepted_question.question_ref,
+            "goal_revision_ref": (
+                None
+                if quest_goal_revision is None
+                else quest_goal_revision.get("goal_revision_ref")
+            ),
+            "quest_goal_revision": quest_goal_revision,
+            "graph_binding": reasoning_graph_context,
+            "causal_context": causal_context,
+            "upstream_stage_commit_refs": [commit.commit_ref for commit in commits],
+        },
+    }
+    _validate_reasoning_context_pack(
+        context_pack,
+        cycle_ref=cycle_ref,
+        epoch=epoch,
+        accepted_question_binding=accepted_question.as_dict(),
+    )
+    return context_pack
+
+
+def _reasoning_route_rows_for_epoch(
+    connection,
+    *,
+    cycle_ref: str,
+    epoch: int,
+) -> list[object]:
+    """Return the current route, or its exact immutable preemption closure.
+
+    A forced switch revokes the foreground epoch but does not revoke accepted
+    upstream StageCommits.  When the same Cycle resumes directly at Reasoning,
+    no current-epoch commits exist yet; the one maximum prior epoch is the
+    issuer-owned closure to freeze.  A partial current epoch never falls back.
+    """
+
+    rows = list(
+        connection.execute(
+            text(
+                "SELECT * FROM ae_stage_commits WHERE cycle_ref = :cycle_ref "
+                "AND epoch = :epoch AND stage IN ('idea', 'plan', 'bundle')"
+            ),
+            {"cycle_ref": cycle_ref, "epoch": epoch},
+        ).all()
+    )
+    if rows:
+        return rows
+    prior_epoch = connection.execute(
+        text(
+            "SELECT MAX(epoch) FROM ae_stage_commits WHERE cycle_ref = "
+            ":cycle_ref AND epoch < :epoch AND stage IN "
+            "('idea', 'plan', 'bundle')"
+        ),
+        {"cycle_ref": cycle_ref, "epoch": epoch},
+    ).scalar_one()
+    if prior_epoch is None:
+        return []
+    return list(
+        connection.execute(
+            text(
+                "SELECT * FROM ae_stage_commits WHERE cycle_ref = :cycle_ref "
+                "AND epoch = :prior_epoch AND stage IN "
+                "('idea', 'plan', 'bundle')"
+            ),
+            {"cycle_ref": cycle_ref, "prior_epoch": int(prior_epoch)},
+        ).all()
+    )
+
+
+def _validate_reasoning_context_pack(
+    context_pack: dict[str, object],
+    *,
+    cycle_ref: str,
+    epoch: int,
+    accepted_question_binding: dict[str, object],
+) -> None:
+    if set(context_pack) != {
+        "schema_ref",
+        "cycle_ref",
+        "foreground_epoch",
+        "accepted_question_binding",
+        "question_literature_input",
+        "upstream_stage_closure",
+        "plan_evidence_input",
+        "accepted_target_commit_closures",
+        "current_target_evidence_closure",
+        "research_context",
+    } or (
+        context_pack.get("schema_ref")
+        != "meta-research/reasoning-context-pack/v1"
+        or context_pack.get("cycle_ref") != cycle_ref
+        or context_pack.get("foreground_epoch") != epoch
+        or context_pack.get("accepted_question_binding")
+        != accepted_question_binding
+    ):
+        raise OwnerConflict("reasoning_context_pack_invalid")
+    literature = context_pack.get("question_literature_input")
+    if not isinstance(literature, dict) or literature.get("kind") not in {
+        "none",
+        "revision",
+    }:
+        raise OwnerConflict("reasoning_literature_binding_invalid")
+    if (literature.get("kind") == "none" and set(literature) != {"kind"}) or (
+        literature.get("kind") == "revision"
+        and (
+            set(literature) != {"kind", "revision_ref", "binding"}
+            or not isinstance(literature.get("revision_ref"), str)
+            or not isinstance(literature.get("binding"), dict)
+        )
+    ):
+        raise OwnerConflict("reasoning_literature_binding_invalid")
+    if literature.get("kind") == "revision":
+        revision_binding = literature.get("binding")
+        if not isinstance(revision_binding, dict) or (
+            revision_binding.get("kind") != "QuestionLiteratureRevision"
+            or revision_binding.get("revision_ref")
+            != literature.get("revision_ref")
+            or revision_binding.get("question_ref")
+            != accepted_question_binding.get("question_ref")
+            or "snapshot_ref" in revision_binding
+            or not isinstance(
+                revision_binding.get("literature_snapshot_ref"), str
+            )
+            or not isinstance(revision_binding.get("records"), list)
+            or not isinstance(
+                revision_binding.get("rm_acceptance_receipt_ref"), str
+            )
+            or not isinstance(
+                revision_binding.get("rg_question_association_receipt_ref"),
+                str,
+            )
+        ):
+            raise OwnerConflict("reasoning_literature_binding_invalid")
+    closure = context_pack.get("upstream_stage_closure")
+    if not isinstance(closure, list) or [
+        item.get("stage") if isinstance(item, dict) else None for item in closure
+    ] != [IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE]:
+        raise OwnerConflict("reasoning_upstream_closure_invalid")
+    plan_input = context_pack.get("plan_evidence_input")
+    if not isinstance(plan_input, dict) or plan_input.get("kind") not in {
+        "accepted",
+        "none",
+    }:
+        raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
+    if plan_input.get("kind") == "accepted" and set(plan_input) != {
+        "kind",
+        "formal_plan_binding",
+        "evidence_reuse_set",
+        "evidence_reuse_closure",
+    }:
+        raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
+    if plan_input.get("kind") == "none" and set(plan_input) != {
+        "kind",
+        "basis_stage_commit_refs",
+    }:
+        raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
+    if plan_input.get("kind") == "accepted":
+        reuse_set = plan_input.get("evidence_reuse_set")
+        reuse_closure = plan_input.get("evidence_reuse_closure")
+        if (
+            not isinstance(reuse_set, list)
+            or not isinstance(reuse_closure, list)
+            or not all(isinstance(item, dict) for item in reuse_set)
+            or not all(isinstance(item, dict) for item in reuse_closure)
+            or {
+                item.get("evidence_ref")
+                for item in reuse_set
+                if isinstance(item, dict)
+            }
+            != {
+                item.get("evidence_ref")
+                for item in reuse_closure
+                if isinstance(item, dict)
+            }
+        ):
+            raise OwnerConflict("reasoning_plan_evidence_closure_invalid")
+    if not isinstance(context_pack.get("accepted_target_commit_closures"), list):
+        raise OwnerConflict("reasoning_target_closure_invalid")
+    target_evidence = context_pack.get("current_target_evidence_closure")
+    if (
+        not isinstance(target_evidence, list)
+        or not all(isinstance(item, dict) for item in target_evidence)
+    ):
+        raise OwnerConflict("reasoning_target_evidence_closure_invalid")
+    target_closures = cast(
+        list[object], context_pack["accepted_target_commit_closures"]
+    )
+    expected_target_refs = {
+        item.get("target_commit_ref")
+        for item in target_closures
+        if isinstance(item, dict)
+        and isinstance(item.get("target_commit_ref"), str)
+    }
+    actual_target_refs = {
+        item.get("target_commit_ref")
+        for item in target_evidence
+        if isinstance(item, dict)
+        and isinstance(item.get("target_commit_ref"), str)
+    }
+    if (
+        len(expected_target_refs) != len(target_closures)
+        or actual_target_refs != expected_target_refs
+        or any(item.get("evidence_use_hashes") != [] for item in target_evidence)
+        or any(
+            sum(
+                item.get("target_commit_ref") == target_ref
+                and item.get("role") == "MetricResult"
+                for item in target_evidence
+            )
+            != 1
+            for target_ref in expected_target_refs
+        )
+    ):
+        raise OwnerConflict("reasoning_target_evidence_closure_invalid")
+    research_context = context_pack.get("research_context")
+    if not isinstance(research_context, dict) or (
+        set(research_context) != {
+            "schema_ref", "cycle_ref", "quest_ref", "question_ref",
+            "goal_revision_ref", "quest_goal_revision", "graph_binding",
+            "causal_context", "upstream_stage_commit_refs",
+        }
+        or research_context.get("schema_ref")
+        != "meta-research/reasoning-research-context/v2"
+        or research_context.get("cycle_ref") != cycle_ref
+        or research_context.get("quest_ref")
+        != accepted_question_binding.get("quest_ref")
+        or research_context.get("question_ref")
+        != accepted_question_binding.get("question_ref")
+        or not isinstance(research_context.get("goal_revision_ref"), str)
+        or not isinstance(research_context.get("quest_goal_revision"), dict)
+        or research_context["quest_goal_revision"].get("goal_revision_ref")
+        != research_context.get("goal_revision_ref")
+        or research_context["quest_goal_revision"].get("quest_ref")
+        != accepted_question_binding.get("quest_ref")
+        or not isinstance(research_context.get("graph_binding"), dict)
+        or not isinstance(research_context.get("causal_context"), dict)
+        or research_context["graph_binding"].get("issuer")
+        != "research_graph"
+        or research_context["graph_binding"].get("quest_ref")
+        != accepted_question_binding.get("quest_ref")
+        or research_context["graph_binding"].get("question_ref")
+        != accepted_question_binding.get("question_ref")
+        or not isinstance(
+            research_context.get("upstream_stage_commit_refs"), list
+        )
+    ):
+        raise OwnerConflict("reasoning_research_context_invalid")
+
+
 def _question_binding_columns(binding: AcceptedQuestionBinding) -> dict[str, object]:
     return {
         "initialization_id": binding.initialization_id,
@@ -6404,11 +10888,26 @@ def _verify_stage_request_integrity(
             )
         elif row.stage == BUNDLE_STAGE:
             formal_plan = _formal_plan_binding_from_context(context_pack)
+            idea_set = (
+                _idea_set_binding_from_context(context_pack)
+                if "accepted_idea_set_binding" in context_pack
+                else None
+            )
             validate_bundle_context_pack(
                 context_pack,
                 cycle_ref=row.cycle_ref,
                 accepted_question_binding=binding.as_dict(),
                 accepted_formal_plan_binding=formal_plan.as_dict(),
+                accepted_idea_set_binding=(
+                    None if idea_set is None else idea_set.as_dict()
+                ),
+            )
+        elif row.stage == REASONING_STAGE:
+            _validate_reasoning_context_pack(
+                context_pack,
+                cycle_ref=row.cycle_ref,
+                epoch=int(row.epoch),
+                accepted_question_binding=binding.as_dict(),
             )
         else:
             raise OwnerConflict("stage_run_request_invalid")
@@ -6416,7 +10915,8 @@ def _verify_stage_request_integrity(
         raise OwnerConflict(str(error)) from error
     accepted_idea_set = (
         None
-        if row.stage != PLAN_STAGE
+        if row.stage not in {PLAN_STAGE, BUNDLE_STAGE}
+        or "accepted_idea_set_binding" not in context_pack
         else _idea_set_binding_from_context(context_pack)
     )
     accepted_formal_plan = (
@@ -6428,6 +10928,7 @@ def _verify_stage_request_integrity(
         IDEA_STAGE: "ensure_idea_stage_request",
         PLAN_STAGE: "ensure_plan_stage_request",
         BUNDLE_STAGE: "ensure_bundle_stage_request",
+        REASONING_STAGE: "ensure_reasoning_stage_request",
     }.get(row.stage)
     if command is None:
         raise OwnerConflict("stage_run_request_invalid")
@@ -6452,7 +10953,7 @@ def _verify_stage_request_integrity(
         }
     )
     if (
-        row.stage not in {IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE}
+        row.stage not in {IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE, REASONING_STAGE}
         or int(row.epoch) < 1
         or canonical_hash(context_pack) != row.context_pack_hash
         or canonical_json(context_pack) != row.context_pack_json
@@ -6483,7 +10984,8 @@ def _stage_request(row) -> StageRunRequest:
         ),
         accepted_idea_set=(
             None
-            if row.stage != PLAN_STAGE
+            if row.stage not in {PLAN_STAGE, BUNDLE_STAGE}
+            or "accepted_idea_set_binding" not in context_pack
             else _idea_set_binding_from_context(context_pack)
         ),
         accepted_formal_plan=(
@@ -6607,7 +11109,7 @@ def _stage_commit_bindings(row) -> dict[str, object]:
         "outcome_receipt_ref": row.outcome_receipt_ref,
         "outcome_receipt_hash": row.outcome_receipt_hash,
     }
-    if row.stage == BUNDLE_STAGE:
+    if row.stage in {BUNDLE_STAGE, REASONING_STAGE}:
         bindings["closure_hash"] = row.closure_hash
     return bindings
 
@@ -6632,9 +11134,8 @@ def _stage_commit(row) -> StageCommit:
             and row.outcome_kind
             in {TARGET_GRAPH_OUTCOME_KIND, BUNDLE_REPORT_OUTCOME_KIND}
         ) or (
-            row.stage == "reasoning"
-            and isinstance(row.outcome_kind, str)
-            and bool(row.outcome_kind)
+            row.stage == REASONING_STAGE
+            and row.outcome_kind == REASONING_OUTCOME_KIND
         )
         if (
             not valid_kind
@@ -6768,16 +11269,16 @@ def _stage_commit(row) -> StageCommit:
     else:
         raise OwnerConflict("stage_commit_disposition_invalid")
     closure = None
-    if row.stage == BUNDLE_STAGE and row.closure_json is not None:
+    if row.stage in {BUNDLE_STAGE, REASONING_STAGE} and row.closure_json is not None:
         try:
             closure = decoded_object(row.closure_json)
         except (TypeError, ValueError) as error:
-            raise OwnerConflict("bundle_stage_closure_invalid") from error
+            raise OwnerConflict(f"{row.stage}_stage_closure_invalid") from error
         if (
             canonical_json(closure) != row.closure_json
             or canonical_hash(closure) != row.closure_hash
         ):
-            raise OwnerConflict("bundle_stage_closure_invalid")
+            raise OwnerConflict(f"{row.stage}_stage_closure_invalid")
     return StageCommit(
         commit_ref=row.commit_ref,
         request_ref=row.request_ref,
@@ -6893,6 +11394,10 @@ def create_advancement_engine_interface(
     current_question_verifier: CurrentQuestionVerifier | None = None,
     bundle_report_verifier: BundleReportReceiptVerifier | None = None,
     bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
+    reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
+    question_literature_revision_verifier: (
+        QuestionLiteratureRevisionVerifier | None
+    ) = None,
 ) -> AdvancementEngineInterface:
     return SQLiteAdvancementEngine(
         database,
@@ -6915,4 +11420,6 @@ def create_advancement_engine_interface(
         current_question_verifier,
         bundle_report_verifier,
         bundle_report_evidence_verifier,
+        reasoning_outcome_verifier,
+        question_literature_revision_verifier,
     )
