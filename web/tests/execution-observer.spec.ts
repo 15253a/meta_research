@@ -248,6 +248,7 @@ async function freezeExperimentProjection(
   page: Page,
   initial: ExperimentFixture | null,
   installEvents?: (route: Route) => Promise<void>,
+  snapshotPatch: Record<string, unknown> = {},
 ) {
   const running = runningProduct();
   await running.authenticate(page);
@@ -276,6 +277,7 @@ async function freezeExperimentProjection(
           status: current ? "active" : "idle",
           current,
         },
+        ...snapshotPatch,
       }),
     });
   });
@@ -292,6 +294,83 @@ async function freezeExperimentProjection(
     },
   };
 }
+
+test("a quest-wide HumanRequest wins first presentation over a new current Fence", async ({
+  page,
+}) => {
+  const requestRef = "agent_runtime:HR-observer-priority:r1";
+  await freezeExperimentProjection(
+    page,
+    experimentFixture(),
+    undefined,
+    {
+      human_collaboration: {
+        companion: {
+          status: "ready",
+          scope_ref: `quest:${QUESTION.quest_ref}`,
+          messages: [],
+          soft_constraints: [],
+          agent_proposals: [],
+        },
+        human_requests: {
+          status: "ready",
+          waiting: {
+            scope: "quest",
+            safe_meaningful_runnable_exists: false,
+            other_blockers: [],
+          },
+          items: [{
+            request_ref: requestRef,
+            request_id: "HR-observer-priority",
+            revision: 1,
+            issuer: "agent_runtime",
+            quest_ref: QUESTION.quest_ref,
+            kind: "offline_action",
+            status: "open",
+            obligation: "先完成当前 Quest 的线下校准。",
+            business_purpose: "恢复同一 current Fence 的受控执行。",
+            target_assertion: {
+              question_ref: QUESTION.question_ref,
+              cycle_ref: "cycle-experiment-001",
+            },
+            acceptance_conditions: ["校准 receipt 已由对应 Owner 验证。"],
+            required_authorization: null,
+            direct_waiters: [{
+              waiter_ref: "run-formal-measurement-001",
+              generation: 2,
+              wait_scope: "quest",
+              status: "blocked",
+              other_blockers: [],
+            }],
+            responses: [],
+            evaluation: null,
+            disposition: null,
+          }],
+        },
+        commands: {
+          status: "ready",
+          authorizations: [],
+          items: [],
+        },
+      },
+    },
+  );
+
+  const humanRequest = page.getByRole("dialog", { name: "HumanRequest" });
+  await expect(humanRequest).toBeVisible();
+  await expect(humanRequest).toContainText("先完成当前 Quest 的线下校准。");
+  await expect(page.getByTestId("execution-observer")).toBeHidden();
+  await expect(page.locator(".execution-observer-backdrop")).toHaveAttribute(
+    "data-open",
+    "false",
+  );
+
+  await humanRequest.getByRole("button", { name: "关闭 HumanRequest" }).click();
+  const notice = page.getByTestId("execution-start-notice");
+  await expect(notice).toBeVisible();
+  await notice.getByRole("button", { name: "打开 stdout" }).click();
+  await expect(page.getByTestId("execution-observer")).toBeVisible();
+});
 
 test("accepted current Quest starts one high-level experiment intent through the Web", async ({
   page,

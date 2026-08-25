@@ -496,6 +496,41 @@ export type QuestionTreeItem = {
   question_receipt_ref: string;
   lifecycle_status: "active" | "pruned";
   lifecycle_revision: number;
+  cycle_binding: {
+    status: "bound" | "not_bound" | "unavailable";
+    cycle_ref: string | null;
+    foreground: null | {
+      quest_ref: string;
+      cycle_ref: string;
+      question_ref: string;
+      stage: string;
+      epoch: number;
+      status: string;
+      grant_ref: string;
+      grant_status: string;
+      safe_point_ref: string | null;
+      pending_operation_ref: string | null;
+      owner_revision: number;
+    };
+    reason: { code: string } | null;
+  };
+  related_human_requests: {
+    status: "ready" | "unavailable";
+    items: Array<{
+      request_ref: string;
+      issuer: string;
+      kind: string;
+      status: string;
+      revision: number;
+      bindings: Array<{
+        source: "target_assertion" | "direct_waiter";
+        waiter_ref?: string;
+        field: string;
+        ref: string;
+      }>;
+    }>;
+    reason: { code: string } | null;
+  };
 };
 
 export type QuestionTreeProjection =
@@ -929,6 +964,21 @@ export type TargetRootObservationPointer = {
   head_cursor: string;
 };
 
+export type BundleExhaustionProjection = {
+  kind: "BundleExhaustion";
+  status: string;
+  operation_ref: string;
+  proposal_identity: string;
+  proposal_hash: string;
+  proposal_ref: string;
+  decision_receipt: IdeaReceipt;
+  evidence?: Record<string, unknown> | null;
+  basis_kind?: string | null;
+  basis_ref?: string | null;
+  basis_receipt?: IdeaReceipt | null;
+  [key: string]: unknown;
+};
+
 export type BundleStageProjection = {
   eligibility: {
     status: string;
@@ -974,8 +1024,14 @@ export type BundleStageProjection = {
     receipt?: IdeaReceipt | null;
     [key: string]: unknown;
   }>;
+  bundle_exhaustion?: BundleExhaustionProjection;
   disposition: {
     status: string;
+    report_disposition?: "exhausted" | string | null;
+    operation_ref?: string;
+    proposal_ref?: string;
+    decision_receipt?: IdeaReceipt | null;
+    basis_receipt?: IdeaReceipt | null;
     target_count?: number;
     target_commit_count?: number;
     reason?: { code?: string; [key: string]: unknown };
@@ -984,6 +1040,9 @@ export type BundleStageProjection = {
   stage_commit: null | (NonNullable<IdeaStageProjection["stage_commit"]> & {
     target_commit_refs?: string[];
     disposition?: string;
+    basis_kind?: string | null;
+    basis_ref?: string | null;
+    basis_receipt?: IdeaReceipt | null;
   });
   [key: string]: unknown;
 };
@@ -1613,6 +1672,17 @@ export type PublicSnapshot = {
     quest_count: number;
     question_count: number;
     foreground_cycle_count: number;
+    current_quest: {
+      status: "ready" | "not_bound" | "unavailable";
+      quest_ref: string | null;
+      goal_revision_ref: string | null;
+      draft_revision: number | null;
+      draft_hash: string | null;
+      goal: string | null;
+      completion_criteria: string | null;
+      projection_digest: string | null;
+      reason: { code: string } | null;
+    };
     current_question?: IdeaQuestionSummary | null;
   };
   owners: Record<string, OwnerSnapshot>;

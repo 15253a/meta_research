@@ -32,6 +32,7 @@ INTENT_REQUEST="$VERIFY_ROOT/intent-request.json"
 GENERATION_REQUEST="$VERIFY_ROOT/generation-request.json"
 QUEST_VIEW="$VERIFY_ROOT/quest-view.json"
 SUCCESS_RESULT="$VERIFY_ROOT/success.json"
+BROWSER_SESSION="$VERIFY_ROOT/browser-session.json"
 
 cleanup() {
   if [[ -x "$INSTALL_ROOT/bin/meta-research" ]]; then
@@ -210,6 +211,17 @@ assert snapshot["research_space"] == {
     "quest_count": 0,
     "question_count": 0,
     "foreground_cycle_count": 0,
+    "current_quest": {
+        "status": "not_bound",
+        "quest_ref": None,
+        "goal_revision_ref": None,
+        "draft_revision": None,
+        "draft_hash": None,
+        "goal": None,
+        "completion_criteria": None,
+        "projection_digest": None,
+        "reason": {"code": "current_quest_not_bound"},
+    },
 }
 assert set(snapshot["owners"]) == {
     "research_graph",
@@ -445,6 +457,17 @@ assert snapshot["research_space"] == {
     "quest_count": 0,
     "question_count": 0,
     "foreground_cycle_count": 0,
+    "current_quest": {
+        "status": "not_bound",
+        "quest_ref": None,
+        "goal_revision_ref": None,
+        "draft_revision": None,
+        "draft_hash": None,
+        "goal": None,
+        "completion_criteria": None,
+        "projection_digest": None,
+        "reason": {"code": "current_quest_not_bound"},
+    },
 }
 PY
 
@@ -1017,6 +1040,14 @@ assert {key: research_space[key] for key in (
     "foreground_cycle_count": 1,
 }
 assert research_space["current_question"]["question_ref"] == confirmed["question_ref"]
+assert research_space["current_quest"]["status"] == "ready"
+assert research_space["current_quest"]["quest_ref"] == confirmed["quest_ref"]
+assert research_space["current_quest"]["goal"] == (
+    "验证安装 wheel 的 production Codex drafting 与 Owner receipt 链。"
+)
+assert research_space["current_quest"]["completion_criteria"] == (
+    "Intent、Proposal、Preview 与五层 receipt 均可公开复核。"
+)
 assert set(idea_stage) == {
     "eligibility",
     "stage_run_request",
@@ -1206,7 +1237,8 @@ fi
 PATH="$PROVIDER_PATH" "$CLI" start \
   --data-root "$DATA_ROOT" --port 0 --json >"$FINAL_RESTART_RESULT"
 "$INSTALL_ROOT/bin/python" - \
-  "$FINAL_RESTART_RESULT" "$SUCCESS_RESULT" "$CODEX_CALLS" <<'PY'
+  "$FINAL_RESTART_RESULT" "$SUCCESS_RESULT" "$CODEX_CALLS" \
+  "$BROWSER_SESSION" <<'PY'
 from http.cookiejar import CookieJar
 import json
 import pathlib
@@ -1218,6 +1250,7 @@ import urllib.request
 started = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 success = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 calls_path = pathlib.Path(sys.argv[3])
+browser_session_path = pathlib.Path(sys.argv[4])
 assert started["status"] == "started"
 base_url = started["base_url"]
 cookies = CookieJar()
@@ -1318,7 +1351,68 @@ assert settled["idea_stage"] == success["idea_stage"]
 assert len(calls_path.read_text(encoding="utf-8").splitlines()) == (
     success["provider_call_count"]
 )
+cookie_values = {cookie.name: cookie.value for cookie in cookies}
+assert set(cookie_values) >= {"meta_research_session", "meta_research_csrf"}
+current_experiment = success["experiments"]["second"]
+current_execution = current_experiment["execution"]
+execution_fence_key = (
+    f"{current_execution['run_ref']}:g"
+    f"{current_execution['attempt_generation']}:"
+    f"{current_execution['root_session_ref']}"
+)
+stage_candidates = [
+    (label, settled.get(key))
+    for label, key in (
+        ("Reasoning", "reasoning_stage"),
+        ("Bundle", "bundle_stage"),
+        ("Plan", "plan_stage"),
+        ("Idea", "idea_stage"),
+    )
+    if settled.get(key) is not None
+]
+current_stage = next(
+    (
+        label
+        for label, projection in stage_candidates
+        if projection["eligibility"]["status"] in {"eligible", "requested"}
+    ),
+    stage_candidates[0][0] if stage_candidates else None,
+)
+assert current_stage is not None
+browser_session_path.write_text(
+    json.dumps(
+        {
+            "base_url": base_url,
+            "cookies": [
+                {
+                    "name": "meta_research_session",
+                    "value": cookie_values["meta_research_session"],
+                    "httpOnly": True,
+                },
+                {
+                    "name": "meta_research_csrf",
+                    "value": cookie_values["meta_research_csrf"],
+                    "httpOnly": False,
+                },
+            ],
+            "expected": {
+                "quest_ref": success["quest_ref"],
+                "question_ref": success["question_ref"],
+                "stage": current_stage,
+                "experiment_title": current_experiment["intent"]["title"],
+                "execution_fence_key": execution_fence_key,
+            },
+        },
+        separators=(",", ":"),
+    ),
+    encoding="utf-8",
+)
+browser_session_path.chmod(0o600)
 PY
+
+test -x /usr/bin/google-chrome
+node "$PROJECT_ROOT/web/tests/support/installed-product-browser.mjs" \
+  "$BROWSER_SESSION"
 
 "$CLI" stop --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '
 import json, sys

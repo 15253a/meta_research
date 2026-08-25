@@ -122,6 +122,18 @@ test("Chrome observes the real Reasoning chain and keeps every Owner boundary se
     await publicReasoningStage(page)
   ).run?.status).toBe("admitted");
   const admitted = await publicReasoningStage(page);
+  const admittedSnapshot = await publicSnapshot(page);
+  expect(admittedSnapshot.idea_stage).toMatchObject({
+    outcome_acceptance: {
+      status: "accepted",
+      outcome_kind: "NoViableCandidate",
+    },
+    stage_commit: {
+      status: "Completed",
+      outcome_kind: "NoViableCandidate",
+      next_stage: "Reasoning",
+    },
+  });
   expect(admitted).toMatchObject({
     eligibility: { status: "requested", next_stage: "Reasoning" },
     stage_run_request: {

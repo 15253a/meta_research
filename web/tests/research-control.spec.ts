@@ -85,6 +85,20 @@ test("Foreground controls require draft preview confirmation and execution in th
         question_receipt_ref: "receipt-root",
         lifecycle_status: "active",
         lifecycle_revision: 1,
+        cycle_binding: {
+          status: "bound",
+          cycle_ref: "cycle_control_1",
+          foreground: {
+            quest_ref: "quest_control_1",
+            cycle_ref: "cycle_control_1",
+            question_ref: "question_control_root",
+            stage: "idea",
+            epoch: 3,
+            status: "active",
+          },
+          reason: null,
+        },
+        related_human_requests: { status: "ready", items: [], reason: null },
       }, {
         question_ref: "question_control_branch",
         quest_ref: "quest_control_1",
@@ -97,6 +111,13 @@ test("Foreground controls require draft preview confirmation and execution in th
         question_receipt_ref: "receipt-branch",
         lifecycle_status: "active",
         lifecycle_revision: 1,
+        cycle_binding: {
+          status: "not_bound",
+          cycle_ref: null,
+          foreground: null,
+          reason: { code: "current_foreground_not_bound" },
+        },
+        related_human_requests: { status: "ready", items: [], reason: null },
       }],
     },
     research_control: {

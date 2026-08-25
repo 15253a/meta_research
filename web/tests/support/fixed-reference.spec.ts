@@ -1,5 +1,8 @@
 import { expect, test } from "@playwright/test";
 import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { PNG } from "pngjs";
 
 import {
@@ -8,6 +11,57 @@ import {
   normalizeReviewedRasterPixels,
   normalizeReviewedRasterRegion,
 } from "./fixed-reference.js";
+
+const FIXED_REFERENCE_MANIFEST_SHA256 =
+  "bf5fcca85188fca3a2df02ff1db92be2275828c4b162cd62e6e76d88fa4d5d2b";
+
+type FixedReferenceManifest = {
+  references: Record<
+    string,
+    {
+      sha256: string;
+      reviewedProductionSha256?: string;
+    }
+  >;
+};
+
+test("locks the fixed-reference manifest and every PNG it declares", () => {
+  const referenceDirectory = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "../fixed-references/d7e2c9b7",
+  );
+  const manifestBytes = readFileSync(resolve(referenceDirectory, "manifest.json"));
+  const digest = (bytes: Buffer) =>
+    createHash("sha256").update(bytes).digest("hex");
+
+  expect(digest(manifestBytes)).toBe(FIXED_REFERENCE_MANIFEST_SHA256);
+
+  const manifest = JSON.parse(
+    manifestBytes.toString("utf8"),
+  ) as FixedReferenceManifest;
+  const declaredPngs = new Set<string>();
+
+  for (const [filename, entry] of Object.entries(manifest.references)) {
+    expect(filename).toMatch(/^[a-z0-9-]+\.png$/);
+    declaredPngs.add(filename);
+    expect(digest(readFileSync(resolve(referenceDirectory, filename)))).toBe(
+      entry.sha256,
+    );
+
+    if (entry.reviewedProductionSha256 !== undefined) {
+      const reviewedFilename = `reviewed-production-${filename}`;
+      declaredPngs.add(reviewedFilename);
+      expect(
+        digest(readFileSync(resolve(referenceDirectory, reviewedFilename))),
+      ).toBe(entry.reviewedProductionSha256);
+    }
+  }
+
+  const presentPngs = readdirSync(referenceDirectory)
+    .filter((filename) => filename.endsWith(".png"))
+    .sort();
+  expect(presentPngs).toEqual([...declaredPngs].sort());
+});
 
 
 test("rejects a spatially displaced diff with the same total ratio", () => {

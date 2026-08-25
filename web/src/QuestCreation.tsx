@@ -1071,18 +1071,10 @@ export function QuestCreationWorkbench({
       return;
     }
     if (writeConflictRef.current) {
-      errorFocusRef.current = "conflict";
-      setError((currentError) => currentError ?? {
-        code: writeConflictRef.current === "draft"
-          ? "quest_draft_stale"
-          : "question_proposal_stale",
-        message: messageFor(
-          writeConflictRef.current === "draft"
-            ? "quest_draft_stale"
-            : "question_proposal_stale",
-        ),
-      });
-      requestAnimationFrame(() => conflictRecoveryRef.current?.focus());
+      // Closing a conflicted recovery view is a local navigation action. The
+      // stale browser draft must neither be persisted nor trap the user in the
+      // dialog; reopening hydrates the latest durable version.
+      finalizeClose();
       return;
     }
     closingRef.current = true;

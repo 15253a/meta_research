@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from meta_research.composition import build_production_runtime
+from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
     HostComputeDevice,
@@ -294,6 +295,17 @@ def test_installed_v2_api_exposes_typed_provider_unavailability_without_domain_f
         "quest_count": 0,
         "question_count": 0,
         "foreground_cycle_count": 0,
+        "current_quest": {
+            "status": "not_bound",
+            "quest_ref": None,
+            "goal_revision_ref": None,
+            "draft_revision": None,
+            "draft_hash": None,
+            "goal": None,
+            "completion_criteria": None,
+            "projection_digest": None,
+            "reason": {"code": "current_quest_not_bound"},
+        },
     }
 
     shell = client.get("/")
@@ -386,6 +398,17 @@ def test_installed_v2_api_exposes_typed_provider_unavailability_without_domain_f
         "quest_count": 0,
         "question_count": 0,
         "foreground_cycle_count": 0,
+        "current_quest": {
+            "status": "not_bound",
+            "quest_ref": None,
+            "goal_revision_ref": None,
+            "draft_revision": None,
+            "draft_hash": None,
+            "goal": None,
+            "completion_criteria": None,
+            "projection_digest": None,
+            "reason": {"code": "current_quest_not_bound"},
+        },
     }
 
     initialization_id = opened["initialization_id"]
@@ -592,9 +615,8 @@ def test_injected_async_success_auto_previews_and_recovers_owner_receipts(
     assert completed["quest_ref"].startswith("quest_")
     assert completed["question_ref"].startswith("question_")
     assert completed["cycle_ref"].startswith("cycle_")
-    research_space = resumed_client.get("/api/v1/snapshot").json()[
-        "research_space"
-    ]
+    snapshot = resumed_client.get("/api/v1/snapshot").json()
+    research_space = snapshot["research_space"]
     assert {
         key: research_space[key]
         for key in (
@@ -612,6 +634,32 @@ def test_injected_async_success_auto_previews_and_recovers_owner_receipts(
     assert research_space["current_question"]["question_ref"] == completed[
         "question_ref"
     ]
+    owner_goal = restarted.owners.research_graph.query_current_quest_goal_revision(
+        completed["quest_ref"]
+    )
+    assert owner_goal is not None
+    assert research_space["current_quest"] == {
+        "status": "ready",
+        "quest_ref": completed["quest_ref"],
+        "goal_revision_ref": owner_goal["goal_revision_ref"],
+        "draft_revision": saved["quest_draft"]["revision"],
+        "draft_hash": saved["quest_draft"]["hash"],
+        "goal": _draft_from(probed)["goal"],
+        "completion_criteria": _draft_from(probed)["completion_criteria"],
+        "projection_digest": canonical_hash(owner_goal),
+        "reason": None,
+    }
+    [root_question] = snapshot["question_tree"]["items"]
+    assert root_question["cycle_binding"]["status"] == "bound"
+    assert root_question["cycle_binding"]["cycle_ref"] == completed["cycle_ref"]
+    assert root_question["cycle_binding"]["foreground"]["question_ref"] == (
+        completed["question_ref"]
+    )
+    assert root_question["related_human_requests"] == {
+        "status": "ready",
+        "items": [],
+        "reason": None,
+    }
     assert resumed_client.get(
         f"/api/v1/quest-initializations/{opened['initialization_id']}/intent-session"
     ).json()["intent_session"]["turns"][0]["assistant_status"] == "completed"

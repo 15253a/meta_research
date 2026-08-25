@@ -25,6 +25,7 @@ type DeterministicProductOptions = {
   manualRoot?: boolean;
   stagePipeline?:
     | "plan-gap"
+    | "bundle-exhaustion"
     | "reasoning-no-evidence"
     | "reasoning-autonomous"
     | "quest-completion";

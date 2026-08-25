@@ -6,11 +6,30 @@ import json
 import socket
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import uvicorn
 
 import meta_research.web as web_module
+from meta_research.bundle_exhaustion import (
+    BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA,
+    BundleExhaustionReviewTrace,
+    bundle_exhaustion_review_response_document,
+    bundle_exhaustion_review_task_hash,
+    bundle_exhaustion_route_fingerprint,
+)
+from meta_research.bundle_protocol import RouteSpec
+from meta_research.bundle_skill import (
+    BundleExhaustionSkillResult,
+    BundleSkillDraft,
+    BundleSkillRequest,
+)
+from meta_research.bundle_target_contract import (
+    build_normalized_completion_contract,
+    normalized_completion_contract_to_dict,
+)
 from meta_research.composition import build_production_runtime
 from meta_research.deepfetch import (
     DeepFetchProviderRequest,
@@ -22,7 +41,16 @@ from meta_research.idea_skill import (
     IdeaSkillRequest,
     IdeaSkillResult,
 )
+from meta_research.harness import FullConformanceRequest
+from meta_research.harness_adapters import (
+    CLAUDE_LOCKED_VERSION,
+    CODEX_LOCKED_VERSION,
+    HARNESS_CAPABILITIES,
+    HarnessInvocation,
+    HarnessTurnEvidence,
+)
 from meta_research.owners.agent_runtime import (
+    BundleRuntimeBinding,
     IdeaRuntimeBinding,
     PlanRuntimeBinding,
     ReasoningRuntimeBinding,
@@ -206,6 +234,68 @@ class ConfirmedDeterministicPowerInhibitor:
         with self._lock:
             self.release_calls.append(lease.holder_ref)
             self._live_holders.discard(lease.holder_ref)
+
+
+class DeterministicFullConformanceAdapter:
+    """Complete Harness evidence for Bundle admission in production E2E."""
+
+    def __init__(self, family: str) -> None:
+        self.family = family
+        self.locked_version = (
+            CODEX_LOCKED_VERSION
+            if family == "codex"
+            else CLAUDE_LOCKED_VERSION
+        )
+
+    def installation_profile(self) -> dict[str, object]:
+        return {
+            "harness_family": self.family,
+            "locked_version": self.locked_version,
+            "provider_version": self.locked_version,
+            "status": "ready",
+        }
+
+    def provider_operation_timeout_seconds(self, *, target_root: bool) -> float:
+        return 30 * 24 * 60 * 60 if target_root else 300.0
+
+    def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
+        native_session_ref = (
+            invocation.native_session_ref or f"{self.family}-native-session"
+        )
+        evidence_events = tuple(
+            {
+                "event_ref": "harness_evidence:"
+                + canonical_hash(
+                    {
+                        "operation_ref": invocation.provider_operation_ref,
+                        "capability": capability,
+                    }
+                ),
+                "sequence": sequence,
+                "kind": f"observed:{capability}",
+            }
+            for sequence, capability in enumerate(HARNESS_CAPABILITIES, start=1)
+        )
+        capabilities = {
+            capability: {
+                "status": "available",
+                "evidence_refs": [evidence_events[sequence - 1]["event_ref"]],
+            }
+            for sequence, capability in enumerate(HARNESS_CAPABILITIES, start=1)
+        }
+        return HarnessTurnEvidence(
+            native_session_ref=native_session_ref,
+            profile={
+                "schema_ref": "meta-research/harness-capability-profile/v1",
+                "harness_family": self.family,
+                "locked_version": self.locked_version,
+                "provider_version": self.locked_version,
+                "native_session_ref": native_session_ref,
+                "capabilities": capabilities,
+            },
+            evidence_events=evidence_events,
+            stream_hash=canonical_hash(evidence_events),
+        )
 
 
 class DeterministicDraftingAdapter:
@@ -1033,6 +1123,186 @@ class ControlledDeterministicPlanSkill:
         return self.review_draft(request, draft)
 
 
+class DeterministicExhaustionBundleSkill:
+    """A fixed-contract exhaustion provider exercised by the Bundle worker."""
+
+    def runtime_binding(self) -> BundleRuntimeBinding:
+        return BundleRuntimeBinding(
+            packaged_skill_bundle_hash=canonical_hash(
+                {"skill": "chrome-production-bundle-exhaustion"}
+            ),
+            instruction_set_hash=canonical_hash(
+                {"instructions": "chrome-production-bundle-exhaustion"}
+            ),
+            model_ref="chrome-test-model",
+            harness_adapter_ref="chrome-deterministic-bundle-exhaustion-v1",
+            mcp_bindings=(),
+            capability_bindings=(),
+            resource_bindings=(),
+        )
+
+    def _assessment(self, request: BundleSkillRequest) -> dict[str, object]:
+        briefs = cast(
+            list[dict[str, object]], request.plan_document["experiment_briefs"]
+        )
+        normalization: list[dict[str, object]] = []
+        records: list[dict[str, object]] = []
+        plan_hash = canonical_hash(request.plan_document)
+        for ordinal, brief in enumerate(briefs, start=1):
+            experiment_key = cast(str, brief["experiment_key"])
+            measurement_unit_key = f"measurement:{experiment_key}"
+            route = RouteSpec(
+                route_ref=f"route:semantic:{experiment_key}",
+                known_external_operation_refs=(),
+            )
+            normalization.append(
+                {
+                    "experiment_key": experiment_key,
+                    "held_fixed_slots": [],
+                    "required_measurement_unit_keys": [measurement_unit_key],
+                }
+            )
+            records.append(
+                {
+                    "record_ref": f"exploration:{ordinal:04d}",
+                    "experiment_key": experiment_key,
+                    "measurement_unit_key": measurement_unit_key,
+                    "held_fixed_bindings": [],
+                    "route": {
+                        "route_ref": route.route_ref,
+                        "known_external_operation_refs": [],
+                    },
+                    "route_disposition": {
+                        "disposition_ref": f"route-disposition:{ordinal:04d}",
+                        "route_ref": route.route_ref,
+                        "experiment_keys": [experiment_key],
+                        "outcome": "semantically_ineligible",
+                        "required_changes": [],
+                        "evidence_refs": [
+                            f"semantic-evidence:{experiment_key}"
+                        ],
+                        "external_reconciliations": [],
+                    },
+                    "frozen_semantic_fingerprint": (
+                        bundle_exhaustion_route_fingerprint(
+                            formal_plan_content_hash=plan_hash,
+                            experiment_key=experiment_key,
+                            measurement_unit_key=measurement_unit_key,
+                            held_fixed_bindings=(),
+                            route=route,
+                        )
+                    ),
+                }
+            )
+        completion = build_normalized_completion_contract(
+            request.plan_document, tuple(normalization)
+        )
+        return {
+            "exhaustion_assessment": {
+                "schema_ref": BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA,
+                "completion_contract": normalized_completion_contract_to_dict(
+                    completion
+                ),
+                "exploration_records": records,
+            }
+        }
+
+    def generate_draft(self, request: BundleSkillRequest) -> BundleSkillDraft:
+        return BundleSkillDraft(
+            draft=self._assessment(request),
+            primary_session_ref=(
+                request.native_session_ref
+                or "chrome-bundle-exhaustion-primary-session"
+            ),
+            adapter_kind="chrome_deterministic_bundle_exhaustion",
+            output_kind="exhaustion_assessment",
+        )
+
+    @staticmethod
+    def _transport_seal(
+        trace: BundleExhaustionReviewTrace,
+        *,
+        runtime_binding_hash: str,
+    ) -> str:
+        return canonical_hash(
+            {
+                "schema_ref": "test/bundle-exhaustion-transport-seal/v1",
+                "runtime_binding_hash": runtime_binding_hash,
+                "trace": trace.unsigned_dict(),
+            }
+        )
+
+    def review_draft(
+        self,
+        request: BundleSkillRequest,
+        draft: BundleSkillDraft,
+    ) -> BundleExhaustionSkillResult:
+        assessment_hash = canonical_hash(draft.draft)
+        reviewer = "chrome-bundle-exhaustion-independent-reviewer"
+        trace = BundleExhaustionReviewTrace(
+            run_ref=request.run_ref,
+            attempt_ref=request.attempt_ref,
+            fence_ref=request.fence_ref,
+            primary_session_ref=draft.primary_session_ref,
+            reviewer_agent_ref=reviewer,
+            reviewed_assessment_hash=assessment_hash,
+            review_task_hash=bundle_exhaustion_review_task_hash(
+                reviewed_assessment_hash=assessment_hash,
+                formal_plan_content_hash=canonical_hash(request.plan_document),
+            ),
+            review_response_hash=canonical_hash(
+                bundle_exhaustion_review_response_document(
+                    reviewer_agent_ref=reviewer,
+                    reviewed_assessment_hash=assessment_hash,
+                )
+            ),
+            spawn_event_hash=canonical_hash(
+                {"event": "spawn", "reviewer": reviewer}
+            ),
+            completion_event_hash=canonical_hash(
+                {"event": "completed", "reviewer": reviewer}
+            ),
+            transport_seal="0" * 64,
+        )
+        trace = replace(
+            trace,
+            transport_seal=self._transport_seal(
+                trace,
+                runtime_binding_hash=canonical_hash(
+                    request.runtime_binding.as_dict()
+                ),
+            ),
+        )
+        return BundleExhaustionSkillResult(
+            reviewed_assessment=draft.draft,
+            reviewed_assessment_hash=assessment_hash,
+            findings=(),
+            primary_session_ref=draft.primary_session_ref,
+            review_mode="harness_child_agent",
+            reviewer_agent_ref=reviewer,
+            adapter_kind=draft.adapter_kind,
+            review_trace=trace,
+        )
+
+    def verify_bundle_exhaustion_review_trace(
+        self,
+        trace: BundleExhaustionReviewTrace,
+        *,
+        runtime_binding_hash: str,
+    ) -> None:
+        expected = self._transport_seal(
+            replace(trace, transport_seal="0" * 64),
+            runtime_binding_hash=runtime_binding_hash,
+        )
+        if trace.transport_seal != expected:
+            raise RuntimeError("bundle_exhaustion_review_trace_seal_invalid")
+
+    def execute(
+        self, request: BundleSkillRequest
+    ) -> BundleExhaustionSkillResult:
+        return self.review_draft(request, self.generate_draft(request))
+
+
 class TransientResearchGraph:
     """The first initialization fails at the first Owner for three retries."""
 
@@ -1231,14 +1501,17 @@ async def serve(
     prepared_data_root = prepare_data_root(data_root)
     idea_skill = None
     plan_skill = None
+    bundle_skill = None
     reasoning_skill = None
-    if stage_pipeline == "plan-gap":
+    if stage_pipeline in {"plan-gap", "bundle-exhaustion"}:
         idea_skill = DeterministicIdeaSkill()
         plan_skill = ControlledDeterministicPlanSkill(
             ProviderPhaseControl(
                 prepared_data_root.run / "chrome-provider-control"
             )
         )
+        if stage_pipeline == "bundle-exhaustion":
+            bundle_skill = DeterministicExhaustionBundleSkill()
     elif stage_pipeline in {"reasoning-no-evidence", "quest-completion"}:
         idea_skill = DeterministicIdeaSkill(no_viable=True)
         reasoning_skill = ControlledDeterministicReasoningSkill(
@@ -1261,6 +1534,14 @@ async def serve(
         else None
     )
     power_inhibitor = ConfirmedDeterministicPowerInhibitor()
+    harness_adapters = (
+        (
+            DeterministicFullConformanceAdapter("codex"),
+            DeterministicFullConformanceAdapter("claude"),
+        )
+        if stage_pipeline == "bundle-exhaustion"
+        else None
+    )
     runtime = build_production_runtime(
         prepared_data_root,
         proposal_drafter=adapter,
@@ -1268,13 +1549,31 @@ async def serve(
         host_compute_probe=SequencedHostProbe(intent_started),
         idea_skill_provider=idea_skill,
         plan_skill_provider=plan_skill,
+        bundle_skill_provider=bundle_skill,
         reasoning_skill_provider=reasoning_skill,
         writing_skill_provider=DeterministicWritingSkill(),
         writing_delivery_provider_registry=writing_delivery_registry,
         deepfetch_provider=DeterministicDeepFetchProvider(),
         power_inhibitor=power_inhibitor,
+        harness_adapters=harness_adapters,
         startup_harness_diagnostics=False,
     )
+    if stage_pipeline == "bundle-exhaustion":
+        runtime.harnesses.start_full_conformance(
+            FullConformanceRequest(
+                codex_model_ref="gpt-conformance",
+                codex_auth_profile_ref="harness-profile:codex-default",
+                claude_model_ref="claude-conformance",
+                claude_auth_profile_ref="harness-profile:claude-default",
+            )
+        )
+        for _turn in range(4):
+            if not runtime.harnesses.advance_full_conformance(
+                mcp_base_url="http://127.0.0.1:8765"
+            ):
+                raise RuntimeError(
+                    "deterministic Harness full conformance did not advance"
+                )
     human_collaboration = runtime.owners.human_collaboration
     if manual_root:
         seed_manual_root(human_collaboration)
@@ -1350,6 +1649,7 @@ def main() -> None:
         "--stage-pipeline",
         choices=(
             "plan-gap",
+            "bundle-exhaustion",
             "reasoning-no-evidence",
             "reasoning-autonomous",
             "quest-completion",

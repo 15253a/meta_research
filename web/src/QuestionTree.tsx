@@ -10,7 +10,7 @@ import {
   type WheelEvent as ReactWheelEvent,
 } from "react";
 
-import type { QuestionTreeItem } from "./api";
+import type { ExperimentProjection, QuestionTreeItem } from "./api";
 import "./QuestionTree.css";
 
 export type QuestionTreeProps = {
@@ -23,7 +23,14 @@ export type QuestionTreeProps = {
   controlsInert?: boolean;
   openingParentRef?: string | null;
   openError?: string | null;
+  currentExperiment?: ExperimentProjection | null;
   onClose: () => void;
+  onOpenExperiment?: (opener: HTMLButtonElement) => void;
+  onSelectionChange?: (selected: QuestionTreeItem | null) => void;
+  onDiscussQuestion?: (
+    selected: QuestionTreeItem,
+    opener: HTMLButtonElement,
+  ) => void;
   onCreateQuestion: (
     parent: QuestionTreeItem,
     opener: HTMLButtonElement,
@@ -65,6 +72,48 @@ const WORLD_MIN_WIDTH = 1_280;
 const WORLD_MIN_HEIGHT = 660;
 const MIN_SCALE = 0.42;
 const MAX_SCALE = 1.8;
+const OUTLINE_MEDIA_QUERY = "(max-width: 620px)";
+
+function currentExperimentHasFence(
+  experiment: ExperimentProjection | null | undefined,
+): boolean {
+  const execution = experiment?.execution;
+  return Boolean(
+    execution?.run_ref &&
+      typeof execution.attempt_generation === "number" &&
+      execution.root_session_ref &&
+      execution.fence_ref &&
+      Array.isArray(execution.events),
+  );
+}
+
+function cycleBindingCopy(item: QuestionTreeItem): string {
+  const binding = item.cycle_binding;
+  if (binding.status !== "bound" || !binding.foreground || !binding.cycle_ref) {
+    return `${binding.status} · ${binding.reason?.code ?? "cycle_binding_not_bound"}`;
+  }
+  return `${binding.cycle_ref} · ${binding.foreground.stage} · epoch ${binding.foreground.epoch} · ${binding.foreground.status}`;
+}
+
+function relatedHumanRequestCopy(item: QuestionTreeItem): string {
+  const related = item.related_human_requests;
+  if (related.status !== "ready") {
+    return `${related.status} · ${related.reason?.code ?? "human_request_projection_unavailable"}`;
+  }
+  if (!related.items.length) return "当前问题没有显式关联 HumanRequest";
+  return related.items.map((request) => {
+    const bindings = request.bindings.map((binding) => (
+      `${binding.source}.${binding.field}=${binding.ref}`
+    )).join(", ");
+    return `${request.request_ref} · ${request.kind} · ${request.status} · ${bindings}`;
+  }).join(" / ");
+}
+
+function relatedHumanRequestCount(item: QuestionTreeItem): number {
+  return item.related_human_requests.status === "ready"
+    ? item.related_human_requests.items.length
+    : 0;
+}
 
 function questionLayout(items: readonly QuestionTreeItem[]): CanvasLayout {
   const byQuestionRef = new Map(items.map((item) => [item.question_ref, item]));
@@ -186,12 +235,17 @@ export function QuestionTree({
   controlsInert = false,
   openingParentRef = null,
   openError = null,
+  currentExperiment = null,
   onClose,
+  onOpenExperiment,
+  onSelectionChange,
+  onDiscussQuestion,
   onCreateQuestion,
   onControlQuestion,
 }: QuestionTreeProps) {
   const mainRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const reportedSelectionKeyRef = useRef<string | null | undefined>(undefined);
   const dragRef = useRef<null | {
     pointerId: number;
     clientX: number;
@@ -213,20 +267,42 @@ export function QuestionTree({
   });
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [dragging, setDragging] = useState(false);
+  const [outlineMode, setOutlineMode] = useState(
+    () => typeof window !== "undefined" && window.matchMedia(OUTLINE_MEDIA_QUERY).matches,
+  );
   const selected = selectedRef ? layout.byRef.get(selectedRef) ?? null : null;
+  const experimentObservable = currentExperimentHasFence(currentExperiment) &&
+    Boolean(onOpenExperiment);
 
   useEffect(() => {
     mainRef.current?.focus({ preventScroll: true });
   }, []);
 
   useEffect(() => {
-    if (initialQuestionRef && layout.byRef.has(initialQuestionRef)) {
-      setSelectedRef(initialQuestionRef);
-      return;
-    }
+    const media = window.matchMedia(OUTLINE_MEDIA_QUERY);
+    const update = () => setOutlineMode(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
     if (selectedRef && layout.byRef.has(selectedRef)) return;
-    setSelectedRef(layout.nodes[0]?.question_ref ?? null);
+    setSelectedRef(
+      initialQuestionRef && layout.byRef.has(initialQuestionRef)
+        ? initialQuestionRef
+        : layout.nodes[0]?.question_ref ?? null,
+    );
   }, [initialQuestionRef, layout, selectedRef]);
+
+  useEffect(() => {
+    const nextKey = selected
+      ? `${selected.question_ref}:${selected.content_hash}:${selected.lifecycle_revision}`
+      : null;
+    if (reportedSelectionKeyRef.current === nextKey) return;
+    reportedSelectionKeyRef.current = nextKey;
+    onSelectionChange?.(selected);
+  }, [onSelectionChange, selected]);
 
   const fitCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -234,17 +310,36 @@ export function QuestionTree({
     const rect = canvas.getBoundingClientRect();
     const width = Math.max(1, rect.width);
     const height = Math.max(1, rect.height);
+    setViewport((current) => (
+      current.width === width && current.height === height
+        ? current
+        : { width, height }
+    ));
+    if (outlineMode) {
+      setTransform((current) => (
+        current.x === 0 && current.y === 0 && current.scale === 1
+          ? current
+          : { x: 0, y: 0, scale: 1 }
+      ));
+      return;
+    }
     const scale = clampScale(Math.min(
       (width - 42) / layout.width,
       (height - 34) / layout.height,
     ));
-    setViewport({ width, height });
-    setTransform({
+    const next = {
       scale,
       x: (width - layout.width * scale) / 2,
       y: (height - layout.height * scale) / 2,
-    });
-  }, [layout.height, layout.width]);
+    };
+    setTransform((current) => (
+      Math.abs(current.x - next.x) < 0.01 &&
+      Math.abs(current.y - next.y) < 0.01 &&
+      Math.abs(current.scale - next.scale) < 0.0001
+        ? current
+        : next
+    ));
+  }, [layout.height, layout.width, outlineMode]);
 
   useEffect(() => {
     const frame = requestAnimationFrame(fitCanvas);
@@ -264,18 +359,22 @@ export function QuestionTree({
     const node = layout.byRef.get(questionRef);
     const canvas = canvasRef.current;
     if (!node || !canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    setTransform((current) => ({
-      ...current,
-      x: rect.width / 2 - (node.x + NODE_WIDTH / 2) * current.scale,
-      y: rect.height / 2 - (node.y + NODE_HEIGHT / 2) * current.scale,
-    }));
+    if (!outlineMode) {
+      const rect = canvas.getBoundingClientRect();
+      setTransform((current) => ({
+        ...current,
+        x: rect.width / 2 - (node.x + NODE_WIDTH / 2) * current.scale,
+        y: rect.height / 2 - (node.y + NODE_HEIGHT / 2) * current.scale,
+      }));
+    }
     requestAnimationFrame(() => {
-      canvas.querySelector<HTMLElement>(
+      const target = canvas.querySelector<HTMLElement>(
         `[data-question-ref="${CSS.escape(questionRef)}"]`,
-      )?.focus({ preventScroll: true });
+      );
+      target?.focus({ preventScroll: true });
+      if (outlineMode) target?.scrollIntoView({ block: "nearest" });
     });
-  }, [layout]);
+  }, [layout, outlineMode]);
 
   const zoomCanvas = (multiplier: number) => {
     const canvas = canvasRef.current;
@@ -295,6 +394,7 @@ export function QuestionTree({
   };
 
   const wheelCanvas = (event: ReactWheelEvent<HTMLDivElement>) => {
+    if (outlineMode) return;
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
     const pointerX = event.clientX - rect.left;
@@ -311,6 +411,7 @@ export function QuestionTree({
   };
 
   const startDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (outlineMode) return;
     if ((event.target as Element).closest("button,.question-canvas-node")) return;
     dragRef.current = {
       pointerId: event.pointerId,
@@ -408,7 +509,18 @@ export function QuestionTree({
           </div>
           <div className="question-tree-tools">
             <span className="projection">{projectionLabel}</span>
-            <button type="button" disabled title="capability_unavailable · stdout">
+            <button
+              type="button"
+              disabled={controlsInert || !experimentObservable}
+              title={experimentObservable
+                ? "重新打开当前 Experiment identity 的 stdout"
+                : onOpenExperiment
+                  ? "当前没有可观测 Experiment identity"
+                  : "capability_unavailable · current_experiment_observer"}
+              onClick={(event) => {
+                if (experimentObservable) onOpenExperiment?.(event.currentTarget);
+              }}
+            >
               当前实验 · stdout
             </button>
             <button
@@ -427,7 +539,7 @@ export function QuestionTree({
             >
               聚焦当前支线
             </button>
-            <button type="button" onClick={fitCanvas}>适配画布</button>
+            <button className="question-tree-canvas-only" type="button" onClick={fitCanvas}>适配画布</button>
             <button type="button" onClick={onClose}>回到总览</button>
           </div>
         </header>
@@ -439,21 +551,29 @@ export function QuestionTree({
           </div>
         ) : null}
 
-        <section className="question-tree-card" aria-label="当前问题树画布">
+        <section
+          className="question-tree-card"
+          aria-label={outlineMode ? "当前问题树缩进大纲" : "当前问题树画布"}
+        >
           <div className="question-tree-topline">
-            <b>问题树画布</b>
-            <small>拖拽平移 · 滚轮缩放 · {graphLabel} 只读投影</small>
+            <b>{outlineMode ? "问题树大纲" : "问题树画布"}</b>
+            <small>{outlineMode
+              ? `缩进层级 · 键盘导航 · ${graphLabel} 只读投影`
+              : `拖拽平移 · 滚轮缩放 · ${graphLabel} 只读投影`}</small>
           </div>
           <div
             ref={canvasRef}
             className={`question-tree-canvas${dragging ? " dragging" : ""}`}
-            tabIndex={0}
-            aria-label="可拖拽和缩放的 Quest 问题树画布"
-            onWheel={wheelCanvas}
-            onPointerDown={startDrag}
-            onPointerMove={moveDrag}
-            onPointerUp={endDrag}
-            onPointerCancel={endDrag}
+            data-layout-mode={outlineMode ? "outline" : "canvas"}
+            tabIndex={outlineMode ? -1 : 0}
+            aria-label={outlineMode
+              ? "Quest 问题树缩进大纲"
+              : "可拖拽和缩放的 Quest 问题树画布"}
+            onWheel={outlineMode ? undefined : wheelCanvas}
+            onPointerDown={outlineMode ? undefined : startDrag}
+            onPointerMove={outlineMode ? undefined : moveDrag}
+            onPointerUp={outlineMode ? undefined : endDrag}
+            onPointerCancel={outlineMode ? undefined : endDrag}
           >
             {layout.nodes.length ? (
               <div
@@ -461,9 +581,11 @@ export function QuestionTree({
                 role="tree"
                 aria-label="Quest 问题树"
                 style={{
-                  width: layout.width,
-                  height: layout.height,
-                  transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`,
+                  width: outlineMode ? "100%" : layout.width,
+                  height: outlineMode ? "auto" : layout.height,
+                  transform: outlineMode
+                    ? "none"
+                    : `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`,
                 }}
               >
                 <svg
@@ -489,7 +611,11 @@ export function QuestionTree({
                 {layout.nodes.map((item) => (
                   <article
                     className={`question-canvas-node ${nodeClass(item)}`}
-                    style={{ left: item.x, top: item.y } as CSSProperties}
+                    style={{
+                      left: item.x,
+                      top: item.y,
+                      "--question-outline-indent": `${Math.min(item.depth, 4) * 18}px`,
+                    } as CSSProperties}
                     role="treeitem"
                     aria-level={item.depth + 1}
                     aria-selected={item.question_ref === selected?.question_ref}
@@ -523,6 +649,13 @@ export function QuestionTree({
                     <small>{nodeLabel(item)}</small>
                     <b>{item.title ?? item.unknown_statement ?? item.question_ref}</b>
                     <span>{item.question_ref} · parent {item.parent_question_ref ?? "root"}</span>
+                    {!controlsInert && relatedHumanRequestCount(item) ? (
+                      <i
+                        className="question-node-human-request"
+                        aria-label={`关联 ${relatedHumanRequestCount(item)} 个 HumanRequest`}
+                        title={`关联 ${relatedHumanRequestCount(item)} 个 HumanRequest`}
+                      />
+                    ) : null}
                     <button
                       className="question-node-action add"
                       type="button"
@@ -599,7 +732,11 @@ export function QuestionTree({
           <div className="question-tree-caption">
             <span><i aria-hidden="true" /> 实线：RG 父子拓扑</span>
             <span><i className="selected" aria-hidden="true" /> 紫色光晕：本地选中</span>
-            <span><i className="human" aria-hidden="true" /> 珊瑚点：Projection 未提供关联 HumanRequest</span>
+            {controlsInert ? (
+              <span><i className="human" aria-hidden="true" /> 珊瑚点：Projection 未提供关联 HumanRequest</span>
+            ) : (
+              <span><i className="human" aria-hidden="true" /> 珊瑚点：Projection 提供的关联 HumanRequest</span>
+            )}
             <span>{controlsInert
               ? "悬停节点：左侧剪裁（typed disabled）· 右侧新建子问题"
               : "悬停节点：左侧建立剪裁草案 · 右侧新建子问题"}</span>
@@ -616,7 +753,16 @@ export function QuestionTree({
               <h2>{selected.title ?? "已接纳 Question"}</h2>
               <p>{selected.unknown_statement ?? "公开 Projection 没有附带 unknown statement。"}</p>
               <div className="question-tree-inspector-actions">
-                <button type="button" disabled title="capability_unavailable · quest_companion">与 Companion 讨论此题</button>
+                <button
+                  type="button"
+                  disabled={controlsInert || !onDiscussQuestion}
+                  title={!controlsInert && onDiscussQuestion
+                    ? "将当前问题作为 Companion 的只读讨论上下文"
+                    : "capability_unavailable · quest_companion"}
+                  onClick={(event) => onDiscussQuestion?.(selected, event.currentTarget)}
+                >
+                  与 Companion 讨论此题
+                </button>
                 <button type="button" disabled title="capability_unavailable · question_evidence">查看证据与来源</button>
                 <button type="button" disabled title="capability_unavailable · question_history">问题历史 ↗</button>
               </div>
@@ -625,7 +771,12 @@ export function QuestionTree({
               <div><small>Topology / RG</small><b>{selected.parent_question_ref ? `${selected.parent_question_ref} 的直接子题` : "Quest 根问题"} · {graphLabel}</b></div>
               <div><small>Question fact / RG</small><b>{selected.question_receipt_ref}{controlsInert ? "" : ` · ${selected.lifecycle_status} r${selected.lifecycle_revision}`}</b></div>
               <div><small>Content fact / RM</small><b>{selected.content_ref} · {selected.content_hash}</b></div>
-              <div><small>Cycle binding / AE</small><b>capability_unavailable · Projection 未提供</b></div>
+              <div><small>Cycle binding / AE</small><b>{controlsInert
+                ? "capability_unavailable · Projection 未提供"
+                : cycleBindingCopy(selected)}</b></div>
+              {!controlsInert ? (
+                <div><small>HumanRequest / Owner</small><b>{relatedHumanRequestCopy(selected)}</b></div>
+              ) : null}
             </div>
           </section>
         ) : null}

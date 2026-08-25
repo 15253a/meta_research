@@ -136,6 +136,11 @@ class PublicProjection:
             foreground_query = getattr(
                 self._advancement_engine, "query_foreground", None
             )
+            foregrounds_by_quest: dict[str, dict[str, object] | None] = {}
+            if control_quest_ref is not None and callable(foreground_query):
+                foregrounds_by_quest[control_quest_ref] = foreground_query(
+                    control_quest_ref
+                )
             managed_runs_query = getattr(
                 self._agent_runtime, "query_managed_runs", None
             )
@@ -146,7 +151,7 @@ class PublicProjection:
                 {
                     "status": "ready",
                     "quest_ref": control_quest_ref,
-                    "foreground": foreground_query(control_quest_ref),
+                    "foreground": foregrounds_by_quest[control_quest_ref],
                     "managed_runs": list(managed_runs_query(control_quest_ref)),
                     "recovery_records": (
                         list(prune_records_query(control_quest_ref))
@@ -184,6 +189,10 @@ class PublicProjection:
                     "recovery_records": [],
                     "actions": [],
                 }
+            )
+            current_quest = _query_current_quest_goal(
+                self._research_graph,
+                control_quest_ref,
             )
             idea_stage = (
                 None if self._idea_stage is None else self._idea_stage.query_current()
@@ -273,6 +282,12 @@ class PublicProjection:
                                 ),
                                 "lifecycle_status": lifecycle["status"],
                                 "lifecycle_revision": lifecycle["revision"],
+                                "cycle_binding": _query_question_cycle_binding(
+                                    foreground_query,
+                                    foregrounds_by_quest,
+                                    quest_ref=question.quest_ref,
+                                    question_ref=question.question_ref,
+                                ),
                             }
                         )
                 except OwnerConflict as error:
@@ -288,6 +303,16 @@ class PublicProjection:
                 )
                 for request in owner.query_human_requests()
             )
+            for question in question_tree_items:
+                cycle_binding = question["cycle_binding"]
+                assert isinstance(cycle_binding, dict)
+                cycle_ref = cycle_binding.get("cycle_ref")
+                question["related_human_requests"] = _related_human_requests(
+                    human_requests,
+                    quest_ref=str(question["quest_ref"]),
+                    question_ref=str(question["question_ref"]),
+                    cycle_ref=cycle_ref if isinstance(cycle_ref, str) else None,
+                )
             collaboration_scopes = tuple(
                 dict.fromkeys(
                     [
@@ -429,6 +454,7 @@ class PublicProjection:
             "quest_count": graph.facts["quest_count"],
             "question_count": graph.facts["question_count"],
             "foreground_cycle_count": advancement.facts["foreground_cycle_count"],
+            "current_quest": current_quest,
         }
         if current_question is not None:
             research_space["current_question"] = current_question
@@ -521,6 +547,242 @@ class PublicProjection:
                 "current": quest_completion,
             }
         return snapshot
+
+
+def _query_current_quest_goal(
+    research_graph: ResearchGraphInterface,
+    quest_ref: str | None,
+) -> dict[str, object]:
+    empty = {
+        "quest_ref": quest_ref,
+        "goal_revision_ref": None,
+        "draft_revision": None,
+        "draft_hash": None,
+        "goal": None,
+        "completion_criteria": None,
+        "projection_digest": None,
+    }
+    if quest_ref is None:
+        return {
+            "status": "not_bound",
+            **empty,
+            "reason": {"code": "current_quest_not_bound"},
+        }
+    query = getattr(research_graph, "query_current_quest_goal_revision", None)
+    if not callable(query):
+        return {
+            "status": "unavailable",
+            **empty,
+            "reason": {"code": "quest_goal_query_unavailable"},
+        }
+    binding = query(quest_ref)
+    if binding is None:
+        return {
+            "status": "not_bound",
+            **empty,
+            "reason": {"code": "quest_goal_revision_not_bound"},
+        }
+    goal_document = binding.get("goal") if isinstance(binding, dict) else None
+    if (
+        not isinstance(binding, dict)
+        or binding.get("kind") != "QuestGoalRevision"
+        or binding.get("quest_ref") != quest_ref
+        or not isinstance(binding.get("goal_revision_ref"), str)
+        or not binding["goal_revision_ref"]
+        or not isinstance(binding.get("draft_revision"), int)
+        or isinstance(binding.get("draft_revision"), bool)
+        or not isinstance(binding.get("draft_hash"), str)
+        or len(str(binding["draft_hash"])) != 64
+        or not isinstance(goal_document, dict)
+        or not isinstance(goal_document.get("goal"), str)
+        or not isinstance(goal_document.get("completion_criteria"), str)
+    ):
+        raise OwnerConflict("quest_goal_projection_invalid")
+    return {
+        "status": "ready",
+        "quest_ref": quest_ref,
+        "goal_revision_ref": binding["goal_revision_ref"],
+        "draft_revision": binding["draft_revision"],
+        "draft_hash": binding["draft_hash"],
+        "goal": goal_document["goal"],
+        "completion_criteria": goal_document["completion_criteria"],
+        "projection_digest": canonical_hash(binding),
+        "reason": None,
+    }
+
+
+def _query_question_cycle_binding(
+    foreground_query,
+    foregrounds_by_quest: dict[str, dict[str, object] | None],
+    *,
+    quest_ref: str,
+    question_ref: str,
+) -> dict[str, object]:
+    if not callable(foreground_query):
+        return {
+            "status": "unavailable",
+            "cycle_ref": None,
+            "foreground": None,
+            "reason": {"code": "advancement_foreground_query_unavailable"},
+        }
+    if quest_ref not in foregrounds_by_quest:
+        foregrounds_by_quest[quest_ref] = foreground_query(quest_ref)
+    foreground = foregrounds_by_quest[quest_ref]
+    if foreground is not None and not isinstance(foreground, dict):
+        raise OwnerConflict("question_cycle_projection_invalid")
+    if foreground is None or foreground.get("question_ref") != question_ref:
+        return {
+            "status": "not_bound",
+            "cycle_ref": None,
+            "foreground": None,
+            "reason": {"code": "current_foreground_not_bound"},
+        }
+    if (
+        foreground.get("quest_ref") != quest_ref
+        or not isinstance(foreground.get("cycle_ref"), str)
+        or not foreground["cycle_ref"]
+    ):
+        raise OwnerConflict("question_cycle_projection_invalid")
+    return {
+        "status": "bound",
+        "cycle_ref": foreground["cycle_ref"],
+        "foreground": dict(foreground),
+        "reason": None,
+    }
+
+
+def _related_human_requests(
+    requests: tuple[dict[str, object], ...],
+    *,
+    quest_ref: str,
+    question_ref: str,
+    cycle_ref: str | None,
+) -> dict[str, object]:
+    related: list[dict[str, object]] = []
+    for request in requests:
+        request_quest_ref = request.get("quest_ref")
+        if isinstance(request_quest_ref, str) and request_quest_ref != quest_ref:
+            continue
+        bindings = _request_question_bindings(
+            request,
+            question_ref=question_ref,
+            cycle_ref=cycle_ref,
+        )
+        if not bindings:
+            continue
+        request_ref = request.get("request_ref")
+        if not isinstance(request_ref, str) or not request_ref:
+            raise OwnerConflict("question_human_request_projection_invalid")
+        related.append(
+            {
+                "request_ref": request_ref,
+                "issuer": request.get("issuer"),
+                "kind": request.get("kind"),
+                "status": request.get("status"),
+                "revision": request.get("revision"),
+                "bindings": bindings,
+            }
+        )
+    return {
+        "status": "ready",
+        "items": sorted(related, key=lambda item: str(item["request_ref"])),
+        "reason": None,
+    }
+
+
+def _request_question_bindings(
+    request: dict[str, object],
+    *,
+    question_ref: str,
+    cycle_ref: str | None,
+) -> list[dict[str, object]]:
+    bindings = _assertion_question_bindings(
+        request.get("target_assertion"),
+        source="target_assertion",
+        waiter_ref=None,
+        question_ref=question_ref,
+        cycle_ref=cycle_ref,
+    )
+    direct_waiters = request.get("direct_waiters", [])
+    if not isinstance(direct_waiters, (list, tuple)):
+        raise OwnerConflict("question_human_request_projection_invalid")
+    for waiter in direct_waiters:
+        if not isinstance(waiter, dict):
+            raise OwnerConflict("question_human_request_projection_invalid")
+        waiter_ref = waiter.get("waiter_ref")
+        if not isinstance(waiter_ref, str) or not waiter_ref:
+            continue
+        bindings.extend(
+            _assertion_question_bindings(
+                waiter.get("target_assertion"),
+                source="direct_waiter",
+                waiter_ref=waiter_ref,
+                question_ref=question_ref,
+                cycle_ref=cycle_ref,
+            )
+        )
+    return sorted(
+        bindings,
+        key=lambda item: (
+            str(item["source"]),
+            str(item.get("waiter_ref", "")),
+            str(item["field"]),
+            str(item["ref"]),
+        ),
+    )
+
+
+def _assertion_question_bindings(
+    assertion: object,
+    *,
+    source: str,
+    waiter_ref: str | None,
+    question_ref: str,
+    cycle_ref: str | None,
+) -> list[dict[str, object]]:
+    if not isinstance(assertion, dict):
+        return []
+    matches: list[dict[str, object]] = []
+    for field in ("question_ref", "source_question_ref", "target_question_ref"):
+        if assertion.get(field) == question_ref:
+            matches.append(
+                _question_binding_document(
+                    source, waiter_ref, field, question_ref
+                )
+            )
+    affected = assertion.get("affected_question_refs")
+    if isinstance(affected, (list, tuple)) and question_ref in affected:
+        matches.append(
+            _question_binding_document(
+                source,
+                waiter_ref,
+                "affected_question_refs",
+                question_ref,
+            )
+        )
+    if cycle_ref is not None:
+        for field in ("cycle_ref", "source_cycle_ref", "target_cycle_ref"):
+            if assertion.get(field) == cycle_ref:
+                matches.append(
+                    _question_binding_document(
+                        source, waiter_ref, field, cycle_ref
+                    )
+                )
+    return matches
+
+
+def _question_binding_document(
+    source: str,
+    waiter_ref: str | None,
+    field: str,
+    ref: str,
+) -> dict[str, object]:
+    return {
+        "source": source,
+        **({} if waiter_ref is None else {"waiter_ref": waiter_ref}),
+        "field": field,
+        "ref": ref,
+    }
 
 
 def _plan_stage_is_public(projection: dict[str, object]) -> bool:

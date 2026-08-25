@@ -1,6 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
 
-import { DeterministicProduct } from "./support/deterministic-product.js";
+import type { BundleStageProjection, PublicSnapshot } from "../src/api.js";
+import {
+  DeterministicProduct,
+  openAuthenticatedProduct,
+} from "./support/deterministic-product.js";
 
 
 const QUESTION = {
@@ -193,6 +197,131 @@ async function freezeBundleProjection(page: Page) {
     "ready-active",
   );
 }
+
+async function publicBundleStage(page: Page): Promise<BundleStageProjection> {
+  return await page.evaluate(async () => {
+    const response = await fetch("/api/v1/bundle-stage/current", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) {
+      throw new Error(`bundle current failed: ${response.status}`);
+    }
+    return response.json();
+  }) as BundleStageProjection;
+}
+
+async function publicSnapshot(page: Page): Promise<PublicSnapshot> {
+  return await page.evaluate(async () => {
+    const response = await fetch("/api/v1/snapshot", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`snapshot failed: ${response.status}`);
+    return response.json();
+  }) as PublicSnapshot;
+}
+
+function acceptedReceiptRef(value: unknown): string {
+  if (!value || typeof value !== "object" || !("receipt_ref" in value)) {
+    throw new Error("accepted receipt is missing its identity");
+  }
+  const ref = value.receipt_ref;
+  if (typeof ref !== "string" || !ref) {
+    throw new Error("accepted receipt identity is invalid");
+  }
+  return ref;
+}
+
+test("a real BundleExhaustion closure renders EXHAUSTED with its public basis and receipt", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await product?.stop();
+  product = await DeterministicProduct.start({
+    manualRoot: true,
+    stagePipeline: "bundle-exhaustion",
+  });
+
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await openAuthenticatedProduct(page, runningProduct());
+  await runningProduct().waitForPlanProviderPhase("plan-primary", 30_000);
+  runningProduct().releasePlanProviderPhase("plan-primary");
+  await runningProduct().waitForPlanProviderPhase("plan-review", 30_000);
+  runningProduct().releasePlanProviderPhase("plan-review");
+
+  await expect.poll(async () => (
+    await publicBundleStage(page)
+  ).disposition.report_disposition, { timeout: 45_000 }).toBe("exhausted");
+
+  const bundleStage = await publicBundleStage(page);
+  expect(bundleStage).toMatchObject({
+    disposition: {
+      status: "completed",
+      report_disposition: "exhausted",
+    },
+    bundle_exhaustion: {
+      kind: "BundleExhaustion",
+      status: "accepted",
+    },
+    stage_commit: {
+      status: "Completed",
+      outcome_kind: "BundleExhaustion",
+      disposition: "exhausted",
+    },
+  });
+  expect(bundleStage.target_graph.targets).toEqual([]);
+  expect(bundleStage.target_commits).toEqual([]);
+
+  const snapshot = await publicSnapshot(page);
+  expect(snapshot.bundle_stage).toEqual(bundleStage);
+  const exhaustion = bundleStage.bundle_exhaustion;
+  if (!exhaustion || !bundleStage.stage_commit) {
+    throw new Error("real exhaustion closure is incomplete");
+  }
+  const basisRef = exhaustion.basis_ref;
+  const basisReceiptRef = acceptedReceiptRef(exhaustion.basis_receipt);
+  const decisionReceiptRef = acceptedReceiptRef(exhaustion.decision_receipt);
+  expect(basisRef).toBe(bundleStage.stage_commit.basis_ref);
+  expect(basisReceiptRef).toBe(
+    acceptedReceiptRef(bundleStage.stage_commit.basis_receipt),
+  );
+
+  // The daemon may already have advanced the current surface to Reasoning.
+  // Replay the exact immutable public Snapshot without that later surface so
+  // this test can inspect the completed Bundle projection itself.
+  await page.route("**/api/v1/events?*", (route) => route.abort());
+  await page.route("**/api/v1/snapshot", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ...snapshot, reasoning_stage: undefined }),
+    });
+  });
+  await page.goto(runningProduct().baseUrl, { waitUntil: "domcontentloaded" });
+
+  await expect(page.getByRole("heading", {
+    name: /Bundle 探索已按正式 basis 穷尽/,
+  })).toBeVisible();
+  const strip = page.getByRole("list", {
+    name: "当前研究周期的四个 Stage",
+  });
+  await expect(strip.getByRole("listitem").filter({ hasText: "Bundle" }))
+    .toContainText("EXHAUSTED");
+  await expect(strip).not.toContainText("03 · COMMITTED");
+  await expect(strip).not.toContainText("03 · SKIPPED");
+  await expect(page.getByText("Target closure 已形成正式交接。"))
+    .toHaveCount(0);
+
+  const stageCard = page.getByTestId("bundle-stage-card");
+  await expect(stageCard).toHaveAttribute("data-bundle-disposition", "exhausted");
+  await expect(stageCard.locator('[data-bundle-slot="target-closure"]'))
+    .toContainText("BundleExhaustion");
+  await stageCard.getByText("查看 Bundle、Target 与 receipt 身份").click();
+  await expect(stageCard).toContainText(basisRef ?? "missing-basis");
+  await expect(stageCard).toContainText(basisReceiptRef);
+  await expect(stageCard).toContainText(decisionReceiptRef);
+});
 
 test("Bundle keeps partial TargetCommit truth and blockers visible", async ({
   page,

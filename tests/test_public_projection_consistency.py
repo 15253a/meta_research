@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from meta_research.feed import FeedReadiness
-from meta_research.owners.common import OwnerSnapshot
+from meta_research.owners.common import OwnerSnapshot, canonical_hash
 from meta_research.projection import PublicProjection
 
 
@@ -99,6 +100,83 @@ class _StaticResearchGraph(_StaticOwner):
 
     def query_asset_reference_revision(self) -> int:
         return 1
+
+
+class _QuestionTreeResearchGraph(_StaticResearchGraph):
+    def __init__(
+        self,
+        *,
+        goal_revision: dict[str, object] | None,
+        requests: tuple[dict[str, object], ...],
+    ) -> None:
+        super().__init__(
+            "research_graph",
+            {"quest_count": 1, "question_count": 2},
+            requests,
+        )
+        self._goal_revision = goal_revision
+        self._questions = (
+            SimpleNamespace(
+                question_ref="question_projection_root",
+                quest_ref="quest_projection",
+                parent_question_ref=None,
+                content_ref="memory:projection-root",
+                content_hash="1" * 64,
+                schema_ref="question/v1",
+                receipt=SimpleNamespace(receipt_ref="receipt:projection-root"),
+            ),
+            SimpleNamespace(
+                question_ref="question_projection_child",
+                quest_ref="quest_projection",
+                parent_question_ref="question_projection_root",
+                content_ref="memory:projection-child",
+                content_hash="2" * 64,
+                schema_ref="question/v1",
+                receipt=SimpleNamespace(receipt_ref="receipt:projection-child"),
+            ),
+        )
+
+    def query_current_quest_goal_revision(
+        self, quest_ref: str
+    ) -> dict[str, object] | None:
+        assert quest_ref == "quest_projection"
+        return self._goal_revision
+
+    def query_question_tree(self):
+        return self._questions
+
+    def query_question_lifecycle(self, question_ref: str) -> dict[str, object]:
+        assert question_ref in {item.question_ref for item in self._questions}
+        return {"status": "active", "revision": 1}
+
+
+class _QuestionTreeResearchMemory(_StaticResearchMemory):
+    def read_question_content(
+        self, content_ref: str, content_hash: str
+    ) -> dict[str, object]:
+        assert len(content_hash) == 64
+        return {
+            "title": content_ref.removeprefix("memory:"),
+            "unknown_statement": f"unknown:{content_ref}",
+        }
+
+
+class _QuestionForegroundOwner(_StaticOwner):
+    def query_foreground(self, quest_ref: str) -> dict[str, object] | None:
+        assert quest_ref == "quest_projection"
+        return {
+            "quest_ref": quest_ref,
+            "cycle_ref": "cycle_projection_root",
+            "question_ref": "question_projection_root",
+            "stage": "idea",
+            "epoch": 4,
+            "status": "active",
+            "grant_ref": "grant_projection_root",
+            "grant_status": "active",
+            "safe_point_ref": None,
+            "pending_operation_ref": None,
+            "owner_revision": 7,
+        }
 
 
 class _RacingResearchGraph:
@@ -384,4 +462,214 @@ def test_unbound_owner_counters_cannot_downgrade_quest_waiting(
         "safe_meaningful_runnable_exists": False,
         "safe_runnable_basis": [],
         "other_blockers": [],
+    }
+
+
+def test_question_tree_projects_only_exact_public_goal_cycle_and_request_bindings(
+    tmp_path: Path,
+) -> None:
+    goal_revision = {
+        "kind": "QuestGoalRevision",
+        "goal_revision_ref": "quest_goal_revision_projection",
+        "quest_ref": "quest_projection",
+        "draft_revision": 3,
+        "draft_hash": "d" * 64,
+        "goal": {
+            "goal": "Determine whether the evidence supports the claim.",
+            "completion_criteria": "Record a bounded conclusion with counterevidence.",
+            "background_and_initial_direction": "Start from the accepted corpus.",
+        },
+        "rg_quest_acceptance_receipt_ref": "receipt:quest-projection",
+    }
+    requests = (
+        {
+            "request_ref": "human_request_question_exact",
+            "issuer": "research_graph",
+            "revision": 2,
+            "quest_ref": "quest_projection",
+            "kind": "question_control_confirmation",
+            "status": "open",
+            "created_at": 1.0,
+            "target_assertion": {
+                "question_ref": "question_projection_root",
+            },
+            "direct_waiters": [
+                {
+                    "waiter_ref": "waiter_cycle_exact",
+                    "status": "blocked",
+                    "target_assertion": {
+                        "source_cycle_ref": "cycle_projection_root",
+                    },
+                }
+            ],
+        },
+        {
+            "request_ref": "human_request_child_exact",
+            "issuer": "research_graph",
+            "revision": 1,
+            "quest_ref": "quest_projection",
+            "kind": "question_input",
+            "status": "open",
+            "created_at": 2.0,
+            "target_assertion": {
+                "target_question_ref": "question_projection_child",
+            },
+            "direct_waiters": [],
+        },
+        {
+            "request_ref": "human_request_text_only",
+            "issuer": "research_graph",
+            "revision": 1,
+            "quest_ref": "quest_projection",
+            "kind": "unrelated",
+            "status": "open",
+            "created_at": 3.0,
+            "business_purpose": "question_projection_root needs discussion",
+            "target_assertion": {"quest_ref": "quest_projection"},
+            "direct_waiters": [],
+        },
+    )
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_projection"
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=_QuestionTreeResearchGraph(
+            goal_revision=goal_revision,
+            requests=requests,
+        ),  # type: ignore[arg-type]
+        advancement_engine=_QuestionForegroundOwner(
+            "advancement_engine", {"foreground_cycle_count": 1}
+        ),  # type: ignore[arg-type]
+        research_memory=_QuestionTreeResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+    )
+
+    snapshot = projection.query_snapshot()
+
+    assert snapshot["research_space"]["current_quest"] == {
+        "status": "ready",
+        "quest_ref": "quest_projection",
+        "goal_revision_ref": "quest_goal_revision_projection",
+        "draft_revision": 3,
+        "draft_hash": "d" * 64,
+        "goal": "Determine whether the evidence supports the claim.",
+        "completion_criteria": "Record a bounded conclusion with counterevidence.",
+        "projection_digest": canonical_hash(goal_revision),
+        "reason": None,
+    }
+    root, child = snapshot["question_tree"]["items"]
+    assert root["cycle_binding"] == {
+        "status": "bound",
+        "cycle_ref": "cycle_projection_root",
+        "foreground": {
+            "quest_ref": "quest_projection",
+            "cycle_ref": "cycle_projection_root",
+            "question_ref": "question_projection_root",
+            "stage": "idea",
+            "epoch": 4,
+            "status": "active",
+            "grant_ref": "grant_projection_root",
+            "grant_status": "active",
+            "safe_point_ref": None,
+            "pending_operation_ref": None,
+            "owner_revision": 7,
+        },
+        "reason": None,
+    }
+    assert root["related_human_requests"] == {
+        "status": "ready",
+        "items": [
+            {
+                "request_ref": "human_request_question_exact",
+                "issuer": "research_graph",
+                "kind": "question_control_confirmation",
+                "status": "open",
+                "revision": 2,
+                "bindings": [
+                    {
+                        "source": "direct_waiter",
+                        "waiter_ref": "waiter_cycle_exact",
+                        "field": "source_cycle_ref",
+                        "ref": "cycle_projection_root",
+                    },
+                    {
+                        "source": "target_assertion",
+                        "field": "question_ref",
+                        "ref": "question_projection_root",
+                    },
+                ],
+            }
+        ],
+        "reason": None,
+    }
+    assert child["cycle_binding"] == {
+        "status": "not_bound",
+        "cycle_ref": None,
+        "foreground": None,
+        "reason": {"code": "current_foreground_not_bound"},
+    }
+    assert [
+        item["request_ref"] for item in child["related_human_requests"]["items"]
+    ] == ["human_request_child_exact"]
+
+
+def test_projection_reports_typed_nulls_when_goal_and_cycle_seams_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_unavailable"
+    graph = _StaticResearchGraph(
+        "research_graph", {"quest_count": 1, "question_count": 1}
+    )
+    question = SimpleNamespace(
+        question_ref="question_unavailable",
+        quest_ref="quest_unavailable",
+        parent_question_ref=None,
+        content_ref="memory:unavailable",
+        content_hash="3" * 64,
+        schema_ref="question/v1",
+        receipt=SimpleNamespace(receipt_ref="receipt:unavailable"),
+    )
+    graph.query_question_tree = lambda: (question,)  # type: ignore[attr-defined]
+    graph.query_question_lifecycle = lambda _ref: {  # type: ignore[attr-defined]
+        "status": "active",
+        "revision": 1,
+    }
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=graph,  # type: ignore[arg-type]
+        advancement_engine=_StaticOwner(
+            "advancement_engine", {"foreground_cycle_count": 0}
+        ),  # type: ignore[arg-type]
+        research_memory=_QuestionTreeResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+    )
+
+    current = projection.query_snapshot()["research_space"]["current_quest"]
+
+    assert current == {
+        "status": "unavailable",
+        "quest_ref": "quest_unavailable",
+        "goal_revision_ref": None,
+        "draft_revision": None,
+        "draft_hash": None,
+        "goal": None,
+        "completion_criteria": None,
+        "projection_digest": None,
+        "reason": {"code": "quest_goal_query_unavailable"},
+    }
+    [item] = projection.query_snapshot()["question_tree"]["items"]
+    assert item["cycle_binding"] == {
+        "status": "unavailable",
+        "cycle_ref": None,
+        "foreground": None,
+        "reason": {"code": "advancement_foreground_query_unavailable"},
     }

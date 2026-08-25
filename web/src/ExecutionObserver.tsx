@@ -42,6 +42,7 @@ export type ExecutionObserverController = {
   noticeVisible: boolean;
   open: (trigger?: HTMLElement | null) => void;
   close: () => void;
+  deferForPrioritySurface: () => void;
   dismissNotice: () => void;
   recordStarted: (experiment: ExperimentProjection) => void;
 };
@@ -245,6 +246,13 @@ export function useExecutionObserver(
     });
   }, [displayed]);
 
+  const deferForPrioritySurface = useCallback(() => {
+    if (!isOpen) return;
+    const key = executionFenceKey(displayed) ?? currentKey;
+    setIsOpen(false);
+    if (key) setNoticeFence(key);
+  }, [currentKey, displayed, isOpen]);
+
   const dismissNotice = useCallback(() => {
     if (noticeFence) rememberSessionValue(DISMISSED_STORAGE_KEY, noticeFence);
     setNoticeFence(null);
@@ -257,6 +265,7 @@ export function useExecutionObserver(
     noticeVisible: Boolean(noticeFence && noticeFence === currentKey && !isOpen),
     open,
     close,
+    deferForPrioritySurface,
     dismissNotice,
     recordStarted,
   };

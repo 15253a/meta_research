@@ -388,6 +388,28 @@ function isHumanRequestPanel(panel: string | null): boolean {
   return panel === "human-requests" || humanRequestKindFromPanel(panel) !== null;
 }
 
+function questWideBlockingHumanRequests(
+  snapshot: PublicSnapshot | null,
+): HumanRequestItem[] {
+  const humanRequests = snapshot?.human_collaboration?.human_requests;
+  const scopeRef = snapshot?.human_collaboration?.companion.scope_ref;
+  if (
+    humanRequests?.status !== "ready" ||
+    !scopeRef ||
+    humanRequests.waiting.safe_meaningful_runnable_exists
+  ) {
+    return [];
+  }
+  const questRef = scopeRef.startsWith("quest:")
+    ? scopeRef.slice("quest:".length)
+    : scopeRef;
+  return humanRequests.items.filter((item) => (
+    item.status === "open" &&
+    item.quest_ref === questRef &&
+    item.direct_waiters?.some((waiter) => waiter.wait_scope === "quest")
+  ));
+}
+
 if (window.location.pathname === "/auth/launch") {
   window.history.replaceState(null, "", "/");
 }
@@ -645,6 +667,100 @@ function currentStageSurface(snapshot: PublicSnapshot): CurrentStageSurface | nu
       candidate.projection.eligibility.status,
     ),
   ) ?? candidates[0] ?? null;
+}
+
+function acceptedChangeSummary(snapshot: PublicSnapshot): string {
+  if (snapshot.quest_completion.current?.status === "ended") {
+    return "Quest completion 已由 RG 接纳，AE 已正式结束当前 Quest";
+  }
+  if (
+    snapshot.bundle_stage?.disposition.report_disposition === "exhausted" &&
+    snapshot.bundle_stage.bundle_exhaustion?.kind === "BundleExhaustion"
+  ) {
+    return `BundleExhaustion 已接纳 · ${snapshot.bundle_stage.bundle_exhaustion.basis_ref ?? "basis ref unavailable"}`;
+  }
+  for (const [name, projection] of [
+    ["Reasoning", snapshot.reasoning_stage],
+    ["Bundle", snapshot.bundle_stage],
+    ["Plan", snapshot.plan_stage],
+    ["Idea", snapshot.idea_stage],
+  ] as const) {
+    if (projection?.stage_commit) {
+      return `${name} StageCommit · ${projection.stage_commit.status} · next ${projection.stage_commit.next_stage ?? "unavailable"}`;
+    }
+  }
+  const stage = currentStageSurface(snapshot);
+  return stage
+    ? `${stage.kind} 正在消费 rev ${snapshot.revision} 的公开 Projection`
+    : `公开 Projection 已到 rev ${snapshot.revision}`;
+}
+
+function currentBlockerSummary(snapshot: PublicSnapshot): string {
+  const global = questWideBlockingHumanRequests(snapshot)[0];
+  if (global) return `Quest wait · ${global.kind} · ${global.request_ref}`;
+  const openLocal = snapshot.human_collaboration?.human_requests.status === "ready"
+    ? snapshot.human_collaboration.human_requests.items.find((item) => item.status === "open")
+    : null;
+  if (openLocal) return `Local wait · ${openLocal.kind} · 其余安全工作可继续`;
+  const unavailable = snapshot.readiness.checks.find((check) => check.status !== "ready");
+  if (unavailable) {
+    return `${unavailable.name} · ${unavailable.reason?.code ?? unavailable.status}`;
+  }
+  return "无公开 blocker · safe meaningful work remains";
+}
+
+function nextStepSummary(snapshot: PublicSnapshot): string {
+  if (questWideBlockingHumanRequests(snapshot).length) {
+    return "先处理 Quest-wide HumanRequest；stdout 保留为手动入口";
+  }
+  const stage = currentStageSurface(snapshot);
+  if (!stage) return "从当前已接纳 Question 继续";
+  const nextStage = stage.projection.stage_commit?.next_stage;
+  if (nextStage) return `由 Advancement Engine 进入 ${nextStage}`;
+  if (stage.projection.run) {
+    return `等待 ${stage.kind} 的执行、内容接纳、领域接纳与推进各自完成`;
+  }
+  return `等待 ${stage.kind} 的公开 Owner 请求与 receipt`;
+}
+
+function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
+  const quest = snapshot.research_space.current_quest ?? {
+    status: "unavailable" as const,
+    goal: null,
+    completion_criteria: null,
+    goal_revision_ref: null,
+    reason: { code: "quest_goal_projection_unavailable" },
+  };
+  return (
+    <section
+      className="lumen-return-summary"
+      aria-label="低密度返场摘要"
+      data-testid="return-summary"
+    >
+      <article>
+        <small>Goal 对齐 · RG</small>
+        <b>{quest.status === "ready" ? quest.goal : quest.reason?.code ?? "unavailable"}</b>
+        <span>{quest.status === "ready"
+          ? `完成标准：${quest.completion_criteria} · ${quest.goal_revision_ref}`
+          : "不会从浏览器草案推断 Goal"}</span>
+      </article>
+      <article>
+        <small>关键变化 · accepted state</small>
+        <b>{acceptedChangeSummary(snapshot)}</b>
+        <span>只报告 Owner receipt 可追溯的当前事实</span>
+      </article>
+      <article>
+        <small>当前阻塞 · typed</small>
+        <b>{currentBlockerSummary(snapshot)}</b>
+        <span>局部等待与 Quest-wide wait 不合并</span>
+      </article>
+      <article>
+        <small>下一步 · AE / Owner</small>
+        <b>{nextStepSummary(snapshot)}</b>
+        <span>Web 只解释公开 Projection，不代替 Owner 推进</span>
+      </article>
+    </section>
+  );
 }
 
 function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
@@ -980,6 +1096,8 @@ function BundleStageHero({
 }) {
   const committed = Boolean(bundleStage.stage_commit);
   const skipped = bundleStage.disposition.status === "skipped";
+  const exhausted = bundleStage.disposition.report_disposition === "exhausted" &&
+    bundleStage.bundle_exhaustion?.kind === "BundleExhaustion";
   const realized = bundleStage.target_commits.length;
   const total = bundleStage.target_graph.targets.length;
 
@@ -987,13 +1105,17 @@ function BundleStageHero({
     <>
       <p className="lumen-eyebrow">Research cycle · Bundle Projection</p>
       <h1 id="workspace-title">
-        {skipped
+        {exhausted
+          ? "Bundle 探索已按正式 basis 穷尽。"
+          : skipped
           ? "Bundle 已按精确 basis 跳过。"
           : committed
             ? "Target closure 已形成正式交接。"
             : "从 FormalPlan 的 GapSet 出发。"}<br />
         <em>
-          {skipped
+          {exhausted
+            ? "没有伪造 Target closure；穷尽结论与 basis receipt 保持可追溯。"
+            : skipped
             ? "没有空 Run、伪 Target 或伪 TargetCommit。"
             : committed
               ? "负面结果也是可复用的已实现事实。"
@@ -1011,7 +1133,7 @@ function BundleStageHero({
           className={committed ? "done" : "current"}
           aria-current={committed ? undefined : "step"}
         >
-          <small>{skipped ? "03 · SKIPPED" : committed ? "03 · COMMITTED" : "03 · NOW"}</small>
+          <small>{exhausted ? "03 · EXHAUSTED" : skipped ? "03 · SKIPPED" : committed ? "03 · COMMITTED" : "03 · NOW"}</small>
           <b>Bundle</b>
         </li>
         <li
@@ -1860,6 +1982,9 @@ function bundleFactRows(
   const graph = bundleStage.target_graph;
   const commit = bundleStage.stage_commit;
   const skipped = bundleStage.disposition.status === "skipped";
+  const exhaustion = bundleStage.bundle_exhaustion;
+  const exhausted = bundleStage.disposition.report_disposition === "exhausted" &&
+    exhaustion?.kind === "BundleExhaustion";
   const targetCount = graph.targets.length;
   const committedCount = bundleStage.target_commits.length;
   const blockedTargets = graph.targets.filter((target) =>
@@ -1895,52 +2020,60 @@ function bundleFactRows(
       slot: "root-run",
       label: "Bundle root Run",
       owner: "AR",
-      state: skipped
+      state: skipped || exhausted
         ? "done"
         : run
           ? isRunBlocked(run.status)
             ? "blocked"
             : run.status === "completed" ? "done" : "current"
           : "pending",
-      title: skipped
-        ? "GapSet 为空；未创建 Bundle Run"
+      title: skipped || exhausted
+        ? exhausted
+          ? "BundleExhaustion 已接纳；没有制造空 root Run"
+          : "GapSet 为空；未创建 Bundle Run"
         : run
           ? "一个 root/native Session 调度正式 Target；child agent 不进入 Target DAG"
           : "等待 Agent Runtime admission",
-      status: skipped ? "not_created_by_design" : run?.status ?? "not_created",
+      status: skipped ? "not_created_by_design" : exhausted ? "exhausted" : run?.status ?? "not_created",
     },
     {
       slot: "target-dag",
       label: "Target DAG / frontier",
       owner: "RG",
-      state: skipped
+      state: skipped || exhausted
         ? "done"
         : graph.status === "accepted"
           ? blockedTargets.length ? "blocked" : "done"
           : "pending",
-      title: skipped
-        ? "GapSet 为空；未制造伪 Target"
+      title: skipped || exhausted
+        ? exhausted
+          ? "正式探索 basis 已穷尽；没有制造伪 Target identity"
+          : "GapSet 为空；未制造伪 Target"
         : graph.status === "accepted"
           ? `${targetCount} Target · ${graph.frontier.length} frontier；身份与依赖由 RG 拥有`
           : "等待 RG 接纳正式 Target identity/spec/DAG",
-      status: skipped ? "not_created_by_design" : graph.status,
+      status: skipped ? "not_created_by_design" : exhausted ? "exhausted" : graph.status,
     },
     {
       slot: "target-closure",
       label: "TargetRun → TargetCommit",
       owner: "AR / RM / RG",
-      state: skipped
+      state: skipped || exhausted
         ? "done"
         : blockedTargets.length
           ? "blocked"
           : targetCount > 0 && committedCount === targetCount
             ? "done"
             : graph.status === "accepted" ? "current" : "pending",
-      title: skipped
-        ? "没有 TargetRun 或 TargetCommit"
+      title: skipped || exhausted
+        ? exhausted
+          ? `BundleExhaustion · ${exhaustion?.basis_kind ?? "formal basis"} 已由 decision receipt 接纳`
+          : "没有 TargetRun 或 TargetCommit"
         : `${committedCount}/${targetCount} closure 已冻结；已接纳的局部结果不会被其他失败抹掉`,
       status: skipped
         ? "not_attempted"
+        : exhausted
+          ? "exhausted"
         : blockedTargets.length
           ? "partial_blocked"
           : bundleStage.disposition.status,
@@ -2238,6 +2371,7 @@ function BundleStageCard({
   const run = bundleStage.run;
   const graph = bundleStage.target_graph;
   const commit = bundleStage.stage_commit;
+  const exhaustion = bundleStage.bundle_exhaustion;
   const formalPlan = request?.accepted_formal_plan_binding ?? {};
 
   return (
@@ -2246,6 +2380,9 @@ function BundleStageCard({
       aria-labelledby="bundle-stage-title"
       data-testid="bundle-stage-card"
       data-bundle-stage-state={phase}
+      data-bundle-disposition={bundleStage.disposition.report_disposition ?? (
+        bundleStage.disposition.status === "skipped" ? "skipped" : "targeted"
+      )}
     >
       <header className="lumen-card-head">
         <b id="bundle-stage-title">Bundle 的六层事实</b>
@@ -2323,6 +2460,11 @@ function BundleStageCard({
           <IdeaDetail label="Frontier count" value={graph.frontier.length} />
           <IdeaDetail label="TargetCommit count" value={bundleStage.target_commits.length} />
           <IdeaDetail label="Baseline Pool count" value={bundleStage.baseline_pool.length} />
+          <IdeaDetail label="BundleExhaustion" value={exhaustion?.proposal_ref} />
+          <IdeaDetail label="Exhaustion basis kind" value={exhaustion?.basis_kind} />
+          <IdeaDetail label="Exhaustion basis" value={exhaustion?.basis_ref} />
+          <IdeaDetail label="Exhaustion basis receipt" value={receiptRef(exhaustion?.basis_receipt)} />
+          <IdeaDetail label="Exhaustion decision receipt" value={receiptRef(exhaustion?.decision_receipt)} />
           <IdeaDetail label="StageCommit" value={commit?.commit_ref ?? commit?.stage_commit_ref} />
           <IdeaDetail label="StageCommit receipt" value={receiptRef(commit?.receipt)} />
           <IdeaDetail label="Next Stage" value={commit?.next_stage} />
@@ -3003,6 +3145,9 @@ function WorkspaceMain({
         {state === "loading" ? <LoadingHero /> : null}
         {state === "first-error" ? <FirstErrorHero retry={retry} /> : null}
         {snapshot ? <SnapshotHero snapshot={snapshot} /> : null}
+        {snapshot?.research_space.status === "active" ? (
+          <ReturnSummary snapshot={snapshot} />
+        ) : null}
       </section>
 
       <div className="lumen-lower">
@@ -3233,6 +3378,9 @@ function App() {
   const [questionRouteNodeRef, setQuestionRouteNodeRef] = useState<string | null>(
     () => initialParameters.get("node"),
   );
+  const [selectedQuestionContext, setSelectedQuestionContext] = useState<
+    QuestionTreeItem | null
+  >(null);
   const [pendingDirectManualParentRef, setPendingDirectManualParentRef] = useState<
     string | null
   >(() => initialParameters.get("panel") === "create-question"
@@ -3267,9 +3415,23 @@ function App() {
   const questionTreeButtonRef = useRef<HTMLButtonElement>(null);
   const writingButtonRef = useRef<HTMLButtonElement>(null);
   const humanRequestReturnFocusRef = useRef<HTMLElement | null>(null);
+  const questWideRequests = useMemo(
+    () => questWideBlockingHumanRequests(snapshot),
+    [
+      snapshot?.human_collaboration?.companion.scope_ref,
+      snapshot?.human_collaboration?.human_requests,
+    ],
+  );
   const executionObserver = useExecutionObserver(
     snapshot?.experiment?.current ?? null,
-    Boolean(creationMode || assetsOpen || writingOpen),
+    Boolean(
+      creationMode ||
+      assetsOpen ||
+      writingOpen ||
+      manualPanel ||
+      humanRequestsOpen ||
+      questWideRequests.length,
+    ),
   );
 
   const handleConnection = useCallback((next: boolean) => {
@@ -3408,20 +3570,7 @@ function App() {
   }, [humanRequestRouteKind, humanRequestsOpen, snapshot?.human_collaboration?.human_requests]);
 
   useEffect(() => {
-    const humanRequests = snapshot?.human_collaboration?.human_requests;
-    if (humanRequests?.status !== "ready") return;
-    const companionScope = snapshot?.human_collaboration?.companion.scope_ref;
-    if (!companionScope) return;
-    const questRef = companionScope.startsWith("quest:")
-      ? companionScope.slice("quest:".length)
-      : companionScope;
-    const candidates = humanRequests.items.filter((item) =>
-      item.status === "open"
-      && item.quest_ref === questRef
-      && item.direct_waiters?.some((waiter) => waiter.wait_scope === "quest")
-      && !humanRequests.waiting.safe_meaningful_runnable_exists,
-    );
-    const globalRequest = candidates.find((item) => {
+    const globalRequest = questWideRequests.find((item) => {
       const key = `meta_research:human_request:auto_presented:${item.request_ref}`;
       try {
         return window.sessionStorage.getItem(key) === null;
@@ -3437,6 +3586,7 @@ function App() {
     } catch {
       // The in-memory open still presents the current global request once this render.
     }
+    executionObserver.deferForPrioritySurface();
     setCreationMode(null);
     setAssetsOpen(false);
     setWritingOpen(false);
@@ -3448,7 +3598,7 @@ function App() {
       `/?panel=${humanRequestPanelByKind[globalRequest.kind]}`,
     );
     setHumanRequestsOpen(true);
-  }, [snapshot?.human_collaboration?.human_requests]);
+  }, [executionObserver.deferForPrioritySurface, questWideRequests]);
 
   const state = shellState(snapshot, error);
   const canCreate = questCreationReady(snapshot);
@@ -3513,6 +3663,7 @@ function App() {
     setManualPanel(null);
     setManualOpenError(null);
     setQuestionRouteNodeRef(null);
+    setSelectedQuestionContext(null);
     setPendingDirectManualParentRef(null);
     window.history.replaceState(null, "", questionTreeUrl());
     setQuestionTreeOpen(true);
@@ -3521,6 +3672,7 @@ function App() {
     setManualPanel(null);
     setQuestionTreeOpen(false);
     setQuestionRouteNodeRef(null);
+    setSelectedQuestionContext(null);
     setPendingDirectManualParentRef(null);
     setManualOpenError(null);
     window.history.replaceState(null, "", "/");
@@ -3528,6 +3680,37 @@ function App() {
       questionTreeButtonRef.current?.focus({ preventScroll: true });
     });
   };
+
+  const selectQuestionTreeContext = useCallback((question: QuestionTreeItem | null) => {
+    setSelectedQuestionContext((current) => (
+      current?.question_ref === question?.question_ref &&
+      current?.content_hash === question?.content_hash &&
+      current?.lifecycle_revision === question?.lifecycle_revision
+        ? current
+        : question
+    ));
+    setQuestionRouteNodeRef((current) => {
+      const next = question?.question_ref ?? null;
+      return current === next ? current : next;
+    });
+    if (question && !manualPanel) {
+      window.history.replaceState(null, "", questionTreeUrl(question.question_ref));
+    }
+  }, [manualPanel]);
+
+  const discussQuestionWithCompanion = useCallback((
+    question: QuestionTreeItem,
+    _opener: HTMLButtonElement,
+  ) => {
+    setSelectedQuestionContext(question);
+    setQuestionRouteNodeRef(question.question_ref);
+    window.history.replaceState(null, "", questionTreeUrl(question.question_ref));
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLInputElement>(
+        "[aria-label='给 Quest Companion 发消息']",
+      )?.focus({ preventScroll: false });
+    });
+  }, []);
 
   const openWriting = () => {
     if (!canBrowseWriting || !snapshot) return;
@@ -3809,7 +3992,11 @@ function App() {
             controlsInert={manualPanel !== null}
             openingParentRef={manualOpeningParentRef}
             openError={manualOpenError}
+            currentExperiment={executionObserver.current}
             onClose={closeQuestionTree}
+            onOpenExperiment={executionObserver.open}
+            onSelectionChange={selectQuestionTreeContext}
+            onDiscussQuestion={discussQuestionWithCompanion}
             onCreateQuestion={openManualCreation}
             onControlQuestion={controlQuestionLifecycle}
           />
@@ -3830,6 +4017,9 @@ function App() {
           collaboration={snapshot?.human_collaboration}
           researchControl={manualPanel ? undefined : snapshot?.research_control}
           questions={snapshot?.question_tree.items ?? []}
+          questionContext={questionTreeOpen && manualPanel === null
+            ? selectedQuestionContext
+            : null}
           onChanged={() => void reload()}
           onOpenRequest={(requestRef) => openHumanRequests(requestRef)}
         />

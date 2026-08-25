@@ -189,7 +189,7 @@ test("an upgraded recovering v1 Quest remains readable through the corrected Web
 });
 
 async function openCreation(page: Page) {
-  const opener = page.getByRole("button", { name: "创建 Quest" });
+  const opener = page.getByRole("button", { name: "创建 Quest", exact: true });
   await opener.click();
   const dialog = page.getByRole("dialog", {
     name: "创建 Quest，并决定第一个研究问题",
@@ -679,6 +679,81 @@ test("compute and Intent stay independent without losing an unsaved draft edit",
   );
 });
 
+for (const conflictExit of [
+  {
+    name: "Close",
+    exit: async (page: Page, dialog: Locator) => {
+      await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
+    },
+  },
+  {
+    name: "Escape",
+    exit: async (page: Page, _dialog: Locator) => {
+      await page.keyboard.press("Escape");
+    },
+  },
+  {
+    name: "backdrop",
+    exit: async (page: Page, _dialog: Locator) => {
+      await page.mouse.click(3, 3);
+    },
+  },
+]) {
+  test(`a CAS-conflict recovery window exits through ${conflictExit.name} without overwriting durable state`, async ({
+    page,
+  }) => {
+    await openAuthenticatedProduct(page, runningProduct());
+    let { dialog, opener } = await openCreation(page);
+    const originalGoal = `CAS 冲突 ${conflictExit.name} 退出必须保留远端事实`;
+    await fillRequiredBasis(
+      dialog,
+      originalGoal,
+      "关闭 recovery window 不得把 stale 本地值写回",
+    );
+    const basis = await publicCurrent(page);
+    expect(basis).not.toBeNull();
+
+    const staleLocalGoal = `stale local ${conflictExit.name}`;
+    const durableCriteria = `durable remote ${conflictExit.name}`;
+    const goal = dialog.getByLabel("这个 Quest 最终要完成什么？");
+    await goal.fill(staleLocalGoal);
+    const remote = await publicPut(
+      page,
+      `/api/v1/quest-initializations/${basis!.initialization_id}/draft`,
+      {
+        expected_draft_revision: basis!.quest_draft.revision,
+        expected_draft_hash: basis!.quest_draft.hash,
+        draft: {
+          ...basis!.quest_draft.value,
+          completion_criteria: durableCriteria,
+        },
+      },
+    );
+    expect(remote.status).toBe(200);
+    const remoteSnapshotRevision = await publicSnapshotRevision(page);
+    await expect.poll(async () => Number(
+      (await page.locator(".lumen-connection code").textContent())?.replace("rev ", ""),
+    )).toBeGreaterThanOrEqual(remoteSnapshotRevision);
+    await goal.blur();
+
+    await expect(dialog.getByRole("alert")).toContainText("quest_draft_stale");
+    await expect(goal).toHaveValue(staleLocalGoal);
+    await conflictExit.exit(page, dialog);
+    await expect(dialog).toBeHidden();
+    await expect(opener).toBeFocused();
+
+    ({ dialog, opener } = await openCreation(page));
+    await expect(dialog.getByRole("alert")).toBeHidden();
+    await expect(dialog.getByLabel("这个 Quest 最终要完成什么？")).toHaveValue(
+      originalGoal,
+    );
+    await expect(dialog.getByLabel("什么情况算完成？")).toHaveValue(
+      durableCriteria,
+    );
+    await expect(opener).not.toBeFocused();
+  });
+}
+
 test("a remote same-init draft write cannot steal a local dirty CAS basis", async ({
   page,
 }) => {
@@ -729,11 +804,6 @@ test("a remote same-init draft write cannot steal a local dirty CAS basis", asyn
     goal: originalGoal,
     completionCriteria: remoteCriteria,
   });
-
-  await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
-  await expect(dialog).toBeVisible();
-  await expect(reloadLatest).toBeVisible();
-  await expect(reloadLatest).toBeFocused();
 
   let rejectNextReload = true;
   const rejectReloadOnce = async (route: Route) => {

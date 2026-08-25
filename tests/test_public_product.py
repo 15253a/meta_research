@@ -132,6 +132,17 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "quest_count": 0,
             "question_count": 0,
             "foreground_cycle_count": 0,
+            "current_quest": {
+                "status": "not_bound",
+                "quest_ref": None,
+                "goal_revision_ref": None,
+                "draft_revision": None,
+                "draft_hash": None,
+                "goal": None,
+                "completion_criteria": None,
+                "projection_digest": None,
+                "reason": {"code": "current_quest_not_bound"},
+            },
         }
         assert set(snapshot["owners"]) == {
             "advancement_engine",

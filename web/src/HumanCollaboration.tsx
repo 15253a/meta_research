@@ -157,6 +157,7 @@ export function QuestCompanion({
   collaboration,
   researchControl,
   questions = [],
+  questionContext = null,
   onChanged,
   onOpenRequest,
 }: {
@@ -164,6 +165,7 @@ export function QuestCompanion({
   collaboration?: HumanCollaborationProjection;
   researchControl?: ResearchControlProjection;
   questions?: readonly QuestionTreeItem[];
+  questionContext?: QuestionTreeItem | null;
   onChanged: () => void;
   onOpenRequest: (requestRef: string) => void;
 }) {
@@ -238,11 +240,23 @@ export function QuestCompanion({
         <span className="lumen-orb" aria-hidden="true" />
         <div>
           <b>Quest Companion</b>
-          <small>贯穿研究空间的高频入口</small>
+          <small>{questionContext
+            ? `正在跟随 ${questionContext.question_ref}`
+            : "贯穿研究空间的高频入口"}</small>
         </div>
         <code>{ready ? "conversation · ready" : "capability_unavailable"}</code>
       </header>
       <div className="lumen-chat" aria-live="polite">
+        {questionContext ? (
+          <article
+            className="lumen-message lumen-question-context"
+            data-testid="companion-question-context"
+          >
+            <small>选中问题 · 只读上下文</small>
+            <b>{questionContext.title ?? questionContext.question_ref}</b>
+            <p>{questionContext.unknown_statement ?? "公开 Projection 未提供 unknown statement。"}</p>
+          </article>
+        ) : null}
         {attention ? (
           <article className="lumen-human-attention">
             <small>NEEDS YOU · {scopeLabel(attention)}</small>
