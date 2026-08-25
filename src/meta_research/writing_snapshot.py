@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from typing import cast
 
+from meta_research.bundle_protocol import projection_plain_value
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.common import OwnerConflict, canonical_hash
-from meta_research.owners.research_graph import ResearchGraphInterface
+from meta_research.owners.research_graph import (
+    ResearchGraphInterface,
+    WritingExperimentTerminalCut,
+)
 from meta_research.owners.research_memory import ResearchMemoryInterface
 from meta_research.writing_contract import WRITING_RESEARCH_SNAPSHOT_SCHEMA
 
@@ -15,7 +19,7 @@ _MAX_SNAPSHOT_EXPERIMENTS = 4096
 
 
 class WritingResearchSnapshotReader:
-    """Build and verify one revision-pinned, stage-neutral Writing input cut."""
+    """Capture one accepted-fact-pinned, stage-neutral Writing input cut."""
 
     def __init__(
         self,
@@ -30,57 +34,44 @@ class WritingResearchSnapshotReader:
         self._agent_runtime = agent_runtime
 
     def capture(self, quest_ref: str) -> dict[str, object]:
+        experiment_cut = (
+            self._research_graph.query_writing_experiment_terminal_cut(quest_ref)
+        )
         for _attempt in range(_MAX_CONSISTENCY_ATTEMPTS):
-            before = self._owner_revisions()
-            # AR participates in the before/after cut because accepted Stage
-            # executions are read below, but its global revision is not part of
-            # the frozen research basis: this Writing Run's own checkpoints
-            # also advance AR and must not make its Snapshot stale by itself.
-            research_revisions = {
-                owner: revision
-                for owner, revision in before.items()
-                if owner != "agent_runtime"
-            }
-            snapshot = self._capture_once(quest_ref, research_revisions)
-            if self._owner_revisions() == before:
-                return snapshot
+            owner_revisions = self._snapshot_metadata_revisions()
+            candidate = self._capture_once(
+                quest_ref, owner_revisions, experiment_cut
+            )
+            # Global Owner revisions also carry unrelated asset intake, live
+            # experiment admission, Target stdout, and checkpoint progress.
+            # Re-read only the exact accepted facts consumed by Writing: a
+            # meaningful Quest/Stage/Bundle fact already inside this cut
+            # changes this value, while progress outside the frozen basis does
+            # not. A newly terminal Experiment belongs to the next Snapshot;
+            # this capture exact-rechecks only its one closed RG identity cut.
+            # Cross-owner receipt checks inside _capture_once still reject
+            # partial acceptance facts.
+            verified = self._capture_once(
+                quest_ref, owner_revisions, experiment_cut
+            )
+            if verified == candidate:
+                return verified
         raise OwnerConflict("writing_snapshot_consistency_unavailable")
 
-    def verify_current(self, snapshot: dict[str, object]) -> None:
-        quest_ref = snapshot.get("quest_ref")
-        if not isinstance(quest_ref, str) or not quest_ref:
-            raise OwnerConflict("writing_snapshot_invalid")
-        current = self.capture(quest_ref)
-        if self.currentness_hash(current) != self.currentness_hash(snapshot):
-            raise OwnerConflict("writing_snapshot_stale")
+    def _snapshot_metadata_revisions(self) -> dict[str, int]:
+        """Return observed lower-bound metadata, never a consistency gate."""
 
-    @staticmethod
-    def currentness_hash(snapshot: dict[str, object]) -> str:
-        """Hash the Quest research basis without global Owner bookkeeping.
-
-        Global RG/RM revisions also advance when this Writing Run accepts a
-        deliverable or citation decision. They prove the capture was a coherent
-        cut, but are not themselves research input and therefore cannot make the
-        frozen report stale.
-        """
-
-        basis = {
-            key: value
-            for key, value in snapshot.items()
-            if key not in {"owner_revisions", "snapshot_ref", "snapshot_hash"}
-        }
-        return canonical_hash(basis)
-
-    def _owner_revisions(self) -> dict[str, int]:
         return {
             "research_graph": self._research_graph.query_snapshot().revision,
             "research_memory": self._research_memory.query_snapshot().revision,
             "advancement_engine": self._advancement_engine.query_snapshot().revision,
-            "agent_runtime": self._agent_runtime.query_snapshot().revision,
         }
 
     def _capture_once(
-        self, quest_ref: str, owner_revisions: dict[str, int]
+        self,
+        quest_ref: str,
+        owner_revisions: dict[str, int],
+        experiment_cut: WritingExperimentTerminalCut,
     ) -> dict[str, object]:
         quest = self._research_graph.query_quest_by_ref(quest_ref)
         if quest is None:
@@ -139,7 +130,7 @@ class WritingResearchSnapshotReader:
             "questions": questions,
             "accepted_sources": sources,
             "advancement": self._advancement_snapshot(
-                quest.initialization_id, quest_ref
+                quest.initialization_id, experiment_cut
             ),
             "owner_revisions": owner_revisions,
         }
@@ -151,14 +142,17 @@ class WritingResearchSnapshotReader:
         return {**snapshot, "snapshot_hash": canonical_hash(snapshot)}
 
     def _advancement_snapshot(
-        self, initialization_id: str, quest_ref: str
+        self,
+        initialization_id: str,
+        experiment_cut: WritingExperimentTerminalCut,
     ) -> dict[str, object]:
+        experiments = self._experiment_closure(experiment_cut)
         cycle = self._advancement_engine.query_initial_cycle(initialization_id)
         if cycle is None:
             return {
                 "cycle": None,
                 "stages": self._empty_stages(),
-                "experiments": [],
+                "experiments": experiments,
             }
 
         stages = self._empty_stages()
@@ -168,13 +162,23 @@ class WritingResearchSnapshotReader:
                 "status": "accepted" if value is not None else "not_accepted",
                 "accepted": value,
             }
+        bundle = self._bundle_stage_value(cycle.cycle_ref)
+        if bundle is not None:
+            stages["bundle"] = {
+                "status": (
+                    "accepted"
+                    if bundle["commit"] is not None
+                    else "report_accepted"
+                ),
+                "accepted": bundle,
+            }
         return {
             "cycle": {
                 "cycle_ref": cycle.cycle_ref,
                 "receipt": cycle.receipt.as_public_dict(),
             },
             "stages": stages,
-            "experiments": self._experiment_closure(quest_ref),
+            "experiments": experiments,
         }
 
     @staticmethod
@@ -182,11 +186,8 @@ class WritingResearchSnapshotReader:
         return {
             "idea": {"status": "not_accepted", "accepted": None},
             "plan": {"status": "not_accepted", "accepted": None},
-            "bundle": {"status": "not_available_in_runtime", "accepted": None},
-            "reasoning": {
-                "status": "not_available_in_runtime",
-                "accepted": None,
-            },
+            "bundle": {"status": "not_accepted", "accepted": None},
+            "reasoning": {"status": "not_accepted", "accepted": None},
         }
 
     def _stage_value(
@@ -267,69 +268,323 @@ class WritingResearchSnapshotReader:
             "result": result,
         }
 
-    def _experiment_closure(self, quest_ref: str) -> list[dict[str, object]]:
-        result: list[dict[str, object]] = []
-        cursor_time = 0.0
-        cursor_ref = ""
-        while True:
-            refs = self._research_graph.query_experiment_admission_refs(
-                after_created_at=cursor_time,
-                after_evaluation_attempt_ref=cursor_ref,
-                limit=64,
+    def _bundle_stage_value(self, cycle_ref: str) -> dict[str, object] | None:
+        """Read only immutable Bundle acceptances from public AE/AR seams.
+
+        The AR StageRun is used solely as a stable request-to-run lookup and,
+        after an AE StageCommit exists, to recheck its closed RunCompletion.
+        Its live status, worker cursor, foreground, and checkpoint state never
+        become Writing input.
+        """
+
+        request = self._advancement_engine.query_bundle_stage_request(cycle_ref)
+        if request is None:
+            return None
+        accepted_plan = request.accepted_formal_plan
+        if (
+            request.stage != "bundle"
+            or request.cycle_ref != cycle_ref
+            or accepted_plan is None
+        ):
+            raise OwnerConflict("writing_bundle_request_invalid")
+
+        stage_run = self._agent_runtime.query_bundle_stage_run(request.request_ref)
+        if stage_run is not None and (
+            stage_run.request_ref != request.request_ref
+            or stage_run.cycle_ref != cycle_ref
+            or stage_run.stage != "bundle"
+            or stage_run.epoch != request.epoch
+        ):
+            raise OwnerConflict("writing_bundle_result_invalid")
+
+        report = (
+            None
+            if stage_run is None
+            else self._agent_runtime.query_bundle_run_report(stage_run.run_ref)
+        )
+        if report is not None:
+            verified_report = self._agent_runtime.verify_bundle_report_receipt(
+                report_ref=report.report_ref,
+                receipt=report.receipt,
             )
-            if not refs:
-                break
-            for evaluation_attempt_ref, created_at in refs:
-                if (created_at, evaluation_attempt_ref) <= (
-                    cursor_time,
-                    cursor_ref,
-                ):
-                    raise OwnerConflict("writing_experiment_pagination_invalid")
-                cursor_time, cursor_ref = created_at, evaluation_attempt_ref
-                admission = self._research_graph.query_experiment(
-                    evaluation_attempt_ref
+            if verified_report != report:
+                raise OwnerConflict("writing_bundle_result_invalid")
+            if (
+                report.request_ref != request.request_ref
+                or report.run_ref != stage_run.run_ref
+                or report.report.stage_request_ref != request.request_ref
+                or report.formal_plan_ref != accepted_plan.formal_plan_ref
+                or report.report.formal_plan_ref != accepted_plan.formal_plan_ref
+                or report.plan_document_hash != accepted_plan.plan_document_hash
+                or report.formal_plan_content_receipt
+                != accepted_plan.content_receipt
+            ):
+                raise OwnerConflict("writing_bundle_result_invalid")
+
+        disposition = (
+            None
+            if report is None
+            else self._advancement_engine.query_bundle_report_disposition(
+                report.report_ref
+            )
+        )
+        verified_disposition = None
+        if disposition is not None:
+            verified_disposition = (
+                self._advancement_engine.verify_bundle_report_disposition_receipt(
+                    disposition_ref=disposition.disposition_ref,
+                    receipt=disposition.receipt,
                 )
+            )
+            if (
+                verified_disposition.request_ref != request.request_ref
+                or verified_disposition.cycle_ref != cycle_ref
+                or verified_disposition.epoch != request.epoch
+                or verified_disposition.run_ref != report.run_ref
+                or verified_disposition.report_ref != report.report_ref
+                or verified_disposition.report_hash != report.report_hash
+                or verified_disposition.disposition != report.report.disposition
+            ):
+                raise OwnerConflict("writing_bundle_result_invalid")
+
+        commit = self._advancement_engine.query_bundle_stage_commit(
+            request.request_ref
+        )
+        if commit is None and report is None:
+            return None
+        if commit is not None and (
+            commit.request_ref != request.request_ref
+            or commit.cycle_ref != cycle_ref
+            or commit.stage != "bundle"
+            or commit.epoch != request.epoch
+        ):
+            raise OwnerConflict("writing_bundle_result_invalid")
+
+        run_completion = None
+        if commit is not None and commit.disposition == "completed":
+            if (
+                report is None
+                or stage_run is None
+                or stage_run.completion is None
+                or commit.run_ref != report.run_ref
+                or commit.outcome_ref != report.report_ref
+                or commit.outcome_kind != "bundle_report"
+                or commit.outcome_receipt != report.receipt
+                or commit.run_completion_receipt != stage_run.completion.receipt
+            ):
+                raise OwnerConflict("writing_bundle_result_invalid")
+            run_completion = stage_run.completion
+            if (
+                run_completion.request_ref != request.request_ref
+                or run_completion.run_ref != report.run_ref
+                or run_completion.outcome_ref != report.report_ref
+                or run_completion.decision_receipt != report.receipt
+            ):
+                raise OwnerConflict("writing_bundle_result_invalid")
+        elif commit is not None and commit.disposition == "exhausted":
+            if (
+                stage_run is None
+                or stage_run.completion is None
+                or commit.run_ref != stage_run.run_ref
+                or commit.run_completion_receipt != stage_run.completion.receipt
+                or commit.basis_ref is None
+                or stage_run.completion.outcome_ref != commit.basis_ref
+            ):
+                raise OwnerConflict("writing_bundle_result_invalid")
+            run_completion = stage_run.completion
+        elif commit is not None and (
+            commit.disposition != "skipped"
+            or commit.outcome_kind != "bundle_skip"
+            or commit.run_ref is not None
+            or report is not None
+            or commit.outcome_ref != accepted_plan.formal_plan_ref
+            or commit.outcome_receipt != accepted_plan.formal_plan_receipt
+            or commit.run_completion_receipt is not None
+        ):
+            raise OwnerConflict("writing_bundle_result_invalid")
+
+        return {
+            "request": {
+                "request_ref": request.request_ref,
+                "cycle_ref": request.cycle_ref,
+                "epoch": request.epoch,
+                "accepted_formal_plan": accepted_plan.as_dict(),
+                "receipt": request.receipt.as_public_dict(),
+            },
+            "report": (
+                None if report is None else self._bundle_report_value(report)
+            ),
+            "report_disposition": (
+                None
+                if verified_disposition is None
+                else {
+                    "disposition_ref": verified_disposition.disposition_ref,
+                    "request_ref": verified_disposition.request_ref,
+                    "cycle_ref": verified_disposition.cycle_ref,
+                    "epoch": verified_disposition.epoch,
+                    "run_ref": verified_disposition.run_ref,
+                    "report_ref": verified_disposition.report_ref,
+                    "report_hash": verified_disposition.report_hash,
+                    "disposition": verified_disposition.disposition,
+                    "status": verified_disposition.status,
+                    "next_stage": verified_disposition.next_stage,
+                    "next_epoch": verified_disposition.next_epoch,
+                    "receipt": verified_disposition.receipt.as_public_dict(),
+                }
+            ),
+            "run_completion": (
+                None
+                if run_completion is None
+                else {
+                    "request_ref": run_completion.request_ref,
+                    "run_ref": run_completion.run_ref,
+                    "attempt_ref": run_completion.attempt_ref,
+                    "outcome_ref": run_completion.outcome_ref,
+                    "decision_receipt": (
+                        run_completion.decision_receipt.as_public_dict()
+                    ),
+                    "receipt": run_completion.receipt.as_public_dict(),
+                }
+            ),
+            "commit": None if commit is None else self._bundle_commit_value(commit),
+        }
+
+    @staticmethod
+    def _bundle_report_value(report) -> dict[str, object]:
+        return {
+            "report_ref": report.report_ref,
+            "request_ref": report.request_ref,
+            "run_ref": report.run_ref,
+            "attempt_ref": report.attempt_ref,
+            "fence_ref": report.fence_ref,
+            "formal_plan_ref": report.formal_plan_ref,
+            "plan_document_hash": report.plan_document_hash,
+            "formal_plan_content_receipt": (
+                report.formal_plan_content_receipt.as_public_dict()
+            ),
+            "formal_plan_projection_digest": (
+                report.formal_plan_projection_digest
+            ),
+            "formal_plan_projection_receipt": (
+                report.formal_plan_projection_receipt.as_public_dict()
+            ),
+            "completion_contract_hash": report.completion_contract_hash,
+            "formal_plan_briefs_hash": report.formal_plan_briefs_hash,
+            "target_graph_ref": report.target_graph_ref,
+            "target_graph_generation": report.target_graph_generation,
+            "target_set_hash": report.target_set_hash,
+            "coverage_hash": report.coverage_hash,
+            "target_graph_receipt": report.target_graph_receipt.as_public_dict(),
+            "target_refs": list(report.target_refs),
+            "notice_refs": list(report.notice_refs),
+            "handoff_manifest_refs": list(report.handoff_manifest_refs),
+            "accepted_measurement_closures": projection_plain_value(
+                report.accepted_measurement_closures
+            ),
+            "target_commit_receipts": [
+                receipt.as_public_dict()
+                for receipt in report.target_commit_receipts
+            ],
+            "report": projection_plain_value(report.report),
+            "report_hash": report.report_hash,
+            "receipt": report.receipt.as_public_dict(),
+        }
+
+    @staticmethod
+    def _bundle_commit_value(commit) -> dict[str, object]:
+        return {
+            "commit_ref": commit.commit_ref,
+            "request_ref": commit.request_ref,
+            "cycle_ref": commit.cycle_ref,
+            "epoch": commit.epoch,
+            "run_ref": commit.run_ref,
+            "outcome_ref": commit.outcome_ref,
+            "outcome_kind": commit.outcome_kind,
+            "disposition": commit.disposition,
+            "run_completion_receipt": (
+                None
+                if commit.run_completion_receipt is None
+                else commit.run_completion_receipt.as_public_dict()
+            ),
+            "outcome_receipt": (
+                None
+                if commit.outcome_receipt is None
+                else commit.outcome_receipt.as_public_dict()
+            ),
+            "basis_kind": commit.basis_kind,
+            "basis_ref": commit.basis_ref,
+            "basis_receipt": (
+                None
+                if commit.basis_receipt is None
+                else commit.basis_receipt.as_public_dict()
+            ),
+            "closure_hash": (
+                None if commit.closure is None else canonical_hash(commit.closure)
+            ),
+            "receipt": commit.receipt.as_public_dict(),
+        }
+
+    def _experiment_closure(
+        self, cut: WritingExperimentTerminalCut
+    ) -> list[dict[str, object]]:
+        if len(cut.facts) > _MAX_SNAPSHOT_EXPERIMENTS:
+            raise OwnerConflict("writing_snapshot_experiment_limit_exceeded")
+        result: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for fact in cut.facts:
+            evaluation_attempt_ref = fact.evaluation_attempt_ref
+            if evaluation_attempt_ref in seen:
+                raise OwnerConflict("writing_experiment_cut_invalid")
+            seen.add(evaluation_attempt_ref)
+            admission = self._research_graph.query_experiment(
+                evaluation_attempt_ref
+            )
+            if (
+                admission is None
+                or admission.execution_request.quest_ref != cut.quest_ref
+                or admission.formal_measurement_status
+                != fact.formal_measurement_status
+                or admission.formal_rejection_code
+                != fact.formal_rejection_code
+                or fact.formal_measurement_status not in {"accepted", "rejected"}
+            ):
+                raise OwnerConflict("writing_experiment_result_invalid")
+            formal_result = self._research_graph.query_formal_metric_result(
+                evaluation_attempt_ref
+            )
+            if fact.formal_measurement_status == "accepted":
                 if (
-                    admission is None
-                    or admission.execution_request.quest_ref != quest_ref
+                    formal_result is None
+                    or formal_result.evaluation_attempt_ref
+                    != evaluation_attempt_ref
+                    or fact.formal_rejection_code is not None
                 ):
-                    continue
-                if len(result) >= _MAX_SNAPSHOT_EXPERIMENTS:
-                    raise OwnerConflict(
-                        "writing_snapshot_experiment_limit_exceeded"
-                    )
-                run = self._agent_runtime.query_experiment_run(
-                    evaluation_attempt_ref
-                )
-                result.append(
-                    {
-                        "evaluation_attempt_ref": evaluation_attempt_ref,
-                        "execution_request": (
-                            admission.execution_request.as_public_dict()
-                        ),
-                        "formal_measurement_status": (
-                            admission.formal_measurement_status
-                        ),
-                        "formal_rejection_code": admission.formal_rejection_code,
-                        "asset_roles": [
-                            role.as_public_dict()
-                            for role in self._research_graph.query_experiment_asset_roles(
-                                evaluation_attempt_ref
-                            )
-                        ],
-                        "run": None
-                        if run is None
-                        else {
-                            "run_ref": run.run_ref,
-                            "attempt_ref": run.attempt_ref,
-                            "fence_ref": run.fence_ref,
-                            "status": run.status,
-                            "result_hash": (
-                                None
-                                if run.result is None
-                                else run.result.result_hash
-                            ),
-                        },
-                    }
-                )
+                    raise OwnerConflict("writing_experiment_result_invalid")
+            elif (
+                formal_result is not None
+                or type(fact.formal_rejection_code) is not str
+                or not fact.formal_rejection_code
+            ):
+                raise OwnerConflict("writing_experiment_result_invalid")
+            result.append(
+                {
+                    "evaluation_attempt_ref": evaluation_attempt_ref,
+                    "execution_request": (
+                        admission.execution_request.as_public_dict()
+                    ),
+                    "formal_measurement_status": fact.formal_measurement_status,
+                    "formal_rejection_code": fact.formal_rejection_code,
+                    "formal_metric_result": (
+                        None
+                        if formal_result is None
+                        else formal_result.as_public_dict()
+                    ),
+                    "asset_roles": [
+                        role.as_public_dict()
+                        for role in self._research_graph.query_experiment_asset_roles(
+                            evaluation_attempt_ref
+                        )
+                    ],
+                }
+            )
         return result

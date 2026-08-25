@@ -152,8 +152,8 @@ class WritingReportService:
             )
         else:
             # A confirmation is a durable fact. Reconciliation after a lost ACK
-            # must not re-run currentness gates that the original confirmation
-            # already crossed atomically.
+            # must reuse the same frozen Snapshot and never recapture or replace
+            # it with later Quest research.
             confirmed = command
         if existing_run is not None:
             return self._public_intent(confirmed)
@@ -901,7 +901,6 @@ class WritingReportService:
         ]
         command = self._human_collaboration.query_command(run.intent_id)
         payload = self._writing_payload(command)
-        current_snapshot = self._capture_snapshot(run.quest_ref)
         return {
             "run_ref": run_ref,
             "left_version_ref": left_version_ref,
@@ -943,12 +942,11 @@ class WritingReportService:
                 "removed_citation_refs": removed_citation_refs,
                 "changed_citations": changed_citations,
             },
-            "stale": self._snapshot_reader.currentness_hash(current_snapshot)
-            != self._snapshot_reader.currentness_hash(
-                cast(dict[str, object], payload["snapshot"])
-            ),
-            "frozen_snapshot_hash": payload["snapshot_hash"],
-            "current_snapshot_hash": current_snapshot["snapshot_hash"],
+            "snapshot": {
+                "mode": "frozen",
+                "snapshot_ref": payload["snapshot_ref"],
+                "snapshot_hash": payload["snapshot_hash"],
+            },
         }
 
     def _capture_snapshot(self, quest_ref: str) -> dict[str, object]:

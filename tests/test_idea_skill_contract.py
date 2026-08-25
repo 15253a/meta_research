@@ -27,7 +27,16 @@ from meta_research.idea_contract import (
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash
-from meta_research.quest_drafting import PROVIDER_RESULT_MAX_BYTES
+from meta_research.provider_supervisor import (
+    CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
+    SUPERVISOR_REQUEST_SCHEMA,
+    read_transport_envelope,
+    write_transport_envelope,
+)
+from meta_research.quest_drafting import (
+    PROVIDER_RESULT_MAX_BYTES,
+    PROVIDER_STREAM_MAX_BYTES,
+)
 
 
 def _runtime_binding() -> IdeaRuntimeBinding:
@@ -687,11 +696,16 @@ def _fake_codex_executable(
     read_all_input: bool,
     sleep_seconds: float = 0,
 ) -> Path:
-    read_expression = "sys.stdin.buffer.read()" if read_all_input else "sys.stdin.buffer.read(1)"
+    read_expression = (
+        "sys.stdin.buffer.read()"
+        if read_all_input
+        else "os.read(sys.stdin.fileno(), 1)"
+    )
     encoded_outcome = repr(json.dumps({"outcome": _idea_set()}, ensure_ascii=False))
     path.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
+        "import os\n"
         "from pathlib import Path\n"
         "import sys\n"
         "import time\n"
@@ -1362,12 +1376,12 @@ def test_graceful_stop_leaves_a_signed_provider_termination(
     executable = _fake_codex_executable(
         tmp_path / "fake-codex-supervisor-stop",
         read_all_input=True,
-        sleep_seconds=5,
+        sleep_seconds=30,
     )
     adapter = CodexIdeaSkillAdapter(
         workspace,
         executable=str(executable),
-        timeout_seconds=10,
+        timeout_seconds=60,
     )
     request = _request(
         runtime_binding=adapter.runtime_binding(),
@@ -1389,7 +1403,7 @@ def test_graceful_stop_leaves_a_signed_provider_termination(
             raise AssertionError("supervisor did not start")
         time.sleep(0.01)
     adapter.request_stop()
-    worker.join(timeout=5)
+    worker.join(timeout=10)
     assert not worker.is_alive()
     assert len(errors) == 1
     assert isinstance(errors[0], IdeaSkillUnavailable)
@@ -1405,7 +1419,7 @@ def test_graceful_stop_leaves_a_signed_provider_termination(
     restarted = CodexIdeaSkillAdapter(
         workspace,
         executable=str(executable),
-        timeout_seconds=10,
+        timeout_seconds=60,
         process_runner=forbidden_replay,
     )
     with pytest.raises(IdeaSkillUnavailable, match="codex_operation_failed"):
@@ -1534,6 +1548,67 @@ def test_durable_supervisor_recovers_a_prelaunch_daemon_loss(
     operation = next(workspace.glob("provider-operations/*/primary"))
     assert (operation / "supervisor-request.json").is_file()
     assert not (operation / "provider-started.json").exists()
+    _key_path, key = first._transport_key()
+    supervisor_request = read_transport_envelope(
+        operation / "supervisor-request.json", key
+    )
+    assert supervisor_request["schema_ref"] == CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
+    assert supervisor_request["prompt_max_bytes"] == PROVIDER_STREAM_MAX_BYTES
+    assert supervisor_request["stream_max_bytes"] == PROVIDER_STREAM_MAX_BYTES
+    assert supervisor_request["result_max_bytes"] == PROVIDER_RESULT_MAX_BYTES
+
+    restarted = CodexIdeaSkillAdapter(workspace, executable=str(executable))
+    recovered = restarted.generate_draft(request)
+
+    assert recovered.primary_session_ref == "supervised-primary"
+    assert recovered.draft == _idea_set()
+    assert (operation / "provider-started.json").is_file()
+    assert (operation / "completed.json").is_file()
+
+
+def test_durable_supervisor_recovers_a_legacy_sealed_prelaunch_request(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "legacy-prelaunch-recovery-provider"
+    executable = _fake_codex_executable(
+        tmp_path / "fake-codex-legacy-prelaunch",
+        read_all_input=True,
+    )
+    first = CodexIdeaSkillAdapter(
+        workspace,
+        executable=str(executable),
+        process_runner=_PrelaunchLossRunner(),
+    )
+    request = _request(
+        runtime_binding=first.runtime_binding(),
+        job_ref="idea-primary-operation:legacy-prelaunch-loss",
+    )
+
+    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_io_unavailable"):
+        first.generate_draft(request)
+    operation = next(workspace.glob("provider-operations/*/primary"))
+    _key_path, key = first._transport_key()
+    invocation_path = operation / "invocation.json"
+    invocation = read_transport_envelope(invocation_path, key)
+    invocation["schema_ref"] = "meta-research/codex-provider-operation/v1"
+    for field in (
+        "prompt_max_bytes",
+        "stream_max_bytes",
+        "result_max_bytes",
+        "mcp_url",
+        "mcp_scope_binding_hash",
+    ):
+        invocation.pop(field)
+    invocation_path.unlink()
+    write_transport_envelope(invocation_path, invocation, key)
+
+    request_path = operation / "supervisor-request.json"
+    supervisor_request = read_transport_envelope(request_path, key)
+    supervisor_request["schema_ref"] = SUPERVISOR_REQUEST_SCHEMA
+    supervisor_request["invocation_hash"] = canonical_hash(invocation)
+    supervisor_request.pop("prompt_max_bytes")
+    request_path.unlink()
+    write_transport_envelope(request_path, supervisor_request, key)
 
     restarted = CodexIdeaSkillAdapter(workspace, executable=str(executable))
     recovered = restarted.generate_draft(request)

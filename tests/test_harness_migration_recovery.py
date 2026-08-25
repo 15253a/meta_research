@@ -26,8 +26,13 @@ def test_existing_0015_data_upgrades_to_one_durable_harness_run_model(
     data_root = prepare_data_root(tmp_path / "upgrade-from-0015")
     _upgrade_to_revision(data_root.database, "0015_writing_report")
     with sqlite3.connect(data_root.database) as connection:
+        before_owner_columns = tuple(
+            row[1]
+            for row in connection.execute("PRAGMA table_info(agent_runtime_state)")
+        )
         before_owner_rows = connection.execute(
-            "SELECT * FROM agent_runtime_state ORDER BY singleton"
+            f"SELECT {', '.join(before_owner_columns)} FROM agent_runtime_state "
+            "ORDER BY singleton"
         ).fetchall()
         before_experiment_tables = {
             row[0]
@@ -51,7 +56,8 @@ def test_existing_0015_data_upgrades_to_one_durable_harness_run_model(
             )
         }
         after_owner_rows = connection.execute(
-            "SELECT * FROM agent_runtime_state ORDER BY singleton"
+            f"SELECT {', '.join(before_owner_columns)} FROM agent_runtime_state "
+            "ORDER BY singleton"
         ).fetchall()
         after_experiment_tables = {
             row[0]
@@ -65,7 +71,7 @@ def test_existing_0015_data_upgrades_to_one_durable_harness_run_model(
         ).fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
 
-        assert version == ("0016_semantic_mcp_harness",)
+        assert version == ("0029_target_root_lifecycle",)
         assert _HARNESS_TABLES <= tables
         assert "ar_harness_sessions" not in tables
         assert "ar_harness_attempts" not in tables

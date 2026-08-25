@@ -197,13 +197,45 @@ def validate_writing_skill_result(
 class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
     """Codex Harness Adapter for one resumable Writing root Session."""
 
-    # Writing consumes untrusted Intent/source text. Generated shell commands
-    # are confined to its dedicated provider workspace with no inherited host
-    # environment; networked discovery remains the read-only Harness search
-    # tool, not arbitrary shell egress.
-    _sandbox_mode = "workspace-write"
+    # Writing consumes untrusted Intent/source text. Its custom permission
+    # profile grants shell reads only to Codex's minimal runtime plus the exact
+    # Frozen Snapshot source root, and writes only to the dedicated provider
+    # workspace. Hosted discovery and arbitrary command egress are disabled.
     _shell_environment_inherit = "none"
+    _web_search_mode = "disabled"
     _reconciliation_operation_names = ("writing-primary", "writing-review")
+
+    def _sandbox_arguments(
+        self, sandbox_read_root: Path | None
+    ) -> tuple[str, ...]:
+        if sandbox_read_root is None:
+            raise WritingSkillUnavailable("writing_source_read_root_missing")
+        try:
+            source_root = sandbox_read_root.resolve(strict=True)
+            staging_root = (self._workspace / "writing-inputs").resolve(
+                strict=True
+            )
+            agent_workspace = self._agent_workspace.resolve(strict=True)
+        except OSError as error:
+            raise WritingSkillUnavailable(
+                "writing_source_read_root_invalid"
+            ) from error
+        if source_root.parent != staging_root:
+            raise WritingSkillUnavailable("writing_source_read_root_invalid")
+        _require_safe_staging_directory(source_root)
+        profile = (
+            'permissions.writing_snapshot={description="Frozen Writing '
+            'Snapshot only",filesystem={":minimal"="read",'
+            f'{json.dumps(str(agent_workspace))}="write",'
+            f'{json.dumps(str(source_root))}="read"}},'
+            'network={enabled=false}}'
+        )
+        return (
+            "--config",
+            profile,
+            "--config",
+            'default_permissions="writing_snapshot"',
+        )
 
     def runtime_binding(self) -> WritingRuntimeBinding:
         resources = _writing_skill_resources()
@@ -233,7 +265,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 "approval-policy-never",
                 "accepted-rm-source-staging",
                 "environment-inheritance-none",
-                "filesystem-workspace-write",
+                "filesystem-read-root-confined",
                 "global-config-ignored",
                 "harness-child-agent-review",
                 "mcp-config-empty",
@@ -241,7 +273,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 "shell-tool-enabled",
                 "structured-output-json-schema",
                 "trusted-local-quest-authorization",
-                "web-search-live",
+                "external-research-disabled",
             ),
             resource_bindings=tuple(
                 f"package:meta_research.skills.writing-report/{name}@sha256:"
@@ -259,9 +291,11 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 f"{supervisor_hash}",
                 "disabled-codex-features:" + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
+                "codex-config:default_permissions=writing_snapshot",
                 "codex-config:features.multi_agent=true",
+                "codex-config:permissions.writing_snapshot=exact-frozen-read-root",
                 "codex-config:shell_environment_policy.inherit=none",
-                "codex-config:web_search=live",
+                "codex-config:web_search=disabled",
                 "output-route:codex-output-last-message/json-schema/v1",
                 "provider-output-limits:"
                 f"stream={PROVIDER_STREAM_MAX_BYTES};"
@@ -269,7 +303,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 "provider-timeout-seconds:"
                 + format(self._timeout_seconds, ".17g"),
                 "runtime-policy:untrusted-writing-input-confined/v1",
-                "sandbox-policy:workspace-write;network=false;host-env=none",
+                "sandbox-policy:permission-profile;minimal=read;"
+                "agent-workspace=write;frozen-source-root=read;network=false",
                 "external-effects:forbidden",
                 "transport-seal-key:sha256:"
                 + transport_key_hash(transport_key),
@@ -283,6 +318,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         if request.runtime_binding != self.runtime_binding():
             raise WritingSkillUnavailable("writing_runtime_binding_drift")
         source_manifest = self._stage_source_materials(request)
+        source_root = Path(cast(str, source_manifest["manifest_path"])).parent
         lineage = (
             ""
             if not request.feedback
@@ -313,6 +349,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 schema=_draft_schema(),
                 native_session_ref=request.native_session_ref,
                 job_ref=request.job_ref,
+                sandbox_read_root=source_root,
             )
         except Exception as error:
             if isinstance(error, WritingSkillUnavailable):
@@ -338,6 +375,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         if request.native_session_ref != draft.primary_session_ref:
             raise WritingSkillUnavailable("writing_native_session_changed")
         source_manifest = self._stage_source_materials(request)
+        source_root = Path(cast(str, source_manifest["manifest_path"])).parent
         review_task_hash = writing_review_task_hash(request, draft)
         child_prompt = _child_review_prompt(
             request,
@@ -371,6 +409,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 schema=_review_schema(),
                 native_session_ref=draft.primary_session_ref,
                 job_ref=request.job_ref,
+                sandbox_read_root=source_root,
             )
         except Exception as error:
             code = getattr(error, "code", "writing_provider_unavailable")

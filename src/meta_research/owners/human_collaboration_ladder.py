@@ -179,14 +179,14 @@ class SQLiteHumanCollaborationLadder:
             tuple[list[dict[str, object]], dict[str, int]],
         ]
         | None = None,
-        writing_snapshot_verifier: Callable[[dict[str, object]], None] | None = None,
+        writing_snapshot_validator: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._drafting_provider = drafting_provider
         self._context_resolver = context_resolver
         self._control_preview_resolver = control_preview_resolver
-        self._writing_snapshot_verifier = writing_snapshot_verifier
+        self._writing_snapshot_validator = writing_snapshot_validator
         with self._database.write() as connection:
             recovered = connection.execute(
                 text(
@@ -1331,9 +1331,9 @@ class SQLiteHumanCollaborationLadder:
                 )
             if draft["command_kind"] == "writing_report_start":
                 snapshot = cast(dict[str, object], payload["snapshot"])
-                if self._writing_snapshot_verifier is None:
+                if self._writing_snapshot_validator is None:
                     raise OwnerConflict("writing_snapshot_verifier_unavailable")
-                self._writing_snapshot_verifier(snapshot)
+                self._writing_snapshot_validator(snapshot)
                 target_assertion = {
                     "owner": HC_OWNER,
                     "operation": "start_writing_report",
@@ -1552,21 +1552,20 @@ class SQLiteHumanCollaborationLadder:
         if confirmed_draft.get("command_kind") == "writing_report_start":
             payload = cast(dict[str, object], confirmed_draft["payload"])
             writing_snapshot = cast(dict[str, object], payload["snapshot"])
-            if self._writing_snapshot_verifier is None:
+            if self._writing_snapshot_validator is None:
                 raise OwnerConflict("writing_snapshot_verifier_unavailable")
-            self._writing_snapshot_verifier(writing_snapshot)
+            self._writing_snapshot_validator(writing_snapshot)
         with self._database.write() as connection:
             replay = _collaboration_command(
                 connection, idempotency_key, "command_confirm", command_hash
             )
             if replay is None:
                 if writing_snapshot is not None:
-                    if self._writing_snapshot_verifier is None:
+                    if self._writing_snapshot_validator is None:
                         raise OwnerConflict("writing_snapshot_verifier_unavailable")
-                    # Close the verify-to-confirm race under the process-local
-                    # writer lock. A research-basis mutation that wins before
-                    # this transaction must make the frozen preview stale.
-                    self._writing_snapshot_verifier(writing_snapshot)
+                    # Recheck the frozen value itself under the writer lock;
+                    # live research may advance independently of this intent.
+                    self._writing_snapshot_validator(writing_snapshot)
                 preview = connection.execute(
                     text(
                         "SELECT * FROM hc_command_previews WHERE preview_ref = "
@@ -1590,11 +1589,9 @@ class SQLiteHumanCollaborationLadder:
                         connection, tuple(owner_revisions)
                     )
                 else:
-                    # WritingResearchSnapshotReader verifies semantic
-                    # currentness while deliberately excluding global Owner
-                    # bookkeeping revisions from that basis. Preserve the
-                    # frozen coherent-cut revisions in the preview and only
-                    # re-read HC's mutable authorization head here.
+                    # Preserve the frozen coherent-cut revisions and only
+                    # re-read HC's mutable authorization head. Later research
+                    # belongs to a later Snapshot, not this confirmation.
                     expected_owner_revisions = _current_owner_revisions(
                         connection, ("human_collaboration",)
                     )

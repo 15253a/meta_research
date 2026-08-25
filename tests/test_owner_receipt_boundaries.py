@@ -653,9 +653,13 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
             "experiment_input_binding_count": 0,
                 "experiment_asset_role_count": 0,
                 "formal_measurement_count": 0,
+                "formal_plan_content_acceptance_count": 0,
+                "reuse_eligibility_count": 0,
                 "target_graph_count": 0,
+                "target_graph_rejection_count": 0,
                 "target_count": 0,
                 "target_commit_count": 0,
+                "target_measurement_domain_authority_count": 0,
                 "writing_citation_decision_count": 0,
                 "writing_citation_rejection_count": 0,
             }

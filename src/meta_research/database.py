@@ -28,6 +28,28 @@ class Database:
         with self._write_lock, self._engine.begin() as connection:
             yield connection
 
+    @contextmanager
+    def fenced_write(self) -> Iterator[Connection]:
+        """Acquire SQLite's writer before any issuer/currentness reads.
+
+        Pysqlite's deferred transaction mode does not emit ``BEGIN`` for a
+        leading ``SELECT``.  A recovery-sensitive Owner boundary that verifies
+        a Fence and only then inserts would therefore leave a cross-process
+        check-to-write window.  This narrow seam deliberately acquires the
+        SQLite writer up front; ordinary writes keep their existing deferred
+        behavior.
+        """
+
+        with self._write_lock, self._engine.connect() as connection:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+
     def close(self) -> None:
         self._engine.dispose()
 

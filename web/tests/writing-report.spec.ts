@@ -115,6 +115,7 @@ test("Writing report stays autonomous and exposes distinct Owner layers", async 
   await expect(comparison).toContainText("浏览器阶段报告 · r1");
   await expect(comparison).toContainText("浏览器阶段报告 · r2");
   await expect(comparison).toContainText("Citation 变化");
+  await expect(comparison).toContainText("frozen ·");
 
   // A comparison is a fact about one exact Run and version pair.  Build a
   // second two-version Run, then prove switching tabs cannot relabel A's facts

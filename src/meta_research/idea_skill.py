@@ -30,6 +30,8 @@ from meta_research.idea_contract import (
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.provider_supervisor import (
+    CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
+    PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES,
     ProviderSupervisorError,
     SUPERVISOR_REQUEST_SCHEMA,
     ensure_transport_key,
@@ -60,6 +62,48 @@ _DISABLED_CODEX_FEATURES = (
     "memories",
     "plugins",
     "remote_plugin",
+)
+_SEMANTIC_MCP_TOKEN_ENV = "META_RESEARCH_MCP_TOKEN"
+_CODEX_PROVIDER_OPERATION_SCHEMA = "meta-research/codex-provider-operation/v2"
+_LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA = (
+    "meta-research/codex-provider-operation/v1"
+)
+_COMPLETION_ENVELOPE_MAX_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderTransportLimits:
+    """Immutable byte contract owned by one Codex Skill adapter."""
+
+    prompt_max_bytes: int
+    stream_max_bytes: int
+    result_max_bytes: int
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.prompt_max_bytes,
+            self.stream_max_bytes,
+            self.result_max_bytes,
+        ):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 < value <= PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES
+            ):
+                raise ValueError("provider_transport_limits_invalid")
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "prompt_max_bytes": self.prompt_max_bytes,
+            "stream_max_bytes": self.stream_max_bytes,
+            "result_max_bytes": self.result_max_bytes,
+        }
+
+
+DEFAULT_PROVIDER_TRANSPORT_LIMITS = ProviderTransportLimits(
+    prompt_max_bytes=PROVIDER_STREAM_MAX_BYTES,
+    stream_max_bytes=PROVIDER_STREAM_MAX_BYTES,
+    result_max_bytes=PROVIDER_RESULT_MAX_BYTES,
 )
 
 
@@ -264,7 +308,16 @@ class CodexIdeaSkillAdapter:
 
     _sandbox_mode = "danger-full-access"
     _shell_environment_inherit: str | None = None
+    _web_search_mode = "live"
     _reconciliation_operation_names = ("primary", "review")
+    _provider_transport_limits = DEFAULT_PROVIDER_TRANSPORT_LIMITS
+
+    def _sandbox_arguments(
+        self, sandbox_read_root: Path | None
+    ) -> tuple[str, ...]:
+        if sandbox_read_root is not None:
+            raise IdeaSkillUnavailable("codex_sandbox_read_root_unsupported")
+        return ("--sandbox", self._sandbox_mode)
 
     def _is_reconciliation_operation_name(self, operation_name: str) -> bool:
         return operation_name in self._reconciliation_operation_names
@@ -365,20 +418,36 @@ class CodexIdeaSkillAdapter:
                         )
                     continue
                 invocation = read_transport_envelope(invocation_path, key)
+                transport_limits = _operation_transport_limits(invocation)
+                legacy_operation = (
+                    invocation.get("schema_ref")
+                    == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA
+                )
+                expected_fields = {
+                    "schema_ref",
+                    "job_ref",
+                    "operation_name",
+                    "prompt_hash",
+                    "output_schema_hash",
+                    "native_session_ref",
+                    "model_ref",
+                    "mcp_url",
+                    "mcp_scope_binding_hash",
+                    "transport_mode",
+                }
+                if legacy_operation:
+                    expected_fields.difference_update(
+                        {"mcp_url", "mcp_scope_binding_hash"}
+                    )
+                else:
+                    expected_fields.update(transport_limits.as_dict())
                 if (
-                    set(invocation)
-                    != {
-                        "schema_ref",
-                        "job_ref",
-                        "operation_name",
-                        "prompt_hash",
-                        "output_schema_hash",
-                        "native_session_ref",
-                        "model_ref",
-                        "transport_mode",
-                    }
+                    set(invocation) != expected_fields
                     or invocation.get("schema_ref")
-                    != "meta-research/codex-provider-operation/v1"
+                    not in {
+                        _CODEX_PROVIDER_OPERATION_SCHEMA,
+                        _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA,
+                    }
                     or invocation.get("job_ref") != job_ref
                     or invocation.get("operation_name") != operation_name
                 ):
@@ -400,7 +469,11 @@ class CodexIdeaSkillAdapter:
                             directory,
                             key=key,
                             invocation_hash=invocation_hash,
-                            request_schema=SUPERVISOR_REQUEST_SCHEMA,
+                            request_schema=(
+                                SUPERVISOR_REQUEST_SCHEMA
+                                if legacy_operation
+                                else CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
+                            ),
                         ):
                             return False
                         continue
@@ -649,7 +722,17 @@ class CodexIdeaSkillAdapter:
         schema: dict[str, object],
         native_session_ref: str | None,
         job_ref: str | None,
+        mcp_url: str | None = None,
+        mcp_token: str | None = None,
+        mcp_scope_binding_hash: str | None = None,
+        sandbox_read_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
+        transport_limits = self._provider_transport_limits
+        _validate_provider_inputs(
+            prompt,
+            schema,
+            transport_limits=transport_limits,
+        )
         if job_ref is not None:
             operation_root = self._workspace / "provider-operations"
             directory = (
@@ -664,6 +747,11 @@ class CodexIdeaSkillAdapter:
                 prompt=prompt,
                 schema=schema,
                 native_session_ref=native_session_ref,
+                mcp_url=mcp_url,
+                mcp_token=mcp_token,
+                mcp_scope_binding_hash=mcp_scope_binding_hash,
+                sandbox_read_root=sandbox_read_root,
+                transport_limits=transport_limits,
             )
         with tempfile.TemporaryDirectory(
             prefix="idea-provider-", dir=self._workspace
@@ -676,6 +764,12 @@ class CodexIdeaSkillAdapter:
                 job_ref=None,
                 stdout_path=None,
                 invocation_hash=None,
+                supervisor_request_schema=CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
+                mcp_url=mcp_url,
+                mcp_token=mcp_token,
+                mcp_scope_binding_hash=mcp_scope_binding_hash,
+                sandbox_read_root=sandbox_read_root,
+                transport_limits=transport_limits,
             )
 
     def _invoke_durable(
@@ -687,16 +781,24 @@ class CodexIdeaSkillAdapter:
         prompt: str,
         schema: dict[str, object],
         native_session_ref: str | None,
+        mcp_url: str | None,
+        mcp_token: str | None,
+        mcp_scope_binding_hash: str | None,
+        sandbox_read_root: Path | None,
+        transport_limits: ProviderTransportLimits,
     ) -> tuple[dict[str, object], str | None, str]:
         directory.mkdir(parents=True, exist_ok=True)
         invocation_base = {
-            "schema_ref": "meta-research/codex-provider-operation/v1",
+            "schema_ref": _CODEX_PROVIDER_OPERATION_SCHEMA,
             "job_ref": job_ref,
             "operation_name": operation_name,
             "prompt_hash": canonical_hash(prompt),
             "output_schema_hash": canonical_hash(schema),
             "native_session_ref": native_session_ref,
             "model_ref": self._model_ref,
+            "mcp_url": mcp_url,
+            "mcp_scope_binding_hash": mcp_scope_binding_hash,
+            **transport_limits.as_dict(),
         }
         current_transport_mode = (
             "durable_supervisor"
@@ -710,6 +812,7 @@ class CodexIdeaSkillAdapter:
         _key_path, transport_key = self._transport_key()
         invocation_json = _sealed_operation_invocation(invocation, transport_key)
         invocation_hash = canonical_hash(invocation)
+        supervisor_request_schema = CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
         invocation_path = directory / "invocation.json"
         if not invocation_path.exists() and any(directory.iterdir()):
             raise IdeaSkillUnavailable("codex_operation_spool_invalid")
@@ -722,6 +825,19 @@ class CodexIdeaSkillAdapter:
             )
             persisted_transport_mode = cast(
                 str, persisted_invocation["transport_mode"]
+            )
+            transport_limits = _operation_transport_limits(
+                persisted_invocation
+            )
+            if (
+                persisted_invocation.get("schema_ref")
+                == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA
+            ):
+                supervisor_request_schema = SUPERVISOR_REQUEST_SCHEMA
+            _validate_provider_inputs(
+                prompt,
+                schema,
+                transport_limits=transport_limits,
             )
             invocation_hash = canonical_hash(persisted_invocation)
             provider_started = directory / "provider-started.json"
@@ -740,6 +856,7 @@ class CodexIdeaSkillAdapter:
                     directory,
                     invocation_hash=invocation_hash,
                     native_session_ref=native_session_ref,
+                    transport_limits=transport_limits,
                 )
             if persisted_transport_mode != "durable_supervisor":
                 raise IdeaSkillUnavailable(
@@ -756,6 +873,12 @@ class CodexIdeaSkillAdapter:
                 job_ref=job_ref,
                 stdout_path=directory / "stdout.jsonl",
                 invocation_hash=invocation_hash,
+                supervisor_request_schema=supervisor_request_schema,
+                mcp_url=mcp_url,
+                mcp_token=mcp_token,
+                mcp_scope_binding_hash=mcp_scope_binding_hash,
+                sandbox_read_root=sandbox_read_root,
+                transport_limits=transport_limits,
             )
         except IdeaSkillUnavailable as error:
             if error.code == "codex_cli_unavailable":
@@ -767,6 +890,7 @@ class CodexIdeaSkillAdapter:
             invocation_hash=invocation_hash,
             decoded=result[0],
             native_session_ref=result[1],
+            transport_limits=transport_limits,
         )
         return result
 
@@ -780,7 +904,20 @@ class CodexIdeaSkillAdapter:
         job_ref: str | None,
         stdout_path: Path | None,
         invocation_hash: str | None,
+        transport_limits: ProviderTransportLimits,
+        supervisor_request_schema: str,
+        mcp_url: str | None = None,
+        mcp_token: str | None = None,
+        mcp_scope_binding_hash: str | None = None,
+        sandbox_read_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
+        mcp_values = (mcp_url, mcp_token, mcp_scope_binding_hash)
+        if any(value is not None for value in mcp_values) and (
+            any(not isinstance(value, str) or not value for value in mcp_values)
+            or len(cast(str, mcp_scope_binding_hash)) != 64
+        ):
+            raise IdeaSkillUnavailable("semantic_mcp_invocation_invalid")
+        semantic_mcp_enabled = all(value is not None for value in mcp_values)
         directory.mkdir(parents=True, exist_ok=True)
         schema_path = directory / "output-schema.json"
         result_path = directory / "last-message.json"
@@ -801,10 +938,23 @@ class CodexIdeaSkillAdapter:
             "--strict-config",
             "--config",
             "mcp_servers={}",
+            *(
+                (
+                    "--config",
+                    f'mcp_servers.meta_research.url="{mcp_url}"',
+                    "--config",
+                    (
+                        "mcp_servers.meta_research.bearer_token_env_var="
+                        f'"{_SEMANTIC_MCP_TOKEN_ENV}"'
+                    ),
+                )
+                if semantic_mcp_enabled
+                else ()
+            ),
             "--config",
             'approval_policy="never"',
             "--config",
-            'web_search="live"',
+            f'web_search="{self._web_search_mode}"',
             *(
                 (
                     "--config",
@@ -818,8 +968,7 @@ class CodexIdeaSkillAdapter:
                 for feature in _DISABLED_CODEX_FEATURES
                 for value in ("--disable", feature)
             ),
-            "--sandbox",
-            self._sandbox_mode,
+            *self._sandbox_arguments(sandbox_read_root),
             "--model",
             self._model_ref,
             "--cd",
@@ -835,8 +984,22 @@ class CodexIdeaSkillAdapter:
         else:
             argv.extend(["resume", native_session_ref, "-"])
         try:
+            environment = (
+                {_SEMANTIC_MCP_TOKEN_ENV: cast(str, mcp_token)}
+                if semantic_mcp_enabled
+                else None
+            )
             if job_ref is None:
-                completed = self._runner(argv, prompt, self._timeout_seconds)
+                completed = (
+                    self._runner(
+                        argv,
+                        prompt,
+                        self._timeout_seconds,
+                        environment,
+                    )
+                    if environment is not None
+                    else self._runner(argv, prompt, self._timeout_seconds)
+                )
             else:
                 run_job = getattr(self._runner, "run_job", None)
                 if not callable(run_job):
@@ -851,42 +1014,52 @@ class CodexIdeaSkillAdapter:
                     _key_path, transport_key = self._transport_key()
                     supervisor_request_path = directory / "supervisor-request.json"
                     try:
+                        supervisor_payload: dict[str, object] = {
+                            "schema_ref": supervisor_request_schema,
+                            "invocation_hash": invocation_hash,
+                            "argv": argv,
+                            "timeout_seconds": self._timeout_seconds,
+                            "stream_max_bytes": (
+                                transport_limits.stream_max_bytes
+                            ),
+                            "result_max_bytes": (
+                                transport_limits.result_max_bytes
+                            ),
+                            "prompt_path": str(directory / "prompt.txt"),
+                            "schema_path": str(schema_path),
+                            "stdout_path": str(stdout_path),
+                            "result_path": str(result_path),
+                            "lock_path": str(directory / "supervisor.lock"),
+                            "ready_path": str(
+                                directory / "supervisor-ready.json"
+                            ),
+                            "started_path": str(
+                                directory / "provider-started.json"
+                            ),
+                            "receipt_path": str(
+                                directory / "supervisor-exit.json"
+                            ),
+                            "stop_path": str(
+                                directory / "supervisor-stop.json"
+                            ),
+                        }
+                        if (
+                            supervisor_request_schema
+                            == CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
+                        ):
+                            supervisor_payload["prompt_max_bytes"] = (
+                                transport_limits.prompt_max_bytes
+                            )
                         write_supervisor_request(
                             supervisor_request_path,
-                            {
-                                "schema_ref": SUPERVISOR_REQUEST_SCHEMA,
-                                "invocation_hash": invocation_hash,
-                                "argv": argv,
-                                "timeout_seconds": self._timeout_seconds,
-                                "stream_max_bytes": PROVIDER_STREAM_MAX_BYTES,
-                                "result_max_bytes": PROVIDER_RESULT_MAX_BYTES,
-                                "prompt_path": str(directory / "prompt.txt"),
-                                "schema_path": str(schema_path),
-                                "stdout_path": str(stdout_path),
-                                "result_path": str(result_path),
-                                "lock_path": str(
-                                    directory / "supervisor.lock"
-                                ),
-                                "ready_path": str(
-                                    directory / "supervisor-ready.json"
-                                ),
-                                "started_path": str(
-                                    directory / "provider-started.json"
-                                ),
-                                "receipt_path": str(
-                                    directory / "supervisor-exit.json"
-                                ),
-                                "stop_path": str(
-                                    directory / "supervisor-stop.json"
-                                ),
-                            },
+                            supervisor_payload,
                             transport_key,
                         )
                     except (OSError, ProviderSupervisorError) as error:
                         raise IdeaSkillUnavailable(
                             "codex_operation_spool_unavailable"
                         ) from error
-                    completed = durable_job(
+                    durable_arguments: list[object] = [
                         job_ref,
                         argv,
                         prompt,
@@ -894,11 +1067,31 @@ class CodexIdeaSkillAdapter:
                         stdout_path,
                         directory / "pid.json",
                         supervisor_request_path,
-                    )
+                    ]
+                    if environment is not None:
+                        durable_arguments.append(environment)
+                    if isinstance(self._runner, _CancellableProcessRunner):
+                        completed = durable_job(
+                            *durable_arguments,
+                            stdout_max_bytes=transport_limits.stream_max_bytes,
+                        )
+                    else:
+                        # Third-party/test runners predate the optional runner
+                        # read limit.  Their signed supervisor request still
+                        # carries and enforces the immutable transport limits.
+                        completed = durable_job(*durable_arguments)
                     supervised = True
                 else:
-                    completed = run_job(
-                        job_ref, argv, prompt, self._timeout_seconds
+                    completed = (
+                        run_job(
+                            job_ref,
+                            argv,
+                            prompt,
+                            self._timeout_seconds,
+                            environment,
+                        )
+                        if environment is not None
+                        else run_job(job_ref, argv, prompt, self._timeout_seconds)
                     )
         except _ProcessStopped as error:
             raise IdeaSkillUnavailable("codex_cli_stopped") from error
@@ -909,8 +1102,10 @@ class CodexIdeaSkillAdapter:
         except OSError as error:
             raise IdeaSkillUnavailable("codex_cli_io_unavailable") from error
         if _text_exceeds_limit(
-            completed.stdout, PROVIDER_STREAM_MAX_BYTES
-        ) or _text_exceeds_limit(completed.stderr, PROVIDER_STREAM_MAX_BYTES):
+            completed.stdout, transport_limits.stream_max_bytes
+        ) or _text_exceeds_limit(
+            completed.stderr, transport_limits.stream_max_bytes
+        ):
             raise IdeaSkillUnavailable("codex_output_too_large")
         if stdout_path is not None and not stdout_path.exists():
             _write_durable(stdout_path, completed.stdout)
@@ -931,7 +1126,12 @@ class CodexIdeaSkillAdapter:
         if effective_returncode != 0:
             raise IdeaSkillUnavailable("codex_cli_failed")
         try:
-            decoded = json.loads(_read_idea_result(result_path))
+            decoded = json.loads(
+                _read_idea_result(
+                    result_path,
+                    result_max_bytes=transport_limits.result_max_bytes,
+                )
+            )
         except IdeaSkillUnavailable:
             raise
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -983,6 +1183,39 @@ def _sealed_operation_invocation(
     )
 
 
+def _operation_transport_limits(
+    invocation: dict[str, object],
+) -> ProviderTransportLimits:
+    schema_ref = invocation.get("schema_ref")
+    if schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA:
+        return DEFAULT_PROVIDER_TRANSPORT_LIMITS
+    if schema_ref != _CODEX_PROVIDER_OPERATION_SCHEMA:
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+    try:
+        return ProviderTransportLimits(
+            prompt_max_bytes=cast(int, invocation.get("prompt_max_bytes")),
+            stream_max_bytes=cast(int, invocation.get("stream_max_bytes")),
+            result_max_bytes=cast(int, invocation.get("result_max_bytes")),
+        )
+    except ValueError as error:
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+
+
+def _validate_provider_inputs(
+    prompt: str,
+    schema: dict[str, object],
+    *,
+    transport_limits: ProviderTransportLimits,
+) -> None:
+    if len(prompt.encode("utf-8")) > transport_limits.prompt_max_bytes:
+        raise IdeaSkillUnavailable("codex_prompt_too_large")
+    if (
+        len(canonical_json(schema).encode("utf-8"))
+        > transport_limits.result_max_bytes
+    ):
+        raise IdeaSkillUnavailable("codex_output_schema_too_large")
+
+
 def _read_operation_invocation(
     path: Path,
     *,
@@ -1006,11 +1239,44 @@ def _read_operation_invocation(
         hashlib.sha256,
     ).hexdigest()
     transport_mode = typed_invocation.get("transport_mode")
+    transport_limits = _operation_transport_limits(typed_invocation)
+    schema_ref = typed_invocation.get("schema_ref")
+    expected_keys = {*expected_base, "transport_mode"}
+    if schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA:
+        expected_keys.difference_update(transport_limits.as_dict())
+        expected_keys.difference_update({"mcp_url", "mcp_scope_binding_hash"})
+    identity_fields = set(expected_base).difference(
+        {
+            "schema_ref",
+            "prompt_max_bytes",
+            "stream_max_bytes",
+            "result_max_bytes",
+        }
+    )
+    if schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA:
+        identity_fields.difference_update(
+            {"mcp_url", "mcp_scope_binding_hash"}
+        )
     if (
         set(envelope) != {"payload", "seal"}
         or not hmac.compare_digest(seal, expected_seal)
-        or set(typed_invocation) != {*expected_base, "transport_mode"}
-        or any(typed_invocation.get(name) != value for name, value in expected_base.items())
+        or set(typed_invocation) != expected_keys
+        or schema_ref
+        not in {
+            _CODEX_PROVIDER_OPERATION_SCHEMA,
+            _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA,
+        }
+        or (
+            schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA
+            and (
+                expected_base.get("mcp_url") is not None
+                or expected_base.get("mcp_scope_binding_hash") is not None
+            )
+        )
+        or any(
+            typed_invocation.get(name) != expected_base[name]
+            for name in identity_fields
+        )
         or transport_mode
         not in {"durable_supervisor", "unreconciled_runner"}
     ):
@@ -1055,7 +1321,7 @@ def _write_exit_marker(
     *,
     invocation_hash: str,
 ) -> dict[str, object]:
-    prompt_hash, output_schema_hash = _verified_operation_inputs(
+    prompt_hash, output_schema_hash, transport_limits = _verified_operation_inputs(
         directory,
         invocation_hash=invocation_hash,
     )
@@ -1074,7 +1340,7 @@ def _write_exit_marker(
             result_path=directory / "last-message.json",
         )
         stdout = _read_spool_text(
-            directory / "stdout.jsonl", PROVIDER_STREAM_MAX_BYTES
+            directory / "stdout.jsonl", transport_limits.stream_max_bytes
         )
     except (OSError, ProviderSupervisorError) as error:
         raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
@@ -1163,19 +1429,27 @@ def _verified_operation_inputs(
     directory: Path,
     *,
     invocation_hash: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, ProviderTransportLimits]:
     try:
         _key_path, transport_key = read_transport_key_for_operation(directory)
         envelope = json.loads(
             (directory / "invocation.json").read_text(encoding="utf-8")
         )
+        if not isinstance(envelope, dict) or not isinstance(
+            envelope.get("payload"), dict
+        ):
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+        invocation = cast(dict[str, object], envelope["payload"])
+        transport_limits = _operation_transport_limits(invocation)
         prompt = _read_spool_text(
-            directory / "prompt.txt", PROVIDER_STREAM_MAX_BYTES
+            directory / "prompt.txt", transport_limits.prompt_max_bytes
         )
         schema_text = _read_spool_text(
-            directory / "output-schema.json", PROVIDER_RESULT_MAX_BYTES
+            directory / "output-schema.json", transport_limits.result_max_bytes
         )
         schema = json.loads(schema_text)
+    except IdeaSkillUnavailable:
+        raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
     if (
@@ -1193,17 +1467,16 @@ def _verified_operation_inputs(
             ).hexdigest(),
         )
         or canonical_hash(envelope["payload"]) != invocation_hash
-        or cast(dict[str, object], envelope["payload"]).get("schema_ref")
-        != "meta-research/codex-provider-operation/v1"
-        or cast(dict[str, object], envelope["payload"]).get("prompt_hash")
-        != canonical_hash(prompt)
-        or cast(dict[str, object], envelope["payload"]).get(
-            "output_schema_hash"
-        )
-        != canonical_hash(schema)
+        or invocation.get("schema_ref")
+        not in {
+            _CODEX_PROVIDER_OPERATION_SCHEMA,
+            _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA,
+        }
+        or invocation.get("prompt_hash") != canonical_hash(prompt)
+        or invocation.get("output_schema_hash") != canonical_hash(schema)
     ):
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
-    return canonical_hash(prompt), canonical_hash(schema)
+    return canonical_hash(prompt), canonical_hash(schema), transport_limits
 
 
 def _verified_native_session(stdout: str, *, expected: str | None) -> str:
@@ -1342,13 +1615,14 @@ def _write_completed_operation(
     invocation_hash: str,
     decoded: dict[str, object],
     native_session_ref: str | None,
+    transport_limits: ProviderTransportLimits,
 ) -> None:
     exit_marker = _verified_success_exit(
         directory,
         invocation_hash=invocation_hash,
     )
     stdout = _read_spool_text(
-        directory / "stdout.jsonl", PROVIDER_STREAM_MAX_BYTES
+        directory / "stdout.jsonl", transport_limits.stream_max_bytes
     )
     verified_session = _verified_native_session(
         stdout,
@@ -1371,6 +1645,7 @@ def _read_completed_operation(
     *,
     invocation_hash: str,
     native_session_ref: str | None,
+    transport_limits: ProviderTransportLimits,
 ) -> tuple[dict[str, object], str | None, str]:
     exit_marker = _verified_success_exit(
         directory,
@@ -1383,8 +1658,15 @@ def _read_completed_operation(
         if not stdout_path.exists() or not result_path.exists():
             raise IdeaSkillUnavailable("codex_operation_reconciliation_pending")
         try:
-            stdout = _read_spool_text(stdout_path, PROVIDER_STREAM_MAX_BYTES)
-            decoded = json.loads(_read_idea_result(result_path))
+            stdout = _read_spool_text(
+                stdout_path, transport_limits.stream_max_bytes
+            )
+            decoded = json.loads(
+                _read_idea_result(
+                    result_path,
+                    result_max_bytes=transport_limits.result_max_bytes,
+                )
+            )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise IdeaSkillUnavailable(
                 "codex_operation_reconciliation_pending"
@@ -1400,14 +1682,24 @@ def _read_completed_operation(
             invocation_hash=invocation_hash,
             decoded=cast(dict[str, object], decoded),
             native_session_ref=recovered_session,
+            transport_limits=transport_limits,
         )
     try:
-        completion = json.loads(completion_path.read_text(encoding="utf-8"))
+        completion = json.loads(
+            _read_spool_text(
+                completion_path,
+                transport_limits.result_max_bytes
+                + _COMPLETION_ENVELOPE_MAX_BYTES,
+            )
+        )
         stdout = _read_spool_text(
-            directory / "stdout.jsonl", PROVIDER_STREAM_MAX_BYTES
+            directory / "stdout.jsonl", transport_limits.stream_max_bytes
         )
         persisted_result = json.loads(
-            _read_idea_result(directory / "last-message.json")
+            _read_idea_result(
+                directory / "last-message.json",
+                result_max_bytes=transport_limits.result_max_bytes,
+            )
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
@@ -1452,12 +1744,12 @@ def _remove_operation_spool(directory: Path) -> None:
     shutil.rmtree(directory, ignore_errors=True)
 
 
-def _read_idea_result(path: Path) -> str:
-    if path.stat().st_size > PROVIDER_RESULT_MAX_BYTES:
+def _read_idea_result(path: Path, *, result_max_bytes: int) -> str:
+    if path.stat().st_size > result_max_bytes:
         raise IdeaSkillUnavailable("codex_output_too_large")
     with path.open("rb") as source:
-        value = source.read(PROVIDER_RESULT_MAX_BYTES + 1)
-    if len(value) > PROVIDER_RESULT_MAX_BYTES:
+        value = source.read(result_max_bytes + 1)
+    if len(value) > result_max_bytes:
         raise IdeaSkillUnavailable("codex_output_too_large")
     return value.decode("utf-8")
 

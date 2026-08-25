@@ -20,6 +20,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from pypdf import PdfReader
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from meta_research.database import Database
 from meta_research.deepfetch import DeepFetchRunRequest
@@ -83,6 +84,8 @@ CONTENT_RECEIPT_KIND = "question_content_acceptance"
 MANUAL_CONTENT_RECEIPT_KIND = "manual_question_content_acceptance"
 IDEA_CONTENT_RECEIPT_KIND = "idea_outcome_content_acceptance"
 PLAN_CONTENT_RECEIPT_KIND = "plan_document_content_acceptance"
+REUSE_SOURCE_VERSION_RECEIPT_KIND = "reuse_source_version_verified"
+IMPLEMENTATION_CONTENT_RECEIPT_KIND = "implementation_revision_content_accepted"
 LITERATURE_SNAPSHOT_RECEIPT_KIND = "literature_snapshot_acceptance"
 ASSET_RECEIPT_KIND = "asset_acceptance"
 ASSET_CUSTODY_ESTABLISHED_RECEIPT_KIND = "asset_custody_established"
@@ -388,6 +391,50 @@ class _PreparedAsset:
 
 
 @dataclass(frozen=True)
+class AcceptedImplementationRevisionContent:
+    """Immutable RM content behind one exact Bundle Implementation Revision.
+
+    ``content`` is the fixed prototype payload, not an alternate production
+    manifest: source/version and the optional external license/content/patch
+    fields are exactly the values whose canonical hash is carried by the
+    Bundle candidate's ``implementation_binding``.
+    """
+
+    implementation_revision_ref: str
+    source_ref: str
+    exact_version_ref: str
+    license_ref: str | None
+    source_content_hash_ref: str | None
+    patch_ref: str | None
+    verification_evidence_ref: str
+    content: dict[str, object]
+    content_hash_ref: str
+    accepted_at: float
+    source_verification_receipt: AcceptanceReceipt
+    content_acceptance_receipt: AcceptanceReceipt
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "implementation_revision_ref": self.implementation_revision_ref,
+            "source_ref": self.source_ref,
+            "exact_version_ref": self.exact_version_ref,
+            "license_ref": self.license_ref,
+            "source_content_hash_ref": self.source_content_hash_ref,
+            "patch_ref": self.patch_ref,
+            "verification_evidence_ref": self.verification_evidence_ref,
+            "content": dict(self.content),
+            "content_hash_ref": self.content_hash_ref,
+            "accepted_at": self.accepted_at,
+            "source_verification_receipt": (
+                self.source_verification_receipt.as_public_dict()
+            ),
+            "content_acceptance_receipt": (
+                self.content_acceptance_receipt.as_public_dict()
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class AcceptedQuestionContent:
     initialization_id: str
     content_ref: str
@@ -561,6 +608,51 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     def query_snapshot(self) -> OwnerSnapshot: ...
 
     def query_projection_snapshot(self) -> OwnerSnapshot: ...
+
+    def accept_implementation_content(
+        self,
+        *,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        verification_evidence_ref: str,
+        license_ref: str | None = None,
+        source_content_hash_ref: str | None = None,
+        patch_ref: str | None = None,
+        idempotency_key: str,
+    ) -> AcceptedImplementationRevisionContent: ...
+
+    def query_implementation_content(
+        self, implementation_revision_ref: str
+    ) -> AcceptedImplementationRevisionContent | None: ...
+
+    def verify_reuse_source_version(
+        self,
+        *,
+        tier: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        license_ref: str | None,
+        source_content_hash_ref: str | None,
+        patch_ref: str | None,
+        receipt_ref: str,
+        receipt_subject_ref: str,
+    ) -> None: ...
+
+    def verify_implementation_content(
+        self,
+        *,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        license_ref: str | None,
+        source_content_hash_ref: str | None,
+        patch_ref: str | None,
+        content_hash_ref: str,
+        receipt_ref: str,
+        receipt_subject_ref: str,
+    ) -> None: ...
 
     def submit_asset_intake(
         self,
@@ -852,7 +944,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
     owner=RM_OWNER,
     statement=text(
         "SELECT revision, asset_count, object_count, formal_content_count, "
-        "idea_content_count, plan_content_count, asset_version_count, "
+        "idea_content_count, plan_content_count, implementation_revision_count, "
+        "asset_version_count, "
         "pending_intake_count, hold_count, "
         "literature_snapshot_count, human_request_count "
         "FROM research_memory_state WHERE singleton = 'owner'"
@@ -863,6 +956,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "formal_content_count",
         "idea_content_count",
         "plan_content_count",
+        "implementation_revision_count",
         "asset_version_count",
         "pending_intake_count",
         "hold_count",
@@ -886,6 +980,105 @@ class SQLiteResearchMemoryReceiptVerifier:
         self._object_store = object_store
         self._execution_verifier = execution_verifier
         self._stage_request_verifier = stage_request_verifier
+
+    def verify_reuse_source_version(
+        self,
+        *,
+        tier: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        license_ref: str | None,
+        source_content_hash_ref: str | None,
+        patch_ref: str | None,
+        receipt_ref: str,
+        receipt_subject_ref: str,
+    ) -> None:
+        _validate_reuse_tier_metadata(
+            tier=tier,
+            license_ref=license_ref,
+            source_content_hash_ref=source_content_hash_ref,
+            patch_ref=patch_ref,
+        )
+        row = self._query_implementation_row(
+            source_ref=source_ref,
+            exact_version_ref=exact_version_ref,
+            implementation_revision_ref=implementation_revision_ref,
+        )
+        if row is None or (
+            receipt_subject_ref != exact_version_ref
+            or row.source_receipt_ref != receipt_ref
+            or row.source_receipt_hash != _reuse_source_receipt_hash(row)
+            or not _implementation_row_matches(
+                row,
+                source_ref=source_ref,
+                exact_version_ref=exact_version_ref,
+                implementation_revision_ref=implementation_revision_ref,
+                license_ref=license_ref,
+                source_content_hash_ref=source_content_hash_ref,
+                patch_ref=patch_ref,
+            )
+        ):
+            raise OwnerConflict("reuse_source_version_receipt_invalid")
+        _accepted_implementation_content(row)
+
+    def verify_implementation_content(
+        self,
+        *,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        license_ref: str | None,
+        source_content_hash_ref: str | None,
+        patch_ref: str | None,
+        content_hash_ref: str,
+        receipt_ref: str,
+        receipt_subject_ref: str,
+    ) -> None:
+        row = self._query_implementation_row(
+            source_ref=source_ref,
+            exact_version_ref=exact_version_ref,
+            implementation_revision_ref=implementation_revision_ref,
+        )
+        if row is None or (
+            receipt_subject_ref != content_hash_ref
+            or row.content_hash_ref != content_hash_ref
+            or row.content_receipt_ref != receipt_ref
+            or row.content_receipt_hash != _implementation_content_receipt_hash(row)
+            or not _implementation_row_matches(
+                row,
+                source_ref=source_ref,
+                exact_version_ref=exact_version_ref,
+                implementation_revision_ref=implementation_revision_ref,
+                license_ref=license_ref,
+                source_content_hash_ref=source_content_hash_ref,
+                patch_ref=patch_ref,
+            )
+        ):
+            raise OwnerConflict("implementation_content_receipt_invalid")
+        _accepted_implementation_content(row)
+
+    def _query_implementation_row(
+        self,
+        *,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+    ):
+        with self._database.read() as connection:
+            return connection.execute(
+                text(
+                    "SELECT * FROM rm_implementation_revision_contents WHERE "
+                    "source_ref = :source_ref AND exact_version_ref = "
+                    ":exact_version_ref AND implementation_revision_ref = "
+                    ":implementation_revision_ref"
+                ),
+                {
+                    "source_ref": source_ref,
+                    "exact_version_ref": exact_version_ref,
+                    "implementation_revision_ref": implementation_revision_ref,
+                },
+            ).first()
 
     def verify_question_content_receipt(
         self,
@@ -1565,6 +1758,182 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 ),
                 {"now": now},
             )
+
+    def accept_implementation_content(
+        self,
+        *,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        verification_evidence_ref: str,
+        license_ref: str | None = None,
+        source_content_hash_ref: str | None = None,
+        patch_ref: str | None = None,
+        idempotency_key: str,
+    ) -> AcceptedImplementationRevisionContent:
+        """Accept the fixed prototype's exact implementation-source payload.
+
+        The source-version receipt is deliberately subject-bound to
+        ``exact_version_ref``.  The independent implementation acceptance
+        receipt is deliberately subject-bound to the canonical content hash;
+        neither receipt can be relabelled as the Implementation Revision ref.
+        """
+
+        source_ref = _reuse_ref(source_ref, "reuse_source_ref_invalid")
+        exact_version_ref = _reuse_ref(
+            exact_version_ref, "reuse_exact_version_ref_invalid"
+        )
+        implementation_revision_ref = _reuse_ref(
+            implementation_revision_ref,
+            "implementation_revision_ref_invalid",
+        )
+        verification_evidence_ref = _reuse_ref(
+            verification_evidence_ref,
+            "reuse_verification_evidence_ref_invalid",
+        )
+        license_ref = _optional_reuse_ref(
+            license_ref, "reuse_license_ref_invalid"
+        )
+        source_content_hash_ref = _optional_sha256(
+            source_content_hash_ref,
+            "reuse_source_content_hash_ref_invalid",
+        )
+        patch_ref = _optional_reuse_ref(patch_ref, "reuse_patch_ref_invalid")
+        idempotency_key = _reuse_idempotency_key(idempotency_key)
+        content = _implementation_content_payload(
+            source_ref=source_ref,
+            exact_version_ref=exact_version_ref,
+            implementation_revision_ref=implementation_revision_ref,
+            license_ref=license_ref,
+            source_content_hash_ref=source_content_hash_ref,
+            patch_ref=patch_ref,
+        )
+        content_json = canonical_json(content)
+        content_hash_ref = canonical_hash(content)
+        request_hash = canonical_hash(
+            {
+                "content": content,
+                "verification_evidence_ref": verification_evidence_ref,
+            }
+        )
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM rm_implementation_revision_contents WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            existing_revision = connection.execute(
+                text(
+                    "SELECT * FROM rm_implementation_revision_contents WHERE "
+                    "implementation_revision_ref = :implementation_revision_ref"
+                ),
+                {"implementation_revision_ref": implementation_revision_ref},
+            ).first()
+            if replay is not None or existing_revision is not None:
+                row = replay if replay is not None else existing_revision
+                if row.request_hash != request_hash:
+                    raise OwnerConflict("implementation_content_conflict")
+            else:
+                now = time.time()
+                source_receipt_ref = new_ref("rm_reuse_source_receipt")
+                content_receipt_ref = new_ref("rm_implementation_content_receipt")
+                values: dict[str, object] = {
+                    "implementation_revision_ref": implementation_revision_ref,
+                    "source_ref": source_ref,
+                    "exact_version_ref": exact_version_ref,
+                    "license_ref": license_ref,
+                    "source_content_hash_ref": source_content_hash_ref,
+                    "patch_ref": patch_ref,
+                    "verification_evidence_ref": verification_evidence_ref,
+                    "content_json": content_json,
+                    "content_hash_ref": content_hash_ref,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "source_receipt_ref": source_receipt_ref,
+                    "content_receipt_ref": content_receipt_ref,
+                    "accepted_at": now,
+                }
+                values["source_receipt_hash"] = _reuse_source_receipt_hash(values)
+                values["content_receipt_hash"] = (
+                    _implementation_content_receipt_hash(values)
+                )
+                try:
+                    connection.execute(
+                        text(
+                            "INSERT INTO rm_implementation_revision_contents ("
+                            "implementation_revision_ref, source_ref, "
+                            "exact_version_ref, license_ref, "
+                            "source_content_hash_ref, patch_ref, "
+                            "verification_evidence_ref, content_json, "
+                            "content_hash_ref, idempotency_key, request_hash, "
+                            "source_receipt_ref, source_receipt_hash, "
+                            "content_receipt_ref, content_receipt_hash, "
+                            "accepted_at) VALUES ("
+                            ":implementation_revision_ref, :source_ref, "
+                            ":exact_version_ref, :license_ref, "
+                            ":source_content_hash_ref, :patch_ref, "
+                            ":verification_evidence_ref, :content_json, "
+                            ":content_hash_ref, :idempotency_key, :request_hash, "
+                            ":source_receipt_ref, :source_receipt_hash, "
+                            ":content_receipt_ref, :content_receipt_hash, "
+                            ":accepted_at)"
+                        ),
+                        values,
+                    )
+                except IntegrityError as error:
+                    # Uniqueness on exact version/content makes identity relabel
+                    # fail closed even under concurrent callers.
+                    raise OwnerConflict("implementation_content_conflict") from error
+                connection.execute(
+                    text(
+                        "UPDATE research_memory_state SET revision = revision + 1, "
+                        "implementation_revision_count = "
+                        "implementation_revision_count + 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "research_memory.implementation_content_accepted",
+                    {
+                        "implementation_revision_ref": implementation_revision_ref,
+                        "source_ref": source_ref,
+                        "exact_version_ref": exact_version_ref,
+                        "content_hash_ref": content_hash_ref,
+                        "source_receipt_ref": source_receipt_ref,
+                        "content_receipt_ref": content_receipt_ref,
+                    },
+                )
+        accepted = self.query_implementation_content(implementation_revision_ref)
+        if accepted is None:
+            raise OwnerConflict("implementation_content_missing_after_commit")
+        return accepted
+
+    def query_implementation_content(
+        self, implementation_revision_ref: str
+    ) -> AcceptedImplementationRevisionContent | None:
+        implementation_revision_ref = _reuse_ref(
+            implementation_revision_ref,
+            "implementation_revision_ref_invalid",
+        )
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_implementation_revision_contents WHERE "
+                    "implementation_revision_ref = :implementation_revision_ref"
+                ),
+                {"implementation_revision_ref": implementation_revision_ref},
+            ).first()
+        if row is None:
+            return None
+        return _accepted_implementation_content(row)
+
+    def verify_reuse_source_version(self, **values) -> None:
+        self._receipt_verifier.verify_reuse_source_version(**values)
+
+    def verify_implementation_content(self, **values) -> None:
+        self._receipt_verifier.verify_implementation_content(**values)
 
     def submit_asset_intake(
         self,
@@ -7997,6 +8366,229 @@ def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> s
             "bindings": bindings,
         }
     )
+
+
+def _implementation_content_payload(
+    *,
+    source_ref: str,
+    exact_version_ref: str,
+    implementation_revision_ref: str,
+    license_ref: str | None,
+    source_content_hash_ref: str | None,
+    patch_ref: str | None,
+) -> dict[str, object]:
+    # This is a direct production mapping of
+    # bundle_stage_mvp._reuse_implementation_payload_digest.
+    return {
+        "source_ref": source_ref,
+        "exact_version_ref": exact_version_ref,
+        "implementation_revision_ref": implementation_revision_ref,
+        "license_ref": license_ref,
+        "source_content_hash_ref": source_content_hash_ref,
+        "patch_ref": patch_ref,
+    }
+
+
+def _stored_value(row, name: str):
+    if isinstance(row, dict):
+        return row[name]
+    return getattr(row, name)
+
+
+def _implementation_row_matches(
+    row,
+    *,
+    source_ref: str,
+    exact_version_ref: str,
+    implementation_revision_ref: str,
+    license_ref: str | None,
+    source_content_hash_ref: str | None,
+    patch_ref: str | None,
+) -> bool:
+    return all(
+        _stored_value(row, name) == value
+        for name, value in {
+            "source_ref": source_ref,
+            "exact_version_ref": exact_version_ref,
+            "implementation_revision_ref": implementation_revision_ref,
+            "license_ref": license_ref,
+            "source_content_hash_ref": source_content_hash_ref,
+            "patch_ref": patch_ref,
+        }.items()
+    )
+
+
+def _reuse_source_receipt_hash(row) -> str:
+    return _receipt_hash(
+        REUSE_SOURCE_VERSION_RECEIPT_KIND,
+        _stored_value(row, "exact_version_ref"),
+        {
+            "receipt_ref": _stored_value(row, "source_receipt_ref"),
+            "source_ref": _stored_value(row, "source_ref"),
+            "implementation_revision_ref": _stored_value(
+                row, "implementation_revision_ref"
+            ),
+            "content_hash_ref": _stored_value(row, "content_hash_ref"),
+            "license_ref": _stored_value(row, "license_ref"),
+            "source_content_hash_ref": _stored_value(
+                row, "source_content_hash_ref"
+            ),
+            "patch_ref": _stored_value(row, "patch_ref"),
+            "verification_evidence_ref": _stored_value(
+                row, "verification_evidence_ref"
+            ),
+        },
+    )
+
+
+def _implementation_content_receipt_hash(row) -> str:
+    return _receipt_hash(
+        IMPLEMENTATION_CONTENT_RECEIPT_KIND,
+        _stored_value(row, "content_hash_ref"),
+        {
+            "receipt_ref": _stored_value(row, "content_receipt_ref"),
+            "implementation_revision_ref": _stored_value(
+                row, "implementation_revision_ref"
+            ),
+            "source_ref": _stored_value(row, "source_ref"),
+            "exact_version_ref": _stored_value(row, "exact_version_ref"),
+            "source_receipt_ref": _stored_value(row, "source_receipt_ref"),
+            "source_receipt_hash": _stored_value(row, "source_receipt_hash"),
+            "verification_evidence_ref": _stored_value(
+                row, "verification_evidence_ref"
+            ),
+        },
+    )
+
+
+def _accepted_implementation_content(row) -> AcceptedImplementationRevisionContent:
+    try:
+        content = decoded_object(_stored_value(row, "content_json"))
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("implementation_content_invalid") from error
+    expected = _implementation_content_payload(
+        source_ref=_stored_value(row, "source_ref"),
+        exact_version_ref=_stored_value(row, "exact_version_ref"),
+        implementation_revision_ref=_stored_value(
+            row, "implementation_revision_ref"
+        ),
+        license_ref=_stored_value(row, "license_ref"),
+        source_content_hash_ref=_stored_value(row, "source_content_hash_ref"),
+        patch_ref=_stored_value(row, "patch_ref"),
+    )
+    if (
+        content != expected
+        or canonical_json(content) != _stored_value(row, "content_json")
+        or canonical_hash(content) != _stored_value(row, "content_hash_ref")
+        or _stored_value(row, "request_hash")
+        != canonical_hash(
+            {
+                "content": content,
+                "verification_evidence_ref": _stored_value(
+                    row, "verification_evidence_ref"
+                ),
+            }
+        )
+        or _stored_value(row, "source_receipt_hash")
+        != _reuse_source_receipt_hash(row)
+        or _stored_value(row, "content_receipt_hash")
+        != _implementation_content_receipt_hash(row)
+    ):
+        raise OwnerConflict("implementation_content_invalid")
+    return AcceptedImplementationRevisionContent(
+        implementation_revision_ref=_stored_value(
+            row, "implementation_revision_ref"
+        ),
+        source_ref=_stored_value(row, "source_ref"),
+        exact_version_ref=_stored_value(row, "exact_version_ref"),
+        license_ref=_stored_value(row, "license_ref"),
+        source_content_hash_ref=_stored_value(row, "source_content_hash_ref"),
+        patch_ref=_stored_value(row, "patch_ref"),
+        verification_evidence_ref=_stored_value(
+            row, "verification_evidence_ref"
+        ),
+        content=content,
+        content_hash_ref=_stored_value(row, "content_hash_ref"),
+        accepted_at=float(_stored_value(row, "accepted_at")),
+        source_verification_receipt=AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=REUSE_SOURCE_VERSION_RECEIPT_KIND,
+            receipt_ref=_stored_value(row, "source_receipt_ref"),
+            subject_ref=_stored_value(row, "exact_version_ref"),
+            payload_hash=_stored_value(row, "source_receipt_hash"),
+        ),
+        content_acceptance_receipt=AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=IMPLEMENTATION_CONTENT_RECEIPT_KIND,
+            receipt_ref=_stored_value(row, "content_receipt_ref"),
+            subject_ref=_stored_value(row, "content_hash_ref"),
+            payload_hash=_stored_value(row, "content_receipt_hash"),
+        ),
+    )
+
+
+def _reuse_ref(value: str, code: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(character in value for character in ("\x00", "\r", "\n"))
+    ):
+        raise OwnerConflict(code)
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeEncodeError as error:
+        raise OwnerConflict(code) from error
+    if len(encoded) > 256:
+        raise OwnerConflict(code)
+    return value
+
+
+def _optional_reuse_ref(value: str | None, code: str) -> str | None:
+    if value is None:
+        return None
+    return _reuse_ref(value, code)
+
+
+def _optional_sha256(value: str | None, code: str) -> str | None:
+    if value is None:
+        return None
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise OwnerConflict(code)
+    return value
+
+
+def _reuse_idempotency_key(value: str) -> str:
+    value = _reuse_ref(value, "implementation_content_idempotency_key_invalid")
+    if len(value.encode("utf-8")) > 128:
+        raise OwnerConflict("implementation_content_idempotency_key_invalid")
+    return value
+
+
+def _validate_reuse_tier_metadata(
+    *,
+    tier: str,
+    license_ref: str | None,
+    source_content_hash_ref: str | None,
+    patch_ref: str | None,
+) -> None:
+    if tier not in {
+        "accepted-local",
+        "related-history",
+        "global-baseline-pool",
+        "mature-external",
+        "self-implementation",
+    }:
+        raise OwnerConflict("reuse_tier_invalid")
+    _optional_reuse_ref(license_ref, "reuse_license_ref_invalid")
+    _optional_sha256(
+        source_content_hash_ref, "reuse_source_content_hash_ref_invalid"
+    )
+    _optional_reuse_ref(patch_ref, "reuse_patch_ref_invalid")
+    if tier == "mature-external" and (
+        license_ref is None or source_content_hash_ref is None
+    ):
+        raise OwnerConflict("mature_external_source_proof_incomplete")
 
 
 def _content_receipt_hash(row) -> str:

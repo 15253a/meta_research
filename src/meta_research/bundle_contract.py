@@ -1,15 +1,31 @@
 from __future__ import annotations
 
-import math
 from typing import cast
 
-from meta_research.owners.common import canonical_hash
+from meta_research.bundle_protocol import BUNDLE_ROOT_MAX_SERIALIZED_BYTES
+from meta_research.bundle_target_contract import (
+    FORMAL_STRATEGY_UPDATE_SCHEMA_REF,
+    NORMALIZED_COMPLETION_CONTRACT_SCHEMA_REF,
+    BundleTargetContractError,
+    LegacyV2TargetSpec,
+    apply_strategy_update,
+    normalized_completion_contract_from_dict,
+    parse_legacy_v2_target_spec,
+    start_rolling_strategy,
+    strategy_update_from_dict,
+)
+from meta_research.owners.common import canonical_hash, canonical_json
 
 
 BUNDLE_CONTEXT_PACK_SCHEMA_REF = "meta-research/bundle-context-pack/v1"
-TARGET_PLAN_SCHEMA_REF = "meta-research/target-plan/v1"
+LEGACY_TARGET_PLAN_SCHEMA_REF = "meta-research/target-plan/v2"
+TARGET_PLAN_SCHEMA_REF = "meta-research/target-plan/v3"
 TARGET_PLAN_REVIEW_SCHEMA_REF = "meta-research/target-plan-review/v1"
+TARGET_GRAPH_APPEND_PROPOSAL_SCHEMA_REF = (
+    "meta-research/target-graph-append-proposal/v2"
+)
 MAX_BUNDLE_TARGETS = 64
+MAX_BUNDLE_TARGET_PLAN_BYTES = BUNDLE_ROOT_MAX_SERIALIZED_BYTES
 
 
 class BundleContractError(ValueError):
@@ -120,6 +136,11 @@ def validate_target_plan(
     context_pack_hash: str,
     plan_document: dict[str, object],
 ) -> str:
+    if (
+        len(canonical_json(target_plan).encode("utf-8"))
+        > MAX_BUNDLE_TARGET_PLAN_BYTES
+    ):
+        raise BundleContractError("target_plan_too_large")
     _exact_keys(
         target_plan,
         {
@@ -127,7 +148,8 @@ def validate_target_plan(
             "kind",
             "formal_plan_ref",
             "context_pack_ref",
-            "targets",
+            "completion_contract",
+            "initial_strategy_update",
             "source_bindings",
         },
         "target_plan_invalid",
@@ -148,114 +170,203 @@ def validate_target_plan(
     }:
         raise BundleContractError("target_plan_source_invalid")
 
-    plan_gaps = plan_document.get("gap_set")
-    briefs = plan_document.get("experiment_briefs")
+    completion_value = target_plan.get("completion_contract")
+    update_value = target_plan.get("initial_strategy_update")
+    if not isinstance(completion_value, dict) or not isinstance(update_value, dict):
+        raise BundleContractError("target_plan_formal_contract_invalid")
+    try:
+        completion = normalized_completion_contract_from_dict(
+            completion_value,
+            plan_document=plan_document,
+        )
+        update = strategy_update_from_dict(
+            update_value,
+            completion_contract=completion,
+        )
+        if (
+            update.update.revision != 1
+            or update.update.requires_accepted_labels
+            or not update.candidates
+            or len(update.candidates) > MAX_BUNDLE_TARGETS
+        ):
+            raise BundleTargetContractError("initial_strategy_update_invalid")
+        apply_strategy_update(
+            start_rolling_strategy(completion),
+            update,
+            completion_contract=completion,
+        )
+    except BundleTargetContractError as error:
+        raise BundleContractError(str(error)) from error
+    return canonical_hash(target_plan)
+
+
+def diagnose_legacy_target_plan_v2(
+    target_plan: dict[str, object],
+) -> tuple[LegacyV2TargetSpec, ...]:
+    """Read a v2 minimal plan for diagnostics; never yield completion state.
+
+    A legacy document which asserted ``strategy_complete=true`` is rejected:
+    the old gap/count slice is not allowed to masquerade as the fixed Bundle
+    completion contract.
+    """
+
+    _exact_keys(
+        target_plan,
+        {
+            "schema_ref",
+            "kind",
+            "formal_plan_ref",
+            "context_pack_ref",
+            "targets",
+            "strategy_complete",
+            "source_bindings",
+        },
+        "legacy_target_plan_v2_invalid",
+    )
     targets = target_plan.get("targets")
     if (
-        not isinstance(plan_gaps, list)
-        or not isinstance(briefs, list)
+        target_plan.get("schema_ref") != LEGACY_TARGET_PLAN_SCHEMA_REF
+        or target_plan.get("kind") != "TargetPlan"
+        or not _text(target_plan.get("formal_plan_ref"))
+        or not _text(target_plan.get("context_pack_ref"))
+        or target_plan.get("strategy_complete") is not False
+        or not isinstance(target_plan.get("source_bindings"), dict)
         or not isinstance(targets, list)
         or not targets
         or len(targets) > MAX_BUNDLE_TARGETS
     ):
-        raise BundleContractError("target_plan_invalid")
-    brief_by_key: dict[str, dict[str, object]] = {}
-    for value in briefs:
-        brief = _object(value, "target_plan_brief_invalid")
-        key = brief.get("experiment_key")
-        if not _text(key) or key in brief_by_key:
-            raise BundleContractError("target_plan_brief_invalid")
-        brief_by_key[cast(str, key)] = brief
+        raise BundleContractError("legacy_target_plan_v2_invalid")
+    try:
+        return tuple(parse_legacy_v2_target_spec(value) for value in targets)
+    except BundleTargetContractError as error:
+        raise BundleContractError(str(error)) from error
 
-    by_key: dict[str, dict[str, object]] = {}
-    covered_gaps: set[str] = set()
-    for value in targets:
-        target = _object(value, "target_spec_invalid")
-        _exact_keys(
-            target,
-            {
-                "target_key",
-                "title",
-                "target_type",
-                "experiment_key",
-                "gap_obligation_keys",
-                "depends_on",
-                "goal",
-                "hypothesis",
-                "variant_parameter",
-                "sample_count",
-                "boundary_constraints",
-                "semantic_delta",
-                "contributing_idea_refs",
-                "risk_class",
-            },
-            "target_spec_invalid",
-        )
-        key = target.get("target_key")
-        experiment_key = target.get("experiment_key")
-        depends_on = target.get("depends_on")
-        gaps = target.get("gap_obligation_keys")
-        variant = target.get("variant_parameter")
-        sample_count = target.get("sample_count")
-        if (
-            not _text(key)
-            or key in by_key
-            or experiment_key not in brief_by_key
-            or target.get("target_type") != "micro_experiment"
-            or target.get("risk_class") not in {"normal", "high"}
-            or not isinstance(depends_on, list)
-            or len(depends_on) != len(set(depends_on))
-            or not all(_text(item) for item in depends_on)
-            or not isinstance(gaps, list)
-            or not gaps
-            or len(gaps) != len(set(gaps))
-            or not all(_text(item) for item in gaps)
-            or not isinstance(variant, (int, float))
-            or isinstance(variant, bool)
-            or not math.isfinite(float(variant))
-            or not isinstance(sample_count, int)
-            or isinstance(sample_count, bool)
-            or not 4 <= sample_count <= 4096
-        ):
-            raise BundleContractError("target_spec_invalid")
-        for field in (
-            "title",
-            "goal",
-            "hypothesis",
-            "boundary_constraints",
-            "semantic_delta",
-        ):
-            if not _text(target.get(field)):
-                raise BundleContractError("target_spec_invalid")
-        brief = brief_by_key[cast(str, experiment_key)]
-        if (
-            set(cast(list[str], gaps))
-            != set(cast(list[str], brief["gap_obligation_keys"]))
-            or target.get("goal") != brief.get("goal")
-            or target.get("boundary_constraints") != brief.get("boundary_constraints")
-            or target.get("semantic_delta") != brief.get("semantic_delta")
-            or target.get("contributing_idea_refs")
-            != brief.get("contributing_idea_refs")
-        ):
-            raise BundleContractError("target_spec_brief_drift")
-        by_key[cast(str, key)] = target
-        covered_gaps.update(cast(list[str], gaps))
-    if covered_gaps != set(cast(list[str], plan_gaps)):
-        raise BundleContractError("target_plan_gap_closure_invalid")
-    if set(brief_by_key) != {
-        cast(str, target["experiment_key"]) for target in by_key.values()
-    }:
-        raise BundleContractError("target_plan_brief_closure_invalid")
 
-    for key, target in by_key.items():
-        dependencies = cast(list[str], target["depends_on"])
-        if key in dependencies or any(item not in by_key for item in dependencies):
-            raise BundleContractError("target_dag_invalid")
-    _assert_acyclic(by_key)
-    return canonical_hash(target_plan)
+def target_graph_append_proposal(
+    *,
+    graph_ref: str,
+    base_generation: int,
+    base_head_receipt: dict[str, object],
+    strategy_update: dict[str, object],
+) -> dict[str, object]:
+    """Build the canonical AR-reviewed slice offered to RG.
+
+    This envelope intentionally carries target keys rather than TargetRefs.  RG
+    remains the sole allocator of Target identity and dependency refs.
+    """
+
+    value: dict[str, object] = {
+        "schema_ref": TARGET_GRAPH_APPEND_PROPOSAL_SCHEMA_REF,
+        "kind": "TargetGraphAppendProposal",
+        "graph_ref": graph_ref,
+        "base_generation": base_generation,
+        "base_head_receipt": base_head_receipt,
+        "strategy_update": strategy_update,
+    }
+    validate_target_graph_append_proposal(value)
+    return value
+
+
+def validate_target_graph_append_proposal(
+    proposal: dict[str, object],
+) -> str:
+    _exact_keys(
+        proposal,
+        {
+            "schema_ref",
+            "kind",
+            "graph_ref",
+            "base_generation",
+            "base_head_receipt",
+            "strategy_update",
+        },
+        "target_graph_append_proposal_invalid",
+    )
+    base_generation = proposal.get("base_generation")
+    update = proposal.get("strategy_update")
+    receipt = proposal.get("base_head_receipt")
+    if (
+        proposal.get("schema_ref") != TARGET_GRAPH_APPEND_PROPOSAL_SCHEMA_REF
+        or proposal.get("kind") != "TargetGraphAppendProposal"
+        or not _text(proposal.get("graph_ref"))
+        or not isinstance(base_generation, int)
+        or isinstance(base_generation, bool)
+        or base_generation < 0
+        or not isinstance(receipt, dict)
+        or not isinstance(update, dict)
+    ):
+        raise BundleContractError("target_graph_append_proposal_invalid")
+    _exact_keys(
+        update,
+        {
+            "schema_ref",
+            "revision",
+            "candidates",
+            "requires_accepted_labels",
+            "strategy_complete",
+        },
+        "target_graph_append_proposal_invalid",
+    )
+    revision = update.get("revision")
+    candidates = update.get("candidates")
+    required = update.get("requires_accepted_labels")
+    strategy_complete = update.get("strategy_complete")
+    if (
+        update.get("schema_ref") != FORMAL_STRATEGY_UPDATE_SCHEMA_REF
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+        or not isinstance(candidates, list)
+        or len(candidates) > MAX_BUNDLE_TARGETS
+        or any(not isinstance(candidate, dict) for candidate in candidates)
+        or not isinstance(required, list)
+        or any(not _text(label) for label in required)
+        or len(required) != len(set(cast(list[str], required)))
+        or not isinstance(strategy_complete, bool)
+        or (not candidates and strategy_complete is not True)
+    ):
+        raise BundleContractError("target_graph_append_proposal_invalid")
+    return canonical_hash(proposal)
 
 
 def material_target_plan_hash(target_plan: dict[str, object]) -> str:
+    """Hash only a closed formal v3 envelope.
+
+    Full Plan-semantic validation happens at admission, where the accepted
+    PlanDocument is available.  This storage hook still rejects legacy or
+    open-shaped documents rather than assigning them a formal outcome hash.
+    """
+
+    _exact_keys(
+        target_plan,
+        {
+            "schema_ref",
+            "kind",
+            "formal_plan_ref",
+            "context_pack_ref",
+            "completion_contract",
+            "initial_strategy_update",
+            "source_bindings",
+        },
+        "target_plan_invalid",
+    )
+    completion = target_plan.get("completion_contract")
+    update = target_plan.get("initial_strategy_update")
+    if (
+        target_plan.get("schema_ref") != TARGET_PLAN_SCHEMA_REF
+        or target_plan.get("kind") != "TargetPlan"
+        or not _text(target_plan.get("formal_plan_ref"))
+        or not _text(target_plan.get("context_pack_ref"))
+        or not isinstance(completion, dict)
+        or completion.get("schema_ref")
+        != NORMALIZED_COMPLETION_CONTRACT_SCHEMA_REF
+        or not isinstance(update, dict)
+        or update.get("schema_ref") != FORMAL_STRATEGY_UPDATE_SCHEMA_REF
+        or not isinstance(target_plan.get("source_bindings"), dict)
+        or len(canonical_json(target_plan).encode("utf-8"))
+        > MAX_BUNDLE_TARGET_PLAN_BYTES
+    ):
+        raise BundleContractError("target_plan_invalid")
     return canonical_hash(target_plan)
 
 
@@ -339,25 +450,6 @@ def validate_target_plan_review(
             else "target_plan_changed_without_review_revision"
         )
     return canonical_hash(review)
-
-
-def _assert_acyclic(by_key: dict[str, dict[str, object]]) -> None:
-    active: set[str] = set()
-    complete: set[str] = set()
-
-    def visit(key: str) -> None:
-        if key in complete:
-            return
-        if key in active:
-            raise BundleContractError("target_dag_invalid")
-        active.add(key)
-        for dependency in cast(list[str], by_key[key]["depends_on"]):
-            visit(dependency)
-        active.remove(key)
-        complete.add(key)
-
-    for key in by_key:
-        visit(key)
 
 
 def _object(value: object, code: str) -> dict[str, object]:

@@ -20,6 +20,9 @@ from typing import cast
 
 TRANSPORT_KEY_BYTES = 32
 SUPERVISOR_REQUEST_SCHEMA = "meta-research/codex-provider-supervisor-request/v1"
+CODEX_SUPERVISOR_REQUEST_SCHEMA_V2 = (
+    "meta-research/codex-provider-supervisor-request/v2"
+)
 SUPERVISOR_EXIT_SCHEMA = "meta-research/codex-provider-supervisor-exit/v1"
 SUPERVISOR_STARTUP_GRACE_SECONDS = 5.5
 PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION"
@@ -28,12 +31,18 @@ SUPERVISOR_REQUEST_SCHEMA_V2 = "meta-research/provider-supervisor-request/v2"
 SUPERVISOR_EXIT_SCHEMA_V2 = "meta-research/provider-supervisor-exit/v2"
 _SUPERVISOR_REQUEST_SCHEMAS = {
     SUPERVISOR_REQUEST_SCHEMA,
+    CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     SUPERVISOR_REQUEST_SCHEMA_V2,
 }
 _SUPERVISOR_EXIT_SCHEMAS = {
     SUPERVISOR_EXIT_SCHEMA,
     SUPERVISOR_EXIT_SCHEMA_V2,
 }
+PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES = 64 * 1024 * 1024
+# Root Target turns may legitimately own provider work for days.  Keep a
+# finite, operator-configurable safety ceiling without forcing them through
+# the ordinary short interactive watchdog.
+PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS = 365 * 24 * 60 * 60
 
 
 class ProviderSupervisorError(RuntimeError):
@@ -689,31 +698,47 @@ def _validated_request_paths(
     }
     argv = payload.get("argv")
     timeout_seconds = payload.get("timeout_seconds")
+    prompt_max_bytes = payload.get("prompt_max_bytes")
     stream_max_bytes = payload.get("stream_max_bytes")
     result_max_bytes = payload.get("result_max_bytes")
+    schema_ref = payload.get("schema_ref")
+    expected_fields = {
+        "schema_ref",
+        "invocation_hash",
+        "argv",
+        "timeout_seconds",
+        "stream_max_bytes",
+        "result_max_bytes",
+        *values,
+    }
+    if schema_ref == CODEX_SUPERVISOR_REQUEST_SCHEMA_V2:
+        expected_fields.add("prompt_max_bytes")
     if (
-        set(payload)
-        != {
-            "schema_ref",
-            "invocation_hash",
-            "argv",
-            "timeout_seconds",
-            "stream_max_bytes",
-            "result_max_bytes",
-            *values,
-        }
+        set(payload) != expected_fields
         or not isinstance(argv, list)
         or not argv
         or not all(isinstance(value, str) and value for value in argv)
         or not isinstance(timeout_seconds, (int, float))
         or isinstance(timeout_seconds, bool)
-        or not 0 < float(timeout_seconds) <= 24 * 60 * 60
+        or not 0
+        < float(timeout_seconds)
+        <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
         or not isinstance(stream_max_bytes, int)
         or isinstance(stream_max_bytes, bool)
-        or not 0 < stream_max_bytes <= 16 * 1024 * 1024
+        or not 0 < stream_max_bytes <= PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES
         or not isinstance(result_max_bytes, int)
         or isinstance(result_max_bytes, bool)
-        or not 0 < result_max_bytes <= 16 * 1024 * 1024
+        or not 0 < result_max_bytes <= PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES
+        or (
+            schema_ref == CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
+            and (
+                not isinstance(prompt_max_bytes, int)
+                or isinstance(prompt_max_bytes, bool)
+                or not 0
+                < prompt_max_bytes
+                <= PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES
+            )
+        )
         or any(payload.get(name) != str(path) for name, path in values.items())
     ):
         raise ProviderSupervisorError("provider_supervisor_request_invalid")

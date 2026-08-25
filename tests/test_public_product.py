@@ -90,7 +90,18 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "name": "meta-research-vnext",
             "version": "0.1.0",
         }
+        # Target work runs in the admitted root Harness Session.  There is no
+        # separately configured execution-port service or sandbox gate.
         assert snapshot["readiness"]["status"] == "ready"
+        target_root = next(
+            check
+            for check in snapshot["readiness"]["checks"]
+            if check["name"] == "target_root_lifecycle"
+        )
+        assert target_root == {
+            "name": "target_root_lifecycle",
+            "status": "ready",
+        }
         assert {check["name"] for check in snapshot["readiness"]["checks"]} == {
             "database",
             "durable_feed",
@@ -100,6 +111,8 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "idea_stage_worker",
             "plan_stage_worker",
             "bundle_stage_worker",
+            "target_run_worker",
+            "target_root_lifecycle",
             "research_asset_intake_worker",
             "research_asset_verification_worker",
             "quest_drafting_worker",
@@ -291,7 +304,11 @@ def test_doctor_json_reports_locked_harness_versions_and_missing_reasons(
         "doctor", "--data-root", str(data_root), "--json"
     )
 
-    assert doctor["status"] in {"ready", "capability_unavailable"}
+    assert doctor["status"] == "unavailable"
+    assert doctor["target_root"] == {
+        "name": "target_root_lifecycle",
+        "status": "ready",
+    }
     assert doctor["gateway"]["transport"] == "streamable_http"
     assert [item["harness_family"] for item in doctor["adapters"]] == [
         "codex",
@@ -303,7 +320,7 @@ def test_doctor_json_reports_locked_harness_versions_and_missing_reasons(
     ]
     assert all(
         item["capability_profile"] is not None
-        or item["missing_reason"]["code"] == "conformance_probe_not_recorded"
+        or item["missing_reason"]["code"] == "full_conformance_not_recorded"
         for item in doctor["adapters"]
     )
 

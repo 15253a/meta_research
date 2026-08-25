@@ -133,6 +133,16 @@ class PlanStageWorker:
             if cursor is not None:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
+            foreground = self._advancement_engine.query_foreground(
+                current.question.quest_ref
+            )
+            if (
+                foreground is None
+                or foreground.get("cycle_ref") != current.cycle_ref
+                or foreground.get("stage") != "plan"
+                or foreground.get("status") != "active"
+            ):
+                continue
             qualification = self._qualify(current)
             if qualification.eligible is None:
                 continue
@@ -158,6 +168,18 @@ class PlanStageWorker:
             current.cycle_ref
         )
         if request is None:
+            foreground = self._advancement_engine.query_foreground(
+                current.question.quest_ref
+            )
+            epoch = None if foreground is None else foreground.get("epoch")
+            if (
+                foreground is None
+                or foreground.get("cycle_ref") != current.cycle_ref
+                or foreground.get("stage") != "plan"
+                or type(epoch) is not int
+                or epoch < 1
+            ):
+                raise OwnerConflict("plan_foreground_epoch_stale")
             context_pack = self._context_pack(eligible)
             self._advancement_engine.ensure_plan_stage_request(
                 cycle_ref=current.cycle_ref,
@@ -165,7 +187,7 @@ class PlanStageWorker:
                 accepted_idea_set=eligible.accepted_idea_set,
                 context_pack=context_pack,
                 idempotency_key=_operation_key(
-                    "plan-request", current.cycle_ref, "worker"
+                    "plan-request", current.cycle_ref, str(epoch)
                 ),
             )
             return _CycleStep(True)

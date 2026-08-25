@@ -188,7 +188,7 @@ test("technical details expose Semantic MCP and both locked Harness profiles", a
   await expect(details.getByText("claude Harness", { exact: true })).toBeVisible();
   await expect(details).toContainText("lock 0.147.0");
   await expect(details).toContainText("lock 2.1.220");
-  await expect(details).toContainText("conformance_probe_not_recorded");
+  await expect(details).toContainText("full_conformance_not_recorded");
 });
 
 test("an SSE interruption warns over the last good snapshot without leaving the shell", async ({ page }) => {

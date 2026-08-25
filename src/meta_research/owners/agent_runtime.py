@@ -5,14 +5,80 @@ import json
 import math
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Protocol, cast
+from types import SimpleNamespace, UnionType
+from typing import Any, Protocol, Union, cast, get_args, get_origin, get_type_hints
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from meta_research.bundle_exhaustion import (
+    BUNDLE_EXHAUSTION_ACCEPTED_RECEIPT_KIND,
+    BUNDLE_EXHAUSTION_ASSESSMENT_RECEIPT_KIND,
+    BUNDLE_EXHAUSTION_EVIDENCE_RECEIPT_KIND,
+    BUNDLE_EXHAUSTION_RECORD_RECEIPT_KIND,
+    BundleExhaustionEvidence,
+    BundleExhaustionProposal,
+    BundleExhaustionRejectedSubmission,
+    BundleExhaustionReviewTraceVerifier,
+    VerifiedBundleExhaustionEvidence,
+    bundle_exhaustion_evidence_from_dict,
+    bundle_exhaustion_review_response_hash,
+    verify_bundle_exhaustion_assessment_envelope,
+)
+from meta_research.bundle_protocol import (
+    BUNDLE_PROJECTION_MAX_TUPLE_ITEMS,
+    BUNDLE_ROOT_MAX_SERIALIZED_BYTES,
+    AcceptedInputAssetProof,
+    AcceptedMeasurementClosure,
+    BundleInboxBatch,
+    BundleProtocolError,
+    BundleReport,
+    CodeReviewScope,
+    ContentBindingProof,
+    FormalPlan,
+    MonitorObservation,
+    ReceiptProof,
+    SemanticBarrier,
+    StopDecisionProof,
+    TargetCandidate,
+    TargetExecutionPreflight,
+    TargetFrontierEntry,
+    TargetLaunchAck,
+    TargetLaunchRequest,
+    TargetRunHandoff,
+    TargetWorkHandle,
+    TargetWorkNotice,
+    TechnicalBlocker,
+    canonical_projection_bytes,
+    projection_plain_value,
+    validate_bundle_inbox_batch,
+    validate_bundle_report,
+    validate_closed_bundle_projection,
+    validate_target_launch_ack,
+    validate_target_launch_request,
+    validate_target_run_handoff,
+    validate_target_work_notice,
+)
+from meta_research.bundle_completion import (
+    build_report,
+    closed_semantic_replan_payload,
+    verify_accepted_closure,
+    verify_reuse_trace,
+)
+from meta_research.bundle_target_contract import completion_contract_hash
+from meta_research.target_run_contract import (
+    TargetRunContractError,
+    _is_target_root_completion_terminal,
+    validate_monitor_observation,
+    validate_protected_execution_admission,
+    validate_semantic_barrier,
+    validate_target_frontier_entry,
+    validate_target_run_activation_scope,
+    validate_target_run_handoff_notice,
+    validate_technical_blocker_recovery,
+)
 from meta_research.control_contract import (
     FORCE_FENCE_ACTIONS,
     TERMINAL_ACTIONS,
@@ -69,8 +135,10 @@ from meta_research.plan_contract import (
 from meta_research.bundle_contract import (
     TARGET_PLAN_REVIEW_SCHEMA_REF,
     material_target_plan_hash,
+    target_graph_append_proposal,
     target_execution_assertion,
     target_execution_authorization_requirement,
+    validate_target_graph_append_proposal,
 )
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
@@ -78,11 +146,19 @@ from meta_research.owners._sqlite_snapshot import (
 )
 from meta_research.owners.agent_runtime_harness import (
     AgentRuntimeHarnessInterface,
+    AgentRuntimeTargetSuccessorReservation,
     SQLiteAgentRuntimeHarness,
 )
 from meta_research.owners.common import (
     AcceptedAssetBinding,
+    AcceptedTargetCommitTransition,
     AcceptanceReceipt,
+    BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+    BundleReportDispositionReceiptVerifier,
+    BundleReportEvidenceVerifier,
+    BundleExhaustionAcceptanceVerifier,
+    VerifiedBundleReportReceipt,
+    VerifiedBundleReplanRunRetirement,
     DeepFetchRunRequestVerifier,
     FormalPlanDecisionVerifier,
     ExperimentInputBindingVerifier,
@@ -103,6 +179,7 @@ from meta_research.owners.human_requests import (
     HumanResponseVerifier,
 )
 from meta_research.owners.advancement_engine import StageRunRequest
+from meta_research.bundle_protocol import StageRunRequest as BundleCompletionRequest
 from meta_research.provider_supervisor import (
     ProviderSupervisorError,
     TypedExecutionFence,
@@ -162,11 +239,23 @@ PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND = "plan_attempt_execution"
 BUNDLE_ATTEMPT_EXECUTION_SCHEMA = "meta-research/bundle-attempt-execution/v1"
 BUNDLE_RUNTIME_BINDING_SCHEMA = "meta-research/bundle-runtime-binding/v1"
 BUNDLE_ATTEMPT_EXECUTION_RECEIPT_KIND = "bundle_attempt_execution"
+BUNDLE_INBOX_CHECKPOINT_SCHEMA = "meta-research/bundle-inbox-checkpoint/v1"
+BUNDLE_INBOX_CHECKPOINT_RECEIPT_KIND = "bundle_inbox_checkpoint"
+BUNDLE_INBOX_OPERATION_CHECKPOINT_RECEIPT_KIND = (
+    "bundle_inbox_operation_checkpoint"
+)
+TARGET_ROOT_COMPLETION_RECEIPT_KIND = "target_root_completion_accepted"
+TARGET_RUN_CHECKPOINT_SCHEMA = "meta-research/target-run-checkpoint/v1"
 BUNDLE_DISPATCH_RECEIPT_KIND = "bundle_target_dispatch"
+BUNDLE_TARGET_PROPOSAL_RECEIPT_KIND = "bundle_target_proposal"
+BUNDLE_REPORT_RECEIPT_KIND = "bundle_report_accepted"
+BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND = "bundle_report_disposition_recorded"
 TARGET_RUN_ADMISSION_RECEIPT_KIND = "target_run_admission"
+TARGET_LAUNCH_ADMISSION_RECEIPT_KIND = "target_launch_admission"
 RUN_COMPLETION_RECEIPT_KIND = "run_execution_completed"
 DEEPFETCH_EXECUTION_RECEIPT_KIND = "deepfetch_execution_completed"
 EXPERIMENT_EXECUTION_RECEIPT_KIND = "experiment_execution_completed"
+_BUNDLE_TARGET_EXECUTION_REQUEST_PREFIX = "bundle-target-"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 DEEPFETCH_RECONCILIATION_BASE_SECONDS = 0.5
 DEEPFETCH_RECONCILIATION_MAX_SECONDS = 60.0
@@ -176,8 +265,10 @@ _IDEA_SAFE_CAPABILITIES = {
     "approval-policy-never",
     "filesystem-danger-full-access",
     "global-config-ignored",
+    "harness-full-conformance-v1",
     "harness-child-agent-review",
     "mcp-config-empty",
+    "semantic-mcp-resident",
     "native-session-resume",
     "shell-tool-enabled",
     "structured-output-json-schema",
@@ -299,6 +390,74 @@ class AttemptExecution:
 
 
 @dataclass(frozen=True)
+class BundleInboxCheckpoint:
+    """AR-owned closed checkpoint for one durable BundleStageRun Inbox.
+
+    The checkpoint contains no TargetRun observation stream.  It only proves
+    that the exact scoped notice prefix was independently re-read, validated,
+    and acknowledged while the named Bundle Attempt/Fence was current.
+    """
+
+    checkpoint_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    checkpoint_revision: int
+    cursor: int
+    generation: int
+    batch_hash: str
+    checkpoint_hash: str
+    receipt: AcceptanceReceipt
+    schema_ref: str = BUNDLE_INBOX_CHECKPOINT_SCHEMA
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "schema_ref": self.schema_ref,
+            "checkpoint_ref": self.checkpoint_ref,
+            "run_ref": self.run_ref,
+            "attempt_ref": self.attempt_ref,
+            "fence_ref": self.fence_ref,
+            "checkpoint_revision": self.checkpoint_revision,
+            "cursor": self.cursor,
+            "generation": self.generation,
+            "batch_hash": self.batch_hash,
+            "checkpoint_hash": self.checkpoint_hash,
+            "closed": True,
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TargetRunCheckpoint:
+    """Closed durable position for one TargetRun Monitor Loop.
+
+    This is deliberately an Agent Runtime read model over the existing 0019
+    frontier and monitor-state rows.  It contains no observation, event,
+    stdout/stderr, live metric, or transcript payload.
+    """
+
+    target_ref: str
+    frontier: TargetFrontierEntry
+    snapshot_required: bool
+    cursor: int | None
+    status_revision: int | None
+    checkpoint_revision: int
+    schema_ref: str = TARGET_RUN_CHECKPOINT_SCHEMA
+
+
+@dataclass(frozen=True, slots=True)
+class TargetRunHandoffHistory:
+    """Exact AR-owned running history needed to publish a later handoff."""
+
+    target_ref: str
+    handle_history: tuple[TargetWorkHandle, ...]
+    code_review_preflights: tuple[TargetExecutionPreflight, ...]
+    stop_decisions: tuple[StopDecisionProof, ...]
+    recovered_blockers: tuple[TechnicalBlocker, ...]
+    recovery_evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class BundleDispatchDecision:
     decision_ref: str
     run_ref: str
@@ -331,6 +490,48 @@ class BundleDispatchDecision:
 
 
 @dataclass(frozen=True)
+class BundleTargetProposal:
+    proposal_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    native_session_ref: str
+    graph_ref: str
+    proposal_sequence: int
+    base_generation: int
+    base_head_receipt: AcceptanceReceipt
+    proposal: dict[str, object]
+    proposal_hash: str
+    receipt: AcceptanceReceipt
+
+    @property
+    def strategy_update(self) -> dict[str, object]:
+        return cast(dict[str, object], self.proposal["strategy_update"])
+
+    @property
+    def targets(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            cast(list[dict[str, object]], self.strategy_update["candidates"])
+        )
+
+    @property
+    def strategy_complete(self) -> bool:
+        return cast(bool, self.strategy_update["strategy_complete"])
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "proposal_ref": self.proposal_ref,
+            "proposal_sequence": self.proposal_sequence,
+            "graph_ref": self.graph_ref,
+            "base_generation": self.base_generation,
+            "base_head_receipt": self.base_head_receipt.as_public_dict(),
+            "proposal": self.proposal,
+            "proposal_hash": self.proposal_hash,
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class TargetRunAdmission:
     admission_ref: str
     target_ref: str
@@ -350,6 +551,26 @@ class TargetRunAdmission:
     human_waiter_ref: str | None = None
     human_waiter_generation: int | None = None
     human_authorization_receipt_ref: str | None = None
+
+
+@dataclass(frozen=True)
+class AdmittedTargetLaunch:
+    """AR-owned launch facts consumed only by the TargetRun runtime.
+
+    Bundle still receives only :class:`TargetLaunchAck`.  This projection lets
+    the local runtime resolve that opaque acknowledgement to the exact
+    Owner-allocated TargetRun identity without reading tables or inventing a
+    ref, and retains the admission receipt under its original subject.
+    """
+
+    launch_ref: str
+    request: TargetLaunchRequest
+    ack: TargetLaunchAck
+    graph_ref: str
+    stage_request_ref: str
+    quest_ref: str
+    target_run_ref: str
+    receipt: AcceptanceReceipt
 
 
 @dataclass(frozen=True)
@@ -924,6 +1145,42 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
 
     def query_bundle_stage_run(self, request_ref: str) -> BundleStageRun | None: ...
 
+    def continue_after_bundle_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> BundleStageRun: ...
+
+    def query_bundle_exhaustion_assessment_receipt(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+    ) -> AcceptanceReceipt: ...
+
+    def query_bundle_exhaustion_rejected_submissions(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+    ) -> tuple[BundleExhaustionRejectedSubmission, ...]: ...
+
+    def verify_bundle_runtime_scope(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> None: ...
+
     def record_bundle_primary_draft(
         self,
         *,
@@ -970,6 +1227,7 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         action: str,
         selected_target_ref: str | None,
         rationale: str,
+        inbox_checkpoint: BundleInboxCheckpoint,
         idempotency_key: str,
     ) -> BundleDispatchDecision: ...
 
@@ -977,22 +1235,166 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, run_ref: str
     ) -> tuple[BundleDispatchDecision, ...]: ...
 
+    def record_bundle_target_proposal(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        graph_ref: str,
+        base_generation: int,
+        base_head_receipt: AcceptanceReceipt,
+        strategy_update: dict[str, object],
+        inbox_checkpoint: BundleInboxCheckpoint,
+        idempotency_key: str,
+    ) -> BundleTargetProposal: ...
+
+    def query_bundle_target_proposals(
+        self, run_ref: str
+    ) -> tuple[BundleTargetProposal, ...]: ...
+
+    def build_bundle_report_candidate(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        disposition: str,
+        formal_plan_content_receipt: AcceptanceReceipt,
+        formal_plan_projection_receipt: AcceptanceReceipt,
+        target_graph_ref: str,
+        target_graph_receipt: AcceptanceReceipt,
+    ) -> BundleReport: ...
+
+    def accept_bundle_report(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        report: BundleReport,
+        formal_plan_content_receipt: AcceptanceReceipt,
+        formal_plan_projection_receipt: AcceptanceReceipt,
+        target_graph_ref: str,
+        target_graph_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> VerifiedBundleReportReceipt: ...
+
+    def query_bundle_report(
+        self, report_ref: str
+    ) -> VerifiedBundleReportReceipt | None: ...
+
+    def query_bundle_run_report(
+        self, run_ref: str
+    ) -> VerifiedBundleReportReceipt | None: ...
+
+    def verify_bundle_report_receipt(self, **values) -> VerifiedBundleReportReceipt: ...
+
+    def bind_bundle_report_disposition_verifier(
+        self, verifier: BundleReportDispositionReceiptVerifier
+    ) -> None: ...
+
+    def retire_bundle_run_for_replan(
+        self,
+        *,
+        disposition_ref: str,
+        disposition_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> VerifiedBundleReplanRunRetirement: ...
+
+    def query_bundle_replan_run_retirement(
+        self, disposition_ref: str
+    ) -> VerifiedBundleReplanRunRetirement | None: ...
+
+    def verify_bundle_replan_run_retirement(
+        self,
+        *,
+        retirement_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> VerifiedBundleReplanRunRetirement: ...
+
+    def accept_bundle_exhaustion_evidence(
+        self,
+        *,
+        evidence: BundleExhaustionEvidence,
+        idempotency_key: str,
+    ) -> VerifiedBundleExhaustionEvidence: ...
+
+    def reconcile_bundle_exhaustion_evidence(
+        self,
+        *,
+        evidence_identity: str,
+        expected_evidence_hash: str,
+    ) -> VerifiedBundleExhaustionEvidence | None: ...
+
+    def query_bundle_exhaustion_evidence(
+        self, evidence_ref: str
+    ) -> VerifiedBundleExhaustionEvidence | None: ...
+
+    def query_bundle_exhaustion_evidence_for_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+    ) -> VerifiedBundleExhaustionEvidence | None: ...
+
+    def verify_bundle_exhaustion_evidence_receipt(
+        self,
+        *,
+        evidence_ref: str,
+        evidence_hash: str,
+        receipt: AcceptanceReceipt,
+        phase: str = "submission",
+    ) -> VerifiedBundleExhaustionEvidence: ...
+
     def complete_bundle_run(
         self,
         *,
         run_ref: str,
         attempt_ref: str,
         fence_ref: str,
-        target_graph_ref: str,
+        report_ref: str,
         decision_receipt: AcceptanceReceipt,
         idempotency_key: str,
     ) -> RunCompletion: ...
+
+    def complete_bundle_exhaustion_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        proposal_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> RunCompletion: ...
+
+    def bind_bundle_exhaustion_verifier(
+        self, verifier: BundleExhaustionAcceptanceVerifier
+    ) -> None: ...
+
+    def bind_bundle_exhaustion_review_trace_verifier(
+        self, verifier: BundleExhaustionReviewTraceVerifier
+    ) -> None: ...
 
     def query_bundle_run_completion(self, run_ref: str) -> RunCompletion | None: ...
 
     def verify_attempt_execution_receipt(self, **values) -> str: ...
 
     def verify_target_run_admission_receipt(self, **values) -> None: ...
+
+    def bind_target_run_harness_verifier(
+        self, verifier: TargetRunHarnessVerifier
+    ) -> None: ...
+
+    def bind_target_root_completion_reader(
+        self, reader: TargetRootCompletionReader
+    ) -> None: ...
+
+    def verify_bundle_target_proposal_receipt(self, **values) -> None: ...
+
+    def verify_bundle_inbox_checkpoint(self, **values) -> None: ...
 
     def verify_run_completion_receipt(self, **values) -> None: ...
 
@@ -1015,6 +1417,159 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     def query_experiment_run(
         self, evaluation_attempt_ref: str
     ) -> ExperimentRun | None: ...
+
+    def admit_target_launch(
+        self,
+        request: TargetLaunchRequest,
+        *,
+        dispatch_decision_ref: str,
+        idempotency_key: str,
+        human_request_ref: str | None = None,
+        human_waiter_ref: str | None = None,
+        human_waiter_generation: int | None = None,
+        human_authorization_receipt_ref: str | None = None,
+    ) -> TargetLaunchAck: ...
+
+    def query_target_launch_ack(self, target_ref: str) -> TargetLaunchAck | None: ...
+
+    def query_admitted_target_launch(
+        self, target_ref: str
+    ) -> AdmittedTargetLaunch | None: ...
+
+    def activate_target_run(
+        self,
+        *,
+        target_ref: str,
+        handle: TargetWorkHandle,
+        candidate: TargetCandidate,
+        formal_plan: FormalPlan,
+        preflight: TargetExecutionPreflight,
+        idempotency_key: str,
+    ) -> TargetFrontierEntry: ...
+
+    def record_target_monitor_observation(
+        self,
+        observation: MonitorObservation,
+        *,
+        idempotency_key: str,
+    ) -> TargetFrontierEntry: ...
+
+    def query_target_run_checkpoint(
+        self, target_ref: str
+    ) -> TargetRunCheckpoint | None: ...
+
+    def list_running_target_frontiers(
+        self,
+    ) -> tuple[TargetFrontierEntry, ...]: ...
+
+    def list_target_root_work_refs(self) -> tuple[str, ...]: ...
+
+    def list_bundle_target_root_work_refs(
+        self, run_ref: str
+    ) -> tuple[str, ...]: ...
+
+    def recover_target_run_from_execution_failure(
+        self,
+        *,
+        target_ref: str,
+        idempotency_key: str,
+    ) -> TargetFrontierEntry: ...
+
+    def publish_target_run_execution_outcome_unknown(
+        self,
+        *,
+        target_ref: str,
+        idempotency_key: str,
+    ) -> TargetWorkNotice: ...
+
+    def query_target_run_handoff_history(
+        self, target_ref: str
+    ) -> TargetRunHandoffHistory | None: ...
+
+    def verify_target_recovery_preflight_reuse(
+        self,
+        *,
+        current_handle: TargetWorkHandle,
+        preflight: TargetExecutionPreflight,
+    ) -> TargetWorkHandle: ...
+
+    def verify_target_run_history_handle(
+        self, handle: TargetWorkHandle
+    ) -> TargetWorkHandle: ...
+
+    def publish_target_run_handoff(
+        self,
+        handoff: TargetRunHandoff,
+        *,
+        idempotency_key: str,
+    ) -> TargetWorkNotice: ...
+
+    def publish_target_root_completion(
+        self,
+        *,
+        target_ref: str,
+        completion_ref: str,
+        target_commit_ref: str,
+    ) -> TargetRunHandoff: ...
+
+    def query_target_root_completion_handoff(
+        self,
+        *,
+        target_ref: str,
+        completion_ref: str,
+        target_commit_ref: str,
+    ) -> TargetRunHandoff | None: ...
+
+    def query_target_frontier_entry(
+        self, target_ref: str
+    ) -> TargetFrontierEntry | None: ...
+
+    def query_target_work_notice(
+        self, target_ref: str
+    ) -> TargetWorkNotice | None: ...
+
+    def read_bundle_inbox(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        limit: int = 128,
+    ) -> BundleInboxBatch: ...
+
+    def acknowledge_bundle_inbox(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        batch: BundleInboxBatch,
+        idempotency_key: str,
+    ) -> BundleInboxCheckpoint: ...
+
+    def query_bundle_inbox_checkpoint(
+        self, run_ref: str
+    ) -> BundleInboxCheckpoint | None: ...
+
+    def query_bundle_inbox_operation_checkpoint(
+        self,
+        *,
+        operation_kind: str,
+        operation_ref: str,
+    ) -> BundleInboxCheckpoint | None: ...
+
+    def query_bundle_inbox_wake_generation(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        after_generation: int,
+    ) -> int: ...
+
+    def read_target_run_handoff(
+        self, handoff_manifest_ref: str
+    ) -> TargetRunHandoff: ...
 
     def admit_target_run(
         self,
@@ -1199,6 +1754,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
     owner=AR_OWNER,
     statement=text(
         "SELECT revision, active_run_count, stage_run_count, completed_run_count, "
+        "bundle_report_count, bundle_replan_retirement_count, "
+        "bundle_exhaustion_evidence_count, "
         "attempt_count, session_count, deepfetch_run_count, "
         "deepfetch_completed_run_count, deepfetch_attempt_count, "
         "deepfetch_session_count, acquisition_session_count, "
@@ -1216,6 +1773,9 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "active_run_count",
         "stage_run_count",
         "completed_run_count",
+        "bundle_report_count",
+        "bundle_replan_retirement_count",
+        "bundle_exhaustion_evidence_count",
         "attempt_count",
         "session_count",
         "deepfetch_run_count",
@@ -1262,6 +1822,18 @@ _PROVIDER_UNIT_KINDS = frozenset(
         "writing_review",
     }
 )
+_PROVIDER_UNIT_RUN_KINDS = {
+    "idea_primary": "idea_stage",
+    "idea_review": "idea_stage",
+    "plan_primary": "plan_stage",
+    "plan_review": "plan_stage",
+    "bundle_primary": "bundle_stage",
+    "bundle_review": "bundle_stage",
+    "deepfetch": "deepfetch",
+    "experiment": "experiment",
+    "writing_primary": "writing",
+    "writing_review": "writing",
+}
 
 
 class SQLiteHostComputeObservationReader:
@@ -1282,8 +1854,3415 @@ class SQLiteHostComputeObservationReader:
         return _observation_from_row(row)
 
 
+class TargetRunHarnessVerifier(Protocol):
+    """Resolve one supplied handle to the Harness's exact current identity."""
+
+    def verify_current_target_run_handle(
+        self,
+        handle: TargetWorkHandle,
+    ) -> TargetWorkHandle:
+        """Return the complete authoritative current handle or fail closed."""
+        ...
+
+    def verify_current_target_run_scope(
+        self,
+        *,
+        handle: TargetWorkHandle,
+        candidate: TargetCandidate,
+        formal_plan: FormalPlan,
+    ) -> None: ...
+
+    def verify_target_run_recovery_successor(
+        self,
+        old_handle: TargetWorkHandle,
+        replacement_handle: TargetWorkHandle,
+        recovery_ref: str,
+    ) -> TargetWorkHandle: ...
+
+    def query_target_execution_failure(self, handle: TargetWorkHandle) -> object: ...
+
+    def query_target_execution_outcome_unknown(
+        self, handle: TargetWorkHandle
+    ) -> object: ...
+
+    def verify_target_execution_terminal_blocker(
+        self, **values: object
+    ) -> TechnicalBlocker: ...
+
+    def verify_target_execution_recovery_history(self, **values: object) -> object: ...
+
+    def verify_target_execution_stop_history(self, **values: object) -> object: ...
+
+
+class TargetRootCompletionReader(Protocol):
+    """Issuer seam for the single AR-owned Target-root lifecycle/completion."""
+
+    def query(self, target_ref: str) -> object | None: ...
+
+    def query_completion(self, target_ref: str) -> object | None: ...
+
+
 class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     """Agent Runtime owns durable host-capability observations and their integrity."""
+
+    def admit_target_launch(
+        self,
+        request: TargetLaunchRequest,
+        *,
+        dispatch_decision_ref: str,
+        idempotency_key: str,
+        human_request_ref: str | None = None,
+        human_waiter_ref: str | None = None,
+        human_waiter_generation: int | None = None,
+        human_authorization_receipt_ref: str | None = None,
+    ) -> TargetLaunchAck:
+        """Atomically admit prototype-shaped Target work before execution.
+
+        The returned acknowledgement is intentionally opaque.  Admission
+        allocates a TargetRun identity but does not claim that a Harness root
+        Session exists.  ``query_target_frontier_entry`` therefore remains
+        empty until a TargetRun worker starts real recoverable execution.
+        """
+
+        _validate_stage_idempotency_key(idempotency_key)
+        if not isinstance(dispatch_decision_ref, str) or not dispatch_decision_ref:
+            raise OwnerConflict("target_launch_dispatch_invalid")
+        try:
+            validate_target_launch_request(request)
+        except (BundleProtocolError, TypeError, ValueError) as error:
+            raise OwnerConflict("target_launch_request_invalid") from error
+        human_values = (
+            human_request_ref,
+            human_waiter_ref,
+            human_waiter_generation,
+            human_authorization_receipt_ref,
+        )
+        has_human_authorization = all(value is not None for value in human_values)
+        if (
+            any(value is not None for value in human_values)
+            and not has_human_authorization
+        ) or (
+            has_human_authorization
+            and (
+                not isinstance(human_waiter_generation, int)
+                or isinstance(human_waiter_generation, bool)
+                or human_waiter_generation < 1
+            )
+        ):
+            raise OwnerConflict("target_launch_authorization_invalid")
+        verifier = self._target_graph_verifier
+        if verifier is None:
+            raise OwnerConflict("target_graph_verifier_unavailable")
+        # Reverify the sole current RG projection before idempotency replay.
+        # A historical source-wrapper row must not bypass a tightened launch
+        # authority merely because its idempotency key already exists.
+        verification = verifier.verify_target_launch_request(request)
+        command = {
+            "command": "admit_target_launch",
+            "request": projection_plain_value(request),
+            "dispatch_decision_ref": dispatch_decision_ref,
+            "human_request_ref": human_request_ref,
+            "human_waiter_ref": human_waiter_ref,
+            "human_waiter_generation": human_waiter_generation,
+            "human_authorization_receipt_ref": human_authorization_receipt_ref,
+        }
+        request_hash = canonical_hash(command)
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_launches WHERE idempotency_key = "
+                    ":idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if replay is not None:
+                if replay.request_hash != request_hash:
+                    raise OwnerConflict("idempotency_conflict")
+                return _target_launch_ack(replay, request)
+            dispatch_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_dispatch_decisions WHERE "
+                    "decision_ref = :decision_ref"
+                ),
+                {"decision_ref": dispatch_decision_ref},
+            ).first()
+            if dispatch_row is None:
+                raise OwnerConflict("target_launch_dispatch_invalid")
+            dispatch = _bundle_dispatch_decision(dispatch_row)
+            dispatch_checkpoint = _bundle_inbox_checkpoint_for_operation(
+                connection,
+                operation_kind="dispatch",
+                operation_ref=dispatch_decision_ref,
+                require_current=True,
+            )
+            latest_dispatch = connection.execute(
+                text(
+                    "SELECT decision_ref FROM ar_bundle_dispatch_decisions WHERE "
+                    "run_ref = :run_ref ORDER BY generation DESC LIMIT 1"
+                ),
+                {"run_ref": dispatch.run_ref},
+            ).first()
+            stage_run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": dispatch.run_ref},
+            ).first()
+            if (
+                latest_dispatch is None
+                or latest_dispatch.decision_ref != dispatch_decision_ref
+                or dispatch.action != "dispatch"
+                or dispatch.selected_target_ref != request.target_ref
+                or dispatch.graph_ref != verification.graph_ref
+                or stage_run is None
+                or stage_run.stage != "bundle"
+                or stage_run.status not in {"running", "awaiting_acceptance"}
+                or stage_run.request_ref != verification.stage_request_ref
+                or stage_run.current_attempt_ref != dispatch.attempt_ref
+                or stage_run.current_fence_ref != dispatch.fence_ref
+                or dispatch_checkpoint.run_ref != dispatch.run_ref
+                or dispatch_checkpoint.attempt_ref != dispatch.attempt_ref
+                or dispatch_checkpoint.fence_ref != dispatch.fence_ref
+            ):
+                raise OwnerConflict("target_launch_dispatch_invalid")
+            _verify_target_launch_stage_current(self, stage_run)
+            verifier.verify_bundle_dispatch_frontier(
+                request_ref=stage_run.request_ref,
+                run_ref=dispatch.run_ref,
+                graph_ref=dispatch.graph_ref,
+                frontier=dispatch.frontier,
+            )
+            if (verification.risk_class == "high") != has_human_authorization:
+                raise OwnerConflict("target_launch_authorization_invalid")
+            duplicate = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_launches WHERE target_ref = :target_ref "
+                    "OR dispatch_decision_ref = :dispatch_decision_ref"
+                ),
+                {
+                    "target_ref": request.target_ref,
+                    "dispatch_decision_ref": dispatch_decision_ref,
+                },
+            ).first()
+            if duplicate is not None:
+                raise OwnerConflict("target_launch_conflict")
+
+            # All request/currentness/dispatch checks above are read-only.  The
+            # first persistent admission identity is allocated only here.
+            launch_ref = new_ref("target_launch")
+            if has_human_authorization:
+                assertion = target_execution_assertion(
+                    quest_ref=verification.quest_ref,
+                    stage_request_ref=verification.stage_request_ref,
+                    graph_ref=verification.graph_ref,
+                    target_ref=request.target_ref,
+                    target_spec_hash=request.target_spec_binding.content_hash_ref,
+                    risk_class=verification.risk_class,
+                )
+                requirement = target_execution_authorization_requirement(
+                    quest_ref=verification.quest_ref,
+                    stage_request_ref=verification.stage_request_ref,
+                    graph_ref=verification.graph_ref,
+                    target_ref=request.target_ref,
+                    target_spec_hash=request.target_spec_binding.content_hash_ref,
+                )
+                human_request = connection.execute(
+                    text(
+                        "SELECT * FROM owner_human_requests WHERE issuer = "
+                        ":issuer AND request_ref = :request_ref"
+                    ),
+                    {"issuer": AR_OWNER, "request_ref": human_request_ref},
+                ).first()
+                waiter = connection.execute(
+                    text(
+                        "SELECT * FROM owner_human_request_waiters WHERE "
+                        "request_ref = :request_ref AND waiter_ref = :waiter_ref"
+                    ),
+                    {
+                        "request_ref": human_request_ref,
+                        "waiter_ref": human_waiter_ref,
+                    },
+                ).first()
+                validation = connection.execute(
+                    text(
+                        "SELECT * FROM owner_human_request_resume_validations WHERE "
+                        "request_ref = :request_ref AND waiter_ref = :waiter_ref "
+                        "ORDER BY created_at DESC, validation_ref DESC LIMIT 1"
+                    ),
+                    {
+                        "request_ref": human_request_ref,
+                        "waiter_ref": human_waiter_ref,
+                    },
+                ).first()
+                if human_request is None or waiter is None or validation is None:
+                    raise OwnerConflict("target_launch_authorization_invalid")
+                try:
+                    stored_assertion = decoded_object(
+                        human_request.target_assertion_json
+                    )
+                    stored_requirement = decoded_object(
+                        human_request.required_authorization_json
+                    )
+                except (TypeError, ValueError) as error:
+                    raise OwnerConflict(
+                        "target_launch_authorization_invalid"
+                    ) from error
+                if (
+                    human_request.kind != "capability_authorization"
+                    or human_request.quest_ref != verification.quest_ref
+                    or stored_assertion != assertion
+                    or stored_requirement != requirement
+                    or waiter.target_assertion_hash != canonical_hash(assertion)
+                    or int(waiter.generation)
+                    != cast(int, human_waiter_generation)
+                    or validation.authorization_receipt_ref
+                    != human_authorization_receipt_ref
+                ):
+                    raise OwnerConflict("target_launch_authorization_invalid")
+                authorization_verifier = self._authorization_verifier
+                if authorization_verifier is None:
+                    raise OwnerConflict(
+                        "human_collaboration_verifier_unavailable"
+                    )
+                authorization_verifier.verify_capability_authorization(
+                    requirement=requirement,
+                    receipt_ref=cast(str, human_authorization_receipt_ref),
+                )
+
+            # Close the cross-Owner TOCTOU window immediately before AR's
+            # first launch write.  Both issuer reads must resolve the exact
+            # same formal candidate projection and current graph authority.
+            if verifier.verify_target_launch_request(request) != verification:
+                raise OwnerConflict("target_launch_authority_stale")
+            target_run_ref = new_ref("target_run")
+            operation_ref = new_ref("target_launch_operation")
+            ack = TargetLaunchAck(
+                target_ref=request.target_ref,
+                operation_ref=operation_ref,
+            )
+            try:
+                validate_target_launch_ack(ack, request)
+            except BundleProtocolError as error:
+                raise OwnerConflict("target_launch_ack_invalid") from error
+            accepted_input_target_commit_refs_json = canonical_json(
+                list(request.accepted_input_target_commit_refs)
+            )
+            accepted_input_asset_refs_json = canonical_json(
+                list(request.accepted_input_asset_refs)
+            )
+            asset_proofs_value = projection_plain_value(verification.asset_proofs)
+            accepted_input_asset_proofs_json = canonical_json(asset_proofs_value)
+            launch_bindings = {
+                "operation_ref": operation_ref,
+                "target_ref": request.target_ref,
+                "graph_ref": verification.graph_ref,
+                "stage_request_ref": verification.stage_request_ref,
+                "quest_ref": verification.quest_ref,
+                "target_spec_content_hash_ref": (
+                    request.target_spec_binding.content_hash_ref
+                ),
+                "target_spec_receipt_ref": (
+                    request.target_spec_acceptance_receipt.receipt_ref
+                ),
+                "accepted_input_target_commit_refs_hash": canonical_hash(
+                    list(request.accepted_input_target_commit_refs)
+                ),
+                "accepted_input_asset_refs_hash": canonical_hash(
+                    list(request.accepted_input_asset_refs)
+                ),
+                "accepted_input_asset_proofs_hash": canonical_hash(
+                    asset_proofs_value
+                ),
+                "recoverable_required": True,
+                "target_run_ref": target_run_ref,
+                "status": "admitted",
+                "dispatch_decision_ref": dispatch.decision_ref,
+                "dispatch_receipt_ref": dispatch.receipt.receipt_ref,
+                "dispatch_receipt_hash": dispatch.receipt.payload_hash,
+                "human_request_ref": human_request_ref,
+                "human_waiter_ref": human_waiter_ref,
+                "human_waiter_generation": human_waiter_generation,
+                "human_authorization_receipt_ref": (
+                    human_authorization_receipt_ref
+                ),
+            }
+            receipt_ref = new_ref("target_launch_admission_receipt")
+            receipt_hash = _owner_receipt_hash(
+                TARGET_LAUNCH_ADMISSION_RECEIPT_KIND,
+                launch_ref,
+                launch_bindings,
+            )
+            now = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO ar_target_launches (launch_ref, operation_ref, "
+                    "target_ref, graph_ref, stage_request_ref, quest_ref, "
+                    "target_spec_content_hash_ref, target_spec_receipt_ref, "
+                    "target_spec_receipt_subject_ref, "
+                    "accepted_input_target_commit_refs_json, "
+                    "accepted_input_target_commit_refs_hash, "
+                    "accepted_input_asset_refs_json, "
+                    "accepted_input_asset_refs_hash, "
+                    "accepted_input_asset_proofs_json, "
+                    "accepted_input_asset_proofs_hash, recoverable_required, "
+                    "target_run_ref, status, root_session_ref, "
+                    "execution_attempt_ref, execution_fence_ref, "
+                    "execution_input_binding_ref, "
+                    "execution_input_binding_receipt_ref, "
+                    "execution_input_binding_receipt_hash, current_handle_json, "
+                    "current_handle_hash, dispatch_decision_ref, "
+                    "dispatch_receipt_ref, dispatch_receipt_hash, "
+                    "human_request_ref, human_waiter_ref, "
+                    "human_waiter_generation, human_authorization_receipt_ref, "
+                    "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                    "admitted_at) VALUES (:launch_ref, :operation_ref, "
+                    ":target_ref, :graph_ref, :stage_request_ref, :quest_ref, "
+                    ":target_spec_content_hash_ref, :target_spec_receipt_ref, "
+                    ":target_spec_receipt_subject_ref, "
+                    ":accepted_input_target_commit_refs_json, "
+                    ":accepted_input_target_commit_refs_hash, "
+                    ":accepted_input_asset_refs_json, "
+                    ":accepted_input_asset_refs_hash, "
+                    ":accepted_input_asset_proofs_json, "
+                    ":accepted_input_asset_proofs_hash, :recoverable_required, "
+                    ":target_run_ref, :status, NULL, NULL, NULL, NULL, NULL, "
+                    "NULL, NULL, NULL, "
+                    ":dispatch_decision_ref, :dispatch_receipt_ref, "
+                    ":dispatch_receipt_hash, :human_request_ref, "
+                    ":human_waiter_ref, :human_waiter_generation, "
+                    ":human_authorization_receipt_ref, :idempotency_key, "
+                    ":request_hash, :receipt_ref, :receipt_hash, :admitted_at)"
+                ),
+                {
+                    **launch_bindings,
+                    "launch_ref": launch_ref,
+                    "target_spec_receipt_subject_ref": (
+                        request.target_spec_acceptance_receipt.subject_ref
+                    ),
+                    "accepted_input_target_commit_refs_json": (
+                        accepted_input_target_commit_refs_json
+                    ),
+                    "accepted_input_asset_refs_json": (
+                        accepted_input_asset_refs_json
+                    ),
+                    "accepted_input_asset_proofs_json": (
+                        accepted_input_asset_proofs_json
+                    ),
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "admitted_at": now,
+                },
+            )
+            if has_human_authorization:
+                self._consume_human_request_waiter(
+                    connection,
+                    request_ref=cast(str, human_request_ref),
+                    waiter_ref=cast(str, human_waiter_ref),
+                    generation=cast(int, human_waiter_generation),
+                    work_ref=launch_ref,
+                    work_hash=request_hash,
+                )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.target_launch_admitted",
+                {
+                    "launch_ref": launch_ref,
+                    "operation_ref": operation_ref,
+                    "target_ref": request.target_ref,
+                    "dispatch_decision_ref": dispatch.decision_ref,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        persisted = self.query_target_launch_ack(request.target_ref)
+        if persisted != ack:
+            raise OwnerConflict("target_launch_missing_after_commit")
+        return persisted
+
+    def query_target_launch_ack(self, target_ref: str) -> TargetLaunchAck | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_launches WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if row is None:
+            return None
+        request = _target_launch_request_from_row(row)
+        verifier = self._target_graph_verifier
+        if verifier is None:
+            raise OwnerConflict("target_graph_verifier_unavailable")
+        verifier.verify_target_launch_request(request)
+        return _target_launch_ack(row, request)
+
+    def query_admitted_target_launch(
+        self, target_ref: str
+    ) -> AdmittedTargetLaunch | None:
+        """Resolve an opaque launch ack to issuer-owned TargetRun facts."""
+
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_launches WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if row is None:
+            return None
+        request = _target_launch_request_from_row(row)
+        verifier = self._target_graph_verifier
+        if verifier is None:
+            raise OwnerConflict("target_graph_verifier_unavailable")
+        verifier.verify_target_launch_request(request)
+        ack = _target_launch_ack(row, request)
+        return AdmittedTargetLaunch(
+            launch_ref=row.launch_ref,
+            request=request,
+            ack=ack,
+            graph_ref=row.graph_ref,
+            stage_request_ref=row.stage_request_ref,
+            quest_ref=row.quest_ref,
+            target_run_ref=row.target_run_ref,
+            receipt=AcceptanceReceipt(
+                issuer=AR_OWNER,
+                kind=TARGET_LAUNCH_ADMISSION_RECEIPT_KIND,
+                receipt_ref=row.receipt_ref,
+                subject_ref=row.launch_ref,
+                payload_hash=row.receipt_hash,
+            ),
+        )
+
+    def activate_target_run(
+        self,
+        *,
+        target_ref: str,
+        handle: TargetWorkHandle,
+        candidate: TargetCandidate,
+        formal_plan: FormalPlan,
+        preflight: TargetExecutionPreflight,
+        idempotency_key: str,
+    ) -> TargetFrontierEntry:
+        """Admit a real TargetRun handle only after the canonical preflight.
+
+        The handle, preflight, receipts, and Harness identities are inputs from
+        their authoritative ports.  Agent Runtime persists them; it never
+        guesses a Session, Attempt, Fence, or receipt on the worker's behalf.
+        """
+
+        _validate_stage_idempotency_key(idempotency_key)
+        command = {
+            "command": "activate_target_run",
+            "target_ref": target_ref,
+            "handle": projection_plain_value(handle),
+            "candidate": projection_plain_value(candidate),
+            "formal_plan": projection_plain_value(formal_plan),
+            "preflight": projection_plain_value(preflight),
+        }
+        request_hash = canonical_hash(command)
+        now = time.time()
+        try:
+            with self._database.fenced_write() as connection:
+                launch = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_launches WHERE target_ref = "
+                        ":target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+                if launch is None:
+                    raise OwnerConflict("target_run_launch_not_admitted")
+                request = _target_launch_request_from_row(launch)
+                _target_launch_ack(launch, request)
+                replay = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_activations WHERE "
+                        "idempotency_key = :idempotency_key"
+                    ),
+                    {"idempotency_key": idempotency_key},
+                ).first()
+                if replay is not None:
+                    if replay.request_hash != request_hash:
+                        raise OwnerConflict("idempotency_conflict")
+                    frontier_row = connection.execute(
+                        text(
+                            "SELECT * FROM ar_target_frontier_entries WHERE "
+                            "target_ref = :target_ref"
+                        ),
+                        {"target_ref": target_ref},
+                    ).first()
+                    if frontier_row is None:
+                        raise OwnerConflict("target_run_activation_integrity_invalid")
+                    return _target_frontier_from_row(frontier_row, request)
+                duplicate = connection.execute(
+                    text(
+                        "SELECT activation_ref FROM ar_target_run_activations "
+                        "WHERE target_ref = :target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+                if duplicate is not None:
+                    raise OwnerConflict("target_run_activation_conflict")
+
+                verifier = self._target_graph_verifier
+                if verifier is None:
+                    raise OwnerConflict("target_graph_verifier_unavailable")
+                verifier.verify_target_candidate_projection_receipt(
+                    target_ref=target_ref,
+                    binding=request.target_spec_binding,
+                    receipt=request.target_spec_acceptance_receipt,
+                    require_uncommitted=True,
+                )
+                try:
+                    stored_asset_proofs = json.loads(
+                        launch.accepted_input_asset_proofs_json
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError) as error:
+                    raise OwnerConflict("target_run_activation_integrity_invalid") from error
+                if (
+                    handle.target_ref != target_ref
+                    or handle.target_run_ref != launch.target_run_ref
+                    or handle.accepted_input_target_commit_refs
+                    != request.accepted_input_target_commit_refs
+                    or tuple(
+                        proof.asset_ref for proof in handle.accepted_input_asset_proofs
+                    )
+                    != request.accepted_input_asset_refs
+                    or projection_plain_value(handle.accepted_input_asset_proofs)
+                    != stored_asset_proofs
+                ):
+                    raise OwnerConflict("target_run_activation_handle_invalid")
+                harness_verifier = self._target_run_harness_verifier
+                if harness_verifier is None:
+                    raise OwnerConflict("target_run_harness_verifier_unavailable")
+                try:
+                    verified_handle = (
+                        harness_verifier.verify_current_target_run_handle(handle)
+                    )
+                    validate_closed_bundle_projection(
+                        verified_handle,
+                        "Harness current TargetWorkHandle",
+                    )
+                    if type(verified_handle) is not TargetWorkHandle or (
+                        verified_handle != handle
+                    ):
+                        raise TargetRunContractError(
+                            "Harness current handle differs from activation"
+                        )
+                    scope_verifier = getattr(
+                        harness_verifier,
+                        "verify_current_target_run_scope",
+                        None,
+                    )
+                    if not callable(scope_verifier):
+                        raise OwnerConflict(
+                            "target_run_harness_scope_verifier_unavailable"
+                        )
+                    scope_verifier(
+                        handle=handle,
+                        candidate=candidate,
+                        formal_plan=formal_plan,
+                    )
+                except (BundleProtocolError, TargetRunContractError, OwnerConflict, TypeError, ValueError) as error:
+                    raise OwnerConflict("target_run_harness_identity_invalid") from error
+                try:
+                    validate_target_run_activation_scope(
+                        handle=handle,
+                        candidate=candidate,
+                        formal_plan=formal_plan,
+                        target_spec_binding=request.target_spec_binding,
+                        target_spec_acceptance_receipt=(
+                            request.target_spec_acceptance_receipt
+                        ),
+                        initial_review_scope=preflight.review_scope,
+                        accepted_input_target_commit_refs=(
+                            request.accepted_input_target_commit_refs
+                        ),
+                        accepted_input_asset_refs=request.accepted_input_asset_refs,
+                    )
+                    validate_protected_execution_admission(
+                        handle,
+                        preflight,
+                        expected_review_scope=preflight.review_scope,
+                        expected_implementation_revision_ref=(
+                            candidate.implementation_revision_ref
+                        ),
+                        expected_code_changed=candidate.code_changed,
+                    )
+                except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
+                    raise OwnerConflict("target_run_preflight_invalid") from error
+
+                handle_json, handle_hash = _bundle_record_storage(handle)
+                candidate_json, candidate_hash = _bundle_record_storage(candidate)
+                formal_plan_json, formal_plan_hash = _bundle_record_storage(formal_plan)
+                preflight_json, preflight_hash = _bundle_record_storage(preflight)
+                scope_json, scope_hash = _bundle_record_storage(preflight.review_scope)
+                activation_ref = new_ref("target_run_activation")
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_run_activations (activation_ref, "
+                        "target_ref, launch_ref, target_run_ref, root_session_ref, "
+                        "execution_attempt_ref, execution_fence_ref, "
+                        "initial_handle_json, initial_handle_hash, candidate_json, "
+                        "candidate_hash, formal_plan_json, formal_plan_hash, "
+                        "initial_preflight_json, initial_preflight_hash, "
+                        "initial_review_scope_json, initial_review_scope_hash, "
+                        "idempotency_key, request_hash, activated_at) VALUES "
+                        "(:activation_ref, :target_ref, :launch_ref, "
+                        ":target_run_ref, :root_session_ref, "
+                        ":execution_attempt_ref, :execution_fence_ref, "
+                        ":handle_json, :handle_hash, :candidate_json, "
+                        ":candidate_hash, :formal_plan_json, :formal_plan_hash, "
+                        ":preflight_json, :preflight_hash, :scope_json, "
+                        ":scope_hash, :idempotency_key, :request_hash, "
+                        ":activated_at)"
+                    ),
+                    {
+                        "activation_ref": activation_ref,
+                        "target_ref": target_ref,
+                        "launch_ref": launch.launch_ref,
+                        "target_run_ref": handle.target_run_ref,
+                        "root_session_ref": handle.root_session_ref,
+                        "execution_attempt_ref": handle.execution_attempt_ref,
+                        "execution_fence_ref": handle.execution_fence_ref,
+                        "handle_json": handle_json,
+                        "handle_hash": handle_hash,
+                        "candidate_json": candidate_json,
+                        "candidate_hash": candidate_hash,
+                        "formal_plan_json": formal_plan_json,
+                        "formal_plan_hash": formal_plan_hash,
+                        "preflight_json": preflight_json,
+                        "preflight_hash": preflight_hash,
+                        "scope_json": scope_json,
+                        "scope_hash": scope_hash,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "activated_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_run_handles (target_ref, ordinal, "
+                        "target_run_ref, root_session_ref, execution_attempt_ref, "
+                        "execution_fence_ref, handle_json, handle_hash, "
+                        "recorded_at) VALUES (:target_ref, 1, :target_run_ref, "
+                        ":root_session_ref, :execution_attempt_ref, "
+                        ":execution_fence_ref, :handle_json, :handle_hash, "
+                        ":recorded_at)"
+                    ),
+                    {
+                        "target_ref": target_ref,
+                        "target_run_ref": handle.target_run_ref,
+                        "root_session_ref": handle.root_session_ref,
+                        "execution_attempt_ref": handle.execution_attempt_ref,
+                        "execution_fence_ref": handle.execution_fence_ref,
+                        "handle_json": handle_json,
+                        "handle_hash": handle_hash,
+                        "recorded_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_run_identities (target_run_ref, "
+                        "target_ref, first_handle_ordinal, recorded_at) VALUES "
+                        "(:target_run_ref, :target_ref, 1, :recorded_at)"
+                    ),
+                    {
+                        "target_run_ref": handle.target_run_ref,
+                        "target_ref": target_ref,
+                        "recorded_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_run_preflights (target_ref, "
+                        "ordinal, implementation_revision_ref, preflight_json, "
+                        "preflight_hash, review_scope_json, review_scope_hash, "
+                        "recorded_at) VALUES (:target_ref, 1, "
+                        ":implementation_revision_ref, :preflight_json, "
+                        ":preflight_hash, :scope_json, :scope_hash, :recorded_at)"
+                    ),
+                    {
+                        "target_ref": target_ref,
+                        "implementation_revision_ref": (
+                            preflight.implementation_revision_ref
+                        ),
+                        "preflight_json": preflight_json,
+                        "preflight_hash": preflight_hash,
+                        "scope_json": scope_json,
+                        "scope_hash": scope_hash,
+                        "recorded_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_monitor_states (target_ref, "
+                        "target_run_ref, execution_attempt_ref, "
+                        "execution_fence_ref, snapshot_required, cursor, "
+                        "status_revision, checkpoint_revision, updated_at) "
+                        "VALUES (:target_ref, :target_run_ref, "
+                        ":execution_attempt_ref, :execution_fence_ref, 1, NULL, "
+                        "NULL, 1, :updated_at)"
+                    ),
+                    {
+                        "target_ref": target_ref,
+                        "target_run_ref": handle.target_run_ref,
+                        "execution_attempt_ref": handle.execution_attempt_ref,
+                        "execution_fence_ref": handle.execution_fence_ref,
+                        "updated_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_frontier_entries (target_ref, "
+                        "launch_ref, target_spec_content_hash_ref, "
+                        "target_spec_receipt_ref, "
+                        "target_spec_receipt_subject_ref, state_revision, state, "
+                        "current_handle_json, current_handle_hash, "
+                        "terminal_fact_ref, currentness_known, current, "
+                        "updated_at) VALUES (:target_ref, :launch_ref, "
+                        ":spec_hash, :receipt_ref, :receipt_subject_ref, 1, "
+                        "'running', :handle_json, :handle_hash, NULL, 1, 1, "
+                        ":updated_at)"
+                    ),
+                    {
+                        "target_ref": target_ref,
+                        "launch_ref": launch.launch_ref,
+                        "spec_hash": request.target_spec_binding.content_hash_ref,
+                        "receipt_ref": (
+                            request.target_spec_acceptance_receipt.receipt_ref
+                        ),
+                        "receipt_subject_ref": (
+                            request.target_spec_acceptance_receipt.subject_ref
+                        ),
+                        "handle_json": handle_json,
+                        "handle_hash": handle_hash,
+                        "updated_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.target_run_activated",
+                    {
+                        "activation_ref": activation_ref,
+                        "target_ref": target_ref,
+                        "target_run_ref": handle.target_run_ref,
+                    },
+                )
+                frontier_row = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_frontier_entries WHERE "
+                        "target_ref = :target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+                if frontier_row is None:
+                    raise OwnerConflict("target_run_activation_integrity_invalid")
+                return _target_frontier_from_row(frontier_row, request)
+        except IntegrityError as error:
+            raise OwnerConflict("target_run_activation_conflict") from error
+
+    def record_target_monitor_observation(
+        self,
+        observation: MonitorObservation,
+        *,
+        idempotency_key: str,
+    ) -> TargetFrontierEntry:
+        """Advance only the durable cursor/status checkpoint, never raw events."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        command = {
+            "command": "record_target_monitor_observation",
+            "observation": projection_plain_value(observation),
+        }
+        request_hash = canonical_hash(command)
+        now = time.time()
+        try:
+            with self._database.write() as connection:
+                frontier, request = _target_frontier_and_request_for_local_write(
+                    connection, observation.target_ref
+                )
+                if frontier.state != "running":
+                    raise OwnerConflict("target_run_terminal")
+                harness_verifier = self._target_run_harness_verifier
+                if harness_verifier is None:
+                    raise OwnerConflict("target_run_harness_verifier_unavailable")
+                # Strict current verification precedes replay and every write:
+                # a successor reservation has already fenced this old handle.
+                try:
+                    verified_handle = (
+                        harness_verifier.verify_current_target_run_handle(
+                            frontier.current_handle
+                        )
+                    )
+                except Exception as error:
+                    raise OwnerConflict("target_monitor_handle_stale") from error
+                if verified_handle != frontier.current_handle:
+                    raise OwnerConflict("target_monitor_handle_stale")
+                issued_failure = None
+                if observation.stop_decision is not None:
+                    try:
+                        issued_failure = (
+                            harness_verifier.query_target_execution_failure(
+                                frontier.current_handle
+                            )
+                        )
+                    except Exception as error:
+                        raise OwnerConflict(
+                            "target_stop_decision_authority_invalid"
+                        ) from error
+                    if (
+                        issued_failure is None
+                        or issued_failure.stop_decision
+                        != observation.stop_decision
+                    ):
+                        raise OwnerConflict(
+                            "target_stop_decision_authority_invalid"
+                        )
+                replay = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_monitor_commands WHERE "
+                        "idempotency_key = :idempotency_key"
+                    ),
+                    {"idempotency_key": idempotency_key},
+                ).first()
+                if replay is not None:
+                    if replay.request_hash != request_hash:
+                        raise OwnerConflict("idempotency_conflict")
+                    return _target_frontier_for_local_write(
+                        connection, observation.target_ref
+                    )
+                monitor = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_monitor_states WHERE target_ref = "
+                        ":target_ref"
+                    ),
+                    {"target_ref": observation.target_ref},
+                ).first()
+                if monitor is None:
+                    raise OwnerConflict("target_monitor_integrity_invalid")
+                try:
+                    stop = validate_monitor_observation(
+                        observation,
+                        handle=frontier.current_handle,
+                        last_cursor=(
+                            None if monitor.cursor is None else int(monitor.cursor)
+                        ),
+                        last_status_revision=(
+                            None
+                            if monitor.status_revision is None
+                            else int(monitor.status_revision)
+                        ),
+                        snapshot_required=bool(monitor.snapshot_required),
+                    )
+                except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
+                    raise OwnerConflict("target_monitor_observation_invalid") from error
+                if stop is not None:
+                    duplicate_stop = connection.execute(
+                        text(
+                            "SELECT decision_ref FROM ar_target_stop_decisions "
+                            "WHERE execution_attempt_ref = :attempt_ref OR "
+                            "decision_ref = :decision_ref"
+                        ),
+                        {
+                            "attempt_ref": stop.execution_attempt_ref,
+                            "decision_ref": stop.decision_ref,
+                        },
+                    ).first()
+                    if duplicate_stop is not None:
+                        raise OwnerConflict("target_stop_decision_conflict")
+                    stop_json, stop_hash = _bundle_record_storage(stop)
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_target_stop_decisions (decision_ref, "
+                            "target_ref, target_run_ref, execution_attempt_ref, "
+                            "stop_json, stop_hash, generic_binding_ref, "
+                            "generic_binding_receipt_ref, "
+                            "generic_binding_receipt_hash, recorded_at) VALUES "
+                            "(:decision_ref, :target_ref, :target_run_ref, "
+                            ":attempt_ref, :stop_json, :stop_hash, "
+                            ":generic_binding_ref, :generic_receipt_ref, "
+                            ":generic_receipt_hash, :recorded_at)"
+                        ),
+                        {
+                            "decision_ref": stop.decision_ref,
+                            "target_ref": stop.target_ref,
+                            "target_run_ref": stop.target_run_ref,
+                            "attempt_ref": stop.execution_attempt_ref,
+                            "stop_json": stop_json,
+                            "stop_hash": stop_hash,
+                            "generic_binding_ref": (
+                                issued_failure.generic_binding_ref
+                            ),
+                            "generic_receipt_ref": (
+                                issued_failure.generic_binding_receipt.receipt_ref
+                            ),
+                            "generic_receipt_hash": (
+                                issued_failure.generic_binding_receipt.payload_hash
+                            ),
+                            "recorded_at": now,
+                        },
+                    )
+                connection.execute(
+                    text(
+                        "UPDATE ar_target_monitor_states SET snapshot_required = "
+                        "0, cursor = :cursor, status_revision = "
+                        ":status_revision, checkpoint_revision = "
+                        "checkpoint_revision + 1, updated_at = :updated_at WHERE "
+                        "target_ref = :target_ref"
+                    ),
+                    {
+                        "cursor": observation.cursor,
+                        "status_revision": observation.status_revision,
+                        "updated_at": now,
+                        "target_ref": observation.target_ref,
+                    },
+                )
+                # Persist the idempotency digest and compact checkpoint only.
+                # The Bundle-facing Owner surface has no raw observation read.
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_monitor_commands "
+                        "(idempotency_key, target_ref, request_hash, cursor, "
+                        "status_revision, recorded_at) VALUES "
+                        "(:idempotency_key, :target_ref, :request_hash, :cursor, "
+                        ":status_revision, :recorded_at)"
+                    ),
+                    {
+                        "idempotency_key": idempotency_key,
+                        "target_ref": observation.target_ref,
+                        "request_hash": request_hash,
+                        "cursor": observation.cursor,
+                        "status_revision": observation.status_revision,
+                        "recorded_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.target_monitor_checkpointed",
+                    {
+                        "target_ref": observation.target_ref,
+                        "cursor": observation.cursor,
+                        "status_revision": observation.status_revision,
+                        "stop_decision_ref": (
+                            None if stop is None else stop.decision_ref
+                        ),
+                    },
+                )
+                return _target_frontier_from_values(frontier, request)
+        except IntegrityError as error:
+            raise OwnerConflict("target_monitor_observation_conflict") from error
+
+    def query_target_run_checkpoint(
+        self, target_ref: str
+    ) -> TargetRunCheckpoint | None:
+        """Rebuild one verified durable Monitor Loop position after restart."""
+
+        verified_before = self.query_target_frontier_entry(target_ref)
+        if verified_before is None:
+            return None
+        with self._database.read() as connection:
+            context = _target_run_current_context(connection, target_ref)
+            checkpoint = _target_run_checkpoint_from_context(context)
+        # Public frontier verification re-enters the Research Graph issuer and
+        # current Bundle Stage authority.  Compare on both sides of the durable
+        # context read so a concurrent recovery/terminal transition is never
+        # returned as a mixed checkpoint.
+        verified_after = self.query_target_frontier_entry(target_ref)
+        if (
+            context.frontier != verified_before
+            or context.frontier != verified_after
+            or checkpoint.frontier != context.frontier
+        ):
+            raise OwnerConflict("target_run_checkpoint_stale")
+        return checkpoint
+
+    def list_running_target_frontiers(
+        self,
+    ) -> tuple[TargetFrontierEntry, ...]:
+        """List verified persistent running frontiers without monitor data."""
+
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT target_ref FROM ar_target_frontier_entries WHERE "
+                    "state = 'running' ORDER BY target_ref LIMIT :limit"
+                ),
+                {"limit": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS + 1},
+            ).all()
+        if len(rows) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS:
+            raise OwnerConflict("target_run_frontier_inventory_oversized")
+        running: list[TargetFrontierEntry] = []
+        for row in rows:
+            try:
+                checkpoint = self.query_target_run_checkpoint(row.target_ref)
+            except OwnerConflict as error:
+                if error.code != "target_run_checkpoint_stale":
+                    raise
+                current = self.query_target_frontier_entry(row.target_ref)
+                if current is None or current.state != "running":
+                    continue
+                raise
+            # A terminal transition racing the initial inventory is benign;
+            # only the reverified current state is eligible for daemon work.
+            if checkpoint is not None and checkpoint.frontier.state == "running":
+                running.append(checkpoint.frontier)
+        result = tuple(running)
+        try:
+            validate_closed_bundle_projection(result, "RunningTargetFrontiers")
+        except BundleProtocolError as error:
+            raise OwnerConflict("target_run_frontier_inventory_oversized") from error
+        return result
+
+    def list_target_root_work_refs(self) -> tuple[str, ...]:
+        """List launch-owned Target roots that the light daemon may wake.
+
+        This is intentionally shallower than the legacy monitor inventory.  A
+        launch with no frontier is still runnable because the Target root owns
+        admission and workspace setup.  A running frontier remains runnable so
+        the same native root Session can be resumed or reconciled.  Terminal
+        Targets are never returned.
+        """
+
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT launches.target_ref FROM ar_target_launches AS "
+                    "launches LEFT JOIN ar_target_frontier_entries AS frontier "
+                    "ON frontier.target_ref = launches.target_ref WHERE "
+                    "frontier.target_ref IS NULL OR frontier.state = 'running' "
+                    "ORDER BY launches.target_ref LIMIT :limit"
+                ),
+                {"limit": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS + 1},
+            ).all()
+        if len(rows) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS:
+            raise OwnerConflict("target_root_work_inventory_oversized")
+
+        result: list[str] = []
+        for row in rows:
+            target_ref = str(row.target_ref)
+            # Re-enter both issuers rather than treating the inventory query as
+            # authority.  A racing terminal transition is simply omitted.
+            launch = self.query_admitted_target_launch(target_ref)
+            if launch is None:
+                raise OwnerConflict("target_root_work_inventory_invalid")
+            frontier = self.query_target_frontier_entry(target_ref)
+            if frontier is None or frontier.state == "running":
+                result.append(target_ref)
+        return tuple(result)
+
+    def list_bundle_target_root_work_refs(
+        self, run_ref: str
+    ) -> tuple[str, ...]:
+        """List unfinished Target roots owned by exactly one Bundle run.
+
+        Bundle exhaustion asks only whether its own accepted launches still
+        have root work.  The launch-to-dispatch join is the issuer-owned scope;
+        roots belonging to another Bundle run must never block this one.
+        """
+
+        if type(run_ref) is not str or not run_ref or len(run_ref) > 256:
+            raise OwnerConflict("bundle_target_root_inventory_run_ref_invalid")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT launches.target_ref FROM ar_target_launches AS "
+                    "launches JOIN ar_bundle_dispatch_decisions AS decisions "
+                    "ON decisions.decision_ref = launches.dispatch_decision_ref "
+                    "LEFT JOIN ar_target_frontier_entries AS frontier ON "
+                    "frontier.target_ref = launches.target_ref WHERE "
+                    "decisions.run_ref = :run_ref AND (frontier.target_ref IS "
+                    "NULL OR frontier.state = 'running') ORDER BY "
+                    "launches.target_ref LIMIT :limit"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "limit": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS + 1,
+                },
+            ).all()
+        if len(rows) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS:
+            raise OwnerConflict("bundle_target_root_work_inventory_oversized")
+
+        result: list[str] = []
+        for row in rows:
+            target_ref = str(row.target_ref)
+            launch = self.query_admitted_target_launch(target_ref)
+            if launch is None:
+                raise OwnerConflict("bundle_target_root_work_inventory_invalid")
+            frontier = self.query_target_frontier_entry(target_ref)
+            if frontier is None or frontier.state == "running":
+                result.append(target_ref)
+        return tuple(result)
+
+    def query_target_run_handoff_history(
+        self, target_ref: str
+    ) -> TargetRunHandoffHistory | None:
+        """Return AR's exact verified history, never caller-rebuilt tuples."""
+
+        verified_before = self.query_target_frontier_entry(target_ref)
+        if verified_before is None:
+            return None
+        with self._database.read() as connection:
+            context = _target_handoff_context(
+                connection,
+                target_ref,
+                verifier=self._target_run_harness_verifier,
+            )
+        verified_after = self.query_target_frontier_entry(target_ref)
+        if (
+            verified_before != verified_after
+            or context.frontier != verified_before
+            or context.frontier.current_handle != context.handles[-1]
+        ):
+            raise OwnerConflict("target_run_handoff_history_stale")
+        return TargetRunHandoffHistory(
+            target_ref=target_ref,
+            handle_history=context.handles,
+            code_review_preflights=context.preflights,
+            stop_decisions=context.stop_decisions,
+            recovered_blockers=context.recovered_blockers,
+            recovery_evidence_refs=context.recovery_evidence_refs,
+        )
+
+    def verify_target_recovery_preflight_reuse(
+        self,
+        *,
+        current_handle: TargetWorkHandle,
+        preflight: TargetExecutionPreflight,
+    ) -> TargetWorkHandle:
+        """Prove immutable review evidence may gate a recovered Attempt.
+
+        A pure execution recovery rotates Harness identities but intentionally
+        does not create a second code-review preflight.  This reader derives
+        the only admissible old handle from AR's issuer-reverified append-only
+        history; callers cannot nominate a trusted predecessor.
+        """
+
+        if (
+            type(current_handle) is not TargetWorkHandle
+            or type(preflight) is not TargetExecutionPreflight
+        ):
+            raise OwnerConflict("target_recovery_preflight_reuse_invalid")
+        history = self.query_target_run_handoff_history(current_handle.target_ref)
+        frontier = self.query_target_frontier_entry(current_handle.target_ref)
+        if (
+            history is None
+            or frontier is None
+            or frontier.state not in {"running", "terminal"}
+            or frontier.current_handle != current_handle
+            or history.handle_history[-1] != current_handle
+            or not history.code_review_preflights
+            or len(history.handle_history)
+            != len(history.recovered_blockers) + 1
+        ):
+            raise OwnerConflict("target_recovery_preflight_reuse_invalid")
+        preflight_index = 0
+        active_preflight = history.code_review_preflights[0]
+        reviewed_handle = history.handle_history[0]
+        for recovery_index, blocker in enumerate(history.recovered_blockers):
+            replacement_handle = history.handle_history[recovery_index + 1]
+            replacement_revision = blocker.replacement_implementation_revision_ref
+            if replacement_revision is None:
+                continue
+            preflight_index += 1
+            if preflight_index >= len(history.code_review_preflights):
+                raise OwnerConflict("target_recovery_preflight_reuse_invalid")
+            active_preflight = history.code_review_preflights[preflight_index]
+            reviewed_handle = replacement_handle
+            if active_preflight.implementation_revision_ref != replacement_revision:
+                raise OwnerConflict("target_recovery_preflight_reuse_invalid")
+        if (
+            preflight_index != len(history.code_review_preflights) - 1
+            or preflight != active_preflight
+        ):
+            raise OwnerConflict("target_recovery_preflight_reuse_invalid")
+        if (
+            preflight.target_ref != current_handle.target_ref
+            or preflight.target_run_ref != current_handle.target_run_ref
+            or reviewed_handle.target_ref != current_handle.target_ref
+            or reviewed_handle.target_run_ref != current_handle.target_run_ref
+            or reviewed_handle.accepted_input_target_commit_refs
+            != current_handle.accepted_input_target_commit_refs
+            or reviewed_handle.accepted_input_asset_proofs
+            != current_handle.accepted_input_asset_proofs
+        ):
+            raise OwnerConflict("target_recovery_preflight_reuse_invalid")
+        try:
+            validate_protected_execution_admission(
+                reviewed_handle,
+                preflight,
+                expected_review_scope=preflight.review_scope,
+                expected_implementation_revision_ref=(
+                    preflight.implementation_revision_ref
+                ),
+                expected_code_changed=preflight.code_review.code_changed,
+            )
+        except (TargetRunContractError, TypeError, ValueError) as error:
+            raise OwnerConflict(
+                "target_recovery_preflight_reuse_invalid"
+            ) from error
+        return reviewed_handle
+
+    def verify_target_run_history_handle(
+        self, handle: TargetWorkHandle
+    ) -> TargetWorkHandle:
+        """Verify one AR-recorded current or durably retired handle."""
+
+        if type(handle) is not TargetWorkHandle:
+            raise OwnerConflict("target_run_history_handle_invalid")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_run_handles WHERE target_ref = "
+                    ":target_ref AND target_run_ref = :target_run_ref AND "
+                    "root_session_ref = :root_ref AND execution_attempt_ref = "
+                    ":attempt_ref AND execution_fence_ref = :fence_ref"
+                ),
+                {
+                    "target_ref": handle.target_ref,
+                    "target_run_ref": handle.target_run_ref,
+                    "root_ref": handle.root_session_ref,
+                    "attempt_ref": handle.execution_attempt_ref,
+                    "fence_ref": handle.execution_fence_ref,
+                },
+            ).all()
+            frontier = connection.execute(
+                text(
+                    "SELECT current_handle_json, current_handle_hash FROM "
+                    "ar_target_frontier_entries WHERE target_ref = :target_ref"
+                ),
+                {"target_ref": handle.target_ref},
+            ).first()
+            retired = connection.execute(
+                text(
+                    "SELECT identity_ref, transition_ref FROM "
+                    "ar_target_retired_identities WHERE identity_ref IN "
+                    "(:root_ref, :attempt_ref, :fence_ref)"
+                ),
+                {
+                    "root_ref": handle.root_session_ref,
+                    "attempt_ref": handle.execution_attempt_ref,
+                    "fence_ref": handle.execution_fence_ref,
+                },
+            ).all()
+            recovery = connection.execute(
+                text(
+                    "SELECT transition_ref FROM ar_target_run_recoveries WHERE "
+                    "target_ref = :target_ref AND old_execution_attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {
+                    "target_ref": handle.target_ref,
+                    "attempt_ref": handle.execution_attempt_ref,
+                },
+            ).first()
+        if len(rows) != 1 or frontier is None:
+            raise OwnerConflict("target_run_history_handle_invalid")
+        stored = _stored_bundle_record(
+            rows[0].handle_json,
+            rows[0].handle_hash,
+            TargetWorkHandle,
+            "target_run_history_handle_invalid",
+        )
+        current = _target_work_handle_from_json(frontier.current_handle_json)
+        if (
+            stored != handle
+            or canonical_hash(projection_plain_value(current))
+            != frontier.current_handle_hash
+        ):
+            raise OwnerConflict("target_run_history_handle_invalid")
+        if current != handle:
+            transition_refs = {str(row.transition_ref) for row in retired}
+            if (
+                recovery is None
+                or len(retired) != 3
+                or {str(row.identity_ref) for row in retired}
+                != {
+                    handle.root_session_ref,
+                    handle.execution_attempt_ref,
+                    handle.execution_fence_ref,
+                }
+                or transition_refs != {str(recovery.transition_ref)}
+            ):
+                raise OwnerConflict("target_run_history_handle_invalid")
+        elif retired:
+            raise OwnerConflict("target_run_history_handle_invalid")
+        return handle
+
+    def recover_target_run_from_execution_failure(
+        self,
+        *,
+        target_ref: str,
+        idempotency_key: str,
+    ) -> TargetFrontierEntry:
+        """Recover from the issuer's signed terminal without trusted inputs."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        with self._database.read() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT target_ref FROM ar_target_run_recoveries WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        if replay is not None:
+            if replay.target_ref != target_ref:
+                raise OwnerConflict("idempotency_conflict")
+            # A replay is accepted only after every persisted recovery/stop
+            # fact has been reopened through the execution issuer.
+            history = self.query_target_run_handoff_history(target_ref)
+            frontier = self.query_target_frontier_entry(target_ref)
+            if history is None or frontier is None:
+                raise OwnerConflict("target_run_recovery_integrity_invalid")
+            return frontier
+        frontier = self.query_target_frontier_entry(target_ref)
+        verifier = self._target_run_harness_verifier
+        if frontier is None or frontier.state != "running" or verifier is None:
+            raise OwnerConflict("target_run_recovery_invalid")
+        try:
+            failure = verifier.query_target_execution_failure(
+                frontier.current_handle
+            )
+            blocker = failure.blocker
+            replacement_handle = failure.replacement_handle
+        except Exception as error:
+            raise OwnerConflict("target_run_recovery_invalid") from error
+        if (
+            type(blocker) is not TechnicalBlocker
+            or type(replacement_handle) is not TargetWorkHandle
+            or blocker.recovery_ready is not True
+            or blocker.old_session_fenced is not True
+            or blocker.recovery_pack_complete is not True
+        ):
+            raise OwnerConflict("target_run_recovery_invalid")
+        return self._persist_target_run_recovery(
+            target_ref=target_ref,
+            blocker=blocker,
+            replacement_handle=replacement_handle,
+            replacement_preflight=None,
+            idempotency_key=idempotency_key,
+        )
+
+    def recover_target_run(
+        self,
+        *,
+        target_ref: str,
+        blocker: TechnicalBlocker,
+        replacement_handle: TargetWorkHandle,
+        replacement_preflight: TargetExecutionPreflight | None,
+        idempotency_key: str,
+    ) -> TargetFrontierEntry:
+        """Reject the superseded caller-authored recovery write seam."""
+
+        del (
+            target_ref,
+            blocker,
+            replacement_handle,
+            replacement_preflight,
+            idempotency_key,
+        )
+        raise OwnerConflict("target_run_direct_recovery_write_forbidden")
+
+    def _persist_target_run_recovery(
+        self,
+        *,
+        target_ref: str,
+        blocker: TechnicalBlocker,
+        replacement_handle: TargetWorkHandle,
+        replacement_preflight: TargetExecutionPreflight | None,
+        idempotency_key: str,
+    ) -> TargetFrontierEntry:
+        """Persist only the exact recovery reissued from signed execution."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        command = {
+            "command": "recover_target_run",
+            "target_ref": target_ref,
+            "blocker": projection_plain_value(blocker),
+            "replacement_handle": projection_plain_value(replacement_handle),
+            "replacement_preflight": projection_plain_value(replacement_preflight),
+        }
+        request_hash = canonical_hash(command)
+        now = time.time()
+        try:
+            with self._database.fenced_write() as connection:
+                replay = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_recoveries WHERE "
+                        "idempotency_key = :idempotency_key"
+                    ),
+                    {"idempotency_key": idempotency_key},
+                ).first()
+                if replay is not None:
+                    if replay.request_hash != request_hash:
+                        raise OwnerConflict("idempotency_conflict")
+                    return _target_frontier_for_local_write(connection, target_ref)
+                frontier, request = _target_frontier_and_request_for_local_write(
+                    connection, target_ref
+                )
+                if frontier.state != "running":
+                    raise OwnerConflict("target_run_terminal")
+                harness_verifier = self._target_run_harness_verifier
+                if harness_verifier is None:
+                    raise OwnerConflict("target_run_harness_verifier_unavailable")
+                try:
+                    issued_failure = harness_verifier.query_target_execution_failure(
+                        frontier.current_handle
+                    )
+                    if (
+                        issued_failure is None
+                        or issued_failure.blocker != blocker
+                        or issued_failure.replacement_handle
+                        != replacement_handle
+                        or issued_failure.failure_ref != blocker.blocker_ref
+                    ):
+                        raise OwnerConflict("target_run_recovery_invalid")
+                    reservation = (
+                        self._harness_runs.verify_target_successor_reservation(
+                            old_handle=frontier.current_handle,
+                            recovery_ref=issued_failure.failure_ref,
+                        )
+                    )
+                except Exception as error:
+                    if isinstance(error, OwnerConflict):
+                        raise
+                    raise OwnerConflict("target_run_recovery_invalid") from error
+                stop_row = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_stop_decisions WHERE "
+                        "target_ref = :target_ref AND execution_attempt_ref = "
+                        ":attempt_ref"
+                    ),
+                    {
+                        "target_ref": target_ref,
+                        "attempt_ref": frontier.current_handle.execution_attempt_ref,
+                    },
+                ).first()
+                if issued_failure.stop_decision is None:
+                    if stop_row is not None:
+                        raise OwnerConflict("target_run_recovery_invalid")
+                elif stop_row is None or (
+                    _stored_bundle_record(
+                        stop_row.stop_json,
+                        stop_row.stop_hash,
+                        StopDecisionProof,
+                        "target_run_recovery_invalid",
+                    )
+                    != issued_failure.stop_decision
+                    or stop_row.generic_binding_ref
+                    != issued_failure.generic_binding_ref
+                    or stop_row.generic_binding_receipt_ref
+                    != issued_failure.generic_binding_receipt.receipt_ref
+                    or stop_row.generic_binding_receipt_hash
+                    != issued_failure.generic_binding_receipt.payload_hash
+                ):
+                    raise OwnerConflict("target_run_recovery_invalid")
+                activation = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_activations WHERE target_ref = "
+                        ":target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+                preflight_rows = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_preflights WHERE target_ref = "
+                        ":target_ref ORDER BY ordinal"
+                    ),
+                    {"target_ref": target_ref},
+                ).all()
+                handle_rows = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_handles WHERE target_ref = "
+                        ":target_ref ORDER BY ordinal"
+                    ),
+                    {"target_ref": target_ref},
+                ).all()
+                if activation is None or not preflight_rows or not handle_rows:
+                    raise OwnerConflict("target_run_recovery_integrity_invalid")
+                previous_preflight = _stored_bundle_record(
+                    preflight_rows[-1].preflight_json,
+                    preflight_rows[-1].preflight_hash,
+                    TargetExecutionPreflight,
+                    "target_run_recovery_integrity_invalid",
+                )
+                initial_scope = _stored_bundle_record(
+                    activation.initial_review_scope_json,
+                    activation.initial_review_scope_hash,
+                    CodeReviewScope,
+                    "target_run_recovery_integrity_invalid",
+                )
+                expected_scope = (
+                    None
+                    if replacement_preflight is None
+                    else replace(
+                        initial_scope,
+                        candidate_revision_binding=(
+                            replacement_preflight.review_scope.candidate_revision_binding
+                        ),
+                    )
+                )
+                try:
+                    verify_successor = getattr(
+                        harness_verifier,
+                        "verify_target_run_recovery_successor",
+                        None,
+                    )
+                    verified_replacement = (
+                        verify_successor(
+                            frontier.current_handle,
+                            replacement_handle,
+                            issued_failure.failure_ref,
+                        )
+                        if callable(verify_successor)
+                        else harness_verifier.verify_current_target_run_handle(
+                            replacement_handle
+                        )
+                    )
+                    validate_closed_bundle_projection(
+                        verified_replacement,
+                        "Harness replacement TargetWorkHandle",
+                    )
+                    if type(verified_replacement) is not TargetWorkHandle or (
+                        verified_replacement != replacement_handle
+                    ):
+                        raise TargetRunContractError(
+                            "Harness current successor differs from recovery"
+                        )
+                except (BundleProtocolError, TargetRunContractError, OwnerConflict, TypeError, ValueError) as error:
+                    raise OwnerConflict("target_run_harness_identity_invalid") from error
+                try:
+                    evidence_refs = validate_technical_blocker_recovery(
+                        blocker,
+                        old_handle=frontier.current_handle,
+                        replacement_handle=replacement_handle,
+                        previous_preflight=previous_preflight,
+                        replacement_preflight=replacement_preflight,
+                        expected_replacement_review_scope=expected_scope,
+                        accepted_input_target_commit_refs=(
+                            request.accepted_input_target_commit_refs
+                        ),
+                        accepted_input_asset_refs=request.accepted_input_asset_refs,
+                    )
+                except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
+                    raise OwnerConflict("target_run_recovery_invalid") from error
+                evidence_refs = tuple(
+                    sorted(
+                        {
+                            *evidence_refs,
+                            issued_failure.generic_binding_ref,
+                            issued_failure.generic_binding_receipt.receipt_ref,
+                            issued_failure.generic_binding_receipt.payload_hash,
+                            reservation.binding_hash,
+                        }
+                    )
+                )
+
+                prior_handles = tuple(
+                    _stored_bundle_record(
+                        row.handle_json,
+                        row.handle_hash,
+                        TargetWorkHandle,
+                        "target_run_recovery_integrity_invalid",
+                    )
+                    for row in handle_rows
+                )
+                if prior_handles[-1] != frontier.current_handle:
+                    raise OwnerConflict("target_run_recovery_integrity_invalid")
+                active_workspaces = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_workspaces WHERE target_ref = "
+                        ":target_ref AND status = 'active'"
+                    ),
+                    {"target_ref": target_ref},
+                ).all()
+                if len(active_workspaces) > 1 or (
+                    active_workspaces
+                    and (
+                        active_workspaces[0].target_run_ref,
+                        active_workspaces[0].root_session_ref,
+                        active_workspaces[0].target_attempt_ref,
+                        active_workspaces[0].target_fence_ref,
+                    )
+                    != (
+                        frontier.current_handle.target_run_ref,
+                        frontier.current_handle.root_session_ref,
+                        frontier.current_handle.execution_attempt_ref,
+                        frontier.current_handle.execution_fence_ref,
+                    )
+                ):
+                    raise OwnerConflict("target_run_recovery_integrity_invalid")
+                retired = {
+                    row.identity_ref
+                    for row in connection.execute(
+                        text("SELECT identity_ref FROM ar_target_retired_identities")
+                    ).all()
+                }
+                old = frontier.current_handle
+                if (
+                    replacement_handle.root_session_ref in retired
+                    or replacement_handle.execution_attempt_ref in retired
+                    or replacement_handle.execution_fence_ref in retired
+                    or (
+                        replacement_handle.target_run_ref != old.target_run_ref
+                        and replacement_handle.target_run_ref in retired
+                    )
+                    or replacement_handle.root_session_ref
+                    in {item.root_session_ref for item in prior_handles}
+                    or replacement_handle.execution_attempt_ref
+                    in {item.execution_attempt_ref for item in prior_handles}
+                    or replacement_handle.execution_fence_ref
+                    in {item.execution_fence_ref for item in prior_handles}
+                    or (
+                        replacement_handle.target_run_ref != old.target_run_ref
+                        and replacement_handle.target_run_ref
+                        in {item.target_run_ref for item in prior_handles}
+                    )
+                ):
+                    raise OwnerConflict("target_run_retired_identity_revival")
+                if replacement_handle.target_run_ref != old.target_run_ref:
+                    existing_target_run = connection.execute(
+                        text(
+                            "SELECT target_ref FROM ar_target_run_identities WHERE "
+                            "target_run_ref = :target_run_ref"
+                        ),
+                        {"target_run_ref": replacement_handle.target_run_ref},
+                    ).first()
+                    if existing_target_run is not None:
+                        raise OwnerConflict("target_run_identity_conflict")
+
+                transition_ref = new_ref("target_run_recovery")
+                recovery_ordinal = int(
+                    connection.execute(
+                        text(
+                            "SELECT COUNT(*) FROM ar_target_run_recoveries WHERE "
+                            "target_ref = :target_ref"
+                        ),
+                        {"target_ref": target_ref},
+                    ).scalar_one()
+                ) + 1
+                handle_ordinal = len(handle_rows) + 1
+                replacement_preflight_ordinal: int | None = None
+                blocker_json, blocker_hash = _bundle_record_storage(blocker)
+                reservation_value = projection_plain_value(reservation)
+                reservation_json = canonical_json(reservation_value)
+                reservation_hash = canonical_hash(reservation_value)
+                evidence_json = canonical_json(list(evidence_refs))
+                evidence_hash = canonical_hash(list(evidence_refs))
+                if replacement_preflight is not None and expected_scope is not None:
+                    replacement_preflight_ordinal = len(preflight_rows) + 1
+                    preflight_json, preflight_hash = _bundle_record_storage(
+                        replacement_preflight
+                    )
+                    scope_json, scope_hash = _bundle_record_storage(expected_scope)
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_target_run_preflights (target_ref, "
+                            "ordinal, implementation_revision_ref, "
+                            "preflight_json, preflight_hash, review_scope_json, "
+                            "review_scope_hash, recorded_at) VALUES (:target_ref, "
+                            ":ordinal, :implementation_revision_ref, "
+                            ":preflight_json, :preflight_hash, :scope_json, "
+                            ":scope_hash, :recorded_at)"
+                        ),
+                        {
+                            "target_ref": target_ref,
+                            "ordinal": replacement_preflight_ordinal,
+                            "implementation_revision_ref": (
+                                replacement_preflight.implementation_revision_ref
+                            ),
+                            "preflight_json": preflight_json,
+                            "preflight_hash": preflight_hash,
+                            "scope_json": scope_json,
+                            "scope_hash": scope_hash,
+                            "recorded_at": now,
+                        },
+                    )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_run_recoveries (transition_ref, "
+                        "target_ref, ordinal, blocker_ref, "
+                        "old_execution_attempt_ref, new_execution_attempt_ref, "
+                        "blocker_json, blocker_hash, "
+                        "recovery_evidence_refs_json, "
+                        "recovery_evidence_refs_hash, "
+                        "generic_binding_ref, generic_binding_receipt_ref, "
+                        "generic_binding_receipt_hash, "
+                        "successor_reservation_json, "
+                        "successor_reservation_hash, "
+                        "replacement_preflight_ordinal, idempotency_key, "
+                        "request_hash, recovered_at) VALUES (:transition_ref, "
+                        ":target_ref, :ordinal, :blocker_ref, :old_attempt_ref, "
+                        ":new_attempt_ref, :blocker_json, :blocker_hash, "
+                        ":evidence_json, :evidence_hash, "
+                        ":generic_binding_ref, :generic_receipt_ref, "
+                        ":generic_receipt_hash, :reservation_json, "
+                        ":reservation_hash, :preflight_ordinal, "
+                        ":idempotency_key, :request_hash, :recovered_at)"
+                    ),
+                    {
+                        "transition_ref": transition_ref,
+                        "target_ref": target_ref,
+                        "ordinal": recovery_ordinal,
+                        "blocker_ref": blocker.blocker_ref,
+                        "old_attempt_ref": old.execution_attempt_ref,
+                        "new_attempt_ref": replacement_handle.execution_attempt_ref,
+                        "blocker_json": blocker_json,
+                        "blocker_hash": blocker_hash,
+                        "evidence_json": evidence_json,
+                        "evidence_hash": evidence_hash,
+                        "generic_binding_ref": issued_failure.generic_binding_ref,
+                        "generic_receipt_ref": (
+                            issued_failure.generic_binding_receipt.receipt_ref
+                        ),
+                        "generic_receipt_hash": (
+                            issued_failure.generic_binding_receipt.payload_hash
+                        ),
+                        "reservation_json": reservation_json,
+                        "reservation_hash": reservation_hash,
+                        "preflight_ordinal": replacement_preflight_ordinal,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "recovered_at": now,
+                    },
+                )
+                retirement_values = [
+                    ("root_session", old.root_session_ref),
+                    ("execution_attempt", old.execution_attempt_ref),
+                    ("execution_fence", old.execution_fence_ref),
+                ]
+                if replacement_handle.target_run_ref != old.target_run_ref:
+                    retirement_values.append(("target_run", old.target_run_ref))
+                for identity_kind, identity_ref in retirement_values:
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_target_retired_identities "
+                            "(identity_ref, identity_kind, target_ref, "
+                            "transition_ref, retired_at) VALUES (:identity_ref, "
+                            ":identity_kind, :target_ref, :transition_ref, "
+                            ":retired_at)"
+                        ),
+                        {
+                            "identity_ref": identity_ref,
+                            "identity_kind": identity_kind,
+                            "target_ref": target_ref,
+                            "transition_ref": transition_ref,
+                            "retired_at": now,
+                        },
+                    )
+                if active_workspaces:
+                    connection.execute(
+                        text(
+                            "UPDATE ar_target_run_workspaces SET status = "
+                            "'retired' WHERE workspace_ref = :workspace_ref AND "
+                            "status = 'active'"
+                        ),
+                        {"workspace_ref": active_workspaces[0].workspace_ref},
+                    )
+                if replacement_handle.target_run_ref != old.target_run_ref:
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_target_run_identities "
+                            "(target_run_ref, target_ref, first_handle_ordinal, "
+                            "recorded_at) VALUES (:target_run_ref, :target_ref, "
+                            ":ordinal, :recorded_at)"
+                        ),
+                        {
+                            "target_run_ref": replacement_handle.target_run_ref,
+                            "target_ref": target_ref,
+                            "ordinal": handle_ordinal,
+                            "recorded_at": now,
+                        },
+                    )
+                handle_json, handle_hash = _bundle_record_storage(replacement_handle)
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_run_handles (target_ref, ordinal, "
+                        "target_run_ref, root_session_ref, execution_attempt_ref, "
+                        "execution_fence_ref, handle_json, handle_hash, "
+                        "recorded_at) VALUES (:target_ref, :ordinal, "
+                        ":target_run_ref, :root_session_ref, :attempt_ref, "
+                        ":fence_ref, :handle_json, :handle_hash, :recorded_at)"
+                    ),
+                    {
+                        "target_ref": target_ref,
+                        "ordinal": handle_ordinal,
+                        "target_run_ref": replacement_handle.target_run_ref,
+                        "root_session_ref": replacement_handle.root_session_ref,
+                        "attempt_ref": replacement_handle.execution_attempt_ref,
+                        "fence_ref": replacement_handle.execution_fence_ref,
+                        "handle_json": handle_json,
+                        "handle_hash": handle_hash,
+                        "recorded_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_target_monitor_states SET target_run_ref = "
+                        ":target_run_ref, execution_attempt_ref = :attempt_ref, "
+                        "execution_fence_ref = :fence_ref, snapshot_required = 1, "
+                        "cursor = NULL, status_revision = NULL, "
+                        "checkpoint_revision = checkpoint_revision + 1, "
+                        "updated_at = :updated_at WHERE target_ref = :target_ref"
+                    ),
+                    {
+                        "target_run_ref": replacement_handle.target_run_ref,
+                        "attempt_ref": replacement_handle.execution_attempt_ref,
+                        "fence_ref": replacement_handle.execution_fence_ref,
+                        "updated_at": now,
+                        "target_ref": target_ref,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_target_frontier_entries SET state_revision = "
+                        "state_revision + 1, current_handle_json = :handle_json, "
+                        "current_handle_hash = :handle_hash, updated_at = "
+                        ":updated_at WHERE target_ref = :target_ref AND state = "
+                        "'running'"
+                    ),
+                    {
+                        "handle_json": handle_json,
+                        "handle_hash": handle_hash,
+                        "updated_at": now,
+                        "target_ref": target_ref,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.target_run_recovered",
+                    {
+                        "transition_ref": transition_ref,
+                        "target_ref": target_ref,
+                        "target_run_ref": replacement_handle.target_run_ref,
+                    },
+                )
+                return _target_frontier_for_local_write(connection, target_ref)
+        except IntegrityError as error:
+            raise OwnerConflict("target_run_recovery_conflict") from error
+
+    def publish_target_run_execution_outcome_unknown(
+        self,
+        *,
+        target_ref: str,
+        idempotency_key: str,
+    ) -> TargetWorkNotice:
+        """Publish a signed unknown outcome without caller-authored facts."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        with self._database.read() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT notices.*, manifests.handoff_json, "
+                    "manifests.handoff_hash FROM ar_target_work_notices AS "
+                    "notices JOIN ar_target_handoff_manifests AS manifests ON "
+                    "manifests.manifest_ref = notices.manifest_ref WHERE "
+                    "notices.idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        if replay is not None:
+            handoff = _stored_bundle_record(
+                replay.handoff_json,
+                replay.handoff_hash,
+                TargetRunHandoff,
+                "target_execution_outcome_unknown_integrity_invalid",
+            )
+            notice = _target_notice_from_row(replay)
+            if (
+                replay.target_ref != target_ref
+                or type(handoff.terminal) is not TechnicalBlocker
+                or handoff.handle_history[-1].target_ref != target_ref
+                or handoff.terminal.blocker_ref != notice.terminal_fact_ref
+            ):
+                raise OwnerConflict("idempotency_conflict")
+            verifier = self._target_run_harness_verifier
+            try:
+                verified_blocker = (
+                    None
+                    if verifier is None
+                    else verifier.verify_target_execution_terminal_blocker(
+                        handle=handoff.handle_history[-1],
+                        blocker=handoff.terminal,
+                    )
+                )
+                history = self.query_target_run_handoff_history(target_ref)
+            except Exception as error:
+                raise OwnerConflict(
+                    "target_execution_outcome_unknown_integrity_invalid"
+                ) from error
+            escalation = handoff.terminal.escalation_evidence
+            escalation_receipt = handoff.terminal.escalation_receipt
+            if (
+                verified_blocker != handoff.terminal
+                or history is None
+                or escalation is None
+                or escalation_receipt is None
+            ):
+                raise OwnerConflict(
+                    "target_execution_outcome_unknown_integrity_invalid"
+                )
+            expected_evidence = set(history.recovery_evidence_refs)
+            expected_evidence.update(
+                {
+                    handoff.terminal.blocker_ref,
+                    handoff.terminal.blocker_receipt.receipt_ref,
+                    handoff.handle_history[-1].target_run_ref,
+                    handoff.handle_history[-1].root_session_ref,
+                    handoff.handle_history[-1].execution_attempt_ref,
+                    handoff.handle_history[-1].execution_fence_ref,
+                    escalation.subject_ref,
+                    escalation.content_hash_ref,
+                    escalation_receipt.receipt_ref,
+                }
+            )
+            if (
+                handoff.handle_history != history.handle_history
+                or handoff.code_review_preflights
+                != history.code_review_preflights
+                or handoff.stop_decisions != history.stop_decisions
+                or handoff.recovered_blockers != history.recovered_blockers
+                or handoff.recovery_evidence_refs
+                != tuple(sorted(expected_evidence))
+            ):
+                raise OwnerConflict(
+                    "target_execution_outcome_unknown_integrity_invalid"
+                )
+            return notice
+        frontier = self.query_target_frontier_entry(target_ref)
+        verifier = self._target_run_harness_verifier
+        if frontier is None or frontier.state != "running" or verifier is None:
+            raise OwnerConflict("target_execution_outcome_unknown_invalid")
+        try:
+            projection = verifier.query_target_execution_outcome_unknown(
+                frontier.current_handle
+            )
+            blocker = None if projection is None else projection.blocker
+        except Exception as error:
+            raise OwnerConflict(
+                "target_execution_outcome_unknown_invalid"
+            ) from error
+        if type(blocker) is not TechnicalBlocker:
+            raise OwnerConflict("target_execution_outcome_unknown_invalid")
+        history = self.query_target_run_handoff_history(target_ref)
+        if history is None or history.handle_history[-1] != frontier.current_handle:
+            raise OwnerConflict("target_run_handoff_history_stale")
+        evidence = set(history.recovery_evidence_refs)
+        escalation = blocker.escalation_evidence
+        escalation_receipt = blocker.escalation_receipt
+        if escalation is None or escalation_receipt is None:
+            raise OwnerConflict("target_execution_outcome_unknown_invalid")
+        evidence.update(
+            {
+                blocker.blocker_ref,
+                blocker.blocker_receipt.receipt_ref,
+                frontier.current_handle.target_run_ref,
+                frontier.current_handle.root_session_ref,
+                frontier.current_handle.execution_attempt_ref,
+                frontier.current_handle.execution_fence_ref,
+                escalation.subject_ref,
+                escalation.content_hash_ref,
+                escalation_receipt.receipt_ref,
+            }
+        )
+        return self.publish_target_run_handoff(
+            TargetRunHandoff(
+                handle_history=history.handle_history,
+                code_review_preflights=history.code_review_preflights,
+                stop_decisions=history.stop_decisions,
+                recovered_blockers=history.recovered_blockers,
+                recovery_evidence_refs=tuple(sorted(evidence)),
+                terminal=blocker,
+            ),
+            idempotency_key=idempotency_key,
+        )
+
+    def publish_target_root_completion(
+        self,
+        *,
+        target_ref: str,
+        completion_ref: str,
+        target_commit_ref: str,
+    ) -> TargetRunHandoff:
+        """Publish the issuer-derived root terminal; callers supply refs only."""
+
+        verified = _query_verified_target_root_publication(
+            completion_reader=self._target_root_completion_reader,
+            graph_verifier=self._target_graph_verifier,
+            target_ref=target_ref,
+            completion_ref=completion_ref,
+            target_commit_ref=target_commit_ref,
+        )
+        handoff = TargetRunHandoff(
+            handle_history=(verified.handle,),
+            code_review_preflights=(),
+            stop_decisions=(),
+            recovered_blockers=(),
+            recovery_evidence_refs=(),
+            terminal=verified.terminal,
+        )
+        idempotency_key = "target-root-publication:" + canonical_hash(
+            {
+                "target_ref": target_ref,
+                "completion_ref": completion_ref,
+                "target_commit_ref": target_commit_ref,
+            }
+        )
+        notice = self.publish_target_run_handoff(
+            handoff,
+            idempotency_key=idempotency_key,
+        )
+        persisted = self.read_target_run_handoff(notice.handoff_manifest_ref)
+        if persisted != handoff:
+            raise OwnerConflict(
+                "target_root_completion_publication_integrity_invalid"
+            )
+        return persisted
+
+    def query_target_root_completion_handoff(
+        self,
+        *,
+        target_ref: str,
+        completion_ref: str,
+        target_commit_ref: str,
+    ) -> TargetRunHandoff | None:
+        """Query one publication only after re-reading both issuing Owners."""
+
+        verified = _query_verified_target_root_publication(
+            completion_reader=self._target_root_completion_reader,
+            graph_verifier=self._target_graph_verifier,
+            target_ref=target_ref,
+            completion_ref=completion_ref,
+            target_commit_ref=target_commit_ref,
+        )
+        notice = self.query_target_work_notice(target_ref)
+        if notice is None:
+            return None
+        handoff = self.read_target_run_handoff(notice.handoff_manifest_ref)
+        expected = TargetRunHandoff(
+            handle_history=(verified.handle,),
+            code_review_preflights=(),
+            stop_decisions=(),
+            recovered_blockers=(),
+            recovery_evidence_refs=(),
+            terminal=verified.terminal,
+        )
+        if handoff != expected or notice.terminal_fact_ref != target_commit_ref:
+            raise OwnerConflict(
+                "target_root_completion_publication_integrity_invalid"
+            )
+        return handoff
+
+    def publish_target_run_handoff(
+        self,
+        handoff: TargetRunHandoff,
+        *,
+        idempotency_key: str,
+    ) -> TargetWorkNotice:
+        """Atomically freeze a terminal manifest, frontier, and compact notice."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        try:
+            validate_target_run_handoff(handoff)
+            target_ref = handoff.handle_history[-1].target_ref
+        except (BundleProtocolError, IndexError, TypeError, ValueError) as error:
+            raise OwnerConflict("target_run_handoff_invalid") from error
+        root_completion = _is_target_root_completion_terminal(handoff.terminal)
+        terminal_blocker_verified = False
+        if type(handoff.terminal) is TechnicalBlocker:
+            verifier = self._target_run_harness_verifier
+            try:
+                verified_blocker = (
+                    None
+                    if verifier is None
+                    else verifier.verify_target_execution_terminal_blocker(
+                        handle=handoff.handle_history[-1],
+                        blocker=handoff.terminal,
+                    )
+                )
+            except Exception as error:
+                raise OwnerConflict(
+                    "target_run_terminal_blocker_authority_invalid"
+                ) from error
+            if verified_blocker != handoff.terminal:
+                raise OwnerConflict(
+                    "target_run_terminal_blocker_authority_invalid"
+                )
+            terminal_blocker_verified = True
+        command = {
+            "command": "publish_target_run_handoff",
+            "handoff": projection_plain_value(handoff),
+        }
+        request_hash = canonical_hash(command)
+        now = time.time()
+        try:
+            with self._database.fenced_write() as connection:
+                replay = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_work_notices WHERE "
+                        "idempotency_key = :idempotency_key"
+                    ),
+                    {"idempotency_key": idempotency_key},
+                ).first()
+                if replay is not None:
+                    if replay.request_hash != request_hash:
+                        raise OwnerConflict("idempotency_conflict")
+                    manifest_row = connection.execute(
+                        text(
+                            "SELECT * FROM ar_target_handoff_manifests WHERE "
+                            "manifest_ref = :manifest_ref"
+                        ),
+                        {"manifest_ref": replay.manifest_ref},
+                    ).first()
+                    if manifest_row is None:
+                        raise OwnerConflict(
+                            "target_run_handoff_integrity_invalid"
+                        )
+                    persisted_handoff = _stored_bundle_record(
+                        manifest_row.handoff_json,
+                        manifest_row.handoff_hash,
+                        TargetRunHandoff,
+                        "target_run_handoff_integrity_invalid",
+                    )
+                    if persisted_handoff != handoff:
+                        raise OwnerConflict("idempotency_conflict")
+                    self._verify_target_run_handoff_readback(
+                        connection,
+                        row=manifest_row,
+                        handoff=persisted_handoff,
+                    )
+                    return _target_notice_from_row(replay)
+                if root_completion:
+                    final_handle = handoff.handle_history[-1]
+                    graph_verifier = self._target_graph_verifier
+                    if graph_verifier is None:
+                        raise OwnerConflict("target_graph_verifier_unavailable")
+                    transition = _query_verified_target_commit_transition(
+                        graph_verifier,
+                        target_ref=target_ref,
+                        handle=final_handle,
+                    )
+                    if transition is None:
+                        raise OwnerConflict(
+                            "target_root_completion_publication_authority_invalid"
+                        )
+                    verified_root = _query_verified_target_root_publication(
+                        completion_reader=self._target_root_completion_reader,
+                        graph_verifier=graph_verifier,
+                        target_ref=target_ref,
+                        completion_ref=(
+                            transition.target_execution_closure_ref
+                        ),
+                        target_commit_ref=handoff.terminal.target_commit_ref,
+                    )
+                    frontier, request = (
+                        _target_frontier_and_request_for_local_write(
+                            connection,
+                            target_ref,
+                        )
+                    )
+                    context = SimpleNamespace(
+                        request=request,
+                        frontier=frontier,
+                        monitor=SimpleNamespace(snapshot_required=0),
+                        candidate=None,
+                        formal_plan=None,
+                        handles=(verified_root.handle,),
+                        preflights=(),
+                        review_scopes=(),
+                        stop_decisions=(),
+                        recovered_blockers=(),
+                        recovery_evidence_refs=(),
+                    )
+                    if (
+                        handoff.handle_history != (verified_root.handle,)
+                        or handoff.terminal != verified_root.terminal
+                    ):
+                        raise OwnerConflict(
+                            "target_root_completion_publication_authority_invalid"
+                        )
+                else:
+                    context = _target_handoff_context(
+                        connection,
+                        target_ref,
+                        verifier=self._target_run_harness_verifier,
+                    )
+                if context.frontier.state != "running":
+                    raise OwnerConflict("target_run_terminal")
+                if (not root_completion) and bool(
+                    context.monitor.snapshot_required
+                ) and not (
+                    terminal_blocker_verified
+                    and type(handoff.terminal) is TechnicalBlocker
+                ):
+                    raise OwnerConflict("target_run_handoff_before_snapshot")
+                if terminal_blocker_verified:
+                    verifier = self._target_run_harness_verifier
+                    try:
+                        verified_blocker = (
+                            None
+                            if verifier is None
+                            else verifier.verify_target_execution_terminal_blocker(
+                                handle=context.handles[-1],
+                                blocker=handoff.terminal,
+                            )
+                        )
+                    except Exception as error:
+                        raise OwnerConflict(
+                            "target_run_terminal_blocker_authority_invalid"
+                        ) from error
+                    if verified_blocker != handoff.terminal:
+                        raise OwnerConflict(
+                            "target_run_terminal_blocker_authority_invalid"
+                        )
+                expected_recovery_evidence = set(context.recovery_evidence_refs)
+                if type(handoff.terminal) is TechnicalBlocker and (
+                    handoff.terminal.escalation_evidence is not None
+                    and handoff.terminal.escalation_receipt is not None
+                ):
+                    expected_recovery_evidence.update(
+                        {
+                            handoff.terminal.blocker_ref,
+                            handoff.terminal.blocker_receipt.receipt_ref,
+                            context.handles[-1].target_run_ref,
+                            context.handles[-1].root_session_ref,
+                            context.handles[-1].execution_attempt_ref,
+                            context.handles[-1].execution_fence_ref,
+                            handoff.terminal.escalation_evidence.subject_ref,
+                            handoff.terminal.escalation_evidence.content_hash_ref,
+                            handoff.terminal.escalation_receipt.receipt_ref,
+                        }
+                    )
+                if (
+                    handoff.handle_history != context.handles
+                    or handoff.code_review_preflights != context.preflights
+                    or handoff.stop_decisions != context.stop_decisions
+                    or handoff.recovered_blockers != context.recovered_blockers
+                    or handoff.recovery_evidence_refs
+                    != tuple(sorted(expected_recovery_evidence))
+                ):
+                    raise OwnerConflict("target_run_handoff_history_drift")
+                terminal = handoff.terminal
+                measurement_transition_verified = False
+                if type(terminal) is AcceptedMeasurementClosure:
+                    verifier = self._target_graph_verifier
+                    if verifier is None:
+                        raise OwnerConflict("target_graph_verifier_unavailable")
+                    commit_transition = _query_verified_target_commit_transition(
+                        verifier,
+                        target_ref=target_ref,
+                        handle=context.handles[-1],
+                    )
+                    if (
+                        commit_transition is None
+                        or commit_transition.canonical_terminal != terminal
+                    ):
+                        raise OwnerConflict(
+                            "target_run_handoff_target_commit_invalid"
+                        )
+                    measurement_transition_verified = True
+                if not root_completion:
+                    _validate_persisted_target_terminal(
+                        handoff,
+                        candidate=context.candidate,
+                        formal_plan=context.formal_plan,
+                        final_handle=context.handles[-1],
+                        measurement_transition_verified=(
+                            measurement_transition_verified
+                        ),
+                    )
+                semantic_fact_ref = (
+                    new_ref("semantic_barrier")
+                    if type(terminal) is SemanticBarrier
+                    else None
+                )
+                kind, terminal_fact_ref, compact_reason, obligations = (
+                    _target_terminal_notice_values(
+                        terminal,
+                        semantic_barrier_fact_ref=semantic_fact_ref,
+                    )
+                )
+                launch_scope = connection.execute(
+                    text(
+                        "SELECT decisions.run_ref FROM ar_target_launches launches "
+                        "JOIN ar_bundle_dispatch_decisions decisions ON "
+                        "decisions.decision_ref = launches.dispatch_decision_ref "
+                        "WHERE launches.target_ref = :target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+                scoped_inbox = (
+                    None
+                    if launch_scope is None
+                    else connection.execute(
+                        text(
+                            "SELECT * FROM ar_bundle_inbox_scopes WHERE run_ref = "
+                            ":run_ref"
+                        ),
+                        {"run_ref": launch_scope.run_ref},
+                    ).first()
+                )
+                if launch_scope is None or scoped_inbox is None:
+                    raise OwnerConflict("bundle_inbox_scope_invalid")
+                scoped_sequence = int(scoped_inbox.next_sequence)
+                scoped_generation = int(scoped_inbox.generation) + (
+                    0 if bool(scoped_inbox.wake_pending) else 1
+                )
+                inbox = connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_inbox_state WHERE singleton = "
+                        "'bundle'"
+                    )
+                ).first()
+                if inbox is None:
+                    raise OwnerConflict("bundle_inbox_integrity_invalid")
+                sequence = int(inbox.next_sequence)
+                manifest_ref = new_ref("target_handoff_manifest")
+                transition_ref = new_ref("target_terminal_transition")
+                notice_ref = new_ref("target_work_notice")
+                handoff_json, handoff_hash = _bundle_record_storage(handoff)
+                final_handle = handoff.handle_history[-1]
+                payload = {
+                    "notice_ref": notice_ref,
+                    "terminal_transition_ref": transition_ref,
+                    "kind": kind,
+                    "target_ref": final_handle.target_ref,
+                    "target_run_ref": final_handle.target_run_ref,
+                    "execution_attempt_ref": final_handle.execution_attempt_ref,
+                    "execution_fence_ref": final_handle.execution_fence_ref,
+                    "terminal_fact_ref": terminal_fact_ref,
+                    "handoff_manifest_ref": manifest_ref,
+                    "handoff_manifest_sha256": handoff_hash,
+                    "compact_reason": compact_reason,
+                    "pending_obligation_refs": obligations,
+                }
+                notice = TargetWorkNotice(
+                    notice_ref=notice_ref,
+                    sequence=sequence,
+                    terminal_transition_ref=transition_ref,
+                    kind=kind,
+                    target_ref=final_handle.target_ref,
+                    target_run_ref=final_handle.target_run_ref,
+                    execution_attempt_ref=final_handle.execution_attempt_ref,
+                    execution_fence_ref=final_handle.execution_fence_ref,
+                    terminal_fact_ref=terminal_fact_ref,
+                    handoff_manifest_ref=manifest_ref,
+                    handoff_manifest_sha256=handoff_hash,
+                    compact_reason=compact_reason,
+                    pending_obligation_refs=obligations,
+                    payload_sha256=canonical_hash(payload),
+                )
+                terminal_frontier = replace(
+                    context.frontier,
+                    state_revision=context.frontier.state_revision + 1,
+                    state="terminal",
+                    terminal_fact_ref=terminal_fact_ref,
+                )
+                try:
+                    validate_target_run_handoff_notice(
+                        handoff,
+                        notice,
+                        terminal_frontier,
+                        terminal_frontier,
+                        initial_handle=context.handles[0],
+                        target_spec_binding=context.request.target_spec_binding,
+                        target_spec_acceptance_receipt=(
+                            context.request.target_spec_acceptance_receipt
+                        ),
+                        expected_review_scopes=context.review_scopes,
+                        expected_initial_implementation_revision_ref=(
+                            handoff.terminal.implementation_revision_ref
+                            if root_completion
+                            else context.candidate.implementation_revision_ref
+                        ),
+                        expected_initial_code_changed=(
+                            False
+                            if root_completion
+                            else context.candidate.code_changed
+                        ),
+                        semantic_barrier_fact_ref=semantic_fact_ref,
+                    )
+                except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
+                    raise OwnerConflict("target_run_handoff_invalid") from error
+
+                notice_json, notice_hash = _bundle_record_storage(notice)
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_handoff_manifests (manifest_ref, "
+                        "target_ref, handoff_json, handoff_hash, "
+                        "semantic_barrier_fact_ref, published_at) VALUES "
+                        "(:manifest_ref, :target_ref, :handoff_json, "
+                        ":handoff_hash, :semantic_fact_ref, :published_at)"
+                    ),
+                    {
+                        "manifest_ref": manifest_ref,
+                        "target_ref": target_ref,
+                        "handoff_json": handoff_json,
+                        "handoff_hash": handoff_hash,
+                        "semantic_fact_ref": semantic_fact_ref,
+                        "published_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_work_notices (notice_ref, "
+                        "sequence, terminal_transition_ref, target_ref, "
+                        "manifest_ref, kind, notice_json, notice_hash, "
+                        "idempotency_key, request_hash, published_at) VALUES "
+                        "(:notice_ref, :sequence, :transition_ref, :target_ref, "
+                        ":manifest_ref, :kind, :notice_json, :notice_hash, "
+                        ":idempotency_key, :request_hash, :published_at)"
+                    ),
+                    {
+                        "notice_ref": notice_ref,
+                        "sequence": sequence,
+                        "transition_ref": transition_ref,
+                        "target_ref": target_ref,
+                        "manifest_ref": manifest_ref,
+                        "kind": kind,
+                        "notice_json": notice_json,
+                        "notice_hash": notice_hash,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "published_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_bundle_inbox_entries (run_ref, sequence, "
+                        "notice_ref, published_generation, published_at) VALUES "
+                        "(:run_ref, :sequence, :notice_ref, :generation, "
+                        ":published_at)"
+                    ),
+                    {
+                        "run_ref": launch_scope.run_ref,
+                        "sequence": scoped_sequence,
+                        "notice_ref": notice_ref,
+                        "generation": scoped_generation,
+                        "published_at": now,
+                    },
+                )
+                frontier_update = connection.execute(
+                    text(
+                        "UPDATE ar_target_frontier_entries SET state_revision = "
+                        ":state_revision, state = 'terminal', terminal_fact_ref = "
+                        ":terminal_fact_ref, updated_at = :updated_at WHERE "
+                        "target_ref = :target_ref AND state = 'running' AND "
+                        "state_revision = :previous_revision"
+                    ),
+                    {
+                        "state_revision": terminal_frontier.state_revision,
+                        "previous_revision": context.frontier.state_revision,
+                        "terminal_fact_ref": terminal_fact_ref,
+                        "updated_at": now,
+                        "target_ref": target_ref,
+                    },
+                )
+                if frontier_update.rowcount != 1:
+                    raise OwnerConflict("target_run_handoff_stale")
+                if root_completion:
+                    completion_ref = getattr(
+                        verified_root.completion,
+                        "completion_ref",
+                        None,
+                    )
+                    lifecycle_update = connection.execute(
+                        text(
+                            "UPDATE ar_target_root_lifecycles SET status = "
+                            "'completed', updated_at = :updated_at WHERE "
+                            "target_ref = :target_ref AND completion_ref = "
+                            ":completion_ref AND status = 'finalizing'"
+                        ),
+                        {
+                            "updated_at": now,
+                            "target_ref": target_ref,
+                            "completion_ref": completion_ref,
+                        },
+                    )
+                    if lifecycle_update.rowcount != 1:
+                        raise OwnerConflict(
+                            "target_root_completion_publication_stale"
+                        )
+                    self._feed.record(
+                        connection,
+                        "agent_runtime.target_root_lifecycle_completed",
+                        {
+                            "target_ref": target_ref,
+                            "completion_ref": completion_ref,
+                            "target_commit_ref": terminal_fact_ref,
+                        },
+                    )
+                generation = int(inbox.generation) + (
+                    0 if bool(inbox.wake_pending) else 1
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_bundle_inbox_state SET next_sequence = "
+                        ":next_sequence, generation = :generation, wake_pending = "
+                        "1 WHERE singleton = 'bundle'"
+                    ),
+                    {
+                        "next_sequence": sequence + 1,
+                        "generation": generation,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_bundle_inbox_scopes SET next_sequence = "
+                        ":next_sequence, generation = :generation, wake_pending = "
+                        "1, current_checkpoint_ref = NULL, updated_at = "
+                        ":updated_at WHERE run_ref = :run_ref"
+                    ),
+                    {
+                        "next_sequence": scoped_sequence + 1,
+                        "generation": scoped_generation,
+                        "updated_at": now,
+                        "run_ref": launch_scope.run_ref,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.target_work_notice_published",
+                    {
+                        "notice_ref": notice_ref,
+                        "sequence": sequence,
+                        "bundle_run_ref": launch_scope.run_ref,
+                        "bundle_sequence": scoped_sequence,
+                        "kind": kind,
+                        "target_ref": target_ref,
+                        "handoff_manifest_ref": manifest_ref,
+                    },
+                )
+                return notice
+        except IntegrityError as error:
+            raise OwnerConflict("target_run_handoff_conflict") from error
+
+    def query_target_work_notice(
+        self, target_ref: str
+    ) -> TargetWorkNotice | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_work_notices WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        return None if row is None else _target_notice_from_row(row)
+
+    def read_bundle_inbox(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        limit: int = 128,
+    ) -> BundleInboxBatch:
+        """Read one BundleStageRun's compact notices without acknowledging them."""
+
+        if (
+            any(
+                type(value) is not str or not value
+                for value in (run_ref, attempt_ref, fence_ref)
+            )
+            or type(limit) is not int
+            or limit < 1
+            or limit > 128
+        ):
+            raise OwnerConflict("bundle_inbox_cursor_invalid")
+        with self._database.read() as connection:
+            stage_run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            scope = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_inbox_scopes WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            if stage_run is None or scope is None:
+                raise OwnerConflict("bundle_inbox_scope_invalid")
+            if (
+                stage_run.stage != "bundle"
+                or stage_run.current_attempt_ref != attempt_ref
+                or stage_run.current_fence_ref != fence_ref
+                or stage_run.status not in {"running", "awaiting_acceptance"}
+            ):
+                raise OwnerConflict("bundle_inbox_scope_stale")
+            return _scoped_bundle_inbox_batch(
+                connection,
+                run_ref=run_ref,
+                after_cursor=int(scope.acknowledged_cursor),
+                generation=int(scope.generation),
+                limit=limit,
+            )
+
+    def acknowledge_bundle_inbox(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        batch: BundleInboxBatch,
+        idempotency_key: str,
+    ) -> BundleInboxCheckpoint:
+        """CAS one fully processed scoped batch into a closed checkpoint."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        try:
+            batch_hash = validate_bundle_inbox_batch(batch)
+        except (BundleProtocolError, TypeError, ValueError) as error:
+            raise OwnerConflict("bundle_inbox_ack_invalid") from error
+        command = {
+            "command": "acknowledge_bundle_inbox",
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "fence_ref": fence_ref,
+            "batch": projection_plain_value(batch),
+            "batch_hash": batch_hash,
+        }
+        request_hash = canonical_hash(command)
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_inbox_checkpoints WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if replay is not None:
+                if replay.request_hash != request_hash:
+                    raise OwnerConflict("idempotency_conflict")
+                return _bundle_inbox_checkpoint_from_row(replay)
+            stage_run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            scope = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_inbox_scopes WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            if stage_run is None or scope is None:
+                raise OwnerConflict("bundle_inbox_scope_invalid")
+            maximum = int(scope.next_sequence) - 1
+            if (
+                stage_run.stage != "bundle"
+                or stage_run.current_attempt_ref != attempt_ref
+                or stage_run.current_fence_ref != fence_ref
+                or stage_run.status not in {"running", "awaiting_acceptance"}
+                or batch.after_cursor != int(scope.acknowledged_cursor)
+                or batch.next_cursor != maximum
+                or batch.generation != int(scope.generation)
+            ):
+                raise OwnerConflict("bundle_inbox_ack_stale")
+            stored_batch = _scoped_bundle_inbox_batch(
+                connection,
+                run_ref=run_ref,
+                after_cursor=int(scope.acknowledged_cursor),
+                generation=int(scope.generation),
+                limit=128,
+            )
+            if stored_batch != batch:
+                raise OwnerConflict("bundle_inbox_ack_stale")
+            target_refs = tuple(notice.target_ref for notice in batch.notices)
+            if len(set(target_refs)) != len(target_refs):
+                raise OwnerConflict("bundle_inbox_ack_invalid")
+            evidence, missing = _bundle_report_target_evidence(
+                connection,
+                target_refs,
+                target_run_verifier=self._target_run_harness_verifier,
+            )
+            if missing or tuple(item.notice.notice_ref for item in evidence) != tuple(
+                notice.notice_ref for notice in batch.notices
+            ):
+                raise OwnerConflict("bundle_inbox_notice_frontier_invalid")
+            current_ref = scope.current_checkpoint_ref
+            if current_ref is not None and not bool(scope.wake_pending):
+                current_row = connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_inbox_checkpoints WHERE "
+                        "checkpoint_ref = :checkpoint_ref"
+                    ),
+                    {"checkpoint_ref": current_ref},
+                ).first()
+                if current_row is None:
+                    raise OwnerConflict("bundle_inbox_checkpoint_integrity_invalid")
+                current = _bundle_inbox_checkpoint_from_row(current_row)
+                if (
+                    current.run_ref == run_ref
+                    and current.attempt_ref == attempt_ref
+                    and current.fence_ref == fence_ref
+                    and current.cursor == batch.next_cursor
+                    and current.generation == batch.generation
+                    and current.batch_hash == batch_hash
+                ):
+                    return current
+            checkpoint_revision = int(
+                connection.execute(
+                    text(
+                        "SELECT COALESCE(MAX(checkpoint_revision), 0) + 1 FROM "
+                        "ar_bundle_inbox_checkpoints WHERE run_ref = :run_ref"
+                    ),
+                    {"run_ref": run_ref},
+                ).scalar_one()
+            )
+            checkpoint_ref = new_ref("bundle_inbox_checkpoint")
+            payload = _bundle_inbox_checkpoint_payload(
+                checkpoint_ref=checkpoint_ref,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                checkpoint_revision=checkpoint_revision,
+                cursor=batch.next_cursor,
+                generation=batch.generation,
+                batch_hash=batch_hash,
+            )
+            checkpoint_hash = canonical_hash(payload)
+            bindings = {**payload, "checkpoint_hash": checkpoint_hash}
+            receipt_ref = new_ref("ar_bundle_inbox_checkpoint_receipt")
+            receipt_hash = _owner_receipt_hash(
+                BUNDLE_INBOX_CHECKPOINT_RECEIPT_KIND,
+                checkpoint_ref,
+                bindings,
+            )
+            now = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO ar_bundle_inbox_checkpoints (checkpoint_ref, "
+                    "run_ref, attempt_ref, fence_ref, checkpoint_revision, cursor, "
+                    "generation, batch_hash, checkpoint_hash, idempotency_key, "
+                    "request_hash, receipt_ref, receipt_hash, accepted_at) VALUES "
+                    "(:checkpoint_ref, :run_ref, :attempt_ref, :fence_ref, "
+                    ":checkpoint_revision, :cursor, :generation, :batch_hash, "
+                    ":checkpoint_hash, :idempotency_key, :request_hash, "
+                    ":receipt_ref, :receipt_hash, :accepted_at)"
+                ),
+                {
+                    **payload,
+                    "checkpoint_hash": checkpoint_hash,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "accepted_at": now,
+                },
+            )
+            updated = connection.execute(
+                text(
+                    "UPDATE ar_bundle_inbox_scopes SET acknowledged_cursor = "
+                    ":cursor, wake_pending = 0, current_checkpoint_ref = "
+                    ":checkpoint_ref, updated_at = :updated_at WHERE run_ref = "
+                    ":run_ref AND acknowledged_cursor = :after_cursor AND "
+                    "generation = :generation AND next_sequence = :next_sequence"
+                ),
+                {
+                    "cursor": batch.next_cursor,
+                    "checkpoint_ref": checkpoint_ref,
+                    "updated_at": now,
+                    "run_ref": run_ref,
+                    "after_cursor": batch.after_cursor,
+                    "generation": batch.generation,
+                    "next_sequence": batch.next_cursor + 1,
+                },
+            )
+            if updated.rowcount != 1:
+                raise OwnerConflict("bundle_inbox_ack_stale")
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.bundle_inbox_acknowledged",
+                {
+                    "checkpoint_ref": checkpoint_ref,
+                    "run_ref": run_ref,
+                    "cursor": batch.next_cursor,
+                    "generation": batch.generation,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_inbox_checkpoints WHERE "
+                    "checkpoint_ref = :checkpoint_ref"
+                ),
+                {"checkpoint_ref": checkpoint_ref},
+            ).one()
+            return _bundle_inbox_checkpoint_from_row(row)
+
+    def query_bundle_inbox_checkpoint(
+        self, run_ref: str
+    ) -> BundleInboxCheckpoint | None:
+        with self._database.read() as connection:
+            scope = connection.execute(
+                text(
+                    "SELECT current_checkpoint_ref FROM ar_bundle_inbox_scopes "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            row = (
+                None
+                if scope is None or scope.current_checkpoint_ref is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_inbox_checkpoints WHERE "
+                        "checkpoint_ref = :checkpoint_ref"
+                    ),
+                    {"checkpoint_ref": scope.current_checkpoint_ref},
+                ).first()
+            )
+            if row is None:
+                return None
+            checkpoint = _bundle_inbox_checkpoint_from_row(row)
+            return _require_current_bundle_inbox_checkpoint(
+                connection,
+                checkpoint,
+                run_ref=checkpoint.run_ref,
+                attempt_ref=checkpoint.attempt_ref,
+                fence_ref=checkpoint.fence_ref,
+            )
+
+    def query_bundle_inbox_operation_checkpoint(
+        self,
+        *,
+        operation_kind: str,
+        operation_ref: str,
+    ) -> BundleInboxCheckpoint | None:
+        """Return the immutable checkpoint bound to one proposal operation."""
+
+        if operation_kind not in {"target_proposal", "dispatch"}:
+            raise OwnerConflict("bundle_inbox_operation_kind_invalid")
+        with self._database.read() as connection:
+            binding = connection.execute(
+                text(
+                    "SELECT operation_ref FROM "
+                    "ar_bundle_inbox_operation_checkpoints WHERE "
+                    "operation_kind = :operation_kind AND operation_ref = "
+                    ":operation_ref"
+                ),
+                {
+                    "operation_kind": operation_kind,
+                    "operation_ref": operation_ref,
+                },
+            ).first()
+            if binding is None:
+                return None
+            return _bundle_inbox_checkpoint_for_operation(
+                connection,
+                operation_kind=operation_kind,
+                operation_ref=operation_ref,
+                require_current=False,
+            )
+
+    def query_bundle_inbox_wake_generation(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        after_generation: int,
+    ) -> int:
+        """Return only the scoped wake generation; notice data stays in read()."""
+
+        if type(after_generation) is not int or after_generation < 0:
+            raise OwnerConflict("bundle_inbox_generation_invalid")
+        with self._database.read() as connection:
+            stage_run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            scope = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_inbox_scopes WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            if stage_run is None or scope is None or (
+                stage_run.stage != "bundle"
+                or stage_run.current_attempt_ref != attempt_ref
+                or stage_run.current_fence_ref != fence_ref
+            ):
+                raise OwnerConflict("bundle_inbox_scope_stale")
+            generation = int(scope.generation)
+            if after_generation > generation:
+                raise OwnerConflict("bundle_inbox_generation_invalid")
+            return generation
+
+    def read_target_run_handoff(
+        self, handoff_manifest_ref: str
+    ) -> TargetRunHandoff:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_handoff_manifests WHERE "
+                    "manifest_ref = :manifest_ref"
+                ),
+                {"manifest_ref": handoff_manifest_ref},
+            ).first()
+            if row is None:
+                raise OwnerConflict("target_run_handoff_not_found")
+            handoff = _stored_bundle_record(
+                row.handoff_json,
+                row.handoff_hash,
+                TargetRunHandoff,
+                "target_run_handoff_integrity_invalid",
+            )
+            try:
+                validate_target_run_handoff(handoff)
+            except BundleProtocolError as error:
+                raise OwnerConflict(
+                    "target_run_handoff_integrity_invalid"
+                ) from error
+            self._verify_target_run_handoff_readback(
+                connection,
+                row=row,
+                handoff=handoff,
+            )
+        return handoff
+
+    def _verify_target_run_handoff_readback(
+        self,
+        connection,
+        *,
+        row,
+        handoff: TargetRunHandoff,
+    ) -> None:
+        """Reopen every terminal/history fact through its issuing authority."""
+
+        if _is_target_root_completion_terminal(handoff.terminal):
+            self._verify_target_root_completion_handoff_readback(
+                connection,
+                row=row,
+                handoff=handoff,
+            )
+            return
+        try:
+            target_ref = handoff.handle_history[-1].target_ref
+            context = _target_handoff_context(
+                connection,
+                target_ref,
+                verifier=self._target_run_harness_verifier,
+            )
+            notice_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_work_notices WHERE manifest_ref = "
+                    ":manifest_ref"
+                ),
+                {"manifest_ref": row.manifest_ref},
+            ).first()
+            notice = (
+                None
+                if notice_row is None
+                else _target_notice_from_row(notice_row)
+            )
+        except Exception as error:
+            raise OwnerConflict("target_run_handoff_integrity_invalid") from error
+        expected_evidence = set(context.recovery_evidence_refs)
+        terminal = handoff.terminal
+        terminal_authority_verified = False
+        if type(terminal) is TechnicalBlocker:
+            verifier = self._target_run_harness_verifier
+            try:
+                verified_blocker = (
+                    None
+                    if verifier is None
+                    else verifier.verify_target_execution_terminal_blocker(
+                        handle=context.handles[-1],
+                        blocker=terminal,
+                    )
+                )
+            except Exception as error:
+                raise OwnerConflict(
+                    "target_run_handoff_integrity_invalid"
+                ) from error
+            if verified_blocker != terminal:
+                raise OwnerConflict("target_run_handoff_integrity_invalid")
+            terminal_authority_verified = True
+            if (
+                terminal.escalation_evidence is not None
+                and terminal.escalation_receipt is not None
+            ):
+                expected_evidence.update(
+                    {
+                        terminal.blocker_ref,
+                        terminal.blocker_receipt.receipt_ref,
+                        context.handles[-1].target_run_ref,
+                        context.handles[-1].root_session_ref,
+                        context.handles[-1].execution_attempt_ref,
+                        context.handles[-1].execution_fence_ref,
+                        terminal.escalation_evidence.subject_ref,
+                        terminal.escalation_evidence.content_hash_ref,
+                        terminal.escalation_receipt.receipt_ref,
+                    }
+                )
+        measurement_transition_verified = False
+        if type(terminal) is AcceptedMeasurementClosure:
+            graph_verifier = self._target_graph_verifier
+            if graph_verifier is None:
+                raise OwnerConflict("target_run_handoff_integrity_invalid")
+            try:
+                transition = _query_verified_target_commit_transition(
+                    graph_verifier,
+                    target_ref=target_ref,
+                    handle=context.handles[-1],
+                )
+            except Exception as error:
+                raise OwnerConflict(
+                    "target_run_handoff_integrity_invalid"
+                ) from error
+            if transition is None or transition.canonical_terminal != terminal:
+                raise OwnerConflict("target_run_handoff_integrity_invalid")
+            measurement_transition_verified = True
+            terminal_authority_verified = True
+        if (
+            row.target_ref != target_ref
+            or context.frontier.state != "terminal"
+            or handoff.handle_history != context.handles
+            or handoff.code_review_preflights != context.preflights
+            or handoff.stop_decisions != context.stop_decisions
+            or handoff.recovered_blockers != context.recovered_blockers
+            or handoff.recovery_evidence_refs
+            != tuple(sorted(expected_evidence))
+            or notice is None
+            or notice.target_ref != target_ref
+            or notice.target_run_ref != context.handles[-1].target_run_ref
+            or notice.execution_attempt_ref
+            != context.handles[-1].execution_attempt_ref
+            or notice.execution_fence_ref != context.handles[-1].execution_fence_ref
+            or notice.handoff_manifest_ref != row.manifest_ref
+            or notice.handoff_manifest_sha256 != row.handoff_hash
+            or context.frontier.terminal_fact_ref != notice.terminal_fact_ref
+        ):
+            raise OwnerConflict("target_run_handoff_integrity_invalid")
+        try:
+            kind, fact_ref, reason, obligations = _target_terminal_notice_values(
+                terminal,
+                semantic_barrier_fact_ref=row.semantic_barrier_fact_ref,
+            )
+            _validate_persisted_target_terminal(
+                handoff,
+                candidate=context.candidate,
+                formal_plan=context.formal_plan,
+                final_handle=context.handles[-1],
+                measurement_transition_verified=measurement_transition_verified,
+            )
+        except Exception as error:
+            raise OwnerConflict("target_run_handoff_integrity_invalid") from error
+        if (
+            (type(terminal) is not SemanticBarrier and not terminal_authority_verified)
+            or (
+                notice.kind,
+                notice.terminal_fact_ref,
+                notice.compact_reason,
+                notice.pending_obligation_refs,
+            )
+            != (kind, fact_ref, reason, obligations)
+        ):
+            raise OwnerConflict("target_run_handoff_integrity_invalid")
+
+    def _verify_target_root_completion_handoff_readback(
+        self,
+        connection,
+        *,
+        row,
+        handoff: TargetRunHandoff,
+    ) -> None:
+        """Re-read root completion, RG commit, terminal frontier, and inbox."""
+
+        try:
+            if len(handoff.handle_history) != 1:
+                raise OwnerConflict(
+                    "target_root_completion_publication_integrity_invalid"
+                )
+            handle = handoff.handle_history[0]
+            target_ref = handle.target_ref
+            terminal = handoff.terminal
+            transition = self._target_graph_verifier
+            if transition is None:
+                raise OwnerConflict(
+                    "target_root_completion_publication_integrity_invalid"
+                )
+            current_transition = _query_verified_target_commit_transition(
+                transition,
+                target_ref=target_ref,
+                handle=handle,
+            )
+            if current_transition is None:
+                raise OwnerConflict(
+                    "target_root_completion_publication_integrity_invalid"
+                )
+            completion_ref = current_transition.target_execution_closure_ref
+            verified = _query_verified_target_root_publication(
+                completion_reader=self._target_root_completion_reader,
+                graph_verifier=self._target_graph_verifier,
+                target_ref=target_ref,
+                completion_ref=completion_ref,
+                target_commit_ref=terminal.target_commit_ref,
+            )
+            frontier, request = _target_frontier_and_request_for_local_write(
+                connection,
+                target_ref,
+            )
+            notice_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_work_notices WHERE manifest_ref = "
+                    ":manifest_ref"
+                ),
+                {"manifest_ref": row.manifest_ref},
+            ).first()
+            notice = (
+                None
+                if notice_row is None
+                else _target_notice_from_row(notice_row)
+            )
+            inbox_row = connection.execute(
+                text(
+                    "SELECT entries.run_ref, entries.sequence FROM "
+                    "ar_bundle_inbox_entries entries JOIN "
+                    "ar_target_launches launches ON launches.target_ref = "
+                    ":target_ref JOIN ar_bundle_dispatch_decisions decisions ON "
+                    "decisions.decision_ref = launches.dispatch_decision_ref AND "
+                    "decisions.run_ref = entries.run_ref WHERE "
+                    "entries.notice_ref = :notice_ref"
+                ),
+                {
+                    "target_ref": target_ref,
+                    "notice_ref": None if notice is None else notice.notice_ref,
+                },
+            ).first()
+            if (
+                verified.handle != handle
+                or verified.terminal != terminal
+                or getattr(verified.lifecycle, "status", None) != "completed"
+                or row.target_ref != target_ref
+                or row.semantic_barrier_fact_ref is not None
+                or frontier.state != "terminal"
+                or frontier.current_handle != handle
+                or frontier.terminal_fact_ref != terminal.target_commit_ref
+                or notice is None
+                or notice.target_ref != target_ref
+                or notice.target_run_ref != handle.target_run_ref
+                or notice.execution_attempt_ref != handle.execution_attempt_ref
+                or notice.execution_fence_ref != handle.execution_fence_ref
+                or notice.terminal_fact_ref != terminal.target_commit_ref
+                or notice.handoff_manifest_ref != row.manifest_ref
+                or notice.handoff_manifest_sha256 != row.handoff_hash
+                or inbox_row is None
+                or type(inbox_row.sequence) is not int
+                or inbox_row.sequence < 1
+            ):
+                raise OwnerConflict(
+                    "target_root_completion_publication_integrity_invalid"
+                )
+            validate_target_run_handoff_notice(
+                handoff,
+                notice,
+                frontier,
+                frontier,
+                initial_handle=handle,
+                target_spec_binding=request.target_spec_binding,
+                target_spec_acceptance_receipt=(
+                    request.target_spec_acceptance_receipt
+                ),
+                expected_review_scopes=(),
+                expected_initial_implementation_revision_ref=(
+                    terminal.implementation_revision_ref
+                ),
+                expected_initial_code_changed=False,
+            )
+            reconfirmed = _query_verified_target_root_publication(
+                completion_reader=self._target_root_completion_reader,
+                graph_verifier=self._target_graph_verifier,
+                target_ref=target_ref,
+                completion_ref=completion_ref,
+                target_commit_ref=terminal.target_commit_ref,
+            )
+            if (
+                reconfirmed.handle != verified.handle
+                or reconfirmed.terminal != verified.terminal
+                or reconfirmed.transition != verified.transition
+                or reconfirmed.completion != verified.completion
+            ):
+                raise OwnerConflict(
+                    "target_root_completion_publication_integrity_invalid"
+                )
+        except OwnerConflict:
+            raise
+        except Exception as error:
+            raise OwnerConflict(
+                "target_root_completion_publication_integrity_invalid"
+            ) from error
+
+    def query_target_frontier_entry(
+        self, target_ref: str
+    ) -> TargetFrontierEntry | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_frontier_entries WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            launch = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_launches WHERE launch_ref = "
+                        ":launch_ref"
+                    ),
+                    {"launch_ref": row.launch_ref},
+                ).first()
+            )
+            dispatch_row = (
+                None
+                if launch is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_dispatch_decisions WHERE "
+                        "decision_ref = :decision_ref"
+                    ),
+                    {"decision_ref": launch.dispatch_decision_ref},
+                ).first()
+            )
+            stage_run = (
+                None
+                if dispatch_row is None
+                else connection.execute(
+                    text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                    {"run_ref": dispatch_row.run_ref},
+                ).first()
+            )
+        if row is None:
+            return None
+        if launch is None or dispatch_row is None or stage_run is None:
+            raise OwnerConflict("target_frontier_integrity_invalid")
+        request = _target_launch_request_from_row(launch)
+        _target_launch_ack(launch, request)
+        dispatch = _bundle_dispatch_decision(dispatch_row)
+        handle = _target_work_handle_from_json(row.current_handle_json)
+        if (
+            canonical_hash(projection_plain_value(handle))
+            != row.current_handle_hash
+            or row.target_ref != handle.target_ref
+            or row.state_revision < 1
+            or row.state not in {"running", "terminal"}
+            or (row.state == "running" and row.terminal_fact_ref is not None)
+            or (row.state == "terminal" and row.terminal_fact_ref is None)
+            or bool(row.currentness_known) is not True
+            or bool(row.current) is not True
+        ):
+            raise OwnerConflict("target_frontier_integrity_invalid")
+        verifier = self._target_graph_verifier
+        if verifier is None:
+            raise OwnerConflict("target_graph_verifier_unavailable")
+        commit_transition = (
+            _query_verified_target_commit_transition(
+                verifier,
+                target_ref=target_ref,
+                handle=handle,
+            )
+            if row.state == "running"
+            else None
+        )
+        verifier.verify_target_candidate_projection_receipt(
+            target_ref=target_ref,
+            binding=request.target_spec_binding,
+            receipt=request.target_spec_acceptance_receipt,
+            # A running frontier is uncommitted except for the exact durable
+            # TargetCommit -> handoff transition.  That narrow transition was
+            # independently re-read above and is bound to this exact handle.
+            require_uncommitted=(
+                row.state == "running" and commit_transition is None
+            ),
+        )
+        _verify_target_launch_stage_current(self, stage_run)
+        if (
+            dispatch.decision_ref != launch.dispatch_decision_ref
+            or dispatch.action != "dispatch"
+            or dispatch.selected_target_ref != target_ref
+            or dispatch.graph_ref != launch.graph_ref
+            or stage_run.request_ref != launch.stage_request_ref
+            or stage_run.current_attempt_ref != dispatch.attempt_ref
+            or stage_run.current_fence_ref != dispatch.fence_ref
+        ):
+            raise OwnerConflict("target_frontier_integrity_invalid")
+        entry = TargetFrontierEntry(
+            target_ref=row.target_ref,
+            target_spec_binding=ContentBindingProof(
+                subject_ref=row.target_ref,
+                content_hash_ref=row.target_spec_content_hash_ref,
+            ),
+            target_spec_acceptance_receipt=ReceiptProof(
+                receipt_ref=row.target_spec_receipt_ref,
+                subject_ref=row.target_spec_receipt_subject_ref,
+                verified=True,
+                currentness_known=True,
+                current=True,
+            ),
+            state_revision=int(row.state_revision),
+            state=row.state,
+            current_handle=handle,
+            terminal_fact_ref=row.terminal_fact_ref,
+            currentness_known=bool(row.currentness_known),
+            current=bool(row.current),
+        )
+        try:
+            validate_target_frontier_entry(
+                entry,
+                target_ref=target_ref,
+                target_spec_binding=request.target_spec_binding,
+                target_spec_acceptance_receipt=(
+                    request.target_spec_acceptance_receipt
+                ),
+                accepted_input_target_commit_refs=(
+                    request.accepted_input_target_commit_refs
+                ),
+                accepted_input_asset_refs=request.accepted_input_asset_refs,
+            )
+        except (BundleProtocolError, TargetRunContractError) as error:
+            raise OwnerConflict("target_frontier_integrity_invalid") from error
+        return entry
 
     def __init__(
         self,
@@ -1298,6 +5277,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         human_response_verifier: HumanResponseVerifier | None = None,
         experiment_binding_verifier: ExperimentInputBindingVerifier | None = None,
         target_graph_verifier: TargetGraphReceiptVerifier | None = None,
+        bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
+        target_run_harness_verifier: TargetRunHarnessVerifier | None = None,
+        bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
+        bundle_report_disposition_verifier: (
+            BundleReportDispositionReceiptVerifier | None
+        ) = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -1306,6 +5291,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self._outcome_verifier = outcome_verifier
         self._formal_plan_verifier = formal_plan_verifier
         self._target_graph_verifier = target_graph_verifier
+        self._bundle_report_evidence_verifier = bundle_report_evidence_verifier
+        self._target_run_harness_verifier = target_run_harness_verifier
+        self._target_root_completion_reader: TargetRootCompletionReader | None = None
+        self._bundle_exhaustion_verifier = bundle_exhaustion_verifier
+        self._bundle_exhaustion_review_trace_verifier: (
+            BundleExhaustionReviewTraceVerifier | None
+        ) = None
+        self._bundle_report_disposition_verifier = (
+            bundle_report_disposition_verifier
+        )
         self._deepfetch_request_verifier = deepfetch_request_verifier
         self._authorization_verifier = human_response_verifier
         self._research_material_resolver: ResearchMaterialResolver | None = None
@@ -1321,8 +5316,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         )
         self._acquisition_private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._receipt_verifier = SQLiteAgentRuntimeReceiptVerifier(
-            database, stage_request_verifier, human_response_verifier
+            database,
+            stage_request_verifier,
+            human_response_verifier,
+            bundle_report_evidence_verifier,
+            bundle_exhaustion_verifier,
+            bundle_report_disposition_verifier,
         )
+        if self._target_run_harness_verifier is not None:
+            self._receipt_verifier.bind_target_run_harness_verifier(
+                self._target_run_harness_verifier
+            )
         self._host_compute_reader = SQLiteHostComputeObservationReader(database)
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._harness_runs = SQLiteAgentRuntimeHarness(database, feed)
@@ -1341,6 +5345,53 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     @property
     def harness_runs(self) -> AgentRuntimeHarnessInterface:
         return self._harness_runs
+
+    def bind_target_run_harness_verifier(
+        self, verifier: TargetRunHarnessVerifier
+    ) -> None:
+        current = self._target_run_harness_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict("target_run_harness_verifier_already_bound")
+        self._target_run_harness_verifier = verifier
+        self._receipt_verifier.bind_target_run_harness_verifier(verifier)
+
+    def bind_target_root_completion_reader(
+        self, reader: TargetRootCompletionReader
+    ) -> None:
+        current = self._target_root_completion_reader
+        if current is not None and current is not reader:
+            raise OwnerConflict("target_root_completion_reader_already_bound")
+        self._target_root_completion_reader = reader
+
+    def bind_bundle_exhaustion_verifier(
+        self, verifier: BundleExhaustionAcceptanceVerifier
+    ) -> None:
+        current = self._bundle_exhaustion_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict("bundle_exhaustion_verifier_already_bound")
+        self._bundle_exhaustion_verifier = verifier
+        self._receipt_verifier.bind_bundle_exhaustion_verifier(verifier)
+
+    def bind_bundle_exhaustion_review_trace_verifier(
+        self, verifier: BundleExhaustionReviewTraceVerifier
+    ) -> None:
+        current = self._bundle_exhaustion_review_trace_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict(
+                "bundle_exhaustion_review_trace_verifier_already_bound"
+            )
+        self._bundle_exhaustion_review_trace_verifier = verifier
+
+    def bind_bundle_report_disposition_verifier(
+        self, verifier: BundleReportDispositionReceiptVerifier
+    ) -> None:
+        current = self._bundle_report_disposition_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict(
+                "bundle_report_disposition_verifier_already_bound"
+            )
+        self._bundle_report_disposition_verifier = verifier
+        self._receipt_verifier.bind_bundle_report_disposition_verifier(verifier)
 
     def bind_research_material_resolver(
         self, resolver: ResearchMaterialResolver
@@ -1399,8 +5450,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         with self._database.write() as connection:
             units = connection.execute(
                 text(
-                    "SELECT * FROM ar_provider_units WHERE status IN ('active', "
-                    "'revocation_pending') ORDER BY started_at, unit_ref"
+                    "SELECT unit.* FROM ar_provider_units AS unit WHERE "
+                    "unit.status IN ('active', 'revocation_pending') AND NOT "
+                    "EXISTS (SELECT 1 FROM ar_experiment_runs AS experiment "
+                    "WHERE experiment.run_ref = unit.run_ref AND "
+                    "(experiment.execution_request_ref LIKE 'bundle-target-%' "
+                    "OR experiment.bundle_target_ref IS NOT NULL)) "
+                    "ORDER BY unit.started_at, unit.unit_ref"
                 )
             ).all()
             recovered = 0
@@ -3293,20 +7349,30 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise OwnerConflict("runtime_provider_unit_invalid")
         now = time.time()
         with self._database.write() as connection:
+            control = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            if control is None:
+                raise OwnerConflict("runtime_provider_unit_stale")
+            # The Owner's run kind is authoritative.  Resolve it before using
+            # any caller label or operation reference so a spoofed unit kind
+            # cannot enter a foreign provider path.
+            if control.run_kind == "experiment":
+                _assert_experiment_run_write_allowed(connection, run_ref)
+            if control.run_kind != _PROVIDER_UNIT_RUN_KINDS[unit_kind]:
+                raise OwnerConflict("runtime_provider_unit_kind_mismatch")
+            if (
+                control.attempt_ref != attempt_ref
+                or control.fence_ref != fence_ref
+            ):
+                raise OwnerConflict("runtime_provider_unit_stale")
             if operation_ref is None:
                 operation_ref = _provider_operation_for_unit(
                     connection, unit_ref=unit_ref, run_ref=run_ref
                 )
             if not operation_ref or len(operation_ref) > 128:
                 raise OwnerConflict("runtime_provider_unit_invalid")
-            control = connection.execute(
-                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
-                {"run_ref": run_ref},
-            ).first()
-            if control is None or (
-                control.attempt_ref != attempt_ref or control.fence_ref != fence_ref
-            ):
-                raise OwnerConflict("runtime_provider_unit_stale")
             if fence_ref is not None:
                 _assert_runtime_control_allows(connection, run_ref, fence_ref)
             existing = connection.execute(
@@ -3433,6 +7499,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         if unit_ref is not None and (not unit_ref or len(unit_ref) > 96):
             raise OwnerConflict("runtime_provider_unit_invalid")
         with self._database.write() as connection:
+            _assert_experiment_run_write_allowed(connection, run_ref)
             unit = connection.execute(
                 text(
                     "SELECT * FROM ar_provider_units WHERE "
@@ -3561,8 +7628,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 text(
                     "SELECT units.* FROM ar_provider_units units JOIN "
                     "ar_run_controls controls ON controls.run_ref = units.run_ref "
+                    "LEFT JOIN ar_experiment_runs experiments ON "
+                    "experiments.run_ref = units.run_ref "
                     "WHERE units.status = 'revocation_pending' AND "
-                    "controls.cleanup_status = 'pending' ORDER "
+                    "controls.cleanup_status = 'pending' AND NOT "
+                    "(units.unit_kind = 'experiment' AND ("
+                    "experiments.execution_request_ref LIKE 'bundle-target-%' "
+                    "OR experiments.bundle_target_ref IS NOT NULL)) "
+                    "ORDER "
                     "BY units.started_at, units.unit_ref"
                 )
             ).all()
@@ -4624,6 +8697,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 }
             )
         if control.run_kind == "experiment":
+            _assert_experiment_run_write_allowed(connection, control.run_ref)
             run = connection.execute(
                 text("SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"),
                 {"run_ref": control.run_ref},
@@ -8212,24 +12286,1380 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             expected_stage="plan",
         )
 
+    def build_bundle_report_candidate(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        disposition: str,
+        formal_plan_content_receipt: AcceptanceReceipt,
+        formal_plan_projection_receipt: AcceptanceReceipt,
+        target_graph_ref: str,
+        target_graph_receipt: AcceptanceReceipt,
+    ) -> BundleReport:
+        verifier = self._bundle_report_evidence_verifier
+        if verifier is None:
+            raise OwnerConflict("bundle_report_evidence_verifier_unavailable")
+        with self._database.read() as connection:
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref
+            )
+            _assert_runtime_control_allows(connection, run_ref, fence_ref)
+            _require_current_fence(run, attempt, fence, "executed", "submitted")
+            if run.stage != "bundle":
+                raise OwnerConflict("bundle_report_run_invalid")
+        _verify_target_launch_stage_current(self, run)
+        material = _prepare_bundle_report_material(
+            self._database,
+            verifier,
+            target_run_verifier=self._target_run_harness_verifier,
+            request_ref=run.request_ref,
+            run_ref=run_ref,
+            disposition=disposition,
+            formal_plan_content_receipt=formal_plan_content_receipt,
+            formal_plan_projection_receipt=formal_plan_projection_receipt,
+            target_graph_ref=target_graph_ref,
+            target_graph_receipt=target_graph_receipt,
+        )
+        return material.report
+
+    def accept_bundle_report(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        report: BundleReport,
+        formal_plan_content_receipt: AcceptanceReceipt,
+        formal_plan_projection_receipt: AcceptanceReceipt,
+        target_graph_ref: str,
+        target_graph_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> VerifiedBundleReportReceipt:
+        _validate_stage_idempotency_key(idempotency_key)
+        verifier = self._bundle_report_evidence_verifier
+        if verifier is None:
+            raise OwnerConflict("bundle_report_evidence_verifier_unavailable")
+        try:
+            report_hash = validate_bundle_report(report)
+        except BundleProtocolError as error:
+            raise OwnerConflict("bundle_report_invalid") from error
+        command_hash = canonical_hash(
+            {
+                "command": "accept_bundle_report",
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+                "report_hash": report_hash,
+                "formal_plan_content_receipt": (
+                    formal_plan_content_receipt.as_public_dict()
+                ),
+                "formal_plan_projection_receipt": (
+                    formal_plan_projection_receipt.as_public_dict()
+                ),
+                "target_graph_ref": target_graph_ref,
+                "target_graph_receipt": target_graph_receipt.as_public_dict(),
+            }
+        )
+        with self._database.read() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_reports WHERE idempotency_key = "
+                    ":idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_reports WHERE run_ref = :run_ref "
+                    "AND report_hash = :report_hash"
+                ),
+                {"run_ref": run_ref, "report_hash": report_hash},
+            ).first()
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref
+            )
+            _assert_runtime_control_allows(connection, run_ref, fence_ref)
+            _require_current_fence(run, attempt, fence, "executed", "submitted")
+            if run.stage != "bundle":
+                raise OwnerConflict("bundle_report_run_invalid")
+        if replay is not None:
+            if replay.request_hash != command_hash:
+                raise OwnerConflict("idempotency_conflict")
+            accepted = self.query_bundle_report(replay.report_ref)
+            if accepted is None:
+                raise OwnerConflict("bundle_report_missing")
+            return accepted
+        if existing is not None:
+            accepted = self.query_bundle_report(existing.report_ref)
+            if accepted is None:
+                raise OwnerConflict("bundle_report_missing")
+            return accepted
+        _verify_target_launch_stage_current(self, run)
+        material = _prepare_bundle_report_material(
+            self._database,
+            verifier,
+            target_run_verifier=self._target_run_harness_verifier,
+            request_ref=run.request_ref,
+            run_ref=run_ref,
+            disposition=report.disposition,
+            formal_plan_content_receipt=formal_plan_content_receipt,
+            formal_plan_projection_receipt=formal_plan_projection_receipt,
+            target_graph_ref=target_graph_ref,
+            target_graph_receipt=target_graph_receipt,
+            expected_report=report,
+        )
+        try:
+            with self._database.write() as connection:
+                replay = connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_reports WHERE idempotency_key = "
+                        ":idempotency_key"
+                    ),
+                    {"idempotency_key": idempotency_key},
+                ).first()
+                if replay is not None:
+                    if replay.request_hash != command_hash:
+                        raise OwnerConflict("idempotency_conflict")
+                    report_ref = replay.report_ref
+                else:
+                    current_run, current_attempt, _session, current_fence = (
+                        _load_stage_fence(
+                            connection, run_ref, attempt_ref, fence_ref
+                        )
+                    )
+                    _assert_runtime_control_allows(connection, run_ref, fence_ref)
+                    _require_current_fence(
+                        current_run,
+                        current_attempt,
+                        current_fence,
+                        "executed",
+                        "submitted",
+                    )
+                    _verify_target_launch_stage_current(self, current_run)
+                    _assert_bundle_report_material_current(
+                        connection,
+                        material,
+                        target_run_verifier=self._target_run_harness_verifier,
+                    )
+                    ordinal_row = connection.execute(
+                        text(
+                            "SELECT COALESCE(MAX(ordinal), 0) AS maximum FROM "
+                            "ar_bundle_reports WHERE run_ref = :run_ref"
+                        ),
+                        {"run_ref": run_ref},
+                    ).first()
+                    ordinal = int(ordinal_row.maximum) + 1
+                    report_ref = new_ref("bundle_report")
+                    receipt_ref = new_ref("ar_bundle_report_receipt")
+                    bindings = _new_bundle_report_bindings(
+                        material,
+                        run=current_run,
+                        report_ref=report_ref,
+                        ordinal=ordinal,
+                        attempt_ref=attempt_ref,
+                        fence_ref=fence_ref,
+                    )
+                    receipt_hash = _owner_receipt_hash(
+                        BUNDLE_REPORT_RECEIPT_KIND, report_ref, bindings
+                    )
+                    connection.execute(
+                        text(_BUNDLE_REPORT_INSERT_SQL),
+                        {
+                            **_bundle_report_material_sql_values(material),
+                            **bindings,
+                            "idempotency_key": idempotency_key,
+                            "request_hash": command_hash,
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "accepted_at": time.time(),
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE agent_runtime_state SET revision = revision + 1, "
+                            "bundle_report_count = bundle_report_count + 1 WHERE "
+                            "singleton = 'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "agent_runtime.bundle_report_accepted",
+                        {
+                            "report_ref": report_ref,
+                            "run_ref": run_ref,
+                            "disposition": report.disposition,
+                            "report_hash": report_hash,
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+        except IntegrityError as error:
+            raise OwnerConflict("bundle_report_conflict") from error
+        accepted = self.query_bundle_report(report_ref)
+        if accepted is None:
+            raise OwnerConflict("bundle_report_missing_after_commit")
+        return accepted
+
+    def query_bundle_report(
+        self, report_ref: str
+    ) -> VerifiedBundleReportReceipt | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_reports WHERE report_ref = :report_ref"
+                ),
+                {"report_ref": report_ref},
+            ).first()
+        if row is None:
+            return None
+        return self._receipt_verifier.verify_bundle_report_receipt(
+            report_ref=report_ref,
+            receipt=AcceptanceReceipt(
+                issuer=AR_OWNER,
+                kind=BUNDLE_REPORT_RECEIPT_KIND,
+                receipt_ref=row.receipt_ref,
+                subject_ref=report_ref,
+                payload_hash=row.receipt_hash,
+            ),
+        )
+
+    def query_bundle_run_report(
+        self, run_ref: str
+    ) -> VerifiedBundleReportReceipt | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT report_ref FROM ar_bundle_reports WHERE run_ref = "
+                    ":run_ref ORDER BY ordinal DESC LIMIT 1"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+        return None if row is None else self.query_bundle_report(row.report_ref)
+
+    def verify_bundle_report_receipt(
+        self, **values
+    ) -> VerifiedBundleReportReceipt:
+        return self._receipt_verifier.verify_bundle_report_receipt(**values)
+
+    def retire_bundle_run_for_replan(
+        self,
+        *,
+        disposition_ref: str,
+        disposition_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> VerifiedBundleReplanRunRetirement:
+        _validate_stage_idempotency_key(idempotency_key)
+        verifier = self._bundle_report_disposition_verifier
+        if verifier is None:
+            raise OwnerConflict("bundle_report_disposition_verifier_unavailable")
+        disposition = verifier.verify_bundle_report_disposition_receipt(
+            disposition_ref=disposition_ref,
+            receipt=disposition_receipt,
+            expected_disposition="replan_required",
+        )
+        if (
+            disposition.status != "pending_run_retirement"
+            or disposition.next_stage != "plan"
+            or disposition.next_epoch != disposition.epoch + 1
+        ):
+            raise OwnerConflict("bundle_replan_disposition_invalid")
+        command_hash = canonical_hash(
+            {
+                "command": "retire_bundle_run_for_replan",
+                "disposition_ref": disposition_ref,
+                "disposition_receipt": disposition_receipt.as_public_dict(),
+                "request_ref": disposition.request_ref,
+                "run_ref": disposition.run_ref,
+                "report_ref": disposition.report_ref,
+            }
+        )
+        with self._database.read() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_replan_retirements WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_replan_retirements WHERE "
+                    "disposition_ref = :disposition_ref"
+                ),
+                {"disposition_ref": disposition_ref},
+            ).first()
+        if replay is not None:
+            if replay.request_hash != command_hash:
+                raise OwnerConflict("idempotency_conflict")
+            return self._receipt_verifier.verify_bundle_replan_run_retirement(
+                retirement_ref=replay.retirement_ref,
+                receipt=AcceptanceReceipt(
+                    issuer=AR_OWNER,
+                    kind=BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+                    receipt_ref=replay.receipt_ref,
+                    subject_ref=replay.run_identity_hash,
+                    payload_hash=replay.receipt_hash,
+                ),
+            )
+        if existing is not None:
+            return self._receipt_verifier.verify_bundle_replan_run_retirement(
+                retirement_ref=existing.retirement_ref,
+                receipt=AcceptanceReceipt(
+                    issuer=AR_OWNER,
+                    kind=BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+                    receipt_ref=existing.receipt_ref,
+                    subject_ref=existing.run_identity_hash,
+                    payload_hash=existing.receipt_hash,
+                ),
+            )
+
+        target = {
+            "quest_ref": disposition.quest_ref,
+            "cycle_ref": disposition.cycle_ref,
+            "question_ref": disposition.question_ref,
+            "epoch": disposition.epoch,
+            "target_scope": "stage",
+        }
+        control_payload = {
+            "action": "cancel",
+            "target": target,
+            "reason": "bundle_replan_run_retirement",
+        }
+        control_operation_ref = (
+            "bundle_replan_control_"
+            + canonical_hash({"disposition_ref": disposition_ref})[:48]
+        )
+        control_receipt = self.query_runtime_control_receipt(control_operation_ref)
+        if control_receipt is None:
+            _preview, revision = self.preview_runtime_control(control_payload)
+            control_receipt = self.apply_runtime_control(
+                operation_ref=control_operation_ref,
+                payload=control_payload,
+                expected_revision=revision,
+                idempotency_key=(
+                    "bundle-replan-control-"
+                    + canonical_hash({"disposition_ref": disposition_ref})[:48]
+                ),
+            )
+        self._receipt_verifier.verify_runtime_control_receipt(
+            operation_ref=control_operation_ref,
+            action="cancel",
+            target=target,
+            receipt=control_receipt,
+        )
+        affected = control_receipt.get("affected_runs")
+        retired_run = (
+            None
+            if not isinstance(affected, list)
+            else next(
+                (
+                    item
+                    for item in affected
+                    if isinstance(item, dict)
+                    and item.get("run_ref") == disposition.run_ref
+                ),
+                None,
+            )
+        )
+        if (
+            not isinstance(retired_run, dict)
+            or retired_run.get("status") != "terminated"
+            or not isinstance(control_receipt.get("receipt_ref"), str)
+            or not isinstance(control_receipt.get("receipt_hash"), str)
+        ):
+            raise OwnerConflict("bundle_replan_run_retirement_invalid")
+        with self._database.read() as connection:
+            run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": disposition.run_ref},
+            ).first()
+            control = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": disposition.run_ref},
+            ).first()
+            fence = (
+                None
+                if run is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_execution_fences WHERE fence_ref = "
+                        ":fence_ref"
+                    ),
+                    {"fence_ref": run.current_fence_ref},
+                ).first()
+            )
+        if (
+            run is None
+            or control is None
+            or fence is None
+            or run.request_ref != disposition.request_ref
+            or run.stage != "bundle"
+            or int(run.epoch) != disposition.epoch
+            or control.status != "terminated"
+            or control.attempt_ref != run.current_attempt_ref
+            or control.fence_ref != run.current_fence_ref
+            or fence.status != "rejected"
+        ):
+            raise OwnerConflict("bundle_replan_run_retirement_invalid")
+        run_identity_hash = canonical_hash(
+            {
+                "run_ref": run.run_ref,
+                "attempt_ref": run.current_attempt_ref,
+                "fence_ref": run.current_fence_ref,
+            }
+        )
+        retirement_ref = new_ref("bundle_replan_retirement")
+        receipt_ref = new_ref("ar_bundle_replan_retirement_receipt")
+        bindings = {
+            "disposition_ref": disposition_ref,
+            "request_ref": disposition.request_ref,
+            "run_ref": run.run_ref,
+            "attempt_ref": run.current_attempt_ref,
+            "fence_ref": run.current_fence_ref,
+            "run_identity_hash": run_identity_hash,
+            "report_ref": disposition.report_ref,
+            "report_hash": disposition.report_hash,
+            "disposition_receipt_ref": disposition_receipt.receipt_ref,
+            "disposition_receipt_hash": disposition_receipt.payload_hash,
+            "control_operation_ref": control_operation_ref,
+            "control_receipt_ref": control_receipt["receipt_ref"],
+            "control_receipt_hash": control_receipt["receipt_hash"],
+        }
+        receipt_hash = _owner_receipt_hash(
+            BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+            run_identity_hash,
+            bindings,
+        )
+        try:
+            with self._database.write() as connection:
+                current = connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_replan_retirements WHERE "
+                        "disposition_ref = :disposition_ref OR idempotency_key = "
+                        ":idempotency_key"
+                    ),
+                    {
+                        "disposition_ref": disposition_ref,
+                        "idempotency_key": idempotency_key,
+                    },
+                ).first()
+                if current is not None:
+                    if current.request_hash != command_hash:
+                        raise OwnerConflict("idempotency_conflict")
+                    retirement_ref = current.retirement_ref
+                else:
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_bundle_replan_retirements "
+                            "(retirement_ref, disposition_ref, request_ref, run_ref, "
+                            "attempt_ref, fence_ref, run_identity_hash, report_ref, "
+                            "report_hash, disposition_receipt_ref, "
+                            "disposition_receipt_hash, control_operation_ref, "
+                            "control_receipt_ref, control_receipt_hash, "
+                            "idempotency_key, request_hash, receipt_ref, "
+                            "receipt_hash, retired_at) VALUES (:retirement_ref, "
+                            ":disposition_ref, :request_ref, :run_ref, :attempt_ref, "
+                            ":fence_ref, :run_identity_hash, :report_ref, "
+                            ":report_hash, :disposition_receipt_ref, "
+                            ":disposition_receipt_hash, :control_operation_ref, "
+                            ":control_receipt_ref, :control_receipt_hash, "
+                            ":idempotency_key, :request_hash, :receipt_ref, "
+                            ":receipt_hash, :retired_at)"
+                        ),
+                        {
+                            **bindings,
+                            "retirement_ref": retirement_ref,
+                            "idempotency_key": idempotency_key,
+                            "request_hash": command_hash,
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "retired_at": time.time(),
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE agent_runtime_state SET revision = revision + "
+                            "1, bundle_replan_retirement_count = "
+                            "bundle_replan_retirement_count + 1 WHERE singleton = "
+                            "'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "agent_runtime.bundle_replan_run_retired",
+                        {
+                            "retirement_ref": retirement_ref,
+                            "disposition_ref": disposition_ref,
+                            "run_ref": run.run_ref,
+                            "attempt_ref": run.current_attempt_ref,
+                            "fence_ref": run.current_fence_ref,
+                            "run_identity_hash": run_identity_hash,
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+        except IntegrityError as error:
+            raise OwnerConflict("bundle_replan_run_retirement_conflict") from error
+        retired = self.query_bundle_replan_run_retirement(disposition_ref)
+        if retired is None:
+            raise OwnerConflict("bundle_replan_run_retirement_missing_after_commit")
+        return retired
+
+    def query_bundle_replan_run_retirement(
+        self, disposition_ref: str
+    ) -> VerifiedBundleReplanRunRetirement | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_replan_retirements WHERE "
+                    "disposition_ref = :disposition_ref"
+                ),
+                {"disposition_ref": disposition_ref},
+            ).first()
+        if row is None:
+            return None
+        return self._receipt_verifier.verify_bundle_replan_run_retirement(
+            retirement_ref=row.retirement_ref,
+            receipt=AcceptanceReceipt(
+                issuer=AR_OWNER,
+                kind=BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+                receipt_ref=row.receipt_ref,
+                subject_ref=row.run_identity_hash,
+                payload_hash=row.receipt_hash,
+            ),
+        )
+
+    def verify_bundle_replan_run_retirement(
+        self,
+        *,
+        retirement_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> VerifiedBundleReplanRunRetirement:
+        return self._receipt_verifier.verify_bundle_replan_run_retirement(
+            retirement_ref=retirement_ref,
+            receipt=receipt,
+        )
+
+    def query_bundle_exhaustion_assessment_receipt(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+    ) -> AcceptanceReceipt:
+        """Project an issuer-backed receipt for the persisted primary turn."""
+
+        with self._database.read() as connection:
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref
+            )
+            _assert_runtime_control_allows(connection, run_ref, fence_ref)
+            _require_current_fence(run, attempt, fence, "running", "current")
+            primary, review = _provider_invocations(
+                connection, run, attempt, fence
+            )
+            draft = _primary_draft(run, attempt, session)
+        if (
+            run.stage != "bundle"
+            or draft is None
+            or primary.status != "completed"
+            or primary.response_hash is None
+            or review.status != "prepared"
+            or attempt.submission_ref is not None
+            or attempt.execution_receipt_ref is not None
+        ):
+            raise OwnerConflict("bundle_exhaustion_assessment_receipt_invalid")
+        return _bundle_exhaustion_assessment_receipt(
+            run, attempt, session, primary, draft
+        )
+
+    def query_bundle_exhaustion_rejected_submissions(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+    ) -> tuple[BundleExhaustionRejectedSubmission, ...]:
+        """Enumerate the exact AR/RG-verified predecessor rejection ledger."""
+
+        with self._database.read() as connection:
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref
+            )
+            _assert_runtime_control_allows(connection, run_ref, fence_ref)
+            _require_current_fence(run, attempt, fence, "running", "current")
+            if run.stage != "bundle":
+                raise OwnerConflict("bundle_exhaustion_history_invalid")
+            return self._bundle_exhaustion_history(
+                connection,
+                run,
+                attempt,
+                session,
+            )
+
+    def accept_bundle_exhaustion_evidence(
+        self,
+        *,
+        evidence: BundleExhaustionEvidence,
+        idempotency_key: str,
+    ) -> VerifiedBundleExhaustionEvidence:
+        """Freeze one independently reviewed exact exploration inventory.
+
+        AR proves provider-turn provenance, current Fence, exact content, and
+        per-record immutability.  AE remains the sole semantic exhaustion
+        decision maker.
+        """
+
+        _validate_stage_idempotency_key(idempotency_key)
+        if type(evidence) is not BundleExhaustionEvidence:
+            raise OwnerConflict("bundle_exhaustion_evidence_invalid")
+        verified_request = self._verified_bundle_exhaustion_request(evidence)
+        accepted_plan = verified_request.accepted_formal_plan
+        if accepted_plan is None:
+            raise OwnerConflict("bundle_exhaustion_formal_plan_binding_invalid")
+        try:
+            revalidated_contract = bundle_exhaustion_evidence_from_dict(
+                evidence.as_dict(),
+                plan_document=accepted_plan.plan_document,
+            )
+        except OwnerConflict:
+            raise
+        if revalidated_contract != evidence:
+            raise OwnerConflict("bundle_exhaustion_evidence_invalid")
+        trace_verifier = self._bundle_exhaustion_review_trace_verifier
+        current_run = self.query_bundle_stage_run(
+            evidence.stage_run_request_ref
+        )
+        if trace_verifier is None or current_run is None or (
+            current_run.run_ref != evidence.run_ref
+            or current_run.attempt_ref != evidence.attempt_ref
+            or current_run.fence_ref != evidence.execution_fence_ref
+        ):
+            raise OwnerConflict(
+                "bundle_exhaustion_review_trace_verifier_unavailable"
+            )
+        trace_verifier.verify_bundle_exhaustion_review_trace(
+            evidence.review_trace,
+            runtime_binding_hash=current_run.runtime_binding_hash,
+        )
+        evidence_hash = evidence.evidence_hash
+        review_response_hash = bundle_exhaustion_review_response_hash(evidence)
+        completion_hash = completion_contract_hash(evidence.completion_contract)
+        request_hash = canonical_hash(
+            {
+                "command": "accept_bundle_exhaustion_evidence",
+                "evidence_identity": evidence.evidence_identity,
+                "evidence_hash": evidence_hash,
+            }
+        )
+        evidence_json = canonical_json(evidence.as_dict())
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_exhaustion_evidence WHERE "
+                    "evidence_identity = :evidence_identity OR idempotency_key = "
+                    ":idempotency_key"
+                ),
+                {
+                    "evidence_identity": evidence.evidence_identity,
+                    "idempotency_key": idempotency_key,
+                },
+            ).first()
+            if replay is not None:
+                if (
+                    replay.evidence_identity != evidence.evidence_identity
+                    or replay.evidence_hash != evidence_hash
+                    or replay.request_hash != request_hash
+                ):
+                    raise OwnerConflict("bundle_exhaustion_evidence_conflict")
+                evidence_ref = replay.evidence_ref
+            else:
+                run, attempt, session, fence = _load_stage_fence(
+                    connection,
+                    evidence.run_ref,
+                    evidence.attempt_ref,
+                    evidence.execution_fence_ref,
+                )
+                _assert_runtime_control_allows(
+                    connection, evidence.run_ref, evidence.execution_fence_ref
+                )
+                _require_current_fence(run, attempt, fence, "running", "current")
+                primary, review = _provider_invocations(
+                    connection, run, attempt, fence
+                )
+                primary_draft = _primary_draft(run, attempt, session)
+                if (
+                    run.stage != "bundle"
+                    or run.request_ref != evidence.stage_run_request_ref
+                    or run.context_pack_ref != evidence.context_pack_ref
+                    or run.context_pack_hash != evidence.context_pack_hash
+                    or run.root_session_ref != evidence.root_session_ref
+                    or attempt.execution_receipt_ref is not None
+                    or attempt.submission_ref is not None
+                    or session.native_session_ref != evidence.native_session_ref
+                    or primary.invocation_ref != evidence.primary_invocation_ref
+                    or primary.run_ref != evidence.run_ref
+                    or primary.attempt_ref != evidence.attempt_ref
+                    or primary.fence_ref != evidence.execution_fence_ref
+                    or primary.phase != "primary"
+                    or primary.status != "completed"
+                    or primary.response_hash != evidence.primary_response_hash
+                    or primary_draft is None
+                    or primary_draft.draft_hash
+                    != evidence.primary_assessment_hash
+                    or review.invocation_ref != evidence.review_invocation_ref
+                    or review.run_ref != evidence.run_ref
+                    or review.attempt_ref != evidence.attempt_ref
+                    or review.fence_ref != evidence.execution_fence_ref
+                    or review.phase != "review"
+                    or review.status not in {"prepared", "completed"}
+                    or (
+                        review.status == "completed"
+                        and review.response_hash != review_response_hash
+                    )
+                    or run.runtime_binding_hash
+                    != current_run.runtime_binding_hash
+                ):
+                    raise OwnerConflict("bundle_exhaustion_provider_proof_invalid")
+                assessment_receipt = _bundle_exhaustion_assessment_receipt(
+                    run,
+                    attempt,
+                    session,
+                    primary,
+                    primary_draft,
+                )
+                if any(
+                    record.assessment_content_hash
+                    != primary_draft.draft_hash
+                    or record.assessment_receipt != assessment_receipt
+                    for record in evidence.exploration_records
+                ):
+                    raise OwnerConflict(
+                        "bundle_exhaustion_assessment_receipt_invalid"
+                    )
+                verify_bundle_exhaustion_assessment_envelope(
+                    primary_draft.draft,
+                    evidence=evidence,
+                )
+                self._assert_bundle_exhaustion_history(
+                    connection,
+                    run,
+                    attempt,
+                    session,
+                    evidence.rejected_submissions,
+                )
+                if review.status == "prepared":
+                    updated = connection.execute(
+                        text(
+                            "UPDATE ar_stage_provider_invocations SET status = "
+                            "'completed', response_hash = :response_hash, "
+                            "completed_at = :completed_at WHERE invocation_ref = "
+                            ":invocation_ref AND status = 'prepared'"
+                        ),
+                        {
+                            "response_hash": review_response_hash,
+                            "completed_at": time.time(),
+                            "invocation_ref": evidence.review_invocation_ref,
+                        },
+                    )
+                    if updated.rowcount != 1:
+                        raise OwnerConflict(
+                            "bundle_exhaustion_provider_proof_invalid"
+                        )
+                evidence_ref = new_ref("bundle_exhaustion_evidence")
+                receipt_ref = new_ref("ar_bundle_exhaustion_evidence_receipt")
+                bindings = _bundle_exhaustion_evidence_bindings(
+                    evidence,
+                    evidence_ref=evidence_ref,
+                    evidence_hash=evidence_hash,
+                    review_response_hash=review_response_hash,
+                    completion_contract_hash=completion_hash,
+                )
+                receipt_hash = _owner_receipt_hash(
+                    BUNDLE_EXHAUSTION_EVIDENCE_RECEIPT_KIND,
+                    evidence_ref,
+                    bindings,
+                )
+                now = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_bundle_exhaustion_evidence "
+                        "(evidence_ref, evidence_identity, request_ref, "
+                        "request_receipt_ref, request_receipt_hash, cycle_ref, "
+                        "epoch, run_ref, attempt_ref, root_session_ref, fence_ref, "
+                        "context_pack_ref, context_pack_hash, formal_plan_ref, "
+                        "formal_plan_content_hash, native_session_ref, "
+                        "primary_invocation_ref, primary_response_hash, "
+                        "primary_assessment_hash, review_invocation_ref, "
+                        "review_response_hash, "
+                        "reviewer_agent_ref, completion_contract_hash, "
+                        "evidence_json, evidence_hash, idempotency_key, "
+                        "request_hash, receipt_ref, receipt_hash, accepted_at) "
+                        "VALUES (:evidence_ref, :evidence_identity, :request_ref, "
+                        ":request_receipt_ref, :request_receipt_hash, :cycle_ref, "
+                        ":epoch, :run_ref, :attempt_ref, :root_session_ref, "
+                        ":fence_ref, :context_pack_ref, :context_pack_hash, "
+                        ":formal_plan_ref, :formal_plan_content_hash, "
+                        ":native_session_ref, :primary_invocation_ref, "
+                        ":primary_response_hash, :primary_assessment_hash, "
+                        ":review_invocation_ref, "
+                        ":review_response_hash, :reviewer_agent_ref, "
+                        ":completion_contract_hash, :evidence_json, "
+                        ":evidence_hash, :idempotency_key, :request_hash, "
+                        ":receipt_ref, :receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "evidence_json": evidence_json,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": now,
+                    },
+                )
+                for ordinal, record in enumerate(
+                    evidence.exploration_records, start=1
+                ):
+                    record_hash = record.record_hash
+                    record_receipt_ref = new_ref(
+                        "ar_bundle_exhaustion_record_receipt"
+                    )
+                    record_bindings = {
+                        "evidence_ref": evidence_ref,
+                        "evidence_hash": evidence_hash,
+                        "ordinal": ordinal,
+                        "record_hash": record_hash,
+                    }
+                    record_receipt_hash = _owner_receipt_hash(
+                        BUNDLE_EXHAUSTION_RECORD_RECEIPT_KIND,
+                        record.record_ref,
+                        record_bindings,
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_bundle_exhaustion_evidence_records "
+                            "(evidence_ref, ordinal, record_ref, record_json, "
+                            "record_hash, receipt_ref, receipt_hash) VALUES "
+                            "(:evidence_ref, :ordinal, :record_ref, "
+                            ":record_json, :record_hash, :receipt_ref, "
+                            ":receipt_hash)"
+                        ),
+                        {
+                            **record_bindings,
+                            "record_ref": record.record_ref,
+                            "record_json": canonical_json(record.as_dict()),
+                            "receipt_ref": record_receipt_ref,
+                            "receipt_hash": record_receipt_hash,
+                        },
+                    )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1, "
+                        "bundle_exhaustion_evidence_count = "
+                        "bundle_exhaustion_evidence_count + 1 WHERE singleton = "
+                        "'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.bundle_exhaustion_evidence_accepted",
+                    {
+                        "evidence_ref": evidence_ref,
+                        "evidence_identity": evidence.evidence_identity,
+                        "evidence_hash": evidence_hash,
+                        "run_ref": evidence.run_ref,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+        accepted = self.query_bundle_exhaustion_evidence(evidence_ref)
+        if accepted is None:
+            raise OwnerConflict("bundle_exhaustion_evidence_missing_after_commit")
+        return accepted
+
+    def reconcile_bundle_exhaustion_evidence(
+        self,
+        *,
+        evidence_identity: str,
+        expected_evidence_hash: str,
+    ) -> VerifiedBundleExhaustionEvidence | None:
+        if not evidence_identity or len(evidence_identity) > 128:
+            raise OwnerConflict("bundle_exhaustion_evidence_identity_invalid")
+        if len(expected_evidence_hash) != 64:
+            raise OwnerConflict("bundle_exhaustion_evidence_hash_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT evidence_ref, evidence_hash FROM "
+                    "ar_bundle_exhaustion_evidence WHERE evidence_identity = "
+                    ":evidence_identity"
+                ),
+                {"evidence_identity": evidence_identity},
+            ).first()
+        if row is None:
+            return None
+        if row.evidence_hash != expected_evidence_hash:
+            raise OwnerConflict("bundle_exhaustion_evidence_conflict")
+        return self.query_bundle_exhaustion_evidence(row.evidence_ref)
+
+    def query_bundle_exhaustion_evidence(
+        self, evidence_ref: str
+    ) -> VerifiedBundleExhaustionEvidence | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_exhaustion_evidence WHERE "
+                    "evidence_ref = :evidence_ref"
+                ),
+                {"evidence_ref": evidence_ref},
+            ).first()
+        if row is None:
+            return None
+        return self._verified_bundle_exhaustion_evidence_row(row)
+
+    def query_bundle_exhaustion_evidence_for_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+    ) -> VerifiedBundleExhaustionEvidence | None:
+        if not run_ref or not attempt_ref:
+            raise OwnerConflict("bundle_exhaustion_run_ref_invalid")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT evidence_ref FROM ar_bundle_exhaustion_evidence "
+                    "WHERE run_ref = :run_ref AND attempt_ref = :attempt_ref "
+                    "ORDER BY accepted_at DESC, evidence_ref DESC LIMIT 2"
+                ),
+                {"run_ref": run_ref, "attempt_ref": attempt_ref},
+            ).all()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise OwnerConflict("bundle_exhaustion_evidence_conflict")
+        return self.query_bundle_exhaustion_evidence(rows[0].evidence_ref)
+
+    def verify_bundle_exhaustion_evidence_receipt(
+        self,
+        *,
+        evidence_ref: str,
+        evidence_hash: str,
+        receipt: AcceptanceReceipt,
+        phase: str = "submission",
+    ) -> VerifiedBundleExhaustionEvidence:
+        if (
+            receipt.issuer != AR_OWNER
+            or receipt.kind != BUNDLE_EXHAUSTION_EVIDENCE_RECEIPT_KIND
+            or receipt.subject_ref != evidence_ref
+        ):
+            raise OwnerConflict("bundle_exhaustion_evidence_receipt_issuer_invalid")
+        if phase not in {"submission", "completion", "commit"}:
+            raise OwnerConflict("bundle_exhaustion_verification_phase_invalid")
+        accepted = self.query_bundle_exhaustion_evidence(evidence_ref)
+        if (
+            accepted is None
+            or accepted.evidence.evidence_hash != evidence_hash
+            or accepted.receipt != receipt
+        ):
+            raise OwnerConflict("bundle_exhaustion_evidence_receipt_invalid")
+        evidence = accepted.evidence
+        with self._database.read() as connection:
+            run, attempt, session, fence = _load_stage_fence(
+                connection,
+                evidence.run_ref,
+                evidence.attempt_ref,
+                evidence.execution_fence_ref,
+            )
+            primary, review = _provider_invocations(
+                connection, run, attempt, fence
+            )
+            primary_draft = _primary_draft(run, attempt, session)
+            if phase == "commit":
+                if (
+                    run.status != "completed"
+                    or attempt.status != "completed"
+                    or fence.status != "completed"
+                ):
+                    raise OwnerConflict("bundle_exhaustion_evidence_stale")
+            else:
+                _assert_runtime_control_allows(
+                    connection, evidence.run_ref, evidence.execution_fence_ref
+                )
+                _require_current_fence(run, attempt, fence, "running", "current")
+            if (
+                run.stage != "bundle"
+                or run.request_ref != evidence.stage_run_request_ref
+                or attempt.execution_receipt_ref is not None
+                or attempt.submission_ref is not None
+                or primary_draft is None
+                or primary_draft.draft_hash
+                != evidence.primary_assessment_hash
+                or primary.invocation_ref != evidence.primary_invocation_ref
+                or primary.response_hash != evidence.primary_response_hash
+                or review.invocation_ref != evidence.review_invocation_ref
+                or review.status != "completed"
+                or review.response_hash
+                != bundle_exhaustion_review_response_hash(evidence)
+            ):
+                raise OwnerConflict("bundle_exhaustion_evidence_stale")
+            assessment_receipt = _bundle_exhaustion_assessment_receipt(
+                run, attempt, session, primary, primary_draft
+            )
+            if any(
+                record.assessment_content_hash != primary_draft.draft_hash
+                or record.assessment_receipt != assessment_receipt
+                for record in evidence.exploration_records
+            ):
+                raise OwnerConflict("bundle_exhaustion_evidence_stale")
+            verify_bundle_exhaustion_assessment_envelope(
+                primary_draft.draft,
+                evidence=evidence,
+            )
+            self._assert_bundle_exhaustion_history(
+                connection,
+                run,
+                attempt,
+                session,
+                evidence.rejected_submissions,
+            )
+            runtime_binding_hash = run.runtime_binding_hash
+        trace_verifier = self._bundle_exhaustion_review_trace_verifier
+        if trace_verifier is None:
+            raise OwnerConflict(
+                "bundle_exhaustion_review_trace_verifier_unavailable"
+            )
+        trace_verifier.verify_bundle_exhaustion_review_trace(
+            evidence.review_trace,
+            runtime_binding_hash=runtime_binding_hash,
+        )
+        return accepted
+
+    def _verified_bundle_exhaustion_request(self, evidence):
+        verifier = self._stage_request_verifier
+        if verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        requested = verifier.query_verified_bundle_stage_request(
+            request_ref=evidence.stage_run_request_ref,
+            context_pack_ref=evidence.context_pack_ref,
+        )
+        accepted = requested.accepted_formal_plan
+        if accepted is None or (
+            requested.receipt.receipt_ref
+            != evidence.stage_run_request_receipt_ref
+            or requested.receipt.payload_hash
+            != evidence.stage_run_request_receipt_hash
+            or requested.cycle_ref != evidence.cycle_ref
+            or requested.epoch != evidence.epoch
+            or requested.context_pack_hash != evidence.context_pack_hash
+            or accepted.formal_plan_ref != evidence.formal_plan_ref
+            or accepted.plan_document_hash != evidence.formal_plan_content_hash
+        ):
+            raise OwnerConflict("bundle_exhaustion_invocation_binding_stale")
+        return requested
+
+    def _assert_bundle_exhaustion_history(
+        self,
+        connection,
+        run,
+        attempt,
+        session,
+        rejected_submissions,
+    ) -> None:
+        """Rebuild every predecessor fact; never accept caller-supplied refs."""
+
+        expected = self._bundle_exhaustion_history(
+            connection,
+            run,
+            attempt,
+            session,
+        )
+        if rejected_submissions != expected:
+            raise OwnerConflict("bundle_exhaustion_history_invalid")
+
+    def _bundle_exhaustion_history(
+        self,
+        connection,
+        run,
+        attempt,
+        session,
+    ) -> tuple[BundleExhaustionRejectedSubmission, ...]:
+        """Return every terminal domain rejection after issuer verification."""
+
+        facts: list[BundleExhaustionRejectedSubmission] = []
+        successor_ref = attempt.attempt_ref
+        predecessor_ref = attempt.predecessor_attempt_ref
+        visited: set[str] = set()
+        while predecessor_ref is not None:
+            if predecessor_ref in visited:
+                raise OwnerConflict("bundle_exhaustion_history_invalid")
+            visited.add(predecessor_ref)
+            predecessor = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
+                    ":attempt_ref AND run_ref = :run_ref"
+                ),
+                {"attempt_ref": predecessor_ref, "run_ref": run.run_ref},
+            ).first()
+            if predecessor is None:
+                raise OwnerConflict("bundle_exhaustion_history_invalid")
+            technical = connection.execute(
+                text(
+                    "SELECT retired_attempt_ref FROM "
+                    "ar_stage_attempt_replacements WHERE "
+                    "replacement_attempt_ref = :successor_ref AND run_ref = "
+                    ":run_ref"
+                ),
+                {"successor_ref": successor_ref, "run_ref": run.run_ref},
+            ).first()
+            if technical is not None:
+                if technical.retired_attempt_ref != predecessor.attempt_ref:
+                    raise OwnerConflict("bundle_exhaustion_history_invalid")
+            else:
+                if (
+                    predecessor.status != "rejected"
+                    or predecessor.submission_ref is None
+                    or predecessor.material_outcome_hash is None
+                    or predecessor.execution_receipt_ref is None
+                    or predecessor.execution_receipt_hash is None
+                    or predecessor.decision_receipt_ref is None
+                    or predecessor.decision_receipt_subject_ref is None
+                    or predecessor.decision_receipt_hash is None
+                ):
+                    raise OwnerConflict("bundle_exhaustion_outcome_unknown")
+                execution = _attempt_execution(run, predecessor, session)
+                self._receipt_verifier.verify_attempt_execution_receipt(
+                    request_ref=run.request_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=predecessor.attempt_ref,
+                    fence_ref=predecessor.fence_ref,
+                    submission_ref=predecessor.submission_ref,
+                    payload_hash=predecessor.payload_hash,
+                    receipt=execution.receipt,
+                )
+                rejection_receipt = AcceptanceReceipt(
+                    issuer="research_graph",
+                    kind="target_graph_rejected",
+                    receipt_ref=predecessor.decision_receipt_ref,
+                    subject_ref=predecessor.decision_receipt_subject_ref,
+                    payload_hash=predecessor.decision_receipt_hash,
+                )
+                verify_rejection = getattr(
+                    self._target_graph_verifier,
+                    "verify_target_graph_rejection_receipt",
+                    None,
+                )
+                if not callable(verify_rejection):
+                    raise OwnerConflict(
+                        "bundle_exhaustion_rejection_verifier_unavailable"
+                    )
+                verify_rejection(
+                    request_ref=run.request_ref,
+                    submission_ref=predecessor.submission_ref,
+                    receipt=rejection_receipt,
+                )
+                facts.append(
+                    BundleExhaustionRejectedSubmission(
+                        attempt_ref=predecessor.attempt_ref,
+                        submission_ref=predecessor.submission_ref,
+                        submission_content_hash=(
+                            predecessor.material_outcome_hash
+                        ),
+                        execution_receipt=execution.receipt,
+                        rejection_receipt=rejection_receipt,
+                    )
+                )
+            successor_ref = predecessor.attempt_ref
+            predecessor_ref = predecessor.predecessor_attempt_ref
+        return tuple(sorted(facts, key=lambda item: item.submission_ref))
+
+    def _verified_bundle_exhaustion_evidence_row(
+        self, row
+    ) -> VerifiedBundleExhaustionEvidence:
+        verifier = self._stage_request_verifier
+        if verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        requested = verifier.query_verified_bundle_stage_request(
+            request_ref=row.request_ref,
+            context_pack_ref=row.context_pack_ref,
+        )
+        accepted_plan = requested.accepted_formal_plan
+        if accepted_plan is None:
+            raise OwnerConflict("bundle_exhaustion_evidence_integrity_invalid")
+        try:
+            evidence = bundle_exhaustion_evidence_from_dict(
+                decoded_object(row.evidence_json),
+                plan_document=accepted_plan.plan_document,
+            )
+        except (OwnerConflict, TypeError, ValueError) as error:
+            raise OwnerConflict(
+                "bundle_exhaustion_evidence_integrity_invalid"
+            ) from error
+        bindings = _bundle_exhaustion_evidence_bindings(
+            evidence,
+            evidence_ref=row.evidence_ref,
+            evidence_hash=row.evidence_hash,
+            review_response_hash=row.review_response_hash,
+            completion_contract_hash=row.completion_contract_hash,
+        )
+        receipt = AcceptanceReceipt(
+            issuer=AR_OWNER,
+            kind=BUNDLE_EXHAUSTION_EVIDENCE_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.evidence_ref,
+            payload_hash=row.receipt_hash,
+        )
+        with self._database.read() as connection:
+            record_rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_exhaustion_evidence_records WHERE "
+                    "evidence_ref = :evidence_ref ORDER BY ordinal"
+                ),
+                {"evidence_ref": row.evidence_ref},
+            ).all()
+        if (
+            canonical_json(evidence.as_dict()) != row.evidence_json
+            or evidence.evidence_hash != row.evidence_hash
+            or bundle_exhaustion_review_response_hash(evidence)
+            != row.review_response_hash
+            or completion_contract_hash(evidence.completion_contract)
+            != row.completion_contract_hash
+            or any(getattr(row, name) != value for name, value in bindings.items())
+            or row.receipt_hash
+            != _owner_receipt_hash(
+                BUNDLE_EXHAUSTION_EVIDENCE_RECEIPT_KIND,
+                row.evidence_ref,
+                bindings,
+            )
+            or len(record_rows) != len(evidence.exploration_records)
+        ):
+            raise OwnerConflict("bundle_exhaustion_evidence_integrity_invalid")
+        record_receipts: list[AcceptanceReceipt] = []
+        for ordinal, (record, record_row) in enumerate(
+            zip(evidence.exploration_records, record_rows, strict=True), start=1
+        ):
+            record_bindings = {
+                "evidence_ref": row.evidence_ref,
+                "evidence_hash": row.evidence_hash,
+                "ordinal": ordinal,
+                "record_hash": record.record_hash,
+            }
+            if (
+                int(record_row.ordinal) != ordinal
+                or record_row.record_ref != record.record_ref
+                or record_row.record_json != canonical_json(record.as_dict())
+                or record_row.record_hash != record.record_hash
+                or record_row.receipt_hash
+                != _owner_receipt_hash(
+                    BUNDLE_EXHAUSTION_RECORD_RECEIPT_KIND,
+                    record.record_ref,
+                    record_bindings,
+                )
+            ):
+                raise OwnerConflict(
+                    "bundle_exhaustion_evidence_record_integrity_invalid"
+                )
+            record_receipts.append(
+                AcceptanceReceipt(
+                    issuer=AR_OWNER,
+                    kind=BUNDLE_EXHAUSTION_RECORD_RECEIPT_KIND,
+                    receipt_ref=record_row.receipt_ref,
+                    subject_ref=record.record_ref,
+                    payload_hash=record_row.receipt_hash,
+                )
+            )
+        return VerifiedBundleExhaustionEvidence(
+            evidence_ref=row.evidence_ref,
+            evidence=evidence,
+            record_receipts=tuple(record_receipts),
+            receipt=receipt,
+        )
+
     def complete_bundle_run(
         self,
         *,
         run_ref: str,
         attempt_ref: str,
         fence_ref: str,
-        target_graph_ref: str,
+        report_ref: str | None = None,
         decision_receipt: AcceptanceReceipt,
         idempotency_key: str,
+        target_graph_ref: str | None = None,
     ) -> RunCompletion:
+        if target_graph_ref is not None or report_ref is None:
+            raise OwnerConflict("bundle_report_required")
+        accepted = self._receipt_verifier.verify_bundle_report_receipt(
+            report_ref=report_ref,
+            receipt=decision_receipt,
+            expected_disposition="realized",
+        )
+        if (
+            accepted.run_ref != run_ref
+            or accepted.attempt_ref != attempt_ref
+            or accepted.fence_ref != fence_ref
+        ):
+            raise OwnerConflict("bundle_report_run_binding_invalid")
         return self._complete_stage_run(
             run_ref=run_ref,
             attempt_ref=attempt_ref,
             fence_ref=fence_ref,
-            outcome_ref=target_graph_ref,
+            outcome_ref=report_ref,
             decision_receipt=decision_receipt,
             idempotency_key=idempotency_key,
             expected_stage="bundle",
+        )
+
+    def complete_bundle_exhaustion_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        proposal_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> RunCompletion:
+        verifier = self._bundle_exhaustion_verifier
+        if verifier is None:
+            raise OwnerConflict("bundle_exhaustion_verifier_unavailable")
+        proposal = verifier.verify_bundle_exhaustion_proposal_acceptance(
+            proposal_ref=proposal_ref,
+            receipt=decision_receipt,
+            require_current=True,
+            phase="completion",
+        )
+        if type(proposal) is not BundleExhaustionProposal:
+            raise OwnerConflict("bundle_exhaustion_acceptance_invalid")
+        with self._database.read() as connection:
+            run, attempt, session, fence = _load_stage_fence(
+                connection, run_ref, attempt_ref, fence_ref
+            )
+            _assert_runtime_control_allows(connection, run_ref, fence_ref)
+            _require_current_fence(run, attempt, fence, "running", "current")
+            if (
+                run.stage != "bundle"
+                or attempt.submission_ref is not None
+                or attempt.execution_receipt_ref is not None
+                or proposal.stage_run_request_ref != run.request_ref
+                or proposal.run_ref != run_ref
+                or proposal.attempt_ref != attempt_ref
+                or proposal.root_session_ref != session.session_ref
+                or proposal.execution_fence_ref != fence_ref
+                or proposal.context_pack_ref != run.context_pack_ref
+                or proposal.context_pack_hash != run.context_pack_hash
+            ):
+                raise OwnerConflict("bundle_exhaustion_run_binding_invalid")
+        return self._complete_stage_run(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            outcome_ref=proposal_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="bundle",
+            command_kind_override="complete_bundle_exhaustion_run",
+            required_attempt_status="running",
+            required_fence_status="current",
         )
 
     def admit_bundle_stage(
@@ -8557,6 +13987,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 "now": now,
             },
         )
+        if expected_stage == "bundle":
+            connection.execute(
+                text(
+                    "INSERT INTO ar_bundle_inbox_scopes (run_ref, next_sequence, "
+                    "generation, wake_pending, acknowledged_cursor, "
+                    "current_checkpoint_ref, updated_at) VALUES (:run_ref, 1, 0, "
+                    "0, 0, NULL, :updated_at)"
+                ),
+                {"run_ref": run_ref, "updated_at": now},
+            )
         connection.execute(
             text(
                 "INSERT INTO ar_stage_sessions (session_ref, run_ref, "
@@ -8670,6 +14110,55 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     def query_bundle_stage_run(self, request_ref: str) -> BundleStageRun | None:
         return self._query_stage_run(request_ref, "bundle")
 
+    def verify_bundle_runtime_scope(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> None:
+        """Verify an exact current Bundle Run scope before MCP credential issue."""
+
+        if not _is_sha256(runtime_binding_hash):
+            raise OwnerConflict("bundle_runtime_scope_invalid")
+        with self._database.read() as connection:
+            run, attempt, session, fence = _load_stage_fence(
+                connection,
+                run_ref,
+                attempt_ref,
+                fence_ref,
+            )
+            status_pair = (attempt.status, fence.status)
+            if status_pair == ("running", "current"):
+                _require_current_fence(
+                    run,
+                    attempt,
+                    fence,
+                    "running",
+                    "current",
+                )
+            elif status_pair == ("submitted", "submitted"):
+                _require_current_fence(
+                    run,
+                    attempt,
+                    fence,
+                    "submitted",
+                    "submitted",
+                )
+            else:
+                raise OwnerConflict("bundle_runtime_scope_stale")
+            if (
+                run.stage != "bundle"
+                or run.root_session_ref != root_session_ref
+                or attempt.root_session_ref != root_session_ref
+                or session.session_ref != root_session_ref
+                or session.status != "active"
+                or run.runtime_binding_hash != runtime_binding_hash
+            ):
+                raise OwnerConflict("bundle_runtime_scope_invalid")
+
     def _query_stage_run(
         self, request_ref: str, expected_stage: str
     ) -> IdeaStageRun | None:
@@ -8762,6 +14251,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             primary_invocation, review_invocation = _provider_invocations(
                 connection, run, attempt, fence
             )
+            exhaustion_review = (
+                connection.execute(
+                    text(
+                        "SELECT review_invocation_ref, review_response_hash, "
+                        "primary_assessment_hash FROM "
+                        "ar_bundle_exhaustion_evidence WHERE run_ref = :run_ref "
+                        "AND attempt_ref = :attempt_ref AND fence_ref = :fence_ref"
+                    ),
+                    {
+                        "run_ref": run.run_ref,
+                        "attempt_ref": attempt.attempt_ref,
+                        "fence_ref": fence.fence_ref,
+                    },
+                ).first()
+                if expected_stage == "bundle"
+                else None
+            )
         if self._stage_request_verifier is not None:
             self._stage_request_verifier.verify_stage_run_request(
                 request_ref=run.request_ref,
@@ -8805,7 +14311,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         ):
             raise OwnerConflict("idea_provider_invocation_invalid")
         if execution is None:
-            if review_invocation.status != "prepared":
+            review_is_accepted_exhaustion = (
+                exhaustion_review is not None
+                and review_invocation.status == "completed"
+                and exhaustion_review.review_invocation_ref
+                == review_invocation.invocation_ref
+                and exhaustion_review.review_response_hash
+                == review_invocation.response_hash
+                and primary_draft is not None
+                and exhaustion_review.primary_assessment_hash
+                == primary_draft.draft_hash
+            )
+            if review_invocation.status != "prepared" and not review_is_accepted_exhaustion:
                 raise OwnerConflict("idea_provider_invocation_invalid")
         elif (
             primary_draft is None
@@ -9611,6 +15128,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         action: str,
         selected_target_ref: str | None,
         rationale: str,
+        inbox_checkpoint: BundleInboxCheckpoint,
         idempotency_key: str,
     ) -> BundleDispatchDecision:
         """Persist one rolling choice made by the current Bundle root Session."""
@@ -9642,6 +15160,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             or (action != "dispatch" and selected_target_ref is not None)
         ):
             raise OwnerConflict("bundle_dispatch_target_not_in_frontier")
+        validate_bundle_inbox_checkpoint(inbox_checkpoint)
+        if (
+            inbox_checkpoint.run_ref != run_ref
+            or inbox_checkpoint.attempt_ref != attempt_ref
+            or inbox_checkpoint.fence_ref != fence_ref
+        ):
+            raise OwnerConflict("bundle_inbox_checkpoint_invalid")
         frontier_json = canonical_json(list(frontier))
         frontier_hash = canonical_hash(list(frontier))
         state_json = canonical_json(state)
@@ -9660,6 +15185,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 "action": action,
                 "selected_target_ref": selected_target_ref,
                 "rationale": rationale,
+                "inbox_checkpoint_ref": inbox_checkpoint.checkpoint_ref,
+                "inbox_checkpoint_hash": inbox_checkpoint.checkpoint_hash,
             }
         )
         with self._database.write() as connection:
@@ -9684,6 +15211,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     or session.native_session_ref != native_session_ref
                 ):
                     raise OwnerConflict("bundle_dispatch_fence_invalid")
+                _require_current_bundle_inbox_checkpoint(
+                    connection,
+                    inbox_checkpoint,
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                )
                 verifier = self._target_graph_verifier
                 if verifier is None:
                     raise OwnerConflict("target_graph_verifier_unavailable")
@@ -9756,6 +15290,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "created_at": now,
                     },
                 )
+                _bind_bundle_inbox_operation_checkpoint(
+                    connection,
+                    operation_kind="dispatch",
+                    operation_ref=decision_ref,
+                    checkpoint=inbox_checkpoint,
+                    now=now,
+                )
                 connection.execute(
                     text(
                         "UPDATE agent_runtime_state SET revision = revision + 1 "
@@ -9795,6 +15336,194 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 {"run_ref": run_ref},
             ).all()
         return tuple(_bundle_dispatch_decision(row) for row in rows)
+
+    def record_bundle_target_proposal(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        graph_ref: str,
+        base_generation: int,
+        base_head_receipt: AcceptanceReceipt,
+        strategy_update: dict[str, object],
+        inbox_checkpoint: BundleInboxCheckpoint,
+        idempotency_key: str,
+    ) -> BundleTargetProposal:
+        """Record one root-Session proposal without allocating RG identity."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        proposal = target_graph_append_proposal(
+            graph_ref=graph_ref,
+            base_generation=base_generation,
+            base_head_receipt=base_head_receipt.as_public_dict(),
+            strategy_update=strategy_update,
+        )
+        proposal_hash = validate_target_graph_append_proposal(proposal)
+        validate_bundle_inbox_checkpoint(inbox_checkpoint)
+        if (
+            inbox_checkpoint.run_ref != run_ref
+            or inbox_checkpoint.attempt_ref != attempt_ref
+            or inbox_checkpoint.fence_ref != fence_ref
+        ):
+            raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+        command_hash = canonical_hash(
+            {
+                "command": "record_bundle_target_proposal",
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+                "native_session_ref": native_session_ref,
+                "proposal_hash": proposal_hash,
+                "inbox_checkpoint_ref": inbox_checkpoint.checkpoint_ref,
+                "inbox_checkpoint_hash": inbox_checkpoint.checkpoint_hash,
+            }
+        )
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_target_proposals WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("idempotency_conflict")
+                proposal_ref = existing.proposal_ref
+            else:
+                run, attempt, session, fence = _load_stage_fence(
+                    connection, run_ref, attempt_ref, fence_ref
+                )
+                _require_current_fence(run, attempt, fence, "executed", "submitted")
+                if (
+                    run.stage != "bundle"
+                    or session.native_session_ref != native_session_ref
+                    or not native_session_ref
+                ):
+                    raise OwnerConflict("bundle_target_proposal_fence_invalid")
+                _require_current_bundle_inbox_checkpoint(
+                    connection,
+                    inbox_checkpoint,
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                )
+                verifier = self._target_graph_verifier
+                if verifier is None:
+                    raise OwnerConflict("target_graph_verifier_unavailable")
+                verifier.verify_target_graph_receipt(
+                    request_ref=run.request_ref,
+                    run_ref=run_ref,
+                    graph_ref=graph_ref,
+                    receipt=base_head_receipt,
+                )
+                proposal_sequence = int(
+                    connection.execute(
+                        text(
+                            "SELECT COALESCE(MAX(proposal_sequence), 0) + 1 FROM "
+                            "ar_bundle_target_proposals WHERE run_ref = :run_ref"
+                        ),
+                        {"run_ref": run_ref},
+                    ).scalar_one()
+                )
+                proposal_ref = new_ref("bundle_target_proposal")
+                receipt_ref = new_ref("ar_bundle_target_proposal_receipt")
+                bindings = {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "native_session_ref": native_session_ref,
+                    "graph_ref": graph_ref,
+                    "proposal_sequence": proposal_sequence,
+                    "base_generation": base_generation,
+                    "base_head_receipt_ref": base_head_receipt.receipt_ref,
+                    "base_head_receipt_hash": base_head_receipt.payload_hash,
+                    "proposal_hash": proposal_hash,
+                }
+                receipt_hash = _owner_receipt_hash(
+                    BUNDLE_TARGET_PROPOSAL_RECEIPT_KIND,
+                    proposal_ref,
+                    bindings,
+                )
+                now = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_bundle_target_proposals (proposal_ref, "
+                        "run_ref, attempt_ref, fence_ref, native_session_ref, "
+                        "graph_ref, proposal_sequence, base_generation, "
+                        "base_head_receipt_ref, base_head_receipt_hash, "
+                        "proposal_json, proposal_hash, idempotency_key, "
+                        "request_hash, receipt_ref, receipt_hash, created_at) "
+                        "VALUES (:proposal_ref, :run_ref, :attempt_ref, "
+                        ":fence_ref, :native_session_ref, :graph_ref, "
+                        ":proposal_sequence, :base_generation, "
+                        ":base_head_receipt_ref, :base_head_receipt_hash, "
+                        ":proposal_json, :proposal_hash, :idempotency_key, "
+                        ":request_hash, :receipt_ref, :receipt_hash, :created_at)"
+                    ),
+                    {
+                        **bindings,
+                        "proposal_ref": proposal_ref,
+                        "proposal_json": canonical_json(proposal),
+                        "idempotency_key": idempotency_key,
+                        "request_hash": command_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "created_at": now,
+                    },
+                )
+                _bind_bundle_inbox_operation_checkpoint(
+                    connection,
+                    operation_kind="target_proposal",
+                    operation_ref=proposal_ref,
+                    checkpoint=inbox_checkpoint,
+                    now=now,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.bundle_target_proposed",
+                    {
+                        "proposal_ref": proposal_ref,
+                        "run_ref": run_ref,
+                        "graph_ref": graph_ref,
+                        "proposal_sequence": proposal_sequence,
+                        "base_generation": base_generation,
+                        "strategy_revision": strategy_update["revision"],
+                        "strategy_complete": strategy_update["strategy_complete"],
+                        "target_count": len(
+                            cast(list[object], strategy_update["candidates"])
+                        ),
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+        proposals = self.query_bundle_target_proposals(run_ref)
+        matching = tuple(
+            value for value in proposals if value.proposal_ref == proposal_ref
+        )
+        if len(matching) != 1:
+            raise OwnerConflict("bundle_target_proposal_missing_after_commit")
+        return matching[0]
+
+    def query_bundle_target_proposals(
+        self, run_ref: str
+    ) -> tuple[BundleTargetProposal, ...]:
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_target_proposals WHERE run_ref = "
+                    ":run_ref ORDER BY proposal_sequence"
+                ),
+                {"run_ref": run_ref},
+            ).all()
+        return tuple(_bundle_target_proposal(row) for row in rows)
 
     def _query_stage_attempt_execution(
         self, submission_ref: str, expected_stage: str
@@ -9867,6 +15596,24 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             expected_stage="plan",
         )
 
+    def continue_after_bundle_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> BundleStageRun:
+        return self._continue_after_stage_rejection(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="bundle",
+        )
+
     def _continue_after_stage_rejection(
         self,
         *,
@@ -9906,6 +15653,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 raise OwnerConflict("stage_run_integrity_invalid")
             request_ref = run.request_ref
             submission_ref = attempt.submission_ref
+        if expected_stage == "bundle":
+            _verify_target_launch_stage_current(self, run)
         self._verify_stage_decision(
             stage=expected_stage,
             request_ref=request_ref,
@@ -10114,11 +15863,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         decision_receipt: AcceptanceReceipt,
         idempotency_key: str,
         expected_stage: str,
+        command_kind_override: str | None = None,
+        required_attempt_status: str = "executed",
+        required_fence_status: str = "submitted",
     ) -> RunCompletion:
         _validate_stage_idempotency_key(idempotency_key)
         if not outcome_ref:
             raise OwnerConflict("outcome_ref_invalid")
-        command_kind = f"complete_{expected_stage}_run"
+        command_kind = command_kind_override or f"complete_{expected_stage}_run"
         command_hash = canonical_hash(
             {
                 "command": command_kind,
@@ -10145,11 +15897,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 connection, run_ref, attempt_ref, fence_ref
             )
             _assert_runtime_control_allows(connection, run_ref, fence_ref)
-            _require_current_fence(run, attempt, fence, "executed", "submitted")
+            _require_current_fence(
+                run,
+                attempt,
+                fence,
+                required_attempt_status,
+                required_fence_status,
+            )
             if run.stage != expected_stage:
                 raise OwnerConflict("stage_run_integrity_invalid")
             request_ref = run.request_ref
             submission_ref = attempt.submission_ref
+        if expected_stage == "bundle":
+            _verify_target_launch_stage_current(self, run)
         self._verify_stage_decision(
             stage=expected_stage,
             request_ref=request_ref,
@@ -10170,7 +15930,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     connection, run_ref, attempt_ref, fence_ref
                 )
                 _assert_runtime_control_allows(connection, run_ref, fence_ref)
-                _require_current_fence(run, attempt, fence, "executed", "submitted")
+                _require_current_fence(
+                    run,
+                    attempt,
+                    fence,
+                    required_attempt_status,
+                    required_fence_status,
+                )
+                if expected_stage == "bundle":
+                    _verify_target_launch_stage_current(self, run)
                 now = time.time()
                 receipt_ref = new_ref("ar_completion_receipt")
                 bindings = {
@@ -10298,9 +16066,53 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 ),
                 {"attempt_ref": run.current_attempt_ref},
             ).first()
+            bundle_report = (
+                None
+                if run.stage != "bundle" or attempt is None
+                else connection.execute(
+                    text(
+                        "SELECT report_ref FROM ar_bundle_reports WHERE "
+                        "receipt_ref = :receipt_ref"
+                    ),
+                    {"receipt_ref": attempt.decision_receipt_ref},
+                ).first()
+            )
+            exhaustion = (
+                None
+                if run.stage != "bundle" or attempt is None
+                else connection.execute(
+                    text(
+                        "SELECT p.proposal_ref, d.receipt_kind FROM "
+                        "ae_bundle_exhaustion_proposals p JOIN "
+                        "ae_bundle_exhaustion_operations o ON "
+                        "o.proposal_ref = p.proposal_ref JOIN "
+                        "ae_bundle_exhaustion_decisions d ON d.decision_ref = "
+                        "o.current_decision_ref WHERE p.proposal_ref = "
+                        ":proposal_ref AND o.status = 'accepted' AND "
+                        "d.status = 'accepted' AND d.receipt_ref = :receipt_ref"
+                    ),
+                    {
+                        "proposal_ref": run.outcome_ref,
+                        "receipt_ref": attempt.decision_receipt_ref,
+                    },
+                ).first()
+            )
         if attempt is None:
             raise OwnerConflict("run_completion_invalid")
-        completed = _run_completion(run, attempt)
+        completed = _run_completion(
+            run,
+            attempt,
+            decision_receipt_issuer=(
+                AR_OWNER
+                if bundle_report is not None
+                else ("advancement_engine" if exhaustion is not None else None)
+            ),
+            decision_receipt_kind=(
+                BUNDLE_REPORT_RECEIPT_KIND
+                if bundle_report is not None
+                else (exhaustion.receipt_kind if exhaustion is not None else None)
+            ),
+        )
         self._receipt_verifier.verify_run_completion_receipt(
             request_ref=run.request_ref,
             run_ref=run.run_ref,
@@ -10366,16 +16178,41 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
             return
         if stage == "bundle":
-            if self._target_graph_verifier is None:
-                raise OwnerConflict("target_graph_verifier_unavailable")
+            if decision == "rejected" and outcome_ref is None:
+                if self._target_graph_verifier is None:
+                    raise OwnerConflict("target_graph_verifier_unavailable")
+                self._target_graph_verifier.verify_target_graph_rejection_receipt(
+                    request_ref=request_ref,
+                    submission_ref=submission_ref,
+                    receipt=receipt,
+                )
+                return
             if decision != "accepted" or outcome_ref is None:
-                raise OwnerConflict("target_graph_decision_invalid")
-            self._target_graph_verifier.verify_target_graph_receipt(
-                request_ref=request_ref,
-                run_ref=self._bundle_run_ref_for_request(request_ref),
-                graph_ref=outcome_ref,
+                raise OwnerConflict("bundle_report_decision_invalid")
+            if (
+                receipt.issuer == "advancement_engine"
+                and receipt.kind == BUNDLE_EXHAUSTION_ACCEPTED_RECEIPT_KIND
+            ):
+                verifier = self._bundle_exhaustion_verifier
+                if verifier is None:
+                    raise OwnerConflict("bundle_exhaustion_verifier_unavailable")
+                proposal = verifier.verify_bundle_exhaustion_proposal_acceptance(
+                    proposal_ref=outcome_ref,
+                    receipt=receipt,
+                )
+                if proposal.stage_run_request_ref != request_ref:
+                    raise OwnerConflict("bundle_exhaustion_run_binding_invalid")
+                return
+            accepted = self._receipt_verifier.verify_bundle_report_receipt(
+                report_ref=outcome_ref,
                 receipt=receipt,
+                expected_disposition="realized",
             )
+            if (
+                accepted.request_ref != request_ref
+                or accepted.run_ref != self._bundle_run_ref_for_request(request_ref)
+            ):
+                raise OwnerConflict("bundle_report_run_binding_invalid")
             return
         raise OwnerConflict("stage_run_integrity_invalid")
 
@@ -10401,6 +16238,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "SELECT r.* FROM ar_experiment_runs AS r JOIN "
                     "ar_run_controls AS c ON c.run_ref = r.run_ref WHERE "
                     "r.status IN ('admitted', 'running') AND c.status = 'running' "
+                    "AND r.execution_request_ref NOT LIKE "
+                    "'bundle-target-%' "
                     "ORDER BY r.run_ref"
                 )
             ).all()
@@ -10730,6 +16569,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         runtime_hash = canonical_hash(runtime_document)
         identities = admission.identities
         execution_request = admission.execution_request
+        _assert_experiment_request_write_allowed(
+            execution_request.execution_request_ref
+        )
         variant_binding = admission.variant_run_binding
         measurement_binding = admission.evaluation_attempt_binding
         if (
@@ -10762,24 +16604,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 inputs_hash=binding.inputs_hash,
                 receipt=binding.receipt,
             )
-        bundle_target_ref = (
-            None
-            if self._target_graph_verifier is None
-            else self._target_graph_verifier.match_bundle_target_candidate(
-                quest_ref=execution_request.quest_ref,
-                evaluation_attempt_ref=identities.evaluation_attempt_ref,
-                execution_request_ref=execution_request.execution_request_ref,
-                definition_hash=execution_request.definition_hash,
-            )
-        )
-
         with self._database.write() as connection:
-            connection.execute(
-                text(
-                    "UPDATE agent_runtime_state SET revision = revision WHERE "
-                    "singleton = 'owner'"
-                )
-            )
             existing = connection.execute(
                 text(
                     "SELECT * FROM ar_experiment_runs WHERE "
@@ -10787,6 +16612,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 ),
                 {"evaluation_attempt_ref": identities.evaluation_attempt_ref},
             ).first()
+            if existing is not None:
+                _assert_experiment_run_write_allowed(
+                    connection, str(existing.run_ref)
+                )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision WHERE "
+                    "singleton = 'owner'"
+                )
+            )
             if existing is not None:
                 expected = (
                     existing.execution_request_ref
@@ -10828,7 +16663,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     and existing.runtime_binding_json
                     == canonical_json(runtime_document)
                     and existing.runtime_binding_hash == runtime_hash
-                    and existing.bundle_target_ref == bundle_target_ref
                 )
                 if not expected:
                     raise OwnerConflict("experiment_admission_conflict")
@@ -10893,8 +16727,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         ":variant_input_receipt_hash, "
                         ":measurement_input_binding_ref, :measurement_input_hash, "
                         ":measurement_input_receipt_ref, "
-                        ":measurement_input_receipt_hash, 'admitted', "
-                        ":bundle_target_ref, "
+                        ":measurement_input_receipt_hash, 'admitted', NULL, "
                         ":provider_operation_ref, 1, 0, :attempt_ref, 1, "
                         ":root_session_ref, :fence_ref, "
                         ":runtime_binding_json, :runtime_binding_hash, :now, :now)"
@@ -10950,7 +16783,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "measurement_input_receipt_hash": (
                             measurement_binding.receipt.payload_hash
                         ),
-                        "bundle_target_ref": bundle_target_ref,
                         "attempt_ref": attempt_ref,
                         "provider_operation_ref": provider_operation,
                         "root_session_ref": root_session_ref,
@@ -11025,7 +16857,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "fence_ref": fence_ref,
                         "variant_run_ref": identities.variant_run_ref,
                         "evaluation_attempt_ref": identities.evaluation_attempt_ref,
-                        "bundle_target_ref": bundle_target_ref,
                     },
                 )
         admitted = self.query_experiment_run(identities.evaluation_attempt_ref)
@@ -11250,308 +17081,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     ) -> TargetRunAdmission:
         """Issue the AR-owned admission that a TargetRun binding consumes."""
 
-        _validate_stage_idempotency_key(idempotency_key)
-        required = (
-            target_ref,
-            graph_ref,
-            stage_request_ref,
-            quest_ref,
-            target_run_ref,
-            evaluation_attempt_ref,
-            execution_request_ref,
-        )
-        human_values = (
-            human_request_ref,
-            human_waiter_ref,
-            human_waiter_generation,
-            human_authorization_receipt_ref,
-        )
-        has_human_authorization = all(value is not None for value in human_values)
-        if (
-            any(not isinstance(value, str) or not value for value in required)
-            or len(target_spec_hash) != 64
-            or len(definition_hash) != 64
-            or (
-                any(value is not None for value in human_values)
-                and not has_human_authorization
-            )
-            or (
-                has_human_authorization
-                and (
-                    not isinstance(human_waiter_generation, int)
-                    or isinstance(human_waiter_generation, bool)
-                    or human_waiter_generation < 1
-                )
-            )
-        ):
-            raise OwnerConflict("target_run_admission_invalid")
-        command = {
-            "command": "admit_target_run",
-            "target_ref": target_ref,
-            "target_spec_hash": target_spec_hash,
-            "graph_ref": graph_ref,
-            "stage_request_ref": stage_request_ref,
-            "quest_ref": quest_ref,
-            "target_run_ref": target_run_ref,
-            "evaluation_attempt_ref": evaluation_attempt_ref,
-            "execution_request_ref": execution_request_ref,
-            "definition_hash": definition_hash,
-            "human_request_ref": human_request_ref,
-            "human_waiter_ref": human_waiter_ref,
-            "human_waiter_generation": human_waiter_generation,
-            "human_authorization_receipt_ref": human_authorization_receipt_ref,
-        }
-        request_hash = canonical_hash(command)
-        with self._database.write() as connection:
-            replay = connection.execute(
-                text(
-                    "SELECT * FROM ar_target_run_admissions WHERE "
-                    "idempotency_key = :idempotency_key"
-                ),
-                {"idempotency_key": idempotency_key},
-            ).first()
-            if replay is not None:
-                if replay.request_hash != request_hash:
-                    raise OwnerConflict("idempotency_conflict")
-                return _target_run_admission(replay)
-            verifier = self._target_graph_verifier
-            if verifier is None:
-                raise OwnerConflict("target_graph_verifier_unavailable")
-            risk_class = verifier.verify_target_run_candidate(
-                target_ref=target_ref,
-                target_spec_hash=target_spec_hash,
-                graph_ref=graph_ref,
-                stage_request_ref=stage_request_ref,
-                quest_ref=quest_ref,
-                evaluation_attempt_ref=evaluation_attempt_ref,
-                execution_request_ref=execution_request_ref,
-                definition_hash=definition_hash,
-            )
-            if (risk_class == "high") != has_human_authorization:
-                raise OwnerConflict("target_run_authorization_invalid")
-            existing = connection.execute(
-                text(
-                    "SELECT * FROM ar_target_run_admissions WHERE "
-                    "idempotency_key = :idempotency_key"
-                ),
-                {"idempotency_key": idempotency_key},
-            ).first()
-            if existing is not None:
-                if existing.request_hash != request_hash:
-                    raise OwnerConflict("idempotency_conflict")
-                admission_ref = existing.admission_ref
-            else:
-                experiment = connection.execute(
-                    text("SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"),
-                    {"run_ref": target_run_ref},
-                ).first()
-                if experiment is None or (
-                    experiment.quest_ref != quest_ref
-                    or experiment.evaluation_attempt_ref != evaluation_attempt_ref
-                    or experiment.execution_request_ref != execution_request_ref
-                    or experiment.definition_hash != definition_hash
-                    or experiment.bundle_target_ref != target_ref
-                    or experiment.status != "admitted"
-                ):
-                    raise OwnerConflict("target_run_experiment_binding_invalid")
-                dispatch_row = connection.execute(
-                    text(
-                        "SELECT * FROM ar_bundle_dispatch_decisions WHERE "
-                        "graph_ref = :graph_ref ORDER BY generation DESC LIMIT 1"
-                    ),
-                    {"graph_ref": graph_ref},
-                ).first()
-                if dispatch_row is None:
-                    raise OwnerConflict("target_run_dispatch_invalid")
-                dispatch = _bundle_dispatch_decision(dispatch_row)
-                stage_run = connection.execute(
-                    text(
-                        "SELECT request_ref, stage FROM ar_stage_runs WHERE "
-                        "run_ref = :run_ref"
-                    ),
-                    {"run_ref": dispatch.run_ref},
-                ).first()
-                if (
-                    dispatch.action != "dispatch"
-                    or dispatch.selected_target_ref != target_ref
-                    or dispatch.graph_ref != graph_ref
-                    or stage_run is None
-                    or stage_run.stage != "bundle"
-                    or stage_run.request_ref != stage_request_ref
-                ):
-                    raise OwnerConflict("target_run_dispatch_invalid")
-                duplicate = connection.execute(
-                    text(
-                        "SELECT * FROM ar_target_run_admissions WHERE target_ref = "
-                        ":target_ref OR target_run_ref = :target_run_ref"
-                    ),
-                    {
-                        "target_ref": target_ref,
-                        "target_run_ref": target_run_ref,
-                    },
-                ).first()
-                if duplicate is not None:
-                    raise OwnerConflict("target_run_admission_conflict")
-                admission_ref = new_ref("target_run_admission")
-                if has_human_authorization:
-                    assertion = target_execution_assertion(
-                        quest_ref=quest_ref,
-                        stage_request_ref=stage_request_ref,
-                        graph_ref=graph_ref,
-                        target_ref=target_ref,
-                        target_spec_hash=target_spec_hash,
-                        risk_class=risk_class,
-                    )
-                    requirement = target_execution_authorization_requirement(
-                        quest_ref=quest_ref,
-                        stage_request_ref=stage_request_ref,
-                        graph_ref=graph_ref,
-                        target_ref=target_ref,
-                        target_spec_hash=target_spec_hash,
-                    )
-                    human_request = connection.execute(
-                        text(
-                            "SELECT * FROM owner_human_requests WHERE issuer = "
-                            ":issuer AND request_ref = :request_ref"
-                        ),
-                        {
-                            "issuer": AR_OWNER,
-                            "request_ref": human_request_ref,
-                        },
-                    ).first()
-                    waiter = connection.execute(
-                        text(
-                            "SELECT * FROM owner_human_request_waiters WHERE "
-                            "request_ref = :request_ref AND waiter_ref = "
-                            ":waiter_ref"
-                        ),
-                        {
-                            "request_ref": human_request_ref,
-                            "waiter_ref": human_waiter_ref,
-                        },
-                    ).first()
-                    validation = connection.execute(
-                        text(
-                            "SELECT * FROM "
-                            "owner_human_request_resume_validations WHERE "
-                            "request_ref = :request_ref AND waiter_ref = "
-                            ":waiter_ref ORDER BY created_at DESC, "
-                            "validation_ref DESC LIMIT 1"
-                        ),
-                        {
-                            "request_ref": human_request_ref,
-                            "waiter_ref": human_waiter_ref,
-                        },
-                    ).first()
-                    if human_request is None or waiter is None or validation is None:
-                        raise OwnerConflict("target_run_authorization_invalid")
-                    try:
-                        stored_assertion = decoded_object(
-                            human_request.target_assertion_json
-                        )
-                        stored_requirement = decoded_object(
-                            human_request.required_authorization_json
-                        )
-                    except (TypeError, ValueError) as error:
-                        raise OwnerConflict(
-                            "target_run_authorization_invalid"
-                        ) from error
-                    if (
-                        human_request.kind != "capability_authorization"
-                        or human_request.quest_ref != quest_ref
-                        or stored_assertion != assertion
-                        or stored_requirement != requirement
-                        or waiter.target_assertion_hash != canonical_hash(assertion)
-                        or int(waiter.generation) != cast(int, human_waiter_generation)
-                        or validation.authorization_receipt_ref
-                        != human_authorization_receipt_ref
-                    ):
-                        raise OwnerConflict("target_run_authorization_invalid")
-                    verifier = self._authorization_verifier
-                    if verifier is None:
-                        raise OwnerConflict("human_collaboration_verifier_unavailable")
-                    verifier.verify_capability_authorization(
-                        requirement=requirement,
-                        receipt_ref=cast(str, human_authorization_receipt_ref),
-                    )
-                    self._consume_human_request_waiter(
-                        connection,
-                        request_ref=cast(str, human_request_ref),
-                        waiter_ref=cast(str, human_waiter_ref),
-                        generation=cast(int, human_waiter_generation),
-                        work_ref=admission_ref,
-                        work_hash=request_hash,
-                    )
-                bindings = {
-                    **{
-                        key: value for key, value in command.items() if key != "command"
-                    },
-                    "dispatch_decision_ref": dispatch.decision_ref,
-                    "dispatch_receipt_ref": dispatch.receipt.receipt_ref,
-                    "dispatch_receipt_hash": dispatch.receipt.payload_hash,
-                }
-                receipt_ref = new_ref("ar_target_run_admission_receipt")
-                receipt_hash = _owner_receipt_hash(
-                    TARGET_RUN_ADMISSION_RECEIPT_KIND,
-                    admission_ref,
-                    bindings,
-                )
-                now = time.time()
-                connection.execute(
-                    text(
-                        "INSERT INTO ar_target_run_admissions (admission_ref, "
-                        "target_ref, target_spec_hash, graph_ref, "
-                        "stage_request_ref, quest_ref, target_run_ref, "
-                        "evaluation_attempt_ref, execution_request_ref, "
-                        "definition_hash, dispatch_decision_ref, "
-                        "dispatch_receipt_ref, dispatch_receipt_hash, "
-                        "human_request_ref, human_waiter_ref, "
-                        "human_waiter_generation, "
-                        "human_authorization_receipt_ref, idempotency_key, "
-                        "request_hash, receipt_ref, receipt_hash, admitted_at) "
-                        "VALUES (:admission_ref, :target_ref, :target_spec_hash, "
-                        ":graph_ref, :stage_request_ref, :quest_ref, "
-                        ":target_run_ref, :evaluation_attempt_ref, "
-                        ":execution_request_ref, :definition_hash, "
-                        ":dispatch_decision_ref, :dispatch_receipt_ref, "
-                        ":dispatch_receipt_hash, "
-                        ":human_request_ref, :human_waiter_ref, "
-                        ":human_waiter_generation, "
-                        ":human_authorization_receipt_ref, :idempotency_key, "
-                        ":request_hash, :receipt_ref, :receipt_hash, :admitted_at)"
-                    ),
-                    {
-                        **bindings,
-                        "admission_ref": admission_ref,
-                        "idempotency_key": idempotency_key,
-                        "request_hash": request_hash,
-                        "receipt_ref": receipt_ref,
-                        "receipt_hash": receipt_hash,
-                        "admitted_at": now,
-                    },
-                )
-                connection.execute(
-                    text(
-                        "UPDATE agent_runtime_state SET revision = revision + 1 "
-                        "WHERE singleton = 'owner'"
-                    )
-                )
-                self._feed.record(
-                    connection,
-                    "agent_runtime.target_run_admitted",
-                    {
-                        "admission_ref": admission_ref,
-                        "target_ref": target_ref,
-                        "target_run_ref": target_run_ref,
-                        "evaluation_attempt_ref": evaluation_attempt_ref,
-                        "dispatch_decision_ref": dispatch.decision_ref,
-                        "receipt_ref": receipt_ref,
-                    },
-                )
-        admitted = self.query_target_run_admission(target_ref)
-        if admitted is None or admitted.admission_ref != admission_ref:
-            raise OwnerConflict("target_run_admission_missing_after_commit")
-        return admitted
+        raise OwnerConflict("legacy_target_run_admission_write_forbidden")
 
     def query_target_run_admission(self, target_ref: str) -> TargetRunAdmission | None:
         with self._database.read() as connection:
@@ -11607,6 +17137,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "SELECT runs.evaluation_attempt_ref FROM ar_experiment_runs runs "
                     "JOIN ar_run_controls controls ON controls.run_ref = runs.run_ref "
                     "WHERE runs.status IN ('admitted', 'running') AND "
+                    "runs.execution_request_ref NOT LIKE 'bundle-target-%' AND "
+                    "runs.bundle_target_ref IS NULL AND "
                     "controls.status = 'running' ORDER BY runs.created_at, "
                     "runs.run_ref LIMIT 1"
                 )
@@ -11648,15 +17180,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "SELECT r.* FROM ar_experiment_runs AS r JOIN "
                     "ar_run_controls AS c ON c.run_ref = r.run_ref WHERE "
                     "r.status = 'admitted' AND c.status = 'running' AND "
-                    "(r.bundle_target_ref IS NULL OR EXISTS (SELECT 1 FROM "
-                    "ar_target_run_admissions a WHERE a.target_ref = "
-                    "r.bundle_target_ref AND a.target_run_ref = r.run_ref)) "
-                    "ORDER BY "
+                    "r.execution_request_ref NOT LIKE 'bundle-target-%' AND "
+                    "r.bundle_target_ref IS NULL ORDER BY "
                     "r.updated_at, r.run_ref LIMIT 1"
                 )
             ).first()
             if run is None:
                 return None
+            _assert_experiment_run_write_allowed(connection, str(run.run_ref))
             _assert_runtime_control_allows(connection, run.run_ref, run.fence_ref)
             now = time.time()
             connection.execute(
@@ -11749,6 +17280,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ):
                 raise OwnerConflict("experiment_stdout_invalid")
         with self._database.write() as connection:
+            _assert_experiment_run_write_allowed(connection, run_ref)
             _assert_runtime_control_allows(connection, run_ref, fence_ref)
             run = _current_experiment_execution(
                 connection,
@@ -11799,6 +17331,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         fence_ref: str,
         result: dict[str, object],
     ) -> ExperimentRun:
+        with self._database.read() as connection:
+            _assert_experiment_run_write_allowed(connection, run_ref)
         if type(result) is not dict:
             raise OwnerConflict("experiment_result_invalid")
         try:
@@ -11813,6 +17347,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 text("SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"),
                 {"run_ref": run_ref},
             ).first()
+            if existing is not None:
+                _assert_experiment_run_write_allowed(connection, run_ref)
             if existing is not None and existing.status == "executed":
                 if (
                     existing.attempt_ref != attempt_ref
@@ -11949,6 +17485,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         if failure_code not in EXPERIMENT_RETRYABLE_PROVIDER_FAILURES:
             raise OwnerConflict("experiment_retry_not_permitted")
         with self._database.write() as connection:
+            _assert_experiment_run_write_allowed(connection, run_ref)
             _assert_runtime_control_allows(connection, run_ref, fence_ref)
             run = _current_experiment_execution(
                 connection,
@@ -12076,6 +17613,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         if not failure_code or len(failure_code) > 96:
             raise OwnerConflict("experiment_failure_code_invalid")
         with self._database.write() as connection:
+            _assert_experiment_run_write_allowed(connection, run_ref)
             _assert_runtime_control_allows(connection, run_ref, fence_ref)
             run = _current_experiment_execution(
                 connection,
@@ -12176,6 +17714,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         if reason_code != "experiment_provider_reconciliation_pending":
             raise OwnerConflict("experiment_reconciliation_reason_invalid")
         with self._database.write() as connection:
+            _assert_experiment_run_write_allowed(connection, run_ref)
             _assert_runtime_control_allows(connection, run_ref, fence_ref)
             run = _current_experiment_execution(
                 connection,
@@ -12248,6 +17787,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ).first()
             if run is None:
                 raise OwnerConflict("experiment_run_not_found")
+            _assert_experiment_run_write_allowed(connection, str(run.run_ref))
             if run.status != "failed" or not bool(
                 run.provider_operation_retry_permitted
             ):
@@ -12339,6 +17879,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     def verify_target_run_admission_receipt(self, **values) -> None:
         self._receipt_verifier.verify_target_run_admission_receipt(**values)
 
+    def verify_bundle_target_proposal_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_bundle_target_proposal_receipt(**values)
+
+    def verify_bundle_inbox_checkpoint(self, **values) -> None:
+        self._receipt_verifier.verify_bundle_inbox_checkpoint(**values)
+
     def verify_run_completion_receipt(self, **values) -> None:
         self._receipt_verifier.verify_run_completion_receipt(**values)
 
@@ -12362,10 +17908,55 @@ class SQLiteAgentRuntimeReceiptVerifier:
         database: Database,
         stage_request_verifier: StageRunRequestVerifier | None = None,
         writing_authorization_verifier: HumanResponseVerifier | None = None,
+        bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
+        bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
+        bundle_report_disposition_verifier: (
+            BundleReportDispositionReceiptVerifier | None
+        ) = None,
     ) -> None:
         self._database = database
         self._stage_request_verifier = stage_request_verifier
         self._writing_authorization_verifier = writing_authorization_verifier
+        self._bundle_report_evidence_verifier = bundle_report_evidence_verifier
+        self._bundle_exhaustion_verifier = bundle_exhaustion_verifier
+        self._bundle_report_disposition_verifier = (
+            bundle_report_disposition_verifier
+        )
+        self._target_run_harness_verifier: TargetRunHarnessVerifier | None = None
+
+    def bind_bundle_report_evidence_verifier(
+        self, verifier: BundleReportEvidenceVerifier
+    ) -> None:
+        current = self._bundle_report_evidence_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict("bundle_report_evidence_verifier_already_bound")
+        self._bundle_report_evidence_verifier = verifier
+
+    def bind_target_run_harness_verifier(
+        self, verifier: TargetRunHarnessVerifier
+    ) -> None:
+        current = self._target_run_harness_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict("target_run_harness_verifier_already_bound")
+        self._target_run_harness_verifier = verifier
+
+    def bind_bundle_exhaustion_verifier(
+        self, verifier: BundleExhaustionAcceptanceVerifier
+    ) -> None:
+        current = self._bundle_exhaustion_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict("bundle_exhaustion_verifier_already_bound")
+        self._bundle_exhaustion_verifier = verifier
+
+    def bind_bundle_report_disposition_verifier(
+        self, verifier: BundleReportDispositionReceiptVerifier
+    ) -> None:
+        current = self._bundle_report_disposition_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict(
+                "bundle_report_disposition_verifier_already_bound"
+            )
+        self._bundle_report_disposition_verifier = verifier
 
     def verify_runtime_control_receipt(
         self,
@@ -12602,6 +18193,117 @@ class SQLiteAgentRuntimeReceiptVerifier:
         ):
             raise OwnerConflict("target_run_admission_receipt_invalid")
 
+    def verify_bundle_target_proposal_receipt(
+        self,
+        *,
+        proposal_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        graph_ref: str,
+        base_generation: int,
+        base_head_receipt: AcceptanceReceipt,
+        proposal_hash: str,
+        receipt: AcceptanceReceipt,
+        require_checkpoint_current: bool = False,
+    ) -> None:
+        if (
+            receipt.issuer != AR_OWNER
+            or receipt.kind != BUNDLE_TARGET_PROPOSAL_RECEIPT_KIND
+            or receipt.subject_ref != proposal_ref
+        ):
+            raise OwnerConflict("bundle_target_proposal_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_target_proposals WHERE proposal_ref = "
+                    ":proposal_ref AND receipt_ref = :receipt_ref"
+                ),
+                {
+                    "proposal_ref": proposal_ref,
+                    "receipt_ref": receipt.receipt_ref,
+                },
+            ).first()
+            checkpoint_binding = connection.execute(
+                text(
+                    "SELECT operation_ref FROM "
+                    "ar_bundle_inbox_operation_checkpoints WHERE "
+                    "operation_kind = 'target_proposal' AND operation_ref = "
+                    ":proposal_ref"
+                ),
+                {"proposal_ref": proposal_ref},
+            ).first()
+            checkpoint = (
+                None
+                if checkpoint_binding is None
+                else _bundle_inbox_checkpoint_for_operation(
+                    connection,
+                    operation_kind="target_proposal",
+                    operation_ref=proposal_ref,
+                    require_current=require_checkpoint_current,
+                )
+            )
+        if row is None:
+            raise OwnerConflict("bundle_target_proposal_receipt_invalid")
+        if require_checkpoint_current and checkpoint is None:
+            raise OwnerConflict("bundle_inbox_operation_checkpoint_missing")
+        proposal = _bundle_target_proposal(row)
+        if (
+            proposal.run_ref != run_ref
+            or proposal.attempt_ref != attempt_ref
+            or proposal.fence_ref != fence_ref
+            or proposal.graph_ref != graph_ref
+            or proposal.base_generation != base_generation
+            or proposal.base_head_receipt != base_head_receipt
+            or proposal.proposal_hash != proposal_hash
+            or proposal.receipt != receipt
+            or checkpoint is not None
+            and (
+                checkpoint.run_ref != run_ref
+                or checkpoint.attempt_ref != attempt_ref
+                or checkpoint.fence_ref != fence_ref
+            )
+        ):
+            raise OwnerConflict("bundle_target_proposal_receipt_invalid")
+
+    def verify_bundle_inbox_checkpoint(
+        self,
+        *,
+        checkpoint: BundleInboxCheckpoint,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        require_current: bool = True,
+    ) -> None:
+        """Verify an AR checkpoint receipt and, when requested, its CAS head."""
+
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_inbox_checkpoints WHERE "
+                    "checkpoint_ref = :checkpoint_ref"
+                ),
+                {"checkpoint_ref": checkpoint.checkpoint_ref},
+            ).first()
+            if row is None:
+                raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+            stored = _bundle_inbox_checkpoint_from_row(row)
+            if (
+                stored != checkpoint
+                or stored.run_ref != run_ref
+                or stored.attempt_ref != attempt_ref
+                or stored.fence_ref != fence_ref
+            ):
+                raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+            if require_current:
+                _require_current_bundle_inbox_checkpoint(
+                    connection,
+                    stored,
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                )
+
     def verify_writing_execution_receipt(
         self,
         *,
@@ -12704,6 +18406,227 @@ class SQLiteAgentRuntimeReceiptVerifier:
             "execution_ref": execution.execution_ref,
         }
 
+    def verify_bundle_report_receipt(
+        self,
+        *,
+        report_ref: str,
+        receipt: AcceptanceReceipt,
+        expected_disposition: str | None = None,
+    ) -> VerifiedBundleReportReceipt:
+        if (
+            receipt.issuer != AR_OWNER
+            or receipt.kind != BUNDLE_REPORT_RECEIPT_KIND
+            or receipt.subject_ref != report_ref
+        ):
+            raise OwnerConflict("bundle_report_receipt_issuer_invalid")
+        verifier = self._bundle_report_evidence_verifier
+        if verifier is None:
+            raise OwnerConflict("bundle_report_evidence_verifier_unavailable")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_reports WHERE report_ref = :report_ref "
+                    "AND receipt_ref = :receipt_ref"
+                ),
+                {"report_ref": report_ref, "receipt_ref": receipt.receipt_ref},
+            ).first()
+            run = (
+                None
+                if row is None
+                else connection.execute(
+                    text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                    {"run_ref": row.run_ref},
+                ).first()
+            )
+        if row is None or run is None:
+            raise OwnerConflict("bundle_report_receipt_invalid")
+        accepted = _verified_bundle_report_from_row(
+            self._database,
+            verifier,
+            target_run_verifier=self._target_run_harness_verifier,
+            row=row,
+            run=run,
+            receipt=receipt,
+        )
+        if (
+            expected_disposition is not None
+            and accepted.report.disposition != expected_disposition
+        ):
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        return accepted
+
+    def verify_bundle_replan_run_retirement(
+        self,
+        *,
+        retirement_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> VerifiedBundleReplanRunRetirement:
+        verifier = self._bundle_report_disposition_verifier
+        if verifier is None:
+            raise OwnerConflict("bundle_report_disposition_verifier_unavailable")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_replan_retirements WHERE "
+                    "retirement_ref = :retirement_ref"
+                ),
+                {"retirement_ref": retirement_ref},
+            ).first()
+            run = (
+                None
+                if row is None
+                else connection.execute(
+                    text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                    {"run_ref": row.run_ref},
+                ).first()
+            )
+            control = (
+                None
+                if row is None
+                else connection.execute(
+                    text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                    {"run_ref": row.run_ref},
+                ).first()
+            )
+            fence = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_execution_fences WHERE fence_ref = "
+                        ":fence_ref"
+                    ),
+                    {"fence_ref": row.fence_ref},
+                ).first()
+            )
+            control_row = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_control_operations WHERE operation_ref = "
+                        ":operation_ref"
+                    ),
+                    {"operation_ref": row.control_operation_ref},
+                ).first()
+            )
+        if row is None or run is None or control is None or fence is None or control_row is None:
+            raise OwnerConflict("bundle_replan_run_retirement_invalid")
+        disposition_receipt = AcceptanceReceipt(
+            issuer="advancement_engine",
+            kind=BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND,
+            receipt_ref=row.disposition_receipt_ref,
+            subject_ref=row.disposition_ref,
+            payload_hash=row.disposition_receipt_hash,
+        )
+        disposition = verifier.verify_bundle_report_disposition_receipt(
+            disposition_ref=row.disposition_ref,
+            receipt=disposition_receipt,
+            expected_disposition="replan_required",
+        )
+        target = {
+            "quest_ref": disposition.quest_ref,
+            "cycle_ref": disposition.cycle_ref,
+            "question_ref": disposition.question_ref,
+            "epoch": disposition.epoch,
+            "target_scope": "stage",
+        }
+        control_receipt = _runtime_control_receipt(control_row)
+        self.verify_runtime_control_receipt(
+            operation_ref=row.control_operation_ref,
+            action="cancel",
+            target=target,
+            receipt=control_receipt,
+        )
+        affected = control_receipt.get("affected_runs")
+        affected_run = (
+            None
+            if not isinstance(affected, list)
+            else next(
+                (
+                    item
+                    for item in affected
+                    if isinstance(item, dict) and item.get("run_ref") == row.run_ref
+                ),
+                None,
+            )
+        )
+        bindings = {
+            "disposition_ref": row.disposition_ref,
+            "request_ref": row.request_ref,
+            "run_ref": row.run_ref,
+            "attempt_ref": row.attempt_ref,
+            "fence_ref": row.fence_ref,
+            "run_identity_hash": row.run_identity_hash,
+            "report_ref": row.report_ref,
+            "report_hash": row.report_hash,
+            "disposition_receipt_ref": row.disposition_receipt_ref,
+            "disposition_receipt_hash": row.disposition_receipt_hash,
+            "control_operation_ref": row.control_operation_ref,
+            "control_receipt_ref": row.control_receipt_ref,
+            "control_receipt_hash": row.control_receipt_hash,
+        }
+        expected_receipt = AcceptanceReceipt(
+            issuer=AR_OWNER,
+            kind=BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.run_identity_hash,
+            payload_hash=row.receipt_hash,
+        )
+        if (
+            receipt != expected_receipt
+            or disposition.status != "pending_run_retirement"
+            or disposition.request_ref != row.request_ref
+            or disposition.run_ref != row.run_ref
+            or disposition.report_ref != row.report_ref
+            or disposition.report_hash != row.report_hash
+            or disposition.receipt != disposition_receipt
+            or run.request_ref != row.request_ref
+            or run.stage != "bundle"
+            or run.current_attempt_ref != row.attempt_ref
+            or run.current_fence_ref != row.fence_ref
+            or canonical_hash(
+                {
+                    "run_ref": row.run_ref,
+                    "attempt_ref": row.attempt_ref,
+                    "fence_ref": row.fence_ref,
+                }
+            )
+            != row.run_identity_hash
+            or control.status != "terminated"
+            or control.attempt_ref != row.attempt_ref
+            or control.fence_ref != row.fence_ref
+            or fence.status != "rejected"
+            or not isinstance(affected_run, dict)
+            or affected_run.get("attempt_ref") != row.attempt_ref
+            or affected_run.get("fence_ref") != row.fence_ref
+            or affected_run.get("status") != "terminated"
+            or control_receipt.get("receipt_ref") != row.control_receipt_ref
+            or control_receipt.get("receipt_hash") != row.control_receipt_hash
+            or row.receipt_hash
+            != _owner_receipt_hash(
+                BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+                row.run_identity_hash,
+                bindings,
+            )
+        ):
+            raise OwnerConflict("bundle_replan_run_retirement_invalid")
+        return VerifiedBundleReplanRunRetirement(
+            retirement_ref=row.retirement_ref,
+            disposition_ref=row.disposition_ref,
+            request_ref=row.request_ref,
+            run_ref=row.run_ref,
+            attempt_ref=row.attempt_ref,
+            fence_ref=row.fence_ref,
+            run_identity_hash=row.run_identity_hash,
+            report_ref=row.report_ref,
+            report_hash=row.report_hash,
+            control_operation_ref=row.control_operation_ref,
+            control_receipt_ref=row.control_receipt_ref,
+            control_receipt_hash=row.control_receipt_hash,
+            receipt=receipt,
+        )
+
     def verify_run_completion_receipt(
         self,
         *,
@@ -12735,6 +18658,36 @@ class SQLiteAgentRuntimeReceiptVerifier:
                 ),
                 {"attempt_ref": run.current_attempt_ref},
             ).first()
+            report_row = (
+                None
+                if run.stage != "bundle"
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_reports WHERE report_ref = "
+                        ":report_ref"
+                    ),
+                    {"report_ref": run.outcome_ref},
+                ).first()
+            )
+            exhaustion_row = (
+                None
+                if run.stage != "bundle" or report_row is not None
+                else connection.execute(
+                    text(
+                        "SELECT p.proposal_ref, p.request_ref, p.run_ref, "
+                        "p.attempt_ref, p.root_session_ref, p.fence_ref, "
+                        "d.receipt_ref, d.receipt_kind, d.receipt_subject_ref, "
+                        "d.receipt_hash FROM ae_bundle_exhaustion_proposals p "
+                        "JOIN ae_bundle_exhaustion_operations o ON "
+                        "o.proposal_ref = p.proposal_ref JOIN "
+                        "ae_bundle_exhaustion_decisions d ON d.decision_ref = "
+                        "o.current_decision_ref WHERE p.proposal_ref = "
+                        ":proposal_ref AND o.status = 'accepted' AND "
+                        "d.status = 'accepted'"
+                    ),
+                    {"proposal_ref": run.outcome_ref},
+                ).first()
+            )
         if attempt is None or (
             run.request_ref != request_ref
             or run.run_ref != run_ref
@@ -12748,6 +18701,50 @@ class SQLiteAgentRuntimeReceiptVerifier:
         ):
             raise OwnerConflict("run_completion_receipt_invalid")
         _runtime_binding_from_row(run)
+        if report_row is not None:
+            self.verify_bundle_report_receipt(
+                report_ref=report_row.report_ref,
+                receipt=AcceptanceReceipt(
+                    issuer=AR_OWNER,
+                    kind=BUNDLE_REPORT_RECEIPT_KIND,
+                    receipt_ref=report_row.receipt_ref,
+                    subject_ref=report_row.report_ref,
+                    payload_hash=report_row.receipt_hash,
+                ),
+                expected_disposition="realized",
+            )
+        elif run.stage == "bundle" and exhaustion_row is not None:
+            verifier = self._bundle_exhaustion_verifier
+            if verifier is None:
+                raise OwnerConflict("bundle_exhaustion_verifier_unavailable")
+            decision_receipt = AcceptanceReceipt(
+                issuer="advancement_engine",
+                kind=exhaustion_row.receipt_kind,
+                receipt_ref=exhaustion_row.receipt_ref,
+                subject_ref=exhaustion_row.receipt_subject_ref,
+                payload_hash=exhaustion_row.receipt_hash,
+            )
+            proposal = verifier.verify_bundle_exhaustion_proposal_acceptance(
+                proposal_ref=exhaustion_row.proposal_ref,
+                receipt=decision_receipt,
+            )
+            if (
+                exhaustion_row.receipt_kind
+                != BUNDLE_EXHAUSTION_ACCEPTED_RECEIPT_KIND
+                or attempt.decision_receipt_ref != exhaustion_row.receipt_ref
+                or attempt.decision_receipt_hash != exhaustion_row.receipt_hash
+                or proposal.stage_run_request_ref != run.request_ref
+                or proposal.run_ref != run.run_ref
+                or proposal.attempt_ref != attempt.attempt_ref
+                or proposal.root_session_ref != run.root_session_ref
+                or proposal.execution_fence_ref != run.current_fence_ref
+            ):
+                raise OwnerConflict("bundle_exhaustion_run_binding_invalid")
+        elif run.stage == "bundle":
+            # Legacy graph-based completions remain readable only until a new
+            # acceptance is attempted; no new command can create one.
+            if run.outcome_ref is None:
+                raise OwnerConflict("bundle_report_required")
         if self._stage_request_verifier is not None:
             self._stage_request_verifier.verify_stage_run_request(
                 request_ref=run.request_ref,
@@ -13339,6 +19336,75 @@ def _owner_receipt_hash(
             "bindings": bindings,
         }
     )
+
+
+def _bundle_exhaustion_assessment_receipt(
+    run,
+    attempt,
+    session,
+    primary: IdeaProviderInvocation,
+    draft: IdeaPrimaryDraft,
+) -> AcceptanceReceipt:
+    if primary.response_hash is None:
+        raise OwnerConflict("bundle_exhaustion_assessment_receipt_invalid")
+    bindings = {
+        "request_ref": run.request_ref,
+        "run_ref": run.run_ref,
+        "attempt_ref": attempt.attempt_ref,
+        "fence_ref": attempt.fence_ref,
+        "root_session_ref": session.session_ref,
+        "native_session_ref": draft.native_session_ref,
+        "runtime_binding_hash": run.runtime_binding_hash,
+        "draft_hash": draft.draft_hash,
+        "primary_response_hash": primary.response_hash,
+    }
+    return AcceptanceReceipt(
+        issuer=AR_OWNER,
+        kind=BUNDLE_EXHAUSTION_ASSESSMENT_RECEIPT_KIND,
+        receipt_ref=f"ar_bundle_exhaustion_assessment:{primary.invocation_ref}",
+        subject_ref=primary.invocation_ref,
+        payload_hash=_owner_receipt_hash(
+            BUNDLE_EXHAUSTION_ASSESSMENT_RECEIPT_KIND,
+            primary.invocation_ref,
+            bindings,
+        ),
+    )
+
+
+def _bundle_exhaustion_evidence_bindings(
+    evidence: BundleExhaustionEvidence,
+    *,
+    evidence_ref: str,
+    evidence_hash: str,
+    review_response_hash: str,
+    completion_contract_hash: str,
+) -> dict[str, object]:
+    return {
+        "evidence_ref": evidence_ref,
+        "evidence_identity": evidence.evidence_identity,
+        "request_ref": evidence.stage_run_request_ref,
+        "request_receipt_ref": evidence.stage_run_request_receipt_ref,
+        "request_receipt_hash": evidence.stage_run_request_receipt_hash,
+        "cycle_ref": evidence.cycle_ref,
+        "epoch": evidence.epoch,
+        "run_ref": evidence.run_ref,
+        "attempt_ref": evidence.attempt_ref,
+        "root_session_ref": evidence.root_session_ref,
+        "fence_ref": evidence.execution_fence_ref,
+        "context_pack_ref": evidence.context_pack_ref,
+        "context_pack_hash": evidence.context_pack_hash,
+        "formal_plan_ref": evidence.formal_plan_ref,
+        "formal_plan_content_hash": evidence.formal_plan_content_hash,
+        "native_session_ref": evidence.native_session_ref,
+        "primary_invocation_ref": evidence.primary_invocation_ref,
+        "primary_response_hash": evidence.primary_response_hash,
+        "primary_assessment_hash": evidence.primary_assessment_hash,
+        "review_invocation_ref": evidence.review_invocation_ref,
+        "review_response_hash": review_response_hash,
+        "reviewer_agent_ref": evidence.reviewer_agent_ref,
+        "completion_contract_hash": completion_contract_hash,
+        "evidence_hash": evidence_hash,
+    }
 
 
 def _stage_execution_schema(stage: str) -> str:
@@ -13993,7 +20059,13 @@ def _run_completion_receipt_hash(run, attempt) -> str:
     )
 
 
-def _run_completion(run, attempt) -> RunCompletion:
+def _run_completion(
+    run,
+    attempt,
+    *,
+    decision_receipt_issuer: str | None = None,
+    decision_receipt_kind: str | None = None,
+) -> RunCompletion:
     if (
         run.status != "completed"
         or attempt.status != "completed"
@@ -14008,8 +20080,9 @@ def _run_completion(run, attempt) -> RunCompletion:
         attempt_ref=attempt.attempt_ref,
         outcome_ref=run.outcome_ref,
         decision_receipt=AcceptanceReceipt(
-            issuer="research_graph",
-            kind=_stage_decision_receipt_kind(run.stage, accepted=True),
+            issuer=decision_receipt_issuer or "research_graph",
+            kind=decision_receipt_kind
+            or _stage_decision_receipt_kind(run.stage, accepted=True),
             receipt_ref=attempt.decision_receipt_ref,
             subject_ref=run.outcome_ref,
             payload_hash=attempt.decision_receipt_hash,
@@ -14645,8 +20718,69 @@ def _validated_runtime_binding(
             or len(values) != len(set(values))
         ):
             raise OwnerConflict("idea_runtime_binding_invalid")
+    full_conformance_resources = tuple(
+        resource
+        for resource in binding.resource_bindings
+        if resource.startswith("harness-artifact:full-conformance-")
+    )
+    bundle_full_conformance_valid = (
+        stage == "bundle"
+        and "harness-full-conformance-v1" in binding.capability_bindings
+        and "semantic-mcp-resident" in binding.capability_bindings
+        and "mcp-config-empty" not in binding.capability_bindings
+        and len(binding.mcp_bindings) == 2
+        and {
+            item.rsplit("@sha256:", 1)[0] for item in binding.mcp_bindings
+        }
+        == {
+            "harness-full-conformance:semantic-mcp-catalog",
+            "harness-full-conformance:semantic-mcp-operation-bindings",
+        }
+        and all(
+            _is_sha256(item.rsplit("@sha256:", 1)[-1])
+            for item in binding.mcp_bindings
+        )
+        and len(full_conformance_resources) == 4
+        and sum(
+            item.startswith(
+                "harness-artifact:full-conformance-contract:"
+            )
+            for item in full_conformance_resources
+        )
+        == 1
+        and sum(
+            item.startswith("harness-artifact:full-conformance-set:")
+            for item in full_conformance_resources
+        )
+        == 1
+        and sum(
+            item.startswith(
+                "harness-artifact:full-conformance-profile:codex:"
+            )
+            for item in full_conformance_resources
+        )
+        == 1
+        and sum(
+            item.startswith(
+                "harness-artifact:full-conformance-profile:claude:"
+            )
+            for item in full_conformance_resources
+        )
+        == 1
+        and all(
+            "@sha256:" in item
+            and _is_sha256(item.rsplit("@sha256:", 1)[-1])
+            for item in full_conformance_resources
+        )
+    )
     if (
-        binding.mcp_bindings
+        (stage == "bundle" and not bundle_full_conformance_valid)
+        or (stage != "bundle" and binding.mcp_bindings)
+        or (
+            stage != "bundle"
+            and "harness-full-conformance-v1" in binding.capability_bindings
+        )
+        or (stage != "bundle" and full_conformance_resources)
         or any(
             capability not in _IDEA_SAFE_CAPABILITIES
             for capability in binding.capability_bindings
@@ -14966,6 +21100,26 @@ def _experiment_runtime_binding(value: str) -> ExperimentRuntimeBinding:
         raise OwnerConflict("experiment_runtime_binding_invalid") from error
 
 
+def _assert_experiment_request_write_allowed(execution_request_ref: str) -> None:
+    if execution_request_ref.startswith(_BUNDLE_TARGET_EXECUTION_REQUEST_PREFIX):
+        raise OwnerConflict("bundle_target_experiment_write_forbidden")
+
+
+def _assert_experiment_run_write_allowed(connection, run_ref: str) -> None:
+    row = connection.execute(
+        text(
+            "SELECT execution_request_ref, bundle_target_ref FROM "
+            "ar_experiment_runs WHERE "
+            "run_ref = :run_ref"
+        ),
+        {"run_ref": run_ref},
+    ).first()
+    if row is not None and row.bundle_target_ref is not None:
+        raise OwnerConflict("bundle_target_experiment_write_forbidden")
+    if row is not None:
+        _assert_experiment_request_write_allowed(str(row.execution_request_ref))
+
+
 def _current_experiment_execution(
     connection,
     *,
@@ -15147,6 +21301,2692 @@ def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
     )
 
 
+def _bundle_target_proposal(row) -> BundleTargetProposal:
+    try:
+        proposal = decoded_object(row.proposal_json)
+        validate_target_graph_append_proposal(proposal)
+        receipt_value = proposal["base_head_receipt"]
+        if (
+            not isinstance(receipt_value, dict)
+            or set(receipt_value)
+            != {
+                "status",
+                "issuer",
+                "kind",
+                "receipt_ref",
+                "subject_ref",
+                "payload_hash",
+            }
+            or receipt_value.get("status") != "accepted"
+        ):
+            raise TypeError("base receipt")
+        base_receipt = AcceptanceReceipt(
+            issuer=cast(str, receipt_value["issuer"]),
+            kind=cast(str, receipt_value["kind"]),
+            receipt_ref=cast(str, receipt_value["receipt_ref"]),
+            subject_ref=cast(str, receipt_value["subject_ref"]),
+            payload_hash=cast(str, receipt_value["payload_hash"]),
+        )
+    except (KeyError, TypeError, ValueError, OwnerConflict) as error:
+        raise OwnerConflict("bundle_target_proposal_invalid") from error
+    bindings = {
+        "run_ref": row.run_ref,
+        "attempt_ref": row.attempt_ref,
+        "fence_ref": row.fence_ref,
+        "native_session_ref": row.native_session_ref,
+        "graph_ref": row.graph_ref,
+        "proposal_sequence": int(row.proposal_sequence),
+        "base_generation": int(row.base_generation),
+        "base_head_receipt_ref": row.base_head_receipt_ref,
+        "base_head_receipt_hash": row.base_head_receipt_hash,
+        "proposal_hash": row.proposal_hash,
+    }
+    if (
+        canonical_json(proposal) != row.proposal_json
+        or canonical_hash(proposal) != row.proposal_hash
+        or proposal.get("graph_ref") != row.graph_ref
+        or proposal.get("base_generation") != int(row.base_generation)
+        or base_receipt.receipt_ref != row.base_head_receipt_ref
+        or base_receipt.payload_hash != row.base_head_receipt_hash
+        or row.receipt_hash
+        != _owner_receipt_hash(
+            BUNDLE_TARGET_PROPOSAL_RECEIPT_KIND,
+            row.proposal_ref,
+            bindings,
+        )
+    ):
+        raise OwnerConflict("bundle_target_proposal_invalid")
+    return BundleTargetProposal(
+        proposal_ref=row.proposal_ref,
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        native_session_ref=row.native_session_ref,
+        graph_ref=row.graph_ref,
+        proposal_sequence=int(row.proposal_sequence),
+        base_generation=int(row.base_generation),
+        base_head_receipt=base_receipt,
+        proposal=proposal,
+        proposal_hash=row.proposal_hash,
+        receipt=AcceptanceReceipt(
+            issuer=AR_OWNER,
+            kind=BUNDLE_TARGET_PROPOSAL_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.proposal_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
+def _target_launch_request_from_row(row) -> TargetLaunchRequest:
+    try:
+        commit_values = json.loads(row.accepted_input_target_commit_refs_json)
+        asset_values = json.loads(row.accepted_input_asset_refs_json)
+        if (
+            not isinstance(commit_values, list)
+            or not all(isinstance(value, str) for value in commit_values)
+            or not isinstance(asset_values, list)
+            or not all(isinstance(value, str) for value in asset_values)
+        ):
+            raise TypeError("target launch inputs")
+        request = TargetLaunchRequest(
+            target_ref=row.target_ref,
+            target_spec_binding=ContentBindingProof(
+                subject_ref=row.target_ref,
+                content_hash_ref=row.target_spec_content_hash_ref,
+            ),
+            target_spec_acceptance_receipt=ReceiptProof(
+                receipt_ref=row.target_spec_receipt_ref,
+                subject_ref=row.target_spec_receipt_subject_ref,
+                verified=True,
+                currentness_known=True,
+                current=True,
+            ),
+            accepted_input_target_commit_refs=tuple(commit_values),
+            accepted_input_asset_refs=tuple(asset_values),
+            recoverable_required=bool(row.recoverable_required),
+        )
+        validate_target_launch_request(request)
+    except (
+        BundleProtocolError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise OwnerConflict("target_launch_integrity_invalid") from error
+    return request
+
+
+def _verify_target_launch_stage_current(runtime: object, stage_run) -> None:
+    verifier = getattr(runtime, "_stage_request_verifier", None)
+    if verifier is None:
+        raise OwnerConflict("stage_request_verifier_unavailable")
+    if (
+        stage_run.stage != "bundle"
+        or stage_run.status not in {"running", "awaiting_acceptance"}
+    ):
+        raise OwnerConflict("target_launch_stage_not_current")
+    verifier.verify_current_stage_run_request(
+        request_ref=stage_run.request_ref,
+        cycle_ref=stage_run.cycle_ref,
+        epoch=int(stage_run.epoch),
+        context_pack_ref=stage_run.context_pack_ref,
+        context_pack_hash=stage_run.context_pack_hash,
+        receipt=AcceptanceReceipt(
+            issuer="advancement_engine",
+            kind="stage_run_request",
+            receipt_ref=stage_run.request_receipt_ref,
+            subject_ref=stage_run.request_ref,
+            payload_hash=stage_run.request_receipt_hash,
+        ),
+    )
+
+
+def _target_launch_ack(
+    row, request: TargetLaunchRequest
+) -> TargetLaunchAck:
+    try:
+        asset_proofs_value = json.loads(row.accepted_input_asset_proofs_json)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise OwnerConflict("target_launch_integrity_invalid") from error
+    launch_bindings = {
+        "operation_ref": row.operation_ref,
+        "target_ref": row.target_ref,
+        "graph_ref": row.graph_ref,
+        "stage_request_ref": row.stage_request_ref,
+        "quest_ref": row.quest_ref,
+        "target_spec_content_hash_ref": row.target_spec_content_hash_ref,
+        "target_spec_receipt_ref": row.target_spec_receipt_ref,
+        "accepted_input_target_commit_refs_hash": (
+            row.accepted_input_target_commit_refs_hash
+        ),
+        "accepted_input_asset_refs_hash": row.accepted_input_asset_refs_hash,
+        "accepted_input_asset_proofs_hash": (
+            row.accepted_input_asset_proofs_hash
+        ),
+        "recoverable_required": bool(row.recoverable_required),
+        "target_run_ref": row.target_run_ref,
+        "status": row.status,
+        "dispatch_decision_ref": row.dispatch_decision_ref,
+        "dispatch_receipt_ref": row.dispatch_receipt_ref,
+        "dispatch_receipt_hash": row.dispatch_receipt_hash,
+        "human_request_ref": row.human_request_ref,
+        "human_waiter_ref": row.human_waiter_ref,
+        "human_waiter_generation": (
+            None
+            if row.human_waiter_generation is None
+            else int(row.human_waiter_generation)
+        ),
+        "human_authorization_receipt_ref": row.human_authorization_receipt_ref,
+    }
+    command = {
+        "command": "admit_target_launch",
+        "request": projection_plain_value(request),
+        "dispatch_decision_ref": row.dispatch_decision_ref,
+        "human_request_ref": row.human_request_ref,
+        "human_waiter_ref": row.human_waiter_ref,
+        "human_waiter_generation": launch_bindings["human_waiter_generation"],
+        "human_authorization_receipt_ref": row.human_authorization_receipt_ref,
+    }
+    if (
+        canonical_json(list(request.accepted_input_target_commit_refs))
+        != row.accepted_input_target_commit_refs_json
+        or canonical_hash(list(request.accepted_input_target_commit_refs))
+        != row.accepted_input_target_commit_refs_hash
+        or canonical_json(list(request.accepted_input_asset_refs))
+        != row.accepted_input_asset_refs_json
+        or canonical_hash(list(request.accepted_input_asset_refs))
+        != row.accepted_input_asset_refs_hash
+        or canonical_json(asset_proofs_value)
+        != row.accepted_input_asset_proofs_json
+        or canonical_hash(asset_proofs_value)
+        != row.accepted_input_asset_proofs_hash
+        or row.status != "admitted"
+        or not isinstance(row.target_run_ref, str)
+        or not row.target_run_ref.startswith("target_run_")
+        or row.root_session_ref is not None
+        or row.execution_attempt_ref is not None
+        or row.execution_fence_ref is not None
+        or row.execution_input_binding_ref is not None
+        or row.execution_input_binding_receipt_ref is not None
+        or row.execution_input_binding_receipt_hash is not None
+        or row.current_handle_json is not None
+        or row.current_handle_hash is not None
+        or canonical_hash(command) != row.request_hash
+        or row.receipt_hash
+        != _owner_receipt_hash(
+            TARGET_LAUNCH_ADMISSION_RECEIPT_KIND,
+            row.launch_ref,
+            launch_bindings,
+        )
+    ):
+        raise OwnerConflict("target_launch_integrity_invalid")
+    ack = TargetLaunchAck(
+        target_ref=row.target_ref,
+        operation_ref=row.operation_ref,
+    )
+    try:
+        validate_target_launch_ack(ack, request)
+    except BundleProtocolError as error:
+        raise OwnerConflict("target_launch_integrity_invalid") from error
+    return ack
+
+
+def _receipt_proof_from_value(value: object) -> ReceiptProof:
+    if not isinstance(value, dict) or set(value) != {
+        "receipt_ref",
+        "subject_ref",
+        "verified",
+        "currentness_known",
+        "current",
+    }:
+        raise OwnerConflict("target_launch_handle_invalid")
+    proof = ReceiptProof(
+        receipt_ref=value["receipt_ref"],
+        subject_ref=value["subject_ref"],
+        verified=value["verified"],
+        currentness_known=value["currentness_known"],
+        current=value["current"],
+    )
+    try:
+        validate_closed_bundle_projection(proof, "ReceiptProof")
+    except BundleProtocolError as error:
+        raise OwnerConflict("target_launch_handle_invalid") from error
+    return proof
+
+
+def _target_work_handle_from_json(value: str) -> TargetWorkHandle:
+    try:
+        document = json.loads(value)
+        if not isinstance(document, dict) or set(document) != {
+            "target_ref",
+            "target_run_ref",
+            "root_session_ref",
+            "execution_attempt_ref",
+            "execution_fence_ref",
+            "execution_input_binding_ref",
+            "execution_input_binding_receipt",
+            "accepted_input_target_commit_refs",
+            "accepted_input_asset_proofs",
+            "recoverable",
+        }:
+            raise TypeError("TargetWorkHandle")
+        commit_refs = document["accepted_input_target_commit_refs"]
+        asset_values = document["accepted_input_asset_proofs"]
+        if (
+            not isinstance(commit_refs, list)
+            or not all(isinstance(item, str) for item in commit_refs)
+            or not isinstance(asset_values, list)
+        ):
+            raise TypeError("TargetWorkHandle inputs")
+        asset_proofs: list[AcceptedInputAssetProof] = []
+        for asset_value in asset_values:
+            if not isinstance(asset_value, dict) or set(asset_value) != {
+                "asset_ref",
+                "rm_acceptance_receipt",
+                "rg_role_receipt",
+            }:
+                raise TypeError("AcceptedInputAssetProof")
+            asset_proofs.append(
+                AcceptedInputAssetProof(
+                    asset_ref=asset_value["asset_ref"],
+                    rm_acceptance_receipt=_receipt_proof_from_value(
+                        asset_value["rm_acceptance_receipt"]
+                    ),
+                    rg_role_receipt=_receipt_proof_from_value(
+                        asset_value["rg_role_receipt"]
+                    ),
+                )
+            )
+        handle = TargetWorkHandle(
+            target_ref=document["target_ref"],
+            target_run_ref=document["target_run_ref"],
+            root_session_ref=document["root_session_ref"],
+            execution_attempt_ref=document["execution_attempt_ref"],
+            execution_fence_ref=document["execution_fence_ref"],
+            execution_input_binding_ref=document["execution_input_binding_ref"],
+            execution_input_binding_receipt=_receipt_proof_from_value(
+                document["execution_input_binding_receipt"]
+            ),
+            accepted_input_target_commit_refs=tuple(commit_refs),
+            accepted_input_asset_proofs=tuple(asset_proofs),
+            recoverable=document["recoverable"],
+        )
+        validate_closed_bundle_projection(handle, "TargetWorkHandle")
+    except (BundleProtocolError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise OwnerConflict("target_launch_handle_invalid") from error
+    return handle
+
+
+def _bundle_record_storage(value: object) -> tuple[str, str]:
+    try:
+        digest = validate_closed_bundle_projection(value, type(value).__name__)
+        document = canonical_json(projection_plain_value(value))
+    except (BundleProtocolError, TypeError, ValueError) as error:
+        raise OwnerConflict("target_run_projection_invalid") from error
+    return document, digest
+
+
+def _decode_bundle_value(value: object, annotation: object) -> object:
+    if annotation is Any:
+        return value
+    origin = get_origin(annotation)
+    if origin in {Union, UnionType}:
+        matches: list[object] = []
+        for option in get_args(annotation):
+            try:
+                matches.append(_decode_bundle_value(value, option))
+            except (TypeError, ValueError):
+                continue
+        if len(matches) != 1:
+            raise TypeError("non-canonical union value")
+        return matches[0]
+    if origin is tuple:
+        if type(value) is not list:
+            raise TypeError("canonical tuple storage")
+        arguments = get_args(annotation)
+        if len(arguments) == 2 and arguments[1] is Ellipsis:
+            return tuple(_decode_bundle_value(item, arguments[0]) for item in value)
+        if len(value) != len(arguments):
+            raise TypeError("fixed tuple length")
+        return tuple(
+            _decode_bundle_value(item, expected)
+            for item, expected in zip(value, arguments, strict=True)
+        )
+    if annotation in {str, int, bool, float, type(None)}:
+        if type(value) is not annotation:
+            raise TypeError("non-canonical primitive")
+        return value
+    if isinstance(annotation, type) and is_dataclass(annotation):
+        if type(value) is not dict:
+            raise TypeError("canonical record storage")
+        record_fields = fields(annotation)
+        if (
+            annotation is AcceptedMeasurementClosure
+            and "root_completion_receipt" not in value
+        ):
+            # Root completion added a wire discriminator without changing the
+            # canonical bytes of already-persisted native closures.
+            value = {**value, "root_completion_receipt": None}
+        if set(value) != {item.name for item in record_fields}:
+            raise TypeError("record fields changed")
+        hints = get_type_hints(annotation)
+        return annotation(
+            **{
+                item.name: _decode_bundle_value(value[item.name], hints[item.name])
+                for item in record_fields
+            }
+        )
+    raise TypeError("unsupported canonical annotation")
+
+
+def _stored_bundle_record(
+    document: str,
+    expected_hash: str,
+    record_type: type[Any],
+    error_code: str,
+):
+    try:
+        plain = json.loads(document)
+        record = _decode_bundle_value(plain, record_type)
+        actual_hash = validate_closed_bundle_projection(record, record_type.__name__)
+        if (
+            type(record) is not record_type
+            or canonical_json(projection_plain_value(record)) != document
+            or actual_hash != expected_hash
+        ):
+            raise ValueError("stored projection digest mismatch")
+    except (
+        BundleProtocolError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise OwnerConflict(error_code) from error
+    return record
+
+
+def _stored_owner_record(
+    document: str,
+    expected_hash: str,
+    record_type: type[Any],
+    error_code: str,
+):
+    """Decode a closed Owner-private projection without Bundle type claims."""
+
+    try:
+        plain = json.loads(document)
+        record = _decode_bundle_value(plain, record_type)
+        if (
+            type(record) is not record_type
+            or canonical_json(projection_plain_value(record)) != document
+            or canonical_hash(plain) != expected_hash
+        ):
+            raise ValueError("stored Owner projection digest mismatch")
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise OwnerConflict(error_code) from error
+    return record
+
+
+@dataclass(frozen=True)
+class _BundleReportTargetEvidence:
+    target_ref: str
+    frontier: TargetFrontierEntry
+    notice: TargetWorkNotice
+    handoff_manifest_ref: str
+    handoff_manifest_hash: str
+    semantic_barrier_fact_ref: str | None
+    handoff: TargetRunHandoff
+    candidate: TargetCandidate
+    formal_plan: FormalPlan
+
+
+@dataclass(frozen=True)
+class _BundleReportMaterial:
+    request_ref: str
+    run_ref: str
+    formal_plan_ref: str
+    plan_document_hash: str
+    formal_plan_content_receipt: AcceptanceReceipt
+    formal_plan_projection_digest: str
+    formal_plan_projection_receipt: AcceptanceReceipt
+    completion_contract_hash: str
+    formal_plan_briefs_hash: str
+    target_graph_ref: str
+    target_graph_generation: int
+    target_set_hash: str
+    coverage_hash: str
+    target_graph_receipt: AcceptanceReceipt
+    target_refs: tuple[str, ...]
+    notice_refs: tuple[str, ...]
+    handoff_manifest_refs: tuple[str, ...]
+    target_commit_receipts: tuple[AcceptanceReceipt, ...]
+    accepted_measurement_closures: tuple[AcceptedMeasurementClosure, ...]
+    report: BundleReport
+    report_hash: str
+    target_evidence: tuple[_BundleReportTargetEvidence, ...]
+    missing_target_refs: tuple[str, ...]
+
+
+def _acceptance_receipt_from_public(
+    value: object,
+    *,
+    error_code: str,
+) -> AcceptanceReceipt:
+    if type(value) is not dict or set(value) != {
+        "status",
+        "issuer",
+        "kind",
+        "receipt_ref",
+        "subject_ref",
+        "payload_hash",
+    }:
+        raise OwnerConflict(error_code)
+    item = cast(dict[str, object], value)
+    if item.get("status") != "accepted" or any(
+        type(item.get(name)) is not str or not cast(str, item[name])
+        for name in (
+            "issuer",
+            "kind",
+            "receipt_ref",
+            "subject_ref",
+            "payload_hash",
+        )
+    ):
+        raise OwnerConflict(error_code)
+    return AcceptanceReceipt(
+        issuer=cast(str, item["issuer"]),
+        kind=cast(str, item["kind"]),
+        receipt_ref=cast(str, item["receipt_ref"]),
+        subject_ref=cast(str, item["subject_ref"]),
+        payload_hash=cast(str, item["payload_hash"]),
+    )
+
+
+def _bundle_report_target_evidence(
+    connection,
+    target_refs: tuple[str, ...],
+    *,
+    target_run_verifier: TargetRunHarnessVerifier | None,
+) -> tuple[tuple[_BundleReportTargetEvidence, ...], tuple[str, ...]]:
+    evidence: list[_BundleReportTargetEvidence] = []
+    missing: list[str] = []
+    for target_ref in target_refs:
+        frontier_row = connection.execute(
+            text(
+                "SELECT target_ref FROM ar_target_frontier_entries WHERE "
+                "target_ref = :target_ref"
+            ),
+            {"target_ref": target_ref},
+        ).first()
+        if frontier_row is None:
+            missing.append(target_ref)
+            continue
+        context = _target_handoff_context(
+            connection,
+            target_ref,
+            verifier=target_run_verifier,
+        )
+        notice_row = connection.execute(
+            text(
+                "SELECT * FROM ar_target_work_notices WHERE target_ref = "
+                ":target_ref"
+            ),
+            {"target_ref": target_ref},
+        ).first()
+        manifest_row = (
+            None
+            if notice_row is None
+            else connection.execute(
+                text(
+                    "SELECT * FROM ar_target_handoff_manifests WHERE "
+                    "manifest_ref = :manifest_ref"
+                ),
+                {"manifest_ref": notice_row.manifest_ref},
+            ).first()
+        )
+        if notice_row is None or manifest_row is None:
+            raise OwnerConflict("bundle_report_handoff_missing")
+        notice = _target_notice_from_row(notice_row)
+        handoff = _stored_bundle_record(
+            manifest_row.handoff_json,
+            manifest_row.handoff_hash,
+            TargetRunHandoff,
+            "bundle_report_handoff_invalid",
+        )
+        reconfirmed_frontier = _target_frontier_for_local_write(
+            connection, target_ref
+        )
+        try:
+            handoff_hash = validate_target_run_handoff_notice(
+                handoff,
+                notice,
+                context.frontier,
+                reconfirmed_frontier,
+                initial_handle=context.handles[0],
+                target_spec_binding=context.request.target_spec_binding,
+                target_spec_acceptance_receipt=(
+                    context.request.target_spec_acceptance_receipt
+                ),
+                expected_review_scopes=context.review_scopes,
+                expected_initial_implementation_revision_ref=(
+                    context.candidate.implementation_revision_ref
+                ),
+                expected_initial_code_changed=context.candidate.code_changed,
+                semantic_barrier_fact_ref=manifest_row.semantic_barrier_fact_ref,
+            )
+        except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
+            raise OwnerConflict("bundle_report_handoff_invalid") from error
+        _validate_persisted_target_terminal(
+            handoff,
+            candidate=context.candidate,
+            formal_plan=context.formal_plan,
+            final_handle=context.handles[-1],
+            measurement_transition_verified=(
+                type(handoff.terminal) is AcceptedMeasurementClosure
+            ),
+        )
+        if (
+            context.frontier.state != "terminal"
+            or context.frontier.currentness_known is not True
+            or context.frontier.current is not True
+            or manifest_row.target_ref != target_ref
+            or notice.handoff_manifest_ref != manifest_row.manifest_ref
+            or notice.handoff_manifest_sha256 != manifest_row.handoff_hash
+            or handoff_hash != manifest_row.handoff_hash
+        ):
+            raise OwnerConflict("bundle_report_handoff_invalid")
+        evidence.append(
+            _BundleReportTargetEvidence(
+                target_ref=target_ref,
+                frontier=context.frontier,
+                notice=notice,
+                handoff_manifest_ref=manifest_row.manifest_ref,
+                handoff_manifest_hash=manifest_row.handoff_hash,
+                semantic_barrier_fact_ref=manifest_row.semantic_barrier_fact_ref,
+                handoff=handoff,
+                candidate=context.candidate,
+                formal_plan=context.formal_plan,
+            )
+        )
+    return tuple(evidence), tuple(missing)
+
+
+def _bundle_receipt_proof_refs(value: object) -> tuple[str, ...]:
+    refs: set[str] = set()
+
+    def visit(item: object) -> None:
+        if type(item) is ReceiptProof:
+            refs.add(item.receipt_ref)
+            return
+        if is_dataclass(item):
+            for field in fields(item):
+                visit(getattr(item, field.name))
+            return
+        if type(item) is tuple:
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return tuple(sorted(refs))
+
+
+def _prepare_bundle_report_material(
+    database: Database,
+    verifier: BundleReportEvidenceVerifier,
+    *,
+    target_run_verifier: TargetRunHarnessVerifier | None,
+    request_ref: str,
+    run_ref: str,
+    disposition: str,
+    formal_plan_content_receipt: AcceptanceReceipt,
+    formal_plan_projection_receipt: AcceptanceReceipt,
+    target_graph_ref: str,
+    target_graph_receipt: AcceptanceReceipt,
+    expected_report: BundleReport | None = None,
+) -> _BundleReportMaterial:
+    try:
+        contract = verifier.query_bundle_report_contract(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            graph_ref=target_graph_ref,
+            head_receipt=target_graph_receipt,
+            formal_plan_content_receipt=formal_plan_content_receipt,
+            formal_plan_projection_receipt=formal_plan_projection_receipt,
+        )
+        plan = contract.get("plan")
+        candidates = contract.get("candidates")
+        target_by_label = contract.get("target_by_label")
+        target_refs = contract.get("target_refs")
+        strategy_complete = contract.get("strategy_complete")
+        generation = contract.get("generation")
+        target_set_hash = contract.get("target_set_hash")
+        coverage_hash = contract.get("coverage_hash")
+        plan_document_hash = contract.get("plan_document_hash")
+        source_acceptance_receipt = contract.get("source_acceptance_receipt")
+        completion_contract_hash = contract.get("completion_contract_hash")
+        briefs_hash = contract.get("briefs_hash")
+        projection_digest = contract.get("projection_digest")
+        projection_receipt = contract.get("projection_receipt")
+        if (
+            type(plan) is not FormalPlan
+            or type(candidates) is not dict
+            or type(target_by_label) is not dict
+            or type(target_refs) is not tuple
+            or any(type(item) is not str or not item for item in target_refs)
+            or type(strategy_complete) is not bool
+            or type(generation) is not int
+            or type(target_set_hash) is not str
+            or type(coverage_hash) is not str
+            or type(plan_document_hash) is not str
+            or len(plan_document_hash) != 64
+            or type(source_acceptance_receipt) is not AcceptanceReceipt
+            or source_acceptance_receipt != formal_plan_content_receipt
+            or source_acceptance_receipt.subject_ref != plan_document_hash
+            or type(completion_contract_hash) is not str
+            or len(completion_contract_hash) != 64
+            or type(briefs_hash) is not str
+            or len(briefs_hash) != 64
+            or type(projection_digest) is not str
+            or len(projection_digest) != 64
+            or type(projection_receipt) is not AcceptanceReceipt
+            or projection_receipt != formal_plan_projection_receipt
+            or projection_receipt.subject_ref != projection_digest
+            or plan.content_binding.content_hash_ref != projection_digest
+            or plan.acceptance_receipt.receipt_ref != projection_receipt.receipt_ref
+            or plan.acceptance_receipt.subject_ref != projection_digest
+            or set(candidates) != set(target_by_label)
+            or any(type(value) is not TargetCandidate for value in candidates.values())
+            or any(type(value) is not str or not value for value in target_by_label.values())
+            or tuple(target_by_label.values()) != target_refs
+            or len(target_refs) != len(set(target_refs))
+        ):
+            raise OwnerConflict("bundle_report_contract_invalid")
+        typed_candidates = cast(dict[str, TargetCandidate], candidates)
+        typed_target_by_label = cast(dict[str, str], target_by_label)
+        typed_target_refs = cast(tuple[str, ...], target_refs)
+        label_by_target = {
+            target_ref: label for label, target_ref in typed_target_by_label.items()
+        }
+        with database.read() as connection:
+            target_evidence, missing_target_refs = _bundle_report_target_evidence(
+                connection,
+                typed_target_refs,
+                target_run_verifier=target_run_verifier,
+            )
+
+        accepted: dict[str, AcceptedMeasurementClosure] = {}
+        blockers: dict[str, str] = {}
+        semantic_barriers: dict[str, SemanticBarrier] = {}
+        accepted_labels: set[str] = set()
+        blocker_labels: set[str] = set()
+        additional_receipt_refs: set[str] = {
+            target_graph_receipt.receipt_ref,
+            formal_plan_content_receipt.receipt_ref,
+        }
+        preflights: list[TargetExecutionPreflight] = []
+        stop_decision_refs: set[str] = set()
+        recovery_evidence_refs: set[str] = set()
+        for item in target_evidence:
+            label = label_by_target.get(item.target_ref)
+            if (
+                label is None
+                or item.candidate != typed_candidates[label]
+                or item.formal_plan != plan
+            ):
+                raise OwnerConflict("bundle_report_handoff_contract_drift")
+            terminal = item.handoff.terminal
+            if type(terminal) is AcceptedMeasurementClosure:
+                accepted[item.target_ref] = terminal
+                accepted_labels.add(label)
+            elif type(terminal) is TechnicalBlocker:
+                blockers[item.target_ref] = terminal.blocker_ref
+                blocker_labels.add(label)
+            elif type(terminal) is SemanticBarrier:
+                semantic_barriers[item.target_ref] = terminal
+            else:
+                raise OwnerConflict("bundle_report_handoff_invalid")
+            additional_receipt_refs.update(_bundle_receipt_proof_refs(item))
+            preflights.extend(item.handoff.code_review_preflights)
+            stop_decision_refs.update(
+                stop.decision_ref for stop in item.handoff.stop_decisions
+            )
+            recovery_evidence_refs.update(item.handoff.recovery_evidence_refs)
+
+        missing_labels = {
+            label_by_target[target_ref] for target_ref in missing_target_refs
+        }
+
+        def has_blocked_ancestor(label: str, visiting: frozenset[str]) -> bool:
+            if label in blocker_labels:
+                return True
+            if label in visiting:
+                raise OwnerConflict("bundle_report_dependency_cycle")
+            return any(
+                has_blocked_ancestor(dependency, visiting | {label})
+                for dependency in typed_candidates[label].depends_on_labels
+            )
+
+        request = BundleCompletionRequest(
+            request_ref=request_ref,
+            formal_plan_ref=plan.formal_plan_ref,
+            formal_plan_content_hash_ref=plan.content_binding.content_hash_ref,
+            typed=True,
+            currentness_known=True,
+            current=True,
+            root_execution_fence_current=True,
+        )
+        report_kwargs: dict[str, object] = {
+            "stop_decision_refs": tuple(sorted(stop_decision_refs)),
+            "recovery_evidence_refs": tuple(sorted(recovery_evidence_refs)),
+            "code_review_preflights": tuple(preflights),
+        }
+        if disposition == "realized":
+            if (
+                not strategy_complete
+                or missing_target_refs
+                or blockers
+                or semantic_barriers
+            ):
+                raise OwnerConflict("bundle_report_realized_incomplete")
+        elif disposition == "blocked":
+            if not blockers or any(
+                not has_blocked_ancestor(label, frozenset())
+                for label in missing_labels
+            ):
+                raise OwnerConflict("bundle_report_blocked_incomplete")
+            report_kwargs["blocker_refs"] = tuple(sorted(blockers.values()))
+        elif disposition == "replan_required":
+            if missing_target_refs or blockers:
+                raise OwnerConflict("bundle_report_replan_incomplete")
+            verify_barriers = getattr(
+                verifier,
+                "verify_bundle_report_semantic_barriers",
+                None,
+            )
+            if not callable(verify_barriers):
+                raise OwnerConflict(
+                    "bundle_report_replan_evidence_verifier_unavailable"
+                )
+            barrier_facts = tuple(
+                sorted(
+                    (
+                        item.semantic_barrier_fact_ref,
+                        item.handoff.terminal,
+                    )
+                    for item in target_evidence
+                    if type(item.handoff.terminal) is SemanticBarrier
+                    and item.semantic_barrier_fact_ref is not None
+                )
+            )
+            if len(barrier_facts) != len(semantic_barriers):
+                raise OwnerConflict("bundle_report_replan_evidence_invalid")
+            barrier_receipts = verify_barriers(
+                graph_ref=target_graph_ref,
+                barriers=barrier_facts,
+            )
+            if (
+                type(barrier_receipts) is not tuple
+                or len(barrier_receipts) != len(barrier_facts)
+                or any(
+                    type(receipt) is not AcceptanceReceipt
+                    or receipt.subject_ref != fact_ref
+                    for (fact_ref, _barrier), receipt in zip(
+                        barrier_facts,
+                        barrier_receipts,
+                        strict=True,
+                    )
+                )
+            ):
+                raise OwnerConflict("bundle_report_replan_evidence_invalid")
+            additional_receipt_refs.update(
+                receipt.receipt_ref for receipt in barrier_receipts
+            )
+            replan = closed_semantic_replan_payload(
+                plan,
+                typed_candidates,
+                typed_target_by_label,
+                accepted,
+                frozenset(accepted_labels),
+                semantic_barriers,
+                strategy_complete=strategy_complete,
+            )
+            if replan is None:
+                raise OwnerConflict("bundle_report_replan_not_closed")
+            (
+                semantic_change_required,
+                evidence_refs,
+                route_disposition_refs,
+                reconciliation_receipt_refs,
+            ) = replan
+            report_kwargs.update(
+                {
+                    "semantic_change_required": semantic_change_required,
+                    "evidence_refs": evidence_refs,
+                    "route_disposition_refs": route_disposition_refs,
+                    "reconciliation_receipt_refs": (
+                        reconciliation_receipt_refs
+                    ),
+                }
+            )
+        else:
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        # Freeze the receipt set only after the selected disposition has
+        # supplied all of its issuer-owned evidence.  In particular, a replan
+        # report must carry every accepted SemanticBarrier fact receipt rather
+        # than merely validating it transiently before persistence.
+        report_kwargs["additional_owner_receipt_refs"] = tuple(
+            sorted(additional_receipt_refs)
+        )
+        report = build_report(
+            disposition,
+            request,
+            plan,
+            accepted,
+            **report_kwargs,
+        )
+        if not additional_receipt_refs.issubset(report.owner_receipt_refs):
+            raise OwnerConflict("bundle_report_owner_receipts_incomplete")
+        report_hash = validate_bundle_report(report)
+        if expected_report is not None and (
+            expected_report != report
+            or validate_bundle_report(expected_report) != report_hash
+        ):
+            raise OwnerConflict("bundle_report_not_canonical")
+        closures = tuple(accepted[target_ref] for target_ref in sorted(accepted))
+        commit_receipts = verifier.verify_bundle_report_target_commits(
+            graph_ref=target_graph_ref,
+            closures=closures,
+            receipts=None,
+            head_receipt=target_graph_receipt,
+        )
+        if type(commit_receipts) is not tuple or any(
+            type(receipt) is not AcceptanceReceipt for receipt in commit_receipts
+        ):
+            raise OwnerConflict("bundle_report_target_commit_invalid")
+    except (BundleProtocolError, TypeError, ValueError) as error:
+        raise OwnerConflict("bundle_report_invalid") from error
+    return _BundleReportMaterial(
+        request_ref=request_ref,
+        run_ref=run_ref,
+        formal_plan_ref=plan.formal_plan_ref,
+        plan_document_hash=cast(str, plan_document_hash),
+        formal_plan_content_receipt=formal_plan_content_receipt,
+        formal_plan_projection_digest=cast(str, projection_digest),
+        formal_plan_projection_receipt=formal_plan_projection_receipt,
+        completion_contract_hash=cast(str, completion_contract_hash),
+        formal_plan_briefs_hash=cast(str, briefs_hash),
+        target_graph_ref=target_graph_ref,
+        target_graph_generation=cast(int, generation),
+        target_set_hash=cast(str, target_set_hash),
+        coverage_hash=cast(str, coverage_hash),
+        target_graph_receipt=target_graph_receipt,
+        target_refs=typed_target_refs,
+        notice_refs=tuple(item.notice.notice_ref for item in target_evidence),
+        handoff_manifest_refs=tuple(
+            item.handoff_manifest_ref for item in target_evidence
+        ),
+        target_commit_receipts=cast(
+            tuple[AcceptanceReceipt, ...], commit_receipts
+        ),
+        accepted_measurement_closures=closures,
+        report=report,
+        report_hash=report_hash,
+        target_evidence=target_evidence,
+        missing_target_refs=missing_target_refs,
+    )
+
+
+def _bundle_report_material_sql_values(
+    material: _BundleReportMaterial,
+) -> dict[str, object]:
+    target_refs_value = list(material.target_refs)
+    notice_refs_value = list(material.notice_refs)
+    manifest_refs_value = list(material.handoff_manifest_refs)
+    commit_receipts_value = [
+        receipt.as_public_dict() for receipt in material.target_commit_receipts
+    ]
+    return {
+        "formal_plan_ref": material.formal_plan_ref,
+        "plan_document_hash": material.plan_document_hash,
+        "formal_plan_content_receipt_ref": (
+            material.formal_plan_content_receipt.receipt_ref
+        ),
+        "formal_plan_content_receipt_hash": (
+            material.formal_plan_content_receipt.payload_hash
+        ),
+        "formal_plan_projection_digest": material.formal_plan_projection_digest,
+        "formal_plan_projection_receipt_ref": (
+            material.formal_plan_projection_receipt.receipt_ref
+        ),
+        "formal_plan_projection_receipt_hash": (
+            material.formal_plan_projection_receipt.payload_hash
+        ),
+        "completion_contract_hash": material.completion_contract_hash,
+        "formal_plan_briefs_hash": material.formal_plan_briefs_hash,
+        "target_graph_ref": material.target_graph_ref,
+        "target_graph_generation": material.target_graph_generation,
+        "target_set_hash": material.target_set_hash,
+        "coverage_hash": material.coverage_hash,
+        "target_graph_receipt_ref": material.target_graph_receipt.receipt_ref,
+        "target_graph_receipt_hash": material.target_graph_receipt.payload_hash,
+        "target_refs_json": canonical_json(target_refs_value),
+        "target_refs_hash": canonical_hash(target_refs_value),
+        "notice_refs_json": canonical_json(notice_refs_value),
+        "notice_refs_hash": canonical_hash(notice_refs_value),
+        "handoff_manifest_refs_json": canonical_json(manifest_refs_value),
+        "handoff_manifest_refs_hash": canonical_hash(manifest_refs_value),
+        "target_commit_receipts_json": canonical_json(commit_receipts_value),
+        "target_commit_receipts_hash": canonical_hash(commit_receipts_value),
+        "report_json": canonical_json(projection_plain_value(material.report)),
+        "report_hash": material.report_hash,
+        "disposition": material.report.disposition,
+    }
+
+
+def _new_bundle_report_bindings(
+    material: _BundleReportMaterial,
+    *,
+    run,
+    report_ref: str,
+    ordinal: int,
+    attempt_ref: str,
+    fence_ref: str,
+) -> dict[str, object]:
+    values = _bundle_report_material_sql_values(material)
+    return {
+        "report_ref": report_ref,
+        "run_ref": run.run_ref,
+        "ordinal": ordinal,
+        "request_ref": run.request_ref,
+        "attempt_ref": attempt_ref,
+        "fence_ref": fence_ref,
+        "formal_plan_ref": values["formal_plan_ref"],
+        "plan_document_hash": values["plan_document_hash"],
+        "formal_plan_content_receipt_ref": values[
+            "formal_plan_content_receipt_ref"
+        ],
+        "formal_plan_content_receipt_hash": values[
+            "formal_plan_content_receipt_hash"
+        ],
+        "formal_plan_projection_digest": values[
+            "formal_plan_projection_digest"
+        ],
+        "formal_plan_projection_receipt_ref": values[
+            "formal_plan_projection_receipt_ref"
+        ],
+        "formal_plan_projection_receipt_hash": values[
+            "formal_plan_projection_receipt_hash"
+        ],
+        "completion_contract_hash": values["completion_contract_hash"],
+        "formal_plan_briefs_hash": values["formal_plan_briefs_hash"],
+        "target_graph_ref": values["target_graph_ref"],
+        "target_graph_generation": values["target_graph_generation"],
+        "target_set_hash": values["target_set_hash"],
+        "coverage_hash": values["coverage_hash"],
+        "target_graph_receipt_ref": values["target_graph_receipt_ref"],
+        "target_graph_receipt_hash": values["target_graph_receipt_hash"],
+        "target_refs_hash": values["target_refs_hash"],
+        "notice_refs_hash": values["notice_refs_hash"],
+        "handoff_manifest_refs_hash": values["handoff_manifest_refs_hash"],
+        "target_commit_receipts_hash": values["target_commit_receipts_hash"],
+        "report_hash": values["report_hash"],
+        "disposition": values["disposition"],
+    }
+
+
+def _assert_bundle_report_material_current(
+    connection,
+    material: _BundleReportMaterial,
+    *,
+    target_run_verifier: TargetRunHarnessVerifier | None,
+) -> None:
+    graph = connection.execute(
+        text("SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"),
+        {"graph_ref": material.target_graph_ref},
+    ).first()
+    append = connection.execute(
+        text(
+            "SELECT * FROM rg_target_graph_appends WHERE graph_ref = :graph_ref "
+            "ORDER BY generation DESC LIMIT 1"
+        ),
+        {"graph_ref": material.target_graph_ref},
+    ).first()
+    if graph is None:
+        raise OwnerConflict("bundle_report_evidence_stale")
+    projection = connection.execute(
+        text(
+            "SELECT * FROM rg_target_formal_plan_projections WHERE graph_ref = "
+            ":graph_ref"
+        ),
+        {"graph_ref": material.target_graph_ref},
+    ).first()
+    if projection is None or (
+        projection.formal_plan_ref != material.formal_plan_ref
+        or projection.plan_document_hash != material.plan_document_hash
+        or projection.source_acceptance_receipt_ref
+        != material.formal_plan_content_receipt.receipt_ref
+        or projection.source_acceptance_receipt_hash
+        != material.formal_plan_content_receipt.payload_hash
+        or projection.completion_contract_hash
+        != material.completion_contract_hash
+        or projection.briefs_hash != material.formal_plan_briefs_hash
+        or projection.content_hash != material.formal_plan_projection_digest
+        or projection.receipt_ref
+        != material.formal_plan_projection_receipt.receipt_ref
+        or projection.receipt_hash
+        != material.formal_plan_projection_receipt.payload_hash
+    ):
+        raise OwnerConflict("bundle_report_evidence_stale")
+    generation = 0 if append is None else int(append.generation)
+    head_receipt_ref = graph.receipt_ref if append is None else append.receipt_ref
+    head_receipt_hash = graph.receipt_hash if append is None else append.receipt_hash
+    target_rows = connection.execute(
+        text(
+            "SELECT target_ref FROM rg_targets WHERE graph_ref = :graph_ref "
+            "ORDER BY ordinal"
+        ),
+        {"graph_ref": material.target_graph_ref},
+    ).all()
+    if (
+        graph.request_ref != material.request_ref
+        or graph.run_ref != material.run_ref
+        or generation != material.target_graph_generation
+        or head_receipt_ref != material.target_graph_receipt.receipt_ref
+        or head_receipt_hash != material.target_graph_receipt.payload_hash
+        or tuple(row.target_ref for row in target_rows) != material.target_refs
+        or (
+            append is not None
+            and (
+                append.target_set_hash != material.target_set_hash
+                or append.coverage_hash != material.coverage_hash
+            )
+        )
+    ):
+        raise OwnerConflict("bundle_report_evidence_stale")
+    target_evidence, missing = _bundle_report_target_evidence(
+        connection,
+        material.target_refs,
+        target_run_verifier=target_run_verifier,
+    )
+    if (
+        target_evidence != material.target_evidence
+        or missing != material.missing_target_refs
+    ):
+        raise OwnerConflict("bundle_report_evidence_stale")
+
+
+_BUNDLE_REPORT_INSERT_SQL = (
+    "INSERT INTO ar_bundle_reports (report_ref, run_ref, ordinal, request_ref, "
+    "attempt_ref, fence_ref, formal_plan_ref, plan_document_hash, "
+    "formal_plan_content_receipt_ref, formal_plan_content_receipt_hash, "
+    "formal_plan_projection_digest, formal_plan_projection_receipt_ref, "
+    "formal_plan_projection_receipt_hash, completion_contract_hash, "
+    "formal_plan_briefs_hash, "
+    "target_graph_ref, target_graph_generation, target_set_hash, coverage_hash, "
+    "target_graph_receipt_ref, target_graph_receipt_hash, target_refs_json, "
+    "target_refs_hash, notice_refs_json, notice_refs_hash, "
+    "handoff_manifest_refs_json, handoff_manifest_refs_hash, "
+    "target_commit_receipts_json, target_commit_receipts_hash, report_json, "
+    "report_hash, disposition, idempotency_key, request_hash, receipt_ref, "
+    "receipt_hash, accepted_at) VALUES (:report_ref, :run_ref, :ordinal, "
+    ":request_ref, :attempt_ref, :fence_ref, :formal_plan_ref, "
+    ":plan_document_hash, :formal_plan_content_receipt_ref, "
+    ":formal_plan_content_receipt_hash, :formal_plan_projection_digest, "
+    ":formal_plan_projection_receipt_ref, "
+    ":formal_plan_projection_receipt_hash, :completion_contract_hash, "
+    ":formal_plan_briefs_hash, :target_graph_ref, "
+    ":target_graph_generation, :target_set_hash, :coverage_hash, "
+    ":target_graph_receipt_ref, :target_graph_receipt_hash, :target_refs_json, "
+    ":target_refs_hash, :notice_refs_json, :notice_refs_hash, "
+    ":handoff_manifest_refs_json, :handoff_manifest_refs_hash, "
+    ":target_commit_receipts_json, :target_commit_receipts_hash, :report_json, "
+    ":report_hash, :disposition, :idempotency_key, :request_hash, :receipt_ref, "
+    ":receipt_hash, :accepted_at)"
+)
+
+
+def _bundle_report_ref_tuple(
+    document: str,
+    digest: str,
+    *,
+    error_code: str,
+) -> tuple[str, ...]:
+    try:
+        value = json.loads(document)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise OwnerConflict(error_code) from error
+    if (
+        type(value) is not list
+        or any(type(item) is not str or not item for item in value)
+        or len(value) != len(set(value))
+        or canonical_json(value) != document
+        or canonical_hash(value) != digest
+    ):
+        raise OwnerConflict(error_code)
+    return tuple(cast(list[str], value))
+
+
+def _bundle_report_receipt_tuple(
+    document: str,
+    digest: str,
+) -> tuple[AcceptanceReceipt, ...]:
+    try:
+        value = json.loads(document)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise OwnerConflict("bundle_report_receipt_invalid") from error
+    if (
+        type(value) is not list
+        or canonical_json(value) != document
+        or canonical_hash(value) != digest
+    ):
+        raise OwnerConflict("bundle_report_receipt_invalid")
+    receipts = tuple(
+        _acceptance_receipt_from_public(
+            item, error_code="bundle_report_receipt_invalid"
+        )
+        for item in value
+    )
+    if len(receipts) != len({receipt.receipt_ref for receipt in receipts}):
+        raise OwnerConflict("bundle_report_receipt_invalid")
+    return receipts
+
+
+def _bundle_report_row_bindings(row) -> dict[str, object]:
+    return {
+        "report_ref": row.report_ref,
+        "run_ref": row.run_ref,
+        "ordinal": int(row.ordinal),
+        "request_ref": row.request_ref,
+        "attempt_ref": row.attempt_ref,
+        "fence_ref": row.fence_ref,
+        "formal_plan_ref": row.formal_plan_ref,
+        "plan_document_hash": row.plan_document_hash,
+        "formal_plan_content_receipt_ref": (
+            row.formal_plan_content_receipt_ref
+        ),
+        "formal_plan_content_receipt_hash": (
+            row.formal_plan_content_receipt_hash
+        ),
+        "formal_plan_projection_digest": row.formal_plan_projection_digest,
+        "formal_plan_projection_receipt_ref": (
+            row.formal_plan_projection_receipt_ref
+        ),
+        "formal_plan_projection_receipt_hash": (
+            row.formal_plan_projection_receipt_hash
+        ),
+        "completion_contract_hash": row.completion_contract_hash,
+        "formal_plan_briefs_hash": row.formal_plan_briefs_hash,
+        "target_graph_ref": row.target_graph_ref,
+        "target_graph_generation": int(row.target_graph_generation),
+        "target_set_hash": row.target_set_hash,
+        "coverage_hash": row.coverage_hash,
+        "target_graph_receipt_ref": row.target_graph_receipt_ref,
+        "target_graph_receipt_hash": row.target_graph_receipt_hash,
+        "target_refs_hash": row.target_refs_hash,
+        "notice_refs_hash": row.notice_refs_hash,
+        "handoff_manifest_refs_hash": row.handoff_manifest_refs_hash,
+        "target_commit_receipts_hash": row.target_commit_receipts_hash,
+        "report_hash": row.report_hash,
+        "disposition": row.disposition,
+    }
+
+
+def _verified_bundle_report_from_row(
+    database: Database,
+    verifier: BundleReportEvidenceVerifier,
+    *,
+    target_run_verifier: TargetRunHarnessVerifier | None,
+    row,
+    run,
+    receipt: AcceptanceReceipt,
+) -> VerifiedBundleReportReceipt:
+    projection_columns = (
+        row.formal_plan_projection_digest,
+        row.formal_plan_projection_receipt_ref,
+        row.formal_plan_projection_receipt_hash,
+        row.completion_contract_hash,
+        row.formal_plan_briefs_hash,
+    )
+    if any(type(value) is not str or not value for value in projection_columns):
+        # Rows accepted while a deployment was stopped at 0021 remain readable
+        # migration history.  They cannot be relabelled as the canonical
+        # FormalPlan projection introduced by 0022, nor can they authorize a
+        # RunCompletion or StageCommit.
+        raise OwnerConflict("bundle_report_formal_plan_projection_required")
+    report = _stored_bundle_record(
+        row.report_json,
+        row.report_hash,
+        BundleReport,
+        "bundle_report_receipt_invalid",
+    )
+    try:
+        validate_bundle_report(report)
+    except BundleProtocolError as error:
+        raise OwnerConflict("bundle_report_receipt_invalid") from error
+    target_refs = _bundle_report_ref_tuple(
+        row.target_refs_json,
+        row.target_refs_hash,
+        error_code="bundle_report_receipt_invalid",
+    )
+    notice_refs = _bundle_report_ref_tuple(
+        row.notice_refs_json,
+        row.notice_refs_hash,
+        error_code="bundle_report_receipt_invalid",
+    )
+    handoff_manifest_refs = _bundle_report_ref_tuple(
+        row.handoff_manifest_refs_json,
+        row.handoff_manifest_refs_hash,
+        error_code="bundle_report_receipt_invalid",
+    )
+    target_commit_receipts = _bundle_report_receipt_tuple(
+        row.target_commit_receipts_json,
+        row.target_commit_receipts_hash,
+    )
+    formal_plan_content_receipt = AcceptanceReceipt(
+        issuer="research_graph",
+        kind="formal_plan_content_accepted",
+        receipt_ref=row.formal_plan_content_receipt_ref,
+        subject_ref=row.plan_document_hash,
+        payload_hash=row.formal_plan_content_receipt_hash,
+    )
+    formal_plan_projection_receipt = AcceptanceReceipt(
+        issuer="research_graph",
+        kind="target_formal_plan_projection_accepted",
+        receipt_ref=row.formal_plan_projection_receipt_ref,
+        subject_ref=row.formal_plan_projection_digest,
+        payload_hash=row.formal_plan_projection_receipt_hash,
+    )
+    target_graph_receipt = AcceptanceReceipt(
+        issuer="research_graph",
+        kind="target_graph_accepted",
+        receipt_ref=row.target_graph_receipt_ref,
+        subject_ref=row.target_graph_ref,
+        payload_hash=row.target_graph_receipt_hash,
+    )
+    expected_receipt = AcceptanceReceipt(
+        issuer=AR_OWNER,
+        kind=BUNDLE_REPORT_RECEIPT_KIND,
+        receipt_ref=row.receipt_ref,
+        subject_ref=row.report_ref,
+        payload_hash=row.receipt_hash,
+    )
+    if (
+        receipt != expected_receipt
+        or row.receipt_hash
+        != _owner_receipt_hash(
+            BUNDLE_REPORT_RECEIPT_KIND,
+            row.report_ref,
+            _bundle_report_row_bindings(row),
+        )
+        or row.request_ref != run.request_ref
+        or row.run_ref != run.run_ref
+        or row.attempt_ref != run.current_attempt_ref
+        or row.fence_ref != run.current_fence_ref
+        or row.formal_plan_ref != report.formal_plan_ref
+        or row.request_ref != report.stage_request_ref
+        or row.disposition != report.disposition
+    ):
+        raise OwnerConflict("bundle_report_receipt_invalid")
+    material = _prepare_bundle_report_material(
+        database,
+        verifier,
+        target_run_verifier=target_run_verifier,
+        request_ref=row.request_ref,
+        run_ref=row.run_ref,
+        disposition=row.disposition,
+        formal_plan_content_receipt=formal_plan_content_receipt,
+        formal_plan_projection_receipt=formal_plan_projection_receipt,
+        target_graph_ref=row.target_graph_ref,
+        target_graph_receipt=target_graph_receipt,
+        expected_report=report,
+    )
+    material_values = _bundle_report_material_sql_values(material)
+    row_values = {
+        name: getattr(row, name)
+        for name in material_values
+    }
+    if (
+        row_values != material_values
+        or material.target_refs != target_refs
+        or material.notice_refs != notice_refs
+        or material.handoff_manifest_refs != handoff_manifest_refs
+        or material.target_commit_receipts != target_commit_receipts
+    ):
+        raise OwnerConflict("bundle_report_receipt_invalid")
+    return VerifiedBundleReportReceipt(
+        report_ref=row.report_ref,
+        request_ref=row.request_ref,
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        formal_plan_ref=row.formal_plan_ref,
+        plan_document_hash=row.plan_document_hash,
+        formal_plan_content_receipt=formal_plan_content_receipt,
+        formal_plan_projection_digest=row.formal_plan_projection_digest,
+        formal_plan_projection_receipt=formal_plan_projection_receipt,
+        completion_contract_hash=row.completion_contract_hash,
+        formal_plan_briefs_hash=row.formal_plan_briefs_hash,
+        target_graph_ref=row.target_graph_ref,
+        target_graph_generation=int(row.target_graph_generation),
+        target_set_hash=row.target_set_hash,
+        coverage_hash=row.coverage_hash,
+        target_graph_receipt=target_graph_receipt,
+        target_refs=target_refs,
+        notice_refs=notice_refs,
+        handoff_manifest_refs=handoff_manifest_refs,
+        accepted_measurement_closures=(
+            material.accepted_measurement_closures
+        ),
+        target_commit_receipts=target_commit_receipts,
+        report=report,
+        report_hash=row.report_hash,
+        receipt=receipt,
+    )
+
+
+def _target_frontier_from_row(
+    row,
+    request: TargetLaunchRequest,
+) -> TargetFrontierEntry:
+    handle = _target_work_handle_from_json(row.current_handle_json)
+    if canonical_hash(projection_plain_value(handle)) != row.current_handle_hash:
+        raise OwnerConflict("target_frontier_integrity_invalid")
+    entry = TargetFrontierEntry(
+        target_ref=row.target_ref,
+        target_spec_binding=ContentBindingProof(
+            subject_ref=row.target_ref,
+            content_hash_ref=row.target_spec_content_hash_ref,
+        ),
+        target_spec_acceptance_receipt=ReceiptProof(
+            receipt_ref=row.target_spec_receipt_ref,
+            subject_ref=row.target_spec_receipt_subject_ref,
+            verified=True,
+            currentness_known=True,
+            current=True,
+        ),
+        state_revision=int(row.state_revision),
+        state=row.state,
+        current_handle=handle,
+        terminal_fact_ref=row.terminal_fact_ref,
+        currentness_known=bool(row.currentness_known),
+        current=bool(row.current),
+    )
+    return _target_frontier_from_values(entry, request)
+
+
+def _target_frontier_from_values(
+    entry: TargetFrontierEntry,
+    request: TargetLaunchRequest,
+) -> TargetFrontierEntry:
+    try:
+        validate_target_frontier_entry(
+            entry,
+            target_ref=request.target_ref,
+            target_spec_binding=request.target_spec_binding,
+            target_spec_acceptance_receipt=request.target_spec_acceptance_receipt,
+            accepted_input_target_commit_refs=(
+                request.accepted_input_target_commit_refs
+            ),
+            accepted_input_asset_refs=request.accepted_input_asset_refs,
+        )
+    except (BundleProtocolError, TargetRunContractError) as error:
+        raise OwnerConflict("target_frontier_integrity_invalid") from error
+    return entry
+
+
+def _target_frontier_and_request_for_local_write(
+    connection,
+    target_ref: str,
+) -> tuple[TargetFrontierEntry, TargetLaunchRequest]:
+    row = connection.execute(
+        text(
+            "SELECT * FROM ar_target_frontier_entries WHERE target_ref = "
+            ":target_ref"
+        ),
+        {"target_ref": target_ref},
+    ).first()
+    launch = connection.execute(
+        text("SELECT * FROM ar_target_launches WHERE target_ref = :target_ref"),
+        {"target_ref": target_ref},
+    ).first()
+    if row is None or launch is None or row.launch_ref != launch.launch_ref:
+        raise OwnerConflict("target_frontier_integrity_invalid")
+    request = _target_launch_request_from_row(launch)
+    _target_launch_ack(launch, request)
+    return _target_frontier_from_row(row, request), request
+
+
+def _target_frontier_for_local_write(
+    connection,
+    target_ref: str,
+) -> TargetFrontierEntry:
+    return _target_frontier_and_request_for_local_write(connection, target_ref)[0]
+
+
+def _target_notice_from_row(row) -> TargetWorkNotice:
+    notice = _stored_bundle_record(
+        row.notice_json,
+        row.notice_hash,
+        TargetWorkNotice,
+        "target_work_notice_integrity_invalid",
+    )
+    try:
+        validate_target_work_notice(notice)
+    except BundleProtocolError as error:
+        raise OwnerConflict("target_work_notice_integrity_invalid") from error
+    if (
+        notice.notice_ref != row.notice_ref
+        or notice.sequence != int(row.sequence)
+        or notice.terminal_transition_ref != row.terminal_transition_ref
+        or notice.target_ref != row.target_ref
+        or notice.handoff_manifest_ref != row.manifest_ref
+        or notice.kind != row.kind
+    ):
+        raise OwnerConflict("target_work_notice_integrity_invalid")
+    return notice
+
+
+def _bundle_inbox_checkpoint_payload(
+    *,
+    checkpoint_ref: str,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+    checkpoint_revision: int,
+    cursor: int,
+    generation: int,
+    batch_hash: str,
+) -> dict[str, object]:
+    return {
+        "schema_ref": BUNDLE_INBOX_CHECKPOINT_SCHEMA,
+        "checkpoint_ref": checkpoint_ref,
+        "run_ref": run_ref,
+        "attempt_ref": attempt_ref,
+        "fence_ref": fence_ref,
+        "checkpoint_revision": checkpoint_revision,
+        "cursor": cursor,
+        "generation": generation,
+        "batch_hash": batch_hash,
+        "closed": True,
+    }
+
+
+def _bundle_inbox_checkpoint_from_row(row) -> BundleInboxCheckpoint:
+    payload = _bundle_inbox_checkpoint_payload(
+        checkpoint_ref=row.checkpoint_ref,
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        checkpoint_revision=int(row.checkpoint_revision),
+        cursor=int(row.cursor),
+        generation=int(row.generation),
+        batch_hash=row.batch_hash,
+    )
+    checkpoint_hash = canonical_hash(payload)
+    bindings = {**payload, "checkpoint_hash": checkpoint_hash}
+    if (
+        row.checkpoint_hash != checkpoint_hash
+        or row.receipt_hash
+        != _owner_receipt_hash(
+            BUNDLE_INBOX_CHECKPOINT_RECEIPT_KIND,
+            row.checkpoint_ref,
+            bindings,
+        )
+    ):
+        raise OwnerConflict("bundle_inbox_checkpoint_integrity_invalid")
+    checkpoint = BundleInboxCheckpoint(
+        checkpoint_ref=row.checkpoint_ref,
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        checkpoint_revision=int(row.checkpoint_revision),
+        cursor=int(row.cursor),
+        generation=int(row.generation),
+        batch_hash=row.batch_hash,
+        checkpoint_hash=checkpoint_hash,
+        receipt=AcceptanceReceipt(
+            issuer=AR_OWNER,
+            kind=BUNDLE_INBOX_CHECKPOINT_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.checkpoint_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+    validate_bundle_inbox_checkpoint(checkpoint)
+    return checkpoint
+
+
+def validate_bundle_inbox_checkpoint(
+    checkpoint: BundleInboxCheckpoint,
+) -> str:
+    if type(checkpoint) is not BundleInboxCheckpoint:
+        raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+    payload = _bundle_inbox_checkpoint_payload(
+        checkpoint_ref=checkpoint.checkpoint_ref,
+        run_ref=checkpoint.run_ref,
+        attempt_ref=checkpoint.attempt_ref,
+        fence_ref=checkpoint.fence_ref,
+        checkpoint_revision=checkpoint.checkpoint_revision,
+        cursor=checkpoint.cursor,
+        generation=checkpoint.generation,
+        batch_hash=checkpoint.batch_hash,
+    )
+    if (
+        checkpoint.schema_ref != BUNDLE_INBOX_CHECKPOINT_SCHEMA
+        or any(
+            type(value) is not str or not value
+            for value in (
+                checkpoint.checkpoint_ref,
+                checkpoint.run_ref,
+                checkpoint.attempt_ref,
+                checkpoint.fence_ref,
+            )
+        )
+        or type(checkpoint.checkpoint_revision) is not int
+        or checkpoint.checkpoint_revision < 1
+        or type(checkpoint.cursor) is not int
+        or checkpoint.cursor < 0
+        or type(checkpoint.generation) is not int
+        or checkpoint.generation < 0
+        or type(checkpoint.batch_hash) is not str
+        or len(checkpoint.batch_hash) != 64
+        or checkpoint.checkpoint_hash != canonical_hash(payload)
+        or checkpoint.receipt.issuer != AR_OWNER
+        or checkpoint.receipt.kind != BUNDLE_INBOX_CHECKPOINT_RECEIPT_KIND
+        or checkpoint.receipt.subject_ref != checkpoint.checkpoint_ref
+        or len(checkpoint.receipt.payload_hash) != 64
+    ):
+        raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+    return checkpoint.checkpoint_hash
+
+
+def validate_bundle_inbox_checkpoint_projection(
+    value: object,
+    *,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+) -> str:
+    """Validate the exact closed value exposed to a Bundle root Skill."""
+
+    expected_fields = {
+        "schema_ref",
+        "checkpoint_ref",
+        "run_ref",
+        "attempt_ref",
+        "fence_ref",
+        "checkpoint_revision",
+        "cursor",
+        "generation",
+        "batch_hash",
+        "checkpoint_hash",
+        "closed",
+        "receipt",
+    }
+    receipt_fields = {
+        "status",
+        "issuer",
+        "kind",
+        "receipt_ref",
+        "subject_ref",
+        "payload_hash",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+    projection = cast(dict[str, object], value)
+    receipt = projection.get("receipt")
+    if type(receipt) is not dict or set(receipt) != receipt_fields:
+        raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+    receipt_value = cast(dict[str, object], receipt)
+    payload = {
+        name: projection[name]
+        for name in expected_fields
+        if name not in {"checkpoint_hash", "receipt"}
+    }
+    checkpoint_ref = projection.get("checkpoint_ref")
+    if (
+        projection.get("schema_ref") != BUNDLE_INBOX_CHECKPOINT_SCHEMA
+        or projection.get("run_ref") != run_ref
+        or projection.get("attempt_ref") != attempt_ref
+        or projection.get("fence_ref") != fence_ref
+        or projection.get("closed") is not True
+        or type(checkpoint_ref) is not str
+        or not checkpoint_ref
+        or type(projection.get("checkpoint_revision")) is not int
+        or cast(int, projection["checkpoint_revision"]) < 1
+        or type(projection.get("cursor")) is not int
+        or cast(int, projection["cursor"]) < 0
+        or type(projection.get("generation")) is not int
+        or cast(int, projection["generation"]) < 0
+        or type(projection.get("batch_hash")) is not str
+        or len(cast(str, projection["batch_hash"])) != 64
+        or projection.get("checkpoint_hash") != canonical_hash(payload)
+        or receipt_value.get("status") != "accepted"
+        or receipt_value.get("issuer") != AR_OWNER
+        or receipt_value.get("kind") != BUNDLE_INBOX_CHECKPOINT_RECEIPT_KIND
+        or receipt_value.get("subject_ref") != checkpoint_ref
+        or type(receipt_value.get("receipt_ref")) is not str
+        or not cast(str, receipt_value["receipt_ref"])
+        or type(receipt_value.get("payload_hash")) is not str
+        or len(cast(str, receipt_value["payload_hash"])) != 64
+    ):
+        raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+    try:
+        encoded = canonical_json(projection).encode("utf-8")
+    except (UnicodeError, TypeError, ValueError) as error:
+        raise OwnerConflict("bundle_inbox_checkpoint_invalid") from error
+    if len(encoded) > 16 * 1024:
+        raise OwnerConflict("bundle_inbox_checkpoint_invalid")
+    return cast(str, projection["checkpoint_hash"])
+
+
+def _scoped_bundle_inbox_batch(
+    connection,
+    *,
+    run_ref: str,
+    after_cursor: int,
+    generation: int,
+    limit: int,
+) -> BundleInboxBatch:
+    rows = connection.execute(
+        text(
+            "SELECT notices.*, entries.sequence AS scoped_sequence FROM "
+            "ar_bundle_inbox_entries entries JOIN ar_target_work_notices "
+            "notices ON notices.notice_ref = entries.notice_ref WHERE "
+            "entries.run_ref = :run_ref AND entries.sequence > :after_cursor "
+            "ORDER BY entries.sequence LIMIT :limit"
+        ),
+        {"run_ref": run_ref, "after_cursor": after_cursor, "limit": limit},
+    ).all()
+    notices = tuple(
+        replace(
+            _target_notice_from_row(row),
+            sequence=int(row.scoped_sequence),
+        )
+        for row in rows
+    )
+    batch = BundleInboxBatch(
+        after_cursor=after_cursor,
+        next_cursor=notices[-1].sequence if notices else after_cursor,
+        generation=generation,
+        notices=notices,
+    )
+    try:
+        validate_bundle_inbox_batch(batch)
+    except BundleProtocolError as error:
+        raise OwnerConflict("bundle_inbox_integrity_invalid") from error
+    return batch
+
+
+def _bundle_inbox_operation_binding_payload(
+    *,
+    operation_kind: str,
+    operation_ref: str,
+    checkpoint: BundleInboxCheckpoint,
+) -> dict[str, object]:
+    return {
+        "schema_ref": "meta-research/bundle-inbox-operation-checkpoint/v1",
+        "operation_kind": operation_kind,
+        "operation_ref": operation_ref,
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "checkpoint_hash": checkpoint.checkpoint_hash,
+    }
+
+
+def _bind_bundle_inbox_operation_checkpoint(
+    connection,
+    *,
+    operation_kind: str,
+    operation_ref: str,
+    checkpoint: BundleInboxCheckpoint,
+    now: float,
+) -> None:
+    if operation_kind not in {"target_proposal", "dispatch"}:
+        raise OwnerConflict("bundle_inbox_operation_kind_invalid")
+    _require_current_bundle_inbox_checkpoint(
+        connection,
+        checkpoint,
+        run_ref=checkpoint.run_ref,
+        attempt_ref=checkpoint.attempt_ref,
+        fence_ref=checkpoint.fence_ref,
+    )
+    payload = _bundle_inbox_operation_binding_payload(
+        operation_kind=operation_kind,
+        operation_ref=operation_ref,
+        checkpoint=checkpoint,
+    )
+    binding_hash = canonical_hash(payload)
+    receipt_ref = new_ref("ar_bundle_inbox_operation_checkpoint_receipt")
+    receipt_hash = _owner_receipt_hash(
+        BUNDLE_INBOX_OPERATION_CHECKPOINT_RECEIPT_KIND,
+        operation_ref,
+        {**payload, "binding_hash": binding_hash},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO ar_bundle_inbox_operation_checkpoints "
+            "(operation_kind, operation_ref, checkpoint_ref, checkpoint_hash, "
+            "binding_hash, receipt_ref, receipt_hash, bound_at) VALUES "
+            "(:operation_kind, :operation_ref, :checkpoint_ref, "
+            ":checkpoint_hash, :binding_hash, :receipt_ref, :receipt_hash, "
+            ":bound_at)"
+        ),
+        {
+            **payload,
+            "binding_hash": binding_hash,
+            "receipt_ref": receipt_ref,
+            "receipt_hash": receipt_hash,
+            "bound_at": now,
+        },
+    )
+
+
+def _bundle_inbox_checkpoint_for_operation(
+    connection,
+    *,
+    operation_kind: str,
+    operation_ref: str,
+    require_current: bool,
+) -> BundleInboxCheckpoint:
+    binding = connection.execute(
+        text(
+            "SELECT * FROM ar_bundle_inbox_operation_checkpoints WHERE "
+            "operation_kind = :operation_kind AND operation_ref = :operation_ref"
+        ),
+        {"operation_kind": operation_kind, "operation_ref": operation_ref},
+    ).first()
+    checkpoint_row = (
+        None
+        if binding is None
+        else connection.execute(
+            text(
+                "SELECT * FROM ar_bundle_inbox_checkpoints WHERE checkpoint_ref = "
+                ":checkpoint_ref"
+            ),
+            {"checkpoint_ref": binding.checkpoint_ref},
+        ).first()
+    )
+    if binding is None or checkpoint_row is None:
+        raise OwnerConflict("bundle_inbox_operation_checkpoint_missing")
+    checkpoint = _bundle_inbox_checkpoint_from_row(checkpoint_row)
+    payload = _bundle_inbox_operation_binding_payload(
+        operation_kind=operation_kind,
+        operation_ref=operation_ref,
+        checkpoint=checkpoint,
+    )
+    binding_hash = canonical_hash(payload)
+    if (
+        binding.operation_kind != operation_kind
+        or binding.operation_ref != operation_ref
+        or binding.checkpoint_ref != checkpoint.checkpoint_ref
+        or binding.checkpoint_hash != checkpoint.checkpoint_hash
+        or binding.binding_hash != binding_hash
+        or binding.receipt_hash
+        != _owner_receipt_hash(
+            BUNDLE_INBOX_OPERATION_CHECKPOINT_RECEIPT_KIND,
+            operation_ref,
+            {**payload, "binding_hash": binding_hash},
+        )
+    ):
+        raise OwnerConflict("bundle_inbox_operation_checkpoint_invalid")
+    if require_current:
+        _require_current_bundle_inbox_checkpoint(
+            connection,
+            checkpoint,
+            run_ref=checkpoint.run_ref,
+            attempt_ref=checkpoint.attempt_ref,
+            fence_ref=checkpoint.fence_ref,
+        )
+    return checkpoint
+
+
+def _require_current_bundle_inbox_checkpoint(
+    connection,
+    checkpoint: BundleInboxCheckpoint,
+    *,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+) -> BundleInboxCheckpoint:
+    validate_bundle_inbox_checkpoint(checkpoint)
+    row = connection.execute(
+        text(
+            "SELECT * FROM ar_bundle_inbox_checkpoints WHERE checkpoint_ref = "
+            ":checkpoint_ref"
+        ),
+        {"checkpoint_ref": checkpoint.checkpoint_ref},
+    ).first()
+    scope = connection.execute(
+        text(
+            "SELECT * FROM ar_bundle_inbox_scopes WHERE run_ref = :run_ref"
+        ),
+        {"run_ref": run_ref},
+    ).first()
+    stage_run = connection.execute(
+        text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+        {"run_ref": run_ref},
+    ).first()
+    if row is None or scope is None or stage_run is None:
+        raise OwnerConflict("bundle_inbox_checkpoint_stale")
+    stored = _bundle_inbox_checkpoint_from_row(row)
+    if (
+        stored != checkpoint
+        or checkpoint.run_ref != run_ref
+        or checkpoint.attempt_ref != attempt_ref
+        or checkpoint.fence_ref != fence_ref
+        or stage_run.stage != "bundle"
+        or stage_run.current_attempt_ref != attempt_ref
+        or stage_run.current_fence_ref != fence_ref
+        or stage_run.status not in {"running", "awaiting_acceptance"}
+        or scope.current_checkpoint_ref != checkpoint.checkpoint_ref
+        or bool(scope.wake_pending)
+        or int(scope.acknowledged_cursor) != checkpoint.cursor
+        or int(scope.next_sequence) - 1 != checkpoint.cursor
+        or int(scope.generation) != checkpoint.generation
+    ):
+        raise OwnerConflict("bundle_inbox_checkpoint_stale")
+    return stored
+
+
+@dataclass(frozen=True)
+class _TargetRunCurrentContext:
+    request: TargetLaunchRequest
+    frontier: TargetFrontierEntry
+    monitor: object
+    activation_ref: str
+
+
+def _query_verified_target_commit_transition(
+    verifier: TargetGraphReceiptVerifier,
+    *,
+    target_ref: str,
+    handle: TargetWorkHandle,
+) -> AcceptedTargetCommitTransition | None:
+    """Re-read RG's exact post-commit/pre-handoff issuer chain.
+
+    ``None`` has the narrow meaning "this Target has no TargetCommit".  Any
+    returned value must close over the same AR-owned current Target identity;
+    it is never a permission to loosen currentness for another Attempt/Fence.
+    """
+
+    try:
+        transition = verifier.query_target_frontier_commit_transition(target_ref)
+    except AttributeError as error:
+        raise OwnerConflict(
+            "target_commit_transition_verifier_unavailable"
+        ) from error
+    if transition is None:
+        return None
+    if type(transition) is not AcceptedTargetCommitTransition:
+        raise OwnerConflict("target_commit_transition_invalid")
+    terminal = transition.canonical_terminal
+    receipt = transition.issuer_receipt
+    try:
+        validate_closed_bundle_projection(
+            terminal,
+            "TargetCommitTransitionTerminal",
+        )
+    except BundleProtocolError as error:
+        raise OwnerConflict("target_commit_transition_invalid") from error
+    if (
+        type(terminal) is not AcceptedMeasurementClosure
+        or type(receipt) is not AcceptanceReceipt
+        or any(
+            type(value) is not str or not value
+            for value in (
+                transition.target_ref,
+                transition.target_run_ref,
+                transition.execution_attempt_ref,
+                transition.execution_fence_ref,
+                transition.target_commit_ref,
+                transition.target_execution_closure_ref,
+                receipt.receipt_ref,
+                receipt.subject_ref,
+            )
+        )
+        or transition.target_ref != target_ref
+        or transition.target_ref != handle.target_ref
+        or transition.target_run_ref != handle.target_run_ref
+        or transition.execution_attempt_ref != handle.execution_attempt_ref
+        or transition.execution_fence_ref != handle.execution_fence_ref
+        or terminal.target_ref != transition.target_ref
+        or terminal.target_run_ref != transition.target_run_ref
+        or terminal.execution_attempt_ref != transition.execution_attempt_ref
+        or terminal.execution_fence_ref != transition.execution_fence_ref
+        or terminal.target_commit_ref != transition.target_commit_ref
+        or receipt.issuer != "research_graph"
+        or receipt.kind != "target_commit_accepted"
+        or receipt.subject_ref != transition.target_commit_ref
+        or terminal.rg_target_commit_receipt.receipt_ref != receipt.receipt_ref
+        or terminal.rg_target_commit_receipt.subject_ref
+        != transition.target_commit_ref
+        or type(receipt.payload_hash) is not str
+        or len(receipt.payload_hash) != 64
+        or terminal.formal_measurement_accepted is not True
+        or terminal.currentness_known is not True
+        or terminal.current is not True
+    ):
+        raise OwnerConflict("target_commit_transition_invalid")
+    return transition
+
+
+@dataclass(frozen=True)
+class _VerifiedTargetRootPublication:
+    lifecycle: object
+    completion: object
+    handle: TargetWorkHandle
+    terminal: AcceptedMeasurementClosure
+    transition: AcceptedTargetCommitTransition
+    completion_receipt: ReceiptProof
+
+
+def _query_verified_target_root_publication(
+    *,
+    completion_reader: TargetRootCompletionReader | None,
+    graph_verifier: TargetGraphReceiptVerifier | None,
+    target_ref: str,
+    completion_ref: str,
+    target_commit_ref: str,
+) -> _VerifiedTargetRootPublication:
+    """Re-enter AR and RG for one refs-only root-completion publication."""
+
+    if (
+        completion_reader is None
+        or graph_verifier is None
+        or any(
+            type(value) is not str
+            or not value
+            or value != value.strip()
+            or len(value.encode("utf-8")) > 128
+            for value in (target_ref, completion_ref, target_commit_ref)
+        )
+    ):
+        raise OwnerConflict("target_root_completion_publication_invalid")
+    try:
+        lifecycle = completion_reader.query(target_ref)
+        completion = completion_reader.query_completion(target_ref)
+        handle = getattr(completion, "handle", None)
+        receipt = getattr(completion, "receipt", None)
+    except Exception as error:
+        raise OwnerConflict(
+            "target_root_completion_publication_authority_invalid"
+        ) from error
+    if type(handle) is not TargetWorkHandle or type(receipt) is not AcceptanceReceipt:
+        raise OwnerConflict("target_root_completion_publication_authority_invalid")
+    if (
+        lifecycle is None
+        or completion is None
+        or getattr(lifecycle, "target_ref", None) != target_ref
+        or getattr(lifecycle, "target_run_ref", None) != handle.target_run_ref
+        or getattr(lifecycle, "root_session_ref", None) != handle.root_session_ref
+        or getattr(lifecycle, "target_attempt_ref", None)
+        != handle.execution_attempt_ref
+        or getattr(lifecycle, "target_fence_ref", None)
+        != handle.execution_fence_ref
+        or getattr(lifecycle, "completion_ref", None) != completion_ref
+        or getattr(lifecycle, "status", None) not in {"finalizing", "completed"}
+        or getattr(completion, "completion_ref", None) != completion_ref
+        or handle.target_ref != target_ref
+        or receipt.issuer != AR_OWNER
+        or receipt.kind != TARGET_ROOT_COMPLETION_RECEIPT_KIND
+        or receipt.subject_ref != handle.execution_attempt_ref
+        or type(receipt.payload_hash) is not str
+        or len(receipt.payload_hash) != 64
+    ):
+        raise OwnerConflict("target_root_completion_publication_authority_invalid")
+    completion_receipt = ReceiptProof(
+        receipt_ref=receipt.receipt_ref,
+        subject_ref=receipt.subject_ref,
+        verified=True,
+        currentness_known=True,
+        current=True,
+    )
+    try:
+        transition = _query_verified_target_commit_transition(
+            graph_verifier,
+            target_ref=target_ref,
+            handle=handle,
+        )
+    except Exception as error:
+        raise OwnerConflict(
+            "target_root_completion_publication_authority_invalid"
+        ) from error
+    terminal = None if transition is None else transition.canonical_terminal
+    if (
+        transition is None
+        or type(terminal) is not AcceptedMeasurementClosure
+        or not _is_target_root_completion_terminal(terminal)
+        or transition.target_commit_ref != target_commit_ref
+        or transition.target_execution_closure_ref != completion_ref
+        or terminal.target_commit_ref != target_commit_ref
+        or terminal.ar_execution_receipt != completion_receipt
+        or getattr(terminal, "root_completion_receipt", None)
+        != completion_receipt
+        or terminal.implementation_revision_ref
+        != getattr(completion, "implementation_revision_ref", None)
+        or getattr(terminal, "code_review", None) is not None
+        or getattr(terminal, "result_review", None) is not None
+    ):
+        raise OwnerConflict("target_root_completion_publication_authority_invalid")
+    return _VerifiedTargetRootPublication(
+        lifecycle=lifecycle,
+        completion=completion,
+        handle=handle,
+        terminal=terminal,
+        transition=transition,
+        completion_receipt=completion_receipt,
+    )
+
+
+def _target_run_current_context(
+    connection, target_ref: str
+) -> _TargetRunCurrentContext:
+    """Verify the small current TargetRun closure shared by daemon/handoff."""
+
+    frontier, request = _target_frontier_and_request_for_local_write(
+        connection, target_ref
+    )
+    activation = connection.execute(
+        text(
+            "SELECT activation_ref, target_ref, launch_ref, target_run_ref, "
+            "root_session_ref, execution_attempt_ref, execution_fence_ref, "
+            "initial_handle_json, initial_handle_hash FROM "
+            "ar_target_run_activations WHERE target_ref = :target_ref"
+        ),
+        {"target_ref": target_ref},
+    ).first()
+    launch = connection.execute(
+        text(
+            "SELECT launch_ref, target_run_ref FROM ar_target_launches WHERE "
+            "target_ref = :target_ref"
+        ),
+        {"target_ref": target_ref},
+    ).first()
+    monitor = connection.execute(
+        text(
+            "SELECT * FROM ar_target_monitor_states WHERE target_ref = :target_ref"
+        ),
+        {"target_ref": target_ref},
+    ).first()
+    current_handle_row = connection.execute(
+        text(
+            "SELECT * FROM ar_target_run_handles WHERE target_ref = :target_ref "
+            "ORDER BY ordinal DESC LIMIT 1"
+        ),
+        {"target_ref": target_ref},
+    ).first()
+    first_handle_row = connection.execute(
+        text(
+            "SELECT * FROM ar_target_run_handles WHERE target_ref = :target_ref "
+            "ORDER BY ordinal LIMIT 1"
+        ),
+        {"target_ref": target_ref},
+    ).first()
+    handle_shape = connection.execute(
+        text(
+            "SELECT COUNT(*) AS handle_count, MIN(ordinal) AS first_ordinal, "
+            "MAX(ordinal) AS last_ordinal FROM ar_target_run_handles WHERE "
+            "target_ref = :target_ref"
+        ),
+        {"target_ref": target_ref},
+    ).one()
+    if (
+        activation is None
+        or launch is None
+        or monitor is None
+        or current_handle_row is None
+        or first_handle_row is None
+        or activation.target_ref != target_ref
+        or activation.launch_ref != launch.launch_ref
+    ):
+        raise OwnerConflict("target_run_checkpoint_integrity_invalid")
+    initial_handle = _stored_bundle_record(
+        activation.initial_handle_json,
+        activation.initial_handle_hash,
+        TargetWorkHandle,
+        "target_run_checkpoint_integrity_invalid",
+    )
+    first_handle = _stored_bundle_record(
+        first_handle_row.handle_json,
+        first_handle_row.handle_hash,
+        TargetWorkHandle,
+        "target_run_checkpoint_integrity_invalid",
+    )
+    current_handle = _stored_bundle_record(
+        current_handle_row.handle_json,
+        current_handle_row.handle_hash,
+        TargetWorkHandle,
+        "target_run_checkpoint_integrity_invalid",
+    )
+    current_identity = connection.execute(
+        text(
+            "SELECT first_handle_ordinal FROM ar_target_run_identities WHERE "
+            "target_run_ref = :target_run_ref AND target_ref = :target_ref"
+        ),
+        {
+            "target_run_ref": current_handle.target_run_ref,
+            "target_ref": target_ref,
+        },
+    ).first()
+    if (
+        current_identity is None
+        or initial_handle != first_handle
+        or activation.target_run_ref != initial_handle.target_run_ref
+        or activation.root_session_ref != initial_handle.root_session_ref
+        or activation.execution_attempt_ref
+        != initial_handle.execution_attempt_ref
+        or activation.execution_fence_ref != initial_handle.execution_fence_ref
+        or launch.target_run_ref != initial_handle.target_run_ref
+        or first_handle_row.target_ref != target_ref
+        or first_handle_row.target_run_ref != first_handle.target_run_ref
+        or first_handle_row.root_session_ref != first_handle.root_session_ref
+        or first_handle_row.execution_attempt_ref
+        != first_handle.execution_attempt_ref
+        or first_handle_row.execution_fence_ref
+        != first_handle.execution_fence_ref
+        or current_handle_row.target_ref != target_ref
+        or current_handle_row.target_run_ref != current_handle.target_run_ref
+        or current_handle_row.root_session_ref != current_handle.root_session_ref
+        or current_handle_row.execution_attempt_ref
+        != current_handle.execution_attempt_ref
+        or current_handle_row.execution_fence_ref
+        != current_handle.execution_fence_ref
+        or type(handle_shape.handle_count) is not int
+        or type(handle_shape.first_ordinal) is not int
+        or type(handle_shape.last_ordinal) is not int
+        or handle_shape.first_ordinal != 1
+        or handle_shape.last_ordinal != handle_shape.handle_count
+        or type(current_handle_row.ordinal) is not int
+        or current_handle_row.ordinal < 1
+        or current_handle_row.ordinal != handle_shape.last_ordinal
+        or type(first_handle_row.ordinal) is not int
+        or first_handle_row.ordinal != 1
+        or type(current_identity.first_handle_ordinal) is not int
+        or current_identity.first_handle_ordinal < 1
+        or current_identity.first_handle_ordinal > current_handle_row.ordinal
+        or frontier.current_handle != current_handle
+        or monitor.target_run_ref != current_handle.target_run_ref
+        or monitor.execution_attempt_ref != current_handle.execution_attempt_ref
+        or monitor.execution_fence_ref != current_handle.execution_fence_ref
+    ):
+        raise OwnerConflict("target_run_checkpoint_integrity_invalid")
+    return _TargetRunCurrentContext(
+        request=request,
+        frontier=frontier,
+        monitor=monitor,
+        activation_ref=activation.activation_ref,
+    )
+
+
+@dataclass(frozen=True)
+class _TargetHandoffContext:
+    request: TargetLaunchRequest
+    frontier: TargetFrontierEntry
+    monitor: object
+    candidate: TargetCandidate
+    formal_plan: FormalPlan
+    handles: tuple[TargetWorkHandle, ...]
+    preflights: tuple[TargetExecutionPreflight, ...]
+    review_scopes: tuple[CodeReviewScope, ...]
+    stop_decisions: tuple[StopDecisionProof, ...]
+    recovered_blockers: tuple[TechnicalBlocker, ...]
+    recovery_evidence_refs: tuple[str, ...]
+
+
+def _target_handoff_context(
+    connection,
+    target_ref: str,
+    *,
+    verifier: TargetRunHarnessVerifier | None = None,
+) -> _TargetHandoffContext:
+    current = _target_run_current_context(connection, target_ref)
+    _target_run_checkpoint_from_context(current)
+    frontier = current.frontier
+    request = current.request
+    activation = connection.execute(
+        text(
+            "SELECT * FROM ar_target_run_activations WHERE activation_ref = "
+            ":activation_ref"
+        ),
+        {"activation_ref": current.activation_ref},
+    ).first()
+    monitor = current.monitor
+    if activation is None:
+        raise OwnerConflict("target_run_handoff_integrity_invalid")
+    candidate = _stored_bundle_record(
+        activation.candidate_json,
+        activation.candidate_hash,
+        TargetCandidate,
+        "target_run_handoff_integrity_invalid",
+    )
+    formal_plan = _stored_bundle_record(
+        activation.formal_plan_json,
+        activation.formal_plan_hash,
+        FormalPlan,
+        "target_run_handoff_integrity_invalid",
+    )
+    handle_rows = connection.execute(
+        text(
+            "SELECT * FROM ar_target_run_handles WHERE target_ref = :target_ref "
+            "ORDER BY ordinal"
+        ),
+        {"target_ref": target_ref},
+    ).all()
+    target_run_identity_rows = connection.execute(
+        text(
+            "SELECT * FROM ar_target_run_identities WHERE target_ref = "
+            ":target_ref ORDER BY first_handle_ordinal"
+        ),
+        {"target_ref": target_ref},
+    ).all()
+    preflight_rows = connection.execute(
+        text(
+            "SELECT * FROM ar_target_run_preflights WHERE target_ref = "
+            ":target_ref ORDER BY ordinal"
+        ),
+        {"target_ref": target_ref},
+    ).all()
+    recovery_rows = connection.execute(
+        text(
+            "SELECT * FROM ar_target_run_recoveries WHERE target_ref = "
+            ":target_ref ORDER BY ordinal"
+        ),
+        {"target_ref": target_ref},
+    ).all()
+    stop_rows = connection.execute(
+        text(
+            "SELECT * FROM ar_target_stop_decisions WHERE target_ref = "
+            ":target_ref ORDER BY decision_ref"
+        ),
+        {"target_ref": target_ref},
+    ).all()
+    handles = tuple(
+        _stored_bundle_record(
+            row.handle_json,
+            row.handle_hash,
+            TargetWorkHandle,
+            "target_run_handoff_integrity_invalid",
+        )
+        for row in handle_rows
+    )
+    preflights = tuple(
+        _stored_bundle_record(
+            row.preflight_json,
+            row.preflight_hash,
+            TargetExecutionPreflight,
+            "target_run_handoff_integrity_invalid",
+        )
+        for row in preflight_rows
+    )
+    review_scopes = tuple(
+        _stored_bundle_record(
+            row.review_scope_json,
+            row.review_scope_hash,
+            CodeReviewScope,
+            "target_run_handoff_integrity_invalid",
+        )
+        for row in preflight_rows
+    )
+    blockers = tuple(
+        _stored_bundle_record(
+            row.blocker_json,
+            row.blocker_hash,
+            TechnicalBlocker,
+            "target_run_handoff_integrity_invalid",
+        )
+        for row in recovery_rows
+    )
+    reservations = tuple(
+        _stored_owner_record(
+            row.successor_reservation_json,
+            row.successor_reservation_hash,
+            AgentRuntimeTargetSuccessorReservation,
+            "target_run_handoff_integrity_invalid",
+        )
+        for row in recovery_rows
+    )
+    stops = tuple(
+        _stored_bundle_record(
+            row.stop_json,
+            row.stop_hash,
+            StopDecisionProof,
+            "target_run_handoff_integrity_invalid",
+        )
+        for row in stop_rows
+    )
+    evidence: set[str] = set()
+    for row in recovery_rows:
+        try:
+            values = json.loads(row.recovery_evidence_refs_json)
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise OwnerConflict("target_run_handoff_integrity_invalid") from error
+        if (
+            type(values) is not list
+            or any(type(item) is not str for item in values)
+            or canonical_json(values) != row.recovery_evidence_refs_json
+            or canonical_hash(values) != row.recovery_evidence_refs_hash
+        ):
+            raise OwnerConflict("target_run_handoff_integrity_invalid")
+        evidence.update(values)
+    initial_handle = _stored_bundle_record(
+        activation.initial_handle_json,
+        activation.initial_handle_hash,
+        TargetWorkHandle,
+        "target_run_handoff_integrity_invalid",
+    )
+    initial_preflight = _stored_bundle_record(
+        activation.initial_preflight_json,
+        activation.initial_preflight_hash,
+        TargetExecutionPreflight,
+        "target_run_handoff_integrity_invalid",
+    )
+    initial_scope = _stored_bundle_record(
+        activation.initial_review_scope_json,
+        activation.initial_review_scope_hash,
+        CodeReviewScope,
+        "target_run_handoff_integrity_invalid",
+    )
+    if (
+        not handles
+        or not preflights
+        or handles[0] != initial_handle
+        or preflights[0] != initial_preflight
+        or review_scopes[0] != initial_scope
+        or any(
+            preflight.review_scope != scope
+            for preflight, scope in zip(preflights, review_scopes, strict=True)
+        )
+        or len(blockers) != len(handles) - 1
+        or frontier.current_handle != handles[-1]
+        or monitor.target_run_ref != handles[-1].target_run_ref
+        or monitor.execution_attempt_ref != handles[-1].execution_attempt_ref
+        or monitor.execution_fence_ref != handles[-1].execution_fence_ref
+        or {row.target_run_ref for row in target_run_identity_rows}
+        != {item.target_run_ref for item in handles}
+    ):
+        raise OwnerConflict("target_run_handoff_integrity_invalid")
+    first_target_run_ordinals: dict[str, int] = {}
+    for ordinal, handle in enumerate(handles, start=1):
+        first_target_run_ordinals.setdefault(handle.target_run_ref, ordinal)
+    if any(
+        int(row.first_handle_ordinal)
+        != first_target_run_ordinals.get(row.target_run_ref)
+        for row in target_run_identity_rows
+    ):
+        raise OwnerConflict("target_run_handoff_integrity_invalid")
+    for index, row in enumerate(recovery_rows):
+        if (
+            row.old_execution_attempt_ref != handles[index].execution_attempt_ref
+            or row.new_execution_attempt_ref
+            != handles[index + 1].execution_attempt_ref
+        ):
+            raise OwnerConflict("target_run_handoff_integrity_invalid")
+    if recovery_rows or stop_rows:
+        if verifier is None:
+            raise OwnerConflict("target_run_harness_verifier_unavailable")
+        stop_by_attempt = {
+            row.execution_attempt_ref: (row, stop)
+            for row, stop in zip(stop_rows, stops, strict=True)
+        }
+        if len(stop_by_attempt) != len(stop_rows):
+            raise OwnerConflict("target_run_handoff_integrity_invalid")
+        try:
+            for index, row in enumerate(recovery_rows):
+                stop_item = stop_by_attempt.get(
+                    handles[index].execution_attempt_ref
+                )
+                issued = verifier.verify_target_execution_recovery_history(
+                    old_handle=handles[index],
+                    replacement_handle=handles[index + 1],
+                    blocker=blockers[index],
+                    stop_decision=(
+                        None if stop_item is None else stop_item[1]
+                    ),
+                    generic_binding_ref=row.generic_binding_ref,
+                    generic_binding_receipt_ref=(
+                        row.generic_binding_receipt_ref
+                    ),
+                    generic_binding_receipt_hash=(
+                        row.generic_binding_receipt_hash
+                    ),
+                    successor_reservation=reservations[index],
+                )
+                if (
+                    issued.blocker != blockers[index]
+                    or issued.replacement_handle != handles[index + 1]
+                ):
+                    raise OwnerConflict("target_run_handoff_integrity_invalid")
+            handle_by_attempt = {
+                handle.execution_attempt_ref: handle for handle in handles
+            }
+            for row, stop in zip(stop_rows, stops, strict=True):
+                handle = handle_by_attempt.get(row.execution_attempt_ref)
+                if handle is None or (
+                    verifier.verify_target_execution_stop_history(
+                        handle=handle,
+                        stop_decision=stop,
+                        generic_binding_ref=row.generic_binding_ref,
+                        generic_binding_receipt_ref=(
+                            row.generic_binding_receipt_ref
+                        ),
+                        generic_binding_receipt_hash=(
+                            row.generic_binding_receipt_hash
+                        ),
+                    )
+                    != stop
+                ):
+                    raise OwnerConflict("target_run_handoff_integrity_invalid")
+        except OwnerConflict:
+            raise
+        except Exception as error:
+            raise OwnerConflict("target_run_handoff_integrity_invalid") from error
+    return _TargetHandoffContext(
+        request=request,
+        frontier=frontier,
+        monitor=monitor,
+        candidate=candidate,
+        formal_plan=formal_plan,
+        handles=handles,
+        preflights=preflights,
+        review_scopes=review_scopes,
+        stop_decisions=stops,
+        recovered_blockers=blockers,
+        recovery_evidence_refs=tuple(sorted(evidence)),
+    )
+
+
+def _target_run_checkpoint_from_context(
+    context: _TargetRunCurrentContext,
+) -> TargetRunCheckpoint:
+    monitor = context.monitor
+    if (
+        type(monitor.snapshot_required) is not int
+        or monitor.snapshot_required not in {0, 1}
+        or type(monitor.checkpoint_revision) is not int
+        or (
+            monitor.cursor is not None and type(monitor.cursor) is not int
+        )
+        or (
+            monitor.status_revision is not None
+            and type(monitor.status_revision) is not int
+        )
+    ):
+        raise OwnerConflict("target_run_checkpoint_integrity_invalid")
+    snapshot_required = monitor.snapshot_required == 1
+    cursor = monitor.cursor
+    status_revision = monitor.status_revision
+    checkpoint_revision = monitor.checkpoint_revision
+    checkpoint = TargetRunCheckpoint(
+        target_ref=context.frontier.target_ref,
+        frontier=context.frontier,
+        snapshot_required=snapshot_required,
+        cursor=cursor,
+        status_revision=status_revision,
+        checkpoint_revision=checkpoint_revision,
+    )
+    try:
+        checkpoint_size = len(
+            canonical_projection_bytes(checkpoint, "TargetRunCheckpoint")
+        )
+    except BundleProtocolError as error:
+        raise OwnerConflict("target_run_checkpoint_integrity_invalid") from error
+    if (
+        checkpoint.schema_ref != TARGET_RUN_CHECKPOINT_SCHEMA
+        or checkpoint.target_ref != checkpoint.frontier.target_ref
+        or type(checkpoint.snapshot_required) is not bool
+        or type(checkpoint.checkpoint_revision) is not int
+        or checkpoint.checkpoint_revision < 1
+        or (
+            checkpoint.snapshot_required
+            and (
+                checkpoint.cursor is not None
+                or checkpoint.status_revision is not None
+            )
+        )
+        or (
+            not checkpoint.snapshot_required
+            and (
+                type(checkpoint.cursor) is not int
+                or checkpoint.cursor < 0
+                or type(checkpoint.status_revision) is not int
+                or checkpoint.status_revision < 0
+            )
+        )
+        or checkpoint_size > BUNDLE_ROOT_MAX_SERIALIZED_BYTES
+    ):
+        raise OwnerConflict("target_run_checkpoint_integrity_invalid")
+    return checkpoint
+
+
+def verify_current_target_run_frontier_in_transaction(
+    connection,
+    handle: TargetWorkHandle,
+) -> TargetFrontierEntry:
+    """Verify AR's exact running handle inside another Owner's transaction.
+
+    This is the narrow cross-Owner CAS seam for a shared SQLite transaction.
+    Callers do not duplicate or reinterpret Agent Runtime tables, and this
+    function does not grant any domain acceptance authority.
+    """
+
+    if type(handle) is not TargetWorkHandle:
+        raise OwnerConflict("target_run_frontier_not_current")
+    context = _target_run_current_context(connection, handle.target_ref)
+    _target_run_checkpoint_from_context(context)
+    notice = connection.execute(
+        text(
+            "SELECT notice_ref FROM ar_target_work_notices WHERE target_ref = "
+            ":target_ref"
+        ),
+        {"target_ref": handle.target_ref},
+    ).first()
+    frontier = context.frontier
+    if (
+        frontier.state != "running"
+        or frontier.terminal_fact_ref is not None
+        or frontier.currentness_known is not True
+        or frontier.current is not True
+        or frontier.current_handle != handle
+        or notice is not None
+    ):
+        raise OwnerConflict("target_run_frontier_not_current")
+    return frontier
+
+
+def _validate_persisted_target_terminal(
+    handoff: TargetRunHandoff,
+    *,
+    candidate: TargetCandidate,
+    formal_plan: FormalPlan,
+    final_handle: TargetWorkHandle,
+    measurement_transition_verified: bool = False,
+) -> None:
+    terminal = handoff.terminal
+    if type(terminal) is AcceptedMeasurementClosure:
+        briefs_by_key = {brief.experiment_key: brief for brief in formal_plan.briefs}
+        try:
+            verify_accepted_closure(terminal, briefs_by_key)
+        except (BundleProtocolError, ValueError) as error:
+            raise OwnerConflict("target_run_handoff_terminal_invalid") from error
+        current_preflight = handoff.code_review_preflights[-1]
+        provenance = list(
+            verify_reuse_trace(
+                candidate.reuse_trace,
+                candidate.implementation_revision_ref,
+            )
+        )
+        for preflight in handoff.code_review_preflights:
+            provenance.extend(
+                (
+                    preflight.implementation_revision_ref,
+                    preflight.review_scope.candidate_revision_binding.content_hash_ref,
+                    preflight.implementation_acceptance_receipt.receipt_ref,
+                )
+            )
+        if (
+            terminal.target_ref != final_handle.target_ref
+            or terminal.target_run_ref != final_handle.target_run_ref
+            or terminal.execution_attempt_ref != final_handle.execution_attempt_ref
+            or terminal.execution_fence_ref != final_handle.execution_fence_ref
+            or terminal.experiment_keys != candidate.experiment_keys
+            or terminal.measurement_unit_key != candidate.measurement_unit_keys[0]
+            or terminal.held_fixed_bindings != candidate.held_fixed_bindings
+            or terminal.implementation_revision_ref
+            != current_preflight.implementation_revision_ref
+            or terminal.code_review != current_preflight.code_review
+            or set(terminal.implementation_provenance_refs) != set(provenance)
+            # Native RG input bindings intentionally bind issuer identities
+            # (execution-input/eligibility/generic-operation/asset-role refs),
+            # not the legacy caller-expanded leaf set.  The exact native
+            # values are accepted only through the RG transition reader above.
+            or measurement_transition_verified is not True
+        ):
+            raise OwnerConflict("target_run_handoff_terminal_invalid")
+        return
+    if type(terminal) is SemanticBarrier:
+        try:
+            validate_semantic_barrier(
+                terminal,
+                candidate=candidate,
+                handle=final_handle,
+            )
+        except (BundleProtocolError, TargetRunContractError) as error:
+            raise OwnerConflict("target_run_handoff_terminal_invalid") from error
+        return
+    if type(terminal) is not TechnicalBlocker:
+        raise OwnerConflict("target_run_handoff_terminal_invalid")
+
+
+def _target_terminal_notice_values(
+    terminal: AcceptedMeasurementClosure | TechnicalBlocker | SemanticBarrier,
+    *,
+    semantic_barrier_fact_ref: str | None,
+) -> tuple[str, str, str, tuple[str, ...]]:
+    if type(terminal) is AcceptedMeasurementClosure:
+        return (
+            "target_completed",
+            terminal.target_commit_ref,
+            "terminal candidate ready",
+            (),
+        )
+    if type(terminal) is TechnicalBlocker:
+        return (
+            "coordination_required",
+            terminal.blocker_ref,
+            terminal.reason,
+            terminal.pending_obligation_refs,
+        )
+    if type(terminal) is SemanticBarrier and semantic_barrier_fact_ref is not None:
+        return (
+            "semantic_change_required",
+            semantic_barrier_fact_ref,
+            terminal.reason,
+            tuple(item.disposition_ref for item in terminal.route_dispositions),
+        )
+    raise OwnerConflict("target_run_handoff_terminal_invalid")
+
+
 def _target_run_admission(row) -> TargetRunAdmission:
     bindings = {
         "target_ref": row.target_ref,
@@ -15291,20 +24131,32 @@ def _controlled_runs_for_target(
     if target_scope == "run":
         rows = connection.execute(
             text(
-                "SELECT * FROM ar_run_controls WHERE quest_ref = :quest_ref AND "
-                "run_ref = :run_ref"
+                "SELECT controls.* FROM ar_run_controls AS controls WHERE "
+                "controls.quest_ref = :quest_ref AND controls.run_ref = "
+                ":run_ref AND NOT EXISTS (SELECT 1 FROM ar_experiment_runs AS "
+                "experiment WHERE experiment.run_ref = controls.run_ref AND "
+                "(experiment.execution_request_ref LIKE 'bundle-target-%' OR "
+                "experiment.bundle_target_ref IS NOT NULL))"
             ),
             {"quest_ref": target["quest_ref"], "run_ref": target["run_ref"]},
         ).all()
         if not rows:
             raise OwnerConflict("managed_run_not_found")
         return rows
-    stage_clause = " AND run_kind LIKE '%_stage'" if target_scope == "stage" else ""
+    stage_clause = (
+        " AND controls.run_kind LIKE '%_stage'"
+        if target_scope == "stage"
+        else ""
+    )
     return connection.execute(
         text(
-            "SELECT * FROM ar_run_controls WHERE quest_ref = :quest_ref AND "
-            "cycle_ref = :cycle_ref AND epoch = :epoch"
-            f"{stage_clause} ORDER BY run_kind, run_ref"
+            "SELECT controls.* FROM ar_run_controls AS controls WHERE "
+            "controls.quest_ref = :quest_ref AND controls.cycle_ref = "
+            ":cycle_ref AND controls.epoch = :epoch AND NOT EXISTS (SELECT 1 "
+            "FROM ar_experiment_runs AS experiment WHERE experiment.run_ref = "
+            "controls.run_ref AND (experiment.execution_request_ref LIKE "
+            "'bundle-target-%' OR experiment.bundle_target_ref IS NOT NULL))"
+            f"{stage_clause} ORDER BY controls.run_kind, controls.run_ref"
         ),
         {
             "quest_ref": target["quest_ref"],
@@ -15641,6 +24493,7 @@ def _terminate_canonical_managed_run(
         )
         return
     if row.run_kind == "experiment":
+        _assert_experiment_run_write_allowed(connection, row.run_ref)
         changed = connection.execute(
             text(
                 "UPDATE ar_experiment_runs SET status = 'failed', failure_code = "
@@ -15680,9 +24533,25 @@ def _terminate_canonical_managed_run(
             )
         return
     if row.run_kind.endswith("_stage"):
-        # Historical Stage tables do not have a cancelled state.  Fence
-        # revocation plus ar_run_controls is the authoritative terminal fact;
-        # every worker/provider boundary consults that fact before execution.
+        # Historical StageRun rows have no cancelled state.  The managed-run
+        # terminal fact remains authoritative, while the exact technical Fence
+        # and root Session are closed in the same AR transaction so neither an
+        # MCP credential nor a provider callback can observe a current identity.
+        connection.execute(
+            text(
+                "UPDATE ar_execution_fences SET status = 'rejected', closed_at = "
+                "COALESCE(closed_at, :now) WHERE fence_ref = :fence_ref AND "
+                "status IN ('current', 'submitted')"
+            ),
+            {"now": now, "fence_ref": row.fence_ref},
+        )
+        connection.execute(
+            text(
+                "UPDATE ar_stage_sessions SET status = 'completed', updated_at = "
+                ":now WHERE session_ref = :session_ref AND status = 'active'"
+            ),
+            {"now": now, "session_ref": row.root_session_ref},
+        )
         return
     raise OwnerConflict("runtime_run_kind_unregistered")
 
@@ -15935,6 +24804,9 @@ def create_agent_runtime_interface(
     human_response_verifier: HumanResponseVerifier | None = None,
     experiment_binding_verifier: ExperimentInputBindingVerifier | None = None,
     target_graph_verifier: TargetGraphReceiptVerifier | None = None,
+    bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
+    target_run_harness_verifier: TargetRunHarnessVerifier | None = None,
+    bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
         database,
@@ -15948,6 +24820,9 @@ def create_agent_runtime_interface(
         human_response_verifier,
         experiment_binding_verifier,
         target_graph_verifier,
+        bundle_report_evidence_verifier,
+        target_run_harness_verifier,
+        bundle_exhaustion_verifier,
     )
 
 
@@ -15955,11 +24830,15 @@ def create_agent_runtime_receipt_verifier(
     database: Database,
     stage_request_verifier: StageRunRequestVerifier | None = None,
     writing_authorization_verifier: HumanResponseVerifier | None = None,
+    bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
+    bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
 ) -> SQLiteAgentRuntimeReceiptVerifier:
     return SQLiteAgentRuntimeReceiptVerifier(
         database,
         stage_request_verifier,
         writing_authorization_verifier,
+        bundle_report_evidence_verifier,
+        bundle_exhaustion_verifier,
     )
 
 

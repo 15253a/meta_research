@@ -7,11 +7,23 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
 
 if TYPE_CHECKING:
+    from meta_research.bundle_exhaustion import BundleExhaustionProposal
+    from meta_research.bundle_protocol import (
+        AcceptedMeasurementClosure,
+        BundleReport,
+        ContentBindingProof,
+        FormalPlan,
+        ReceiptProof,
+        SemanticBarrier,
+        TargetLaunchRequest,
+    )
     from meta_research.experiment_contract import ExperimentResultComponentManifest
+    from meta_research.owners.research_graph import TargetLaunchVerification
 
 
 OwnerFact: TypeAlias = int | str | bool | None
 QUESTION_PROPOSAL_SCHEMA = "meta-research/question-proposal/v1"
+BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND = "bundle_replan_run_retired"
 
 
 @dataclass(frozen=True)
@@ -46,6 +58,90 @@ class AcceptanceReceipt:
             "subject_ref": self.subject_ref,
             "payload_hash": self.payload_hash,
         }
+
+
+@dataclass(frozen=True)
+class AcceptedTargetCommitTransition:
+    """RG-authenticated post-commit/pre-handoff Target frontier state."""
+
+    target_ref: str
+    target_run_ref: str
+    execution_attempt_ref: str
+    execution_fence_ref: str
+    target_commit_ref: str
+    target_execution_closure_ref: str
+    canonical_terminal: AcceptedMeasurementClosure
+    issuer_receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class VerifiedBundleReportReceipt:
+    """AR-authenticated report plus the exact Owner facts it was closed over."""
+
+    report_ref: str
+    request_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    formal_plan_ref: str
+    plan_document_hash: str
+    formal_plan_content_receipt: AcceptanceReceipt
+    formal_plan_projection_digest: str
+    formal_plan_projection_receipt: AcceptanceReceipt
+    completion_contract_hash: str
+    formal_plan_briefs_hash: str
+    target_graph_ref: str
+    target_graph_generation: int
+    target_set_hash: str
+    coverage_hash: str
+    target_graph_receipt: AcceptanceReceipt
+    target_refs: tuple[str, ...]
+    notice_refs: tuple[str, ...]
+    handoff_manifest_refs: tuple[str, ...]
+    accepted_measurement_closures: tuple["AcceptedMeasurementClosure", ...]
+    target_commit_receipts: tuple[AcceptanceReceipt, ...]
+    report: "BundleReport"
+    report_hash: str
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class VerifiedBundleReportDispositionReceipt:
+    """AE-authenticated, non-advancing BundleReport disposition fact."""
+
+    disposition_ref: str
+    request_ref: str
+    cycle_ref: str
+    epoch: int
+    quest_ref: str
+    question_ref: str
+    run_ref: str
+    report_ref: str
+    report_hash: str
+    disposition: str
+    status: str
+    next_stage: str
+    next_epoch: int
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class VerifiedBundleReplanRunRetirement:
+    """AR-authenticated retirement of one exact Bundle Run identity."""
+
+    retirement_ref: str
+    disposition_ref: str
+    request_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    run_identity_hash: str
+    report_ref: str
+    report_hash: str
+    control_operation_ref: str
+    control_receipt_ref: str
+    control_receipt_hash: str
+    receipt: AcceptanceReceipt
 
 
 @dataclass(frozen=True)
@@ -515,6 +611,21 @@ class AttemptExecutionReceiptVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
+    def verify_bundle_target_proposal_receipt(
+        self,
+        *,
+        proposal_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        graph_ref: str,
+        base_generation: int,
+        base_head_receipt: AcceptanceReceipt,
+        proposal_hash: str,
+        receipt: AcceptanceReceipt,
+        require_checkpoint_current: bool = False,
+    ) -> None: ...
+
     def verify_deepfetch_execution_receipt(
         self,
         *,
@@ -644,6 +755,82 @@ class FormalPlanDecisionVerifier(Protocol):
     ) -> None: ...
 
 
+class BundleReportEvidenceVerifier(Protocol):
+    """RG verification seam consumed by AR and independently by AE."""
+
+    def verify_formal_plan_content_acceptance(
+        self,
+        *,
+        formal_plan_ref: str,
+        plan_document_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def query_bundle_report_contract(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        graph_ref: str,
+        head_receipt: AcceptanceReceipt,
+        formal_plan_content_receipt: AcceptanceReceipt,
+        formal_plan_projection_receipt: AcceptanceReceipt,
+    ) -> dict[str, object]: ...
+
+    def verify_bundle_report_target_commits(
+        self,
+        *,
+        graph_ref: str,
+        closures: tuple["AcceptedMeasurementClosure", ...],
+        receipts: tuple[AcceptanceReceipt, ...] | None,
+        head_receipt: AcceptanceReceipt,
+    ) -> tuple[AcceptanceReceipt, ...]: ...
+
+    def verify_bundle_report_semantic_barriers(
+        self,
+        *,
+        graph_ref: str,
+        barriers: tuple[tuple[str, "SemanticBarrier"], ...],
+    ) -> tuple[AcceptanceReceipt, ...]: ...
+
+
+class BundleReportReceiptVerifier(Protocol):
+    """AR report receipt seam; verification returns its frozen evidence set."""
+
+    def verify_bundle_report_receipt(
+        self,
+        *,
+        report_ref: str,
+        receipt: AcceptanceReceipt,
+        expected_disposition: str | None = None,
+    ) -> VerifiedBundleReportReceipt: ...
+
+
+class BundleReportDispositionReceiptVerifier(Protocol):
+    """AE issuer seam used by AR for the exact replan retirement effect."""
+
+    def verify_bundle_report_disposition_receipt(
+        self,
+        *,
+        disposition_ref: str,
+        receipt: AcceptanceReceipt,
+        expected_disposition: str | None = None,
+    ) -> VerifiedBundleReportDispositionReceipt: ...
+
+
+class BundleExhaustionAcceptanceVerifier(Protocol):
+    """AE issuer seam used by AR to close only an accepted exhaustion proposal."""
+
+    def verify_bundle_exhaustion_proposal_acceptance(
+        self,
+        *,
+        proposal_ref: str,
+        receipt: AcceptanceReceipt,
+        require_current: bool = False,
+        phase: str = "submission",
+    ) -> "BundleExhaustionProposal": ...
+
+
 class AcceptedFormalPlanBindingVerifier(Protocol):
     def verify_accepted_formal_plan_binding(
         self, binding: AcceptedFormalPlanBinding
@@ -658,7 +845,9 @@ class TargetGraphReceiptVerifier(Protocol):
         run_ref: str,
         graph_ref: str,
         receipt: AcceptanceReceipt,
-    ) -> None: ...
+        require_current: bool = False,
+        require_complete: bool = False,
+    ) -> dict[str, object]: ...
 
     def verify_target_run_candidate(
         self,
@@ -673,14 +862,31 @@ class TargetGraphReceiptVerifier(Protocol):
         definition_hash: str,
     ) -> str: ...
 
-    def match_bundle_target_candidate(
+    def verify_target_launch_request(
+        self, request: "TargetLaunchRequest"
+    ) -> "TargetLaunchVerification": ...
+
+    def query_target_frontier_commit_transition(
+        self, target_ref: str
+    ) -> AcceptedTargetCommitTransition | None: ...
+
+    def verify_target_spec_content_receipt(
         self,
         *,
-        quest_ref: str,
-        evaluation_attempt_ref: str,
-        execution_request_ref: str,
-        definition_hash: str,
-    ) -> str | None: ...
+        target_ref: str,
+        binding: "ContentBindingProof",
+        receipt: "ReceiptProof",
+        require_uncommitted: bool = False,
+    ) -> None: ...
+
+    def verify_target_candidate_projection_receipt(
+        self,
+        *,
+        target_ref: str,
+        binding: "ContentBindingProof",
+        receipt: "ReceiptProof",
+        require_uncommitted: bool = False,
+    ) -> None: ...
 
     def verify_bundle_dispatch_frontier(
         self,
@@ -698,6 +904,7 @@ class TargetCommitReceiptVerifier(Protocol):
         *,
         graph_ref: str,
         receipts: tuple[AcceptanceReceipt, ...],
+        head_receipt: AcceptanceReceipt | None = None,
     ) -> None: ...
 
 

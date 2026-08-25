@@ -59,6 +59,30 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_data_root(doctor_parser)
     doctor_parser.add_argument("--json", action="store_true", dest="as_json")
 
+    conformance_parser = commands.add_parser(
+        "conformance", help="Run the fixed Codex and Claude Harness contract"
+    )
+    conformance_commands = conformance_parser.add_subparsers(
+        dest="conformance_command", required=True
+    )
+    conformance_start_parser = conformance_commands.add_parser(
+        "start", help="Start the full durable Harness conformance matrix"
+    )
+    _add_data_root(conformance_start_parser)
+    conformance_start_parser.add_argument("--codex-model", required=True)
+    conformance_start_parser.add_argument(
+        "--codex-auth-profile",
+        default="harness-profile:codex-default",
+    )
+    conformance_start_parser.add_argument("--claude-model", required=True)
+    conformance_start_parser.add_argument(
+        "--claude-auth-profile",
+        default="harness-profile:claude-default",
+    )
+    conformance_start_parser.add_argument(
+        "--json", action="store_true", dest="as_json"
+    )
+
     session_parser = commands.add_parser(
         "session", help="Issue a one-use browser bootstrap token"
     )
@@ -125,6 +149,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 human=(
                     f"Harness gateway is {result['status']} at "
                     f"{state.base_url}/mcp"
+                ),
+            )
+        if args.command == "conformance":
+            state = _require_running(data_root)
+            result = _internal_request(
+                data_root,
+                state,
+                "/internal/harness-conformance",
+                payload={
+                    "codex_model_ref": args.codex_model,
+                    "codex_auth_profile_ref": args.codex_auth_profile,
+                    "claude_model_ref": args.claude_model,
+                    "claude_auth_profile_ref": args.claude_auth_profile,
+                },
+            )
+            return _emit(
+                result,
+                args.as_json,
+                human=(
+                    "Started full Harness conformance "
+                    f"{result['conformance_ref']}"
                 ),
             )
         if args.command == "session":

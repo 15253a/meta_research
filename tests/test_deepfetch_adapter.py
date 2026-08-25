@@ -838,6 +838,8 @@ result_path = pathlib.Path(arguments[arguments.index('--output-last-message') + 
 prompt = sys.stdin.read()
 thread_ref = 'native-web-research-durable'
 print(json.dumps({'type': 'thread.started', 'thread_id': thread_ref}), flush=True)
+pathlib.Path(__file__).with_suffix('.session-started').write_text(
+    thread_ref, encoding='utf-8')
 if 'resume' not in arguments:
     time.sleep(30)
 else:
@@ -882,14 +884,10 @@ else:
 
     worker = threading.Thread(target=execute_until_stopped, daemon=True)
     worker.start()
+    session_started = executable.with_suffix(".session-started")
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        started_paths = list(
-            workspace.glob(
-                "provider-operations/*/deepfetch-initial/provider-started.json"
-            )
-        )
-        if started_paths:
+        if session_started.is_file():
             break
         time.sleep(0.02)
     else:  # pragma: no cover - diagnostic for an unusually slow host
@@ -987,13 +985,13 @@ result_path.write_text(json.dumps({result!r}), encoding='utf-8')
 
     worker = threading.Thread(target=execute_until_stopped, daemon=True)
     worker.start()
+    counter_path = executable.with_suffix(".count")
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if list(
-            workspace.glob(
-                "provider-operations/*/deepfetch-initial/provider-started.json"
-            )
-        ):
+        # The durable provider-started marker is written before the child gets
+        # CPU time.  Synchronize on the fixture process itself so cancellation
+        # cannot race the assertion that its first invocation was observed.
+        if counter_path.exists():
             break
         time.sleep(0.02)
     else:  # pragma: no cover - diagnostic for an unusually slow host
@@ -1018,11 +1016,11 @@ result_path.write_text(json.dumps({result!r}), encoding='utf-8')
     assert reconciled.value.code == "deepfetch_provider_stopped_before_session"
     assert reconciled.value.durable_outcome == "terminal"
     assert reconciled.value.native_session_ref is None
-    assert executable.with_suffix(".count").read_text(encoding="utf-8") == "1"
+    assert counter_path.read_text(encoding="utf-8") == "1"
 
     result = restarted.execute(
         replace(first_request, job_ref="deepfetch-run:early-stop:2")
     )
 
     assert result.native_session_ref == "native-after-early-stop"
-    assert executable.with_suffix(".count").read_text(encoding="utf-8") == "2"
+    assert counter_path.read_text(encoding="utf-8") == "2"

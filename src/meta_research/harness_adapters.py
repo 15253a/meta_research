@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
 import sys
+import threading
+import unicodedata
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from meta_research.owners.common import canonical_hash
+from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.owners.secret_detection import contains_secret
 from meta_research.provider_supervisor import (
+    PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS,
     ProviderSupervisorError,
     SUPERVISOR_EXIT_SCHEMA_V2,
     SUPERVISOR_REQUEST_SCHEMA_V2,
@@ -23,12 +28,37 @@ from meta_research.quest_drafting import (
     _CancellableProcessRunner,
     _ProcessStopped,
 )
+from meta_research.target_run_runtime_contract import (
+    TargetCompletionHandoff,
+    TargetCompletionHandoffError,
+    decode_target_completion_handoff,
+    validate_target_completion_handoff,
+)
 
 
 HarnessFamily = Literal["codex", "claude"]
 HarnessProcessRunner = Callable[
     [list[str], str, float, dict[str, str]], subprocess.CompletedProcess[str]
 ]
+HarnessEventSink = Callable[
+    [str, tuple[dict[str, object], ...]], None
+]
+
+
+class CodexChildLedgerReader(Protocol):
+    """Read the public, append-only event ledger for one native child thread.
+
+    The reader deliberately returns parsed event envelopes only.  The adapter
+    consumes session metadata, the injected Skill envelope, and task-complete
+    output; it never reads model reasoning.
+    """
+
+    def read(self, child_session_ref: str) -> tuple[dict[str, object], ...]: ...
+
+    def verify_skill_package(self, skill_path: str, injected_body: str) -> str:
+        """Return the trusted package's SHA-256 after exact body binding."""
+
+        ...
 
 CODEX_LOCKED_VERSION = "0.147.0"
 CLAUDE_LOCKED_VERSION = "2.1.220"
@@ -36,8 +66,35 @@ _MCP_TOKEN_ENV = "META_RESEARCH_MCP_TOKEN"
 _HARNESS_FAMILY_ENV = "META_RESEARCH_HARNESS_FAMILY"
 _HARNESS_WORKSPACE_ENV = "META_RESEARCH_HARNESS_WORKSPACE"
 _PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION_REF"
+_HARNESS_EVIDENCE_SCOPE_ENV = "META_RESEARCH_HARNESS_EVIDENCE_SCOPE_REF"
+_HARNESS_OBSERVATION_SCOPE_ENV = "META_RESEARCH_HARNESS_OBSERVATION_SCOPE"
 _STREAM_LIMIT = 16 * 1024 * 1024
 _RESULT_LIMIT = 1024 * 1024
+_TARGET_ROOT_OUTPUT_CHUNK_LIMIT = 8 * 1024
+_TARGET_ROOT_OUTPUT_TOTAL_LIMIT = 1024 * 1024
+_TARGET_ROOT_OUTPUT_PENDING_LIMIT = _TARGET_ROOT_OUTPUT_CHUNK_LIMIT
+# A private provider spool is capped at ``_STREAM_LIMIT``.  Keeping no more
+# command identities than the smallest possible JSONL envelopes in that spool
+# makes the in-process cumulative index bounded even for adversarial ids.
+_TARGET_ROOT_COMMAND_STATE_LIMIT = max(256, _STREAM_LIMIT // 256)
+# After the initial display budget, exact redacted tails remain observable at
+# a bounded cadence instead of making a long-running turn permanently silent.
+_TARGET_ROOT_OUTPUT_SAMPLE_BYTES = 256 * 1024
+_TARGET_ROOT_OUTPUT_SAMPLE_EVENTS = 64
+_TARGET_ROOT_EVENT_BATCH_LIMIT = 64
+TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
+# The private spool is capped at 16 MiB, so no raw JSONL stream can reach this
+# sequence range. Observation-only rows can share the Harness ledger without
+# colliding with formal evidence stored at raw sequences.
+_TARGET_ROOT_OBSERVATION_SEQUENCE_BASE = 1_000_000_000
+_TARGET_CANDIDATE_READY_SCHEMA = (
+    "meta-research/target-candidate-ready-evidence/v1"
+)
+_TARGET_SELF_CHECK_SCHEMA = "meta-research/target-self-check-evidence/v1"
+_TARGET_RESULT_REVIEW_REQUEST_SCHEMA = (
+    "meta-research/target-result-review-request/v1"
+)
+_TARGET_REVIEW_EVIDENCE_SCHEMA = "meta-research/target-review-evidence/v1"
 HARNESS_CAPABILITIES = (
     "tool_inventory",
     "shell",
@@ -82,6 +139,8 @@ class HarnessInvocation:
     mcp_url: str
     mcp_token: str
     native_session_ref: str | None = None
+    target_workspace_ref: str | None = None
+    working_directory: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +150,69 @@ class HarnessTurnEvidence:
     evidence_events: tuple[dict[str, object], ...]
     stream_hash: str
     transport_receipt: dict[str, object] | None = None
+
+
+def _harness_evidence_scope_ref(invocation: HarnessInvocation) -> str:
+    return canonical_hash(
+        {
+            "run_ref": invocation.run_ref,
+            "provider_operation_ref": invocation.provider_operation_ref,
+            "attempt_ref": invocation.attempt_ref,
+            "fence_ref": invocation.fence_ref,
+            "native_session_ref": invocation.native_session_ref,
+            "target_workspace_ref": invocation.target_workspace_ref,
+            "prompt_hash": canonical_hash(invocation.prompt),
+        }
+    )
+
+
+def _target_root_observation_scope(
+    invocation: HarnessInvocation,
+) -> dict[str, object]:
+    return {
+        "schema_ref": "meta-research/target-root-observation-scope/v1",
+        "target_run_ref": invocation.run_ref,
+        "attempt_ref": invocation.attempt_ref,
+        "attempt_generation": invocation.attempt_generation,
+        "root_session_ref": invocation.root_session_ref,
+        "fence_ref": invocation.fence_ref,
+        "native_session_ref": invocation.native_session_ref,
+    }
+
+
+def _target_root_observation_scope_is_valid(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_ref",
+        "target_run_ref",
+        "attempt_ref",
+        "attempt_generation",
+        "root_session_ref",
+        "fence_ref",
+        "native_session_ref",
+    }:
+        return False
+    generation = value.get("attempt_generation")
+    native_session_ref = value.get("native_session_ref")
+    return (
+        value.get("schema_ref")
+        == "meta-research/target-root-observation-scope/v1"
+        and all(
+            isinstance(value.get(field), str) and bool(value[field])
+            for field in (
+                "target_run_ref",
+                "attempt_ref",
+                "root_session_ref",
+                "fence_ref",
+            )
+        )
+        and isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 1
+        and (
+            native_session_ref is None
+            or (isinstance(native_session_ref, str) and bool(native_session_ref))
+        )
+    )
 
 
 class HarnessAdapter(Protocol):
@@ -113,24 +235,54 @@ class _NativeCliHarnessAdapter:
         *,
         runner: HarnessProcessRunner | None = None,
         timeout_seconds: float = 300.0,
+        target_root_timeout_seconds: float = TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS,
+        codex_child_ledger_reader: CodexChildLedgerReader | None = None,
     ) -> None:
+        if (
+            not 0 < timeout_seconds <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+            or not 0
+            < target_root_timeout_seconds
+            <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError("harness_timeout_invalid")
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._runner = runner or HarnessSupervisorTransport(
             workspace / "shared-provider-supervisor"
         )
         self._timeout_seconds = timeout_seconds
+        self._target_root_timeout_seconds = target_root_timeout_seconds
         self._cached_installation_profile: dict[str, object] | None = None
+        self._codex_child_ledger_reader = codex_child_ledger_reader
+        if self.family == "codex" and codex_child_ledger_reader is None:
+            codex_home = os.environ.get("CODEX_HOME")
+            if codex_home:
+                self._codex_child_ledger_reader = _CodexHomeChildLedgerReader(
+                    Path(codex_home)
+                )
 
     def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
         self._validate_invocation(invocation)
         provider_version = self._provider_version()
         argv = self._argv(invocation)
+        evidence_scope_ref = _harness_evidence_scope_ref(invocation)
+        observation_scope = _target_root_observation_scope(invocation)
+        timeout_seconds = (
+            self._target_root_timeout_seconds
+            if invocation.target_workspace_ref is not None
+            else self._timeout_seconds
+        )
         environment = {
             _MCP_TOKEN_ENV: invocation.mcp_token,
             _HARNESS_FAMILY_ENV: self.family,
-            _HARNESS_WORKSPACE_ENV: str(self._workspace.resolve()),
+            _HARNESS_WORKSPACE_ENV: (
+                invocation.working_directory
+                if invocation.working_directory is not None
+                else str(self._workspace.resolve())
+            ),
             _PROVIDER_OPERATION_ENV: invocation.provider_operation_ref,
+            _HARNESS_EVIDENCE_SCOPE_ENV: evidence_scope_ref,
+            _HARNESS_OBSERVATION_SCOPE_ENV: canonical_json(observation_scope),
             "NO_PROXY": _loopback_no_proxy(),
             "no_proxy": _loopback_no_proxy(),
         }
@@ -138,7 +290,7 @@ class _NativeCliHarnessAdapter:
             completed = self._runner(
                 argv,
                 invocation.prompt,
-                self._timeout_seconds,
+                timeout_seconds,
                 environment,
             )
         except FileNotFoundError as error:
@@ -160,24 +312,29 @@ class _NativeCliHarnessAdapter:
         events = _parse_jsonl(completed.stdout)
         if not events:
             raise HarnessAdapterUnavailable("provider_stream_invalid")
-        return _evidence_from_events(
+        evidence = _evidence_from_events(
             family=self.family,
             provider_version=provider_version,
             events=events,
             expected_native_session_ref=invocation.native_session_ref,
-            evidence_scope_ref=canonical_hash(
-                {
-                    "run_ref": invocation.run_ref,
-                    "provider_operation_ref": invocation.provider_operation_ref,
-                    "attempt_ref": invocation.attempt_ref,
-                    "fence_ref": invocation.fence_ref,
-                    "native_session_ref": invocation.native_session_ref,
-                    "prompt_hash": canonical_hash(invocation.prompt),
-                }
-            ),
+            evidence_scope_ref=evidence_scope_ref,
+            observation_scope=observation_scope,
             transport_receipt=getattr(
                 completed, "meta_research_transport_receipt", None
             ),
+            codex_child_ledger_reader=self._codex_child_ledger_reader,
+            expected_working_directory=(
+                invocation.working_directory
+                if invocation.working_directory is not None
+                else str(self._workspace.resolve())
+            ),
+        )
+        return replace(
+            evidence,
+            profile={
+                **evidence.profile,
+                "sandbox_mode": self._sandbox_mode(invocation),
+            },
         )
 
     def installation_profile(self) -> dict[str, object]:
@@ -241,17 +398,40 @@ class _NativeCliHarnessAdapter:
             or any(not value for value in refs)
             or invocation.attempt_generation < 1
             or not invocation.mcp_url.startswith("http://")
+            or (
+                invocation.working_directory is not None
+                and (
+                    invocation.target_workspace_ref is None
+                    or not Path(invocation.working_directory).is_absolute()
+                    or not Path(invocation.working_directory).is_dir()
+                    or Path(invocation.working_directory).is_symlink()
+                )
+            )
+            or (
+                invocation.target_workspace_ref is not None
+                and invocation.working_directory is None
+            )
         ):
             raise HarnessAdapterUnavailable("harness_invocation_invalid")
 
     def _argv(self, invocation: HarnessInvocation) -> list[str]:
         raise NotImplementedError
 
+    def _sandbox_mode(self, invocation: HarnessInvocation) -> str:
+        return "danger-full-access"
+
 
 class CodexHarnessAdapter(_NativeCliHarnessAdapter):
     family = "codex"
     executable = "codex"
     locked_version = CODEX_LOCKED_VERSION
+
+    def _sandbox_mode(self, invocation: HarnessInvocation) -> str:
+        return (
+            "workspace-write"
+            if invocation.target_workspace_ref is not None
+            else "danger-full-access"
+        )
 
     def _argv(self, invocation: HarnessInvocation) -> list[str]:
         argv = [
@@ -273,9 +453,13 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             "--config",
             "mcp_servers={}",
             "--sandbox",
-            "danger-full-access",
+            self._sandbox_mode(invocation),
             "--cd",
-            str(self._workspace),
+            (
+                invocation.working_directory
+                if invocation.working_directory is not None
+                else str(self._workspace)
+            ),
             "--config",
             f'mcp_servers.meta_research.url="{invocation.mcp_url}"',
             "--config",
@@ -371,6 +555,118 @@ def _run_process(
     )
 
 
+class _HarnessStdoutEventTail:
+    """Replay the private JSONL spool from byte zero while it is growing."""
+
+    def __init__(
+        self,
+        *,
+        stdout_path: Path,
+        family: HarnessFamily,
+        operation_ref: str,
+        evidence_scope_ref: str,
+        observation_scope: dict[str, object],
+        sink: HarnessEventSink,
+    ) -> None:
+        self._stdout_path = stdout_path
+        self._operation_ref = operation_ref
+        self._evidence_scope_ref = evidence_scope_ref
+        self._projector = _TargetRootEventProjector(
+            family=family,
+            observation_scope=observation_scope,
+        )
+        self._sink = sink
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="harness-target-root-tail",
+            daemon=True,
+        )
+        self._offset = 0
+        self._buffer = b""
+        self._sequence = 0
+        self.failure: BaseException | None = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        if self._thread.is_alive() and self.failure is None:
+            self.failure = RuntimeError("harness stdout tail did not stop")
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.wait(0.02):
+                self._drain(final=False)
+            self._drain(final=True)
+        except BaseException as error:  # surfaced by the transport thread
+            self.failure = error
+
+    def _drain(self, *, final: bool) -> None:
+        if self._stdout_path.exists():
+            size = self._stdout_path.stat().st_size
+            if size < self._offset:
+                raise OSError("harness stdout spool truncated")
+            if size > self._offset:
+                with self._stdout_path.open("rb") as stream:
+                    stream.seek(self._offset)
+                    chunk = stream.read(size - self._offset)
+                self._offset += len(chunk)
+                self._buffer += chunk
+        lines = self._buffer.split(b"\n")
+        self._buffer = lines.pop()
+        if final and self._buffer:
+            lines.append(self._buffer)
+            self._buffer = b""
+        projected: list[dict[str, object]] = []
+        for line in lines:
+            try:
+                event = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            self._sequence += 1
+            _summary, _capabilities, _native_ref, _terminal, observation = (
+                self._projector.summarize(cast(dict[str, object], event))
+            )
+            # Observation delivery does not wait for a terminal Harness item;
+            # the final evidence pass still derives its own bounded summaries.
+            if observation is None:
+                continue
+            observation_sequence = (
+                _TARGET_ROOT_OBSERVATION_SEQUENCE_BASE + self._sequence
+            )
+            observation_summary = {
+                "kind": "target_root_observation",
+                "target_run_scope": observation["scope"],
+                "target_root_observation": {
+                    **observation,
+                    "raw_sequence": self._sequence,
+                },
+            }
+            event_value = {
+                "event_ref": "harness_observation:"
+                + canonical_hash(
+                    {
+                        "evidence_scope_ref": self._evidence_scope_ref,
+                        "raw_sequence": self._sequence,
+                        "summary": observation_summary,
+                    }
+                ),
+                "sequence": observation_sequence,
+                **observation_summary,
+            }
+            projected.append(event_value)
+            if len(projected) == _TARGET_ROOT_EVENT_BATCH_LIMIT:
+                self._sink(self._operation_ref, tuple(projected))
+                projected.clear()
+        if projected:
+            self._sink(self._operation_ref, tuple(projected))
+
+
 class HarnessSupervisorTransport:
     """Thin Harness adapter over the existing shared provider runner."""
 
@@ -379,11 +675,13 @@ class HarnessSupervisorTransport:
         workspace: Path,
         *,
         process_runner: _CancellableProcessRunner | None = None,
+        event_sink: HarnessEventSink | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         _key_path, self._transport_key = ensure_transport_key(self._workspace)
         self._process_runner = process_runner or _CancellableProcessRunner()
+        self._event_sink = event_sink
 
     def __call__(
         self,
@@ -469,47 +767,60 @@ class HarnessSupervisorTransport:
         except ProviderSupervisorError as error:
             raise OSError("supervisor request unavailable") from error
         receipt_path = directory / "supervisor-exit.json"
-        if not receipt_path.exists():
-            try:
-                self._process_runner.run_durable_job(
-                    invocation_hash,
-                    bridge_argv,
-                    prompt,
-                    timeout,
-                    stdout_path,
-                    directory / "pid.json",
-                    request_path,
-                    environment=environment,
-                )
-            except _ProcessStopped as error:
-                raise OSError("provider supervisor stopped") from error
-            except subprocess.TimeoutExpired as error:
-                if (directory / "provider-started.json").exists():
-                    raise HarnessRunnerOutcomeUnknown(
-                        "provider outcome requires reconciliation"
-                    ) from error
-                raise
-            except OSError:
-                if not receipt_path.exists():
+        tail = self._start_event_tail(
+            stdout_path=stdout_path,
+            family=family,
+            operation_ref=operation_ref,
+            environment=environment,
+        )
+        try:
+            if not receipt_path.exists():
+                try:
+                    self._process_runner.run_durable_job(
+                        invocation_hash,
+                        bridge_argv,
+                        prompt,
+                        timeout,
+                        stdout_path,
+                        directory / "pid.json",
+                        request_path,
+                        environment=environment,
+                        stdout_max_bytes=_STREAM_LIMIT,
+                    )
+                except _ProcessStopped as error:
+                    raise OSError("provider supervisor stopped") from error
+                except subprocess.TimeoutExpired as error:
                     if (directory / "provider-started.json").exists():
                         raise HarnessRunnerOutcomeUnknown(
                             "provider outcome requires reconciliation"
-                        )
+                        ) from error
                     raise
-        try:
-            receipt, envelope = read_verified_exit_receipt(
-                receipt_path,
-                key=self._transport_key,
-                invocation_hash=invocation_hash,
-                prompt_path=prompt_path,
-                schema_path=schema_path,
-                stdout_path=stdout_path,
-                result_path=result_path,
-                expected_schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
-            )
-            stdout = stdout_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
-            raise OSError("provider supervisor receipt invalid") from error
+                except OSError:
+                    if not receipt_path.exists():
+                        if (directory / "provider-started.json").exists():
+                            raise HarnessRunnerOutcomeUnknown(
+                                "provider outcome requires reconciliation"
+                            )
+                        raise
+            try:
+                receipt, envelope = read_verified_exit_receipt(
+                    receipt_path,
+                    key=self._transport_key,
+                    invocation_hash=invocation_hash,
+                    prompt_path=prompt_path,
+                    schema_path=schema_path,
+                    stdout_path=stdout_path,
+                    result_path=result_path,
+                    expected_schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+                )
+                stdout = stdout_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
+                raise OSError("provider supervisor receipt invalid") from error
+        finally:
+            if tail is not None:
+                tail.stop()
+        if tail is not None and tail.failure is not None:
+            raise OSError("harness event sink unavailable") from tail.failure
         termination_reason = receipt["termination_reason"]
         returncode = int(receipt["returncode"])
         if termination_reason != "completed":
@@ -536,6 +847,41 @@ class HarnessSupervisorTransport:
         }
         return completed
 
+    def _start_event_tail(
+        self,
+        *,
+        stdout_path: Path,
+        family: HarnessFamily,
+        operation_ref: str,
+        environment: dict[str, str],
+    ) -> _HarnessStdoutEventTail | None:
+        if self._event_sink is None:
+            return None
+        evidence_scope_ref = environment.get(_HARNESS_EVIDENCE_SCOPE_ENV)
+        scope_json = environment.get(_HARNESS_OBSERVATION_SCOPE_ENV)
+        if (
+            evidence_scope_ref is None
+            or re.fullmatch(r"[0-9a-f]{64}", evidence_scope_ref) is None
+            or scope_json is None
+        ):
+            raise OSError("harness observation scope unavailable")
+        try:
+            scope = json.loads(scope_json)
+        except json.JSONDecodeError as error:
+            raise OSError("harness observation scope invalid") from error
+        if not _target_root_observation_scope_is_valid(scope):
+            raise OSError("harness observation scope invalid")
+        tail = _HarnessStdoutEventTail(
+            stdout_path=stdout_path,
+            family=family,
+            operation_ref=operation_ref,
+            evidence_scope_ref=evidence_scope_ref,
+            observation_scope=cast(dict[str, object], scope),
+            sink=self._event_sink,
+        )
+        tail.start()
+        return tail
+
 
 def _parse_jsonl(value: str) -> tuple[dict[str, object], ...]:
     events: list[dict[str, object]] = []
@@ -549,6 +895,1034 @@ def _parse_jsonl(value: str) -> tuple[dict[str, object], ...]:
     return tuple(events)
 
 
+class _CodexHomeChildLedgerReader:
+    """Read one child ledger only from the configured CODEX_HOME tree."""
+
+    def __init__(self, codex_home: Path) -> None:
+        if not codex_home.is_absolute() or codex_home.is_symlink():
+            raise ValueError("codex home is not a trusted directory")
+        self._codex_home = codex_home.resolve()
+
+    def read(self, child_session_ref: str) -> tuple[dict[str, object], ...]:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", child_session_ref):
+            raise OSError("child session reference invalid")
+        candidates: list[tuple[Path, tuple[dict[str, object], ...]]] = []
+        for relative in ("sessions", "archived_sessions"):
+            directory = self._codex_home / relative
+            if not directory.exists():
+                continue
+            if directory.is_symlink() or not directory.is_dir():
+                raise OSError("codex ledger directory invalid")
+            for path in directory.rglob(f"*{child_session_ref}*.jsonl"):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(self._codex_home)
+                    records = _parse_jsonl(resolved.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, ValueError):
+                    continue
+                if _ledger_session_id(records) == child_session_ref:
+                    candidates.append((resolved, records))
+        if len(candidates) != 1:
+            raise OSError("child ledger missing or ambiguous")
+        return candidates[0][1]
+
+    def verify_skill_package(self, skill_path: str, injected_body: str) -> str:
+        path = Path(skill_path)
+        if (
+            not path.is_absolute()
+            or not path.is_file()
+            or not _is_non_symlink_codex_home_descendant(path, self._codex_home)
+        ):
+            raise OSError("child Skill package invalid")
+        try:
+            resolved = path.resolve(strict=True)
+            package_bytes = resolved.read_bytes()
+            package = package_bytes.decode("utf-8")
+        except (OSError, ValueError) as error:
+            raise OSError("child Skill package invalid") from error
+        except UnicodeDecodeError as error:
+            raise OSError("child Skill package invalid") from error
+        if not any(
+            candidate == package
+            for candidate in _skill_body_without_wrapper_newline(injected_body)
+        ):
+            raise OSError("child Skill package content drift")
+        return hashlib.sha256(package_bytes).hexdigest()
+
+
+def _is_non_symlink_codex_home_descendant(path: Path, codex_home: Path) -> bool:
+    """Reject a package routed through a symlink even when it resolves in home."""
+
+    try:
+        relative = path.relative_to(codex_home)
+    except ValueError:
+        return False
+    current = codex_home
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    try:
+        path.resolve(strict=True).relative_to(codex_home)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _ledger_session_id(records: tuple[dict[str, object], ...]) -> str | None:
+    metadata = [
+        record.get("payload")
+        for record in records
+        if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict)
+    ]
+    if len(metadata) != 1:
+        return None
+    value = metadata[0].get("id")
+    return value if isinstance(value, str) else None
+
+
+_ANSI_ESCAPE = re.compile(
+    r"(?:\x1B\[[0-?]*[ -/]*[@-~]|\x1B\][^\x07]*(?:\x07|\x1B\\))"
+)
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|password|passwd|"
+    r"secret|cookie|authorization)\b([ \t]*[:=][ \t]*)([^\s,;]*)"
+)
+_BEARER_SECRET = re.compile(
+    r"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]*"
+)
+_URL_USERINFO = re.compile(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@")
+_KNOWN_TOKEN = re.compile(
+    r"(?i)\b(?:ghp_[A-Za-z0-9_]*|github_pat_[A-Za-z0-9_]*|"
+    r"sk-[A-Za-z0-9_-]*|AKIA[0-9A-Z]*)"
+)
+_PRIVATE_KEY = re.compile(
+    r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?"
+    r"-----END [^-\r\n]*PRIVATE KEY-----"
+)
+_PRIVATE_KEY_BEGIN = re.compile(r"(?i)-----BEGIN(?:[ \t]|$)")
+_PRIVATE_KEY_END = re.compile(
+    r"(?i)-----END [^-\r\n]*PRIVATE KEY-----"
+)
+_BEARER_OPENER = re.compile(r"(?i)\bBearer[ \t]+")
+_SECRET_ASSIGNMENT_OPENER = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|password|passwd|"
+    r"secret|cookie|authorization)\b([ \t]*[:=][ \t]*)"
+)
+_GENERIC_ASSIGNMENT_OPENER = re.compile(
+    r"(?i)(?<![a-z0-9_.-])([a-z_][a-z0-9_.-]{0,255})"
+    r"([ \t]*[:=][ \t]*)"
+)
+_OWNER_SECRET_TEXT_MARKERS = (
+    "://",
+    "password",
+    "passwd",
+    "passphrase",
+    "cookie",
+    "sessionid",
+    "sid",
+    "otp",
+    "one_time",
+    "one-time",
+    "one time",
+    "secret",
+    "private",
+    "api_",
+    "api-",
+    "api ",
+    "access_",
+    "access-",
+    "access ",
+    "refresh",
+    "session_token",
+    "id_token",
+    "auth",
+    "personal",
+    "token",
+    "credential",
+    "bearer",
+    "basic",
+    "-----begin",
+    "github_pat_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "xox",
+    "sk-",
+    "akia",
+    "aiza",
+    "eyj",
+)
+@dataclass
+class _TargetRootCommandOutputState:
+    raw_char_count: int = 0
+    raw_hash: str = hashlib.sha256(b"").hexdigest()
+    pending: str = ""
+    pending_redacted: bool = False
+    ansi_pending: str = ""
+    ansi_overflow_mode: Literal["csi", "osc", "escape"] | None = None
+    ansi_osc_escape_pending: bool = False
+    carriage_return_pending: bool = False
+    mode: Literal["normal", "secret_line", "private_key", "overflow"] = (
+        "normal"
+    )
+
+
+class _TargetRootEventProjector:
+    """Derive a bounded display projection without weakening Harness evidence."""
+
+    def __init__(
+        self,
+        *,
+        family: HarnessFamily,
+        observation_scope: dict[str, object],
+    ) -> None:
+        if not _target_root_observation_scope_is_valid(observation_scope):
+            raise HarnessAdapterUnavailable("target_root_observation_scope_invalid")
+        self._family = family
+        self._scope = observation_scope
+        native_ref = observation_scope.get("native_session_ref")
+        self._root_native_session_ref = (
+            native_ref if isinstance(native_ref, str) else None
+        )
+        self._claude_tools: dict[str, str] = {}
+        self._codex_command_outputs: dict[
+            str, _TargetRootCommandOutputState
+        ] = {}
+        self._codex_pending_bytes = 0
+        self._codex_projection_saturated = False
+        self._output_bytes = 0
+        self._gap_bytes = 0
+        self._gap_events = 0
+        self._gap_tail = ""
+        self._gap_redacted = False
+        self._gap_emissions = 0
+
+    def summarize(
+        self, event: dict[str, object]
+    ) -> tuple[
+        dict[str, object] | None,
+        set[str],
+        str | None,
+        bool,
+        dict[str, object] | None,
+    ]:
+        summary, capabilities, native_ref, terminal = _summarize_event(
+            self._family, event
+        )
+        self._observe_root_identity(event, native_ref)
+        if summary is not None:
+            summary["target_run_scope"] = self._scope
+            root_message = self._root_agent_message(event)
+            if root_message is not None:
+                summary["actor_session_ref"] = self._root_native_session_ref
+                summary["target_root_agent_message"] = True
+                try:
+                    handoff = decode_target_completion_handoff(root_message)
+                    validate_target_completion_handoff(
+                        handoff,
+                        expected_target_run_ref=str(self._scope["target_run_ref"]),
+                    )
+                except TargetCompletionHandoffError:
+                    pass
+                else:
+                    summary["target_root_completion_candidate"] = (
+                        _target_completion_handoff_value(handoff)
+                    )
+            if terminal:
+                summary["target_root_terminal"] = True
+        output = self._root_output(event)
+        observation: dict[str, object] | None = None
+        if output is not None:
+            output_text, command_ref = output
+            overflow_bytes = 0
+            if self._family == "codex" and command_ref is not None:
+                text, redacted, overflow_bytes = (
+                    self._consume_codex_command_output(
+                        command_ref,
+                        output_text,
+                        final=event.get("type") == "item.completed",
+                    )
+                )
+            else:
+                ephemeral = _TargetRootCommandOutputState()
+                text, redacted, overflow_bytes = (
+                    _consume_target_root_output_delta(
+                        ephemeral,
+                        output_text,
+                        final=True,
+                    )
+                )
+            if overflow_bytes:
+                self._remember_redacted_output_gap(overflow_bytes)
+            remaining = max(
+                0, _TARGET_ROOT_OUTPUT_TOTAL_LIMIT - self._output_bytes
+            )
+            if remaining > 0 and text:
+                visible, chunk_truncated = _truncate_utf8(
+                    text,
+                    min(remaining, _TARGET_ROOT_OUTPUT_CHUNK_LIMIT),
+                )
+                self._output_bytes += len(_target_root_output_bytes(visible))
+                observation = {
+                    "schema_ref": "meta-research/target-root-observation/v1",
+                    "scope": self._scope,
+                    "root_native_session_ref": self._root_native_session_ref,
+                    "kind": "command_output",
+                    "stream": "stdout",
+                    "text": visible,
+                    "redacted": redacted,
+                    "truncated": chunk_truncated,
+                }
+                if chunk_truncated:
+                    self._remember_output_gap(
+                        text[len(visible) :], redacted=redacted
+                    )
+            elif text:
+                self._remember_output_gap(text, redacted=redacted)
+                if self._output_gap_is_due():
+                    observation = self._take_output_gap()
+            elif overflow_bytes and self._output_gap_is_due():
+                observation = self._take_output_gap()
+        if terminal and observation is None and self._gap_events:
+            observation = self._take_output_gap()
+        return summary, capabilities, native_ref, terminal, observation
+
+    def _consume_codex_command_output(
+        self,
+        command_ref: str,
+        cumulative_raw: str,
+        *,
+        final: bool,
+    ) -> tuple[str, bool, int]:
+        """Project one cumulative command stream without retaining its raw body."""
+
+        if self._codex_projection_saturated:
+            return "", True, len(_target_root_output_bytes(cumulative_raw))
+        state = self._codex_command_outputs.get(command_ref)
+        if state is None:
+            if (
+                len(self._codex_command_outputs)
+                >= _TARGET_ROOT_COMMAND_STATE_LIMIT
+            ):
+                self._saturate_codex_projection()
+                return "", True, len(
+                    _target_root_output_bytes(cumulative_raw)
+                )
+            state = _TargetRootCommandOutputState()
+            self._codex_command_outputs[command_ref] = state
+
+        previous_pending_bytes = len(
+            _target_root_output_bytes(state.pending + state.ansi_pending)
+        )
+        if (
+            len(cumulative_raw) < state.raw_char_count
+            or hashlib.sha256(
+                _target_root_output_bytes(
+                    cumulative_raw[: state.raw_char_count]
+                )
+            ).hexdigest()
+            != state.raw_hash
+        ):
+            # A cumulative output that rewrites already-observed bytes cannot
+            # be differenced safely.  Fail closed for the remainder of this
+            # projector instead of replaying a newly formed secret prefix.
+            self._saturate_codex_projection()
+            return "", True, len(_target_root_output_bytes(cumulative_raw))
+
+        delta = cumulative_raw[state.raw_char_count :]
+        state.raw_char_count = len(cumulative_raw)
+        state.raw_hash = hashlib.sha256(
+            _target_root_output_bytes(cumulative_raw)
+        ).hexdigest()
+        text, redacted, overflow_bytes = _consume_target_root_output_delta(
+            state,
+            delta,
+            final=final,
+        )
+        current_pending_bytes = len(
+            _target_root_output_bytes(state.pending + state.ansi_pending)
+        )
+        self._codex_pending_bytes += (
+            current_pending_bytes - previous_pending_bytes
+        )
+        if (
+            current_pending_bytes > _TARGET_ROOT_OUTPUT_PENDING_LIMIT
+            or self._codex_pending_bytes > _STREAM_LIMIT
+        ):
+            self._saturate_codex_projection()
+            return "", True, overflow_bytes + max(
+                current_pending_bytes,
+                len(_target_root_output_bytes(delta)),
+            )
+        return text, redacted, overflow_bytes
+
+    def _saturate_codex_projection(self) -> None:
+        self._codex_projection_saturated = True
+        self._codex_command_outputs.clear()
+        self._codex_pending_bytes = 0
+
+    def _remember_output_gap(self, text: str, *, redacted: bool) -> None:
+        if not text:
+            return
+        self._gap_bytes += len(_target_root_output_bytes(text))
+        self._gap_events += 1
+        self._gap_tail = _utf8_tail(text, _TARGET_ROOT_OUTPUT_CHUNK_LIMIT)
+        self._gap_redacted = self._gap_redacted or redacted
+
+    def _remember_redacted_output_gap(self, dropped_bytes: int) -> None:
+        if dropped_bytes <= 0:
+            return
+        marker = "[REDACTED]"
+        self._gap_bytes += dropped_bytes + len(
+            _target_root_output_bytes(marker)
+        )
+        self._gap_events += 1
+        self._gap_tail = marker
+        self._gap_redacted = True
+
+    def _output_gap_is_due(self) -> bool:
+        return (
+            self._gap_emissions == 0
+            or self._gap_bytes >= _TARGET_ROOT_OUTPUT_SAMPLE_BYTES
+            or self._gap_events >= _TARGET_ROOT_OUTPUT_SAMPLE_EVENTS
+        )
+
+    def _take_output_gap(self) -> dict[str, object]:
+        tail_bytes = len(_target_root_output_bytes(self._gap_tail))
+        observation = {
+            "schema_ref": "meta-research/target-root-observation/v1",
+            "scope": self._scope,
+            "root_native_session_ref": self._root_native_session_ref,
+            "kind": "output_gap",
+            "stream": "stdout",
+            # This is an exact redacted tail sample. Gap metadata is carried in
+            # its own fields so no synthetic marker is mixed into stdout.
+            "text": self._gap_tail,
+            "redacted": self._gap_redacted,
+            "truncated": True,
+            "dropped_bytes": max(0, self._gap_bytes - tail_bytes),
+            "dropped_events": self._gap_events,
+        }
+        self._gap_bytes = 0
+        self._gap_events = 0
+        self._gap_tail = ""
+        self._gap_redacted = False
+        self._gap_emissions += 1
+        return observation
+
+    def _root_agent_message(self, event: dict[str, object]) -> str | None:
+        if self._root_native_session_ref is None:
+            return None
+        if self._family == "codex":
+            item = event.get("item")
+            actor_ref = (
+                _codex_item_actor(event, item)
+                if isinstance(item, dict)
+                else None
+            )
+            if (
+                event.get("type") != "item.completed"
+                or not isinstance(item, dict)
+                or item.get("type") != "agent_message"
+                # Native Codex root item envelopes do not always repeat the
+                # thread id learned from ``thread.started``.  An explicit
+                # actor must still match, so child-ledger items fail closed.
+                or actor_ref not in (None, self._root_native_session_ref)
+            ):
+                return None
+            value = item.get("text") or item.get("content")
+            return value if isinstance(value, str) else None
+        if (
+            event.get("type") != "assistant"
+            or event.get("session_id") != self._root_native_session_ref
+            or event.get("parent_tool_use_id") not in (None, "")
+        ):
+            return None
+        text_blocks = [
+            block["text"]
+            for block in _claude_content_blocks(event)
+            if block.get("type") == "text" and isinstance(block.get("text"), str)
+        ]
+        return str(text_blocks[0]) if len(text_blocks) == 1 else None
+
+    def _observe_root_identity(
+        self, event: dict[str, object], native_ref: str | None
+    ) -> None:
+        is_root_start = (
+            self._family == "codex" and event.get("type") == "thread.started"
+        ) or (
+            self._family == "claude"
+            and event.get("type") == "system"
+            and event.get("subtype") == "init"
+        )
+        if not is_root_start or native_ref is None:
+            return
+        if self._root_native_session_ref is None:
+            self._root_native_session_ref = native_ref
+        elif self._root_native_session_ref != native_ref:
+            raise HarnessAdapterUnavailable("native_session_identity_changed")
+
+    def _root_output(
+        self, event: dict[str, object]
+    ) -> tuple[str, str | None] | None:
+        if self._root_native_session_ref is None:
+            return None
+        if self._family == "codex":
+            item = event.get("item")
+            actor_ref = (
+                _codex_item_actor(event, item)
+                if isinstance(item, dict)
+                else None
+            )
+            if (
+                event.get("type") not in {"item.updated", "item.completed"}
+                or not isinstance(item, dict)
+                or item.get("type") != "command_execution"
+                or actor_ref not in (None, self._root_native_session_ref)
+            ):
+                return None
+            output = next(
+                (
+                    item.get(name)
+                    for name in ("aggregated_output", "output", "stdout")
+                    if isinstance(item.get(name), str)
+                ),
+                None,
+            )
+            if not isinstance(output, str):
+                return None
+            command_ref = item.get("id")
+            return output, command_ref if isinstance(command_ref, str) else None
+
+        event_native_ref = event.get("session_id")
+        root_event = (
+            event_native_ref == self._root_native_session_ref
+            and event.get("parent_tool_use_id") in (None, "")
+        )
+        if not root_event:
+            return None
+        output: list[str] = []
+        for block in _claude_content_blocks(event):
+            block_type = block.get("type")
+            if block_type == "tool_use":
+                tool_use_id = block.get("id")
+                name = block.get("name")
+                if isinstance(tool_use_id, str) and isinstance(name, str):
+                    self._claude_tools[tool_use_id] = name
+                continue
+            if block_type != "tool_result":
+                continue
+            tool_use_id = block.get("tool_use_id")
+            name = (
+                self._claude_tools.get(tool_use_id)
+                if isinstance(tool_use_id, str)
+                else None
+            )
+            if name is None or name.casefold() not in {"bash", "shell"}:
+                continue
+            value = _claude_tool_result_text(block.get("content"))
+            if value:
+                output.append(value)
+        return ("\n".join(output), None) if output else None
+
+
+def _claude_tool_result_text(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return None
+    parts = [
+        str(item["text"])
+        for item in value
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and isinstance(item.get("text"), str)
+    ]
+    return "\n".join(parts) if parts else None
+
+
+def _target_completion_handoff_value(
+    handoff: TargetCompletionHandoff,
+) -> dict[str, object]:
+    return {
+        "schema_ref": handoff.schema_ref,
+        "target_ref": handoff.target_ref,
+        "target_run_ref": handoff.target_run_ref,
+        "status": handoff.status,
+        "artifacts": [
+            {"role": artifact.role, "relative_path": artifact.relative_path}
+            for artifact in handoff.artifacts
+        ],
+        "result_document_path": handoff.result_document_path,
+        "summary": handoff.summary,
+    }
+
+
+def _consume_target_root_ansi_delta(
+    state: _TargetRootCommandOutputState,
+    delta: str,
+    *,
+    final: bool,
+) -> tuple[str, bool, int]:
+    """Strip CSI/OSC incrementally so event boundaries cannot hide tokens."""
+
+    data = state.ansi_pending + delta
+    state.ansi_pending = ""
+    visible: list[str] = []
+    changed = False
+    overflow_bytes = 0
+
+    while data:
+        overflow_mode = state.ansi_overflow_mode
+        if overflow_mode is not None:
+            consumed, terminated = _consume_overflowed_ansi_sequence(
+                state, data, overflow_mode
+            )
+            overflow_bytes += len(
+                _target_root_output_bytes(data[:consumed])
+            )
+            data = data[consumed:]
+            changed = True
+            if not terminated:
+                return "".join(visible), changed, overflow_bytes
+            state.ansi_overflow_mode = None
+            continue
+
+        introducer = _next_ansi_introducer(data)
+        if introducer is None:
+            visible.append(data)
+            break
+        index, mode, body_start = introducer
+        if index:
+            visible.append(data[:index])
+        sequence_end = _ansi_sequence_end(data, mode, body_start)
+        if sequence_end is not None:
+            data = data[sequence_end:]
+            changed = True
+            continue
+
+        pending = data[index:]
+        if final:
+            # A truncated escape at command completion is control material,
+            # never public stdout.
+            changed = True
+            break
+        if (
+            len(_target_root_output_bytes(pending))
+            <= _TARGET_ROOT_OUTPUT_PENDING_LIMIT
+        ):
+            state.ansi_pending = pending
+            break
+        overflow_bytes += len(_target_root_output_bytes(pending))
+        state.ansi_overflow_mode = mode
+        state.ansi_osc_escape_pending = (
+            mode == "osc" and pending.endswith("\x1b")
+        )
+        changed = True
+        break
+
+    return "".join(visible), changed, overflow_bytes
+
+
+def _next_ansi_introducer(
+    value: str,
+) -> tuple[int, Literal["csi", "osc", "escape"], int] | None:
+    candidates = [
+        (index, character)
+        for character in ("\x1b", "\x9b", "\x9d")
+        if (index := value.find(character)) >= 0
+    ]
+    if not candidates:
+        return None
+    index, character = min(candidates, key=lambda item: item[0])
+    if character == "\x9b":
+        return index, "csi", index + 1
+    if character == "\x9d":
+        return index, "osc", index + 1
+    if index + 1 >= len(value):
+        return index, "escape", index + 1
+    selector = value[index + 1]
+    if selector == "[":
+        return index, "csi", index + 2
+    if selector == "]":
+        return index, "osc", index + 2
+    return index, "escape", index + 1
+
+
+def _ansi_sequence_end(
+    value: str,
+    mode: Literal["csi", "osc", "escape"],
+    body_start: int,
+) -> int | None:
+    if mode == "escape":
+        return body_start + 1 if body_start < len(value) else None
+    if mode == "csi":
+        for index in range(body_start, len(value)):
+            if 0x40 <= ord(value[index]) <= 0x7E:
+                return index + 1
+        return None
+    index = body_start
+    while index < len(value):
+        character = value[index]
+        if character in {"\x07", "\x9c"}:
+            return index + 1
+        if (
+            character == "\x1b"
+            and index + 1 < len(value)
+            and value[index + 1] == "\\"
+        ):
+            return index + 2
+        index += 1
+    return None
+
+
+def _consume_overflowed_ansi_sequence(
+    state: _TargetRootCommandOutputState,
+    value: str,
+    mode: Literal["csi", "osc", "escape"],
+) -> tuple[int, bool]:
+    if mode == "escape":
+        return (1, True) if value else (0, False)
+    if mode == "csi":
+        for index, character in enumerate(value):
+            if 0x40 <= ord(character) <= 0x7E:
+                return index + 1, True
+        return len(value), False
+    start = 0
+    if state.ansi_osc_escape_pending:
+        state.ansi_osc_escape_pending = False
+        if value.startswith("\\"):
+            return 1, True
+    while start < len(value):
+        character = value[start]
+        if character in {"\x07", "\x9c"}:
+            return start + 1, True
+        if character == "\x1b":
+            if start + 1 < len(value) and value[start + 1] == "\\":
+                return start + 2, True
+            if start + 1 == len(value):
+                state.ansi_osc_escape_pending = True
+        start += 1
+    return len(value), False
+
+
+def _consume_target_root_line_endings(
+    state: _TargetRootCommandOutputState,
+    delta: str,
+    *,
+    final: bool,
+) -> tuple[str, bool]:
+    """Normalize CRLF, but never let a bare CR create a trusted line."""
+
+    visible: list[str] = []
+    changed = False
+    index = 0
+    if state.carriage_return_pending:
+        if delta.startswith("\n"):
+            visible.append("\n")
+            index = 1
+        elif not delta and not final:
+            return "", False
+        state.carriage_return_pending = False
+        changed = True
+
+    while index < len(delta):
+        character = delta[index]
+        if character != "\r":
+            visible.append(character)
+            index += 1
+            continue
+        changed = True
+        if index + 1 < len(delta):
+            if delta[index + 1] == "\n":
+                visible.append("\n")
+                index += 2
+            else:
+                # Delete a bare CR so both sides remain one logical line and
+                # are judged together by the Owner secret detector.
+                index += 1
+            continue
+        if not final:
+            state.carriage_return_pending = True
+        index += 1
+    return "".join(visible), changed
+
+
+def _consume_target_root_output_delta(
+    state: _TargetRootCommandOutputState,
+    delta: str,
+    *,
+    final: bool,
+) -> tuple[str, bool, int]:
+    """Return only bytes proven safe for an incremental public observation.
+
+    Codex command events repeat cumulative stdout.  An unfinished line is the
+    only raw fragment retained, and it is capped at the public chunk budget.
+    Secret bodies are discarded as soon as their opener is recognized.
+    """
+
+    clean_delta, ansi_changed, ansi_overflow_bytes = (
+        _consume_target_root_ansi_delta(state, delta, final=final)
+    )
+    normalized_delta, carriage_return_changed = (
+        _consume_target_root_line_endings(state, clean_delta, final=final)
+    )
+    data = state.pending + normalized_delta
+    state.pending = ""
+    redacted = (
+        state.pending_redacted
+        or ansi_changed
+        or carriage_return_changed
+    )
+    state.pending_redacted = False
+    visible: list[str] = []
+    overflow_bytes = ansi_overflow_bytes
+
+    while data:
+        if state.mode == "secret_line":
+            newline = data.find("\n")
+            if newline < 0:
+                # The replacement was already emitted.  Retaining the token
+                # body would add no display value and could retain a secret.
+                return "".join(visible), True, overflow_bytes
+            visible.append("\n")
+            redacted = True
+            data = data[newline + 1 :]
+            state.mode = "normal"
+            continue
+
+        if state.mode == "overflow":
+            newline = data.find("\n")
+            if newline < 0:
+                overflow_bytes += len(_target_root_output_bytes(data))
+                if final:
+                    state.mode = "normal"
+                return "".join(visible), True, overflow_bytes
+            dropped = data[: newline + 1]
+            overflow_bytes += len(_target_root_output_bytes(dropped))
+            data = data[newline + 1 :]
+            state.mode = "normal"
+            redacted = True
+            continue
+
+        if state.mode == "private_key":
+            normalized = _normalize_target_root_output(data)
+            key_end = _PRIVATE_KEY_END.search(normalized)
+            if key_end is not None:
+                data = normalized[key_end.end() :]
+                state.mode = "normal"
+                redacted = True
+                continue
+            if final:
+                # An unterminated PEM body is still secret.  Its opener's
+                # replacement was emitted by the earlier cumulative update.
+                state.mode = "normal"
+                return "".join(visible), True, overflow_bytes
+            encoded = _target_root_output_bytes(normalized)
+            if len(encoded) > _TARGET_ROOT_OUTPUT_PENDING_LIMIT:
+                kept = _utf8_tail(
+                    normalized, _TARGET_ROOT_OUTPUT_PENDING_LIMIT
+                )
+                overflow_bytes += len(encoded) - len(
+                    _target_root_output_bytes(kept)
+                )
+                state.pending = kept
+            else:
+                state.pending = normalized
+            return "".join(visible), True, overflow_bytes
+
+        newline = data.find("\n")
+        if newline >= 0:
+            line = data[: newline + 1]
+            data = data[newline + 1 :]
+            projected, changed = _project_complete_target_root_line(
+                state, line
+            )
+            if projected:
+                visible.append(projected)
+            redacted = redacted or changed
+            continue
+
+        if final:
+            projected, changed = _project_complete_target_root_line(
+                state, data
+            )
+            if projected:
+                visible.append(projected)
+            redacted = redacted or changed
+            return "".join(visible), redacted, overflow_bytes
+
+        normalized = _normalize_target_root_output(data)
+        normalized_changed = normalized != data
+        encoded = _target_root_output_bytes(normalized)
+        if len(encoded) > _TARGET_ROOT_OUTPUT_PENDING_LIMIT:
+            overflow_bytes += len(encoded)
+            state.mode = "overflow"
+            return "".join(visible), True, overflow_bytes
+        # Until a logical line is closed, no raw prefix is provably safe: a
+        # later cumulative suffix can turn it into a credential URI, natural
+        # language password, JWT, or provider token.  Hold the whole line.
+        state.pending = normalized
+        state.pending_redacted = redacted or normalized_changed
+        return "".join(visible), redacted, overflow_bytes
+
+    if final and state.mode in {"secret_line", "private_key", "overflow"}:
+        state.mode = "normal"
+    return "".join(visible), redacted, overflow_bytes
+
+
+def _project_complete_target_root_line(
+    state: _TargetRootCommandOutputState,
+    value: str,
+) -> tuple[str, bool]:
+    normalized = _normalize_target_root_output(value)
+    normalized_changed = normalized != value
+    opener = _first_target_root_secret_opener(normalized)
+    if opener is not None:
+        kind, match = opener
+        prefix, _prefix_redacted = _sanitize_target_root_output(
+            normalized[: match.start()]
+        )
+        line_ending = "\n" if normalized.endswith("\n") else ""
+        if kind == "private_key":
+            key_end = _PRIVATE_KEY_END.search(normalized, match.end())
+            if key_end is None:
+                state.mode = "private_key"
+                return prefix + "[REDACTED PRIVATE KEY]", True
+            return prefix + "[REDACTED PRIVATE KEY]" + line_ending, True
+        if kind == "bearer":
+            replacement = "Bearer [REDACTED]"
+        elif kind == "assignment":
+            replacement = (
+                str(match.group(1))
+                + str(match.group(2))
+                + "[REDACTED]"
+            )
+        else:
+            replacement = "[REDACTED]"
+        return prefix + replacement + line_ending, True
+    if _target_root_owner_secret_detected(normalized):
+        return "[REDACTED]" + ("\n" if normalized.endswith("\n") else ""), True
+    sanitized, sanitized_changed = _sanitize_target_root_output(normalized)
+    return sanitized, normalized_changed or sanitized_changed
+
+
+def _first_target_root_secret_opener(
+    value: str,
+) -> tuple[
+    Literal["private_key", "known_token", "bearer", "assignment"],
+    re.Match[str],
+] | None:
+    matches: list[
+        tuple[
+            Literal[
+                "private_key", "known_token", "bearer", "assignment"
+            ],
+            re.Match[str],
+        ]
+    ] = []
+    for kind, pattern in (
+        ("private_key", _PRIVATE_KEY_BEGIN),
+        ("known_token", _KNOWN_TOKEN),
+        ("bearer", _BEARER_OPENER),
+        ("assignment", _SECRET_ASSIGNMENT_OPENER),
+    ):
+        match = pattern.search(value)
+        if match is not None:
+            matches.append((kind, match))
+    generic_assignment = _first_owner_secret_assignment(value)
+    if generic_assignment is not None:
+        matches.append(("assignment", generic_assignment))
+    if not matches:
+        return None
+    return min(matches, key=lambda item: item[1].start())
+
+
+def _first_owner_secret_assignment(value: str) -> re.Match[str] | None:
+    """Find a key assignment in linear time; Owner decides key sensitivity."""
+
+    for separator in re.finditer(r"[:=]", value):
+        key_end = separator.start()
+        while key_end and value[key_end - 1] in {" ", "\t"}:
+            key_end -= 1
+        key_start = key_end
+        while (
+            key_start
+            and key_end - key_start <= 255
+            and (
+                value[key_start - 1].isalnum()
+                or value[key_start - 1] in {"_", ".", "-"}
+            )
+        ):
+            key_start -= 1
+        match = _GENERIC_ASSIGNMENT_OPENER.match(value, key_start)
+        if (
+            match is not None
+            and match.end(1) == key_end
+            and contains_secret(
+                {str(match.group(1)): "public-placeholder"}
+            )
+        ):
+            return match
+    return None
+
+
+def _target_root_owner_secret_detected(value: str) -> bool:
+    folded = value.casefold()
+    return any(marker in folded for marker in _OWNER_SECRET_TEXT_MARKERS) and (
+        contains_secret(value)
+    )
+
+
+def _normalize_target_root_output(value: str) -> str:
+    sanitized = value.replace("\r\n", "\n").replace("\r", "")
+    sanitized = _ANSI_ESCAPE.sub("", sanitized)
+    sanitized = "".join(
+        character
+        for character in sanitized
+        if character in {"\n", "\t"}
+        or not unicodedata.category(character).startswith("C")
+    )
+    return sanitized
+
+
+def _target_root_output_bytes(value: str) -> bytes:
+    # JSON permits escaped lone surrogates.  They are removed from the public
+    # projection as Unicode controls, but must remain hashable/countable while
+    # cumulative raw output is reconciled.
+    return value.encode("utf-8", errors="surrogatepass")
+
+
+def _sanitize_target_root_output(value: str) -> tuple[str, bool]:
+    sanitized = _normalize_target_root_output(value)
+    sanitized = _PRIVATE_KEY.sub("[REDACTED PRIVATE KEY]", sanitized)
+    sanitized = _BEARER_SECRET.sub("Bearer [REDACTED]", sanitized)
+    sanitized = _URL_USERINFO.sub(r"\1[REDACTED]@", sanitized)
+    sanitized = _KNOWN_TOKEN.sub("[REDACTED]", sanitized)
+    sanitized = _SECRET_ASSIGNMENT.sub(r"\1\2[REDACTED]", sanitized)
+    changed = sanitized != value
+    return sanitized, changed
+
+
+def _truncate_utf8(value: str, limit: int) -> tuple[str, bool]:
+    encoded = _target_root_output_bytes(value)
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", errors="ignore"), True
+
+
+def _utf8_tail(value: str, limit: int) -> str:
+    encoded = _target_root_output_bytes(value)
+    if len(encoded) <= limit:
+        return value
+    return encoded[-limit:].decode("utf-8", errors="ignore")
+
+
 def _evidence_from_events(
     *,
     family: HarnessFamily,
@@ -556,19 +1930,31 @@ def _evidence_from_events(
     events: tuple[dict[str, object], ...],
     expected_native_session_ref: str | None,
     evidence_scope_ref: str,
+    observation_scope: dict[str, object],
     transport_receipt: dict[str, object] | None = None,
+    codex_child_ledger_reader: CodexChildLedgerReader | None = None,
+    expected_working_directory: str | None = None,
 ) -> HarnessTurnEvidence:
     observed: dict[str, list[str]] = {
         name: [] for name in HARNESS_CAPABILITIES
     }
     native_refs: set[str] = set()
+    root_native_refs: set[str] = set()
     summaries: list[dict[str, object]] = []
     terminal = False
     claude_pending_tools: dict[str, tuple[str, str]] = {}
+    projector = _TargetRootEventProjector(
+        family=family,
+        observation_scope=observation_scope,
+    )
     for sequence, event in enumerate(events, start=1):
-        summary, capabilities, native_ref, is_terminal = _summarize_event(
-            family, event
-        )
+        (
+            summary,
+            capabilities,
+            native_ref,
+            is_terminal,
+            _observation,
+        ) = projector.summarize(event)
         if summary is None:
             continue
         event_ref = "harness_evidence:" + canonical_hash(
@@ -608,30 +1994,48 @@ def _evidence_from_events(
         if native_ref is not None:
             native_refs.add(native_ref)
             observed["native_session"].append(event_ref)
+            if (
+                (family == "codex" and event.get("type") == "thread.started")
+                or (
+                    family == "claude"
+                    and event.get("type") == "system"
+                    and event.get("subtype") == "init"
+                )
+            ):
+                root_native_refs.add(native_ref)
         terminal = terminal or is_terminal
     if len(summaries) >= 2 and terminal:
         observed["stream"].extend(
             [summaries[0]["event_ref"], summaries[-1]["event_ref"]]
         )
-    if len(native_refs) != 1:
+    if expected_native_session_ref is not None:
+        if expected_native_session_ref not in native_refs:
+            raise HarnessAdapterUnavailable("native_session_identity_changed")
+        native_session_ref = expected_native_session_ref
+    elif len(root_native_refs) == 1:
+        native_session_ref = next(iter(root_native_refs))
+    elif len(native_refs) == 1:
+        native_session_ref = next(iter(native_refs))
+    else:
         raise HarnessAdapterUnavailable("native_session_identity_unavailable")
-    native_session_ref = next(iter(native_refs))
-    if (
-        expected_native_session_ref is not None
-        and native_session_ref != expected_native_session_ref
-    ):
-        raise HarnessAdapterUnavailable("native_session_identity_changed")
-    observed["subagent"].extend(
-        _verified_subagent_evidence_refs(
-            family,
-            events,
-            evidence_refs_by_sequence={
-                int(item["sequence"]): str(item["event_ref"])
-                for item in summaries
-            },
-            root_session_ref=native_session_ref,
-        )
+    subagent_evidence = _verified_subagent_evidence(
+        family,
+        events,
+        evidence_refs_by_sequence={
+            int(item["sequence"]): str(item["event_ref"])
+            for item in summaries
+        },
+        root_session_ref=native_session_ref,
+        codex_child_ledger_reader=codex_child_ledger_reader,
+        expected_working_directory=expected_working_directory,
     )
+    if subagent_evidence is not None:
+        observed["subagent"].extend(
+            (
+                str(subagent_evidence["spawn_evidence_ref"]),
+                str(subagent_evidence["completion_evidence_ref"]),
+            )
+        )
     capabilities = {
         name: (
             {
@@ -656,6 +2060,9 @@ def _evidence_from_events(
         "provider_version": provider_version,
         "native_session_ref": native_session_ref,
         "capabilities": capabilities,
+        "subagent_evidence": (
+            [] if subagent_evidence is None else [subagent_evidence]
+        ),
     }
     return HarnessTurnEvidence(
         native_session_ref=native_session_ref,
@@ -723,6 +2130,23 @@ def _summarize_codex_event(
     summary: dict[str, object] = {"kind": event_type}
     if isinstance(item_type, str):
         summary["item_kind"] = item_type
+    if (
+        event_type == "item.completed"
+        and item_type == "skill"
+        and isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+    ):
+        summary["skill_name"] = item["name"]
+        actor_ref = item.get("sender_thread_id")
+        if isinstance(actor_ref, str):
+            summary["actor_session_ref"] = actor_ref
+    if event_type == "item.completed" and isinstance(item, dict):
+        command = _codex_successful_command(item)
+        if command is not None:
+            summary.update(command)
+        root_evidence = _codex_root_preflight_envelope(item)
+        if root_evidence is not None:
+            summary["target_root_evidence"] = root_evidence
     if isinstance(tool, str):
         summary["tool_kind"] = tool
     if isinstance(server, str):
@@ -745,6 +2169,7 @@ def _summarize_claude_event(
     capabilities: set[str] = set()
     inventory_names: list[str] = []
     invoked_tool_names: list[str] = []
+    skill_invocations: list[dict[str, str]] = []
     if event_type == "system" and subtype == "init":
         tools = event.get("tools")
         if isinstance(tools, list):
@@ -758,6 +2183,21 @@ def _summarize_claude_event(
                 name = block.get("name")
                 if isinstance(name, str):
                     invoked_tool_names.append(name)
+                    tool_use_id = block.get("id")
+                    skill_input = block.get("input")
+                    if (
+                        name.lower() == "skill"
+                        and isinstance(tool_use_id, str)
+                        and isinstance(skill_input, dict)
+                        and set(skill_input) == {"skill"}
+                        and isinstance(skill_input.get("skill"), str)
+                    ):
+                        skill_invocations.append(
+                            {
+                                "tool_use_id": tool_use_id,
+                                "skill_name": skill_input["skill"],
+                            }
+                        )
     lifecycle = {
         "fork": "fork",
         "steer": "steer",
@@ -781,6 +2221,8 @@ def _summarize_claude_event(
         summary["inventory_kinds"] = sorted(set(inventory_names))
     if invoked_tool_names:
         summary["tool_kinds"] = sorted(set(invoked_tool_names))
+    if skill_invocations:
+        summary["skill_invocations"] = skill_invocations
     result_ids = [
         block["tool_use_id"]
         for block in _claude_content_blocks(event)
@@ -789,6 +2231,18 @@ def _summarize_claude_event(
     ]
     if result_ids:
         summary["tool_result_ids"] = sorted(set(result_ids))
+    successful_result_ids = [
+        block["tool_use_id"]
+        for block in _claude_content_blocks(event)
+        if block.get("type") == "tool_result"
+        and isinstance(block.get("tool_use_id"), str)
+        and block.get("is_error") is not True
+        and block.get("status") not in {"error", "failed", "cancelled"}
+    ]
+    if successful_result_ids:
+        summary["successful_tool_result_ids"] = sorted(
+            set(successful_result_ids)
+        )
     if native_ref is not None:
         summary["native_session_ref"] = native_ref
     is_terminal = event_type == "result" and event.get("is_error") is False
@@ -811,120 +2265,900 @@ def _verified_subagent_evidence_refs(
     *,
     evidence_refs_by_sequence: dict[int, str],
     root_session_ref: str,
+    codex_child_ledger_reader: CodexChildLedgerReader | None = None,
+    expected_working_directory: str | None = None,
 ) -> tuple[str, ...]:
+    evidence = _verified_subagent_evidence(
+        family,
+        events,
+        evidence_refs_by_sequence=evidence_refs_by_sequence,
+        root_session_ref=root_session_ref,
+        codex_child_ledger_reader=codex_child_ledger_reader,
+        expected_working_directory=expected_working_directory,
+    )
+    if evidence is None:
+        return ()
+    return (
+        str(evidence["spawn_evidence_ref"]),
+        str(evidence["completion_evidence_ref"]),
+    )
+
+
+def _verified_subagent_evidence(
+    family: HarnessFamily,
+    events: tuple[dict[str, object], ...],
+    *,
+    evidence_refs_by_sequence: dict[int, str],
+    root_session_ref: str,
+    codex_child_ledger_reader: CodexChildLedgerReader | None = None,
+    expected_working_directory: str | None = None,
+) -> dict[str, object] | None:
     if family == "codex":
-        return _verified_codex_subagent_evidence_refs(
+        return _verified_codex_subagent_evidence(
             events,
             evidence_refs_by_sequence=evidence_refs_by_sequence,
             root_session_ref=root_session_ref,
+            codex_child_ledger_reader=codex_child_ledger_reader,
+            expected_working_directory=expected_working_directory,
         )
-    return _verified_claude_subagent_evidence_refs(
+    return _verified_claude_subagent_evidence(
         events,
         evidence_refs_by_sequence=evidence_refs_by_sequence,
         root_session_ref=root_session_ref,
     )
 
 
-def _verified_codex_subagent_evidence_refs(
+def _verified_codex_subagent_evidence(
     events: tuple[dict[str, object], ...],
     *,
     evidence_refs_by_sequence: dict[int, str],
     root_session_ref: str,
-) -> tuple[str, ...]:
-    spawn_calls: list[tuple[int, dict[str, object]]] = []
+    codex_child_ledger_reader: CodexChildLedgerReader | None = None,
+    expected_working_directory: str | None = None,
+) -> dict[str, object] | None:
+    root_code_review_skill_calls: list[int] = []
+    spawn_calls: list[tuple[int, dict[str, object], str]] = []
     wait_calls: list[tuple[int, dict[str, object]]] = []
     for sequence, event in enumerate(events, start=1):
         item = event.get("item")
         if (
-            not isinstance(item, dict)
-            or item.get("type") != "collab_tool_call"
+            event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "skill"
+            and item.get("name") == "code-review"
+            and _codex_item_actor(event, item) == root_session_ref
         ):
+            root_code_review_skill_calls.append(sequence)
+        if not isinstance(item, dict) or item.get("type") != "collab_tool_call":
             continue
-        if item.get("tool") == "spawn_agent":
-            spawn_calls.append((sequence, item))
+        if item.get("tool") == "spawn_agent" and _is_completed_codex_spawn(
+            event, item, root_session_ref
+        ):
+            child_ref = item["receiver_thread_ids"][0]
+            assert isinstance(child_ref, str)
+            spawn_calls.append((sequence, item, child_ref))
         elif (
             item.get("tool") == "wait"
             and event.get("type") == "item.completed"
             and item.get("status") == "completed"
+            and item.get("sender_thread_id") == root_session_ref
         ):
             wait_calls.append((sequence, item))
-    if len(spawn_calls) != 1:
-        return ()
-    spawn_sequence, spawn = spawn_calls[0]
-    receivers = spawn.get("receiver_thread_ids")
-    states = spawn.get("agents_states")
-    if (
-        events[spawn_sequence - 1].get("type") != "item.completed"
-        or spawn.get("status") != "completed"
-        or spawn.get("sender_thread_id") != root_session_ref
-        or not isinstance(receivers, list)
-        or len(receivers) != 1
-        or not isinstance(receivers[0], str)
-        or not receivers[0]
-        or receivers[0] == root_session_ref
-        or not isinstance(states, dict)
-        or not isinstance(states.get(receivers[0]), dict)
-    ):
-        return ()
-    child_ref = receivers[0]
-    terminal_wait_sequence: int | None = None
-    for sequence, wait in wait_calls:
-        wait_receivers = wait.get("receiver_thread_ids")
-        wait_states = wait.get("agents_states")
-        if wait_receivers == [] and wait_states == {}:
+    child_spawn_counts = {
+        child_ref: sum(1 for _sequence, _spawn, value in spawn_calls if value == child_ref)
+        for _sequence, _spawn, child_ref in spawn_calls
+    }
+    completed_children: list[
+        tuple[int, dict[str, object], str, int, dict[str, object]]
+    ] = []
+    for spawn_sequence, spawn, child_ref in spawn_calls:
+        terminal_waits = [
+            (sequence, state)
+            for sequence, wait in wait_calls
+            if (state := _codex_terminal_wait_child_state(
+                wait,
+                child_ref=child_ref,
+                wait_sequence=sequence,
+                after_sequence=spawn_sequence,
+            )) is not None
+        ]
+        # A native child has one definitive root terminal wait.  Other
+        # children' waits are intentionally ignored, but duplicate terminal
+        # receipts for this child are ambiguous and cannot authorize it.
+        if len(terminal_waits) != 1 or child_spawn_counts[child_ref] != 1:
             continue
-        if (
-            sequence <= spawn_sequence
-            or wait.get("sender_thread_id") != root_session_ref
-            or wait_receivers != [child_ref]
-            or not isinstance(wait_states, dict)
-            or not isinstance(wait_states.get(child_ref), dict)
-        ):
-            return ()
-        if wait_states[child_ref].get("status") == "completed":
-            terminal_wait_sequence = sequence
-    if terminal_wait_sequence is None:
-        return ()
-    refs = (
-        evidence_refs_by_sequence.get(spawn_sequence),
-        evidence_refs_by_sequence.get(terminal_wait_sequence),
+        terminal_wait_sequence, terminal_child_state = terminal_waits[0]
+        completed_children.append(
+            (
+                spawn_sequence,
+                spawn,
+                child_ref,
+                terminal_wait_sequence,
+                terminal_child_state,
+            )
+        )
+    reviewer_candidates: list[
+        tuple[
+            int,
+            dict[str, object],
+            str,
+            int,
+            dict[str, object],
+            dict[str, object],
+            str,
+        ]
+    ] = []
+    for (
+        spawn_sequence,
+        spawn,
+        child_ref,
+        terminal_wait_sequence,
+        terminal_child_state,
+    ) in completed_children:
+        payload = _target_review_payload(terminal_child_state)
+        if payload is None:
+            continue
+        review_kind = payload.get("review_kind")
+        if review_kind == "code":
+            child_review_evidence = _verified_codex_child_code_review_evidence(
+                spawn=spawn,
+                child_ref=child_ref,
+                terminal_child_state=terminal_child_state,
+                root_session_ref=root_session_ref,
+                root_code_review_skill_calls=root_code_review_skill_calls,
+                codex_child_ledger_reader=codex_child_ledger_reader,
+                expected_working_directory=expected_working_directory,
+            )
+        elif review_kind == "result":
+            child_review_evidence = _verified_codex_child_result_review_evidence(
+                spawn=spawn,
+                child_ref=child_ref,
+                terminal_child_state=terminal_child_state,
+                root_session_ref=root_session_ref,
+                codex_child_ledger_reader=codex_child_ledger_reader,
+                expected_working_directory=expected_working_directory,
+            )
+        else:
+            child_review_evidence = None
+        if child_review_evidence is not None:
+            reviewer_candidates.append(
+                (
+                    spawn_sequence,
+                    spawn,
+                    child_ref,
+                    terminal_wait_sequence,
+                    terminal_child_state,
+                    child_review_evidence,
+                    str(review_kind),
+                )
+            )
+    if len(reviewer_candidates) > 1:
+        return None
+    if reviewer_candidates:
+        (
+            spawn_sequence,
+            _spawn,
+            child_ref,
+            terminal_wait_sequence,
+            terminal_child_state,
+            child_review_evidence,
+            review_kind,
+        ) = reviewer_candidates[0]
+        result = _codex_subagent_result(
+            root_session_ref=root_session_ref,
+            child_ref=child_ref,
+            spawn_sequence=spawn_sequence,
+            terminal_wait_sequence=terminal_wait_sequence,
+            terminal_child_state=terminal_child_state,
+            evidence_refs_by_sequence=evidence_refs_by_sequence,
+        )
+        if result is None:
+            return None
+        if review_kind == "code":
+            root_preflight_evidence = _verified_codex_root_preflight_evidence(
+                events,
+                evidence_refs_by_sequence=evidence_refs_by_sequence,
+                root_session_ref=root_session_ref,
+                spawn_sequence=spawn_sequence,
+            )
+            if root_preflight_evidence is not None:
+                result.update(root_preflight_evidence)
+        result.update(child_review_evidence)
+        return result
+    # Preserve generic subagent conformance when exactly one ordinary child
+    # exists, while never downgrading an invalid Target review into generic
+    # evidence that a review Owner could accidentally consume.
+    if len(completed_children) != 1:
+        return None
+    (
+        spawn_sequence,
+        fallback_spawn,
+        child_ref,
+        terminal_wait_sequence,
+        terminal_child_state,
+    ) = completed_children[0]
+    fallback_payload = _target_review_payload(terminal_child_state)
+    if (
+        (fallback_payload is not None and fallback_payload.get("review_kind") == "result")
+        or _target_result_review_request(fallback_spawn.get("prompt")) is not None
+    ):
+        return None
+    return _codex_subagent_result(
+        root_session_ref=root_session_ref,
+        child_ref=child_ref,
+        spawn_sequence=spawn_sequence,
+        terminal_wait_sequence=terminal_wait_sequence,
+        terminal_child_state=terminal_child_state,
+        evidence_refs_by_sequence=evidence_refs_by_sequence,
     )
-    return tuple(ref for ref in refs if ref is not None)
 
 
-def _verified_claude_subagent_evidence_refs(
+def _is_completed_codex_spawn(
+    event: dict[str, object], item: dict[str, object], root_session_ref: str
+) -> bool:
+    receivers = item.get("receiver_thread_ids")
+    states = item.get("agents_states")
+    return (
+        event.get("type") == "item.completed"
+        and item.get("status") == "completed"
+        and item.get("sender_thread_id") == root_session_ref
+        and isinstance(receivers, list)
+        and len(receivers) == 1
+        and isinstance(receivers[0], str)
+        and bool(receivers[0])
+        and receivers[0] != root_session_ref
+        and isinstance(states, dict)
+        and isinstance(states.get(receivers[0]), dict)
+    )
+
+
+def _codex_terminal_wait_child_state(
+    wait: dict[str, object],
+    *,
+    child_ref: str,
+    wait_sequence: int,
+    after_sequence: int,
+) -> dict[str, object] | None:
+    # The sequence check belongs here so each candidate binds to its own
+    # spawn, rather than to any unrelated terminal wait in the root turn.
+    receivers = wait.get("receiver_thread_ids")
+    states = wait.get("agents_states")
+    if (
+        wait_sequence <= after_sequence
+        or receivers != [child_ref]
+        or not isinstance(states, dict)
+        or not isinstance(states.get(child_ref), dict)
+        or states[child_ref].get("status") != "completed"
+    ):
+        return None
+    return states[child_ref]
+
+
+def _codex_subagent_result(
+    *,
+    root_session_ref: str,
+    child_ref: str,
+    spawn_sequence: int,
+    terminal_wait_sequence: int,
+    terminal_child_state: dict[str, object],
+    evidence_refs_by_sequence: dict[int, str],
+) -> dict[str, object] | None:
+    spawn_ref = evidence_refs_by_sequence.get(spawn_sequence)
+    completion_ref = evidence_refs_by_sequence.get(terminal_wait_sequence)
+    if spawn_ref is None or completion_ref is None:
+        return None
+    payload = _target_review_payload(terminal_child_state)
+    return {
+        "parent_session_ref": root_session_ref,
+        "child_session_ref": child_ref,
+        "spawn_evidence_ref": spawn_ref,
+        "completion_evidence_ref": completion_ref,
+        "payload": payload,
+        "payload_hash": None if payload is None else canonical_hash(payload),
+    }
+
+
+def _codex_item_actor(event: dict[str, object], item: dict[str, object]) -> str | None:
+    """Return an explicit actor only; never infer a child event is root-owned."""
+
+    for value in (event.get("thread_id"), item.get("sender_thread_id")):
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _codex_successful_command(item: dict[str, object]) -> dict[str, object] | None:
+    """Summarize an observed successful root command without retaining output."""
+
+    item_id = item.get("id")
+    exit_code = item.get("exit_code")
+    if (
+        item.get("type") != "command_execution"
+        or not isinstance(item_id, str)
+        or not item_id
+        or isinstance(exit_code, bool)
+        or exit_code != 0
+    ):
+        return None
+    output = item.get("output")
+    if isinstance(output, str):
+        # Escaped lone surrogates are legal JSON string content but cannot be
+        # encoded by canonical_json.  The public observation projector removes
+        # them; the formal command-exit hash uses a deterministic replacement.
+        output = output.encode("utf-8", errors="replace").decode("utf-8")
+    return {
+        "command_item_id": item_id,
+        "command_exit_hash": canonical_hash(
+            {
+                "command_item_id": item_id,
+                "exit_code": exit_code,
+                "output": output,
+            }
+        ),
+    }
+
+
+def _closed_root_preflight_envelope(value: object) -> dict[str, object] | None:
+    """Parse the exact JSON envelope emitted by the root agent, not prose."""
+
+    if not isinstance(value, str) or len(value.encode("utf-8")) > _RESULT_LIMIT:
+        return None
+    try:
+        document = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(document, dict):
+        return None
+    schema_ref = document.get("schema_ref")
+    common_keys = {
+        "schema_ref",
+        "target_ref",
+        "target_run_ref",
+        "implementation_revision_ref",
+        "expected_tree_hash",
+    }
+    if schema_ref == _TARGET_CANDIDATE_READY_SCHEMA:
+        expected_keys = common_keys
+    elif schema_ref == _TARGET_SELF_CHECK_SCHEMA:
+        expected_keys = common_keys | {"status"}
+    else:
+        return None
+    if set(document) != expected_keys:
+        return None
+    if any(
+        not isinstance(document.get(field), str) or not document[field]
+        for field in (
+            "target_ref",
+            "target_run_ref",
+            "implementation_revision_ref",
+            "expected_tree_hash",
+        )
+    ):
+        return None
+    if not re.fullmatch(r"[0-9a-f]{64}", str(document["expected_tree_hash"])):
+        return None
+    if schema_ref == _TARGET_SELF_CHECK_SCHEMA and document.get("status") != "passed":
+        return None
+    return cast(dict[str, object], document)
+
+
+def _codex_root_preflight_envelope(item: dict[str, object]) -> dict[str, object] | None:
+    if item.get("type") != "agent_message":
+        return None
+    # Codex 0.147 uses ``text`` for agent_message.  ``content`` is accepted
+    # only when it is the same closed scalar envelope, never a prose search.
+    return _closed_root_preflight_envelope(item.get("text") or item.get("content"))
+
+
+def _verified_codex_root_preflight_evidence(
     events: tuple[dict[str, object], ...],
     *,
     evidence_refs_by_sequence: dict[int, str],
     root_session_ref: str,
-) -> tuple[str, ...]:
+    spawn_sequence: int,
+) -> dict[str, object] | None:
+    """Bind root implementation readiness to native spawn in causal order."""
+
+    candidates: list[tuple[int, dict[str, object]]] = []
+    self_checks: list[tuple[int, dict[str, object]]] = []
+    commands: list[tuple[int, dict[str, object]]] = []
+    for sequence, event in enumerate(events, start=1):
+        item = event.get("item")
+        if event.get("type") != "item.completed" or not isinstance(item, dict):
+            continue
+        if _codex_item_actor(event, item) != root_session_ref:
+            continue
+        command = _codex_successful_command(item)
+        if command is not None:
+            commands.append((sequence, command))
+        envelope = _codex_root_preflight_envelope(item)
+        if envelope is None:
+            continue
+        if envelope["schema_ref"] == _TARGET_CANDIDATE_READY_SCHEMA:
+            candidates.append((sequence, envelope))
+        else:
+            self_checks.append((sequence, envelope))
+    if len(candidates) != 1 or len(self_checks) != 1:
+        return None
+    candidate_sequence, candidate = candidates[0]
+    self_check_sequence, self_check = self_checks[0]
+    if not (candidate_sequence < self_check_sequence < spawn_sequence):
+        return None
+    for field in (
+        "target_ref",
+        "target_run_ref",
+        "implementation_revision_ref",
+        "expected_tree_hash",
+    ):
+        if candidate[field] != self_check[field]:
+            return None
+    observed_commands = [
+        command
+        for sequence, command in commands
+        if candidate_sequence < sequence < self_check_sequence
+    ]
+    if not observed_commands:
+        return None
+    candidate_ref = evidence_refs_by_sequence.get(candidate_sequence)
+    self_check_ref = evidence_refs_by_sequence.get(self_check_sequence)
+    if candidate_ref is None or self_check_ref is None:
+        return None
+    return {
+        "candidate_ready_evidence_ref": candidate_ref,
+        "candidate_ready": candidate,
+        "self_check_evidence_ref": self_check_ref,
+        "self_check_evidence_refs": [self_check_ref],
+        "self_check": self_check,
+        # These are adapter-derived native command facts.  The root marker
+        # cannot know CLI item identifiers or output hashes while producing
+        # its response, so accepting them from the root would be forgeable.
+        "successful_command_item_ids": [
+            command["command_item_id"] for command in observed_commands
+        ],
+        "successful_command_exit_hashes": [
+            command["command_exit_hash"] for command in observed_commands
+        ],
+    }
+
+
+def _verified_codex_child_code_review_evidence(
+    *,
+    spawn: dict[str, object],
+    child_ref: str,
+    terminal_child_state: dict[str, object] | None,
+    root_session_ref: str,
+    root_code_review_skill_calls: list[int],
+    codex_child_ledger_reader: CodexChildLedgerReader | None,
+    expected_working_directory: str | None,
+) -> dict[str, object] | None:
+    """Prove child-local `$code-review` without treating parent JSONL as it.
+
+    Codex's parent ``--json`` stream proves the native spawn and terminal wait,
+    but child Skill events live in the child session ledger.  Both sources are
+    necessary: the ledger alone cannot prove the root waited for this child,
+    and the parent stream alone cannot prove what the child executed.
+    """
+
+    prompt = spawn.get("prompt")
+    spawn_skill_paths = (
+        re.findall(r"\[skill:\$code-review\]\((/[^)\s]+)\)", prompt)
+        if isinstance(prompt, str)
+        else []
+    )
+    if (
+        not isinstance(prompt, str)
+        or len(prompt.encode("utf-8")) > 256_000
+        or len(spawn_skill_paths) != 1
+        or root_code_review_skill_calls
+        or codex_child_ledger_reader is None
+        or expected_working_directory is None
+    ):
+        return None
+    wait_message = terminal_child_state.get("message") if terminal_child_state else None
+    if not isinstance(wait_message, str) or not wait_message:
+        return None
+    try:
+        records = codex_child_ledger_reader.read(child_ref)
+    except (OSError, ValueError):
+        return None
+    metadata = _verified_child_ledger_metadata(
+        records,
+        child_ref=child_ref,
+        root_session_ref=root_session_ref,
+        expected_working_directory=expected_working_directory,
+    )
+    skill = _verified_child_code_review_skill(records)
+    terminal = _verified_child_terminal_output(records)
+    if metadata is None or skill is None or terminal != wait_message:
+        return None
+    skill_path, skill_body = skill
+    if spawn_skill_paths[0] != skill_path:
+        return None
+    try:
+        package_hash = codex_child_ledger_reader.verify_skill_package(
+            skill_path, skill_body
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(package_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", package_hash
+    ):
+        return None
+    return {
+        "skill_name": "code-review",
+        "skill_actor_session_ref": child_ref,
+        # The Skill injection is a child-ledger fact.  The session ledger has
+        # no separate tool-call id for this CLI version, so this stable digest
+        # is the non-forgeable-in-profile reference Owner persists with the
+        # root spawn/wait event refs.
+        "skill_invocation_evidence_ref": "codex_child_skill:"
+        + canonical_hash(
+            {
+                "child_session_ref": child_ref,
+                "parent_session_ref": root_session_ref,
+                "skill_path": skill_path,
+                "skill_package_hash": package_hash,
+            }
+        ),
+        "skill_completion_evidence_ref": "codex_child_terminal:"
+        + canonical_hash(
+            {
+                "child_session_ref": child_ref,
+                "parent_session_ref": root_session_ref,
+                "terminal_output_hash": hashlib.sha256(
+                    terminal.encode("utf-8")
+                ).hexdigest(),
+            }
+        ),
+        "skill_package_path": skill_path,
+        "skill_package_hash": package_hash,
+        "spawn_prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "child_terminal_output_hash": hashlib.sha256(
+            terminal.encode("utf-8")
+        ).hexdigest(),
+        "child_ledger_lineage": metadata,
+    }
+
+
+def _verified_codex_child_result_review_evidence(
+    *,
+    spawn: dict[str, object],
+    child_ref: str,
+    terminal_child_state: dict[str, object] | None,
+    root_session_ref: str,
+    codex_child_ledger_reader: CodexChildLedgerReader | None,
+    expected_working_directory: str | None,
+) -> dict[str, object] | None:
+    """Prove a fresh native result-review child without a review Skill.
+
+    The root stream supplies the native spawn and its own terminal wait.  The
+    child ledger independently binds the exact structured task, lineage,
+    confinement, and terminal output.  Result review deliberately does not
+    reuse the code-review Skill or its child evidence contract.
+    """
+
+    prompt = spawn.get("prompt")
+    request = _target_result_review_request(prompt)
+    if (
+        request is None
+        or codex_child_ledger_reader is None
+        or expected_working_directory is None
+        or not isinstance(prompt, str)
+        or len(prompt.encode("utf-8")) > 256_000
+    ):
+        return None
+    wait_message = terminal_child_state.get("message") if terminal_child_state else None
+    if not isinstance(wait_message, str) or not wait_message:
+        return None
+    payload = _target_review_payload(terminal_child_state)
+    review = payload.get("review") if payload is not None else None
+    if (
+        payload is None
+        or payload.get("review_kind") != "result"
+        or not isinstance(review, dict)
+        or any(
+            review.get(field) != request[field]
+            for field in (
+                "reviewed_evaluation_attempt_ref",
+                "reviewed_metric_result_ref",
+                "reviewed_asset_manifest_ref",
+            )
+        )
+    ):
+        return None
+    try:
+        records = codex_child_ledger_reader.read(child_ref)
+    except (OSError, ValueError):
+        return None
+    metadata = _verified_child_ledger_metadata(
+        records,
+        child_ref=child_ref,
+        root_session_ref=root_session_ref,
+        expected_working_directory=expected_working_directory,
+        allowed_sandbox_modes=frozenset({"read-only", "workspace-write"}),
+    )
+    terminal = _verified_child_terminal_output(records)
+    if (
+        metadata is None
+        or terminal != wait_message
+        or _verified_child_code_review_skill(records) is not None
+        or _child_prompt_occurrences(records, prompt) != 1
+    ):
+        return None
+    terminal_output_hash = hashlib.sha256(terminal.encode("utf-8")).hexdigest()
+    return {
+        "review_actor_session_ref": child_ref,
+        "review_completion_evidence_ref": "codex_child_terminal:"
+        + canonical_hash(
+            {
+                "child_session_ref": child_ref,
+                "parent_session_ref": root_session_ref,
+                "terminal_output_hash": terminal_output_hash,
+            }
+        ),
+        "spawn_prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "child_terminal_output_hash": terminal_output_hash,
+        "child_ledger_lineage": metadata,
+        "result_review_request": request,
+    }
+
+
+def _target_result_review_request(value: object) -> dict[str, object] | None:
+    """Read one closed result-review request marker from a spawn prompt."""
+
+    if not isinstance(value, str):
+        return None
+    matches = re.findall(
+        r"<target-result-review-request>\s*(\{.*?\})\s*"
+        r"</target-result-review-request>",
+        value,
+        re.DOTALL,
+    )
+    if len(matches) != 1:
+        return None
+    try:
+        request = json.loads(matches[0])
+    except json.JSONDecodeError:
+        return None
+    expected_keys = {
+        "schema_ref",
+        "review_kind",
+        "target_ref",
+        "target_run_ref",
+        "reviewed_evaluation_attempt_ref",
+        "reviewed_metric_result_ref",
+        "reviewed_asset_manifest_ref",
+    }
+    if (
+        not isinstance(request, dict)
+        or set(request) != expected_keys
+        or request.get("schema_ref") != _TARGET_RESULT_REVIEW_REQUEST_SCHEMA
+        or request.get("review_kind") != "result"
+        or any(
+            not isinstance(request.get(field), str) or not request[field]
+            for field in expected_keys - {"schema_ref", "review_kind"}
+        )
+    ):
+        return None
+    return cast(dict[str, object], request)
+
+
+def _child_prompt_occurrences(
+    records: tuple[dict[str, object], ...], prompt: str
+) -> int:
+    """Count exact child-task prompt occurrences in user ledger items."""
+
+    count = 0
+    for record in records:
+        if record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or payload.get("role") != "user":
+            continue
+        content = payload.get("content")
+        if isinstance(content, str):
+            count += int(content == prompt)
+        elif isinstance(content, list):
+            count += sum(
+                1
+                for item in content
+                if isinstance(item, dict)
+                and item.get("type") in {"input_text", "text"}
+                and item.get("text") == prompt
+            )
+    return count
+
+
+def _verified_child_ledger_metadata(
+    records: tuple[dict[str, object], ...],
+    *,
+    child_ref: str,
+    root_session_ref: str,
+    expected_working_directory: str,
+    allowed_sandbox_modes: frozenset[str] = frozenset({"workspace-write"}),
+) -> dict[str, object] | None:
+    metadata = [
+        record.get("payload")
+        for record in records
+        if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict)
+    ]
+    if len(metadata) != 1:
+        return None
+    value = metadata[0]
+    source = value.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    sandbox_mode = _verified_child_sandbox_mode(
+        records,
+        expected_working_directory=expected_working_directory,
+        allowed_sandbox_modes=allowed_sandbox_modes,
+    )
+    if (
+        value.get("id") != child_ref
+        or value.get("session_id") != root_session_ref
+        or value.get("parent_thread_id") != root_session_ref
+        or not isinstance(spawn, dict)
+        or spawn.get("parent_thread_id") != root_session_ref
+        or value.get("cwd") != expected_working_directory
+        or value.get("thread_source") != "subagent"
+        or value.get("originator") != "codex_exec"
+        or value.get("cli_version") != CODEX_LOCKED_VERSION
+        or sandbox_mode is None
+    ):
+        return None
+    return {
+        "session_id": child_ref,
+        "parent_session_id": root_session_ref,
+        "thread_source": "subagent",
+        "cwd": expected_working_directory,
+        "originator": "codex_exec",
+        "cli_version": CODEX_LOCKED_VERSION,
+        "sandbox_mode": sandbox_mode,
+    }
+
+
+def _verified_child_sandbox_mode(
+    records: tuple[dict[str, object], ...],
+    *,
+    expected_working_directory: str,
+    allowed_sandbox_modes: frozenset[str],
+) -> str | None:
+    """Require every persisted child turn context to retain Target confinement."""
+
+    contexts = [
+        record.get("payload")
+        for record in records
+        if record.get("type") == "turn_context"
+        and isinstance(record.get("payload"), dict)
+    ]
+    if not contexts:
+        return None
+    observed_mode: str | None = None
+    for context in contexts:
+        assert isinstance(context, dict)
+        policy = context.get("sandbox_policy")
+        mode = policy.get("type") if isinstance(policy, dict) else None
+        if (
+            context.get("cwd") != expected_working_directory
+            or not isinstance(policy, dict)
+            or not isinstance(mode, str)
+            or mode not in allowed_sandbox_modes
+            or (observed_mode is not None and mode != observed_mode)
+        ):
+            return None
+        observed_mode = mode
+    return observed_mode
+
+
+def _verified_child_code_review_skill(
+    records: tuple[dict[str, object], ...],
+) -> tuple[str, str] | None:
+    injections: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r"<skill>\s*<name>\s*code-review\s*</name>\s*<path>\s*"
+        r"(/[^<\s]+)\s*</path>(.*?)</skill>",
+        re.DOTALL,
+    )
+    for record in records:
+        if record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or payload.get("role") != "user":
+            continue
+        content = payload.get("content")
+        texts: list[str] = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") in {"input_text", "text"}
+                    and isinstance(item.get("text"), str)
+                ):
+                    texts.append(item["text"])
+        for text in texts:
+            matches = pattern.findall(text)
+            if len(matches) != 1:
+                continue
+            path, body = matches[0]
+            if not path or not body:
+                continue
+            injections.append((path, body))
+    return injections[0] if len(injections) == 1 else None
+
+
+def _skill_body_without_wrapper_newline(body: str) -> tuple[str, ...]:
+    """Allow only the newline(s) introduced by the XML-like Skill wrapper."""
+
+    candidates = [body]
+    if body.startswith("\n"):
+        candidates.append(body[1:])
+    if body.endswith("\n"):
+        candidates.append(body[:-1])
+    if body.startswith("\n") and body.endswith("\n"):
+        candidates.append(body[1:-1])
+    return tuple(dict.fromkeys(candidates))
+
+
+def _verified_child_terminal_output(
+    records: tuple[dict[str, object], ...],
+) -> str | None:
+    outputs = []
+    for record in records:
+        if record.get("type") != "event_msg":
+            continue
+        payload = record.get("payload")
+        if (
+            isinstance(payload, dict)
+            and payload.get("type") == "task_complete"
+            and isinstance(payload.get("last_agent_message"), str)
+            and payload["last_agent_message"]
+        ):
+            outputs.append(payload["last_agent_message"])
+    return outputs[0] if len(outputs) == 1 else None
+
+
+def _verified_claude_subagent_evidence(
+    events: tuple[dict[str, object], ...],
+    *,
+    evidence_refs_by_sequence: dict[int, str],
+    root_session_ref: str,
+) -> dict[str, object] | None:
     requests: list[tuple[int, str]] = []
-    results: list[tuple[int, dict[str, object]]] = []
+    results: list[tuple[int, dict[str, object], str | None]] = []
     for sequence, event in enumerate(events, start=1):
         for block in _claude_content_blocks(event):
-            if block.get("type") == "tool_use" and str(
-                block.get("name", "")
-            ).lower() in {"agent", "task", "subagent"}:
+            if block.get("type") == "tool_use":
+                tool_name = str(block.get("name", "")).lower()
                 tool_use_id = block.get("id")
-                if (
-                    event.get("session_id") != root_session_ref
-                    or not isinstance(tool_use_id, str)
-                    or not tool_use_id
-                ):
-                    return ()
-                requests.append((sequence, tool_use_id))
+                if tool_name in {"agent", "task", "subagent"}:
+                    if (
+                        event.get("session_id") != root_session_ref
+                        or not isinstance(tool_use_id, str)
+                        or not tool_use_id
+                    ):
+                        return None
+                    requests.append((sequence, tool_use_id))
             elif block.get("type") == "tool_result":
-                results.append((sequence, block))
+                session_ref = event.get("session_id")
+                results.append(
+                    (
+                        sequence,
+                        block,
+                        session_ref if isinstance(session_ref, str) else None,
+                    )
+                )
     if len(requests) != 1:
-        return ()
+        return None
     request_sequence, tool_use_id = requests[0]
     matching = [
         (sequence, block)
-        for sequence, block in results
+        for sequence, block, _session_ref in results
         if block.get("tool_use_id") == tool_use_id
     ]
     if len(matching) != 1:
-        return ()
+        return None
     result_sequence, result = matching[0]
     child_ref = result.get("agent_id") or result.get("child_agent_ref")
     if (
@@ -936,12 +3170,52 @@ def _verified_claude_subagent_evidence_refs(
         or not child_ref
         or child_ref == root_session_ref
     ):
-        return ()
-    refs = (
-        evidence_refs_by_sequence.get(request_sequence),
-        evidence_refs_by_sequence.get(result_sequence),
-    )
-    return tuple(ref for ref in refs if ref is not None)
+        return None
+    spawn_ref = evidence_refs_by_sequence.get(request_sequence)
+    completion_ref = evidence_refs_by_sequence.get(result_sequence)
+    if spawn_ref is None or completion_ref is None:
+        return None
+    payload = _target_review_payload(result)
+    evidence: dict[str, object] = {
+        "parent_session_ref": root_session_ref,
+        "child_session_ref": child_ref,
+        "spawn_evidence_ref": spawn_ref,
+        "completion_evidence_ref": completion_ref,
+        "payload": payload,
+        "payload_hash": None if payload is None else canonical_hash(payload),
+    }
+    return evidence
+
+
+def _target_review_payload(value: object) -> dict[str, object] | None:
+    """Extract only the closed Target review envelope from child output."""
+
+    candidates: list[object] = [value]
+    if isinstance(value, dict):
+        candidates.extend(
+            value.get(name) for name in ("result", "output", "message", "content")
+        )
+    for candidate in candidates:
+        decoded = candidate
+        if isinstance(candidate, str):
+            try:
+                decoded = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        if (
+            isinstance(decoded, dict)
+            and decoded.get("schema_ref")
+            == _TARGET_REVIEW_EVIDENCE_SCHEMA
+            and decoded.get("review_kind") in {"code", "result"}
+            and isinstance(decoded.get("review"), dict)
+            and set(decoded)
+            <= {"schema_ref", "review_kind", "review", "scope"}
+        ):
+            scope = decoded.get("scope")
+            if scope is not None and not isinstance(scope, dict):
+                continue
+            return cast(dict[str, object], decoded)
+    return None
 
 
 def _capabilities_for_tool(

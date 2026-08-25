@@ -866,7 +866,6 @@ export type PlanStageProjection = {
 export type BundleTargetProjection = {
   target_ref: string;
   target_key: string;
-  target_type: string;
   spec_hash: string;
   dependency_refs: string[];
   target_run_ref?: string | null;
@@ -888,6 +887,46 @@ export type BundleTargetCommitProjection = {
   result_disposition: string;
   receipt?: IdeaReceipt | null;
   [key: string]: unknown;
+};
+
+export type TargetRootObservation = {
+  event_ref: string;
+  cursor: string;
+  operation_ref: string;
+  operation_generation: number;
+  sequence: number;
+  kind: string;
+  stream: string;
+  text: string;
+  recorded_at: number;
+  redacted: boolean;
+  truncated: boolean;
+  dropped_bytes: number;
+  dropped_events: number;
+};
+
+export type TargetRootObservationPage = {
+  target_ref: string;
+  target_run_ref: string;
+  attempt_ref: string;
+  attempt_generation: number;
+  root_session_ref: string;
+  native_session_ref: string | null;
+  fence_ref: string;
+  stream_ref: string;
+  status: string;
+  items: TargetRootObservation[];
+  next_cursor: string | null;
+  head_cursor: string | null;
+  has_more: boolean;
+  observation_only: true;
+};
+
+export type TargetRootObservationPointer = {
+  target_ref: string;
+  target_run_ref: string;
+  stream_ref: string;
+  head_cursor: string;
 };
 
 export type BundleStageProjection = {
@@ -1143,9 +1182,11 @@ export type WritingComparison = {
       right: WritingVersion["citations"][number];
     }>;
   };
-  stale: boolean;
-  frozen_snapshot_hash: string;
-  current_snapshot_hash: string;
+  snapshot: {
+    mode: "frozen";
+    snapshot_ref: string;
+    snapshot_hash: string;
+  };
 };
 
 export type WritingRender = {
@@ -1863,6 +1904,27 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
     throw new ProductError(`snapshot_unavailable:${response.status}`);
   }
   return (await response.json()) as PublicSnapshot;
+}
+
+export function fetchTargetRootObservations(
+  targetRef: string,
+  options: {
+    after?: string | null;
+    limit?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<TargetRootObservationPage> {
+  const limit = options.limit ?? 128;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+    throw new ProductError("target_root_observation_limit_invalid");
+  }
+  const parameters = new URLSearchParams({ limit: String(limit) });
+  if (options.after) parameters.set("after", options.after);
+  return readJson(
+    `/api/v1/bundle/targets/${encodeURIComponent(targetRef)}`
+      + `/root-observations?${parameters}`,
+    options.signal,
+  );
 }
 
 export function fetchWriting(signal?: AbortSignal): Promise<WritingOverview> {
@@ -4430,6 +4492,9 @@ export function followProjection(
   onSnapshotRequired: () => void,
   onConnection: (connected: boolean) => void,
   latestSnapshotRevision?: () => number | null,
+  onTargetRootObservationsAvailable?: (
+    pointer: TargetRootObservationPointer,
+  ) => void,
 ): () => void {
   const eventTypes = [
     "system.ready",
@@ -4584,6 +4649,31 @@ export function followProjection(
       if (!acceptCursor(event)) return;
       scheduleSnapshotReload();
     };
+    next.addEventListener(
+      "agent_runtime.target_root_observations_available",
+      (event) => {
+        if (!onTargetRootObservationsAvailable) return;
+        try {
+          const payload = JSON.parse((event as MessageEvent<string>).data) as
+            Partial<TargetRootObservationPointer>;
+          if (
+            typeof payload.target_ref !== "string"
+            || !payload.target_ref
+            || typeof payload.target_run_ref !== "string"
+            || !payload.target_run_ref
+            || typeof payload.stream_ref !== "string"
+            || !payload.stream_ref
+            || typeof payload.head_cursor !== "string"
+            || !payload.head_cursor
+          ) return;
+          onTargetRootObservationsAvailable(
+            payload as TargetRootObservationPointer,
+          );
+        } catch {
+          // A malformed advisory pointer cannot alter the monotonic Projection.
+        }
+      },
+    );
     next.addEventListener("projection.updated", update);
     for (const eventType of eventTypes) next.addEventListener(eventType, update);
     next.addEventListener("snapshot.required", (event) => {

@@ -1026,6 +1026,67 @@ def test_revoked_epoch_request_cannot_admit_a_new_stage_run(tmp_path: Path) -> N
         runtime.close()
 
 
+def test_provider_unit_kind_spoof_fails_before_any_owner_write(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "provider-unit-kind-spoof")
+    runtime = _runtime(data_root, _IdeaProvider())
+    try:
+        completed = _confirm_question_with_prefix(
+            runtime,
+            "provider-unit-kind-spoof",
+        )
+        _root_question, _request, run = _admit_direct_idea_request(
+            runtime,
+            completed,
+            "provider-unit-kind-spoof",
+        )
+        with runtime._database.read() as connection:
+            state_before = tuple(
+                connection.execute(
+                    text(
+                        "SELECT * FROM agent_runtime_state WHERE "
+                        "singleton = 'owner'"
+                    )
+                ).one()
+            )
+            unit_count_before = connection.execute(
+                text("SELECT COUNT(*) FROM ar_provider_units")
+            ).scalar_one()
+            feed_before = connection.execute(
+                text("SELECT COUNT(*) FROM durable_feed")
+            ).scalar_one()
+        with pytest.raises(
+            OwnerConflict,
+            match="runtime_provider_unit_kind_mismatch",
+        ):
+            runtime.owners.agent_runtime.begin_provider_unit(
+                unit_ref=run.primary_invocation.invocation_ref,
+                operation_ref=run.primary_invocation.operation_ref,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                unit_kind="experiment",
+            )
+        with runtime._database.read() as connection:
+            assert tuple(
+                connection.execute(
+                    text(
+                        "SELECT * FROM agent_runtime_state WHERE "
+                        "singleton = 'owner'"
+                    )
+                ).one()
+            ) == state_before
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM ar_provider_units")
+            ).scalar_one() == unit_count_before
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM durable_feed")
+            ).scalar_one() == feed_before
+    finally:
+        runtime.close()
+
+
 def test_forced_switch_back_rebinds_logical_run_to_new_epoch_and_fence(
     tmp_path: Path,
 ) -> None:

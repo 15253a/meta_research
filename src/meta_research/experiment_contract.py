@@ -4,7 +4,7 @@ import base64
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Callable, Literal, cast
 
 from meta_research.owners.common import (
     AcceptedAssetBinding,
@@ -17,6 +17,11 @@ from meta_research.owners.common import (
 EXPERIMENT_INPUT_BINDING_SCHEMA = "meta-research/experiment-input-binding/v1"
 EXPERIMENT_RUNTIME_BINDING_SCHEMA = "meta-research/experiment-runtime-binding/v1"
 EXPERIMENT_RESULT_SCHEMA = "meta-research/micro-experiment-result/v1"
+PROTOCOL_EXPERIMENT_INTENT_SCHEMA = "meta-research/protocol-experiment-intent/v2"
+PROTOCOL_EXPERIMENT_DEFINITION_SCHEMA = (
+    "meta-research/protocol-experiment-definition/v2"
+)
+PROTOCOL_EXPERIMENT_RESULT_SCHEMA = "meta-research/protocol-experiment-result/v2"
 EXPERIMENT_RESULT_COMPONENT_MANIFEST_SCHEMA = (
     "meta-research/experiment-result-component-manifest/v1"
 )
@@ -112,14 +117,182 @@ class ExperimentIntent:
         checkpoints = self.selected_checkpoint_role_refs
         if (
             len(checkpoints) > 32
+            or any(
+                not isinstance(ref, str) or not ref or len(ref) > 96
+                for ref in checkpoints
+            )
             or len(set(checkpoints)) != len(checkpoints)
-            or any(not ref or len(ref) > 96 for ref in checkpoints)
         ):
             raise OwnerConflict("experiment_checkpoint_selection_invalid")
 
     @property
     def content_hash(self) -> str:
         return canonical_hash(self.as_dict())
+
+    @property
+    def forms_new_variant(self) -> bool:
+        return self.request_kind == "retrain"
+
+    @property
+    def checkpoint_policy(self) -> Literal["forbidden", "optional", "required"]:
+        return "required" if self.forms_new_variant else "forbidden"
+
+    @property
+    def result_schema_ref(self) -> str:
+        return EXPERIMENT_RESULT_SCHEMA
+
+
+@dataclass(frozen=True)
+class ProtocolExperimentIntent:
+    """Versioned, provider-neutral state formation and measurement request.
+
+    The four semantic documents remain owned by Research Graph.  Only the
+    versioned ``execution`` envelope is interpreted by the installed provider.
+    This keeps a packaged example runner out of the product Target contract.
+    """
+
+    execution_request_ref: str
+    quest_ref: str
+    title: str
+    objective: str
+    baseline_forward_contract: dict[str, object]
+    variant_recipe: dict[str, object]
+    evaluation_protocol_lineage: dict[str, object]
+    protocol_version: dict[str, object]
+    execution: dict[str, object]
+    checkpoint_policy: Literal["forbidden", "optional", "required"]
+    request_kind: Literal["new_variant", "remeasure"] = "new_variant"
+    source_variant_run_ref: str | None = None
+    selected_checkpoint_role_refs: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        self.validate()
+        return {
+            "schema_ref": PROTOCOL_EXPERIMENT_INTENT_SCHEMA,
+            "execution_request_ref": self.execution_request_ref,
+            "quest_ref": self.quest_ref,
+            "title": self.title,
+            "objective": self.objective,
+            "request_kind": self.request_kind,
+            "source_variant_run_ref": self.source_variant_run_ref,
+            "selected_checkpoint_role_refs": list(
+                self.selected_checkpoint_role_refs
+            ),
+            "checkpoint_policy": self.checkpoint_policy,
+            "baseline_forward_contract": self.baseline_forward_contract,
+            "variant_recipe": self.variant_recipe,
+            "evaluation_protocol_lineage": self.evaluation_protocol_lineage,
+            "protocol_version": self.protocol_version,
+            "execution": self.execution,
+        }
+
+    def validate(self) -> None:
+        if not self.execution_request_ref or len(self.execution_request_ref) > 96:
+            raise OwnerConflict("experiment_execution_request_ref_invalid")
+        if not self.quest_ref or len(self.quest_ref) > 96:
+            raise OwnerConflict("experiment_quest_ref_invalid")
+        if not self.title.strip() or len(self.title) > 512:
+            raise OwnerConflict("experiment_title_invalid")
+        if not self.objective.strip() or len(self.objective) > 4000:
+            raise OwnerConflict("experiment_objective_invalid")
+        if self.request_kind not in {"new_variant", "remeasure"}:
+            raise OwnerConflict("experiment_request_kind_invalid")
+        if self.checkpoint_policy not in {"forbidden", "optional", "required"}:
+            raise OwnerConflict("experiment_checkpoint_policy_invalid")
+        if self.request_kind == "new_variant":
+            if self.source_variant_run_ref is not None:
+                raise OwnerConflict("experiment_source_variant_run_forbidden")
+            if self.selected_checkpoint_role_refs:
+                raise OwnerConflict("experiment_checkpoint_selection_forbidden")
+        else:
+            if not self.source_variant_run_ref:
+                raise OwnerConflict("experiment_source_variant_run_required")
+            if self.checkpoint_policy != "forbidden":
+                raise OwnerConflict("experiment_checkpoint_policy_invalid")
+        if (
+            self.source_variant_run_ref is not None
+            and len(self.source_variant_run_ref) > 96
+        ):
+            raise OwnerConflict("experiment_source_variant_run_invalid")
+        checkpoints = self.selected_checkpoint_role_refs
+        if (
+            len(checkpoints) > 32
+            or any(
+                not isinstance(ref, str) or not ref or len(ref) > 96
+                for ref in checkpoints
+            )
+            or len(set(checkpoints)) != len(checkpoints)
+        ):
+            raise OwnerConflict("experiment_checkpoint_selection_invalid")
+        documents = (
+            self.baseline_forward_contract,
+            self.variant_recipe,
+            self.evaluation_protocol_lineage,
+            self.protocol_version,
+            self.execution,
+        )
+        if any(not isinstance(value, dict) or not value for value in documents):
+            raise OwnerConflict("experiment_definition_invalid")
+        for document in documents:
+            canonical_hash(document)
+        required = self.protocol_version.get("required_metrics")
+        optional = self.protocol_version.get("optional_metrics", [])
+        if (
+            not isinstance(required, list)
+            or not required
+            or len(required) > 64
+            or not all(
+                isinstance(value, str) and bool(value.strip()) and len(value) <= 128
+                for value in required
+            )
+            or len(required) != len(set(required))
+            or not isinstance(optional, list)
+            or len(optional) > 64
+            or not all(
+                isinstance(value, str) and bool(value.strip()) and len(value) <= 128
+                for value in optional
+            )
+            or len(optional) != len(set(optional))
+            or set(required) & set(optional)
+        ):
+            raise OwnerConflict("experiment_required_metrics_invalid")
+        if set(self.execution) != {"adapter_kind", "schema_ref", "payload"}:
+            raise OwnerConflict("experiment_execution_adapter_invalid")
+        if (
+            not isinstance(self.execution.get("adapter_kind"), str)
+            or not cast(str, self.execution["adapter_kind"]).strip()
+            or len(cast(str, self.execution["adapter_kind"])) > 128
+            or not isinstance(self.execution.get("schema_ref"), str)
+            or not cast(str, self.execution["schema_ref"]).strip()
+            or len(cast(str, self.execution["schema_ref"])) > 256
+            or not isinstance(self.execution.get("payload"), dict)
+        ):
+            raise OwnerConflict("experiment_execution_adapter_invalid")
+
+    @property
+    def content_hash(self) -> str:
+        return canonical_hash(self.as_dict())
+
+    @property
+    def forms_new_variant(self) -> bool:
+        return self.request_kind == "new_variant"
+
+    @property
+    def result_schema_ref(self) -> str:
+        return PROTOCOL_EXPERIMENT_RESULT_SCHEMA
+
+    @property
+    def required_metrics(self) -> tuple[str, ...]:
+        self.validate()
+        return tuple(cast(list[str], self.protocol_version["required_metrics"]))
+
+    @property
+    def optional_metrics(self) -> tuple[str, ...]:
+        self.validate()
+        return tuple(cast(list[str], self.protocol_version.get("optional_metrics", [])))
+
+
+ExperimentIntentLike = ExperimentIntent | ProtocolExperimentIntent
 
 
 @dataclass(frozen=True)
@@ -187,7 +360,7 @@ class ExperimentIdentitySet:
 
 @dataclass(frozen=True)
 class ExperimentDomainAdmission:
-    intent: ExperimentIntent
+    intent: ExperimentIntentLike
     execution_request: "AcceptedExperimentExecutionRequest"
     identities: ExperimentIdentitySet
     variant_run_binding: AcceptedExperimentInputBinding
@@ -342,8 +515,10 @@ class ExperimentProviderRequest:
     required_metrics: tuple[str, ...]
     provider_operation_ref: str = ""
     provider_operation_generation: int = 1
-    request_kind: Literal["retrain", "remeasure"] = "retrain"
+    request_kind: Literal["retrain", "new_variant", "remeasure"] = "retrain"
     selected_checkpoints: tuple[MaterializedExperimentCheckpoint, ...] = ()
+    definition: dict[str, object] | None = None
+    checkpoint_policy: Literal["forbidden", "optional", "required"] | None = None
 
     def validate(self) -> None:
         if (
@@ -353,16 +528,31 @@ class ExperimentProviderRequest:
             or self.provider_operation_generation < 1
         ):
             raise OwnerConflict("experiment_provider_operation_ref_invalid")
-        if self.request_kind not in {"retrain", "remeasure"}:
+        if self.request_kind not in {"retrain", "new_variant", "remeasure"}:
             raise OwnerConflict("experiment_provider_request_invalid")
-        if self.request_kind == "retrain" and self.selected_checkpoints:
+        if self.request_kind in {"retrain", "new_variant"} and self.selected_checkpoints:
             raise OwnerConflict("experiment_provider_request_invalid")
+        policy = self.effective_checkpoint_policy
+        if policy not in {"forbidden", "optional", "required"}:
+            raise OwnerConflict("experiment_checkpoint_policy_invalid")
+        if self.request_kind == "remeasure" and policy != "forbidden":
+            raise OwnerConflict("experiment_checkpoint_policy_invalid")
+        if self.definition is not None:
+            canonical_hash(self.definition)
         if len(self.selected_checkpoints) > 32 or tuple(
             checkpoint.ordinal for checkpoint in self.selected_checkpoints
         ) != tuple(range(len(self.selected_checkpoints))):
             raise OwnerConflict("experiment_checkpoint_materialization_invalid")
         for checkpoint in self.selected_checkpoints:
             checkpoint.validate()
+
+    @property
+    def effective_checkpoint_policy(
+        self,
+    ) -> Literal["forbidden", "optional", "required"]:
+        if self.checkpoint_policy is not None:
+            return self.checkpoint_policy
+        return "required" if self.request_kind == "retrain" else "forbidden"
 
 
 @dataclass(frozen=True)
@@ -372,11 +562,12 @@ class ExperimentProviderResult:
     result_content: dict[str, object]
     adapter_kind: str
     additional_checkpoint_contents: tuple[bytes, ...] = ()
+    schema_ref: str = EXPERIMENT_RESULT_SCHEMA
 
     def as_document(self) -> dict[str, object]:
         validate_experiment_provider_result(self)
         return {
-            "schema_ref": EXPERIMENT_RESULT_SCHEMA,
+            "schema_ref": self.schema_ref,
             "checkpoint_content_base64": (
                 None
                 if self.checkpoint_content is None
@@ -393,7 +584,11 @@ class ExperimentProviderResult:
 
     @classmethod
     def from_document(cls, value: dict[str, object]) -> "ExperimentProviderResult":
-        if value.get("schema_ref") != EXPERIMENT_RESULT_SCHEMA:
+        schema_ref = value.get("schema_ref")
+        if schema_ref not in {
+            EXPERIMENT_RESULT_SCHEMA,
+            PROTOCOL_EXPERIMENT_RESULT_SCHEMA,
+        }:
             raise OwnerConflict("experiment_result_invalid")
         encoded = value.get("checkpoint_content_base64")
         analysis = value.get("analysis")
@@ -424,6 +619,7 @@ class ExperimentProviderResult:
             result_content,
             adapter_kind,
             additional,
+            cast(str, schema_ref),
         )
         validate_experiment_provider_result(result)
         return result
@@ -538,12 +734,24 @@ def validate_experiment_runtime_binding(binding: ExperimentRuntimeBinding) -> No
 
 
 def experiment_definition_document(
-    intent: ExperimentIntent, runtime_binding: ExperimentRuntimeBinding
+    intent: ExperimentIntentLike, runtime_binding: ExperimentRuntimeBinding
 ) -> dict[str, object]:
     """Exact RM-owned content from which RG derives semantic identities."""
 
     intent_document = intent.as_dict()
     runtime_document = runtime_binding.as_dict()
+    if isinstance(intent, ProtocolExperimentIntent):
+        return {
+            "schema_ref": PROTOCOL_EXPERIMENT_DEFINITION_SCHEMA,
+            "intent": intent_document,
+            "baseline_forward_contract": intent.baseline_forward_contract,
+            "variant_recipe": intent.variant_recipe,
+            "evaluation_protocol_lineage": intent.evaluation_protocol_lineage,
+            "protocol_version": intent.protocol_version,
+            "execution": intent.execution,
+            "checkpoint_policy": intent.checkpoint_policy,
+            "runtime_binding": runtime_document,
+        }
     return {
         "schema_ref": "meta-research/micro-experiment-definition/v1",
         "intent": intent_document,
@@ -587,10 +795,20 @@ def experiment_definition_document(
 def validate_experiment_provider_result(
     result: ExperimentProviderResult,
     *,
-    request_kind: Literal["retrain", "remeasure"] | None = None,
+    request_kind: Literal["retrain", "new_variant", "remeasure"] | None = None,
+    checkpoint_policy: Literal["forbidden", "optional", "required"] | None = None,
+    required_metrics: tuple[str, ...] | None = None,
+    result_schema_ref: str | None = None,
 ) -> None:
-    if request_kind not in {None, "retrain", "remeasure"}:
+    if request_kind not in {None, "retrain", "new_variant", "remeasure"}:
         raise OwnerConflict("experiment_result_invalid")
+    if checkpoint_policy is None:
+        if request_kind == "retrain":
+            checkpoint_policy = "required"
+        elif request_kind in {"new_variant", "remeasure"}:
+            checkpoint_policy = "forbidden"
+    if checkpoint_policy not in {None, "forbidden", "optional", "required"}:
+        raise OwnerConflict("experiment_checkpoint_policy_invalid")
     if result.checkpoint_content is None:
         if result.additional_checkpoint_contents:
             raise OwnerConflict("experiment_checkpoint_invalid")
@@ -601,8 +819,8 @@ def validate_experiment_provider_result(
             *result.additional_checkpoint_contents,
         )
     if (
-        (request_kind == "retrain" and not checkpoints)
-        or (request_kind == "remeasure" and checkpoints)
+        (checkpoint_policy == "required" and not checkpoints)
+        or (checkpoint_policy == "forbidden" and checkpoints)
         or len(checkpoints) > 32
         or any(
             not isinstance(content, bytes)
@@ -613,12 +831,18 @@ def validate_experiment_provider_result(
         or len(set(checkpoints)) != len(checkpoints)
     ):
         raise OwnerConflict("experiment_checkpoint_invalid")
-    if not result.adapter_kind or len(result.adapter_kind) > 128:
+    if (
+        not result.adapter_kind
+        or len(result.adapter_kind) > 128
+        or result.schema_ref
+        not in {EXPERIMENT_RESULT_SCHEMA, PROTOCOL_EXPERIMENT_RESULT_SCHEMA}
+        or (result_schema_ref is not None and result.schema_ref != result_schema_ref)
+    ):
         raise OwnerConflict("experiment_result_invalid")
     metrics = result.result_content.get("metrics")
     disposition = result.result_content.get("result_disposition")
     if (
-        result.result_content.get("schema_ref") != EXPERIMENT_RESULT_SCHEMA
+        result.result_content.get("schema_ref") != result.schema_ref
         or not isinstance(metrics, dict)
         or (
             disposition is not None
@@ -635,6 +859,120 @@ def validate_experiment_provider_result(
             or not math.isfinite(float(value))
         ):
             raise OwnerConflict("experiment_metric_invalid")
+    if required_metrics is not None and any(
+        name not in metrics for name in required_metrics
+    ):
+        raise OwnerConflict("formal_measurement_metrics_incomplete")
     # Sign, magnitude, and significance deliberately do not gate validity.
     canonical_hash(result.analysis)
     canonical_hash(result.result_content)
+
+
+def experiment_intent_from_document(value: dict[str, object]) -> ExperimentIntentLike:
+    """Decode old receipt material exactly, while admitting versioned v2 intents."""
+
+    try:
+        if value.get("schema_ref") == PROTOCOL_EXPERIMENT_INTENT_SCHEMA:
+            checkpoints = value["selected_checkpoint_role_refs"]
+            documents = {
+                name: value[name]
+                for name in (
+                    "baseline_forward_contract",
+                    "variant_recipe",
+                    "evaluation_protocol_lineage",
+                    "protocol_version",
+                    "execution",
+                )
+            }
+            if not isinstance(checkpoints, list) or any(
+                not isinstance(document, dict) for document in documents.values()
+            ):
+                raise TypeError("protocol experiment intent")
+            intent: ExperimentIntentLike = ProtocolExperimentIntent(
+                execution_request_ref=str(value["execution_request_ref"]),
+                quest_ref=str(value["quest_ref"]),
+                title=str(value["title"]),
+                objective=str(value["objective"]),
+                baseline_forward_contract=cast(
+                    dict[str, object], documents["baseline_forward_contract"]
+                ),
+                variant_recipe=cast(dict[str, object], documents["variant_recipe"]),
+                evaluation_protocol_lineage=cast(
+                    dict[str, object], documents["evaluation_protocol_lineage"]
+                ),
+                protocol_version=cast(
+                    dict[str, object], documents["protocol_version"]
+                ),
+                execution=cast(dict[str, object], documents["execution"]),
+                checkpoint_policy=cast(
+                    Literal["forbidden", "optional", "required"],
+                    str(value["checkpoint_policy"]),
+                ),
+                request_kind=cast(
+                    Literal["new_variant", "remeasure"],
+                    str(value["request_kind"]),
+                ),
+                source_variant_run_ref=(
+                    None
+                    if value["source_variant_run_ref"] is None
+                    else str(value["source_variant_run_ref"])
+                ),
+                selected_checkpoint_role_refs=tuple(
+                    str(item) for item in checkpoints
+                ),
+            )
+        else:
+            checkpoints = value["selected_checkpoint_role_refs"]
+            if not isinstance(checkpoints, list):
+                raise TypeError("legacy experiment intent")
+            intent = ExperimentIntent(
+                execution_request_ref=str(value["execution_request_ref"]),
+                quest_ref=str(value["quest_ref"]),
+                title=str(value["title"]),
+                hypothesis=str(value["hypothesis"]),
+                variant_parameter=float(value["variant_parameter"]),
+                sample_count=int(value["sample_count"]),
+                request_kind=cast(
+                    Literal["retrain", "remeasure"], str(value["request_kind"])
+                ),
+                source_variant_run_ref=(
+                    None
+                    if value["source_variant_run_ref"] is None
+                    else str(value["source_variant_run_ref"])
+                ),
+                selected_checkpoint_role_refs=tuple(
+                    str(item) for item in checkpoints
+                ),
+            )
+        intent.validate()
+        if intent.as_dict() != value:
+            raise OwnerConflict("experiment_intent_invalid")
+        return intent
+    except (KeyError, TypeError, ValueError) as error:
+        raise OwnerConflict("experiment_intent_invalid") from error
+
+
+def experiment_required_metrics(intent: ExperimentIntentLike) -> tuple[str, ...]:
+    if isinstance(intent, ProtocolExperimentIntent):
+        return intent.required_metrics
+    return EXPERIMENT_REQUIRED_METRICS
+
+
+def experiment_optional_metrics(intent: ExperimentIntentLike) -> tuple[str, ...]:
+    if isinstance(intent, ProtocolExperimentIntent):
+        return intent.optional_metrics
+    return ()
+
+
+def experiment_checkpoint_policy(
+    intent: ExperimentIntentLike,
+) -> Literal["forbidden", "optional", "required"]:
+    return intent.checkpoint_policy
+
+
+def experiment_result_schema_ref(intent: ExperimentIntentLike) -> str:
+    return intent.result_schema_ref
+
+
+def experiment_forms_new_variant(intent: ExperimentIntentLike) -> bool:
+    return intent.forms_new_variant

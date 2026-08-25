@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
 from meta_research.composition import build_production_runtime
 from meta_research.experiment import (
@@ -17,6 +18,8 @@ from meta_research.experiment import (
     ExperimentService,
 )
 from meta_research.experiment_contract import (
+    PROTOCOL_EXPERIMENT_RESULT_SCHEMA,
+    ProtocolExperimentIntent,
     experiment_definition_document,
     experiment_execution_log_document,
 )
@@ -226,6 +229,43 @@ class _SequenceMetricsProvider(_DeterministicExperimentProvider):
         )
 
 
+class _ProtocolEvaluationProvider(_DeterministicExperimentProvider):
+    def __init__(self, metrics: dict[str, float]) -> None:
+        super().__init__()
+        self._metrics = metrics
+
+    def execute(self, request, observe) -> ExperimentProviderResult:
+        self.execute_calls += 1
+        self.requests.append(request)
+        assert request.definition is not None
+        assert request.definition["schema_ref"] == (
+            "meta-research/protocol-experiment-definition/v2"
+        )
+        assert request.definition["execution"] == {
+            "adapter_kind": "test_rule_protocol",
+            "schema_ref": "test/rule-protocol/v1",
+            "payload": {"rule": "compare-normalized-sets"},
+        }
+        observe(
+            ExperimentObservation(
+                kind="stdout",
+                payload={"line": "rule protocol completed", "stream": "stdout"},
+                observed_at=1_720_000_101.0,
+            )
+        )
+        return ExperimentProviderResult(
+            checkpoint_content=None,
+            analysis={"interpretation": "rule protocol completed without model state"},
+            result_content={
+                "schema_ref": PROTOCOL_EXPERIMENT_RESULT_SCHEMA,
+                "metrics": self._metrics,
+                "result_disposition": "nonsignificant",
+            },
+            adapter_kind="test_rule_protocol",
+            schema_ref=PROTOCOL_EXPERIMENT_RESULT_SCHEMA,
+        )
+
+
 class _CrashBeforeRuntimeAdmission:
     def admit_experiment(self, **_values):
         raise RuntimeError("simulated_crash_before_runtime_admission")
@@ -247,6 +287,28 @@ def _runtime(path: Path, experiment_provider=None):
         host_compute_probe=_DeterministicProbe(),
         experiment_provider=experiment_provider or _DeterministicExperimentProvider(),
     )
+
+
+def _experiment_write_counts(runtime) -> dict[str, int]:
+    tables = (
+        "rm_asset_intakes",
+        "rm_assets",
+        "rm_asset_versions",
+        "rg_experiment_input_bindings",
+        "rg_experiment_requests",
+        "rg_experiment_idempotency",
+        "ar_experiment_runs",
+        "ar_experiment_sessions",
+        "ar_experiment_attempts",
+        "ar_provider_units",
+    )
+    with runtime._database.read() as connection:
+        return {
+            table: int(
+                connection.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+            )
+            for table in tables
+        }
 
 
 def _accept_test_asset(runtime, *, name: str, content: bytes):
@@ -417,6 +479,155 @@ def test_experiment_admission_keeps_domain_and_runtime_identities_independent(
         for new_identity in ("variant_run_ref", "evaluation_attempt_ref"):
             assert repeated["identities"][new_identity] != identities[new_identity]
         assert repeated["execution"]["run_ref"] != admitted["execution"]["run_ref"]
+    finally:
+        runtime.close()
+
+
+def test_bundle_target_namespace_is_rejected_before_provider_or_owner_writes(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicExperimentProvider()
+    runtime = _runtime(tmp_path / "bundle-target-namespace-rejected", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        before_counts = _experiment_write_counts(runtime)
+        before_snapshots = tuple(
+            owner.query_snapshot()
+            for owner in (
+                runtime.owners.research_memory,
+                runtime.owners.research_graph,
+                runtime.owners.agent_runtime,
+            )
+        )
+        before_provider_calls = (
+            provider.runtime_binding_calls,
+            provider.implementation_bundle_calls,
+            provider.execute_calls,
+        )
+
+        with pytest.raises(
+            OwnerConflict,
+            match="bundle_target_experiment_write_forbidden",
+        ):
+            runtime.experiment.start(
+                ExperimentIntent(
+                    execution_request_ref="bundle-target-forged-source-wrapper",
+                    quest_ref=quest["quest_ref"],
+                    title="forged formal Target Experiment",
+                    hypothesis="Formal Target must never enter Experiment authority.",
+                    variant_parameter=-0.25,
+                    sample_count=16,
+                ),
+                "reject-bundle-target-namespace",
+            )
+
+        assert (
+            provider.runtime_binding_calls,
+            provider.implementation_bundle_calls,
+            provider.execute_calls,
+        ) == before_provider_calls
+        assert _experiment_write_counts(runtime) == before_counts
+        assert tuple(
+            owner.query_snapshot()
+            for owner in (
+                runtime.owners.research_memory,
+                runtime.owners.research_graph,
+                runtime.owners.agent_runtime,
+            )
+        ) == before_snapshots
+    finally:
+        runtime.close()
+
+
+def _protocol_intent(quest_ref: str, request_ref: str) -> ProtocolExperimentIntent:
+    return ProtocolExperimentIntent(
+        execution_request_ref=request_ref,
+        quest_ref=quest_ref,
+        title="无 checkpoint 的规则协议",
+        objective="按冻结规则比较两个规范化集合，并形成正式测量。",
+        baseline_forward_contract={
+            "schema_ref": "test/set-forward-contract/v1",
+            "input": "two finite identifier sets",
+            "output": "normalized identifier sets",
+        },
+        variant_recipe={
+            "schema_ref": "test/set-rule-variant/v1",
+            "operation": "normalize then compare",
+        },
+        evaluation_protocol_lineage={
+            "schema_ref": "test/set-protocol-lineage/v1",
+            "name": "set agreement",
+        },
+        protocol_version={
+            "schema_ref": "test/set-protocol/v3",
+            "required_metrics": ["agreement_rate", "conflict_count"],
+            "optional_metrics": ["coverage_rate"],
+            "stopping_rule": "all identifiers classified",
+        },
+        execution={
+            "adapter_kind": "test_rule_protocol",
+            "schema_ref": "test/rule-protocol/v1",
+            "payload": {"rule": "compare-normalized-sets"},
+        },
+        checkpoint_policy="forbidden",
+    )
+
+
+def test_protocol_experiment_accepts_arbitrary_metrics_without_a_checkpoint(
+    tmp_path: Path,
+) -> None:
+    provider = _ProtocolEvaluationProvider(
+        {"agreement_rate": 0.875, "conflict_count": 2.0, "coverage_rate": 1.0}
+    )
+    runtime = _runtime(tmp_path / "protocol-experiment", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = runtime.experiment.start(
+            _protocol_intent(quest["quest_ref"], "protocol-experiment-request"),
+            "protocol-experiment-start",
+        )
+        for _step in range(3):
+            assert runtime.experiment.process_once()
+        accepted = runtime.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )
+        assert accepted["assets"]["checkpoint_artifacts"] == []
+        assert accepted["formal_measurement"]["status"] == "accepted"
+        assert accepted["formal_measurement"]["metric_result"]["metrics"] == {
+            "agreement_rate": 0.875,
+            "conflict_count": 2.0,
+            "coverage_rate": 1.0,
+        }
+        assert provider.requests[0].checkpoint_policy == "forbidden"
+        assert provider.requests[0].required_metrics == (
+            "agreement_rate",
+            "conflict_count",
+        )
+    finally:
+        runtime.close()
+
+
+def test_protocol_experiment_rejects_a_missing_required_metric(
+    tmp_path: Path,
+) -> None:
+    provider = _ProtocolEvaluationProvider({"agreement_rate": 0.875})
+    runtime = _runtime(tmp_path / "protocol-experiment-missing-metric", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = runtime.experiment.start(
+            _protocol_intent(quest["quest_ref"], "protocol-missing-metric-request"),
+            "protocol-missing-metric-start",
+        )
+        for _step in range(3):
+            assert runtime.experiment.process_once()
+        rejected = runtime.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )
+        assert rejected["formal_measurement"] == {
+            "status": "rejected",
+            "reason": {"code": "formal_measurement_metrics_incomplete"},
+            "metric_result": None,
+        }
     finally:
         runtime.close()
 
@@ -1444,6 +1655,104 @@ def test_worker_reconciles_domain_admission_after_pre_runtime_crash(
         recovered_runtime.close()
 
 
+def test_worker_restart_does_not_replay_historical_bundle_target_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "bundle-target-admission-reconciliation"
+    provider = _DeterministicExperimentProvider()
+    runtime = _runtime(root, provider)
+    evaluation_attempt_ref = ""
+    try:
+        quest = _confirm_direct_quest(runtime)
+        intent = ExperimentIntent(
+            execution_request_ref="bundle-target-historical-row",
+            quest_ref=quest["quest_ref"],
+            title="historical Target Experiment",
+            hypothesis="Historical Target-linked Experiment rows are diagnostic only.",
+            variant_parameter=-0.25,
+            sample_count=16,
+        )
+        runtime_binding = provider.runtime_binding()
+        definition_binding = _accept_test_asset(
+            runtime,
+            name="historical-bundle-target-definition.json",
+            content=canonical_json(
+                experiment_definition_document(intent, runtime_binding)
+            ).encode("utf-8"),
+        )
+        implementation_binding = _accept_test_asset(
+            runtime,
+            name="historical-bundle-target-implementation.json",
+            content=provider.implementation_bundle(),
+        )
+        # Simulate an internally valid row accepted by a pre-guard binary.
+        # Production admission remains forbidden; only the historical reader
+        # and restart filter are under test here.
+        with monkeypatch.context() as legacy_seed:
+            legacy_seed.setattr(
+                "meta_research.owners.research_graph."
+                "_forbid_bundle_target_experiment_write",
+                lambda _execution_request_ref: None,
+            )
+            admission = runtime.owners.research_graph.admit_experiment(
+                intent=intent,
+                runtime_binding=runtime_binding,
+                definition_binding=definition_binding,
+                implementation_binding=implementation_binding,
+                idempotency_key="historical-bundle-target-rg-admission",
+            )
+        evaluation_attempt_ref = admission.identities.evaluation_attempt_ref
+        assert (
+            runtime.owners.agent_runtime.query_experiment_run(evaluation_attempt_ref)
+            is None
+        )
+    finally:
+        runtime.close()
+
+    recovered_runtime = _runtime(root, provider)
+    try:
+        before_counts = _experiment_write_counts(recovered_runtime)
+        before_snapshots = tuple(
+            owner.query_snapshot()
+            for owner in (
+                recovered_runtime.owners.research_memory,
+                recovered_runtime.owners.research_graph,
+                recovered_runtime.owners.agent_runtime,
+            )
+        )
+        before_provider_calls = (
+            provider.runtime_binding_calls,
+            provider.implementation_bundle_calls,
+            provider.execute_calls,
+        )
+
+        assert recovered_runtime.experiment.process_once() is False
+
+        assert (
+            recovered_runtime.owners.agent_runtime.query_experiment_run(
+                evaluation_attempt_ref
+            )
+            is None
+        )
+        assert (
+            provider.runtime_binding_calls,
+            provider.implementation_bundle_calls,
+            provider.execute_calls,
+        ) == before_provider_calls
+        assert _experiment_write_counts(recovered_runtime) == before_counts
+        assert tuple(
+            owner.query_snapshot()
+            for owner in (
+                recovered_runtime.owners.research_memory,
+                recovered_runtime.owners.research_graph,
+                recovered_runtime.owners.agent_runtime,
+            )
+        ) == before_snapshots
+    finally:
+        recovered_runtime.close()
+
+
 def test_running_observations_publish_feed_and_support_bounded_event_cursors(
     tmp_path: Path,
 ) -> None:
@@ -1922,6 +2231,278 @@ def test_incomplete_formal_measurement_is_durably_rejected_and_converges(
         assert runtime.experiment.process_once() is False
     finally:
         runtime.close()
+
+
+def _agent_runtime_experiment_storage(
+    runtime,
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    tables = (
+        "agent_runtime_state",
+        "ar_experiment_runs",
+        "ar_experiment_sessions",
+        "ar_experiment_attempts",
+        "ar_experiment_events",
+        "ar_provider_units",
+        "ar_run_controls",
+        "ar_fence_revocations",
+        "durable_feed",
+        "projection_offsets",
+    )
+    with runtime._database.read() as connection:
+        return {
+            table: tuple(
+                tuple(row)
+                for row in connection.execute(
+                    text(f"SELECT * FROM {table} ORDER BY rowid")
+                ).all()
+            )
+            for table in tables
+        }
+
+
+def test_agent_runtime_rejects_direct_bundle_target_experiment_admission(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicExperimentProvider()
+    runtime = _runtime(tmp_path / "agent-runtime-direct-target-admission", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        intent = ExperimentIntent(
+            execution_request_ref="standalone-request-before-forgery",
+            quest_ref=quest["quest_ref"],
+            title="standalone admission forged at AR boundary",
+            hypothesis="AR must independently reject the formal Target namespace.",
+            variant_parameter=-0.25,
+            sample_count=16,
+        )
+        runtime_binding = provider.runtime_binding()
+        definition_binding = _accept_test_asset(
+            runtime,
+            name="ar-direct-admission-definition.json",
+            content=canonical_json(
+                experiment_definition_document(intent, runtime_binding)
+            ).encode("utf-8"),
+        )
+        implementation_binding = _accept_test_asset(
+            runtime,
+            name="ar-direct-admission-implementation.json",
+            content=provider.implementation_bundle(),
+        )
+        admission = runtime.owners.research_graph.admit_experiment(
+            intent=intent,
+            runtime_binding=runtime_binding,
+            definition_binding=definition_binding,
+            implementation_binding=implementation_binding,
+            idempotency_key="ar-direct-admission-domain",
+        )
+        forged_admission = replace(
+            admission,
+            execution_request=replace(
+                admission.execution_request,
+                execution_request_ref="bundle-target-forged-direct-ar-admission",
+            ),
+        )
+        before = _agent_runtime_experiment_storage(runtime)
+
+        with pytest.raises(
+            OwnerConflict,
+            match="bundle_target_experiment_write_forbidden",
+        ):
+            runtime.owners.agent_runtime.admit_experiment(
+                admission=forged_admission,
+                runtime_binding=runtime_binding,
+            )
+
+        assert _agent_runtime_experiment_storage(runtime) == before
+        assert (
+            runtime.owners.agent_runtime.query_experiment_run(
+                admission.identities.evaluation_attempt_ref
+            )
+            is None
+        )
+    finally:
+        runtime.close()
+
+
+def test_research_graph_rejects_direct_bundle_target_experiment_admission(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicExperimentProvider()
+    runtime = _runtime(tmp_path / "rg-direct-target-admission", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        intent = ExperimentIntent(
+            execution_request_ref="bundle-target-forged-direct-rg-admission",
+            quest_ref=quest["quest_ref"],
+            title="formal Target namespace at RG boundary",
+            hypothesis="RG must independently reject the formal Target namespace.",
+            variant_parameter=-0.25,
+            sample_count=16,
+        )
+        runtime_binding = provider.runtime_binding()
+        definition_binding = _accept_test_asset(
+            runtime,
+            name="rg-direct-admission-definition.json",
+            content=canonical_json(
+                experiment_definition_document(intent, runtime_binding)
+            ).encode("utf-8"),
+        )
+        implementation_binding = _accept_test_asset(
+            runtime,
+            name="rg-direct-admission-implementation.json",
+            content=provider.implementation_bundle(),
+        )
+        before_counts = _experiment_write_counts(runtime)
+        before_snapshot = runtime.owners.research_graph.query_snapshot()
+        before_feed = runtime.feed.current_revision()
+
+        with pytest.raises(
+            OwnerConflict,
+            match="bundle_target_experiment_write_forbidden",
+        ):
+            runtime.owners.research_graph.admit_experiment(
+                intent=intent,
+                runtime_binding=runtime_binding,
+                definition_binding=definition_binding,
+                implementation_binding=implementation_binding,
+                idempotency_key="reject-rg-direct-target-admission",
+            )
+
+        assert _experiment_write_counts(runtime) == before_counts
+        assert runtime.owners.research_graph.query_snapshot() == before_snapshot
+        assert runtime.feed.current_revision() == before_feed
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "legacy_marker",
+    ("execution_request_prefix", "bundle_target_ref"),
+)
+def test_historical_bundle_target_experiment_rows_are_diagnostic_only(
+    tmp_path: Path,
+    legacy_marker: str,
+) -> None:
+    root = tmp_path / f"agent-runtime-historical-target-row-{legacy_marker}"
+    provider = _DeterministicExperimentProvider()
+    runtime = _runtime(root, provider)
+    admitted = runtime.experiment.start(
+        ExperimentIntent(
+            execution_request_ref="standalone-request-before-history-seed",
+            quest_ref=_confirm_direct_quest(runtime)["quest_ref"],
+            title="historical row seed",
+            hypothesis="A legacy Target row must never become executable again.",
+            variant_parameter=-0.25,
+            sample_count=16,
+        ),
+        "historical-target-row-seed",
+    )
+    run = runtime.owners.agent_runtime.query_experiment_run(
+        admitted["identities"]["evaluation_attempt_ref"]
+    )
+    assert run is not None
+    with runtime._database.write() as connection:
+        if legacy_marker == "execution_request_prefix":
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET execution_request_ref = "
+                    "'bundle-target-historical-ar-row' WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run.run_ref},
+            )
+        else:
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET execution_request_ref = "
+                    "'historical-nonprefix-request', bundle_target_ref = "
+                    "'historical-bundle-target-ref' WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run.run_ref},
+            )
+    before_restart = _agent_runtime_experiment_storage(runtime)
+    assert runtime.owners.agent_runtime.query_active_experiment_run() is None
+    assert runtime.owners.agent_runtime.claim_next_experiment() is None
+    assert _agent_runtime_experiment_storage(runtime) == before_restart
+    runtime.close()
+
+    recovered = _runtime(root, provider)
+    try:
+        assert _agent_runtime_experiment_storage(recovered) == before_restart
+        with recovered._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET status = 'running' "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run.run_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_attempts SET status = 'running' "
+                    "WHERE attempt_ref = :attempt_ref"
+                ),
+                {"attempt_ref": run.attempt_ref},
+            )
+        before_mutations = _agent_runtime_experiment_storage(recovered)
+        blocked_mutations = (
+            lambda: recovered.owners.agent_runtime.record_experiment_observation(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                kind="stdout",
+                payload={"line": "must not be recorded"},
+                observed_at=1_720_000_202.0,
+            ),
+            lambda: recovered.owners.agent_runtime.complete_experiment_execution(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                result={},
+            ),
+            lambda: recovered.owners.agent_runtime.retry_experiment_execution(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                failure_code="experiment_provider_timeout",
+            ),
+            lambda: recovered.owners.agent_runtime.fail_experiment_execution(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                failure_code="historical_target_row_forbidden",
+            ),
+            lambda: recovered.owners.agent_runtime.defer_experiment_reconciliation(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                reason_code="experiment_provider_reconciliation_pending",
+            ),
+            lambda: recovered.owners.agent_runtime.replace_experiment_execution(
+                run.evaluation_attempt_ref
+            ),
+            lambda: recovered.owners.agent_runtime.begin_provider_unit(
+                unit_ref="historical-target-provider-unit",
+                operation_ref="historical-target-operation",
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                unit_kind="experiment",
+            ),
+            lambda: recovered.owners.agent_runtime.acknowledge_provider_safe_point(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+            ),
+        )
+        for mutate in blocked_mutations:
+            with pytest.raises(
+                OwnerConflict,
+                match="bundle_target_experiment_write_forbidden",
+            ):
+                mutate()
+            assert _agent_runtime_experiment_storage(recovered) == before_mutations
+    finally:
+        recovered.close()
 
 
 @pytest.mark.parametrize(

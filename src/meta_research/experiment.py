@@ -15,9 +15,9 @@ from typing import Protocol
 from meta_research.experiment_contract import (
     EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS,
     EXPERIMENT_RETRYABLE_PROVIDER_FAILURES,
-    EXPERIMENT_REQUIRED_METRICS,
     ExperimentDomainAdmission,
     ExperimentIntent,
+    ExperimentIntentLike,
     ExperimentObservation,
     ExperimentObserver,
     ExperimentProviderRequest,
@@ -25,8 +25,11 @@ from meta_research.experiment_contract import (
     ExperimentProviderUnavailable,
     ExperimentRuntimeBinding,
     MaterializedExperimentCheckpoint,
+    PROTOCOL_EXPERIMENT_DEFINITION_SCHEMA,
+    experiment_checkpoint_policy,
     experiment_definition_document,
     experiment_execution_log_document,
+    experiment_result_schema_ref,
     validate_experiment_provider_result,
 )
 from meta_research.experiment_provider_supervisor import (
@@ -65,6 +68,13 @@ _EXPERIMENT_CONTROL_WON_CODES = frozenset(
         "terminal_run_cannot_reopen",
     }
 )
+
+
+_BUNDLE_TARGET_EXECUTION_REQUEST_PREFIX = "bundle-target-"
+
+
+def _is_bundle_target_execution_request(execution_request_ref: str) -> bool:
+    return execution_request_ref.startswith(_BUNDLE_TARGET_EXECUTION_REQUEST_PREFIX)
 
 
 class ExperimentProvider(Protocol):
@@ -199,6 +209,15 @@ class BuiltinMicroExperimentProvider:
         ):
             raise OwnerConflict("experiment_provider_operation_ref_invalid")
         request.validate()
+        if (
+            request.definition is not None
+            and request.definition.get("schema_ref")
+            == PROTOCOL_EXPERIMENT_DEFINITION_SCHEMA
+        ):
+            raise ExperimentProviderUnavailable(
+                "experiment_provider_adapter_unavailable",
+                durable_outcome="terminal",
+            )
         with self._state_lock:
             if self._stop_requested:
                 raise OwnerConflict("experiment_provider_shutdown_detached")
@@ -825,7 +844,7 @@ class ExperimentService:
 
     def start(
         self,
-        intent: ExperimentIntent,
+        intent: ExperimentIntentLike,
         idempotency_key: str,
         *,
         require_idle: bool = False,
@@ -837,12 +856,14 @@ class ExperimentService:
 
     def _start(
         self,
-        intent: ExperimentIntent,
+        intent: ExperimentIntentLike,
         idempotency_key: str,
         *,
         require_idle: bool,
     ) -> dict[str, object]:
         intent.validate()
+        if _is_bundle_target_execution_request(intent.execution_request_ref):
+            raise OwnerConflict("bundle_target_experiment_write_forbidden")
         if not idempotency_key or len(idempotency_key) > 128:
             raise OwnerConflict("experiment_idempotency_key_invalid")
         replay = self._research_graph.preflight_experiment(
@@ -1050,6 +1071,8 @@ class ExperimentService:
                 validate_experiment_provider_result(
                     result,
                     request_kind=domain.intent.request_kind,
+                    checkpoint_policy=experiment_checkpoint_policy(domain.intent),
+                    result_schema_ref=experiment_result_schema_ref(domain.intent),
                 )
                 self._agent_runtime.complete_experiment_execution(
                     run_ref=run.run_ref,
@@ -1226,6 +1249,8 @@ class ExperimentService:
             required_metrics=domain.required_metrics,
             request_kind=domain.intent.request_kind,
             selected_checkpoints=tuple(selected),
+            definition=domain.execution_request.definition,
+            checkpoint_policy=experiment_checkpoint_policy(domain.intent),
         )
         request.validate()
         return request
@@ -1254,6 +1279,10 @@ class ExperimentService:
                 )
                 if admission is None:
                     raise OwnerConflict("experiment_domain_binding_missing")
+                if _is_bundle_target_execution_request(
+                    admission.execution_request.execution_request_ref
+                ):
+                    continue
                 self._agent_runtime.admit_experiment(
                     admission=admission,
                     runtime_binding=_frozen_experiment_runtime_binding(admission),
@@ -1276,6 +1305,8 @@ class ExperimentService:
         validate_experiment_provider_result(
             result,
             request_kind=domain.intent.request_kind,
+            checkpoint_policy=experiment_checkpoint_policy(domain.intent),
+            result_schema_ref=experiment_result_schema_ref(domain.intent),
         )
         execution_events = self._all_execution_events(run)
         provenance = {
@@ -1287,18 +1318,17 @@ class ExperimentService:
             "fence_ref": run.fence_ref,
             "execution_receipt": run.execution_receipt.as_public_dict(),
         }
-        if domain.intent.request_kind == "remeasure":
-            checkpoint_documents = ()
-        else:
-            if result.checkpoint_content is None:
-                raise OwnerConflict("experiment_checkpoint_invalid")
-            checkpoint_documents = tuple(
-                (content, "application/vnd.meta-research.checkpoint+json")
-                for content in (
+        checkpoint_documents = tuple(
+            (content, "application/vnd.meta-research.checkpoint+json")
+            for content in (
+                ()
+                if result.checkpoint_content is None
+                else (
                     result.checkpoint_content,
                     *result.additional_checkpoint_contents,
                 )
             )
+        )
         documents = {
             "checkpoint_artifact": checkpoint_documents,
             "log_asset": ((

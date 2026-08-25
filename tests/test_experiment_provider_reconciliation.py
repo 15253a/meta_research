@@ -659,6 +659,7 @@ def test_web_projects_live_supervisor_observations_before_terminal_receipt(
                 },
             )
             assert started.status_code == 201
+            attempt_ref = started.json()["identities"]["evaluation_attempt_ref"]
 
             live: dict[str, object] | None = None
             deadline = time.monotonic() + 0.7
@@ -690,14 +691,20 @@ def test_web_projects_live_supervisor_observations_before_terminal_receipt(
                 - float(event_time_path.read_text(encoding="utf-8"))
             ) < 0.25
 
+            completed: dict[str, object] | None = None
             deadline = time.monotonic() + 4.0
             while time.monotonic() < deadline:
-                completed = client.get("/api/v1/experiments/current").json()[
-                    "current"
-                ]
+                completed_response = client.get(
+                    f"/api/v1/experiments/{attempt_ref}"
+                )
+                if completed_response.status_code != 200:
+                    time.sleep(0.02)
+                    continue
+                completed = completed_response.json()
                 if completed["formal_measurement"]["status"] == "accepted":
                     break
                 time.sleep(0.02)
+            assert completed is not None
             assert completed["formal_measurement"]["status"] == "accepted"
     finally:
         runtime.close()

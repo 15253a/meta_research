@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Protocol, cast
 
 from sqlalchemy import text
 
+from meta_research.bundle_protocol import (
+    FormalPlan,
+    projection_plain_value,
+    validate_bundle_report,
+)
+from meta_research.bundle_exhaustion import (
+    BUNDLE_EXHAUSTION_ACCEPTED_RECEIPT_KIND,
+    BUNDLE_EXHAUSTION_BASIS_KIND,
+    BUNDLE_EXHAUSTION_DECISION_RECEIPT_KIND,
+    BundleExhaustionEvaluation,
+    BundleExhaustionEvidenceVerifier,
+    BundleExhaustionOperationResult,
+    BundleExhaustionProposal,
+    bundle_exhaustion_proposal_from_dict,
+)
 from meta_research.bundle_contract import (
     BundleContractError,
     validate_bundle_context_pack,
@@ -40,6 +56,11 @@ from meta_research.owners.common import (
     AcceptedQuestionBinding,
     AcceptedQuestionBindingVerifier,
     AcceptanceReceipt,
+    BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+    BundleReportEvidenceVerifier,
+    BundleReportReceiptVerifier,
+    VerifiedBundleReportDispositionReceipt,
+    VerifiedBundleReplanRunRetirement,
     EvidenceRefVerifier,
     FormalPlanDecisionVerifier,
     IdeaOutcomeDecisionVerifier,
@@ -52,6 +73,7 @@ from meta_research.owners.common import (
     TargetCommitReceiptVerifier,
     TargetGraphReceiptVerifier,
     VerifiedStageRunRequestBinding,
+    VerifiedBundleReportReceipt,
     canonical_hash,
     canonical_json,
     decoded_object,
@@ -76,6 +98,9 @@ IDEA_SET_OUTCOME_KIND = "idea_set"
 NO_VIABLE_CANDIDATE_OUTCOME_KIND = "no_viable_candidate"
 FORMAL_PLAN_OUTCOME_KIND = "formal_plan"
 TARGET_GRAPH_OUTCOME_KIND = "target_graph"
+BUNDLE_REPORT_OUTCOME_KIND = "bundle_report"
+BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND = "bundle_report_disposition_recorded"
+BUNDLE_REPLAN_ACTIVATED_RECEIPT_KIND = "bundle_replan_activated"
 BUNDLE_SKIP_OUTCOME_KIND = "bundle_skip"
 COMPLETED_DISPOSITION = "completed"
 SKIPPED_DISPOSITION = "skipped"
@@ -103,6 +128,13 @@ class RuntimeControlReceiptVerifier(Protocol):
         target: dict[str, object],
         receipt: dict[str, object],
     ) -> None: ...
+
+    def verify_bundle_replan_run_retirement(
+        self,
+        *,
+        retirement_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> VerifiedBundleReplanRunRetirement: ...
 
 
 class QuestionControlReceiptVerifier(Protocol):
@@ -182,6 +214,78 @@ class StageCommit:
     basis_receipt: AcceptanceReceipt | None
     receipt: AcceptanceReceipt
     closure: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class BundleReportDisposition:
+    disposition_ref: str
+    request_ref: str
+    cycle_ref: str
+    epoch: int
+    run_ref: str
+    report_ref: str
+    report_hash: str
+    disposition: str
+    status: str
+    next_stage: str
+    next_epoch: int
+    report_receipt: AcceptanceReceipt
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class BundleReplanActivation:
+    activation_ref: str
+    disposition_ref: str
+    retirement_ref: str
+    request_ref: str
+    cycle_ref: str
+    source_epoch: int
+    next_epoch: int
+    run_ref: str
+    report_ref: str
+    run_identity_hash: str
+    retirement_receipt: AcceptanceReceipt
+    receipt: AcceptanceReceipt
+
+
+def _bundle_stage_report_closure(
+    accepted: VerifiedBundleReportReceipt,
+) -> dict[str, object]:
+    return {
+        "schema_ref": "meta-research/bundle-stage-closure/v3",
+        "formal_plan_ref": accepted.formal_plan_ref,
+        "plan_document_hash": accepted.plan_document_hash,
+        "formal_plan_content_receipt": (
+            accepted.formal_plan_content_receipt.as_public_dict()
+        ),
+        "formal_plan_projection_digest": (
+            accepted.formal_plan_projection_digest
+        ),
+        "formal_plan_projection_receipt": (
+            accepted.formal_plan_projection_receipt.as_public_dict()
+        ),
+        "completion_contract_hash": accepted.completion_contract_hash,
+        "formal_plan_briefs_hash": accepted.formal_plan_briefs_hash,
+        "bundle_report_ref": accepted.report_ref,
+        "bundle_report_hash": accepted.report_hash,
+        "bundle_report_receipt": accepted.receipt.as_public_dict(),
+        "bundle_report": projection_plain_value(accepted.report),
+        "target_graph_ref": accepted.target_graph_ref,
+        "target_graph_generation": accepted.target_graph_generation,
+        "target_set_hash": accepted.target_set_hash,
+        "coverage_hash": accepted.coverage_hash,
+        "target_graph_receipt": accepted.target_graph_receipt.as_public_dict(),
+        "target_refs": list(accepted.target_refs),
+        "notice_refs": list(accepted.notice_refs),
+        "handoff_manifest_refs": list(accepted.handoff_manifest_refs),
+        "accepted_measurement_closures": projection_plain_value(
+            accepted.accepted_measurement_closures
+        ),
+        "target_commit_receipts": [
+            receipt.as_public_dict() for receipt in accepted.target_commit_receipts
+        ],
+    }
 
 
 class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
@@ -331,13 +435,46 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
         *,
         request_ref: str,
         run_ref: str,
-        target_graph_ref: str,
-        target_commit_receipts: tuple[AcceptanceReceipt, ...],
+        bundle_report_ref: str,
         run_completion_receipt: AcceptanceReceipt,
-        target_graph_receipt: AcceptanceReceipt,
+        bundle_report_receipt: AcceptanceReceipt,
         idempotency_key: str,
     ) -> StageCommit: ...
 
+    def record_bundle_report_disposition(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        bundle_report_ref: str,
+        bundle_report_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> BundleReportDisposition: ...
+
+    def query_bundle_report_disposition(
+        self, bundle_report_ref: str
+    ) -> BundleReportDisposition | None: ...
+
+    def verify_bundle_report_disposition_receipt(
+        self,
+        *,
+        disposition_ref: str,
+        receipt: AcceptanceReceipt,
+        expected_disposition: str | None = None,
+    ) -> VerifiedBundleReportDispositionReceipt: ...
+
+    def activate_bundle_replan(
+        self,
+        *,
+        disposition_ref: str,
+        retirement_ref: str,
+        retirement_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> BundleReplanActivation: ...
+
+    def query_bundle_replan_activation(
+        self, disposition_ref: str
+    ) -> BundleReplanActivation | None: ...
     def skip_bundle_stage(
         self,
         *,
@@ -348,6 +485,37 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     ) -> StageCommit: ...
 
     def query_bundle_stage_commit(self, request_ref: str) -> StageCommit | None: ...
+
+    def submit_bundle_exhaustion_proposal(
+        self,
+        *,
+        proposal: BundleExhaustionProposal,
+        idempotency_key: str,
+    ) -> BundleExhaustionOperationResult: ...
+
+    def reconcile_bundle_exhaustion_proposal(
+        self,
+        *,
+        proposal_identity: str,
+        expected_proposal_hash: str,
+    ) -> BundleExhaustionOperationResult | None: ...
+
+    def verify_bundle_exhaustion_proposal_acceptance(
+        self,
+        *,
+        proposal_ref: str,
+        receipt: AcceptanceReceipt,
+        require_current: bool = False,
+        phase: str = "submission",
+    ) -> BundleExhaustionProposal: ...
+
+    def query_bundle_exhaustion_for_request(
+        self, request_ref: str
+    ) -> BundleExhaustionOperationResult | None: ...
+
+    def bind_bundle_exhaustion_evidence_verifier(
+        self, verifier: BundleExhaustionEvidenceVerifier
+    ) -> None: ...
 
     def verify_stage_run_request(
         self,
@@ -366,7 +534,9 @@ _SNAPSHOT = OwnerSnapshotQuery(
     statement=text(
         "SELECT revision, foreground_cycle_count, stage_request_count, "
         "stage_commit_count, human_request_count, control_operation_count, "
-        "safe_point_count "
+        "safe_point_count, bundle_exhaustion_proposal_count, "
+        "bundle_exhaustion_decision_count, bundle_report_disposition_count, "
+        "bundle_replan_activation_count "
         "FROM advancement_engine_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -376,6 +546,10 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "human_request_count",
         "control_operation_count",
         "safe_point_count",
+        "bundle_exhaustion_proposal_count",
+        "bundle_exhaustion_decision_count",
+        "bundle_report_disposition_count",
+        "bundle_replan_activation_count",
     ),
 )
 
@@ -402,6 +576,8 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         stage_disposition_basis_verifier: StageDispositionBasisVerifier
         | None = None,
         current_question_verifier: CurrentQuestionVerifier | None = None,
+        bundle_report_verifier: BundleReportReceiptVerifier | None = None,
+        bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -421,11 +597,21 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         self._question_control_verifier = question_control_verifier
         self._stage_disposition_basis_verifier = stage_disposition_basis_verifier
         self._current_question_verifier = current_question_verifier
+        self._bundle_report_verifier = bundle_report_verifier
+        self._bundle_report_evidence_verifier = bundle_report_evidence_verifier
+        self._bundle_exhaustion_verifier: (
+            BundleExhaustionEvidenceVerifier | None
+        ) = None
         self._configure_human_request_owner(
             database, feed, AE_OWNER, human_response_verifier
         )
         self._stage_request_verifier = SQLiteAdvancementEngineReceiptVerifier(database)
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
+
+    def bind_bundle_exhaustion_evidence_verifier(
+        self, verifier: BundleExhaustionEvidenceVerifier
+    ) -> None:
+        self._bundle_exhaustion_verifier = verifier
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
@@ -3150,19 +3336,52 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 outcome_ref=basis_ref,
                 receipt=run_completion_receipt,
             )
-        if self._stage_disposition_basis_verifier is None:
-            raise OwnerConflict("stage_disposition_basis_verifier_unavailable")
-        self._stage_disposition_basis_verifier.verify_stage_disposition_basis(
-            cycle_ref=cycle_ref,
-            quest_ref=quest_ref,
-            question_ref=question_ref,
-            stage=stage,
-            epoch=epoch,
-            disposition=disposition,
-            basis_kind=basis_kind,
-            basis_ref=basis_ref,
-            receipt=basis_receipt,
+        is_bundle_exhaustion = (
+            stage == BUNDLE_STAGE
+            and disposition == EXHAUSTED_DISPOSITION
+            and basis_kind == BUNDLE_EXHAUSTION_BASIS_KIND
         )
+        if (
+            stage == BUNDLE_STAGE
+            and disposition == EXHAUSTED_DISPOSITION
+            and not is_bundle_exhaustion
+        ) or (basis_kind == BUNDLE_EXHAUSTION_BASIS_KIND and not is_bundle_exhaustion):
+            raise OwnerConflict("bundle_exhaustion_basis_required")
+        if is_bundle_exhaustion:
+            assert request is not None and run_ref is not None
+            proposal = self.verify_bundle_exhaustion_proposal_acceptance(
+                proposal_ref=basis_ref,
+                receipt=basis_receipt,
+            )
+            if (
+                proposal.stage_run_request_ref != request.request_ref
+                or proposal.cycle_ref != request.cycle_ref
+                or proposal.epoch != request.epoch
+                or proposal.run_ref != run_ref
+            ):
+                raise OwnerConflict("bundle_exhaustion_basis_binding_invalid")
+            current_request = self._verify_bundle_exhaustion_submission_scope(proposal)
+            evaluation = self._evaluate_bundle_exhaustion(
+                proposal,
+                quest_ref=current_request.accepted_question.quest_ref,
+                phase="commit",
+            )
+            if evaluation.status != "accepted":
+                raise OwnerConflict("bundle_exhaustion_acceptance_stale")
+        else:
+            if self._stage_disposition_basis_verifier is None:
+                raise OwnerConflict("stage_disposition_basis_verifier_unavailable")
+            self._stage_disposition_basis_verifier.verify_stage_disposition_basis(
+                cycle_ref=cycle_ref,
+                quest_ref=quest_ref,
+                question_ref=question_ref,
+                stage=stage,
+                epoch=epoch,
+                disposition=disposition,
+                basis_kind=basis_kind,
+                basis_ref=basis_ref,
+                receipt=basis_receipt,
+            )
         command_kind = "commit_stage_disposition"
         command_input = {
             "command": command_kind,
@@ -3563,66 +3782,613 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             return None
         return self._stage_commit_from_row(row)
 
+    def _verify_bundle_report_for_advancement(
+        self,
+        *,
+        request: StageRunRequest,
+        run_ref: str,
+        bundle_report_ref: str,
+        bundle_report_receipt: AcceptanceReceipt,
+        expected_disposition: str | None = None,
+    ) -> VerifiedBundleReportReceipt:
+        report_verifier = self._bundle_report_verifier
+        evidence_verifier = self._bundle_report_evidence_verifier
+        if report_verifier is None or evidence_verifier is None:
+            raise OwnerConflict("bundle_report_verifier_unavailable")
+        accepted = report_verifier.verify_bundle_report_receipt(
+            report_ref=bundle_report_ref,
+            receipt=bundle_report_receipt,
+            expected_disposition=expected_disposition,
+        )
+        formal_plan = request.accepted_formal_plan
+        if (
+            formal_plan is None
+            or accepted.request_ref != request.request_ref
+            or accepted.run_ref != run_ref
+            or accepted.report_ref != bundle_report_ref
+            or accepted.report.stage_request_ref != request.request_ref
+            or accepted.report.formal_plan_ref != formal_plan.formal_plan_ref
+            or accepted.formal_plan_ref != formal_plan.formal_plan_ref
+            or accepted.plan_document_hash != formal_plan.plan_document_hash
+            or accepted.formal_plan_projection_receipt.subject_ref
+            != accepted.formal_plan_projection_digest
+            or validate_bundle_report(accepted.report) != accepted.report_hash
+        ):
+            raise OwnerConflict("bundle_report_advancement_binding_invalid")
+        evidence_verifier.verify_formal_plan_content_acceptance(
+            formal_plan_ref=accepted.formal_plan_ref,
+            plan_document_hash=accepted.plan_document_hash,
+            receipt=accepted.formal_plan_content_receipt,
+        )
+        contract = evidence_verifier.query_bundle_report_contract(
+            request_ref=request.request_ref,
+            run_ref=run_ref,
+            graph_ref=accepted.target_graph_ref,
+            head_receipt=accepted.target_graph_receipt,
+            formal_plan_content_receipt=accepted.formal_plan_content_receipt,
+            formal_plan_projection_receipt=(
+                accepted.formal_plan_projection_receipt
+            ),
+        )
+        plan = contract.get("plan")
+        if (
+            type(plan) is not FormalPlan
+            or plan.formal_plan_ref != accepted.formal_plan_ref
+            or plan.content_binding.content_hash_ref
+            != accepted.formal_plan_projection_digest
+            or contract.get("plan_document_hash") != accepted.plan_document_hash
+            or contract.get("source_acceptance_receipt")
+            != accepted.formal_plan_content_receipt
+            or contract.get("completion_contract_hash")
+            != accepted.completion_contract_hash
+            or contract.get("briefs_hash") != accepted.formal_plan_briefs_hash
+            or contract.get("projection_digest")
+            != accepted.formal_plan_projection_digest
+            or contract.get("projection_receipt")
+            != accepted.formal_plan_projection_receipt
+            or contract.get("generation") != accepted.target_graph_generation
+            or contract.get("target_set_hash") != accepted.target_set_hash
+            or contract.get("coverage_hash") != accepted.coverage_hash
+            or contract.get("target_refs") != accepted.target_refs
+        ):
+            raise OwnerConflict("bundle_report_advancement_evidence_invalid")
+        resolved = evidence_verifier.verify_bundle_report_target_commits(
+            graph_ref=accepted.target_graph_ref,
+            closures=accepted.accepted_measurement_closures,
+            receipts=accepted.target_commit_receipts,
+            head_receipt=accepted.target_graph_receipt,
+        )
+        if resolved != accepted.target_commit_receipts:
+            raise OwnerConflict("bundle_report_advancement_evidence_invalid")
+        return accepted
+
     def commit_bundle_stage(
         self,
         *,
         request_ref: str,
         run_ref: str,
-        target_graph_ref: str,
-        target_commit_receipts: tuple[AcceptanceReceipt, ...],
+        bundle_report_ref: str,
         run_completion_receipt: AcceptanceReceipt,
-        target_graph_receipt: AcceptanceReceipt,
+        bundle_report_receipt: AcceptanceReceipt,
         idempotency_key: str,
     ) -> StageCommit:
         request = self._query_stage_request_by_ref(request_ref)
         if request.stage != BUNDLE_STAGE or request.accepted_formal_plan is None:
             raise OwnerConflict("bundle_stage_request_invalid")
-        if (
-            self._run_completion_verifier is None
-            or self._target_graph_verifier is None
-            or self._target_commit_verifier is None
-        ):
+        if self._run_completion_verifier is None:
             raise OwnerConflict("bundle_stage_verifier_unavailable")
+        accepted = self._verify_bundle_report_for_advancement(
+            request=request,
+            run_ref=run_ref,
+            bundle_report_ref=bundle_report_ref,
+            bundle_report_receipt=bundle_report_receipt,
+            expected_disposition="realized",
+        )
         self._run_completion_verifier.verify_run_completion_receipt(
             request_ref=request_ref,
             run_ref=run_ref,
             attempt_ref=None,
-            outcome_ref=target_graph_ref,
+            outcome_ref=bundle_report_ref,
             receipt=run_completion_receipt,
         )
-        self._target_graph_verifier.verify_target_graph_receipt(
-            request_ref=request_ref,
-            run_ref=run_ref,
-            graph_ref=target_graph_ref,
-            receipt=target_graph_receipt,
-        )
-        self._target_commit_verifier.verify_target_commit_set(
-            graph_ref=target_graph_ref, receipts=target_commit_receipts
-        )
-        closure = {
-            "schema_ref": "meta-research/bundle-stage-closure/v1",
-            "formal_plan_ref": request.accepted_formal_plan.formal_plan_ref,
-            "target_graph_ref": target_graph_ref,
-            "target_graph_receipt": target_graph_receipt.as_public_dict(),
-            "target_commit_refs": [
-                receipt.subject_ref for receipt in target_commit_receipts
-            ],
-            "target_commit_receipts": [
-                receipt.as_public_dict() for receipt in target_commit_receipts
-            ],
-        }
         return self._commit_bundle_disposition(
             request=request,
             run_ref=run_ref,
-            outcome_ref=target_graph_ref,
-            outcome_kind=TARGET_GRAPH_OUTCOME_KIND,
+            outcome_ref=bundle_report_ref,
+            outcome_kind=BUNDLE_REPORT_OUTCOME_KIND,
             disposition=COMPLETED_DISPOSITION,
             run_completion_receipt=run_completion_receipt,
-            outcome_receipt=target_graph_receipt,
-            closure=closure,
+            outcome_receipt=bundle_report_receipt,
+            closure=_bundle_stage_report_closure(accepted),
             idempotency_key=idempotency_key,
             command_kind="commit_bundle_stage",
         )
+
+    def record_bundle_report_disposition(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        bundle_report_ref: str,
+        bundle_report_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> BundleReportDisposition:
+        _validate_idempotency_key(idempotency_key)
+        request = self._query_stage_request_by_ref(request_ref)
+        if request.stage != BUNDLE_STAGE or request.accepted_formal_plan is None:
+            raise OwnerConflict("bundle_stage_request_invalid")
+        accepted = self._verify_bundle_report_for_advancement(
+            request=request,
+            run_ref=run_ref,
+            bundle_report_ref=bundle_report_ref,
+            bundle_report_receipt=bundle_report_receipt,
+        )
+        if accepted.report.disposition not in {"blocked", "replan_required"}:
+            raise OwnerConflict("bundle_report_non_advancing_disposition_invalid")
+        command_kind = "record_bundle_report_disposition"
+        command_hash = canonical_hash(
+            {
+                "command": command_kind,
+                "request_ref": request_ref,
+                "run_ref": run_ref,
+                "bundle_report_ref": bundle_report_ref,
+                "bundle_report_hash": accepted.report_hash,
+                "bundle_report_receipt": bundle_report_receipt.as_public_dict(),
+            }
+        )
+        _query_ae_command(
+            self._database, idempotency_key, command_kind, command_hash
+        )
+        with self._database.write() as connection:
+            replay_ref = _ae_command_replay(
+                connection, idempotency_key, command_kind, command_hash
+            )
+            if replay_ref is not None:
+                row = connection.execute(
+                    text(
+                        "SELECT * FROM ae_bundle_report_dispositions WHERE "
+                        "disposition_ref = :disposition_ref"
+                    ),
+                    {"disposition_ref": replay_ref},
+                ).first()
+                if row is None:
+                    raise OwnerConflict("stage_command_result_missing")
+                return self._bundle_report_disposition_from_row(row)
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ae_bundle_report_dispositions WHERE "
+                    "report_ref = :report_ref"
+                ),
+                {"report_ref": bundle_report_ref},
+            ).first()
+            if existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("bundle_report_disposition_conflict")
+                _record_ae_command(
+                    connection,
+                    idempotency_key,
+                    command_kind,
+                    command_hash,
+                    existing.disposition_ref,
+                )
+                return self._bundle_report_disposition_from_row(existing)
+            self._assert_stage_head_current(
+                connection,
+                cycle_ref=request.cycle_ref,
+                quest_ref=request.accepted_question.quest_ref,
+                stage=BUNDLE_STAGE,
+                epoch=request.epoch,
+            )
+            disposition_ref = new_ref("bundle_report_disposition")
+            next_stage = (
+                PLAN_STAGE
+                if accepted.report.disposition == "replan_required"
+                else BUNDLE_STAGE
+            )
+            next_epoch = (
+                request.epoch + 1
+                if accepted.report.disposition == "replan_required"
+                else request.epoch
+            )
+            status = (
+                "pending_run_retirement"
+                if accepted.report.disposition == "replan_required"
+                else "blocked"
+            )
+            bindings = {
+                "request_ref": request.request_ref,
+                "cycle_ref": request.cycle_ref,
+                "epoch": request.epoch,
+                "run_ref": run_ref,
+                "report_ref": bundle_report_ref,
+                "report_hash": accepted.report_hash,
+                "disposition": accepted.report.disposition,
+                "status": status,
+                "next_stage": next_stage,
+                "next_epoch": next_epoch,
+                "report_receipt_ref": bundle_report_receipt.receipt_ref,
+                "report_receipt_hash": bundle_report_receipt.payload_hash,
+            }
+            receipt_ref = new_ref("ae_bundle_report_disposition_receipt")
+            receipt_hash = _receipt_hash(
+                BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND,
+                disposition_ref,
+                bindings,
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO ae_bundle_report_dispositions (disposition_ref, "
+                    "request_ref, cycle_ref, epoch, run_ref, report_ref, "
+                    "report_hash, disposition, report_receipt_ref, "
+                    "report_receipt_hash, idempotency_key, request_hash, "
+                    "receipt_ref, receipt_hash, recorded_at) VALUES "
+                    "(:disposition_ref, :request_ref, :cycle_ref, :epoch, "
+                    ":run_ref, :report_ref, :report_hash, :disposition, "
+                    ":report_receipt_ref, :report_receipt_hash, "
+                    ":idempotency_key, :request_hash, :receipt_ref, "
+                    ":receipt_hash, :recorded_at)"
+                ),
+                {
+                    **bindings,
+                    "disposition_ref": disposition_ref,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": command_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "recorded_at": time.time(),
+                },
+            )
+            _record_ae_command(
+                connection,
+                idempotency_key,
+                command_kind,
+                command_hash,
+                disposition_ref,
+            )
+            connection.execute(
+                text(
+                    "UPDATE advancement_engine_state SET revision = revision + 1, "
+                    "bundle_report_disposition_count = "
+                    "bundle_report_disposition_count + 1 WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "advancement_engine.bundle_report_disposition_recorded",
+                {
+                    "disposition_ref": disposition_ref,
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "report_ref": bundle_report_ref,
+                    "disposition": accepted.report.disposition,
+                    "next_stage": next_stage,
+                    "next_epoch": next_epoch,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        recorded = self.query_bundle_report_disposition(bundle_report_ref)
+        if recorded is None:
+            raise OwnerConflict("bundle_report_disposition_missing_after_commit")
+        return recorded
+
+    def query_bundle_report_disposition(
+        self, bundle_report_ref: str
+    ) -> BundleReportDisposition | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_bundle_report_dispositions WHERE "
+                    "report_ref = :report_ref"
+                ),
+                {"report_ref": bundle_report_ref},
+            ).first()
+        return (
+            None if row is None else self._bundle_report_disposition_from_row(row)
+        )
+
+    def verify_bundle_report_disposition_receipt(
+        self,
+        *,
+        disposition_ref: str,
+        receipt: AcceptanceReceipt,
+        expected_disposition: str | None = None,
+    ) -> VerifiedBundleReportDispositionReceipt:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_bundle_report_dispositions WHERE "
+                    "disposition_ref = :disposition_ref"
+                ),
+                {"disposition_ref": disposition_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        recorded = self._bundle_report_disposition_from_row(row)
+        if receipt != recorded.receipt or (
+            expected_disposition is not None
+            and recorded.disposition != expected_disposition
+        ):
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        request = self._query_stage_request_by_ref(recorded.request_ref)
+        return VerifiedBundleReportDispositionReceipt(
+            disposition_ref=recorded.disposition_ref,
+            request_ref=recorded.request_ref,
+            cycle_ref=recorded.cycle_ref,
+            epoch=recorded.epoch,
+            quest_ref=request.accepted_question.quest_ref,
+            question_ref=request.accepted_question.question_ref,
+            run_ref=recorded.run_ref,
+            report_ref=recorded.report_ref,
+            report_hash=recorded.report_hash,
+            disposition=recorded.disposition,
+            status=recorded.status,
+            next_stage=recorded.next_stage,
+            next_epoch=recorded.next_epoch,
+            receipt=recorded.receipt,
+        )
+
+    def activate_bundle_replan(
+        self,
+        *,
+        disposition_ref: str,
+        retirement_ref: str,
+        retirement_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> BundleReplanActivation:
+        _validate_idempotency_key(idempotency_key)
+        verifier = self._runtime_control_verifier
+        if verifier is None or not callable(
+            getattr(verifier, "verify_bundle_replan_run_retirement", None)
+        ):
+            raise OwnerConflict("bundle_replan_retirement_verifier_unavailable")
+        with self._database.read() as connection:
+            disposition_row = connection.execute(
+                text(
+                    "SELECT * FROM ae_bundle_report_dispositions WHERE "
+                    "disposition_ref = :disposition_ref"
+                ),
+                {"disposition_ref": disposition_ref},
+            ).first()
+        if disposition_row is None:
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        disposition = self._bundle_report_disposition_from_row(disposition_row)
+        if (
+            disposition.disposition != "replan_required"
+            or disposition.status != "pending_run_retirement"
+        ):
+            raise OwnerConflict("bundle_replan_activation_invalid")
+        retirement = verifier.verify_bundle_replan_run_retirement(
+            retirement_ref=retirement_ref,
+            receipt=retirement_receipt,
+        )
+        if (
+            retirement.disposition_ref != disposition_ref
+            or retirement.request_ref != disposition.request_ref
+            or retirement.run_ref != disposition.run_ref
+            or retirement.report_ref != disposition.report_ref
+            or retirement.report_hash != disposition.report_hash
+            or retirement.receipt != retirement_receipt
+        ):
+            raise OwnerConflict("bundle_replan_retirement_invalid")
+        command_kind = "activate_bundle_replan"
+        command_hash = canonical_hash(
+            {
+                "command": command_kind,
+                "disposition_ref": disposition_ref,
+                "retirement_ref": retirement_ref,
+                "retirement_receipt": retirement_receipt.as_public_dict(),
+            }
+        )
+        replay_ref = _query_ae_command(
+            self._database, idempotency_key, command_kind, command_hash
+        )
+        if replay_ref is not None:
+            replay = self.query_bundle_replan_activation(disposition_ref)
+            if replay is None or replay.activation_ref != replay_ref:
+                raise OwnerConflict("stage_command_result_missing")
+            return replay
+        request = self._query_stage_request_by_ref(disposition.request_ref)
+        now = time.time()
+        with self._database.write() as connection:
+            replay_ref = _ae_command_replay(
+                connection, idempotency_key, command_kind, command_hash
+            )
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ae_bundle_replan_activations WHERE "
+                    "disposition_ref = :disposition_ref"
+                ),
+                {"disposition_ref": disposition_ref},
+            ).first()
+            if replay_ref is not None:
+                activation_ref = replay_ref
+            elif existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("bundle_replan_activation_conflict")
+                activation_ref = existing.activation_ref
+                _record_ae_command(
+                    connection,
+                    idempotency_key,
+                    command_kind,
+                    command_hash,
+                    activation_ref,
+                )
+            else:
+                self._assert_stage_head_current(
+                    connection,
+                    cycle_ref=request.cycle_ref,
+                    quest_ref=request.accepted_question.quest_ref,
+                    stage=BUNDLE_STAGE,
+                    epoch=request.epoch,
+                )
+                grant = connection.execute(
+                    text(
+                        "SELECT * FROM ae_foreground_grants WHERE quest_ref = "
+                        ":quest_ref AND cycle_ref = :cycle_ref AND epoch = "
+                        ":epoch AND status = 'active'"
+                    ),
+                    {
+                        "quest_ref": request.accepted_question.quest_ref,
+                        "cycle_ref": request.cycle_ref,
+                        "epoch": request.epoch,
+                    },
+                ).first()
+                if grant is None or grant.stage != BUNDLE_STAGE:
+                    raise OwnerConflict("bundle_replan_foreground_invalid")
+                activation_ref = new_ref("bundle_replan_activation")
+                next_epoch = request.epoch + 1
+                bindings = {
+                    "disposition_ref": disposition_ref,
+                    "retirement_ref": retirement_ref,
+                    "request_ref": request.request_ref,
+                    "cycle_ref": request.cycle_ref,
+                    "source_epoch": request.epoch,
+                    "next_epoch": next_epoch,
+                    "run_ref": disposition.run_ref,
+                    "report_ref": disposition.report_ref,
+                    "run_identity_hash": retirement.run_identity_hash,
+                    "retirement_receipt_ref": retirement_receipt.receipt_ref,
+                    "retirement_receipt_hash": retirement_receipt.payload_hash,
+                }
+                receipt_ref = new_ref("ae_bundle_replan_activation_receipt")
+                receipt_hash = _receipt_hash(
+                    BUNDLE_REPLAN_ACTIVATED_RECEIPT_KIND,
+                    activation_ref,
+                    bindings,
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_bundle_replan_activations (activation_ref, "
+                        "disposition_ref, retirement_ref, request_ref, cycle_ref, "
+                        "source_epoch, next_epoch, run_ref, report_ref, "
+                        "run_identity_hash, retirement_receipt_ref, "
+                        "retirement_receipt_hash, idempotency_key, request_hash, "
+                        "receipt_ref, receipt_hash, activated_at) VALUES "
+                        "(:activation_ref, :disposition_ref, :retirement_ref, "
+                        ":request_ref, :cycle_ref, :source_epoch, :next_epoch, "
+                        ":run_ref, :report_ref, :run_identity_hash, "
+                        ":retirement_receipt_ref, :retirement_receipt_hash, "
+                        ":idempotency_key, :request_hash, :receipt_ref, "
+                        ":receipt_hash, :activated_at)"
+                    ),
+                    {
+                        **bindings,
+                        "activation_ref": activation_ref,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": command_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "activated_at": now,
+                    },
+                )
+                revoked = connection.execute(
+                    text(
+                        "UPDATE ae_foreground_grants SET status = 'revoked', "
+                        "revoked_at = :now WHERE grant_ref = :grant_ref AND "
+                        "status = 'active'"
+                    ),
+                    {"now": now, "grant_ref": grant.grant_ref},
+                )
+                if revoked.rowcount != 1:
+                    raise OwnerConflict("bundle_replan_foreground_invalid")
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_foreground_grants (grant_ref, quest_ref, "
+                        "cycle_ref, question_ref, stage, epoch, status, "
+                        "predecessor_grant_ref, safe_point_ref, granted_at, "
+                        "revoked_at) VALUES (:grant_ref, :quest_ref, :cycle_ref, "
+                        ":question_ref, :stage, :epoch, 'active', :predecessor, "
+                        "NULL, :now, NULL)"
+                    ),
+                    {
+                        "grant_ref": new_ref("foreground_grant"),
+                        "quest_ref": request.accepted_question.quest_ref,
+                        "cycle_ref": request.cycle_ref,
+                        "question_ref": request.accepted_question.question_ref,
+                        "stage": PLAN_STAGE,
+                        "epoch": next_epoch,
+                        "predecessor": grant.grant_ref,
+                        "now": now,
+                    },
+                )
+                advanced = connection.execute(
+                    text(
+                        "UPDATE ae_foreground_heads SET stage = :stage, epoch = "
+                        ":next_epoch, updated_at = :now WHERE quest_ref = "
+                        ":quest_ref AND cycle_ref = :cycle_ref AND stage = "
+                        ":source_stage AND epoch = :source_epoch AND status = "
+                        "'active' AND pending_operation_ref IS NULL"
+                    ),
+                    {
+                        "stage": PLAN_STAGE,
+                        "next_epoch": next_epoch,
+                        "now": now,
+                        "quest_ref": request.accepted_question.quest_ref,
+                        "cycle_ref": request.cycle_ref,
+                        "source_stage": BUNDLE_STAGE,
+                        "source_epoch": request.epoch,
+                    },
+                )
+                cycle = connection.execute(
+                    text(
+                        "UPDATE ae_cycles SET stage = :stage, suspension_reason = "
+                        "NULL, updated_at = :now WHERE cycle_ref = :cycle_ref AND "
+                        "stage = :source_stage AND status = 'ongoing'"
+                    ),
+                    {
+                        "stage": PLAN_STAGE,
+                        "now": now,
+                        "cycle_ref": request.cycle_ref,
+                        "source_stage": BUNDLE_STAGE,
+                    },
+                )
+                if advanced.rowcount != 1 or cycle.rowcount != 1:
+                    raise OwnerConflict("bundle_replan_foreground_invalid")
+                _record_ae_command(
+                    connection,
+                    idempotency_key,
+                    command_kind,
+                    command_hash,
+                    activation_ref,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE advancement_engine_state SET revision = "
+                        "revision + 1, bundle_replan_activation_count = "
+                        "bundle_replan_activation_count + 1 WHERE singleton = "
+                        "'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "advancement_engine.bundle_replan_activated",
+                    {
+                        "activation_ref": activation_ref,
+                        "disposition_ref": disposition_ref,
+                        "retirement_ref": retirement_ref,
+                        "cycle_ref": request.cycle_ref,
+                        "source_epoch": request.epoch,
+                        "next_epoch": next_epoch,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+        activated = self.query_bundle_replan_activation(disposition_ref)
+        if activated is None or activated.activation_ref != activation_ref:
+            raise OwnerConflict("bundle_replan_activation_missing_after_commit")
+        return activated
+
+    def query_bundle_replan_activation(
+        self, disposition_ref: str
+    ) -> BundleReplanActivation | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_bundle_replan_activations WHERE "
+                    "disposition_ref = :disposition_ref"
+                ),
+                {"disposition_ref": disposition_ref},
+            ).first()
+        return None if row is None else self._bundle_replan_activation_from_row(row)
 
     def skip_bundle_stage(
         self,
@@ -3862,6 +4628,594 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 {"request_ref": request_ref},
             ).first()
         return None if row is None else self._stage_commit_from_row(row)
+
+    def submit_bundle_exhaustion_proposal(
+        self,
+        *,
+        proposal: BundleExhaustionProposal,
+        idempotency_key: str,
+    ) -> BundleExhaustionOperationResult:
+        """Mechanically decide a root-Agent proposal without forging StageCommit."""
+
+        _validate_idempotency_key(idempotency_key)
+        if type(proposal) is not BundleExhaustionProposal:
+            raise OwnerConflict("bundle_exhaustion_proposal_invalid")
+        request = self._verify_bundle_exhaustion_submission_scope(proposal)
+        proposal_hash = proposal.proposal_hash
+        request_hash = canonical_hash(
+            {
+                "command": "submit_bundle_exhaustion_proposal",
+                "proposal_identity": proposal.proposal_identity,
+                "proposal_hash": proposal_hash,
+            }
+        )
+        existing = self._query_bundle_exhaustion_operation(
+            proposal_identity=proposal.proposal_identity
+        )
+        if existing is not None:
+            if (
+                existing.proposal_hash != proposal_hash
+                or existing.proposal_identity != proposal.proposal_identity
+            ):
+                raise OwnerConflict("bundle_exhaustion_proposal_conflict")
+            return existing
+        with self._database.read() as connection:
+            idempotent = connection.execute(
+                text(
+                    "SELECT proposal_identity, proposal_hash, request_hash FROM "
+                    "ae_bundle_exhaustion_operations WHERE idempotency_key = "
+                    ":idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        if idempotent is not None:
+            if (
+                idempotent.proposal_identity != proposal.proposal_identity
+                or idempotent.proposal_hash != proposal_hash
+                or idempotent.request_hash != request_hash
+            ):
+                raise OwnerConflict("idempotency_conflict")
+            replay = self._query_bundle_exhaustion_operation(
+                proposal_identity=proposal.proposal_identity
+            )
+            if replay is None:
+                raise OwnerConflict("bundle_exhaustion_operation_missing")
+            return replay
+
+        evaluation = self._evaluate_bundle_exhaustion(
+            proposal,
+            quest_ref=request.accepted_question.quest_ref,
+        )
+        proposal_ref = new_ref("bundle_exhaustion_proposal")
+        operation_ref = new_ref("bundle_exhaustion_operation")
+        proposal_json = canonical_json(proposal.as_dict())
+        now = time.time()
+        with self._database.write() as connection:
+            duplicate = connection.execute(
+                text(
+                    "SELECT proposal_identity, proposal_hash, request_hash FROM "
+                    "ae_bundle_exhaustion_operations WHERE proposal_identity = "
+                    ":proposal_identity OR idempotency_key = :idempotency_key"
+                ),
+                {
+                    "proposal_identity": proposal.proposal_identity,
+                    "idempotency_key": idempotency_key,
+                },
+            ).first()
+            if duplicate is not None:
+                if (
+                    duplicate.proposal_identity != proposal.proposal_identity
+                    or duplicate.proposal_hash != proposal_hash
+                    or duplicate.request_hash != request_hash
+                ):
+                    raise OwnerConflict("bundle_exhaustion_proposal_conflict")
+            else:
+                self._assert_bundle_exhaustion_scope_in_transaction(
+                    connection, request, proposal
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_bundle_exhaustion_proposals "
+                        "(proposal_ref, proposal_identity, request_ref, "
+                        "request_receipt_ref, request_receipt_hash, cycle_ref, "
+                        "epoch, run_ref, attempt_ref, root_session_ref, fence_ref, "
+                        "context_pack_ref, context_pack_hash, formal_plan_ref, "
+                        "formal_plan_content_hash, "
+                        "formal_plan_content_receipt_ref, "
+                        "formal_plan_content_receipt_hash, evidence_ref, "
+                        "evidence_hash, evidence_receipt_ref, "
+                        "evidence_receipt_hash, proposal_json, proposal_hash, "
+                        "authoritative, created_at) VALUES (:proposal_ref, "
+                        ":proposal_identity, :request_ref, :request_receipt_ref, "
+                        ":request_receipt_hash, :cycle_ref, :epoch, :run_ref, "
+                        ":attempt_ref, :root_session_ref, :fence_ref, "
+                        ":context_pack_ref, :context_pack_hash, :formal_plan_ref, "
+                        ":formal_plan_content_hash, "
+                        ":formal_plan_content_receipt_ref, "
+                        ":formal_plan_content_receipt_hash, :evidence_ref, "
+                        ":evidence_hash, :evidence_receipt_ref, "
+                        ":evidence_receipt_hash, :proposal_json, "
+                        ":proposal_hash, 0, "
+                        ":created_at)"
+                    ),
+                    {
+                        "proposal_ref": proposal_ref,
+                        "proposal_identity": proposal.proposal_identity,
+                        "request_ref": proposal.stage_run_request_ref,
+                        "request_receipt_ref": (
+                            proposal.stage_run_request_receipt_ref
+                        ),
+                        "request_receipt_hash": (
+                            proposal.stage_run_request_receipt_hash
+                        ),
+                        "cycle_ref": proposal.cycle_ref,
+                        "epoch": proposal.epoch,
+                        "run_ref": proposal.run_ref,
+                        "attempt_ref": proposal.attempt_ref,
+                        "root_session_ref": proposal.root_session_ref,
+                        "fence_ref": proposal.execution_fence_ref,
+                        "context_pack_ref": proposal.context_pack_ref,
+                        "context_pack_hash": proposal.context_pack_hash,
+                        "formal_plan_ref": proposal.formal_plan_ref,
+                        "formal_plan_content_hash": (
+                            proposal.formal_plan_content_hash
+                        ),
+                        "formal_plan_content_receipt_ref": (
+                            proposal.formal_plan_content_receipt.receipt_ref
+                        ),
+                        "formal_plan_content_receipt_hash": (
+                            proposal.formal_plan_content_receipt.payload_hash
+                        ),
+                        "evidence_ref": proposal.evidence_ref,
+                        "evidence_hash": proposal.evidence_hash,
+                        "evidence_receipt_ref": (
+                            proposal.evidence_receipt.receipt_ref
+                        ),
+                        "evidence_receipt_hash": (
+                            proposal.evidence_receipt.payload_hash
+                        ),
+                        "proposal_json": proposal_json,
+                        "proposal_hash": proposal_hash,
+                        "created_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_bundle_exhaustion_operations "
+                        "(operation_ref, proposal_ref, proposal_identity, "
+                        "proposal_hash, status, current_decision_ref, "
+                        "idempotency_key, request_hash, created_at, updated_at) "
+                        "VALUES (:operation_ref, :proposal_ref, "
+                        ":proposal_identity, :proposal_hash, :status, NULL, "
+                        ":idempotency_key, :request_hash, :created_at, "
+                        ":updated_at)"
+                    ),
+                    {
+                        "operation_ref": operation_ref,
+                        "proposal_ref": proposal_ref,
+                        "proposal_identity": proposal.proposal_identity,
+                        "proposal_hash": proposal_hash,
+                        "status": evaluation.status,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+                self._append_bundle_exhaustion_decision(
+                    connection,
+                    operation_ref=operation_ref,
+                    proposal_ref=proposal_ref,
+                    proposal_identity=proposal.proposal_identity,
+                    proposal_hash=proposal_hash,
+                    request_ref=proposal.stage_run_request_ref,
+                    evidence_hash=proposal.evidence_hash,
+                    evaluation=evaluation,
+                    now=now,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE advancement_engine_state SET revision = "
+                        "revision + 1, bundle_exhaustion_proposal_count = "
+                        "bundle_exhaustion_proposal_count + 1, "
+                        "bundle_exhaustion_decision_count = "
+                        "bundle_exhaustion_decision_count + 1 WHERE singleton = "
+                        "'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "advancement_engine.bundle_exhaustion_proposal_decided",
+                    {
+                        "operation_ref": operation_ref,
+                        "proposal_ref": proposal_ref,
+                        "proposal_identity": proposal.proposal_identity,
+                        "proposal_hash": proposal_hash,
+                        "status": evaluation.status,
+                    },
+                )
+        result = self._query_bundle_exhaustion_operation(
+            proposal_identity=proposal.proposal_identity
+        )
+        if result is None:
+            raise OwnerConflict("bundle_exhaustion_operation_missing_after_submit")
+        return result
+
+    def reconcile_bundle_exhaustion_proposal(
+        self,
+        *,
+        proposal_identity: str,
+        expected_proposal_hash: str,
+    ) -> BundleExhaustionOperationResult | None:
+        if not proposal_identity or len(proposal_identity) > 128:
+            raise OwnerConflict("bundle_exhaustion_proposal_identity_invalid")
+        if len(expected_proposal_hash) != 64:
+            raise OwnerConflict("bundle_exhaustion_proposal_hash_invalid")
+        current = self._query_bundle_exhaustion_operation(
+            proposal_identity=proposal_identity
+        )
+        if current is None:
+            return None
+        if current.proposal_hash != expected_proposal_hash:
+            raise OwnerConflict("bundle_exhaustion_proposal_conflict")
+        if current.status not in {"outcome_unknown", "technical_blocker"}:
+            return current
+        proposal = self._query_bundle_exhaustion_proposal(proposal_identity)
+        if proposal.proposal_hash != expected_proposal_hash:
+            raise OwnerConflict("bundle_exhaustion_proposal_conflict")
+        request = self._verify_bundle_exhaustion_submission_scope(proposal)
+        evaluation = self._evaluate_bundle_exhaustion(
+            proposal,
+            quest_ref=request.accepted_question.quest_ref,
+        )
+        with self._database.write() as connection:
+            operation = connection.execute(
+                text(
+                    "SELECT * FROM ae_bundle_exhaustion_operations WHERE "
+                    "proposal_identity = :proposal_identity"
+                ),
+                {"proposal_identity": proposal_identity},
+            ).first()
+            if operation is None:
+                raise OwnerConflict("bundle_exhaustion_operation_missing")
+            if operation.proposal_hash != expected_proposal_hash:
+                raise OwnerConflict("bundle_exhaustion_proposal_conflict")
+            if operation.status not in {"outcome_unknown", "technical_blocker"}:
+                pass
+            elif operation.status != evaluation.status:
+                proposal_row = connection.execute(
+                    text(
+                        "SELECT evidence_hash, proposal_ref, request_ref FROM "
+                        "ae_bundle_exhaustion_proposals WHERE proposal_ref = "
+                        ":proposal_ref"
+                    ),
+                    {"proposal_ref": operation.proposal_ref},
+                ).first()
+                if proposal_row is None:
+                    raise OwnerConflict("bundle_exhaustion_proposal_missing")
+                self._assert_bundle_exhaustion_scope_in_transaction(
+                    connection, request, proposal
+                )
+                self._append_bundle_exhaustion_decision(
+                    connection,
+                    operation_ref=operation.operation_ref,
+                    proposal_ref=operation.proposal_ref,
+                    proposal_identity=proposal_identity,
+                    proposal_hash=expected_proposal_hash,
+                    request_ref=proposal_row.request_ref,
+                    evidence_hash=proposal_row.evidence_hash,
+                    evaluation=evaluation,
+                    now=time.time(),
+                )
+                connection.execute(
+                    text(
+                        "UPDATE advancement_engine_state SET revision = "
+                        "revision + 1, bundle_exhaustion_decision_count = "
+                        "bundle_exhaustion_decision_count + 1 WHERE singleton = "
+                        "'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "advancement_engine.bundle_exhaustion_proposal_reconciled",
+                    {
+                        "operation_ref": operation.operation_ref,
+                        "proposal_ref": operation.proposal_ref,
+                        "proposal_identity": proposal_identity,
+                        "proposal_hash": expected_proposal_hash,
+                        "status": evaluation.status,
+                    },
+                )
+        resolved = self._query_bundle_exhaustion_operation(
+            proposal_identity=proposal_identity
+        )
+        if resolved is None:
+            raise OwnerConflict("bundle_exhaustion_operation_missing")
+        return resolved
+
+    def verify_bundle_exhaustion_proposal_acceptance(
+        self,
+        *,
+        proposal_ref: str,
+        receipt: AcceptanceReceipt,
+        require_current: bool = False,
+        phase: str = "submission",
+    ) -> BundleExhaustionProposal:
+        if (
+            receipt.issuer != AE_OWNER
+            or receipt.kind != BUNDLE_EXHAUSTION_ACCEPTED_RECEIPT_KIND
+            or receipt.subject_ref != proposal_ref
+        ):
+            raise OwnerConflict("bundle_exhaustion_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    _BUNDLE_EXHAUSTION_OPERATION_QUERY
+                    + " WHERE p.proposal_ref = :proposal_ref"
+                ),
+                {"proposal_ref": proposal_ref},
+            ).first()
+        if row is None or row.operation_status != "accepted":
+            raise OwnerConflict("bundle_exhaustion_acceptance_invalid")
+        result = _bundle_exhaustion_result(row)
+        if result.decision_receipt != receipt:
+            raise OwnerConflict("bundle_exhaustion_acceptance_invalid")
+        proposal = bundle_exhaustion_proposal_from_dict(
+            decoded_object(row.proposal_json)
+        )
+        if proposal.proposal_hash != row.proposal_hash:
+            raise OwnerConflict("bundle_exhaustion_proposal_integrity_invalid")
+        if require_current:
+            request = self._verify_bundle_exhaustion_submission_scope(proposal)
+            evaluation = self._evaluate_bundle_exhaustion(
+                proposal,
+                quest_ref=request.accepted_question.quest_ref,
+                phase=phase,
+            )
+            if evaluation.status != "accepted":
+                raise OwnerConflict("bundle_exhaustion_acceptance_stale")
+        return proposal
+
+    def query_bundle_exhaustion_for_request(
+        self, request_ref: str
+    ) -> BundleExhaustionOperationResult | None:
+        if not request_ref or len(request_ref) > 96:
+            raise OwnerConflict("bundle_exhaustion_request_ref_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    _BUNDLE_EXHAUSTION_OPERATION_QUERY
+                    + " WHERE p.request_ref = :request_ref ORDER BY "
+                    "p.created_at DESC, p.proposal_ref DESC LIMIT 1"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        return None if row is None else _bundle_exhaustion_result(row)
+
+    def _verify_bundle_exhaustion_submission_scope(
+        self, proposal: BundleExhaustionProposal
+    ) -> StageRunRequest:
+        request = self._query_stage_request_by_ref(
+            proposal.stage_run_request_ref
+        )
+        accepted = request.accepted_formal_plan
+        if request.stage != BUNDLE_STAGE or accepted is None:
+            raise OwnerConflict("bundle_exhaustion_request_invalid")
+        if (
+            request.receipt.receipt_ref
+            != proposal.stage_run_request_receipt_ref
+            or request.receipt.payload_hash
+            != proposal.stage_run_request_receipt_hash
+            or request.cycle_ref != proposal.cycle_ref
+            or request.epoch != proposal.epoch
+            or request.context_pack_ref != proposal.context_pack_ref
+            or request.context_pack_hash != proposal.context_pack_hash
+            or accepted.formal_plan_ref != proposal.formal_plan_ref
+            or accepted.plan_document_hash != proposal.formal_plan_content_hash
+        ):
+            raise OwnerConflict("bundle_exhaustion_invocation_binding_stale")
+        self._assert_stage_request_current(request)
+        with self._database.read() as connection:
+            commit = connection.execute(
+                text(
+                    "SELECT commit_ref FROM ae_stage_commits WHERE request_ref = "
+                    ":request_ref"
+                ),
+                {"request_ref": request.request_ref},
+            ).first()
+        if commit is not None:
+            raise OwnerConflict("bundle_exhaustion_stage_commit_exists")
+        return request
+
+    def _evaluate_bundle_exhaustion(
+        self,
+        proposal: BundleExhaustionProposal,
+        *,
+        quest_ref: str,
+        phase: str = "submission",
+    ) -> BundleExhaustionEvaluation:
+        open_human_requests = tuple(
+            item
+            for item in self.query_human_requests(quest_ref=quest_ref)
+            if item.get("status") == "open"
+        )
+        if open_human_requests:
+            request_ref = open_human_requests[0].get("request_ref")
+            if not isinstance(request_ref, str) or not request_ref:
+                raise OwnerConflict("bundle_exhaustion_human_request_invalid")
+            return BundleExhaustionEvaluation(
+                status="needs_input", human_request_ref=request_ref
+            )
+        verifier = self._bundle_exhaustion_verifier
+        if verifier is None:
+            return BundleExhaustionEvaluation(
+                status="technical_blocker",
+                blocker_ref="bundle-exhaustion-verifier:unavailable",
+            )
+        result = verifier.evaluate_bundle_exhaustion(
+            proposal, quest_ref=quest_ref, phase=phase
+        )
+        if type(result) is not BundleExhaustionEvaluation:
+            raise OwnerConflict("bundle_exhaustion_evaluation_invalid")
+        return result
+
+    def _assert_bundle_exhaustion_scope_in_transaction(
+        self, connection, request: StageRunRequest, proposal: BundleExhaustionProposal
+    ) -> None:
+        self._assert_stage_head_current(
+            connection,
+            cycle_ref=request.cycle_ref,
+            quest_ref=request.accepted_question.quest_ref,
+            stage=BUNDLE_STAGE,
+            epoch=request.epoch,
+        )
+        current = connection.execute(
+            text(
+                "SELECT request_ref, receipt_ref, receipt_hash, context_pack_ref, "
+                "context_pack_hash FROM ae_stage_run_requests WHERE cycle_ref = "
+                ":cycle_ref AND stage = 'bundle' ORDER BY epoch DESC, "
+                "created_at DESC, request_ref DESC LIMIT 1"
+            ),
+            {"cycle_ref": request.cycle_ref},
+        ).first()
+        commit = connection.execute(
+            text(
+                "SELECT commit_ref FROM ae_stage_commits WHERE request_ref = "
+                ":request_ref"
+            ),
+            {"request_ref": request.request_ref},
+        ).first()
+        if current is None or (
+            current.request_ref != proposal.stage_run_request_ref
+            or current.receipt_ref != proposal.stage_run_request_receipt_ref
+            or current.receipt_hash != proposal.stage_run_request_receipt_hash
+            or current.context_pack_ref != proposal.context_pack_ref
+            or current.context_pack_hash != proposal.context_pack_hash
+            or commit is not None
+        ):
+            raise OwnerConflict("bundle_exhaustion_invocation_binding_stale")
+
+    def _append_bundle_exhaustion_decision(
+        self,
+        connection,
+        *,
+        operation_ref: str,
+        proposal_ref: str,
+        proposal_identity: str,
+        proposal_hash: str,
+        request_ref: str,
+        evidence_hash: str,
+        evaluation: BundleExhaustionEvaluation,
+        now: float,
+    ) -> None:
+        ordinal = int(
+            connection.execute(
+                text(
+                    "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM "
+                    "ae_bundle_exhaustion_decisions WHERE operation_ref = "
+                    ":operation_ref"
+                ),
+                {"operation_ref": operation_ref},
+            ).scalar_one()
+        )
+        decision_ref = new_ref("bundle_exhaustion_decision")
+        feedback_json = canonical_json(list(evaluation.feedback))
+        feedback_hash = canonical_hash(list(evaluation.feedback))
+        receipt_kind = (
+            BUNDLE_EXHAUSTION_ACCEPTED_RECEIPT_KIND
+            if evaluation.status == "accepted"
+            else BUNDLE_EXHAUSTION_DECISION_RECEIPT_KIND
+        )
+        receipt_subject_ref = (
+            proposal_ref if evaluation.status == "accepted" else operation_ref
+        )
+        bindings = {
+            "operation_ref": operation_ref,
+            "proposal_ref": proposal_ref,
+            "proposal_identity": proposal_identity,
+            "proposal_hash": proposal_hash,
+            "request_ref": request_ref,
+            "evidence_hash": evidence_hash,
+            "ordinal": ordinal,
+            "status": evaluation.status,
+            "feedback_hash": feedback_hash,
+            "human_request_ref": evaluation.human_request_ref,
+            "blocker_ref": evaluation.blocker_ref,
+        }
+        receipt_ref = new_ref("ae_bundle_exhaustion_receipt")
+        receipt_hash = _receipt_hash(
+            receipt_kind, receipt_subject_ref, bindings
+        )
+        connection.execute(
+            text(
+                "INSERT INTO ae_bundle_exhaustion_decisions (decision_ref, "
+                "operation_ref, ordinal, status, feedback_json, feedback_hash, "
+                "human_request_ref, blocker_ref, receipt_ref, receipt_kind, "
+                "receipt_subject_ref, receipt_hash, decided_at) VALUES "
+                "(:decision_ref, :operation_ref, :ordinal, :status, "
+                ":feedback_json, :feedback_hash, :human_request_ref, "
+                ":blocker_ref, :receipt_ref, :receipt_kind, "
+                ":receipt_subject_ref, :receipt_hash, :decided_at)"
+            ),
+            {
+                **bindings,
+                "decision_ref": decision_ref,
+                "feedback_json": feedback_json,
+                "receipt_ref": receipt_ref,
+                "receipt_kind": receipt_kind,
+                "receipt_subject_ref": receipt_subject_ref,
+                "receipt_hash": receipt_hash,
+                "decided_at": now,
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE ae_bundle_exhaustion_operations SET status = :status, "
+                "current_decision_ref = :decision_ref, updated_at = :updated_at "
+                "WHERE operation_ref = :operation_ref"
+            ),
+            {
+                "status": evaluation.status,
+                "decision_ref": decision_ref,
+                "updated_at": now,
+                "operation_ref": operation_ref,
+            },
+        )
+
+    def _query_bundle_exhaustion_operation(
+        self, *, proposal_identity: str
+    ) -> BundleExhaustionOperationResult | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    _BUNDLE_EXHAUSTION_OPERATION_QUERY
+                    + " WHERE o.proposal_identity = :proposal_identity"
+                ),
+                {"proposal_identity": proposal_identity},
+            ).first()
+        return None if row is None else _bundle_exhaustion_result(row)
+
+    def _query_bundle_exhaustion_proposal(
+        self, proposal_identity: str
+    ) -> BundleExhaustionProposal:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT proposal_json, proposal_hash FROM "
+                    "ae_bundle_exhaustion_proposals WHERE proposal_identity = "
+                    ":proposal_identity"
+                ),
+                {"proposal_identity": proposal_identity},
+            ).first()
+        if row is None:
+            raise OwnerConflict("bundle_exhaustion_proposal_missing")
+        proposal = bundle_exhaustion_proposal_from_dict(
+            decoded_object(row.proposal_json)
+        )
+        if proposal.proposal_hash != row.proposal_hash:
+            raise OwnerConflict("bundle_exhaustion_proposal_integrity_invalid")
+        return proposal
+
     def _query_stage_commit(self, request_ref: str) -> StageCommit | None:
         with self._database.read() as connection:
             row = connection.execute(
@@ -4019,6 +5373,208 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             },
         )
 
+    def _bundle_report_disposition_from_row(
+        self, row
+    ) -> BundleReportDisposition:
+        report_receipt = AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind="bundle_report_accepted",
+            receipt_ref=row.report_receipt_ref,
+            subject_ref=row.report_ref,
+            payload_hash=row.report_receipt_hash,
+        )
+        next_stage = (
+            PLAN_STAGE if row.disposition == "replan_required" else BUNDLE_STAGE
+        )
+        next_epoch = (
+            int(row.epoch) + 1
+            if row.disposition == "replan_required"
+            else int(row.epoch)
+        )
+        status = (
+            "pending_run_retirement"
+            if row.disposition == "replan_required"
+            else "blocked"
+        )
+        bindings = {
+            "request_ref": row.request_ref,
+            "cycle_ref": row.cycle_ref,
+            "epoch": int(row.epoch),
+            "run_ref": row.run_ref,
+            "report_ref": row.report_ref,
+            "report_hash": row.report_hash,
+            "disposition": row.disposition,
+            "status": status,
+            "next_stage": next_stage,
+            "next_epoch": next_epoch,
+            "report_receipt_ref": row.report_receipt_ref,
+            "report_receipt_hash": row.report_receipt_hash,
+        }
+        receipt = AcceptanceReceipt(
+            issuer=AE_OWNER,
+            kind=BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.disposition_ref,
+            payload_hash=row.receipt_hash,
+        )
+        if (
+            row.disposition not in {"blocked", "replan_required"}
+            or row.receipt_hash
+            != _receipt_hash(
+                BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND,
+                row.disposition_ref,
+                bindings,
+            )
+        ):
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        request = self._query_stage_request_by_ref(row.request_ref)
+        accepted = self._verify_bundle_report_for_advancement(
+            request=request,
+            run_ref=row.run_ref,
+            bundle_report_ref=row.report_ref,
+            bundle_report_receipt=report_receipt,
+            expected_disposition=row.disposition,
+        )
+        if (
+            request.cycle_ref != row.cycle_ref
+            or request.epoch != int(row.epoch)
+            or accepted.report_hash != row.report_hash
+        ):
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        return BundleReportDisposition(
+            disposition_ref=row.disposition_ref,
+            request_ref=row.request_ref,
+            cycle_ref=row.cycle_ref,
+            epoch=int(row.epoch),
+            run_ref=row.run_ref,
+            report_ref=row.report_ref,
+            report_hash=row.report_hash,
+            disposition=row.disposition,
+            status=status,
+            next_stage=next_stage,
+            next_epoch=next_epoch,
+            report_receipt=report_receipt,
+            receipt=receipt,
+        )
+
+    def _bundle_replan_activation_from_row(self, row) -> BundleReplanActivation:
+        verifier = self._runtime_control_verifier
+        if verifier is None or not callable(
+            getattr(verifier, "verify_bundle_replan_run_retirement", None)
+        ):
+            raise OwnerConflict("bundle_replan_retirement_verifier_unavailable")
+        retirement_receipt = AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind=BUNDLE_REPLAN_RUN_RETIRED_RECEIPT_KIND,
+            receipt_ref=row.retirement_receipt_ref,
+            subject_ref=row.run_identity_hash,
+            payload_hash=row.retirement_receipt_hash,
+        )
+        retirement = verifier.verify_bundle_replan_run_retirement(
+            retirement_ref=row.retirement_ref,
+            receipt=retirement_receipt,
+        )
+        bindings = {
+            "disposition_ref": row.disposition_ref,
+            "retirement_ref": row.retirement_ref,
+            "request_ref": row.request_ref,
+            "cycle_ref": row.cycle_ref,
+            "source_epoch": int(row.source_epoch),
+            "next_epoch": int(row.next_epoch),
+            "run_ref": row.run_ref,
+            "report_ref": row.report_ref,
+            "run_identity_hash": row.run_identity_hash,
+            "retirement_receipt_ref": row.retirement_receipt_ref,
+            "retirement_receipt_hash": row.retirement_receipt_hash,
+        }
+        receipt = AcceptanceReceipt(
+            issuer=AE_OWNER,
+            kind=BUNDLE_REPLAN_ACTIVATED_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.activation_ref,
+            payload_hash=row.receipt_hash,
+        )
+        if (
+            int(row.next_epoch) != int(row.source_epoch) + 1
+            or retirement.disposition_ref != row.disposition_ref
+            or retirement.request_ref != row.request_ref
+            or retirement.run_ref != row.run_ref
+            or retirement.report_ref != row.report_ref
+            or retirement.run_identity_hash != row.run_identity_hash
+            or retirement.receipt != retirement_receipt
+            or row.receipt_hash
+            != _receipt_hash(
+                BUNDLE_REPLAN_ACTIVATED_RECEIPT_KIND,
+                row.activation_ref,
+                bindings,
+            )
+        ):
+            raise OwnerConflict("bundle_replan_activation_invalid")
+        disposition = self.verify_bundle_report_disposition_receipt(
+            disposition_ref=row.disposition_ref,
+            receipt=AcceptanceReceipt(
+                issuer=AE_OWNER,
+                kind=BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND,
+                receipt_ref=(
+                    self._bundle_report_disposition_receipt_ref(row.disposition_ref)
+                ),
+                subject_ref=row.disposition_ref,
+                payload_hash=(
+                    self._bundle_report_disposition_receipt_hash(row.disposition_ref)
+                ),
+            ),
+            expected_disposition="replan_required",
+        )
+        if (
+            disposition.request_ref != row.request_ref
+            or disposition.cycle_ref != row.cycle_ref
+            or disposition.epoch != int(row.source_epoch)
+            or disposition.next_epoch != int(row.next_epoch)
+            or disposition.run_ref != row.run_ref
+            or disposition.report_ref != row.report_ref
+        ):
+            raise OwnerConflict("bundle_replan_activation_invalid")
+        return BundleReplanActivation(
+            activation_ref=row.activation_ref,
+            disposition_ref=row.disposition_ref,
+            retirement_ref=row.retirement_ref,
+            request_ref=row.request_ref,
+            cycle_ref=row.cycle_ref,
+            source_epoch=int(row.source_epoch),
+            next_epoch=int(row.next_epoch),
+            run_ref=row.run_ref,
+            report_ref=row.report_ref,
+            run_identity_hash=row.run_identity_hash,
+            retirement_receipt=retirement_receipt,
+            receipt=receipt,
+        )
+
+    def _bundle_report_disposition_receipt_ref(self, disposition_ref: str) -> str:
+        with self._database.read() as connection:
+            value = connection.execute(
+                text(
+                    "SELECT receipt_ref FROM ae_bundle_report_dispositions WHERE "
+                    "disposition_ref = :disposition_ref"
+                ),
+                {"disposition_ref": disposition_ref},
+            ).scalar_one_or_none()
+        if not isinstance(value, str):
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        return value
+
+    def _bundle_report_disposition_receipt_hash(self, disposition_ref: str) -> str:
+        with self._database.read() as connection:
+            value = connection.execute(
+                text(
+                    "SELECT receipt_hash FROM ae_bundle_report_dispositions WHERE "
+                    "disposition_ref = :disposition_ref"
+                ),
+                {"disposition_ref": disposition_ref},
+            ).scalar_one_or_none()
+        if not isinstance(value, str):
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        return value
+
     def _stage_commit_from_row(self, row) -> StageCommit:
         committed = _stage_commit(row)
         if row.receipt_hash != _stage_commit_receipt_hash(row):
@@ -4067,31 +5623,56 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             )
         elif row.stage == BUNDLE_STAGE:
             if row.disposition == COMPLETED_DISPOSITION:
-                if (
-                    self._target_graph_verifier is None
-                    or self._target_commit_verifier is None
-                    or row.run_ref is None
-                    or committed.closure is None
-                ):
+                if row.run_ref is None or committed.closure is None:
                     raise OwnerConflict("bundle_stage_verifier_unavailable")
-                self._target_graph_verifier.verify_target_graph_receipt(
-                    request_ref=row.request_ref,
-                    run_ref=row.run_ref,
-                    graph_ref=row.outcome_ref,
-                    receipt=committed.outcome_receipt,
-                )
-                receipts_value = committed.closure.get("target_commit_receipts")
-                if not isinstance(receipts_value, list):
-                    raise OwnerConflict("bundle_stage_closure_invalid")
-                try:
-                    receipts = tuple(
-                        _receipt_from_public(value) for value in receipts_value
+                if row.outcome_kind == BUNDLE_REPORT_OUTCOME_KIND:
+                    if committed.outcome_receipt is None:
+                        raise OwnerConflict("bundle_stage_verifier_unavailable")
+                    request = self._query_stage_request_by_ref(row.request_ref)
+                    accepted = self._verify_bundle_report_for_advancement(
+                        request=request,
+                        run_ref=row.run_ref,
+                        bundle_report_ref=row.outcome_ref,
+                        bundle_report_receipt=committed.outcome_receipt,
+                        expected_disposition="realized",
                     )
-                except TypeError as error:
-                    raise OwnerConflict("bundle_stage_closure_invalid") from error
-                self._target_commit_verifier.verify_target_commit_set(
-                    graph_ref=row.outcome_ref, receipts=receipts
-                )
+                    if committed.closure != _bundle_stage_report_closure(accepted):
+                        raise OwnerConflict("bundle_stage_closure_invalid")
+                elif row.outcome_kind == TARGET_GRAPH_OUTCOME_KIND:
+                    # Historical target-graph completions remain issuer-verified
+                    # when read, but no current public command can create one.
+                    if (
+                        self._target_graph_verifier is None
+                        or self._target_commit_verifier is None
+                        or committed.outcome_receipt is None
+                    ):
+                        raise OwnerConflict("bundle_stage_verifier_unavailable")
+                    self._target_graph_verifier.verify_target_graph_receipt(
+                        request_ref=row.request_ref,
+                        run_ref=row.run_ref,
+                        graph_ref=row.outcome_ref,
+                        receipt=committed.outcome_receipt,
+                        require_current=True,
+                        require_complete=True,
+                    )
+                    receipts_value = committed.closure.get(
+                        "target_commit_receipts"
+                    )
+                    if not isinstance(receipts_value, list):
+                        raise OwnerConflict("bundle_stage_closure_invalid")
+                    try:
+                        receipts = tuple(
+                            _receipt_from_public(value) for value in receipts_value
+                        )
+                    except TypeError as error:
+                        raise OwnerConflict("bundle_stage_closure_invalid") from error
+                    self._target_commit_verifier.verify_target_commit_set(
+                        graph_ref=row.outcome_ref,
+                        receipts=receipts,
+                        head_receipt=committed.outcome_receipt,
+                    )
+                else:
+                    raise OwnerConflict("bundle_stage_closure_invalid")
             elif (
                 row.disposition == SKIPPED_DISPOSITION
                 and row.outcome_kind == BUNDLE_SKIP_OUTCOME_KIND
@@ -4110,8 +5691,6 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             elif row.disposition not in BASIS_DISPOSITIONS:
                 raise OwnerConflict("stage_commit_disposition_invalid")
         if row.disposition in BASIS_DISPOSITIONS and committed.basis_receipt is not None:
-            if self._stage_disposition_basis_verifier is None:
-                raise OwnerConflict("stage_disposition_basis_verifier_unavailable")
             with self._database.read() as connection:
                 cycle = connection.execute(
                     text(
@@ -4122,17 +5701,48 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 ).first()
             if cycle is None:
                 raise OwnerConflict("stage_commit_basis_invalid")
-            self._stage_disposition_basis_verifier.verify_stage_disposition_basis(
-                cycle_ref=row.cycle_ref,
-                quest_ref=cycle.quest_ref,
-                question_ref=cycle.question_ref,
-                stage=row.stage,
-                epoch=int(row.epoch),
-                disposition=row.disposition,
-                basis_kind=row.basis_kind,
-                basis_ref=row.basis_ref,
-                receipt=committed.basis_receipt,
+            is_bundle_exhaustion = (
+                row.stage == BUNDLE_STAGE
+                and row.disposition == EXHAUSTED_DISPOSITION
+                and row.basis_kind == BUNDLE_EXHAUSTION_BASIS_KIND
             )
+            if (
+                row.stage == BUNDLE_STAGE
+                and row.disposition == EXHAUSTED_DISPOSITION
+                and not is_bundle_exhaustion
+            ) or (
+                row.basis_kind == BUNDLE_EXHAUSTION_BASIS_KIND
+                and not is_bundle_exhaustion
+            ):
+                raise OwnerConflict("bundle_exhaustion_basis_required")
+            if is_bundle_exhaustion:
+                proposal = self.verify_bundle_exhaustion_proposal_acceptance(
+                    proposal_ref=row.basis_ref,
+                    receipt=committed.basis_receipt,
+                )
+                if (
+                    proposal.stage_run_request_ref != row.request_ref
+                    or proposal.cycle_ref != row.cycle_ref
+                    or proposal.epoch != int(row.epoch)
+                    or proposal.run_ref != row.run_ref
+                ):
+                    raise OwnerConflict("bundle_exhaustion_basis_binding_invalid")
+            else:
+                if self._stage_disposition_basis_verifier is None:
+                    raise OwnerConflict(
+                        "stage_disposition_basis_verifier_unavailable"
+                    )
+                self._stage_disposition_basis_verifier.verify_stage_disposition_basis(
+                    cycle_ref=row.cycle_ref,
+                    quest_ref=cycle.quest_ref,
+                    question_ref=cycle.question_ref,
+                    stage=row.stage,
+                    epoch=int(row.epoch),
+                    disposition=row.disposition,
+                    basis_kind=row.basis_kind,
+                    basis_ref=row.basis_ref,
+                    receipt=committed.basis_receipt,
+                )
         return committed
 
     def _query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest:
@@ -4244,6 +5854,7 @@ class SQLiteAdvancementEngineReceiptVerifier:
                 text(
                     "SELECT h.pending_operation_ref, h.status AS head_status, "
                     "g.status AS grant_status, c.status AS cycle_status, "
+                    "replan.disposition_ref AS pending_replan_ref, "
                     "operation.action AS pending_action FROM ae_stage_run_requests r "
                     "JOIN ae_foreground_heads h ON h.cycle_ref = r.cycle_ref AND "
                     "h.stage = r.stage AND h.epoch = r.epoch JOIN "
@@ -4251,6 +5862,9 @@ class SQLiteAdvancementEngineReceiptVerifier:
                     "g.cycle_ref = h.cycle_ref AND g.epoch = h.epoch JOIN ae_cycles c "
                     "ON c.cycle_ref = h.cycle_ref LEFT JOIN ae_control_operations "
                     "operation ON operation.operation_ref = h.pending_operation_ref "
+                    "LEFT JOIN ae_bundle_report_dispositions replan ON "
+                    "replan.request_ref = r.request_ref AND "
+                    "replan.disposition = 'replan_required' "
                     "WHERE r.request_ref = :request_ref"
                 ),
                 {"request_ref": request_ref},
@@ -4259,6 +5873,7 @@ class SQLiteAdvancementEngineReceiptVerifier:
             current.head_status != "active"
             or current.grant_status != "active"
             or current.cycle_status != "ongoing"
+            or current.pending_replan_ref is not None
             or (
                 current.pending_operation_ref is not None
                 and current.pending_action != "normal_switch"
@@ -4552,6 +6167,102 @@ def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> s
             "subject_ref": subject_ref,
             "bindings": bindings,
         }
+    )
+
+
+_BUNDLE_EXHAUSTION_OPERATION_QUERY = (
+    "SELECT o.operation_ref, o.proposal_ref AS operation_proposal_ref, "
+    "o.proposal_identity AS operation_proposal_identity, "
+    "o.proposal_hash AS operation_proposal_hash, "
+    "o.status AS operation_status, o.current_decision_ref, "
+    "p.proposal_ref, p.proposal_identity, p.proposal_hash, p.request_ref, "
+    "p.evidence_hash, p.proposal_json, d.decision_ref, d.ordinal, "
+    "d.status AS decision_status, d.feedback_json, d.feedback_hash, "
+    "d.human_request_ref, d.blocker_ref, d.receipt_ref, d.receipt_kind, "
+    "d.receipt_subject_ref, d.receipt_hash "
+    "FROM ae_bundle_exhaustion_operations o JOIN "
+    "ae_bundle_exhaustion_proposals p ON p.proposal_ref = o.proposal_ref "
+    "JOIN ae_bundle_exhaustion_decisions d ON "
+    "d.decision_ref = o.current_decision_ref"
+)
+
+
+def _bundle_exhaustion_result(row) -> BundleExhaustionOperationResult:
+    if (
+        row.operation_proposal_ref != row.proposal_ref
+        or row.operation_proposal_identity != row.proposal_identity
+        or row.operation_proposal_hash != row.proposal_hash
+        or row.operation_status != row.decision_status
+        or row.current_decision_ref != row.decision_ref
+    ):
+        raise OwnerConflict("bundle_exhaustion_operation_integrity_invalid")
+    try:
+        proposal_value = decoded_object(row.proposal_json)
+        proposal = bundle_exhaustion_proposal_from_dict(proposal_value)
+        feedback_value = json.loads(row.feedback_json)
+    except (OwnerConflict, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("bundle_exhaustion_operation_integrity_invalid") from error
+    if type(feedback_value) is not list or any(
+        type(item) is not str for item in feedback_value
+    ):
+        raise OwnerConflict("bundle_exhaustion_operation_integrity_invalid")
+    feedback = tuple(feedback_value)
+    if (
+        canonical_json(proposal.as_dict()) != row.proposal_json
+        or proposal.proposal_hash != row.proposal_hash
+        or proposal.evidence_hash != row.evidence_hash
+        or canonical_json(list(feedback)) != row.feedback_json
+        or canonical_hash(list(feedback)) != row.feedback_hash
+    ):
+        raise OwnerConflict("bundle_exhaustion_operation_integrity_invalid")
+    receipt_kind = (
+        BUNDLE_EXHAUSTION_ACCEPTED_RECEIPT_KIND
+        if row.decision_status == "accepted"
+        else BUNDLE_EXHAUSTION_DECISION_RECEIPT_KIND
+    )
+    receipt_subject_ref = (
+        row.proposal_ref
+        if row.decision_status == "accepted"
+        else row.operation_ref
+    )
+    bindings = {
+        "operation_ref": row.operation_ref,
+        "proposal_ref": row.proposal_ref,
+        "proposal_identity": row.proposal_identity,
+        "proposal_hash": row.proposal_hash,
+        "request_ref": row.request_ref,
+        "evidence_hash": row.evidence_hash,
+        "ordinal": int(row.ordinal),
+        "status": row.decision_status,
+        "feedback_hash": row.feedback_hash,
+        "human_request_ref": row.human_request_ref,
+        "blocker_ref": row.blocker_ref,
+    }
+    if (
+        row.receipt_kind != receipt_kind
+        or row.receipt_subject_ref != receipt_subject_ref
+        or row.receipt_hash
+        != _receipt_hash(receipt_kind, receipt_subject_ref, bindings)
+    ):
+        raise OwnerConflict("bundle_exhaustion_decision_receipt_invalid")
+    return BundleExhaustionOperationResult(
+        operation_ref=row.operation_ref,
+        proposal_identity=row.proposal_identity,
+        proposal_hash=row.proposal_hash,
+        status=row.decision_status,
+        accepted_proposal_ref=(
+            row.proposal_ref if row.decision_status == "accepted" else None
+        ),
+        decision_receipt=AcceptanceReceipt(
+            issuer=AE_OWNER,
+            kind=row.receipt_kind,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.receipt_subject_ref,
+            payload_hash=row.receipt_hash,
+        ),
+        feedback=feedback,
+        human_request_ref=row.human_request_ref,
+        blocker_ref=row.blocker_ref,
     )
 
 
@@ -4918,7 +6629,8 @@ def _stage_commit(row) -> StageCommit:
             row.stage == PLAN_STAGE and row.outcome_kind == FORMAL_PLAN_OUTCOME_KIND
         ) or (
             row.stage == BUNDLE_STAGE
-            and row.outcome_kind == TARGET_GRAPH_OUTCOME_KIND
+            and row.outcome_kind
+            in {TARGET_GRAPH_OUTCOME_KIND, BUNDLE_REPORT_OUTCOME_KIND}
         ) or (
             row.stage == "reasoning"
             and isinstance(row.outcome_kind, str)
@@ -4943,14 +6655,23 @@ def _stage_commit(row) -> StageCommit:
             payload_hash=row.run_completion_receipt_hash,
         )
         outcome_receipt = AcceptanceReceipt(
-            issuer="research_graph",
+            issuer=(
+                "agent_runtime"
+                if row.stage == BUNDLE_STAGE
+                and row.outcome_kind == BUNDLE_REPORT_OUTCOME_KIND
+                else "research_graph"
+            ),
             kind=(
                 "idea_outcome_accepted"
                 if row.stage == IDEA_STAGE
                 else (
                     "formal_plan_accepted"
                     if row.stage == PLAN_STAGE
-                    else f"{row.outcome_kind}_accepted"
+                    else (
+                        "bundle_report_accepted"
+                        if row.outcome_kind == BUNDLE_REPORT_OUTCOME_KIND
+                        else f"{row.outcome_kind}_accepted"
+                    )
                 )
             ),
             receipt_ref=row.outcome_receipt_ref,
@@ -5170,6 +6891,8 @@ def create_advancement_engine_interface(
     question_control_verifier: QuestionControlReceiptVerifier | None = None,
     stage_disposition_basis_verifier: StageDispositionBasisVerifier | None = None,
     current_question_verifier: CurrentQuestionVerifier | None = None,
+    bundle_report_verifier: BundleReportReceiptVerifier | None = None,
+    bundle_report_evidence_verifier: BundleReportEvidenceVerifier | None = None,
 ) -> AdvancementEngineInterface:
     return SQLiteAdvancementEngine(
         database,
@@ -5190,4 +6913,6 @@ def create_advancement_engine_interface(
         question_control_verifier,
         stage_disposition_basis_verifier,
         current_question_verifier,
+        bundle_report_verifier,
+        bundle_report_evidence_verifier,
     )

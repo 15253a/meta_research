@@ -50,7 +50,7 @@ _WRITING_SAFE_CAPABILITIES = {
     "accepted-rm-source-staging",
     "approval-policy-never",
     "environment-inheritance-none",
-    "filesystem-workspace-write",
+    "filesystem-read-root-confined",
     "global-config-ignored",
     "harness-child-agent-review",
     "mcp-config-empty",
@@ -58,7 +58,7 @@ _WRITING_SAFE_CAPABILITIES = {
     "shell-tool-enabled",
     "structured-output-json-schema",
     "trusted-local-quest-authorization",
-    "web-search-live",
+    "external-research-disabled",
 }
 _WRITING_SAFE_RESOURCE_PREFIXES = (
     "adapter-source:",
@@ -416,6 +416,39 @@ def _validate_writing_snapshot_shape(snapshot: dict[str, object]) -> None:
             isinstance(revision, bool) or not isinstance(revision, int) or revision < 0
             for revision in revisions.values()
         )
+    ):
+        raise OwnerConflict("writing_snapshot_invalid")
+
+
+def validate_frozen_writing_snapshot(snapshot: dict[str, object]) -> None:
+    """Validate one immutable Writing input cut without reading live research.
+
+    Once captured, a Snapshot is intentionally independent of later Quest,
+    Stage, source, or Owner revisions.  ``owner_revisions`` are capture-time
+    lower-bound observations, not an atomic cross-Owner cut or a currentness
+    gate.  The Snapshot's closed value and hashes remain authoritative for
+    this Writing intent.
+    """
+
+    if type(snapshot) is not dict:
+        raise OwnerConflict("writing_snapshot_invalid")
+    _validate_writing_snapshot_shape(snapshot)
+    document = dict(snapshot)
+    snapshot_hash = document.pop("snapshot_hash", None)
+    snapshot_ref = document.get("snapshot_ref")
+    payload = dict(document)
+    payload.pop("snapshot_ref", None)
+    basis_hash = canonical_hash(payload)
+    quest = snapshot.get("quest")
+    if (
+        type(snapshot_hash) is not str
+        or len(snapshot_hash) != 64
+        or canonical_hash(document) != snapshot_hash
+        or snapshot_ref != f"writing_snapshot_{basis_hash[:32]}"
+        or type(snapshot.get("quest_ref")) is not str
+        or not snapshot["quest_ref"]
+        or type(quest) is not dict
+        or quest.get("quest_ref") != snapshot["quest_ref"]
     ):
         raise OwnerConflict("writing_snapshot_invalid")
 

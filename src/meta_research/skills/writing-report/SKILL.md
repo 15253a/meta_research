@@ -7,7 +7,13 @@ description: Draft and revise an evidence-grounded Markdown research report from
 
 Produce one auditable report candidate inside the managed Writing Session. Treat
 the supplied Intent, Snapshot, runtime binding, lineage, and feedback as exact
-inputs. Do not query or silently substitute newer Quest state.
+inputs. Research may continue accepting newer facts while this Writing Run is
+active; those facts belong to a later Snapshot and neither mutate nor gate this
+run. Starting or finishing this run likewise does not advance, pause, or gate
+research, Bundle completion, or any Quest Stage. Do not query or silently
+substitute newer Quest state. The host captured this candidate cut for the
+Intent and sealed that exact cut at HC authorization. A lost acknowledgement or
+restart resumes the sealed cut without recapture, revalidation, or replacement.
 
 ## Draft
 
@@ -15,6 +21,9 @@ inputs. Do not query or silently substitute newer Quest state.
 - Read the staged files listed in `accepted_source_manifest` before making
   evidence claims. Bind each file back to its manifest `version_ref`; the file
   path is transport only and is never a citation identity.
+- Use only the exact Frozen Snapshot source root exposed by the permission
+  profile. Web search, MCP, other workspace roots, and live Owner files are not
+  Writing inputs.
 - Make claim coverage machine-checkable. The first block must be the single H1
   document title. Every later block must begin with exactly one marker. A
   section heading uses `<!-- meta-research-structure -->` followed immediately

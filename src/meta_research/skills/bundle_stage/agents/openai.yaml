@@ -1,7 +1,7 @@
 interface:
   display_name: "Bundle Stage"
-  short_description: "Build a reviewed Target DAG from an accepted FormalPlan"
+  short_description: "按完整 Bundle 合同滚动执行并收口 Target 工作"
   brand_color: "#596B5A"
-  default_prompt: "Use $bundle-stage to turn the frozen FormalPlan gaps into a reviewed Target DAG."
+  default_prompt: "使用 $bundle-stage 时，先完整读取 Bundle 合同和 Owner 操作，再按固定原型的八步滚动执行并收口 Target 工作。"
 policy:
   allow_implicit_invocation: false

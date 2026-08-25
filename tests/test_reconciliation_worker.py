@@ -393,7 +393,12 @@ def test_reconciliation_worker_is_non_blocking_and_recovers_after_io_failure() -
         await asyncio.sleep(0.1)
         assert time.monotonic() - started < 0.18
         deadline = time.monotonic() + 1.5
-        while calls < 2 and time.monotonic() < deadline:
+        # ``calls`` increments at invocation entry, while recovery health is
+        # published only after the awaited call returns.  Wait for that whole
+        # boundary instead of racing the few instructions between the two.
+        while (
+            calls < 2 or health.status != "ready"
+        ) and time.monotonic() < deadline:
             await asyncio.sleep(0.02)
         assert calls >= 2
         assert not worker.done()
@@ -432,6 +437,12 @@ def test_web_lifespan_stops_provider_before_waiting_for_drafting_worker() -> Non
                 reconcile_once=lambda: False,
                 process_drafting_once=process_drafting_once,
             )
+        ),
+        bundle_stage=SimpleNamespace(
+            configure_resident_mcp_endpoint=lambda _base_url: None,
+        ),
+        target_run_runtime=SimpleNamespace(
+            configure_resident_mcp_endpoint=lambda _base_url: None,
         ),
         request_stop=request_stop,
     )

@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.resources import files
@@ -23,6 +24,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from meta_research.auth import AuthSession
 from meta_research.composition import ProductionRuntime
 from meta_research.experiment import ExperimentIntent
+from meta_research.harness import (
+    FullConformanceRequest,
+    HarnessAdmissionError,
+)
 from meta_research.owners.common import OwnerConflict
 from meta_research.owners.secret_detection import contains_secret
 from meta_research.owners.research_graph import ASSET_ROLE_QUERY_MAX_PAGE_SIZE
@@ -59,6 +64,32 @@ BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 DEEPFETCH_WORKER_WATCHDOG_SECONDS = 1810.0
 EXPERIMENT_WORKER_WATCHDOG_SECONDS = 30.0
 WRITING_WORKER_WATCHDOG_SECONDS = 910.0
+HARNESS_CONFORMANCE_WORKER_WATCHDOG_SECONDS = 310.0
+# ``BundleStage.transient_error`` predates the durable pause/wait contract and
+# carries both actual failures and normal no-progress states.  Keep this list
+# closed: an unfamiliar code must remain fail-closed as worker-unavailable.
+_BUNDLE_STAGE_HEALTHY_WAIT_CODES = frozenset(
+    {
+        # Root policy and rolling-plan control flow.
+        "bundle_strategy_incomplete",
+        "bundle_replan_required",
+        "bundle_root_waiting",
+        # Target launch and the independently owned root lifecycle.
+        "target_launch_admitted",
+        "target_launch_pending",
+        "target_root_running",
+        # Human/domain waits and mechanical terminal transitions.
+        "target_high_risk_authorization_required",
+        "target_high_risk_authorization_declined",
+        "bundle_report_blocked",
+        "bundle_replan_activated",
+        "bundle_exhaustion_rejected",
+        "bundle_exhaustion_stale",
+        "bundle_exhaustion_needs_input",
+        "bundle_exhaustion_outcome_unknown",
+        "bundle_exhaustion_technical_blocker",
+    }
+)
 _T = TypeVar("_T")
 
 
@@ -73,6 +104,12 @@ class ReconciliationHealth:
 class _PendingWorkerRetirement:
     operation: asyncio.Future[bool]
     retirement: asyncio.Future[None]
+
+
+@dataclass(frozen=True)
+class _TargetRunFlight:
+    target_ref: str
+    operation: asyncio.Future[bool]
 
 
 @dataclass
@@ -104,6 +141,15 @@ class BootstrapExchange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     token: str = Field(min_length=20, max_length=256)
+
+
+class StartHarnessConformanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    codex_model_ref: str = Field(min_length=1, max_length=160)
+    codex_auth_profile_ref: str = Field(min_length=1, max_length=160)
+    claude_model_ref: str = Field(min_length=1, max_length=160)
+    claude_auth_profile_ref: str = Field(min_length=1, max_length=160)
 
 
 class OpenQuestRequest(BaseModel):
@@ -510,12 +556,16 @@ class WritingRevisionRequest(BaseModel):
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
+    runtime.bundle_stage.configure_resident_mcp_endpoint(base_url)
+    runtime.target_run_runtime.configure_resident_mcp_endpoint(base_url)
+    harness_conformance_task: asyncio.Task[None] | None = None
     reconciliation_task: asyncio.Task[None] | None = None
     drafting_task: asyncio.Task[None] | None = None
     deepfetch_task: asyncio.Task[None] | None = None
     idea_stage_task: asyncio.Task[None] | None = None
     plan_stage_task: asyncio.Task[None] | None = None
     bundle_stage_task: asyncio.Task[None] | None = None
+    target_run_task: asyncio.Task[None] | None = None
     experiment_task: asyncio.Task[None] | None = None
     writing_task: asyncio.Task[None] | None = None
     research_asset_task: asyncio.Task[None] | None = None
@@ -526,6 +576,7 @@ def create_app(
     idea_stage_health = ReconciliationHealth()
     plan_stage_health = ReconciliationHealth()
     bundle_stage_health = ReconciliationHealth()
+    target_run_health = ReconciliationHealth()
     experiment_health = ReconciliationHealth()
     writing_health = ReconciliationHealth()
     research_asset_health = ReconciliationHealth()
@@ -538,9 +589,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        nonlocal harness_conformance_task
         nonlocal reconciliation_task, drafting_task, deepfetch_task, idea_stage_task
-        nonlocal plan_stage_task, bundle_stage_task, experiment_task, writing_task
+        nonlocal plan_stage_task, bundle_stage_task, target_run_task
+        nonlocal experiment_task, writing_task
         nonlocal research_asset_task, research_asset_verification_task
+        harness_conformance_task = asyncio.create_task(
+            _process_harness_conformance(runtime, base_url)
+        )
+        harness_conformance_task.add_done_callback(_log_reconciliation_exit)
         reconciliation_task = asyncio.create_task(
             _reconcile_quest_initializations(
                 runtime,
@@ -589,6 +646,14 @@ def create_app(
             )
         )
         bundle_stage_task.add_done_callback(_log_reconciliation_exit)
+        target_run_task = asyncio.create_task(
+            _process_target_runs(
+                runtime,
+                target_run_health,
+                worker_health_updates.publish,
+            )
+        )
+        target_run_task.add_done_callback(_log_reconciliation_exit)
         experiment_task = asyncio.create_task(
             _process_experiments(
                 runtime,
@@ -627,12 +692,14 @@ def create_app(
             tasks = tuple(
                 task
                 for task in (
+                    harness_conformance_task,
                     reconciliation_task,
                     drafting_task,
                     deepfetch_task,
                     idea_stage_task,
                     plan_stage_task,
                     bundle_stage_task,
+                    target_run_task,
                     experiment_task,
                     writing_task,
                     research_asset_task,
@@ -686,6 +753,7 @@ def create_app(
         readiness = snapshot["readiness"]
         checks = [
             *readiness["checks"],
+            runtime.query_target_root_readiness(),
             worker_check(
                 "quest_reconciliation_worker",
                 reconciliation_task,
@@ -700,6 +768,7 @@ def create_app(
             worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
             worker_check("plan_stage_worker", plan_stage_task, plan_stage_health),
             worker_check("bundle_stage_worker", bundle_stage_task, bundle_stage_health),
+            worker_check("target_run_worker", target_run_task, target_run_health),
             worker_check(
                 "experiment_worker",
                 experiment_task,
@@ -725,6 +794,7 @@ def create_app(
                 "idea_stage_worker",
                 "plan_stage_worker",
                 "bundle_stage_worker",
+                "target_run_worker",
                 "writing_worker",
                 "research_asset_intake_worker",
                 "research_asset_verification_worker",
@@ -893,6 +963,15 @@ def create_app(
             detail["status"] = "capability_unavailable"
         return JSONResponse(status_code=status_code, content={"detail": detail})
 
+    @app.exception_handler(HarnessAdmissionError)
+    async def harness_admission_error(
+        _request: Request, error: HarnessAdmissionError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": {"code": error.code}},
+        )
+
     @app.exception_handler(SnapshotConsistencyUnavailable)
     async def snapshot_consistency_unavailable(
         _request: Request, _error: SnapshotConsistencyUnavailable
@@ -944,6 +1023,9 @@ def create_app(
         bundle_stage = worker_check(
             "bundle_stage_worker", bundle_stage_task, bundle_stage_health
         )
+        target_runs = worker_check(
+            "target_run_worker", target_run_task, target_run_health
+        )
         research_assets = worker_check(
             "research_asset_intake_worker",
             research_asset_task,
@@ -958,6 +1040,7 @@ def create_app(
             "experiment_worker", experiment_task, experiment_health
         )
         writing = worker_check("writing_worker", writing_task, writing_health)
+        target_root = runtime.query_target_root_readiness()
         return {
             "status": snapshot["readiness"]["status"],
             "revision": snapshot["revision"],
@@ -985,6 +1068,10 @@ def create_app(
                 "status": bundle_stage["status"],
                 "last_error": bundle_stage_health.last_error,
             },
+            "target_runs": {
+                "status": target_runs["status"],
+                "last_error": target_run_health.last_error,
+            },
             "experiment": {
                 "status": experiment["status"],
                 "last_error": experiment_health.last_error,
@@ -993,6 +1080,7 @@ def create_app(
                 "status": writing["status"],
                 "last_error": writing_health.last_error,
             },
+            "target_root": target_root,
             "research_assets": {
                 "status": research_assets["status"],
                 "last_error": research_asset_health.last_error,
@@ -1005,7 +1093,26 @@ def create_app(
 
     @app.get("/internal/doctor")
     def internal_doctor() -> dict[str, object]:
-        return runtime.harnesses.query_status()
+        harness = runtime.harnesses.query_status()
+        target_root = runtime.query_target_root_readiness()
+        return {
+            **harness,
+            "status": (
+                "ready"
+                if harness.get("status") == "ready"
+                and target_root.get("status") == "ready"
+                else "unavailable"
+            ),
+            "target_root": target_root,
+        }
+
+    @app.post("/internal/harness-conformance")
+    def start_harness_conformance(
+        request: StartHarnessConformanceRequest,
+    ) -> dict[str, object]:
+        return runtime.harnesses.start_full_conformance(
+            FullConformanceRequest(**request.model_dump())
+        ).as_public_dict()
 
     @app.post("/auth/bootstrap")
     def exchange_bootstrap(exchange: BootstrapExchange) -> JSONResponse:
@@ -2146,6 +2253,21 @@ def create_app(
     def query_current_bundle_stage() -> dict[str, object]:
         return runtime.bundle_stage.query_current()
 
+    @app.get(
+        "/api/v1/bundle/targets/{target_ref}/root-observations"
+    )
+    def query_target_root_observations(
+        target_ref: str,
+        after: str | None = Query(default=None, max_length=512),
+        limit: int = Query(default=128, ge=1, le=256),
+    ) -> dict[str, object]:
+        page = runtime.harnesses.query_target_root_observations(
+            target_ref,
+            after_cursor=after,
+            limit=limit,
+        )
+        return page.as_dict()
+
     @app.get("/api/v1/events")
     async def stream_events(request: Request) -> StreamingResponse:
         raw_revision = (
@@ -2861,6 +2983,33 @@ def _daemon_thread_call(call: Callable[[], _T]) -> asyncio.Future[_T]:
     return result
 
 
+async def _process_harness_conformance(
+    runtime: ProductionRuntime, base_url: str
+) -> None:
+    """Advance only explicitly admitted full-contract Harness Runs."""
+
+    health = ReconciliationHealth()
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                lambda: runtime.harnesses.advance_full_conformance(
+                    mcp_base_url=base_url
+                ),
+                health=health,
+                timeout_code="harness_conformance_operation_timeout",
+                on_health_change=None,
+                timeout_seconds=HARNESS_CONFORMANCE_WORKER_WATCHDOG_SECONDS,
+            )
+        except HarnessAdmissionError as error:
+            LOGGER.warning("Harness conformance turn unavailable: %s", error.code)
+            await asyncio.sleep(0.2)
+        except Exception:
+            LOGGER.exception("Harness conformance turn failed unexpectedly")
+            await asyncio.sleep(0.5)
+        else:
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
 async def _process_idea_stage(
     runtime: ProductionRuntime,
     health: ReconciliationHealth,
@@ -2957,6 +3106,145 @@ async def _process_plan_stage(
             await asyncio.sleep(0 if advanced else 0.2)
 
 
+async def _process_target_runs(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Fairly wake each admitted or running Target root, independent of Bundle."""
+
+    flights: dict[str, _TargetRunFlight] = {}
+    cancel_flights: dict[str, _TargetRunFlight] = {}
+
+    def set_health(status: Literal["ready", "unavailable"], code: str | None) -> None:
+        changed = health.status != status or health.last_error != code
+        health.status = status
+        health.last_error = code
+        if status == "ready":
+            health.retry_count = 0
+        elif changed:
+            health.retry_count += 1
+        if changed and on_health_change is not None:
+            on_health_change()
+
+    while True:
+        try:
+            target_refs = await asyncio.to_thread(
+                runtime.owners.agent_runtime.list_target_root_work_refs
+            )
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("TargetRun frontier discovery failed unexpectedly")
+            error_code = (
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            )
+            set_health("unavailable", error_code)
+            await asyncio.sleep(min(2.0, 0.2 * (2 ** min(health.retry_count, 4))))
+            continue
+
+        discovery_error: str | None = None
+        for target_ref in target_refs:
+            if target_ref in flights:
+                if target_ref in cancel_flights:
+                    continue
+                has_pending_cancel = getattr(
+                    runtime.target_run_runtime,
+                    "has_pending_cancel",
+                    None,
+                )
+                if not callable(has_pending_cancel):
+                    continue
+                try:
+                    pending_cancel = await asyncio.to_thread(
+                        has_pending_cancel,
+                        target_ref,
+                    )
+                except Exception as error:
+                    if not isinstance(
+                        error, (OSError, OwnerConflict, SQLAlchemyError)
+                    ):
+                        LOGGER.exception(
+                            "TargetRun cancel discovery failed unexpectedly"
+                        )
+                    discovery_error = (
+                        error.code
+                        if isinstance(error, OwnerConflict)
+                        else type(error).__name__
+                    )
+                    continue
+                if pending_cancel:
+                    operation = _daemon_thread_call(
+                        lambda target_ref=target_ref: (
+                            runtime.target_run_runtime.process_once(target_ref)
+                        )
+                    )
+                    cancel_flights[target_ref] = _TargetRunFlight(
+                        target_ref=target_ref,
+                        operation=operation,
+                    )
+                continue
+            if target_ref in cancel_flights:
+                continue
+            operation = _daemon_thread_call(
+                lambda target_ref=target_ref: runtime.target_run_runtime.process_once(
+                    target_ref
+                )
+            )
+            flights[target_ref] = _TargetRunFlight(
+                target_ref=target_ref,
+                operation=operation,
+            )
+
+        all_flights = (*flights.values(), *cancel_flights.values())
+        completed = {
+            flight.operation for flight in all_flights if flight.operation.done()
+        }
+        if not completed and all_flights:
+            completed, _pending = await asyncio.wait(
+                {flight.operation for flight in all_flights},
+                timeout=0.2,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+        advanced = False
+        operation_error: str | None = None
+        for flight_map in (flights, cancel_flights):
+            for target_ref, flight in tuple(flight_map.items()):
+                if (
+                    flight.operation not in completed
+                    and not flight.operation.done()
+                ):
+                    continue
+                del flight_map[target_ref]
+                try:
+                    result = flight.operation.result()
+                    if type(result) is not bool:
+                        raise TypeError(
+                            "TargetRun process_once returned a non-bool value"
+                        )
+                    advanced = advanced or result
+                except Exception as error:
+                    if not isinstance(
+                        error, (OSError, OwnerConflict, SQLAlchemyError)
+                    ):
+                        LOGGER.exception("TargetRun boundary failed unexpectedly")
+                    if operation_error is None:
+                        operation_error = (
+                            error.code
+                            if isinstance(error, OwnerConflict)
+                            else type(error).__name__
+                        )
+
+        if discovery_error is not None or operation_error is not None:
+            set_health("unavailable", discovery_error or operation_error)
+        else:
+            set_health("ready", None)
+
+        await asyncio.sleep(
+            0 if advanced else (0.05 if flights or cancel_flights else 0.2)
+        )
+
+
 async def _process_bundle_stage(
     runtime: ProductionRuntime,
     health: ReconciliationHealth,
@@ -2974,7 +3262,10 @@ async def _process_bundle_stage(
                 timeout_seconds=BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS,
             )
             transient_error = runtime.bundle_stage.transient_error
-            if transient_error is not None:
+            if (
+                transient_error is not None
+                and transient_error not in _BUNDLE_STAGE_HEALTHY_WAIT_CODES
+            ):
                 raise _BundleStageTransientError(transient_error)
         except Exception as error:
             if not isinstance(

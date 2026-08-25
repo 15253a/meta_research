@@ -185,12 +185,15 @@ and never promotes live observations into RM or RG truth.
 
 Writing Report is a separate long-lived capability, not a fifth Stage and not a
 gate on Quest advancement. Human Collaboration freezes an exact report Intent,
-Research Snapshot, Owner revision cut, and bounded execution budget before
+accepted-fact-stable Research Snapshot, capture-time Owner revision observations,
+and bounded execution budget before
 Agent Runtime admits one managed root/native Session. The packaged Writing
-Skill may draft, self-review through a focused child context, revise, and use
-ordinary read-only research capabilities covered by the Quest policy, but it
-cannot publish, send, accept its own deliverable, or claim formal citation
-correctness. Pause and resume retain the Session lineage while retiring stale
+Skill may draft, self-review through a focused child context, and revise using
+only the exact source material sealed into that Snapshot. Live Owner state,
+Web search, and later research facts are not inputs to the current Writing Run;
+they belong to a later Snapshot. The Skill cannot publish, send, accept its own
+deliverable, or claim formal citation correctness. Pause and resume retain the
+Session lineage while retiring stale
 Execution Fences; terminal cancellation requires a separate exact impact
 preview and human confirmation. The default budget bounds content revisions
 and output bytes, not elapsed wall time; an idle or paused Session has no hidden
@@ -206,9 +209,9 @@ that RM can read back at its locator; translations, paraphrases, and synthesis
 remain visibly classified inference or uncertainty unless a separate verifier
 can prove them. Rejection creates a materially changed successor
 within the same Writing Session until the frozen revision/resource budget is
-exhausted. A revoked authorization, stale cut, unverifiable receipt, timeout,
-or exhausted budget persists a typed run-local blocker without making the core
-Quest unavailable or starving another Writing Run.
+exhausted. A revoked authorization, malformed frozen value, unverifiable
+receipt, timeout, or exhausted budget persists a typed run-local blocker
+without making the core Quest unavailable or starving another Writing Run.
 
 The Web reads Writing only through the same consistent Public Projection. It
 keeps unadmitted intents recoverable, displays execution, RM deliverable, RG
@@ -229,30 +232,55 @@ The supported public host operations are exposed by the `meta-research`
 command. Research state is observed through the authenticated Snapshot and SSE
 interfaces; the Web client does not read persistence directly.
 
-## 2026-08-23 Bundle production delta
+## 2026-08-24 Bundle Target execution correction
 
-The Bundle behavior remains fixed to prototype commit
-`f2d3f3f0d77a6f50ab535d50d6d404a525c09757`. Production now turns the exact
-accepted FormalPlan GapSet into a reviewed TargetPlan, then lets Research Graph
-own stable Target identities, the dependency DAG, and the live frontier. The
-Bundle root Session schedules work, but its native child-agent tree is only
-Harness topology and never becomes the Target DAG.
+Bundle turns the accepted FormalPlan GapSet into a rolling set of Target
+candidates. Research Graph owns stable Target identity, specification,
+dependencies and frontier; the Bundle root Session owns rolling strategy. A
+Harness child tree remains internal execution topology and never becomes the
+Target dependency graph.
 
-Each ordinary micro-experiment Target reuses the independently fenced
-Experiment Run/Attempt lifecycle instead of introducing a second execution
-system. A TargetCommit forms only after the exact EvaluationAttempt has an
-accepted Formal Measurement and freezes implementation, definition/protocol,
-input bindings, checkpoints, MetricResult, receipts, logs, analysis, and result
-content. Negative, zero, and non-significant results remain realized facts;
-execution, permission, resource, currentness, or receipt failures remain typed
-blockers. A high-risk Target is not auto-executed under ordinary Quest authority.
+Each claimed Target has one current, independently recoverable root Agent
+Session. That Session exclusively owns the Target workspace and the complete
+local loop: implement or reuse code, self-check, train or evaluate, inspect the
+actual result, revise, and repeat. It may use focused child agents for advisory
+work, but only the root chooses changes, launches work, selects the terminal
+candidate, and freezes the handoff. The loop uses the Harness's native authorized
+tools directly and is not split into daemon-owned execution phases.
 
-Accepted TargetCommits are published into the future Plan Baseline Pool only
-through immutable RM content and an RG Evidence role whose provenance closes at
-that exact TargetCommit. Generic Evidence metadata cannot impersonate this
-lineage. With an empty GapSet, Advancement Engine records an exact Bundle skip
-without creating a Bundle Run or Target. With work present, StageCommit requires
-the current request/epoch, Bundle completion receipt, TargetGraph receipt, and
-the complete ordered set of TargetCommit receipts. The existing Lumen hierarchy
-is unchanged; its Bundle surface exposes these boundaries, partial success, and
-specific blockers at 390, 800, and 1440 pixel layouts.
+For Target work, the daemon is deliberately lightweight. It only claims and
+wakes root Sessions, enforces per-Target single-flight, delivers cancellation,
+reconciles lost acknowledgements or restart state, and forwards events. It does
+not implement code, run a scientific control loop, interpret stdout, choose a
+checkpoint, approve a revision, or decide a Metric. Bundle can continue other
+work or restart while a Target root Session advances independently.
+
+All generated code, checkpoints, logs, analyses, intermediate measurements and
+discarded attempts remain Target-local during iteration. The Target root Session
+may use them to guide the next change, subject to the frozen FormalPlan semantics,
+but neither Research Memory nor Research Graph accepts those generated facts
+mid-loop. The root first reconciles outstanding processes and writes one deeply
+immutable Frozen Target Handoff containing the selected implementation, exact
+inputs, environment, commands, result assets, provenance and audit history.
+
+Only after that freeze does Research Memory accept the selected immutable bytes.
+Research Graph then independently accepts the resulting roles, VariantRun,
+EvaluationAttempt, Formal Measurement, MetricResult and TargetCommit. A rejected
+handoff stays immutable; a recoverable rejection wakes the same Target root
+Session to produce a successor handoff rather than rewriting the prior one.
+Execution completion, frozen handoff, RM asset acceptance, RG measurement
+acceptance, TargetCommit acceptance and StageCommit remain separate facts.
+
+The authenticated Web may observe forwarded Target stdout, stderr and tool
+events. These live events are a best-effort execution projection, not Metric
+authority and not an Owner receipt. Formal Metric values come only from the
+selected result assets in a Frozen Target Handoff and become authoritative only
+after Research Graph validation.
+
+Bundle strategy remains rolling rather than an up-front complete graph. A sealed
+TargetGraph head and a count-complete set of accepted TargetCommits are required
+for the immutable BundleReport, but neither a running Session, forwarded event,
+workspace file nor handoff candidate can complete the Stage. Advancement Engine
+alone verifies the current request, BundleReport and Owner receipts before
+forming StageCommit. Negative, zero and non-significant accepted results remain
+realized facts for Reasoning; technical or semantic blockers remain explicit.

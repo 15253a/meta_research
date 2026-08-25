@@ -223,10 +223,16 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     review_argv, review_prompt, _review_schema = runner.calls[1]
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert review_argv[-3:] == ["resume", "codex-writing-primary:1", "-"]
-    assert primary_argv[primary_argv.index("--sandbox") + 1] == "workspace-write"
-    assert review_argv[review_argv.index("--sandbox") + 1] == "workspace-write"
+    assert 'web_search="disabled"' in primary_argv
+    assert 'web_search="disabled"' in review_argv
+    assert 'web_search="live"' not in primary_argv
+    assert 'web_search="live"' not in review_argv
+    assert "mcp_servers={}" in primary_argv
+    assert "mcp_servers={}" in review_argv
     assert 'shell_environment_policy.inherit="none"' in primary_argv
     assert "danger-full-access" not in primary_argv
+    assert "external-research-disabled" in request.runtime_binding.capability_bindings
+    assert "web-search-live" not in request.runtime_binding.capability_bindings
     assert "accepted_source_manifest=" in primary_prompt
     assert '"accepted_source_manifest":' in review_prompt
     assert 'fresh_context_mode":"fork_turns:none"' in review_prompt
@@ -240,6 +246,31 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
         / "writing-inputs"
         / request.snapshot["snapshot_hash"]
     )
+    permission_profile = next(
+        value
+        for value in primary_argv
+        if value.startswith("permissions.writing_snapshot=")
+    )
+    review_permission_profile = next(
+        value
+        for value in review_argv
+        if value.startswith("permissions.writing_snapshot=")
+    )
+    assert "--sandbox" not in primary_argv
+    assert "--sandbox" not in review_argv
+    assert 'default_permissions="writing_snapshot"' in primary_argv
+    assert 'default_permissions="writing_snapshot"' in review_argv
+    assert f'{json.dumps(str(source_root))}="read"' in permission_profile
+    assert f'{json.dumps(str(source_root))}="read"' in review_permission_profile
+    assert (
+        f'{json.dumps(str(tmp_path / "provider" / "research-workspace"))}="write"'
+        in permission_profile
+    )
+    assert (
+        f'{json.dumps(str(tmp_path / "provider" / "writing-inputs"))}="read"'
+        not in permission_profile
+    )
+    assert 'network={enabled=false}' in permission_profile
     manifest = json.loads((source_root / "manifest.json").read_text("utf-8"))
     assert manifest["snapshot_hash"] == request.snapshot["snapshot_hash"]
     assert manifest["sources"][0]["version_ref"] == "asset_version:source-1"
@@ -386,9 +417,10 @@ def test_writing_runtime_binding_seals_the_complete_provider_contract(
     binding = adapter.runtime_binding()
 
     binding.validate()
-    assert "filesystem-workspace-write" in binding.capability_bindings
+    assert "filesystem-read-root-confined" in binding.capability_bindings
     assert "environment-inheritance-none" in binding.capability_bindings
     assert "filesystem-danger-full-access" not in binding.capability_bindings
+    assert "filesystem-workspace-write" not in binding.capability_bindings
     assert any(
         item.startswith("adapter-source:meta_research.provider_supervisor@sha256:")
         for item in binding.resource_bindings

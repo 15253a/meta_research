@@ -10,8 +10,18 @@ import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
+from meta_research.bundle_protocol import BundleReport, projection_plain_value
 from meta_research.composition import build_production_runtime
-from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.common import (
+    AcceptanceReceipt,
+    AcceptedFormalPlanBinding,
+    OwnerConflict,
+    canonical_hash,
+)
+from meta_research.owners.research_graph import (
+    WritingExperimentTerminalCut,
+    WritingExperimentTerminalFactRef,
+)
 from meta_research.owners.research_memory import (
     AssetIntakeRequest,
     AssetIntakeResult,
@@ -276,6 +286,337 @@ def test_report_intent_freezes_snapshot_before_independent_run_admission(
         assert runtime.idea_stage.query_current() == stage_before
     finally:
         runtime.close()
+
+
+def test_report_intent_capture_ignores_continuous_target_observation_revisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime(tmp_path / "writing-capture-target-observation-noise")
+    observations_started = threading.Event()
+    observations_finished = threading.Event()
+    observation_thread: threading.Thread | None = None
+    try:
+        quest = _confirm_direct_quest(runtime)
+        source = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="accepted-before-writing-capture.txt",
+                media_type="text/plain; charset=utf-8",
+                content=b"accepted fact remains exact while target logs stream\n",
+            ),
+            idempotency_key="writing-capture-noise-source",
+        )
+        assert source.asset is not None
+        role = runtime.owners.research_graph.accept_asset_role(
+            binding=source.asset.as_binding(),
+            role="evidence",
+            quest_ref=quest["quest_ref"],
+            idempotency_key="writing-capture-noise-role",
+        )
+
+        base_runtime_snapshot = runtime.owners.agent_runtime.query_snapshot()
+        revision_lock = threading.Lock()
+        observed_revisions = 0
+
+        def observation_only_runtime_snapshot():
+            nonlocal observed_revisions
+            with revision_lock:
+                observed_revisions += 1
+                revision = base_runtime_snapshot.revision + observed_revisions
+            return replace(base_runtime_snapshot, revision=revision)
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "query_snapshot",
+            observation_only_runtime_snapshot,
+        )
+        query_quest = runtime.owners.research_graph.query_quest_by_ref
+
+        def query_quest_after_observation_burst(quest_ref: str):
+            observations_started.set()
+            assert observations_finished.wait(timeout=5)
+            return query_quest(quest_ref)
+
+        monkeypatch.setattr(
+            runtime.owners.research_graph,
+            "query_quest_by_ref",
+            query_quest_after_observation_burst,
+        )
+
+        def stream_target_observations() -> None:
+            assert observations_started.wait(timeout=5)
+            for _observation in range(12):
+                runtime.owners.agent_runtime.query_snapshot()
+            observations_finished.set()
+
+        observation_thread = threading.Thread(
+            target=stream_target_observations, daemon=True
+        )
+        observation_thread.start()
+
+        drafted = runtime.writing.create_report_intent(
+            quest_ref=quest["quest_ref"],
+            title="持续日志期间的冻结报告",
+            audience="研究负责人",
+            purpose="验证 Target stdout 不阻断 Writing Intent Snapshot 捕获",
+            instructions="冻结当前已接纳事实，不读取后续 Target observation。",
+            idempotency_key="writing-capture-noise-intent",
+        )
+
+        assert observed_revisions >= 12
+        assert drafted["snapshot"]["quest"]["draft_hash"] == quest[
+            "quest_draft"
+        ]["hash"]
+        assert drafted["snapshot"]["accepted_sources"] == [
+            {
+                "role": "evidence",
+                "role_ref": role.role_ref,
+                "version_ref": source.asset.version_ref,
+                "asset_ref": source.asset.asset_ref,
+                "content_hash": source.asset.content_hash,
+                "manifest_hash": source.asset.manifest_hash,
+                "display_name": source.asset.display_name,
+                "media_type": source.asset.media_type,
+                "asset_receipt": source.asset.receipt.as_public_dict(),
+                "role_receipt": role.receipt.as_public_dict(),
+            }
+        ]
+    finally:
+        observations_started.set()
+        observations_finished.set()
+        if observation_thread is not None:
+            observation_thread.join(timeout=5)
+        runtime.close()
+
+
+def test_report_intent_capture_ignores_unaccepted_experiment_admission_revisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime(tmp_path / "writing-capture-live-admission-noise")
+    try:
+        quest = _confirm_direct_quest(runtime)
+        base_graph_snapshot = runtime.owners.research_graph.query_snapshot()
+        observed_revisions = 0
+
+        def live_admission_graph_snapshot():
+            nonlocal observed_revisions
+            observed_revisions += 1
+            return replace(
+                base_graph_snapshot,
+                revision=base_graph_snapshot.revision + observed_revisions,
+            )
+
+        monkeypatch.setattr(
+            runtime.owners.research_graph,
+            "query_snapshot",
+            live_admission_graph_snapshot,
+        )
+
+        drafted = runtime.writing.create_report_intent(
+            quest_ref=quest["quest_ref"],
+            title="实时实验接纳期间的冻结报告",
+            audience="研究负责人",
+            purpose="验证未形成正式 measurement 的 admission 不属于 Writing cut",
+            instructions="仅冻结 RG 正式接受或拒绝的实验结论。",
+            idempotency_key="writing-capture-live-admission-intent",
+        )
+
+        assert observed_revisions >= 1
+        assert drafted["snapshot"]["quest_ref"] == quest["quest_ref"]
+        assert drafted["snapshot"]["advancement"]["experiments"] == []
+    finally:
+        runtime.close()
+
+
+def test_snapshot_capture_retries_an_accepted_stage_fact_that_changes_inside_cut(
+) -> None:
+    def receipt(kind: str, subject_ref: str) -> AcceptanceReceipt:
+        return AcceptanceReceipt(
+            issuer="test_owner",
+            kind=kind,
+            receipt_ref=f"receipt:{kind}:{subject_ref}",
+            subject_ref=subject_ref,
+            payload_hash=canonical_hash(
+                {"kind": kind, "subject_ref": subject_ref}
+            ),
+        )
+
+    quest_ref = "quest:accepted-fact-cut"
+    initialization_id = "initialization:accepted-fact-cut"
+    cycle_ref = "cycle:accepted-fact-cut"
+    request_ref = "idea-request:accepted-fact-cut"
+    run_ref = "idea-run:accepted-fact-cut"
+    outcome_ref = "idea-outcome:accepted-fact-cut"
+    quest = SimpleNamespace(
+        quest_ref=quest_ref,
+        initialization_id=initialization_id,
+        draft_revision=1,
+        draft_hash=canonical_hash({"quest": quest_ref}),
+        draft={"goal": "freeze one coherent accepted fact cut"},
+        receipt=receipt("quest_accepted", quest_ref),
+    )
+
+    class _ResearchGraph:
+        terminal_cut_calls = 0
+
+        def query_snapshot(self):
+            return SimpleNamespace(revision=7)
+
+        def query_quest_by_ref(self, candidate_ref: str):
+            return quest if candidate_ref == quest_ref else None
+
+        def query_question_tree(self, _quest_ref: str):
+            return ()
+
+        def query_asset_roles(self, *, quest_ref: str):
+            return ()
+
+        def query_idea_outcome_decision(self, submission_ref: str):
+            generation = submission_ref.rsplit(":", 1)[-1]
+            outcome_hash = canonical_hash({"accepted_generation": generation})
+            return SimpleNamespace(
+                decision="accepted",
+                outcome_ref=outcome_ref,
+                outcome_hash=outcome_hash,
+                receipt=receipt("idea_accepted", submission_ref),
+            )
+
+        def query_writing_experiment_terminal_cut(self, candidate_ref: str):
+            assert candidate_ref == quest_ref
+            self.terminal_cut_calls += 1
+            facts = (
+                ()
+                if self.terminal_cut_calls == 1
+                else (
+                    WritingExperimentTerminalFactRef(
+                        evaluation_attempt_ref="evaluation-attempt:later-terminal",
+                        formal_measurement_status="rejected",
+                        formal_rejection_code="formal_measurement_later_terminal",
+                    ),
+                )
+            )
+            return WritingExperimentTerminalCut(quest_ref=quest_ref, facts=facts)
+
+        def query_experiment_admission_refs(self, **_values):
+            raise AssertionError("Writing must not scan live Experiment admissions")
+
+        def query_experiment(self, evaluation_attempt_ref: str):
+            assert evaluation_attempt_ref == "evaluation-attempt:later-terminal"
+            return SimpleNamespace(
+                execution_request=SimpleNamespace(
+                    quest_ref=quest_ref,
+                    as_public_dict=lambda: {
+                        "execution_request_ref": "experiment-request:later-terminal",
+                        "quest_ref": quest_ref,
+                    },
+                ),
+                formal_measurement_status="rejected",
+                formal_rejection_code="formal_measurement_later_terminal",
+            )
+
+        def query_formal_metric_result(self, evaluation_attempt_ref: str):
+            assert evaluation_attempt_ref == "evaluation-attempt:later-terminal"
+            return None
+
+        def query_experiment_asset_roles(self, evaluation_attempt_ref: str):
+            assert evaluation_attempt_ref == "evaluation-attempt:later-terminal"
+            return ()
+
+    class _ResearchMemory:
+        def query_snapshot(self):
+            return SimpleNamespace(revision=11)
+
+        def query_idea_outcome_content(self, submission_ref: str):
+            generation = submission_ref.rsplit(":", 1)[-1]
+            outcome_hash = canonical_hash({"accepted_generation": generation})
+            return SimpleNamespace(
+                content_ref=f"idea-content:{generation}",
+                payload_hash=canonical_hash({"content": generation}),
+                outcome_hash=outcome_hash,
+                outcome={"accepted_generation": generation},
+                receipt=receipt("idea_content", submission_ref),
+            )
+
+    class _AdvancementEngine:
+        def query_snapshot(self):
+            return SimpleNamespace(revision=13)
+
+        def query_initial_cycle(self, candidate_initialization_id: str):
+            assert candidate_initialization_id == initialization_id
+            return SimpleNamespace(
+                cycle_ref=cycle_ref,
+                receipt=receipt("cycle_accepted", cycle_ref),
+            )
+
+        def query_idea_stage_request(self, candidate_cycle_ref: str):
+            assert candidate_cycle_ref == cycle_ref
+            return SimpleNamespace(request_ref=request_ref, epoch=1)
+
+        def query_idea_stage_commit(self, candidate_request_ref: str):
+            assert candidate_request_ref == request_ref
+            return SimpleNamespace(
+                commit_ref="idea-commit:accepted-fact-cut",
+                run_ref=run_ref,
+                outcome_ref=outcome_ref,
+                outcome_kind="idea_outcome",
+                disposition="completed",
+                receipt=receipt("stage_committed", outcome_ref),
+            )
+
+        def query_plan_stage_request(self, _cycle_ref: str):
+            return None
+
+        def query_bundle_stage_request(self, _cycle_ref: str):
+            return None
+
+    class _AgentRuntime:
+        stage_reads = 0
+
+        def query_idea_stage_run(self, candidate_request_ref: str):
+            assert candidate_request_ref == request_ref
+            self.stage_reads += 1
+            generation = "A" if self.stage_reads == 1 else "B"
+            return SimpleNamespace(
+                run_ref=run_ref,
+                execution=SimpleNamespace(
+                    submission_ref=f"idea-submission:{generation}"
+                ),
+            )
+
+    research_graph = _ResearchGraph()
+    reader = WritingResearchSnapshotReader(
+        research_graph,
+        _AdvancementEngine(),
+        _ResearchMemory(),
+        _AgentRuntime(),
+    )
+
+    snapshot = reader.capture(quest_ref)
+
+    accepted = snapshot["advancement"]["stages"]["idea"]["accepted"]
+    assert accepted["result"]["content_ref"] == "idea-content:B"
+    assert accepted["result"]["outcome"] == {"accepted_generation": "B"}
+    assert "idea-content:A" not in str(snapshot)
+    assert snapshot["advancement"]["experiments"] == []
+
+    next_snapshot = reader.capture(quest_ref)
+
+    assert next_snapshot["advancement"]["experiments"] == [
+        {
+            "evaluation_attempt_ref": "evaluation-attempt:later-terminal",
+            "execution_request": {
+                "execution_request_ref": "experiment-request:later-terminal",
+                "quest_ref": quest_ref,
+            },
+            "formal_measurement_status": "rejected",
+            "formal_rejection_code": "formal_measurement_later_terminal",
+            "formal_metric_result": None,
+            "asset_roles": [],
+        }
+    ]
+    assert research_graph.terminal_cut_calls == 2
+
 
 def test_writing_run_checkpoints_then_separates_execution_rm_rg_and_rendering(
     tmp_path: Path,
@@ -912,6 +1253,7 @@ def test_claim_inventory_does_not_exempt_an_assertive_heading() -> None:
 
 def test_rg_rejection_creates_successor_version_in_same_session_and_fences_old_attempt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _RevisionWritingSkill()
     runtime = _runtime(tmp_path / "writing-revision", provider)
@@ -1013,6 +1355,30 @@ def test_rg_rejection_creates_successor_version_in_same_session_and_fences_old_a
             == first_bytes
         )
 
+        late = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="accepted-after-writing-snapshot.txt",
+                media_type="text/plain; charset=utf-8",
+                content=b"accepted only after both frozen Writing versions\n",
+            ),
+            idempotency_key="writing-revision-late-source",
+        )
+        assert late.asset is not None
+        runtime.owners.research_graph.accept_asset_role(
+            binding=late.asset.as_binding(),
+            role="evidence",
+            quest_ref=quest["quest_ref"],
+            idempotency_key="writing-revision-late-evidence-role",
+        )
+        def forbid_live_capture(_quest_ref: str) -> None:
+            raise AssertionError("comparison_must_not_read_live_research")
+
+        monkeypatch.setattr(
+            runtime.writing._snapshot_reader, "capture", forbid_live_capture
+        )
+
         compared = runtime.writing.compare_report_versions(
             run_ref,
             left_version_ref=first_version_ref,
@@ -1029,7 +1395,13 @@ def test_rg_rejection_creates_successor_version_in_same_session_and_fences_old_a
         assert compared["citation"]["added_citation_refs"] == ["citation-2"]
         assert compared["citation"]["removed_citation_refs"] == ["citation-1"]
         assert compared["citation"]["changed_citations"] == []
-        assert compared["stale"] is False
+        assert compared["snapshot"] == {
+            "mode": "frozen",
+            "snapshot_ref": admitted["snapshot"]["snapshot_ref"],
+            "snapshot_hash": admitted["snapshot"]["snapshot_hash"],
+        }
+        assert "stale" not in compared
+        assert "current_snapshot_hash" not in compared
 
     finally:
         runtime.close()
@@ -1463,6 +1835,23 @@ def test_restart_reconciles_lost_provider_ack_without_duplicate_version(
     interrupted = runtime.owners.agent_runtime.query_writing_report(run_ref)
     assert interrupted is not None and interrupted.checkpoint is None
     first_request = provider.draft_requests[-1]
+    late = runtime.owners.research_memory.submit_asset_intake(
+        AssetIntakeRequest(
+            source_kind="text",
+            custody_mode="managed",
+            display_name="accepted-after-writing-provider-ack-loss.txt",
+            media_type="text/plain; charset=utf-8",
+            content=b"accepted after the sealed Writing provider request\n",
+        ),
+        idempotency_key="writing-lost-ack-late-source",
+    )
+    assert late.asset is not None
+    runtime.owners.research_graph.accept_asset_role(
+        binding=late.asset.as_binding(),
+        role="evidence",
+        quest_ref=quest["quest_ref"],
+        idempotency_key="writing-lost-ack-late-evidence-role",
+    )
     runtime.close()
 
     restarted = _runtime(root, provider)
@@ -1480,6 +1869,14 @@ def test_restart_reconciles_lost_provider_ack_without_duplicate_version(
         assert len(provider.draft_requests) == 2
         assert provider.draft_requests[-1].job_ref == first_request.job_ref
         assert provider.draft_requests[-1].revision == first_request.revision == 1
+        assert provider.draft_requests[-1].snapshot == first_request.snapshot
+        assert provider.draft_requests[-1].source_materials == (
+            first_request.source_materials
+        )
+        assert late.asset.version_ref not in {
+            material.version_ref
+            for material in provider.draft_requests[-1].source_materials
+        }
         assert len(
             restarted.owners.research_graph.query_writing_citation_history(run_ref)
         ) == 1
@@ -1487,22 +1884,23 @@ def test_restart_reconciles_lost_provider_ack_without_duplicate_version(
         restarted.close()
 
 
-def test_confirmation_fails_closed_when_frozen_research_snapshot_is_stale(
+def test_confirmation_keeps_frozen_snapshot_when_research_advances(
     tmp_path: Path,
 ) -> None:
-    runtime = _runtime(tmp_path / "writing-stale")
+    runtime = _runtime(tmp_path / "writing-frozen-while-research-advances")
     try:
         quest = _confirm_direct_quest(runtime)
         drafted = runtime.writing.create_report_intent(
             quest_ref=quest["quest_ref"],
-            title="过期 Snapshot 报告",
+            title="冻结 Snapshot 报告",
             audience="研究负责人",
-            purpose="验证过期保护",
-            instructions="不得静默换入新证据。",
-            idempotency_key="writing-stale-create",
+            purpose="验证写作与后续研究解耦",
+            instructions="只使用创建 Intent 时冻结的证据。",
+            idempotency_key="writing-frozen-create",
         )
+        frozen_snapshot = drafted["snapshot"]
         previewed = runtime.writing.preview_report_intent(
-            drafted["intent_id"], idempotency_key="writing-stale-preview"
+            drafted["intent_id"], idempotency_key="writing-frozen-preview"
         )
         source = runtime.owners.research_memory.submit_asset_intake(
             AssetIntakeRequest(
@@ -1511,36 +1909,41 @@ def test_confirmation_fails_closed_when_frozen_research_snapshot_is_stale(
                 display_name="late-evidence.txt",
                 content=b"late accepted evidence\n",
             ),
-            idempotency_key="writing-stale-source",
+            idempotency_key="writing-frozen-late-source",
         )
         assert source.asset is not None
         runtime.owners.research_graph.accept_asset_role(
             binding=source.asset.as_binding(),
             role="evidence",
             quest_ref=quest["quest_ref"],
-            idempotency_key="writing-stale-role",
+            idempotency_key="writing-frozen-late-role",
         )
         preview = previewed["impact_preview"]
-        with pytest.raises(OwnerConflict, match="writing_snapshot_stale"):
-            runtime.writing.confirm_report_intent(
-                drafted["intent_id"],
-                draft_revision=previewed["draft_revision"],
-                draft_hash=previewed["draft_hash"],
-                preview_ref=preview["preview_ref"],
-                preview_hash=preview["preview_hash"],
-                idempotency_key="writing-stale-confirm",
-            )
+        confirmed = runtime.writing.confirm_report_intent(
+            drafted["intent_id"],
+            draft_revision=previewed["draft_revision"],
+            draft_hash=previewed["draft_hash"],
+            preview_ref=preview["preview_ref"],
+            preview_hash=preview["preview_hash"],
+            idempotency_key="writing-frozen-confirm",
+        )
+
+        assert confirmed["snapshot"] == frozen_snapshot
+        assert source.asset.version_ref not in {
+            item["version_ref"]
+            for item in confirmed["snapshot"]["accepted_sources"]
+        }
         assert runtime.owners.agent_runtime.query_writing_report_by_intent(
             drafted["intent_id"]
-        ) is None
+        ) is not None
     finally:
         runtime.close()
 
 
-def test_confirmation_rechecks_concurrent_basis_mutation_before_writer_lock(
+def test_confirmation_keeps_frozen_snapshot_during_concurrent_research(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime = _runtime(tmp_path / "writing-confirm-currentness-race")
+    runtime = _runtime(tmp_path / "writing-confirm-frozen-race")
     basis_mutated = threading.Event()
     confirmation_thread: threading.Thread | None = None
     try:
@@ -1549,8 +1952,8 @@ def test_confirmation_rechecks_concurrent_basis_mutation_before_writer_lock(
             quest_ref=quest["quest_ref"],
             title="并发 Snapshot 报告",
             audience="研究负责人",
-            purpose="验证确认时序保护",
-            instructions="不得确认已经过期的研究 basis。",
+            purpose="验证确认与研究推进相互独立",
+            instructions="确认期间也只能使用已冻结的研究 basis。",
             idempotency_key="writing-race-create",
         )
         previewed = runtime.writing.preview_report_intent(
@@ -1559,22 +1962,22 @@ def test_confirmation_rechecks_concurrent_basis_mutation_before_writer_lock(
         preview = previewed["impact_preview"]
 
         ladder = runtime.owners.human_collaboration._collaboration_ladder
-        verifier = ladder._writing_snapshot_verifier
-        assert verifier is not None
+        validator = ladder._writing_snapshot_validator
+        assert validator is not None
         first_verification_finished = threading.Event()
         verification_calls = 0
         confirmation_outcome: list[object] = []
 
-        def coordinated_verifier(snapshot: dict[str, object]) -> None:
+        def coordinated_validator(snapshot: dict[str, object]) -> None:
             nonlocal verification_calls
             verification_calls += 1
-            verifier(snapshot)
+            validator(snapshot)
             if verification_calls == 1:
                 first_verification_finished.set()
                 assert basis_mutated.wait(timeout=5)
 
         monkeypatch.setattr(
-            ladder, "_writing_snapshot_verifier", coordinated_verifier
+            ladder, "_writing_snapshot_validator", coordinated_validator
         )
 
         def confirm() -> None:
@@ -1617,16 +2020,21 @@ def test_confirmation_rechecks_concurrent_basis_mutation_before_writer_lock(
         confirmation_thread.join(timeout=5)
         assert not confirmation_thread.is_alive()
         assert len(confirmation_outcome) == 1
-        error = confirmation_outcome[0]
-        assert isinstance(error, OwnerConflict)
-        assert error.code == "writing_snapshot_stale"
+        confirmed = confirmation_outcome[0]
+        assert isinstance(confirmed, dict)
         assert verification_calls == 2
-        assert runtime.owners.agent_runtime.query_writing_report_by_intent(
+        run = runtime.owners.agent_runtime.query_writing_report_by_intent(
             drafted["intent_id"]
-        ) is None
+        )
+        assert run is not None
         current = runtime.writing.query_report_intent(drafted["intent_id"])
-        assert current["status"] == "previewed"
-        assert current["confirmation_receipt"] is None
+        assert current["status"] == "running"
+        assert current["confirmation_receipt"] is not None
+        assert current["snapshot"] == drafted["snapshot"]
+        assert source.asset.version_ref not in {
+            item["version_ref"]
+            for item in current["snapshot"]["accepted_sources"]
+        }
     finally:
         basis_mutated.set()
         if confirmation_thread is not None:
@@ -1676,28 +2084,28 @@ def test_confirmation_ignores_unrelated_owner_revision_bookkeeping(
         runtime.close()
 
 
-def test_experiment_closure_pages_past_256_without_silent_snapshot_truncation() -> None:
-    admissions = [
-        (f"evaluation_attempt:{index:04d}", float(index + 1))
+def test_experiment_terminal_cut_past_256_has_no_silent_snapshot_truncation() -> None:
+    facts = tuple(
+        WritingExperimentTerminalFactRef(
+            evaluation_attempt_ref=f"evaluation_attempt:{index:04d}",
+            formal_measurement_status=("accepted" if index < 256 else "rejected"),
+            formal_rejection_code=(
+                None if index < 256 else "formal_measurement_out_of_scope"
+            ),
+        )
         for index in range(257)
-    ]
+    )
+    cut = WritingExperimentTerminalCut(
+        quest_ref="quest:exact-snapshot",
+        facts=facts,
+    )
 
     class _ResearchGraph:
-        def query_experiment_admission_refs(
-            self,
-            *,
-            after_created_at: float,
-            after_evaluation_attempt_ref: str,
-            limit: int,
-        ) -> tuple[tuple[str, float], ...]:
-            cursor = (after_created_at, after_evaluation_attempt_ref)
-            return tuple(
-                item
-                for item in admissions
-                if (item[1], item[0]) > cursor
-            )[:limit]
+        def query_experiment_admission_refs(self, **_values):
+            raise AssertionError("Writing must not scan live Experiment admissions")
 
         def query_experiment(self, evaluation_attempt_ref: str):
+            index = int(evaluation_attempt_ref.rsplit(":", 1)[-1])
             return SimpleNamespace(
                 execution_request=SimpleNamespace(
                     quest_ref="quest:exact-snapshot",
@@ -1706,8 +2114,32 @@ def test_experiment_closure_pages_past_256_without_silent_snapshot_truncation() 
                         "evaluation_attempt_ref": evaluation_attempt_ref,
                     },
                 ),
-                formal_measurement_status="not_attempted",
-                formal_rejection_code=None,
+                formal_measurement_status=(
+                    "accepted"
+                    if index < 256
+                    else "rejected"
+                ),
+                formal_rejection_code=(
+                    "formal_measurement_out_of_scope"
+                    if index >= 256
+                    else None
+                ),
+            )
+
+        def query_formal_metric_result(self, evaluation_attempt_ref: str):
+            if int(evaluation_attempt_ref.rsplit(":", 1)[-1]) >= 256:
+                return None
+            return SimpleNamespace(
+                evaluation_attempt_ref=evaluation_attempt_ref,
+                as_public_dict=lambda: {
+                    "metric_result_ref": f"metric:{evaluation_attempt_ref}",
+                    "evaluation_attempt_ref": evaluation_attempt_ref,
+                    "metrics": {"score": 1.0},
+                    "receipt": {
+                        "issuer": "research_graph",
+                        "subject_ref": evaluation_attempt_ref,
+                    },
+                }
             )
 
         def query_experiment_asset_roles(
@@ -1716,16 +2148,272 @@ def test_experiment_closure_pages_past_256_without_silent_snapshot_truncation() 
             del evaluation_attempt_ref
             return ()
 
+    def forbid_live_experiment_run(_evaluation_attempt_ref: str):
+        raise AssertionError(
+            "live Agent Runtime experiment state is not Writing input"
+        )
+
     reader = object.__new__(WritingResearchSnapshotReader)
     reader._research_graph = _ResearchGraph()
     reader._agent_runtime = SimpleNamespace(
-        query_experiment_run=lambda _evaluation_attempt_ref: None
+        query_experiment_run=forbid_live_experiment_run
     )
 
-    closure = reader._experiment_closure("quest:exact-snapshot")
+    closure = reader._experiment_closure(cut)
 
     assert len(closure) == 257
-    assert closure[-1]["evaluation_attempt_ref"] == admissions[-1][0]
+    assert closure[-1]["evaluation_attempt_ref"] == facts[256].evaluation_attempt_ref
+    assert closure[0]["formal_metric_result"] == {
+        "metric_result_ref": f"metric:{facts[0].evaluation_attempt_ref}",
+        "evaluation_attempt_ref": facts[0].evaluation_attempt_ref,
+        "metrics": {"score": 1.0},
+        "receipt": {
+            "issuer": "research_graph",
+            "subject_ref": facts[0].evaluation_attempt_ref,
+        },
+    }
+    assert closure[-1]["formal_measurement_status"] == "rejected"
+    assert closure[-1]["formal_rejection_code"] == (
+        "formal_measurement_out_of_scope"
+    )
+    assert closure[-1]["formal_metric_result"] is None
+    assert all("run" not in item for item in closure)
+
+
+def test_frozen_snapshot_captures_only_verified_accepted_bundle_facts(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "writing-bundle-snapshot")
+    try:
+        quest = _confirm_direct_quest(runtime)
+
+        def receipt(issuer: str, kind: str, subject_ref: str) -> AcceptanceReceipt:
+            return AcceptanceReceipt(
+                issuer=issuer,
+                kind=kind,
+                receipt_ref=f"receipt:{kind}:{subject_ref}",
+                subject_ref=subject_ref,
+                payload_hash=canonical_hash(
+                    {"issuer": issuer, "kind": kind, "subject_ref": subject_ref}
+                ),
+            )
+
+        cycle_ref = "cycle:bundle-writing-snapshot"
+        request_ref = "bundle-request:writing-snapshot"
+        run_ref = "bundle-run:writing-snapshot"
+        attempt_ref = "bundle-attempt:writing-snapshot"
+        report_ref = "bundle-report:writing-snapshot"
+        plan_ref = "formal-plan:writing-snapshot"
+        plan_hash = canonical_hash({"formal_plan_ref": plan_ref})
+        request_receipt = receipt("Advancement Engine", "stage_run_requested", request_ref)
+        plan_content_receipt = receipt("Research Memory", "plan_content", plan_ref)
+        plan_acceptance_receipt = receipt("Research Graph", "plan_accepted", plan_ref)
+        plan_commit_receipt = receipt("Advancement Engine", "stage_committed", plan_ref)
+        accepted_plan = AcceptedFormalPlanBinding(
+            formal_plan_ref=plan_ref,
+            content_ref="plan-content:writing-snapshot",
+            plan_document_hash=plan_hash,
+            answer_contract_hash=canonical_hash({"answer": plan_ref}),
+            content_receipt=plan_content_receipt,
+            formal_plan_receipt=plan_acceptance_receipt,
+            stage_commit_ref="plan-commit:writing-snapshot",
+            stage_commit_receipt=plan_commit_receipt,
+            plan_document={
+                "bundle_disposition": "experiments_required",
+                "gap_set": [{"gap_ref": "gap:writing-snapshot"}],
+            },
+        )
+        request = SimpleNamespace(
+            request_ref=request_ref,
+            cycle_ref=cycle_ref,
+            stage="bundle",
+            epoch=1,
+            accepted_formal_plan=accepted_plan,
+            receipt=request_receipt,
+        )
+        report_document = BundleReport(
+            disposition="realized",
+            stage_request_ref=request_ref,
+            formal_plan_ref=plan_ref,
+            accepted_target_commit_refs=("target-commit:writing-snapshot",),
+            accepted_evaluation_attempt_refs=("evaluation:writing-snapshot",),
+            metric_result_refs=("metric:writing-snapshot",),
+            execution_attempt_refs=("execution:writing-snapshot",),
+            execution_fence_refs=("fence:target-writing-snapshot",),
+            checkpoint_artifact_refs=("checkpoint:writing-snapshot",),
+            realized_experiment_keys=("experiment:writing-snapshot",),
+            remaining_experiment_keys=(),
+        )
+        report_receipt = receipt("Agent Runtime", "bundle_report_accepted", report_ref)
+        verified_report = SimpleNamespace(
+            report_ref=report_ref,
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref="bundle-fence:writing-snapshot",
+            formal_plan_ref=plan_ref,
+            plan_document_hash=plan_hash,
+            formal_plan_content_receipt=plan_content_receipt,
+            formal_plan_projection_digest=canonical_hash({"projection": plan_ref}),
+            formal_plan_projection_receipt=receipt(
+                "Research Graph", "formal_plan_projection", plan_ref
+            ),
+            completion_contract_hash=canonical_hash({"completion": request_ref}),
+            formal_plan_briefs_hash=canonical_hash({"briefs": request_ref}),
+            target_graph_ref="target-graph:writing-snapshot",
+            target_graph_generation=3,
+            target_set_hash=canonical_hash({"targets": ["target:writing-snapshot"]}),
+            coverage_hash=canonical_hash({"covered": ["gap:writing-snapshot"]}),
+            target_graph_receipt=receipt(
+                "Research Graph", "target_graph_accepted", request_ref
+            ),
+            target_refs=("target:writing-snapshot",),
+            notice_refs=("notice:writing-snapshot",),
+            handoff_manifest_refs=("handoff:writing-snapshot",),
+            accepted_measurement_closures=(),
+            target_commit_receipts=(
+                receipt(
+                    "Research Graph",
+                    "target_commit_accepted",
+                    "target-commit:writing-snapshot",
+                ),
+            ),
+            report=report_document,
+            report_hash=canonical_hash(projection_plain_value(report_document)),
+            receipt=report_receipt,
+        )
+        completion_receipt = receipt("Agent Runtime", "run_completed", run_ref)
+        completion = SimpleNamespace(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            outcome_ref=report_ref,
+            decision_receipt=report_receipt,
+            receipt=completion_receipt,
+        )
+        stage_run = SimpleNamespace(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            cycle_ref=cycle_ref,
+            stage="bundle",
+            epoch=1,
+            status="live-worker-status-must-not-leak",
+            inbox_cursor="live-worker-cursor-must-not-leak",
+            completion=completion,
+        )
+        commit = SimpleNamespace(
+            commit_ref="bundle-commit:writing-snapshot",
+            request_ref=request_ref,
+            cycle_ref=cycle_ref,
+            stage="bundle",
+            epoch=1,
+            run_ref=run_ref,
+            outcome_ref=report_ref,
+            outcome_kind="bundle_report",
+            disposition="completed",
+            run_completion_receipt=completion_receipt,
+            outcome_receipt=report_receipt,
+            basis_kind=None,
+            basis_ref=None,
+            basis_receipt=None,
+            receipt=receipt(
+                "Advancement Engine", "stage_committed", report_ref
+            ),
+            closure={
+                "schema_ref": "meta-research/bundle-stage-report-closure/v1",
+                "report_ref": report_ref,
+                "target_commit_refs": ["target-commit:writing-snapshot"],
+            },
+        )
+
+        class _AdvancementEngine:
+            def query_snapshot(self):
+                return SimpleNamespace(revision=11)
+
+            def query_initial_cycle(self, _initialization_id: str):
+                return SimpleNamespace(
+                    cycle_ref=cycle_ref,
+                    receipt=receipt(
+                        "Advancement Engine", "cycle_activated", cycle_ref
+                    ),
+                )
+
+            def query_idea_stage_request(self, _cycle_ref: str):
+                return None
+
+            def query_plan_stage_request(self, _cycle_ref: str):
+                return None
+
+            def query_bundle_stage_request(self, _cycle_ref: str):
+                return request
+
+            def query_bundle_stage_commit(self, _request_ref: str):
+                return commit
+
+            def query_bundle_report_disposition(self, _report_ref: str):
+                return None
+
+        class _AgentRuntime:
+            verify_calls: list[dict[str, object]] = []
+
+            def query_snapshot(self):
+                return SimpleNamespace(revision=17)
+
+            def query_bundle_stage_run(self, _request_ref: str):
+                return stage_run
+
+            def query_bundle_run_report(self, _run_ref: str):
+                return verified_report
+
+            def verify_bundle_report_receipt(self, **values):
+                self.verify_calls.append(values)
+                return verified_report
+
+            def query_experiment_run(self, _evaluation_attempt_ref: str):
+                return None
+
+        fake_runtime = _AgentRuntime()
+        reader = WritingResearchSnapshotReader(
+            runtime.owners.research_graph,
+            _AdvancementEngine(),
+            runtime.owners.research_memory,
+            fake_runtime,
+        )
+
+        frozen = reader.capture(quest["quest_ref"])
+
+        bundle = frozen["advancement"]["stages"]["bundle"]
+        assert bundle["status"] == "accepted"
+        assert bundle["accepted"]["request"] == {
+            "request_ref": request_ref,
+            "cycle_ref": cycle_ref,
+            "epoch": 1,
+            "accepted_formal_plan": accepted_plan.as_dict(),
+            "receipt": request_receipt.as_public_dict(),
+        }
+        assert bundle["accepted"]["report"]["report_ref"] == report_ref
+        assert bundle["accepted"]["report"]["report"] == projection_plain_value(
+            report_document
+        )
+        assert bundle["accepted"]["run_completion"]["receipt"] == (
+            completion_receipt.as_public_dict()
+        )
+        assert bundle["accepted"]["commit"]["commit_ref"] == commit.commit_ref
+        assert bundle["accepted"]["commit"]["closure_hash"] == canonical_hash(
+            commit.closure
+        )
+        assert fake_runtime.verify_calls == [
+            {"report_ref": report_ref, "receipt": report_receipt},
+            {"report_ref": report_ref, "receipt": report_receipt},
+        ]
+        assert frozen["advancement"]["stages"]["reasoning"] == {
+            "status": "not_accepted",
+            "accepted": None,
+        }
+        assert "live-worker-status-must-not-leak" not in str(bundle)
+        assert "live-worker-cursor-must-not-leak" not in str(bundle)
+    finally:
+        runtime.close()
 
 
 def test_same_asset_version_can_fill_two_snapshot_roles_without_duplicate_staging(

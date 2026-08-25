@@ -66,6 +66,201 @@ def _downgrade_to_revision(database: Path, revision: str) -> None:
         engine.dispose()
 
 
+def test_0021_source_only_bundle_report_upgrades_but_cannot_advance(
+    tmp_path: Path,
+) -> None:
+    """0021 history survives 0022 without inventing the projection receipt."""
+
+    from meta_research.owners.common import AcceptanceReceipt
+    from test_public_bundle_stage import (
+        _bundle_runtime,
+        _prepare_bundle_request,
+    )
+
+    data_root = prepare_data_root(tmp_path / "source-only-bundle-report")
+    _upgrade_to_revision(data_root.database, "0021_bundle_report_closure")
+    empty_refs_json = canonical_json([])
+    empty_refs_hash = canonical_hash([])
+    legacy_report_json = canonical_json({})
+    legacy_report_hash = canonical_hash({})
+    source_receipt_hash = canonical_hash({"legacy": "source-receipt"})
+    graph_receipt_hash = canonical_hash({"legacy": "graph-receipt"})
+    report_receipt_hash = canonical_hash({"legacy": "report-receipt"})
+    with sqlite3.connect(data_root.database) as connection:
+        # Foreign-key enforcement is intentionally disabled on the migration
+        # connection.  This fixture freezes the report row itself; after the
+        # upgrade it is rebound to a real current Bundle Run before exercising
+        # the public Owner APIs below.
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "INSERT INTO ar_bundle_reports ("
+            "report_ref, run_ref, ordinal, request_ref, attempt_ref, fence_ref, "
+            "formal_plan_ref, plan_document_hash, "
+            "formal_plan_content_receipt_ref, "
+            "formal_plan_content_receipt_hash, target_graph_ref, "
+            "target_graph_generation, target_set_hash, coverage_hash, "
+            "target_graph_receipt_ref, target_graph_receipt_hash, "
+            "target_refs_json, target_refs_hash, notice_refs_json, "
+            "notice_refs_hash, handoff_manifest_refs_json, "
+            "handoff_manifest_refs_hash, target_commit_receipts_json, "
+            "target_commit_receipts_hash, report_json, report_hash, "
+            "disposition, idempotency_key, request_hash, receipt_ref, "
+            "receipt_hash, accepted_at) VALUES ("
+            ":report_ref, :run_ref, 1, :request_ref, :attempt_ref, :fence_ref, "
+            ":formal_plan_ref, :plan_document_hash, :source_receipt_ref, "
+            ":source_receipt_hash, :target_graph_ref, 0, :target_set_hash, "
+            ":coverage_hash, :graph_receipt_ref, :graph_receipt_hash, "
+            ":empty_refs_json, :empty_refs_hash, :empty_refs_json, "
+            ":empty_refs_hash, :empty_refs_json, :empty_refs_hash, "
+            ":empty_refs_json, :empty_refs_hash, :report_json, :report_hash, "
+            "'realized', :idempotency_key, :request_hash, :receipt_ref, "
+            ":receipt_hash, 21.0)",
+            {
+                "report_ref": "bundle_report_source_only_0021",
+                "run_ref": "bundle_run_source_only_0021",
+                "request_ref": "bundle_request_source_only_0021",
+                "attempt_ref": "bundle_attempt_source_only_0021",
+                "fence_ref": "bundle_fence_source_only_0021",
+                "formal_plan_ref": "formal_plan_source_only_0021",
+                "plan_document_hash": canonical_hash(
+                    {"legacy": "plan-document"}
+                ),
+                "source_receipt_ref": "formal_plan_source_receipt_0021",
+                "source_receipt_hash": source_receipt_hash,
+                "target_graph_ref": "target_graph_source_only_0021",
+                "target_set_hash": canonical_hash({"legacy": "target-set"}),
+                "coverage_hash": canonical_hash({"legacy": "coverage"}),
+                "graph_receipt_ref": "target_graph_receipt_0021",
+                "graph_receipt_hash": graph_receipt_hash,
+                "empty_refs_json": empty_refs_json,
+                "empty_refs_hash": empty_refs_hash,
+                "report_json": legacy_report_json,
+                "report_hash": legacy_report_hash,
+                "idempotency_key": "legacy-source-only-report-0021",
+                "request_hash": canonical_hash({"legacy": "request"}),
+                "receipt_ref": "bundle_report_receipt_source_only_0021",
+                "receipt_hash": report_receipt_hash,
+            },
+        )
+        connection.commit()
+
+    _upgrade_to_revision(data_root.database, "0022_target_run_runtime")
+    with sqlite3.connect(data_root.database) as connection:
+        migrated = connection.execute(
+            "SELECT formal_plan_projection_digest, "
+            "formal_plan_projection_receipt_ref, "
+            "formal_plan_projection_receipt_hash, completion_contract_hash, "
+            "formal_plan_briefs_hash FROM ar_bundle_reports WHERE "
+            "report_ref = 'bundle_report_source_only_0021'"
+        ).fetchone()
+    assert migrated == (None, None, None, None, None)
+
+    # Also prove the same database can continue through later independent
+    # migrations before a production runtime opens it.
+    upgrade_database(data_root.database)
+    runtime = _bundle_runtime(data_root.root)
+    try:
+        _prepare_bundle_request(runtime)
+        assert runtime.bundle_stage.process_once()
+        current = runtime.bundle_stage.query_current()
+        request_value = current["stage_run_request"]
+        assert isinstance(request_value, dict)
+        request = runtime.owners.advancement_engine.query_bundle_stage_request(
+            request_value["cycle_ref"]
+        )
+        assert request is not None
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(
+            request.request_ref
+        )
+        assert run is not None
+        with sqlite3.connect(data_root.database) as connection:
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                "UPDATE ar_bundle_reports SET run_ref = ?, request_ref = ?, "
+                "attempt_ref = ?, fence_ref = ? WHERE report_ref = "
+                "'bundle_report_source_only_0021'",
+                (
+                    run.run_ref,
+                    request.request_ref,
+                    run.attempt_ref,
+                    run.fence_ref,
+                ),
+            )
+            before = connection.execute(
+                "SELECT completed_run_count FROM agent_runtime_state WHERE "
+                "singleton = 'owner'"
+            ).fetchone()
+            commit_count_before = connection.execute(
+                "SELECT count(*) FROM ae_stage_commits"
+            ).fetchone()
+            connection.commit()
+        assert before is not None and commit_count_before is not None
+
+        legacy_receipt = AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind="bundle_report_accepted",
+            receipt_ref="bundle_report_receipt_source_only_0021",
+            subject_ref="bundle_report_source_only_0021",
+            payload_hash=report_receipt_hash,
+        )
+        with pytest.raises(
+            OwnerConflict,
+            match="bundle_report_formal_plan_projection_required",
+        ):
+            runtime.owners.agent_runtime.query_bundle_report(
+                "bundle_report_source_only_0021"
+            )
+        with pytest.raises(
+            OwnerConflict,
+            match="bundle_report_formal_plan_projection_required",
+        ):
+            runtime.owners.agent_runtime.complete_bundle_run(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                report_ref="bundle_report_source_only_0021",
+                decision_receipt=legacy_receipt,
+                idempotency_key="reject-source-only-report-completion",
+            )
+        with pytest.raises(
+            OwnerConflict,
+            match="bundle_report_formal_plan_projection_required",
+        ):
+            runtime.owners.advancement_engine.commit_bundle_stage(
+                request_ref=request.request_ref,
+                run_ref=run.run_ref,
+                bundle_report_ref="bundle_report_source_only_0021",
+                run_completion_receipt=AcceptanceReceipt(
+                    issuer="agent_runtime",
+                    kind="stage_run_completed",
+                    receipt_ref="unreachable-completion-receipt",
+                    subject_ref=run.run_ref,
+                    payload_hash="0" * 64,
+                ),
+                bundle_report_receipt=legacy_receipt,
+                idempotency_key="reject-source-only-report-stage-commit",
+            )
+
+        with sqlite3.connect(data_root.database) as connection:
+            completed_after = connection.execute(
+                "SELECT completed_run_count FROM agent_runtime_state WHERE "
+                "singleton = 'owner'"
+            ).fetchone()
+            commit_count_after = connection.execute(
+                "SELECT count(*) FROM ae_stage_commits"
+            ).fetchone()
+        assert completed_after == before
+        assert commit_count_after == commit_count_before
+        assert runtime.owners.agent_runtime.query_bundle_run_completion(
+            run.run_ref
+        ) is None
+        assert runtime.owners.advancement_engine.query_bundle_stage_commit(
+            request.request_ref
+        ) is None
+    finally:
+        runtime.close()
+
+
 def _insert_completed_0008_quest(
     connection: sqlite3.Connection,
 ) -> dict[str, str]:
@@ -707,7 +902,7 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert version == ("0016_semantic_mcp_harness",)
+    assert version == ("0029_target_root_lifecycle",)
     assert "formal_content_count" in columns
     assert "hc_quest_initializations" in tables
     assert "hc_proposal_generation_attempts" in tables
@@ -772,7 +967,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0016_semantic_mcp_harness",)
+        ).fetchone() == ("0029_target_root_lifecycle",)
 
 
 def test_process_exit_mid_0003_ddl_recovers_on_the_next_upgrade(
@@ -830,7 +1025,7 @@ upgrade_database(Path(sys.argv[1]))
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0016_semantic_mcp_harness",)
+        ).fetchone() == ("0029_target_root_lifecycle",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -952,7 +1147,7 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 ("d" * 64,),
             )
 
-    assert version == ("0016_semantic_mcp_harness",)
+    assert version == ("0029_target_root_lifecycle",)
     assert feed == ("legacy.event", '{"kept":true}', 17.0)
     assert auth == ("a" * 64, "b" * 64, 18.0, 1800.0, None)
     assert initialization == (
@@ -1042,7 +1237,7 @@ def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0016_semantic_mcp_harness",)
+        ).fetchone() == ("0029_target_root_lifecycle",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -1097,7 +1292,7 @@ def test_interrupted_0005_rolls_back_and_converges_on_retry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0016_semantic_mcp_harness",)
+        ).fetchone() == ("0029_target_root_lifecycle",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -1173,7 +1368,7 @@ def test_0005_backfills_existing_rm_contents_without_changing_identity_or_receip
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0016_semantic_mcp_harness",)
+        ).fetchone() == ("0029_target_root_lifecycle",)
         original_formal = connection.execute(
             "SELECT content_ref, content_hash, object_path, receipt_ref, "
             "receipt_hash FROM rm_formal_question_contents"
@@ -1367,7 +1562,7 @@ def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0016_semantic_mcp_harness",)
+        ).fetchone() == ("0029_target_root_lifecycle",)
         assert connection.execute(
             "SELECT object_path, content_hash, byte_count FROM rm_managed_objects"
         ).fetchone() == (object_path, digest, len(payload))
@@ -1703,7 +1898,7 @@ def test_interrupted_0007_rolls_back_typed_runs_and_snapshot_bindings(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0016_semantic_mcp_harness",)
+        ).fetchone() == ("0029_target_root_lifecycle",)
         tables = {
             row[0]
             for row in connection.execute(
@@ -1818,7 +2013,7 @@ def test_interrupted_0008_rolls_back_acquisition_sessions_and_converges(
         }
         foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
-    assert version == ("0016_semantic_mcp_harness",)
+    assert version == ("0029_target_root_lifecycle",)
     assert {
         "ar_acquisition_sessions",
         "ar_acquisition_requests",
@@ -2240,7 +2435,7 @@ def test_interrupted_0009_rolls_back_whole_revision_and_converges(
         foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA quick_check").fetchone()
 
-    assert version == ("0016_semantic_mcp_harness",)
+    assert version == ("0029_target_root_lifecycle",)
     assert {
         "owner_human_requests",
         "hc_command_previews",
@@ -2505,7 +2700,7 @@ def test_interrupted_0009_restores_literature_identity_and_converges(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0016_semantic_mcp_harness",)
+        ).fetchone() == ("0029_target_root_lifecycle",)
         backfilled = connection.execute(
             "SELECT creation_context_kind, creation_context_ref, quest_ref "
             "FROM rm_literature_snapshots WHERE snapshot_ref = 'snapshot_before_0009'"

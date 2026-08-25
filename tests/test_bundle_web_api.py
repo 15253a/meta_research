@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from meta_research.bundle_skill import CodexBundleSkillAdapter
 from meta_research.composition import build_production_runtime
 from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
-from meta_research.web import create_app
+from meta_research.web import ReconciliationHealth, _process_bundle_stage, create_app
 
 
 def _authenticated_client(runtime) -> tuple[TestClient, dict[str, str]]:
@@ -110,7 +113,13 @@ def test_bundle_provider_failure_is_visible_without_hiding_partial_truth(
                     break
                 time.sleep(0.02)
 
+            # A Stage provider failure remains visible without turning the
+            # independently healthy Target root lifecycle into a false gate.
             assert snapshot["readiness"]["status"] == "ready"
+            assert checks["target_root_lifecycle"] == {
+                "name": "target_root_lifecycle",
+                "status": "ready",
+            }
             assert checks["bundle_stage_worker"] == {
                 "name": "bundle_stage_worker",
                 "status": "unavailable",
@@ -122,12 +131,65 @@ def test_bundle_provider_failure_is_visible_without_hiding_partial_truth(
                 headers={"X-Meta-Research-Control": "control-secret"},
             ).json()
             assert readiness["status"] == "ready"
+            assert readiness["target_root"] == checks["target_root_lifecycle"]
             assert readiness["bundle_stage"] == {
                 "status": "unavailable",
                 "last_error": "bundle_skill_capability_unavailable",
             }
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("pending_code", "expected_status"),
+    (
+        ("target_launch_pending", "ready"),
+        ("target_root_running", "ready"),
+        ("target_high_risk_authorization_required", "ready"),
+        ("bundle_unknown_integrity_error", "unavailable"),
+    ),
+)
+def test_bundle_worker_health_distinguishes_waits_from_unknown_failures(
+    pending_code: str,
+    expected_status: str,
+) -> None:
+    stage = SimpleNamespace(transient_error=None)
+
+    def process_once() -> bool:
+        stage.transient_error = pending_code
+        return False
+
+    stage.process_once = process_once
+    runtime = SimpleNamespace(bundle_stage=stage)
+    health = (
+        ReconciliationHealth(
+            status="unavailable",
+            last_error="previous_transport_failure",
+            retry_count=2,
+        )
+        if expected_status == "ready"
+        else ReconciliationHealth()
+    )
+
+    async def exercise() -> None:
+        health_changed = asyncio.Event()
+        task = asyncio.create_task(
+            _process_bundle_stage(runtime, health, health_changed.set)
+        )
+        try:
+            await asyncio.wait_for(health_changed.wait(), timeout=0.5)
+            assert health.status == expected_status
+            assert health.last_error == (
+                None if expected_status == "ready" else pending_code
+            )
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(exercise())
 
 
 def test_bundle_provider_participates_in_runtime_shutdown(tmp_path: Path) -> None:

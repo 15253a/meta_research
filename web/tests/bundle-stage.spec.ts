@@ -84,7 +84,6 @@ const PARTIAL_BUNDLE = {
       {
         target_ref: "target-007-a",
         target_key: "gap-structure",
-        target_type: "micro_experiment",
         spec_hash: "d".repeat(64),
         dependency_refs: [],
         target_run_ref: "target-run-007-a",
@@ -94,7 +93,6 @@ const PARTIAL_BUNDLE = {
       {
         target_ref: "target-007-b",
         target_key: "gap-transfer",
-        target_type: "micro_experiment",
         spec_hash: "e".repeat(64),
         dependency_refs: ["target-007-a"],
         target_run_ref: "target-run-007-b",
@@ -234,4 +232,224 @@ test("Bundle keeps partial TargetCommit truth and blockers visible", async ({
       })),
     ).toEqual({ pageWidth: viewport.width, viewportWidth: viewport.width });
   }
+});
+
+test("an open Target terminal pages redacted root output through the one Projection stream", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    class ProjectionEventSource {
+      static instances: ProjectionEventSource[] = [];
+      readonly url: string;
+      closed = false;
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      private readonly listeners = new Map<
+        string,
+        Array<(event: Event) => void>
+      >();
+
+      constructor(url: string | URL) {
+        this.url = String(url);
+        ProjectionEventSource.instances.push(this);
+        queueMicrotask(() => {
+          if (!this.closed) this.onopen?.(new Event("open"));
+        });
+      }
+
+      addEventListener(type: string, listener: (event: Event) => void) {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      close() {
+        this.closed = true;
+      }
+
+      emit(type: string, payload: object, lastEventId = "") {
+        const event = new MessageEvent(type, {
+          data: JSON.stringify(payload),
+          lastEventId,
+        });
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    Object.defineProperty(window, "EventSource", {
+      configurable: true,
+      value: ProjectionEventSource,
+    });
+    const testingWindow = window as typeof window & {
+      __emitProjectionEvent: (type: string, payload: object) => void;
+      __activeProjectionStreamCount: () => number;
+    };
+    testingWindow.__emitProjectionEvent = (type, payload) => {
+      let stream: ProjectionEventSource | undefined;
+      for (let index = ProjectionEventSource.instances.length - 1; index >= 0; index -= 1) {
+        const candidate = ProjectionEventSource.instances[index];
+        if (!candidate.closed) {
+          stream = candidate;
+          break;
+        }
+      }
+      if (!stream) throw new Error("Projection EventSource is not connected");
+      stream.emit(type, payload);
+    };
+    testingWindow.__activeProjectionStreamCount = () =>
+      ProjectionEventSource.instances.filter((candidate) => !candidate.closed).length;
+  });
+
+  type RootObservationRequest = { targetRef: string; after: string | null };
+  const requests: RootObservationRequest[] = [];
+  let streamA = "target-root-stream-a";
+  let recoveredA = false;
+  await page.route("**/api/v1/bundle/targets/*/root-observations?*", async (route) => {
+    const url = new URL(route.request().url());
+    const match = url.pathname.match(/\/targets\/([^/]+)\/root-observations$/);
+    const targetRef = decodeURIComponent(match?.[1] ?? "");
+    const after = url.searchParams.get("after");
+    requests.push({ targetRef, after });
+    expect(url.searchParams.get("limit")).toBe("128");
+
+    const targetA = targetRef === "target-007-a";
+    const suffix = targetA ? "a" : "b";
+    const cursor = recoveredA && targetA
+      ? "cursor-a-recovered"
+      : after
+        ? `cursor-${suffix}-2`
+        : `cursor-${suffix}-1`;
+    const text = recoveredA && targetA
+      ? "recovered root output"
+      : after
+        ? `live ${suffix} output`
+        : `initial ${suffix} output · token=[REDACTED]`;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        target_ref: targetRef,
+        target_run_ref: `target-run-007-${suffix}`,
+        attempt_ref: recoveredA && targetA
+          ? "attempt-a-recovered"
+          : `attempt-${suffix}`,
+        attempt_generation: recoveredA && targetA ? 2 : 1,
+        root_session_ref: recoveredA && targetA
+          ? "root-a-recovered"
+          : `root-${suffix}`,
+        native_session_ref: `native-${suffix}`,
+        fence_ref: `fence-${suffix}`,
+        stream_ref: targetA ? streamA : "target-root-stream-b",
+        status: "live",
+        items: [{
+          event_ref: `event-${cursor}`,
+          cursor,
+          operation_ref: `operation-${suffix}`,
+          operation_generation: recoveredA && targetA ? 2 : 1,
+          sequence: after ? 2 : 1,
+          kind: after ? "output_gap" : "command_output",
+          stream: "stdout",
+          text,
+          recorded_at: 1_787_520_000,
+          redacted: true,
+          truncated: Boolean(after),
+          dropped_bytes: after ? 65_536 : 0,
+          dropped_events: after ? 64 : 0,
+        }],
+        next_cursor: cursor,
+        head_cursor: cursor,
+        has_more: false,
+        observation_only: true,
+      }),
+    });
+  });
+
+  await page.setViewportSize({ width: 800, height: 900 });
+  await freezeBundleProjection(page);
+  await expect.poll(() => page.evaluate(() => (
+    window as typeof window & { __activeProjectionStreamCount: () => number }
+  ).__activeProjectionStreamCount())).toBe(1);
+
+  const targetList = page.getByTestId("bundle-target-list");
+  const targetA = targetList.locator('[data-target-ref="target-007-a"]');
+  const targetB = targetList.locator('[data-target-ref="target-007-b"]');
+  await targetA.getByRole("button", { name: "查看根 Session" }).click();
+  const terminal = targetA.getByRole("region", { name: /gap-structure 根 Session 输出/ });
+  await expect(terminal).toContainText("initial a output · token=[REDACTED]");
+  await expect(terminal).toContainText("仅观察");
+  await expect.poll(() => requests.filter(
+    (request) => request.targetRef === "target-007-a",
+  )).toEqual([{ targetRef: "target-007-a", after: null }]);
+
+  await page.evaluate(() => {
+    const testingWindow = window as typeof window & {
+      __emitProjectionEvent: (type: string, payload: object) => void;
+    };
+    testingWindow.__emitProjectionEvent(
+      "agent_runtime.target_root_observations_available",
+      {
+        target_ref: "target-007-a",
+        target_run_ref: "target-run-007-a",
+        stream_ref: "target-root-stream-a",
+        head_cursor: "cursor-a-2",
+      },
+    );
+    testingWindow.__emitProjectionEvent(
+      "agent_runtime.target_root_observations_available",
+      {
+        target_ref: "target-007-b",
+        target_run_ref: "target-run-007-b",
+        stream_ref: "target-root-stream-b",
+        head_cursor: "cursor-b-2",
+      },
+    );
+  });
+  await expect(terminal).toContainText("live a output");
+  await expect(terminal).toContainText("OUTPUT GAP · 65536 bytes / 64 events");
+  await expect.poll(() => requests.filter(
+    (request) => request.targetRef === "target-007-a",
+  )).toEqual([
+    { targetRef: "target-007-a", after: null },
+    { targetRef: "target-007-a", after: "cursor-a-1" },
+  ]);
+  expect(requests.filter((request) => request.targetRef === "target-007-b")).toEqual([]);
+  await expect(targetB.locator(".lumen-target-terminal")).toHaveCount(0);
+
+  await page.evaluate(() => (
+    window as typeof window & {
+      __emitProjectionEvent: (type: string, payload: object) => void;
+    }
+  ).__emitProjectionEvent(
+    "agent_runtime.target_root_observations_available",
+    {
+      target_ref: "target-007-a",
+      target_run_ref: "target-run-007-a",
+      stream_ref: "target-root-stream-a",
+      head_cursor: "cursor-a-2",
+    },
+  ));
+  await page.waitForTimeout(100);
+  expect(requests.filter((request) => request.targetRef === "target-007-a")).toHaveLength(2);
+
+  recoveredA = true;
+  streamA = "target-root-stream-a-recovered";
+  await page.evaluate(() => (
+    window as typeof window & {
+      __emitProjectionEvent: (type: string, payload: object) => void;
+    }
+  ).__emitProjectionEvent(
+    "agent_runtime.target_root_observations_available",
+    {
+      target_ref: "target-007-a",
+      target_run_ref: "target-run-007-a",
+      stream_ref: "target-root-stream-a-recovered",
+      head_cursor: "cursor-a-recovered",
+    },
+  ));
+  await expect(terminal).toContainText("recovered root output");
+  await expect(terminal).not.toContainText("initial a output");
+  await expect.poll(() => requests.at(-1)).toEqual({
+    targetRef: "target-007-a",
+    after: null,
+  });
 });

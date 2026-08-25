@@ -209,9 +209,11 @@ def _write_process_identity(
         temporary.unlink(missing_ok=True)
 
 
-def _read_bounded_provider_stream(path: Path) -> str:
+def _read_bounded_provider_stream(
+    path: Path, max_bytes: int = PROVIDER_STREAM_MAX_BYTES
+) -> str:
     with path.open("rb") as source:
-        value = source.read(PROVIDER_STREAM_MAX_BYTES + 1)
+        value = source.read(max_bytes + 1)
     return value.decode("utf-8", errors="replace")
 
 
@@ -226,14 +228,23 @@ class _CancellableProcessRunner:
         self._stopping = False
 
     def __call__(
-        self, argv: list[str], input_text: str, timeout: float
+        self,
+        argv: list[str],
+        input_text: str,
+        timeout: float,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return self._run(None, argv, input_text, timeout)
+        return self._run(None, argv, input_text, timeout, environment)
 
     def run_job(
-        self, job_ref: str, argv: list[str], input_text: str, timeout: float
+        self,
+        job_ref: str,
+        argv: list[str],
+        input_text: str,
+        timeout: float,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return self._run(job_ref, argv, input_text, timeout)
+        return self._run(job_ref, argv, input_text, timeout, environment)
 
     def run_durable_job(
         self,
@@ -245,6 +256,7 @@ class _CancellableProcessRunner:
         pid_path: Path,
         supervisor_request_path: Path,
         environment: dict[str, str] | None = None,
+        stdout_max_bytes: int = PROVIDER_STREAM_MAX_BYTES,
     ) -> subprocess.CompletedProcess[str]:
         """Run through a supervisor that outlives a daemon crash.
 
@@ -310,7 +322,7 @@ class _CancellableProcessRunner:
                 except subprocess.TimeoutExpired:
                     if (
                         stdout_path.exists()
-                        and stdout_path.stat().st_size > PROVIDER_STREAM_MAX_BYTES
+                        and stdout_path.stat().st_size > stdout_max_bytes
                     ):
                         oversized = True
                         self._signal_process_tree(
@@ -328,7 +340,7 @@ class _CancellableProcessRunner:
                 raise _ProcessStopped
             if not stdout_path.exists():
                 raise OSError("provider supervisor did not create stdout")
-            stdout = _read_bounded_provider_stream(stdout_path)
+            stdout = _read_bounded_provider_stream(stdout_path, stdout_max_bytes)
             if process.returncode != 0 and not oversized:
                 raise OSError("provider supervisor failed")
             return subprocess.CompletedProcess(
@@ -357,6 +369,7 @@ class _CancellableProcessRunner:
         argv: list[str],
         input_text: str,
         timeout: float,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         deadline = time.monotonic() + timeout
         with self._lock:
@@ -370,6 +383,11 @@ class _CancellableProcessRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 start_new_session=os.name == "posix",
+                env=(
+                    None
+                    if environment is None
+                    else {**os.environ, **environment}
+                ),
             )
             process_group = os.getpgid(process.pid) if os.name == "posix" else None
             self._processes[process] = process_group

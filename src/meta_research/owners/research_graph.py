@@ -1,30 +1,82 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
 from dataclasses import dataclass
-from typing import Protocol, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, OperationalError
+from jsonschema import Draft202012Validator, validators
 
+from meta_research.bundle_protocol import (
+    AcceptedMeasurementClosure,
+    AcceptedInputAssetProof,
+    BUNDLE_CANONICAL_INTEGER_MAX_ABS,
+    CodeReviewRecord,
+    ContentBindingProof,
+    ExecutionInputBindingProof,
+    FormalPlan,
+    HeldFixedBinding,
+    ProtocolAggregationProof,
+    ProtocolPart,
+    ReceiptProof,
+    ResultReviewRecord,
+    TargetCandidate,
+    TargetExecutionPreflight,
+    TargetLaunchRequest,
+    TargetWorkHandle,
+    BundleProtocolError,
+    projection_plain_value,
+    validate_target_launch_request,
+)
+from meta_research.bundle_completion import verify_accepted_closure, verify_reuse_trace
+from meta_research.bundle_target_contract import (
+    BundleTargetContractError,
+    FORMAL_TARGET_CANDIDATE_SCHEMA_REF,
+    ROLLING_STRATEGY_STATE_SCHEMA_REF,
+    FormalTargetCandidate,
+    NormalizedCompletionContract,
+    RollingStrategyState,
+    TargetMeasurementContractCandidate,
+    apply_strategy_update,
+    completion_contract_hash,
+    formal_target_candidate_from_dict,
+    measurement_contract_from_dict,
+    measurement_contract_hash,
+    measurement_contract_to_dict,
+    normalized_completion_contract_from_dict,
+    normalized_completion_contract_to_dict,
+    rolling_strategy_state_from_dict,
+    rolling_strategy_state_to_dict,
+    start_rolling_strategy,
+    strategy_update_from_dict,
+)
 from meta_research.control_contract import signed_owner_preview, validate_control_payload
 from meta_research.database import Database
 from meta_research.experiment_contract import (
     EXPERIMENT_INPUT_BINDING_SCHEMA,
-    EXPERIMENT_REQUIRED_METRICS,
     EXPERIMENT_RESULT_DISPOSITIONS,
-    EXPERIMENT_RESULT_SCHEMA,
     AcceptedExperimentInputBinding,
     AcceptedExperimentExecutionRequest,
     AcceptedExperimentAssetRole,
     ExperimentDomainAdmission,
     ExperimentIdentitySet,
-    ExperimentIntent,
+    ExperimentIntentLike,
+    ProtocolExperimentIntent,
     ExperimentResultComponentManifest,
     ExperimentRuntimeBinding,
     FormalMetricResult,
+    experiment_checkpoint_policy,
     experiment_definition_document,
+    experiment_forms_new_variant,
+    experiment_intent_from_document,
+    experiment_optional_metrics,
+    experiment_required_metrics,
+    experiment_result_schema_ref,
 )
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import (
@@ -42,6 +94,7 @@ from meta_research.plan_contract import (
 from meta_research.bundle_contract import (
     BundleContractError,
     validate_bundle_context_pack,
+    validate_target_graph_append_proposal,
     validate_target_plan,
 )
 from meta_research.owners._sqlite_snapshot import (
@@ -49,6 +102,7 @@ from meta_research.owners._sqlite_snapshot import (
     SQLiteOwnerSnapshot,
 )
 from meta_research.owners.common import (
+    AcceptedTargetCommitTransition,
     AcceptedAssetBinding,
     AcceptedFormalPlanBinding,
     AcceptedIdeaSetBinding,
@@ -74,10 +128,45 @@ from meta_research.owners.human_requests import (
     HumanRequestOwnerMixin,
     HumanResponseVerifier,
 )
+from meta_research.target_execution import target_experiment_intent
+from meta_research.target_execution_legacy import (
+    TargetExecutionRequest,
+    TargetExecutionTerminalResult,
+    TargetMeasurementAuthorityBinding,
+)
+from meta_research.target_run_runtime_contract import (
+    AcceptedTargetCandidateProjection,
+    AcceptedTargetExecutionClosure,
+    AcceptedTargetExecutionEligibility,
+    AcceptedTargetExecutionInputBinding,
+    AcceptedTargetFormalPlanProjection,
+    AcceptedTargetGenericExecutionClosure,
+    AcceptedTargetGenericMeasurement,
+    AcceptedTargetGenericResultManifest,
+    AcceptedTargetMeasurementAttempt,
+    AcceptedTargetNativeExecutionClosure,
+    AcceptedTargetImplementationArtifact,
+    AcceptedTargetImplementationBundle,
+    AcceptedTargetResultManifest,
+    TargetGenericExecutionBinding,
+    TargetProtectedExecutionBinding,
+    receipt_proof,
+)
 from meta_research.writing_contract import validate_writing_claim_inventory
+
+if TYPE_CHECKING:
+    from meta_research.owners.target_root_lifecycle import (
+        AcceptedTargetRootCompletion,
+    )
+    from meta_research.target_run_finalizer import (
+        AcceptedTargetRootCompletionManifest,
+        TargetRootGraphAcceptance,
+        TargetRootResultDocument,
+    )
 
 
 RG_OWNER = "research_graph"
+_BUNDLE_TARGET_EXPERIMENT_REQUEST_PREFIX = "bundle-target-"
 QUEST_RECEIPT_KIND = "quest_acceptance"
 QUESTION_RECEIPT_KIND = "root_question_acceptance"
 MANUAL_QUESTION_RECEIPT_KIND = "manual_question_acceptance"
@@ -85,15 +174,41 @@ IDEA_ACCEPTED_RECEIPT_KIND = "idea_outcome_accepted"
 IDEA_REJECTED_RECEIPT_KIND = "idea_outcome_rejected"
 FORMAL_PLAN_ACCEPTED_RECEIPT_KIND = "formal_plan_accepted"
 FORMAL_PLAN_REJECTED_RECEIPT_KIND = "formal_plan_rejected"
+FORMAL_PLAN_CONTENT_ACCEPTED_RECEIPT_KIND = "formal_plan_content_accepted"
 ASSET_ROLE_RECEIPT_KIND = "asset_role_acceptance"
 EXPERIMENT_INPUT_BINDING_RECEIPT_KIND = "experiment_input_binding_acceptance"
 EXPERIMENT_EXECUTION_REQUEST_RECEIPT_KIND = "experiment_execution_request_acceptance"
 EXPERIMENT_ASSET_ROLE_RECEIPT_KIND = "experiment_asset_role_acceptance"
 FORMAL_MEASUREMENT_RECEIPT_KIND = "formal_measurement_acceptance"
 TARGET_GRAPH_RECEIPT_KIND = "target_graph_accepted"
+TARGET_GRAPH_REJECTED_RECEIPT_KIND = "target_graph_rejected"
 TARGET_RECEIPT_KIND = "target_accepted"
+TARGET_SPEC_CONTENT_RECEIPT_KIND = "target_spec_content_accepted"
+TARGET_MEASUREMENT_DOMAIN_AUTHORITY_RECEIPT_KIND = (
+    "target_measurement_domain_authority_accepted"
+)
+TARGET_MEASUREMENT_PROTOCOL_AGGREGATION_RECEIPT_KIND = (
+    "target_measurement_protocol_aggregation_accepted"
+)
+TARGET_MEASUREMENT_ATTEMPT_RECEIPT_KIND = (
+    "target_measurement_attempt_accepted"
+)
 TARGET_RUN_BINDING_RECEIPT_KIND = "target_run_binding_accepted"
 TARGET_COMMIT_RECEIPT_KIND = "target_commit_accepted"
+TARGET_ROOT_COMMIT_CLOSURE_SCHEMA_REF = (
+    "meta-research/target-root-commit-closure/v1"
+)
+TARGET_ROOT_VARIANT_INPUT_RECEIPT_KIND = (
+    "target_root_variant_input_binding_accepted"
+)
+TARGET_ROOT_EVALUATION_INPUT_RECEIPT_KIND = (
+    "target_root_evaluation_input_binding_accepted"
+)
+_AR_TARGET_ROOT_COMPLETION_RECEIPT_KIND = "target_root_completion_accepted"
+_RM_TARGET_ROOT_COMPLETION_MANIFEST_RECEIPT_KIND = (
+    "target_root_completion_manifest_accepted"
+)
+REUSE_ELIGIBILITY_RECEIPT_KIND = "reuse_eligibility_accepted"
 WRITING_CITATIONS_ACCEPTED_RECEIPT_KIND = "writing_citations_accepted"
 WRITING_CITATIONS_REJECTED_RECEIPT_KIND = "writing_citations_rejected"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
@@ -101,6 +216,64 @@ MAX_ASSET_ROLES_PER_QUEST = MAX_IDEA_CONTEXT_EVIDENCE_REFS
 MAX_ASSET_ROLES_PER_VERSION = 100
 ASSET_ROLE_PROJECTION_HISTORY_PER_VERSION = 20
 ASSET_ROLE_QUERY_MAX_PAGE_SIZE = 100
+WRITING_EXPERIMENT_TERMINAL_CUT_MAX_FACTS = 4096
+
+
+def _forbid_bundle_target_experiment_write(
+    execution_request_ref: object,
+) -> None:
+    if (
+        type(execution_request_ref) is str
+        and execution_request_ref.startswith(
+            _BUNDLE_TARGET_EXPERIMENT_REQUEST_PREFIX
+        )
+    ):
+        raise OwnerConflict("bundle_target_experiment_write_forbidden")
+
+
+class TargetExecutionClosureVerifier(Protocol):
+    def query_target_native_execution_closure(
+        self, closure_ref: str
+    ) -> AcceptedTargetNativeExecutionClosure | None: ...
+
+    def verify_execution_closure(
+        self,
+        *,
+        closure_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> dict[str, object]: ...
+
+
+class TargetFormalPlanProjectionVerifier(Protocol):
+    def accept_formal_plan_projection(
+        self, *, graph_ref: str, idempotency_key: str
+    ) -> AcceptedTargetFormalPlanProjection: ...
+
+    def query_formal_plan_projection(
+        self, *, graph_ref: str
+    ) -> AcceptedTargetFormalPlanProjection | None: ...
+
+    def verify_formal_plan_projection(self, **values: object) -> None: ...
+
+    def accept_candidate_projection(
+        self, *, target_ref: str, idempotency_key: str
+    ) -> AcceptedTargetCandidateProjection: ...
+
+    def query_candidate_projection(
+        self, *, target_ref: str
+    ) -> AcceptedTargetCandidateProjection | None: ...
+
+    def verify_candidate_projection(self, **values: object) -> None: ...
+
+    def accept_protocol_aggregation_from_result(
+        self, **values: object
+    ) -> tuple[tuple[ProtocolPart, ...], ProtocolAggregationProof]: ...
+
+    def query_protocol_aggregation(
+        self, **values: object
+    ) -> tuple[tuple[ProtocolPart, ...], ProtocolAggregationProof] | None: ...
+
+    def verify_protocol_aggregation(self, **values: object) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -195,6 +368,23 @@ class AcceptedAssetRole:
             manifest_hash=self.manifest_hash,
             receipt=self.asset_receipt,
         )
+
+
+@dataclass(frozen=True)
+class WritingExperimentTerminalFactRef:
+    """One immutable formal Experiment outcome inside a Writing cut."""
+
+    evaluation_attempt_ref: str
+    formal_measurement_status: Literal["accepted", "rejected"]
+    formal_rejection_code: str | None
+
+
+@dataclass(frozen=True)
+class WritingExperimentTerminalCut:
+    """Closed, quest-scoped identity set captured by one SQLite read."""
+
+    quest_ref: str
+    facts: tuple[WritingExperimentTerminalFactRef, ...]
 
 
 @dataclass(frozen=True)
@@ -320,6 +510,22 @@ class FormalPlanDecision:
 
 
 @dataclass(frozen=True)
+class AcceptedFormalPlanContent:
+    """RG acceptance whose receipt subject is the exact PlanDocument hash."""
+
+    acceptance_ref: str
+    formal_plan_ref: str
+    decision_ref: str
+    request_ref: str
+    submission_ref: str
+    plan_content_ref: str
+    plan_document_hash: str
+    plan_content_receipt: AcceptanceReceipt
+    formal_plan_receipt: AcceptanceReceipt
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
 class AcceptedTarget:
     target_ref: str
     graph_ref: str
@@ -329,6 +535,60 @@ class AcceptedTarget:
     spec_hash: str
     dependency_refs: tuple[str, ...]
     receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class TargetMeasurementDomainIdentities:
+    """The five native RG identities fixed before any Target execution."""
+
+    baseline_ref: str
+    variant_ref: str
+    evaluation_protocol_ref: str
+    protocol_version_ref: str
+    evaluation_ref: str
+
+    def as_public_dict(self) -> dict[str, str]:
+        return {
+            "baseline_ref": self.baseline_ref,
+            "variant_ref": self.variant_ref,
+            "evaluation_protocol_ref": self.evaluation_protocol_ref,
+            "protocol_version_ref": self.protocol_version_ref,
+            "evaluation_ref": self.evaluation_ref,
+        }
+
+
+@dataclass(frozen=True)
+class AcceptedTargetMeasurementDomainAuthority:
+    """Plan-bound Target measurement semantics accepted with its Target row.
+
+    This fact deliberately stops at ``Evaluation``.  A VariantRun and an
+    EvaluationAttempt require later exact execution/input bindings and cannot
+    be inferred merely because the Target entered the graph.
+    """
+
+    authority_ref: str
+    authority_hash: str
+    target_ref: str
+    graph_ref: str
+    graph_generation: int
+    stage_request_ref: str
+    formal_plan_ref: str
+    plan_document_hash: str
+    accepted_formal_plan_binding_hash: str
+    completion_contract_hash: str
+    formal_plan_projection_digest: str
+    target_spec_hash: str
+    measurement_contract: TargetMeasurementContractCandidate
+    measurement_contract_hash: str
+    experiment_keys: tuple[str, ...]
+    measurement_unit_key: str
+    identities: TargetMeasurementDomainIdentities
+    protocol_parts: tuple[ProtocolPart, ...]
+    protocol_aggregation_proof: ProtocolAggregationProof | None
+    target_receipt: AcceptanceReceipt
+    graph_acceptance_receipt: AcceptanceReceipt
+    receipt: AcceptanceReceipt
+    accepted_at: float
 
 
 @dataclass(frozen=True)
@@ -350,7 +610,45 @@ class AcceptedTargetGraph:
     target_plan_hash: str
     execution_receipt: AcceptanceReceipt
     receipt: AcceptanceReceipt
+    head_generation: int
+    strategy_complete: bool
+    target_set_hash: str
+    coverage_hash: str
+    head_receipt: AcceptanceReceipt
     targets: tuple[AcceptedTarget, ...]
+
+
+@dataclass(frozen=True)
+class TargetGraphRejection:
+    """RG-owned terminal rejection of one exact executed TargetPlan submission."""
+
+    rejection_ref: str
+    request_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    submission_ref: str
+    context_pack_ref: str
+    context_pack_hash: str
+    formal_plan_ref: str
+    plan_document_hash: str
+    target_plan: dict[str, object]
+    target_plan_hash: str
+    execution_payload_hash: str
+    execution_receipt: AcceptanceReceipt
+    reason_code: str
+    feedback: tuple[str, ...]
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class TargetGraphHead:
+    graph_ref: str
+    generation: int
+    strategy_complete: bool
+    target_set_hash: str
+    coverage_hash: str
+    receipt: AcceptanceReceipt
 
 
 @dataclass(frozen=True)
@@ -376,6 +674,147 @@ class TargetCommit:
     closure_hash: str
     result_disposition: str
     receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class _NativeTargetCommitMaterial:
+    """Issuer-reconstructed material shared by native commit write/read paths."""
+
+    canonical_terminal: AcceptedMeasurementClosure
+    closure: dict[str, object]
+    closure_hash: str
+    result_disposition: str
+    execution_closure: AcceptedTargetNativeExecutionClosure
+    execution_closure_payload: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _TargetRootCommitMaterial:
+    """Canonical RG facts reconstructed from AR, RM, and domain issuers."""
+
+    canonical_terminal: AcceptedMeasurementClosure
+    closure: dict[str, object]
+    closure_hash: str
+    result_disposition: str
+    measurement_ref: str
+    metrics: dict[str, int | float]
+    checkpoint_refs: tuple[str, ...]
+    variant_input_binding: ExecutionInputBindingProof
+    evaluation_input_binding: ExecutionInputBindingProof
+    measurement_payload: dict[str, object]
+    measurement_receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class AcceptedReuseEligibility:
+    eligibility_ref: str
+    tier: str
+    target_commit_ref: str
+    source_ref: str
+    exact_version_ref: str
+    implementation_revision_ref: str
+    implementation_content_hash_ref: str
+    payload: dict[str, object]
+    payload_hash: str
+    accepted_at: float
+    receipt: AcceptanceReceipt
+
+    def content_binding(self) -> ContentBindingProof:
+        return ContentBindingProof(
+            subject_ref=self.eligibility_ref,
+            content_hash_ref=self.payload_hash,
+        )
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "eligibility_ref": self.eligibility_ref,
+            "tier": self.tier,
+            "target_commit_ref": self.target_commit_ref,
+            "source_ref": self.source_ref,
+            "exact_version_ref": self.exact_version_ref,
+            "implementation_revision_ref": self.implementation_revision_ref,
+            "implementation_content_hash_ref": (
+                self.implementation_content_hash_ref
+            ),
+            "payload": dict(self.payload),
+            "payload_hash": self.payload_hash,
+            "accepted_at": self.accepted_at,
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class TargetLaunchVerification:
+    """Exact RG facts consumed atomically by AR launch admission."""
+
+    graph_ref: str
+    stage_request_ref: str
+    quest_ref: str
+    risk_class: str
+    asset_proofs: tuple[AcceptedInputAssetProof, ...]
+
+
+class TargetInputAssetProofReader(Protocol):
+    def query_bundle_input_asset_proof(
+        self, *, target_ref: str, asset_ref: str
+    ) -> AcceptedInputAssetProof | None: ...
+
+
+class TargetMeasurementDomainAuthorityReader(Protocol):
+    def query_target_measurement_domain_authority(
+        self, target_ref: str
+    ) -> AcceptedTargetMeasurementDomainAuthority | None: ...
+
+
+class TargetMeasurementExecutionReader(Protocol):
+    """Issuer seam for one terminal generic execution and its exact input."""
+
+    def query_generic_execution_terminal(
+        self, binding_ref: str
+    ) -> tuple[
+        TargetGenericExecutionBinding,
+        TargetExecutionRequest,
+        TargetExecutionTerminalResult,
+        AcceptedTargetExecutionInputBinding,
+    ] | None: ...
+
+    def query_generic_execution_input_assets(
+        self, binding_ref: str
+    ) -> tuple[AcceptedAssetBinding, ...]: ...
+
+
+class TargetMeasurementResultReader(Protocol):
+    """Issuer seam for RM-accepted terminal assets and exact result bytes."""
+
+    def query_generic_result_manifest(
+        self, manifest_ref: str
+    ) -> AcceptedTargetGenericResultManifest | None: ...
+
+    def materialize_generic_result_asset(
+        self, *, manifest_ref: str, version_ref: str
+    ) -> bytes: ...
+
+
+class TargetRootCompletionReader(Protocol):
+    """Issuer seam for the one AR-frozen final root completion."""
+
+    def query_completion(
+        self, target_ref: str
+    ) -> AcceptedTargetRootCompletion | None: ...
+
+
+class TargetRootCompletionManifestReader(Protocol):
+    """Issuer seam for the RM-owned immutable completion manifest."""
+
+    def query(
+        self, manifest_ref: str
+    ) -> AcceptedTargetRootCompletionManifest | None: ...
+
+
+class TargetRootCommitTransitionReader(Protocol):
+    def query_target_root_commit_transition(
+        self, target_ref: str
+    ) -> AcceptedTargetCommitTransition | None: ...
 
 
 class TargetCommitEvidenceAuthority(Protocol):
@@ -422,10 +861,113 @@ class RuntimeControlReceiptVerifier(Protocol):
     ) -> None: ...
 
 
+class TargetCandidateOwnerProofVerifier(Protocol):
+    """Issuer-backed verification seam for every formal reuse proof.
+
+    The canonical Bundle dataclasses intentionally carry issuer-neutral proof
+    projections.  RG therefore must delegate live/currentness verification to
+    the Owner that issued each proof instead of trusting ``verified=true``.
+    """
+
+    def verify_reuse_source_receipt(
+        self,
+        *,
+        tier: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        license_ref: str | None,
+        source_content_hash_ref: str | None,
+        patch_ref: str | None,
+        receipt: ReceiptProof,
+    ) -> None: ...
+
+    def verify_reuse_content_receipt(
+        self,
+        *,
+        tier: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        license_ref: str | None,
+        source_content_hash_ref: str | None,
+        patch_ref: str | None,
+        binding: ContentBindingProof,
+        receipt: ReceiptProof,
+    ) -> None: ...
+
+    def verify_reuse_eligibility_receipt(
+        self,
+        *,
+        tier: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        implementation_content_hash_ref: str,
+        eligibility_anchor_ref: str,
+        binding: ContentBindingProof,
+        receipt: ReceiptProof,
+    ) -> None: ...
+
 class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for authoritative research semantics."""
 
     def query_snapshot(self) -> OwnerSnapshot: ...
+
+    def bind_target_candidate_proof_verifier(
+        self, verifier: TargetCandidateOwnerProofVerifier
+    ) -> None: ...
+
+    def bind_target_execution_closure_verifier(
+        self, verifier: TargetExecutionClosureVerifier
+    ) -> None: ...
+
+    def bind_target_measurement_runtime_readers(
+        self,
+        *,
+        execution_reader: TargetMeasurementExecutionReader,
+        result_reader: TargetMeasurementResultReader,
+    ) -> None: ...
+
+    def bind_target_root_completion_readers(
+        self,
+        *,
+        completion_reader: TargetRootCompletionReader,
+        manifest_reader: TargetRootCompletionManifestReader,
+    ) -> None: ...
+
+    def verify_target_execution_closure(
+        self, *, closure_ref: str, receipt: AcceptanceReceipt
+    ) -> dict[str, object]: ...
+
+    def bind_target_formal_plan_projection_verifier(
+        self, verifier: TargetFormalPlanProjectionVerifier
+    ) -> None: ...
+
+    def accept_target_formal_plan_projection(
+        self, *, graph_ref: str, idempotency_key: str
+    ) -> AcceptedTargetFormalPlanProjection: ...
+
+    def query_target_formal_plan_projection(
+        self, *, graph_ref: str
+    ) -> AcceptedTargetFormalPlanProjection | None: ...
+
+    def accept_target_protocol_aggregation_from_result(
+        self,
+        *,
+        target_ref: str,
+        protected_binding_ref: str,
+        result_manifest_ref: str,
+        idempotency_key: str,
+    ) -> tuple[tuple[ProtocolPart, ...], ProtocolAggregationProof]: ...
+
+    def query_target_protocol_aggregation(
+        self,
+        *,
+        target_ref: str,
+        protected_binding_ref: str,
+        result_manifest_ref: str,
+    ) -> tuple[tuple[ProtocolPart, ...], ProtocolAggregationProof] | None: ...
 
     def query_question_lifecycle(self, question_ref: str) -> dict[str, object]: ...
 
@@ -660,6 +1202,36 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
 
     def verify_formal_plan_decision(self, **values) -> None: ...
 
+    def accept_formal_plan_content(
+        self, *, formal_plan_ref: str, idempotency_key: str
+    ) -> AcceptedFormalPlanContent: ...
+
+    def query_formal_plan_content_acceptance(
+        self, formal_plan_ref: str
+    ) -> AcceptedFormalPlanContent | None: ...
+
+    def verify_formal_plan_content_acceptance(self, **values) -> None: ...
+
+    def query_bundle_report_contract(self, **values) -> dict[str, object]: ...
+
+    def query_target_formal_plan_projection_source(
+        self, **values: object
+    ) -> dict[str, object]: ...
+
+    def query_target_candidate_projection_source(
+        self, *, target_ref: str
+    ) -> dict[str, object]: ...
+
+    def accept_target_candidate_projection(
+        self, *, target_ref: str, idempotency_key: str
+    ) -> AcceptedTargetCandidateProjection: ...
+
+    def query_target_candidate_projection(
+        self, *, target_ref: str
+    ) -> AcceptedTargetCandidateProjection | None: ...
+
+    def verify_bundle_report_target_commits(self, **values) -> None: ...
+
     def accept_target_graph(
         self,
         *,
@@ -675,9 +1247,98 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
         execution_receipt: AcceptanceReceipt,
     ) -> AcceptedTargetGraph: ...
 
+    def decide_target_graph_submission(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        context_pack_ref: str,
+        target_plan: dict[str, object],
+        target_plan_hash: str,
+        execution_payload_hash: str,
+        execution_receipt: AcceptanceReceipt,
+    ) -> AcceptedTargetGraph | TargetGraphRejection: ...
+
     def query_target_graph(self, request_ref: str) -> AcceptedTargetGraph | None: ...
 
+    def query_target_measurement_domain_authority(
+        self, target_ref: str
+    ) -> AcceptedTargetMeasurementDomainAuthority | None: ...
+
+    def verify_target_measurement_domain_authority(
+        self,
+        *,
+        target_ref: str,
+        measurement_contract_hash: str,
+        identities: TargetMeasurementDomainIdentities,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_target_measurement_protocol_aggregation(
+        self,
+        *,
+        target_ref: str,
+        parts: tuple[ProtocolPart, ...],
+        proof: ProtocolAggregationProof | None,
+    ) -> None: ...
+
+    def accept_target_measurement_attempt(
+        self,
+        *,
+        target_ref: str,
+        generic_binding_ref: str,
+        result_manifest_ref: str,
+        idempotency_key: str,
+    ) -> AcceptedTargetMeasurementAttempt: ...
+
+    def query_target_measurement_attempt(
+        self, evaluation_attempt_ref: str
+    ) -> AcceptedTargetMeasurementAttempt | None: ...
+
+    def query_target_measurement_attempt_for_binding(
+        self, generic_binding_ref: str
+    ) -> AcceptedTargetMeasurementAttempt | None: ...
+
+    def accept_target_formal_measurement(
+        self,
+        *,
+        target_ref: str,
+        evaluation_attempt_ref: str,
+        idempotency_key: str,
+    ) -> FormalMetricResult: ...
+
+    def query_target_formal_metric_result(
+        self, evaluation_attempt_ref: str
+    ) -> FormalMetricResult | None: ...
+
+    def query_target_frontier_commit_transition(
+        self, target_ref: str
+    ) -> AcceptedTargetCommitTransition | None: ...
+
+    def query_target_graph_rejection(
+        self, submission_ref: str
+    ) -> TargetGraphRejection | None: ...
+
+    def verify_target_graph_rejection_receipt(self, **values) -> None: ...
+
+    def append_target_batch(
+        self,
+        *,
+        graph_ref: str,
+        proposal_ref: str,
+        proposal: dict[str, object],
+        proposal_hash: str,
+        proposal_receipt: AcceptanceReceipt,
+    ) -> TargetGraphHead: ...
+
+    def query_target_graph_head(self, graph_ref: str) -> TargetGraphHead: ...
+
     def query_target_frontier(self, graph_ref: str) -> tuple[AcceptedTarget, ...]: ...
+
+    def query_target_launch_request(self, target_ref: str) -> TargetLaunchRequest: ...
 
     def bind_target_run(
         self,
@@ -706,16 +1367,88 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
         result_content: dict[str, object],
     ) -> TargetCommit: ...
 
+    def accept_target_commit_from_measurement_closure(
+        self,
+        *,
+        target_ref: str,
+        target_execution_closure_ref: str,
+        target_execution_closure_receipt: AcceptanceReceipt,
+        implementation_revision_ref: str,
+        implementation_provenance_refs: tuple[str, ...],
+        held_fixed_bindings: tuple[HeldFixedBinding, ...],
+        code_review: CodeReviewRecord,
+        result_review: ResultReviewRecord,
+        protocol_internal_parts: tuple[ProtocolPart, ...],
+        protocol_aggregation_proof: ProtocolAggregationProof | None,
+        result_content: dict[str, object],
+    ) -> TargetCommit: ...
+
+    def accept_target_commit_from_generic_measurement_closure(
+        self,
+        *,
+        target_ref: str,
+        target_execution_closure_ref: str,
+        target_execution_closure_receipt: AcceptanceReceipt,
+    ) -> TargetCommit: ...
+
+    def accept_target_commit_from_native_execution_closure(
+        self,
+        *,
+        target_ref: str,
+        target_execution_closure_ref: str,
+        target_execution_closure_receipt: AcceptanceReceipt,
+    ) -> TargetCommit: ...
+
+    def accept_target_commit_from_root_completion(
+        self,
+        *,
+        completion: AcceptedTargetRootCompletion,
+        manifest: AcceptedTargetRootCompletionManifest,
+        result_document: TargetRootResultDocument,
+        idempotency_key: str,
+    ) -> TargetRootGraphAcceptance: ...
+
     def query_target_commits(self, graph_ref: str) -> tuple[TargetCommit, ...]: ...
 
     def query_target_commits_for_quest(
         self, quest_ref: str
     ) -> tuple[TargetCommit, ...]: ...
 
+    def accept_reuse_eligibility(
+        self,
+        *,
+        tier: str,
+        target_commit_ref: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        implementation_content_hash_ref: str,
+        idempotency_key: str,
+    ) -> AcceptedReuseEligibility: ...
+
+    def query_reuse_eligibility(
+        self, eligibility_ref: str
+    ) -> AcceptedReuseEligibility | None: ...
+
+    def verify_reuse_eligibility(
+        self,
+        *,
+        tier: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        implementation_content_hash_ref: str,
+        eligibility_anchor_ref: str,
+        eligibility_ref: str,
+        eligibility_content_hash_ref: str,
+        receipt_ref: str,
+        receipt_subject_ref: str,
+    ) -> None: ...
+
     def admit_experiment(
         self,
         *,
-        intent: ExperimentIntent,
+        intent: ExperimentIntentLike,
         runtime_binding: ExperimentRuntimeBinding,
         definition_binding: AcceptedAssetBinding,
         implementation_binding: AcceptedAssetBinding,
@@ -723,7 +1456,7 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
     ) -> ExperimentDomainAdmission: ...
 
     def preflight_experiment(
-        self, *, intent: ExperimentIntent, idempotency_key: str
+        self, *, intent: ExperimentIntentLike, idempotency_key: str
     ) -> ExperimentDomainAdmission | None: ...
 
     def query_experiment(
@@ -731,6 +1464,10 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
     ) -> ExperimentDomainAdmission | None: ...
 
     def query_current_experiment(self) -> ExperimentDomainAdmission | None: ...
+
+    def query_writing_experiment_terminal_cut(
+        self, quest_ref: str
+    ) -> WritingExperimentTerminalCut: ...
 
     def query_experiment_admission_refs(
         self,
@@ -811,7 +1548,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
     owner=RG_OWNER,
     statement=text(
         "SELECT revision, quest_count, question_count, idea_outcome_count, "
-        "idea_rejection_count, formal_plan_count, plan_rejection_count, "
+        "idea_rejection_count, formal_plan_count, "
+        "formal_plan_content_acceptance_count, plan_rejection_count, "
         "asset_role_count, evidence_role_count, "
         "source_material_role_count, human_request_count, "
         "experiment_baseline_count, "
@@ -819,7 +1557,10 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "protocol_version_count, evaluation_count, variant_run_count, "
         "evaluation_attempt_count, experiment_input_binding_count, "
         "experiment_asset_role_count, formal_measurement_count, "
-        "target_graph_count, target_count, target_commit_count, "
+        "target_graph_count, target_graph_rejection_count, target_count, "
+        "target_measurement_domain_authority_count, "
+        "target_commit_count, "
+        "reuse_eligibility_count, "
         "writing_citation_decision_count, writing_citation_rejection_count "
         "FROM research_graph_state WHERE singleton = 'owner'"
     ),
@@ -829,6 +1570,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "idea_outcome_count",
         "idea_rejection_count",
         "formal_plan_count",
+        "formal_plan_content_acceptance_count",
         "plan_rejection_count",
         "asset_role_count",
         "evidence_role_count",
@@ -845,8 +1587,11 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "experiment_asset_role_count",
         "formal_measurement_count",
         "target_graph_count",
+        "target_graph_rejection_count",
         "target_count",
+        "target_measurement_domain_authority_count",
         "target_commit_count",
+        "reuse_eligibility_count",
         "writing_citation_decision_count",
         "writing_citation_rejection_count",
     ),
@@ -868,6 +1613,11 @@ class SQLiteResearchGraphReceiptVerifier:
         manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
         plan_content_verifier: PlanContentReceiptVerifier | None = None,
         target_commit_evidence_authority: TargetCommitEvidenceAuthority | None = None,
+        target_input_asset_proof_reader: TargetInputAssetProofReader | None = None,
+        target_formal_plan_projection_verifier: (
+            TargetFormalPlanProjectionVerifier | None
+        ) = None,
+        target_execution_closure_verifier: TargetExecutionClosureVerifier | None = None,
     ) -> None:
         self._database = database
         self._confirmation_verifier = confirmation_verifier
@@ -879,6 +1629,37 @@ class SQLiteResearchGraphReceiptVerifier:
         self._manual_confirmation_verifier = manual_confirmation_verifier
         self._plan_content_verifier = plan_content_verifier
         self._target_commit_evidence_authority = target_commit_evidence_authority
+        self._target_input_asset_proof_reader = target_input_asset_proof_reader
+        self._target_formal_plan_projection_verifier = (
+            target_formal_plan_projection_verifier
+        )
+        self._target_execution_closure_verifier = target_execution_closure_verifier
+        self._target_measurement_domain_authority_reader: (
+            TargetMeasurementDomainAuthorityReader | None
+        ) = None
+        self._target_root_commit_transition_reader: (
+            TargetRootCommitTransitionReader | None
+        ) = None
+
+    def bind_target_measurement_domain_authority_reader(
+        self, reader: TargetMeasurementDomainAuthorityReader
+    ) -> None:
+        current = self._target_measurement_domain_authority_reader
+        if current is not None and current is not reader:
+            raise OwnerConflict(
+                "target_measurement_domain_authority_reader_already_bound"
+            )
+        self._target_measurement_domain_authority_reader = reader
+
+    def bind_target_root_commit_transition_reader(
+        self, reader: TargetRootCommitTransitionReader
+    ) -> None:
+        current = self._target_root_commit_transition_reader
+        if current is not None and current is not reader:
+            raise OwnerConflict(
+                "target_root_commit_transition_reader_already_bound"
+            )
+        self._target_root_commit_transition_reader = reader
 
     def bind_target_commit_evidence_authority(
         self, authority: TargetCommitEvidenceAuthority
@@ -887,6 +1668,293 @@ class SQLiteResearchGraphReceiptVerifier:
         if current is not None and current is not authority:
             raise OwnerConflict("target_commit_evidence_authority_already_bound")
         self._target_commit_evidence_authority = authority
+
+    def bind_target_input_asset_proof_reader(
+        self, reader: TargetInputAssetProofReader
+    ) -> None:
+        current = self._target_input_asset_proof_reader
+        if current is not None and current is not reader:
+            raise OwnerConflict("target_input_asset_proof_reader_already_bound")
+        self._target_input_asset_proof_reader = reader
+
+    def bind_target_formal_plan_projection_verifier(
+        self, verifier: TargetFormalPlanProjectionVerifier
+    ) -> None:
+        current = self._target_formal_plan_projection_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict(
+                "target_formal_plan_projection_verifier_already_bound"
+            )
+        self._target_formal_plan_projection_verifier = verifier
+
+    def bind_target_execution_closure_verifier(
+        self, verifier: TargetExecutionClosureVerifier
+    ) -> None:
+        current = self._target_execution_closure_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict(
+                "target_execution_closure_verifier_already_bound"
+            )
+        self._target_execution_closure_verifier = verifier
+
+    def verify_target_execution_closure(
+        self, *, closure_ref: str, receipt: AcceptanceReceipt
+    ) -> dict[str, object]:
+        verifier = self._target_execution_closure_verifier
+        if verifier is None:
+            raise OwnerConflict("target_execution_closure_verifier_unavailable")
+        return verifier.verify_execution_closure(
+            closure_ref=closure_ref,
+            receipt=receipt,
+        )
+
+    def query_target_frontier_commit_transition(
+        self, target_ref: str
+    ) -> AcceptedTargetCommitTransition | None:
+        """Reconstruct one post-commit/pre-handoff frontier from its issuers."""
+
+        if type(target_ref) is not str or not target_ref:
+            raise OwnerConflict("target_commit_transition_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_commits WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            target_row = connection.execute(
+                text("SELECT * FROM rg_targets WHERE target_ref = :target_ref"),
+                {"target_ref": target_ref},
+            ).first()
+        if row is None:
+            return None
+        if target_row is None:
+            raise OwnerConflict("target_commit_transition_invalid")
+        commit = _target_commit(row)
+        target = _accepted_target(target_row)
+        if commit.closure.get("schema_ref") == TARGET_ROOT_COMMIT_CLOSURE_SCHEMA_REF:
+            reader = self._target_root_commit_transition_reader
+            if reader is None:
+                raise OwnerConflict("target_commit_transition_invalid")
+            return reader.query_target_root_commit_transition(target_ref)
+        execution_document = commit.closure.get("target_execution_closure")
+        if (
+            commit.closure.get("schema_ref")
+            != "meta-research/target-commit-closure/v3"
+            or type(commit.closure.get("accepted_measurement")) is not dict
+            or type(execution_document) is not dict
+        ):
+            raise OwnerConflict("target_commit_transition_invalid")
+        closure_ref = execution_document.get("closure_ref")
+        if type(closure_ref) is not str or not closure_ref:
+            raise OwnerConflict("target_commit_transition_invalid")
+        closure_receipt = _acceptance_receipt_from_document(
+            execution_document.get("receipt"),
+            error_code="target_commit_transition_invalid",
+        )
+        facts = self.verify_target_execution_closure(
+            closure_ref=closure_ref,
+            receipt=closure_receipt,
+        )
+        projection_verifier = self._target_formal_plan_projection_verifier
+        if projection_verifier is None:
+            raise OwnerConflict("target_commit_transition_invalid")
+        projection = projection_verifier.query_formal_plan_projection(
+            graph_ref=target.graph_ref
+        )
+        candidate_projection = projection_verifier.query_candidate_projection(
+            target_ref=target_ref
+        )
+        if projection is None or candidate_projection is None:
+            raise OwnerConflict("target_commit_transition_invalid")
+        projection_verifier.verify_formal_plan_projection(
+            graph_ref=target.graph_ref,
+            formal_plan=projection.formal_plan,
+            plan_document_hash=projection.plan_document_hash,
+            source_acceptance_receipt=projection.source_acceptance_receipt,
+            completion_contract_hash=projection.completion_contract_hash,
+            receipt=projection.receipt,
+        )
+        projection_verifier.verify_candidate_projection(
+            target_ref=target_ref,
+            candidate=candidate_projection.candidate,
+            source_spec_hash=candidate_projection.source_spec_hash,
+            source_acceptance_receipt=(
+                candidate_projection.source_acceptance_receipt
+            ),
+            receipt=candidate_projection.receipt,
+        )
+        material = _native_target_commit_material(
+            target=target,
+            commit_ref=commit.commit_ref,
+            commit_receipt_ref=commit.receipt.receipt_ref,
+            projection=projection,
+            candidate_projection=candidate_projection,
+            facts=facts,
+        )
+        if (
+            commit.target_ref != target_ref
+            or commit.target_run_ref
+            != material.execution_closure.target_run_ref
+            or commit.evaluation_attempt_ref
+            != material.canonical_terminal.evaluation_attempt_ref
+            or commit.target_spec_hash != target.spec_hash
+            or commit.closure != material.closure
+            or commit.closure_hash != material.closure_hash
+            or commit.result_disposition != material.result_disposition
+            or execution_document
+            != projection_plain_value(material.execution_closure)
+            or commit.receipt.issuer != RG_OWNER
+            or commit.receipt.kind != TARGET_COMMIT_RECEIPT_KIND
+            or commit.receipt.subject_ref != commit.commit_ref
+        ):
+            raise OwnerConflict("target_commit_transition_invalid")
+
+        # The reader is side-effect free and does not hold an RG transaction
+        # while consulting AR/RM.  Repeat every issuer read after reconstruction
+        # and then re-read both RG rows so a concurrent change cannot produce a
+        # mixed-view transition.
+        latest_facts = self.verify_target_execution_closure(
+            closure_ref=closure_ref,
+            receipt=closure_receipt,
+        )
+        latest_projection = projection_verifier.query_formal_plan_projection(
+            graph_ref=target.graph_ref
+        )
+        latest_candidate_projection = (
+            projection_verifier.query_candidate_projection(
+                target_ref=target_ref
+            )
+        )
+        with self._database.read() as connection:
+            latest_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_commits WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            latest_target_row = connection.execute(
+                text("SELECT * FROM rg_targets WHERE target_ref = :target_ref"),
+                {"target_ref": target_ref},
+            ).first()
+        if (
+            latest_facts != facts
+            or latest_projection != projection
+            or latest_candidate_projection != candidate_projection
+            or latest_row is None
+            or _target_commit(latest_row) != commit
+            or latest_target_row is None
+            or _accepted_target(latest_target_row) != target
+        ):
+            raise OwnerConflict("target_commit_transition_invalid")
+        return AcceptedTargetCommitTransition(
+            target_ref=target_ref,
+            target_run_ref=material.execution_closure.target_run_ref,
+            execution_attempt_ref=(
+                material.execution_closure.target_attempt_ref
+            ),
+            execution_fence_ref=material.execution_closure.target_fence_ref,
+            target_commit_ref=commit.commit_ref,
+            target_execution_closure_ref=material.execution_closure.closure_ref,
+            canonical_terminal=material.canonical_terminal,
+            issuer_receipt=commit.receipt,
+        )
+
+    def accept_target_formal_plan_projection(
+        self, *, graph_ref: str, idempotency_key: str
+    ) -> AcceptedTargetFormalPlanProjection:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_formal_plan_projection_verifier_unavailable")
+        return verifier.accept_formal_plan_projection(
+            graph_ref=graph_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def query_target_formal_plan_projection(
+        self, *, graph_ref: str
+    ) -> AcceptedTargetFormalPlanProjection | None:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_formal_plan_projection_verifier_unavailable")
+        return verifier.query_formal_plan_projection(graph_ref=graph_ref)
+
+    def verify_target_formal_plan_projection(
+        self, **values: object
+    ) -> None:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict(
+                "target_formal_plan_projection_verifier_unavailable"
+            )
+        verifier.verify_formal_plan_projection(**values)
+
+    def accept_target_candidate_projection(
+        self, *, target_ref: str, idempotency_key: str
+    ) -> AcceptedTargetCandidateProjection:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_candidate_projection_verifier_unavailable")
+        return verifier.accept_candidate_projection(
+            target_ref=target_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def query_target_candidate_projection(
+        self, *, target_ref: str
+    ) -> AcceptedTargetCandidateProjection | None:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_candidate_projection_verifier_unavailable")
+        return verifier.query_candidate_projection(target_ref=target_ref)
+
+    def verify_target_candidate_projection(self, **values: object) -> None:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_candidate_projection_verifier_unavailable")
+        verifier.verify_candidate_projection(**values)
+
+    def accept_target_protocol_aggregation_from_result(
+        self,
+        *,
+        target_ref: str,
+        protected_binding_ref: str,
+        result_manifest_ref: str,
+        idempotency_key: str,
+    ) -> tuple[tuple[ProtocolPart, ...], ProtocolAggregationProof]:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_protocol_aggregation_authority_unavailable")
+        return verifier.accept_protocol_aggregation_from_result(
+            target_ref=target_ref,
+            protected_binding_ref=protected_binding_ref,
+            result_manifest_ref=result_manifest_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def query_target_protocol_aggregation(
+        self,
+        *,
+        target_ref: str,
+        protected_binding_ref: str,
+        result_manifest_ref: str,
+    ) -> tuple[tuple[ProtocolPart, ...], ProtocolAggregationProof] | None:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_protocol_aggregation_authority_unavailable")
+        return verifier.query_protocol_aggregation(
+            target_ref=target_ref,
+            protected_binding_ref=protected_binding_ref,
+            result_manifest_ref=result_manifest_ref,
+        )
+
+    def verify_target_protocol_aggregation(self, **values: object) -> None:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_protocol_aggregation_authority_unavailable")
+        verifier.verify_protocol_aggregation(**values)
 
     def verify_question_control_receipt(
         self,
@@ -1846,15 +2914,16 @@ class SQLiteResearchGraphReceiptVerifier:
         stored_implementation = _experiment_implementation_binding(row)
         try:
             intent_value = decoded_object(row.intent_json)
+            stored_intent = experiment_intent_from_document(intent_value)
             definition = decoded_object(row.definition_json)
             runtime_definition = definition["runtime_binding"]
             if not isinstance(runtime_definition, dict):
                 raise TypeError("runtime binding")
-            request_kind = str(intent_value["request_kind"])
-            selected_checkpoint_role_refs = [
-                str(value) for value in intent_value["selected_checkpoint_role_refs"]
-            ]
-        except (KeyError, TypeError, ValueError) as error:
+            request_kind = stored_intent.request_kind
+            selected_checkpoint_role_refs = list(
+                stored_intent.selected_checkpoint_role_refs
+            )
+        except (KeyError, TypeError, ValueError, OwnerConflict) as error:
             raise OwnerConflict("experiment_execution_request_invalid") from error
         bindings = {
             "quest_ref": row.quest_ref,
@@ -2126,6 +3195,427 @@ class SQLiteResearchGraphReceiptVerifier:
             ),
         )
 
+    def query_formal_plan_content_acceptance(
+        self, formal_plan_ref: str
+    ) -> AcceptedFormalPlanContent | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_formal_plan_content_acceptances WHERE "
+                    "formal_plan_ref = :formal_plan_ref"
+                ),
+                {"formal_plan_ref": formal_plan_ref},
+            ).first()
+        if row is None:
+            return None
+        accepted = _formal_plan_content_acceptance(row)
+        self.verify_formal_plan_content_acceptance(
+            formal_plan_ref=accepted.formal_plan_ref,
+            plan_document_hash=accepted.plan_document_hash,
+            receipt=accepted.receipt,
+        )
+        return accepted
+
+    def verify_formal_plan_content_acceptance(
+        self,
+        *,
+        formal_plan_ref: str,
+        plan_document_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != RG_OWNER
+            or receipt.kind != FORMAL_PLAN_CONTENT_ACCEPTED_RECEIPT_KIND
+            or receipt.subject_ref != plan_document_hash
+        ):
+            raise OwnerConflict("formal_plan_content_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_formal_plan_content_acceptances WHERE "
+                    "receipt_ref = :receipt_ref"
+                ),
+                {"receipt_ref": receipt.receipt_ref},
+            ).first()
+            decision = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_formal_plan_decisions WHERE "
+                        "decision_ref = :decision_ref"
+                    ),
+                    {"decision_ref": row.decision_ref},
+                ).first()
+            )
+            content = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rm_plan_documents WHERE content_ref = "
+                        ":content_ref"
+                    ),
+                    {"content_ref": row.plan_content_ref},
+                ).first()
+            )
+        if row is None or decision is None or content is None:
+            raise OwnerConflict("formal_plan_content_receipt_invalid")
+        try:
+            plan_document = decoded_object(content.plan_document_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("formal_plan_content_receipt_invalid") from error
+        plan_content_receipt = AcceptanceReceipt(
+            issuer="research_memory",
+            kind="plan_document_content_acceptance",
+            receipt_ref=row.plan_content_receipt_ref,
+            subject_ref=row.plan_content_ref,
+            payload_hash=row.plan_content_receipt_hash,
+        )
+        formal_plan_receipt = AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=FORMAL_PLAN_ACCEPTED_RECEIPT_KIND,
+            receipt_ref=row.formal_plan_receipt_ref,
+            subject_ref=row.formal_plan_ref,
+            payload_hash=row.formal_plan_receipt_hash,
+        )
+        if (
+            row.formal_plan_ref != formal_plan_ref
+            or row.plan_document_hash != plan_document_hash
+            or row.receipt_hash != receipt.payload_hash
+            or row.receipt_hash != _formal_plan_content_acceptance_receipt_hash(row)
+            or decision.decision_ref != row.decision_ref
+            or decision.decision != "accepted"
+            or decision.formal_plan_ref != row.formal_plan_ref
+            or decision.request_ref != row.request_ref
+            or decision.submission_ref != row.submission_ref
+            or decision.plan_content_ref != row.plan_content_ref
+            or decision.plan_document_hash != row.plan_document_hash
+            or decision.plan_content_receipt_ref != row.plan_content_receipt_ref
+            or decision.plan_content_receipt_hash != row.plan_content_receipt_hash
+            or decision.receipt_ref != row.formal_plan_receipt_ref
+            or decision.receipt_hash != row.formal_plan_receipt_hash
+            or content.content_ref != row.plan_content_ref
+            or content.submission_ref != row.submission_ref
+            or content.request_ref != row.request_ref
+            or content.plan_document_hash != row.plan_document_hash
+            or canonical_json(plan_document) != content.plan_document_json
+            or canonical_hash(plan_document) != row.plan_document_hash
+        ):
+            raise OwnerConflict("formal_plan_content_receipt_invalid")
+        if self._plan_content_verifier is None:
+            raise OwnerConflict("plan_content_verifier_unavailable")
+        self._plan_content_verifier.verify_plan_content_receipt(
+            request_ref=content.request_ref,
+            submission_ref=content.submission_ref,
+            content_ref=content.content_ref,
+            payload_hash=content.payload_hash,
+            plan_hash=content.plan_document_hash,
+            reviewed_draft_hash=content.reviewed_draft_hash,
+            review_hash=content.review_hash,
+            receipt=plan_content_receipt,
+        )
+        self.verify_formal_plan_decision(
+            request_ref=decision.request_ref,
+            submission_ref=decision.submission_ref,
+            decision="accepted",
+            formal_plan_ref=decision.formal_plan_ref,
+            receipt=formal_plan_receipt,
+        )
+
+    def _query_bundle_report_contract_source(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        graph_ref: str,
+        head_receipt: AcceptanceReceipt,
+        formal_plan_content_receipt: AcceptanceReceipt,
+    ) -> tuple[AcceptedTargetGraph, dict[str, object]]:
+        self.verify_target_graph_receipt(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            graph_ref=graph_ref,
+            receipt=head_receipt,
+            require_current=True,
+            require_complete=False,
+        )
+        with self._database.read() as connection:
+            graph_row = connection.execute(
+                text("SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"),
+                {"graph_ref": graph_ref},
+            ).first()
+            target_rows = connection.execute(
+                text(
+                    "SELECT * FROM rg_targets WHERE graph_ref = :graph_ref "
+                    "ORDER BY ordinal"
+                ),
+                {"graph_ref": graph_ref},
+            ).all()
+            append_rows = connection.execute(
+                text(
+                    "SELECT a.*, p.proposal_json AS proposal_json FROM "
+                    "rg_target_graph_appends a JOIN ar_bundle_target_proposals p "
+                    "ON p.proposal_ref = a.proposal_ref WHERE a.graph_ref = "
+                    ":graph_ref ORDER BY a.generation"
+                ),
+                {"graph_ref": graph_ref},
+            ).all()
+            plan_row = (
+                None
+                if graph_row is None
+                else connection.execute(
+                    text(
+                        "SELECT plan_document_json, plan_document_hash FROM "
+                        "rm_plan_documents WHERE content_ref = :content_ref"
+                    ),
+                    {"content_ref": graph_row.plan_content_ref},
+                ).first()
+            )
+        if graph_row is None or plan_row is None:
+            raise OwnerConflict("bundle_report_contract_invalid")
+        try:
+            plan_document = decoded_object(plan_row.plan_document_json)
+            graph = _accepted_target_graph(
+                graph_row, target_rows, append_rows, plan_document
+            )
+            completion_value = graph.target_plan.get("completion_contract")
+            if not isinstance(completion_value, dict):
+                raise TypeError("completion contract")
+            completion = normalized_completion_contract_from_dict(
+                completion_value,
+                plan_document=plan_document,
+            )
+            formal_candidates = tuple(
+                formal_target_candidate_from_dict(
+                    target.spec,
+                    completion_contract=completion,
+                )
+                for target in graph.targets
+            )
+        except (
+            BundleTargetContractError,
+            OwnerConflict,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise OwnerConflict("bundle_report_contract_invalid") from error
+        self.verify_formal_plan_content_acceptance(
+            formal_plan_ref=graph.formal_plan_ref,
+            plan_document_hash=graph.plan_document_hash,
+            receipt=formal_plan_content_receipt,
+        )
+        briefs = tuple(item.brief for item in completion.experiments)
+        candidates = {
+            item.candidate.local_label: item.candidate for item in formal_candidates
+        }
+        target_by_label = {
+            target.target_key: target.target_ref for target in graph.targets
+        }
+        if set(candidates) != set(target_by_label):
+            raise OwnerConflict("bundle_report_contract_invalid")
+        result: dict[str, object] = {
+            "formal_plan_ref": graph.formal_plan_ref,
+            "briefs": briefs,
+            "completion_contract": completion,
+            "candidates": candidates,
+            "target_by_label": target_by_label,
+            "target_refs": tuple(target.target_ref for target in graph.targets),
+            "strategy_complete": graph.strategy_complete,
+            "generation": graph.head_generation,
+            "target_set_hash": graph.target_set_hash,
+            "coverage_hash": graph.coverage_hash,
+        }
+        return graph, result
+
+    def query_target_formal_plan_projection_source(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        graph_ref: str,
+        head_receipt: AcceptanceReceipt,
+        formal_plan_content_receipt: AcceptanceReceipt,
+    ) -> dict[str, object]:
+        """Return validated source normalization without a FormalPlan value."""
+
+        _graph, result = self._query_bundle_report_contract_source(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            graph_ref=graph_ref,
+            head_receipt=head_receipt,
+            formal_plan_content_receipt=formal_plan_content_receipt,
+        )
+        return result
+
+    def query_bundle_report_contract(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        graph_ref: str,
+        head_receipt: AcceptanceReceipt,
+        formal_plan_content_receipt: AcceptanceReceipt,
+        formal_plan_projection_receipt: AcceptanceReceipt,
+    ) -> dict[str, object]:
+        if not isinstance(formal_plan_projection_receipt, AcceptanceReceipt):
+            raise OwnerConflict("target_formal_plan_projection_receipt_required")
+        graph, result = self._query_bundle_report_contract_source(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            graph_ref=graph_ref,
+            head_receipt=head_receipt,
+            formal_plan_content_receipt=formal_plan_content_receipt,
+        )
+        completion = result.get("completion_contract")
+        if type(completion) is not NormalizedCompletionContract:
+            raise OwnerConflict("bundle_report_contract_invalid")
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_formal_plan_projection_verifier_unavailable")
+        projection = verifier.query_formal_plan_projection(graph_ref=graph_ref)
+        if projection is None or projection.receipt != formal_plan_projection_receipt:
+            raise OwnerConflict("target_formal_plan_projection_invalid")
+        verifier.verify_formal_plan_projection(
+            graph_ref=graph_ref,
+            formal_plan=projection.formal_plan,
+            plan_document_hash=projection.plan_document_hash,
+            source_acceptance_receipt=projection.source_acceptance_receipt,
+            completion_contract_hash=projection.completion_contract_hash,
+            receipt=projection.receipt,
+        )
+        if (
+            projection.plan_document_hash != graph.plan_document_hash
+            or projection.source_acceptance_receipt != formal_plan_content_receipt
+            or projection.completion_contract != completion
+            or projection.formal_plan.briefs != result["briefs"]
+        ):
+            raise OwnerConflict("target_formal_plan_projection_invalid")
+        result.update(
+            {
+                "plan": projection.formal_plan,
+                "plan_document_hash": projection.plan_document_hash,
+                "source_acceptance_receipt": (
+                    projection.source_acceptance_receipt
+                ),
+                "completion_contract_hash": (
+                    projection.completion_contract_hash
+                ),
+                "briefs_hash": projection.briefs_hash,
+                "projection_digest": projection.projection_digest,
+                "projection_receipt": projection.receipt,
+                "formal_plan_projection": projection,
+            }
+        )
+        result.pop("formal_plan_ref", None)
+        result.pop("briefs", None)
+        return result
+
+    def verify_bundle_report_target_commits(
+        self,
+        *,
+        graph_ref: str,
+        closures: tuple[AcceptedMeasurementClosure, ...],
+        receipts: tuple[AcceptanceReceipt, ...] | None,
+        head_receipt: AcceptanceReceipt,
+    ) -> tuple[AcceptanceReceipt, ...]:
+        if receipts is not None and len(closures) != len(receipts):
+            raise OwnerConflict("bundle_report_target_commit_invalid")
+        with self._database.read() as connection:
+            graph_row = connection.execute(
+                text("SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"),
+                {"graph_ref": graph_ref},
+            ).first()
+            rows = connection.execute(
+                text(
+                    "SELECT c.* FROM rg_target_commits c JOIN rg_targets t ON "
+                    "t.target_ref = c.target_ref WHERE t.graph_ref = :graph_ref"
+                ),
+                {"graph_ref": graph_ref},
+            ).all()
+        if graph_row is None:
+            raise OwnerConflict("bundle_report_target_commit_invalid")
+        self.verify_target_graph_receipt(
+            request_ref=graph_row.request_ref,
+            run_ref=graph_row.run_ref,
+            graph_ref=graph_ref,
+            receipt=head_receipt,
+            require_current=True,
+            require_complete=False,
+        )
+        commits = {row.commit_ref: _target_commit(row) for row in rows}
+        commit_bindings = {
+            (commit.commit_ref, commit.target_ref) for commit in commits.values()
+        }
+        closure_bindings = {
+            (closure.target_commit_ref, closure.target_ref)
+            for closure in closures
+        }
+        if (
+            len(commits) != len(rows)
+            or len(closure_bindings) != len(closures)
+            or closure_bindings != commit_bindings
+        ):
+            # A blocked or replan report may legitimately include Targets with
+            # no commit, but it may never omit a commit that RG has already
+            # accepted.  Bind both identities so a handoff cannot substitute
+            # one Target's closure under another TargetRef.
+            raise OwnerConflict("bundle_report_target_commit_invalid")
+        resolved_receipts = tuple(
+            commits[closure.target_commit_ref].receipt
+            for closure in sorted(
+                closures, key=lambda value: value.target_commit_ref
+            )
+        )
+        supplied_receipts = resolved_receipts if receipts is None else receipts
+        paired = tuple(
+            sorted(
+                zip(closures, supplied_receipts, strict=True),
+                key=lambda pair: pair[0].target_commit_ref,
+            )
+        )
+        if tuple(receipt.subject_ref for _closure, receipt in paired) != tuple(
+            closure.target_commit_ref for closure, _receipt in paired
+        ):
+            raise OwnerConflict("bundle_report_target_commit_invalid")
+        if len(paired) != len(
+            {closure.target_commit_ref for closure, _receipt in paired}
+        ):
+            raise OwnerConflict("bundle_report_target_commit_invalid")
+        for closure, receipt in paired:
+            commit = commits.get(closure.target_commit_ref)
+            try:
+                transition = self.query_target_frontier_commit_transition(
+                    closure.target_ref
+                )
+            except OwnerConflict as error:
+                raise OwnerConflict(
+                    "bundle_report_target_commit_invalid"
+                ) from error
+            if (
+                commit is None
+                or receipt.issuer != RG_OWNER
+                or receipt.kind != TARGET_COMMIT_RECEIPT_KIND
+                or commit.receipt != receipt
+                or commit.target_ref != closure.target_ref
+                or commit.target_run_ref != closure.target_run_ref
+                or commit.evaluation_attempt_ref != closure.evaluation_attempt_ref
+                or closure.rg_target_commit_receipt.receipt_ref
+                != commit.receipt.receipt_ref
+                or closure.rg_target_commit_receipt.subject_ref != commit.commit_ref
+                or transition is None
+                or transition.target_ref != closure.target_ref
+                or transition.target_run_ref != closure.target_run_ref
+                or transition.execution_attempt_ref
+                != closure.execution_attempt_ref
+                or transition.execution_fence_ref != closure.execution_fence_ref
+                or transition.target_commit_ref != commit.commit_ref
+                or transition.canonical_terminal != closure
+                or transition.issuer_receipt != receipt
+            ):
+                raise OwnerConflict("bundle_report_target_commit_invalid")
+        return tuple(receipt for _closure, receipt in paired)
+
     def verify_accepted_formal_plan_binding(
         self, binding: AcceptedFormalPlanBinding
     ) -> None:
@@ -2163,6 +3653,102 @@ class SQLiteResearchGraphReceiptVerifier:
             receipt=binding.formal_plan_receipt,
         )
 
+    def query_target_graph_rejection(
+        self, submission_ref: str
+    ) -> TargetGraphRejection | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_graph_rejections WHERE "
+                    "submission_ref = :submission_ref"
+                ),
+                {"submission_ref": submission_ref},
+            ).first()
+            accepted = connection.execute(
+                text(
+                    "SELECT graph_ref FROM rg_target_graphs WHERE "
+                    "submission_ref = :submission_ref"
+                ),
+                {"submission_ref": submission_ref},
+            ).first()
+        if row is None:
+            return None
+        if accepted is not None:
+            raise OwnerConflict("target_graph_rejection_integrity_invalid")
+        rejection = _target_graph_rejection(row)
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        verified = self._stage_request_verifier.query_verified_bundle_stage_request(
+            request_ref=row.request_ref,
+            context_pack_ref=row.context_pack_ref,
+        )
+        formal = verified.accepted_formal_plan
+        if formal is None:
+            raise OwnerConflict("target_graph_rejection_integrity_invalid")
+        try:
+            question_binding = verified.context_pack.get(
+                "accepted_question_binding"
+            )
+            if not isinstance(question_binding, dict):
+                raise BundleContractError("bundle_context_pack_invalid")
+            validate_bundle_context_pack(
+                verified.context_pack,
+                cycle_ref=verified.cycle_ref,
+                accepted_question_binding=question_binding,
+                accepted_formal_plan_binding=formal.as_dict(),
+            )
+            validated_hash = validate_target_plan(
+                rejection.target_plan,
+                formal_plan_ref=formal.formal_plan_ref,
+                context_pack_ref=row.context_pack_ref,
+                context_pack_hash=verified.context_pack_hash,
+                plan_document=formal.plan_document,
+            )
+        except (BundleContractError, BundleTargetContractError) as error:
+            raise OwnerConflict("target_graph_rejection_integrity_invalid") from error
+        if (
+            row.context_pack_hash != verified.context_pack_hash
+            or row.formal_plan_ref != formal.formal_plan_ref
+            or row.plan_document_hash != formal.plan_document_hash
+            or validated_hash != row.target_plan_hash
+        ):
+            raise OwnerConflict("target_graph_rejection_integrity_invalid")
+        if self._execution_verifier is None:
+            raise OwnerConflict("attempt_execution_verifier_unavailable")
+        executed_hash = self._execution_verifier.verify_attempt_execution_receipt(
+            request_ref=row.request_ref,
+            run_ref=row.run_ref,
+            attempt_ref=row.attempt_ref,
+            fence_ref=row.fence_ref,
+            submission_ref=row.submission_ref,
+            payload_hash=row.execution_payload_hash,
+            receipt=rejection.execution_receipt,
+        )
+        if executed_hash != row.target_plan_hash:
+            raise OwnerConflict("target_graph_rejection_integrity_invalid")
+        return rejection
+
+    def verify_target_graph_rejection_receipt(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != RG_OWNER
+            or receipt.kind != TARGET_GRAPH_REJECTED_RECEIPT_KIND
+            or receipt.subject_ref != submission_ref
+        ):
+            raise OwnerConflict("target_graph_rejection_receipt_issuer_invalid")
+        rejection = self.query_target_graph_rejection(submission_ref)
+        if (
+            rejection is None
+            or rejection.request_ref != request_ref
+            or rejection.receipt != receipt
+        ):
+            raise OwnerConflict("target_graph_rejection_receipt_invalid")
+
     def verify_target_graph_receipt(
         self,
         *,
@@ -2170,7 +3756,9 @@ class SQLiteResearchGraphReceiptVerifier:
         run_ref: str,
         graph_ref: str,
         receipt: AcceptanceReceipt,
-    ) -> None:
+        require_current: bool = False,
+        require_complete: bool = False,
+    ) -> dict[str, object]:
         if (
             receipt.issuer != RG_OWNER
             or receipt.kind != TARGET_GRAPH_RECEIPT_KIND
@@ -2182,6 +3770,21 @@ class SQLiteResearchGraphReceiptVerifier:
                 text("SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"),
                 {"graph_ref": graph_ref},
             ).first()
+            execution_row = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT payload_hash FROM ar_stage_attempts WHERE "
+                        "attempt_ref = :attempt_ref AND execution_receipt_ref = "
+                        ":execution_receipt_ref"
+                    ),
+                    {
+                        "attempt_ref": row.attempt_ref,
+                        "execution_receipt_ref": row.execution_receipt_ref,
+                    },
+                ).first()
+            )
             target_rows = (
                 []
                 if row is None
@@ -2193,14 +3796,118 @@ class SQLiteResearchGraphReceiptVerifier:
                     {"graph_ref": graph_ref},
                 ).fetchall()
             )
+            append_rows = (
+                []
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT a.*, p.proposal_json AS proposal_json FROM "
+                        "rg_target_graph_appends a JOIN ar_bundle_target_proposals p "
+                        "ON p.proposal_ref = a.proposal_ref WHERE a.graph_ref = "
+                        ":graph_ref ORDER BY a.generation"
+                    ),
+                    {"graph_ref": graph_ref},
+                ).fetchall()
+            )
+            plan_row = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT plan_document_json, plan_document_hash FROM "
+                        "rm_plan_documents WHERE content_ref = :content_ref"
+                    ),
+                    {"content_ref": row.plan_content_ref},
+                ).first()
+            )
         if row is None or (
             row.request_ref != request_ref
             or row.run_ref != run_ref
-            or row.receipt_ref != receipt.receipt_ref
-            or row.receipt_hash != receipt.payload_hash
         ):
             raise OwnerConflict("target_graph_receipt_invalid")
-        _accepted_target_graph(row, target_rows)
+        try:
+            plan_document = (
+                None if plan_row is None else decoded_object(plan_row.plan_document_json)
+            )
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("target_graph_receipt_invalid") from error
+        if plan_row is not None and (
+            canonical_hash(plan_document) != plan_row.plan_document_hash
+            or plan_row.plan_document_hash != row.plan_document_hash
+        ):
+            raise OwnerConflict("target_graph_receipt_invalid")
+        accepted = _accepted_target_graph(
+            row,
+            target_rows,
+            append_rows,
+            plan_document,
+        )
+        accepted_receipts = (accepted.receipt,) + tuple(
+            AcceptanceReceipt(
+                issuer=RG_OWNER,
+                kind=TARGET_GRAPH_RECEIPT_KIND,
+                receipt_ref=append_row.receipt_ref,
+                subject_ref=graph_ref,
+                payload_hash=append_row.receipt_hash,
+            )
+            for append_row in append_rows
+        )
+        if receipt not in accepted_receipts:
+            raise OwnerConflict("target_graph_receipt_invalid")
+        if self._execution_verifier is None or execution_row is None:
+            raise OwnerConflict("attempt_execution_verifier_unavailable")
+        executed_hash = self._execution_verifier.verify_attempt_execution_receipt(
+            request_ref=row.request_ref,
+            run_ref=row.run_ref,
+            attempt_ref=row.attempt_ref,
+            fence_ref=row.fence_ref,
+            submission_ref=row.submission_ref,
+            payload_hash=execution_row.payload_hash,
+            receipt=accepted.execution_receipt,
+        )
+        if executed_hash != row.target_plan_hash:
+            raise OwnerConflict("target_graph_receipt_invalid")
+        predecessor = accepted.receipt
+        for append_row in append_rows:
+            if self._execution_verifier is None:
+                raise OwnerConflict("attempt_execution_verifier_unavailable")
+            self._execution_verifier.verify_bundle_target_proposal_receipt(
+                proposal_ref=append_row.proposal_ref,
+                run_ref=row.run_ref,
+                attempt_ref=row.attempt_ref,
+                fence_ref=row.fence_ref,
+                graph_ref=graph_ref,
+                base_generation=int(append_row.generation) - 1,
+                base_head_receipt=predecessor,
+                proposal_hash=append_row.proposal_hash,
+                receipt=AcceptanceReceipt(
+                    issuer="agent_runtime",
+                    kind="bundle_target_proposal",
+                    receipt_ref=append_row.proposal_receipt_ref,
+                    subject_ref=append_row.proposal_ref,
+                    payload_hash=append_row.proposal_receipt_hash,
+                ),
+            )
+            predecessor = AcceptanceReceipt(
+                issuer=RG_OWNER,
+                kind=TARGET_GRAPH_RECEIPT_KIND,
+                receipt_ref=append_row.receipt_ref,
+                subject_ref=graph_ref,
+                payload_hash=append_row.receipt_hash,
+            )
+        if require_current and receipt != accepted.head_receipt:
+            raise OwnerConflict("target_graph_head_stale")
+        if require_complete and not accepted.strategy_complete:
+            raise OwnerConflict("target_graph_strategy_incomplete")
+        return {
+            "graph_ref": graph_ref,
+            "generation": accepted.head_generation,
+            "strategy_complete": accepted.strategy_complete,
+            "target_set_hash": accepted.target_set_hash,
+            "coverage_hash": accepted.coverage_hash,
+            "root_receipt": accepted.receipt.as_public_dict(),
+            "receipt": accepted.head_receipt.as_public_dict(),
+        }
 
     def match_bundle_target_candidate(
         self,
@@ -2212,51 +3919,405 @@ class SQLiteResearchGraphReceiptVerifier:
     ) -> str | None:
         """Identify exact Bundle experiments before AR makes them claimable."""
 
+        # Formal Targets have a root-lifecycle authority.  The
+        # historical Target-to-Experiment matcher is permanently disabled;
+        # persisted legacy rows remain queryable only as diagnostics.
+        return None
+
+    def verify_target_launch_request(
+        self, request: TargetLaunchRequest
+    ) -> TargetLaunchVerification:
+        """Recompute the complete current launch authority from RG/RM facts.
+
+        This is deliberately independent of Experiment admission.  AR invokes
+        it while holding its launch transaction, before allocating any
+        TargetRun, Session, Attempt, Fence, frontier, or provider work.
+        """
+
+        try:
+            validate_target_launch_request(request)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("target_launch_request_invalid") from error
+        authoritative, verification = self._formal_target_launch_authority(
+            request.target_ref
+        )
+        if request != authoritative:
+            raise OwnerConflict("target_launch_authority_stale")
+        return verification
+
+    def query_target_launch_request(self, target_ref: str) -> TargetLaunchRequest:
+        request, _verification = self._formal_target_launch_authority(target_ref)
+        return request
+
+    def _formal_target_launch_authority(
+        self, target_ref: str
+    ) -> tuple[TargetLaunchRequest, TargetLaunchVerification]:
+        source, verification = self._target_launch_authority(target_ref)
+        reader = self._target_measurement_domain_authority_reader
+        if reader is None:
+            raise OwnerConflict(
+                "target_measurement_domain_authority_reader_unavailable"
+            )
+        measurement_authority = reader.query_target_measurement_domain_authority(
+            target_ref
+        )
+        if measurement_authority is None:
+            # Upgraded pre-0027 Target rows have no provable Plan-bound domain
+            # authority.  They remain diagnostic history and cannot launch.
+            raise OwnerConflict("target_measurement_domain_authority_required")
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_candidate_projection_verifier_unavailable")
+        projection = self.query_target_candidate_projection(target_ref=target_ref)
+        if projection is None:
+            raise OwnerConflict("target_candidate_projection_required")
+        verifier.verify_candidate_projection(
+            target_ref=target_ref,
+            candidate=projection.candidate,
+            source_spec_hash=projection.source_spec_hash,
+            source_acceptance_receipt=projection.source_acceptance_receipt,
+            receipt=projection.receipt,
+        )
+        if (
+            projection.source_spec_hash
+            != source.target_spec_binding.content_hash_ref
+            or projection.source_acceptance_receipt.receipt_ref
+            != source.target_spec_acceptance_receipt.receipt_ref
+            or projection.source_acceptance_receipt.subject_ref
+            != source.target_spec_acceptance_receipt.subject_ref
+        ):
+            raise OwnerConflict("target_candidate_projection_source_invalid")
+        request = TargetLaunchRequest(
+            target_ref=source.target_ref,
+            target_spec_binding=ContentBindingProof(
+                subject_ref=source.target_ref,
+                content_hash_ref=projection.projection_digest,
+            ),
+            target_spec_acceptance_receipt=ReceiptProof(
+                receipt_ref=projection.receipt.receipt_ref,
+                subject_ref=projection.projection_digest,
+                verified=True,
+                currentness_known=True,
+                current=True,
+            ),
+            accepted_input_target_commit_refs=(
+                source.accepted_input_target_commit_refs
+            ),
+            accepted_input_asset_refs=source.accepted_input_asset_refs,
+            recoverable_required=source.recoverable_required,
+        )
+        validate_target_launch_request(request)
+        return request, verification
+
+    def _target_launch_authority(
+        self, target_ref: str
+    ) -> tuple[TargetLaunchRequest, TargetLaunchVerification]:
+        if not isinstance(target_ref, str) or not target_ref:
+            raise OwnerConflict("target_launch_request_invalid")
         with self._database.read() as connection:
             target_row = connection.execute(
                 text(
-                    "SELECT t.*, g.quest_ref FROM rg_targets t JOIN "
+                    "SELECT t.*, g.request_ref AS stage_request_ref, g.quest_ref, "
+                    "g.run_ref AS bundle_run_ref FROM rg_targets t JOIN "
                     "rg_target_graphs g ON g.graph_ref = t.graph_ref WHERE "
-                    ":execution_request_ref = 'bundle-target-' || t.target_ref"
+                    "t.target_ref = :target_ref"
                 ),
-                {"execution_request_ref": execution_request_ref},
+                {"target_ref": target_ref},
             ).first()
-            experiment_row = connection.execute(
+            if target_row is None:
+                raise OwnerConflict("target_launch_target_invalid")
+            spec_acceptance_row = connection.execute(
                 text(
-                    "SELECT * FROM rg_experiment_requests WHERE "
-                    "evaluation_attempt_ref = :evaluation_attempt_ref AND "
-                    "execution_request_ref = :execution_request_ref"
+                    "SELECT * FROM rg_target_spec_acceptances WHERE target_ref = "
+                    ":target_ref"
                 ),
-                {
-                    "evaluation_attempt_ref": evaluation_attempt_ref,
-                    "execution_request_ref": execution_request_ref,
-                },
+                {"target_ref": target_ref},
             ).first()
-        if target_row is None:
-            return None
-        if experiment_row is None:
-            raise OwnerConflict("bundle_target_experiment_invalid")
-        target = _accepted_target(target_row)
-        expected_intent = ExperimentIntent(
-            execution_request_ref=f"bundle-target-{target.target_ref}",
-            quest_ref=target_row.quest_ref,
-            title=cast(str, target.spec["title"]),
-            hypothesis=cast(str, target.spec["hypothesis"]),
-            variant_parameter=float(target.spec["variant_parameter"]),
-            sample_count=cast(int, target.spec["sample_count"]),
+            graph_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"
+                ),
+                {"graph_ref": target_row.graph_ref},
+            ).first()
+            target_rows = connection.execute(
+                text(
+                    "SELECT * FROM rg_targets WHERE graph_ref = :graph_ref "
+                    "ORDER BY ordinal"
+                ),
+                {"graph_ref": target_row.graph_ref},
+            ).all()
+            append_rows = connection.execute(
+                text(
+                    "SELECT a.*, p.proposal_json AS proposal_json FROM "
+                    "rg_target_graph_appends a JOIN ar_bundle_target_proposals p "
+                    "ON p.proposal_ref = a.proposal_ref WHERE a.graph_ref = "
+                    ":graph_ref ORDER BY a.generation"
+                ),
+                {"graph_ref": target_row.graph_ref},
+            ).all()
+            plan_row = (
+                None
+                if graph_row is None
+                else connection.execute(
+                    text(
+                        "SELECT plan_document_json, plan_document_hash FROM "
+                        "rm_plan_documents WHERE content_ref = :content_ref"
+                    ),
+                    {"content_ref": graph_row.plan_content_ref},
+                ).first()
+            )
+            dependency_commit_rows = connection.execute(
+                text(
+                    "SELECT c.* FROM rg_target_commits c JOIN rg_targets t ON "
+                    "t.target_ref = c.target_ref WHERE t.graph_ref = :graph_ref"
+                ),
+                {"graph_ref": target_row.graph_ref},
+            ).all()
+            legacy_binding = connection.execute(
+                text(
+                    "SELECT 1 FROM rg_target_run_bindings WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if graph_row is None or plan_row is None:
+            raise OwnerConflict("target_launch_target_invalid")
+        try:
+            plan_document = decoded_object(plan_row.plan_document_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("target_launch_target_invalid") from error
+        if (
+            canonical_hash(plan_document) != plan_row.plan_document_hash
+            or plan_row.plan_document_hash != graph_row.plan_document_hash
+        ):
+            raise OwnerConflict("target_launch_target_invalid")
+        graph = _accepted_target_graph(
+            graph_row,
+            target_rows,
+            append_rows,
+            plan_document,
+        )
+        target_by_ref = {target.target_ref: target for target in graph.targets}
+        target = target_by_ref.get(target_ref)
+        if target is None or spec_acceptance_row is None:
+            raise OwnerConflict("target_launch_target_invalid")
+        spec_proof = self._verify_target_spec_acceptance_row(
+            target=target,
+            row=spec_acceptance_row,
+        )
+        commits = tuple(_target_commit(row) for row in dependency_commit_rows)
+        commit_by_target = {commit.target_ref: commit for commit in commits}
+        if len(commit_by_target) != len(commits):
+            raise OwnerConflict("target_launch_upstream_commits_invalid")
+        if (
+            legacy_binding is not None
+            or target_ref in commit_by_target
+            or any(ref not in commit_by_target for ref in target.dependency_refs)
+        ):
+            raise OwnerConflict("target_launch_frontier_invalid")
+        upstream_commit_refs = tuple(
+            sorted(commit_by_target[ref].commit_ref for ref in target.dependency_refs)
+        )
+        direct_asset_refs = _target_direct_accepted_input_asset_refs(target.spec)
+        proof_reader = self._target_input_asset_proof_reader
+        if direct_asset_refs and proof_reader is None:
+            raise OwnerConflict("target_launch_asset_proof_verifier_unavailable")
+        asset_proofs = tuple(
+            proof
+            for asset_ref in direct_asset_refs
+            for proof in (
+                proof_reader.query_bundle_input_asset_proof(
+                    target_ref=target_ref,
+                    asset_ref=asset_ref,
+                )
+                if proof_reader is not None
+                else None,
+            )
+            if proof is not None
+        )
+        if tuple(proof.asset_ref for proof in asset_proofs) != direct_asset_refs:
+            raise OwnerConflict("target_launch_asset_proof_invalid")
+        risk_class = target.spec.get("risk_class")
+        if risk_class not in {"normal", "high"}:
+            raise OwnerConflict("target_launch_target_invalid")
+        binding = ContentBindingProof(
+            subject_ref=target_ref,
+            content_hash_ref=target.spec_hash,
+        )
+        proof = ReceiptProof(
+            receipt_ref=spec_proof.receipt_ref,
+            subject_ref=target.spec_hash,
+            verified=True,
+            currentness_known=True,
+            current=True,
+        )
+        request = TargetLaunchRequest(
+            target_ref=target_ref,
+            target_spec_binding=binding,
+            target_spec_acceptance_receipt=proof,
+            accepted_input_target_commit_refs=upstream_commit_refs,
+            accepted_input_asset_refs=direct_asset_refs,
+            recoverable_required=True,
         )
         try:
-            stored_intent = decoded_object(experiment_row.intent_json)
+            validate_target_launch_request(request)
         except (TypeError, ValueError) as error:
-            raise OwnerConflict("bundle_target_experiment_invalid") from error
+            raise OwnerConflict("target_launch_request_invalid") from error
+        return request, TargetLaunchVerification(
+            graph_ref=graph.graph_ref,
+            stage_request_ref=graph.request_ref,
+            quest_ref=graph.quest_ref,
+            risk_class=cast(str, risk_class),
+            asset_proofs=asset_proofs,
+        )
+
+    def verify_target_spec_content_receipt(
+        self,
+        *,
+        target_ref: str,
+        binding: ContentBindingProof,
+        receipt: ReceiptProof,
+        require_uncommitted: bool = False,
+    ) -> None:
+        """Re-read the actual content-subject RG receipt and Target currentness."""
+
+        with self._database.read() as connection:
+            target_row = connection.execute(
+                text(
+                    "SELECT t.*, g.request_ref, g.quest_ref FROM rg_targets t "
+                    "JOIN rg_target_graphs g ON g.graph_ref = t.graph_ref WHERE "
+                    "t.target_ref = :target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            spec_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_spec_acceptances WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            committed = connection.execute(
+                text(
+                    "SELECT 1 FROM rg_target_commits WHERE target_ref = :target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if target_row is None or spec_row is None:
+            raise OwnerConflict("target_spec_content_receipt_invalid")
+        target = _accepted_target(target_row)
+        expected = self._verify_target_spec_acceptance_row(
+            target=target,
+            row=spec_row,
+        )
         if (
-            target_row.quest_ref != quest_ref
-            or experiment_row.quest_ref != quest_ref
-            or experiment_row.definition_hash != definition_hash
-            or stored_intent != expected_intent.as_dict()
+            binding
+            != ContentBindingProof(
+                subject_ref=target_ref,
+                content_hash_ref=target.spec_hash,
+            )
+            or receipt != expected
+            or (require_uncommitted and committed is not None)
         ):
-            raise OwnerConflict("bundle_target_experiment_invalid")
-        return target.target_ref
+            raise OwnerConflict("target_spec_content_receipt_invalid")
+
+    def query_target_candidate_projection_source(
+        self, *, target_ref: str
+    ) -> dict[str, object]:
+        """Return the complete formal wrapper and its own receipt chain.
+
+        This source seam deliberately does not construct or return a
+        ``TargetCandidate``.  The 0022 projection authority owns that separate
+        canonical subject.
+        """
+
+        with self._database.read() as connection:
+            target_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_targets WHERE target_ref = :target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            spec_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_spec_acceptances WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if target_row is None or spec_row is None:
+            raise OwnerConflict("target_candidate_projection_source_missing")
+        target = _accepted_target(target_row)
+        proof = self._verify_target_spec_acceptance_row(
+            target=target,
+            row=spec_row,
+        )
+        receipt = AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=TARGET_SPEC_CONTENT_RECEIPT_KIND,
+            receipt_ref=proof.receipt_ref,
+            subject_ref=target.spec_hash,
+            payload_hash=spec_row.receipt_hash,
+        )
+        return {
+            "target_ref": target.target_ref,
+            "graph_ref": target.graph_ref,
+            "spec": target.spec,
+            "source_spec_hash": target.spec_hash,
+            "source_acceptance_receipt": receipt,
+        }
+
+    def verify_target_candidate_projection_receipt(
+        self,
+        *,
+        target_ref: str,
+        binding: ContentBindingProof,
+        receipt: ReceiptProof,
+        require_uncommitted: bool = False,
+    ) -> None:
+        verifier = self._target_formal_plan_projection_verifier
+        if verifier is None:
+            raise OwnerConflict("target_candidate_projection_verifier_unavailable")
+        accepted = verifier.query_candidate_projection(target_ref=target_ref)
+        if accepted is None:
+            raise OwnerConflict("target_candidate_projection_invalid")
+        verifier.verify_candidate_projection(
+            target_ref=target_ref,
+            candidate=accepted.candidate,
+            source_spec_hash=accepted.source_spec_hash,
+            source_acceptance_receipt=accepted.source_acceptance_receipt,
+            receipt=accepted.receipt,
+        )
+        with self._database.read() as connection:
+            committed = connection.execute(
+                text(
+                    "SELECT 1 FROM rg_target_commits WHERE target_ref = :target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if (
+            binding
+            != ContentBindingProof(
+                subject_ref=target_ref,
+                content_hash_ref=accepted.projection_digest,
+            )
+            or receipt
+            != ReceiptProof(
+                receipt_ref=accepted.receipt.receipt_ref,
+                subject_ref=accepted.projection_digest,
+                verified=True,
+                currentness_known=True,
+                current=True,
+            )
+            or (require_uncommitted and committed is not None)
+        ):
+            raise OwnerConflict("target_candidate_projection_invalid")
+
+    @staticmethod
+    def _verify_target_spec_acceptance_row(
+        *, target: AcceptedTarget, row
+    ) -> ReceiptProof:
+        return _verify_target_spec_acceptance_row(target=target, row=row)
 
     def verify_target_run_candidate(
         self,
@@ -2309,13 +4370,10 @@ class SQLiteResearchGraphReceiptVerifier:
         if target_row is None or experiment_row is None:
             raise OwnerConflict("target_run_candidate_invalid")
         target = _accepted_target(target_row)
-        expected_intent = ExperimentIntent(
-            execution_request_ref=f"bundle-target-{target_ref}",
+        expected_intent = target_experiment_intent(
             quest_ref=quest_ref,
-            title=cast(str, target.spec["title"]),
-            hypothesis=cast(str, target.spec["hypothesis"]),
-            variant_parameter=float(target.spec["variant_parameter"]),
-            sample_count=cast(int, target.spec["sample_count"]),
+            target_ref=target_ref,
+            target_spec=target.spec,
         )
         try:
             stored_intent = decoded_object(experiment_row.intent_json)
@@ -2364,6 +4422,26 @@ class SQLiteResearchGraphReceiptVerifier:
                 ),
                 {"graph_ref": graph_ref},
             ).all()
+            append_rows = connection.execute(
+                text(
+                    "SELECT a.*, p.proposal_json AS proposal_json FROM "
+                    "rg_target_graph_appends a JOIN ar_bundle_target_proposals p "
+                    "ON p.proposal_ref = a.proposal_ref WHERE a.graph_ref = "
+                    ":graph_ref ORDER BY a.generation"
+                ),
+                {"graph_ref": graph_ref},
+            ).all()
+            plan_row = (
+                None
+                if graph_row is None
+                else connection.execute(
+                    text(
+                        "SELECT plan_document_json, plan_document_hash FROM "
+                        "rm_plan_documents WHERE content_ref = :content_ref"
+                    ),
+                    {"content_ref": graph_row.plan_content_ref},
+                ).first()
+            )
             bound = {
                 row.target_ref
                 for row in connection.execute(
@@ -2386,13 +4464,22 @@ class SQLiteResearchGraphReceiptVerifier:
                     {"graph_ref": graph_ref},
                 ).all()
             }
+        try:
+            plan_document = (
+                None if plan_row is None else decoded_object(plan_row.plan_document_json)
+            )
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("bundle_dispatch_frontier_invalid") from error
         if (
             graph_row is None
+            or plan_row is None
+            or canonical_hash(plan_document) != plan_row.plan_document_hash
+            or plan_row.plan_document_hash != graph_row.plan_document_hash
             or graph_row.request_ref != request_ref
             or graph_row.run_ref != run_ref
         ):
             raise OwnerConflict("bundle_dispatch_frontier_invalid")
-        _accepted_target_graph(graph_row, target_rows)
+        _accepted_target_graph(graph_row, target_rows, append_rows, plan_document)
         authoritative = tuple(
             target
             for target in (_accepted_target(row) for row in target_rows)
@@ -2418,6 +4505,8 @@ class SQLiteResearchGraphReceiptVerifier:
                 "target_key": target.target_key,
                 "spec_hash": target.spec_hash,
                 "spec": target.spec,
+                "candidate": target.spec["candidate"],
+                "risk_class": target.spec["risk_class"],
                 "dependency_refs": list(target.dependency_refs),
                 "receipt": target.receipt.as_public_dict(),
             }
@@ -2431,15 +4520,40 @@ class SQLiteResearchGraphReceiptVerifier:
         *,
         graph_ref: str,
         receipts: tuple[AcceptanceReceipt, ...],
+        head_receipt: AcceptanceReceipt | None = None,
     ) -> None:
         with self._database.read() as connection:
+            graph_row = connection.execute(
+                text("SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"),
+                {"graph_ref": graph_ref},
+            ).first()
             target_rows = connection.execute(
                 text(
-                    "SELECT target_ref FROM rg_targets WHERE graph_ref = "
+                    "SELECT * FROM rg_targets WHERE graph_ref = "
                     ":graph_ref ORDER BY ordinal"
                 ),
                 {"graph_ref": graph_ref},
             ).fetchall()
+            append_rows = connection.execute(
+                text(
+                    "SELECT a.*, p.proposal_json AS proposal_json FROM "
+                    "rg_target_graph_appends a JOIN ar_bundle_target_proposals p "
+                    "ON p.proposal_ref = a.proposal_ref WHERE a.graph_ref = "
+                    ":graph_ref ORDER BY a.generation"
+                ),
+                {"graph_ref": graph_ref},
+            ).fetchall()
+            plan_row = (
+                None
+                if graph_row is None
+                else connection.execute(
+                    text(
+                        "SELECT plan_document_json, plan_document_hash FROM "
+                        "rm_plan_documents WHERE content_ref = :content_ref"
+                    ),
+                    {"content_ref": graph_row.plan_content_ref},
+                ).first()
+            )
             commit_rows = connection.execute(
                 text(
                     "SELECT c.* FROM rg_target_commits c JOIN rg_targets t ON "
@@ -2448,11 +4562,35 @@ class SQLiteResearchGraphReceiptVerifier:
                 ),
                 {"graph_ref": graph_ref},
             ).fetchall()
+        try:
+            plan_document = (
+                None if plan_row is None else decoded_object(plan_row.plan_document_json)
+            )
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("target_commit_set_incomplete") from error
+        graph = (
+            None
+            if graph_row is None
+            else _accepted_target_graph(
+                graph_row,
+                target_rows,
+                append_rows,
+                plan_document,
+            )
+        )
         commits = tuple(_target_commit(row) for row in commit_rows)
         if (
-            not target_rows
+            graph is None
+            or not target_rows
             or len(commits) != len(target_rows)
             or tuple(commit.receipt for commit in commits) != receipts
+            or (
+                head_receipt is not None
+                and (
+                    graph.head_receipt != head_receipt
+                    or not graph.strategy_complete
+                )
+            )
             or any(
                 receipt.issuer != RG_OWNER or receipt.kind != TARGET_COMMIT_RECEIPT_KIND
                 for receipt in receipts
@@ -2528,6 +4666,10 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         human_response_verifier: HumanResponseVerifier | None = None,
         plan_content_verifier: PlanContentReceiptVerifier | None = None,
         runtime_control_verifier: RuntimeControlReceiptVerifier | None = None,
+        target_candidate_proof_verifier: TargetCandidateOwnerProofVerifier
+        | None = None,
+        target_execution_closure_verifier: TargetExecutionClosureVerifier
+        | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -2544,7 +4686,536 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         )
         self._plan_content_verifier = plan_content_verifier
         self._runtime_control_verifier = runtime_control_verifier
+        self._target_candidate_proof_verifier = target_candidate_proof_verifier
+        self._target_execution_closure_verifier = (
+            target_execution_closure_verifier
+        )
+        self._target_measurement_execution_reader: (
+            TargetMeasurementExecutionReader | None
+        ) = None
+        self._target_measurement_result_reader: (
+            TargetMeasurementResultReader | None
+        ) = None
+        self._target_root_completion_reader: TargetRootCompletionReader | None = None
+        self._target_root_manifest_reader: (
+            TargetRootCompletionManifestReader | None
+        ) = None
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
+        # Receipt verification is constructed first in production composition.
+        # Bind this owning RG facade afterward so launch verification can read
+        # the current authority without a constructor cycle or duplicate store.
+        self._receipt_verifier.bind_target_measurement_domain_authority_reader(
+            self
+        )
+        self._receipt_verifier.bind_target_root_commit_transition_reader(self)
+
+    def bind_target_candidate_proof_verifier(
+        self, verifier: TargetCandidateOwnerProofVerifier
+    ) -> None:
+        current = self._target_candidate_proof_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict("target_candidate_proof_verifier_already_bound")
+        self._target_candidate_proof_verifier = verifier
+
+    def bind_target_execution_closure_verifier(
+        self, verifier: TargetExecutionClosureVerifier
+    ) -> None:
+        current = self._target_execution_closure_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict(
+                "target_execution_closure_verifier_already_bound"
+            )
+        self._target_execution_closure_verifier = verifier
+        self._receipt_verifier.bind_target_execution_closure_verifier(verifier)
+
+    def bind_target_measurement_runtime_readers(
+        self,
+        *,
+        execution_reader: TargetMeasurementExecutionReader,
+        result_reader: TargetMeasurementResultReader,
+    ) -> None:
+        current_execution = self._target_measurement_execution_reader
+        current_result = self._target_measurement_result_reader
+        if (
+            current_execution is not None
+            and current_execution is not execution_reader
+        ) or (current_result is not None and current_result is not result_reader):
+            raise OwnerConflict("target_measurement_runtime_readers_already_bound")
+        self._target_measurement_execution_reader = execution_reader
+        self._target_measurement_result_reader = result_reader
+
+    def bind_target_root_completion_readers(
+        self,
+        *,
+        completion_reader: TargetRootCompletionReader,
+        manifest_reader: TargetRootCompletionManifestReader,
+    ) -> None:
+        current_completion = self._target_root_completion_reader
+        current_manifest = self._target_root_manifest_reader
+        if (
+            current_completion is not None
+            and current_completion is not completion_reader
+        ) or (
+            current_manifest is not None
+            and current_manifest is not manifest_reader
+        ):
+            raise OwnerConflict("target_root_completion_readers_already_bound")
+        self._target_root_completion_reader = completion_reader
+        self._target_root_manifest_reader = manifest_reader
+
+    def _verify_target_root_issuers(
+        self,
+        *,
+        completion: AcceptedTargetRootCompletion,
+        manifest: AcceptedTargetRootCompletionManifest,
+        result_document: TargetRootResultDocument,
+    ) -> tuple[
+        AcceptedTargetRootCompletion,
+        AcceptedTargetRootCompletionManifest,
+    ]:
+        from meta_research.owners.target_root_lifecycle import (
+            AcceptedTargetRootCompletion as RootCompletion,
+        )
+        from meta_research.target_run_finalizer import (
+            AcceptedTargetRootCompletionManifest as RootManifest,
+            TargetRootResultDocument as RootResult,
+        )
+
+        completion_reader = self._target_root_completion_reader
+        manifest_reader = self._target_root_manifest_reader
+        if completion_reader is None or manifest_reader is None:
+            raise OwnerConflict("target_root_commit_issuer_unavailable")
+        if (
+            type(completion) is not RootCompletion
+            or type(manifest) is not RootManifest
+            or type(result_document) is not RootResult
+        ):
+            raise OwnerConflict("target_root_commit_issuer_invalid")
+        accepted_completion = completion_reader.query_completion(
+            completion.handle.target_ref
+        )
+        accepted_manifest = manifest_reader.query(manifest.manifest_ref)
+        if (
+            accepted_completion != completion
+            or accepted_manifest != manifest
+            or manifest.completion_ref != completion.completion_ref
+            or manifest.target_ref != completion.handle.target_ref
+            or manifest.target_run_ref != completion.handle.target_run_ref
+            or manifest.workspace_ref != completion.workspace_ref
+            or manifest.implementation_revision_ref
+            != completion.implementation_revision_ref
+            or manifest.implementation_tree_hash
+            != completion.implementation_tree_hash
+            or manifest.result_document_hash != completion.result_document_hash
+            or manifest.artifact_snapshot_hash
+            != completion.artifact_snapshot_hash
+            or manifest.result_document != result_document
+            or result_document.content_hash != manifest.result_document_hash
+            or canonical_hash(result_document.as_dict())
+            != result_document.content_hash
+            or completion.receipt.issuer != "agent_runtime"
+            or completion.receipt.kind
+            != _AR_TARGET_ROOT_COMPLETION_RECEIPT_KIND
+            or completion.receipt.subject_ref
+            != completion.handle.execution_attempt_ref
+            or manifest.receipt.issuer != "research_memory"
+            or manifest.receipt.kind
+            != _RM_TARGET_ROOT_COMPLETION_MANIFEST_RECEIPT_KIND
+            or manifest.receipt.subject_ref != manifest.manifest_ref
+        ):
+            raise OwnerConflict("target_root_commit_issuer_invalid")
+        return accepted_completion, accepted_manifest
+
+    def _target_root_domain_context(
+        self,
+        *,
+        completion: AcceptedTargetRootCompletion,
+        manifest: AcceptedTargetRootCompletionManifest,
+        result_document: TargetRootResultDocument,
+    ) -> tuple[
+        AcceptedTarget,
+        AcceptedTargetMeasurementDomainAuthority,
+        AcceptedTargetFormalPlanProjection,
+        AcceptedTargetCandidateProjection,
+    ]:
+        with self._database.read() as connection:
+            target_row = connection.execute(
+                text("SELECT * FROM rg_targets WHERE target_ref = :target_ref"),
+                {"target_ref": completion.handle.target_ref},
+            ).first()
+        if target_row is None:
+            raise OwnerConflict("target_not_found")
+        target = _accepted_target(target_row)
+        authority = self.query_target_measurement_domain_authority(
+            target.target_ref
+        )
+        projection = self._receipt_verifier.query_target_formal_plan_projection(
+            graph_ref=target.graph_ref
+        )
+        candidate_projection = (
+            self._receipt_verifier.query_target_candidate_projection(
+                target_ref=target.target_ref
+            )
+        )
+        if authority is None or projection is None or candidate_projection is None:
+            raise OwnerConflict("target_root_commit_domain_invalid")
+        self._receipt_verifier.verify_target_formal_plan_projection(
+            graph_ref=target.graph_ref,
+            formal_plan=projection.formal_plan,
+            plan_document_hash=projection.plan_document_hash,
+            source_acceptance_receipt=projection.source_acceptance_receipt,
+            completion_contract_hash=projection.completion_contract_hash,
+            receipt=projection.receipt,
+        )
+        self._receipt_verifier.verify_target_candidate_projection(
+            target_ref=target.target_ref,
+            candidate=candidate_projection.candidate,
+            source_spec_hash=candidate_projection.source_spec_hash,
+            source_acceptance_receipt=(
+                candidate_projection.source_acceptance_receipt
+            ),
+            receipt=candidate_projection.receipt,
+        )
+        candidate = candidate_projection.candidate
+        protocol = authority.measurement_contract.protocol_version
+        metric_keys = set(result_document.metrics)
+        required_keys = set(protocol.required_metric_keys)
+        allowed_keys = required_keys | set(protocol.optional_metric_keys)
+        checkpoints = tuple(
+            entry for entry in manifest.entries if entry.role == "checkpoint"
+        )
+        policy = authority.measurement_contract.checkpoint_policy
+        if (
+            target.spec.get("schema_ref") != FORMAL_TARGET_CANDIDATE_SCHEMA_REF
+            or authority.target_ref != target.target_ref
+            or authority.graph_ref != target.graph_ref
+            or authority.target_spec_hash != target.spec_hash
+            or candidate_projection.source_spec_hash != target.spec_hash
+            or candidate.experiment_keys != authority.experiment_keys
+            or candidate.measurement_unit_keys
+            != (authority.measurement_unit_key,)
+            or result_document.schema_ref
+            != authority.measurement_contract.result_schema_ref
+            or not required_keys <= metric_keys <= allowed_keys
+            or any(
+                type(value) not in {int, float}
+                or (
+                    type(value) is int
+                    and abs(value) > BUNDLE_CANONICAL_INTEGER_MAX_ABS
+                )
+                or (type(value) is float and not math.isfinite(value))
+                for value in result_document.metrics.values()
+            )
+            or result_document.result_disposition
+            not in EXPERIMENT_RESULT_DISPOSITIONS
+            or (policy == "required" and not checkpoints)
+            or (policy == "forbidden" and checkpoints)
+            or policy not in {"required", "optional", "forbidden"}
+        ):
+            raise OwnerConflict("target_root_commit_domain_invalid")
+        return target, authority, projection, candidate_projection
+
+    def verify_target_execution_closure(
+        self, *, closure_ref: str, receipt: AcceptanceReceipt
+    ) -> dict[str, object]:
+        return self._receipt_verifier.verify_target_execution_closure(
+            closure_ref=closure_ref,
+            receipt=receipt,
+        )
+
+    def query_target_frontier_commit_transition(
+        self, target_ref: str
+    ) -> AcceptedTargetCommitTransition | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT closure_json FROM rg_target_commits WHERE "
+                    "target_ref = :target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if row is not None:
+            try:
+                closure = decoded_object(row.closure_json)
+            except (TypeError, ValueError) as error:
+                raise OwnerConflict("target_commit_transition_invalid") from error
+            if closure.get("schema_ref") == TARGET_ROOT_COMMIT_CLOSURE_SCHEMA_REF:
+                return self.query_target_root_commit_transition(target_ref)
+        return self._receipt_verifier.query_target_frontier_commit_transition(
+            target_ref
+        )
+
+    def query_target_root_commit_transition(
+        self, target_ref: str
+    ) -> AcceptedTargetCommitTransition | None:
+        return self._query_target_root_commit_transition(target_ref)
+
+    def _query_target_root_commit_transition(
+        self, target_ref: str
+    ) -> AcceptedTargetCommitTransition | None:
+        """Rebuild a root TargetCommit from current AR/RM/RG issuers."""
+
+        if type(target_ref) is not str or not target_ref:
+            raise OwnerConflict("target_root_commit_transition_invalid")
+        with self._database.read() as connection:
+            root_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_root_measurements WHERE "
+                    "target_ref = :target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            commit_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_commits WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            target_row = connection.execute(
+                text("SELECT * FROM rg_targets WHERE target_ref = :target_ref"),
+                {"target_ref": target_ref},
+            ).first()
+        if root_row is None:
+            if commit_row is not None:
+                raise OwnerConflict("target_root_commit_transition_invalid")
+            return None
+        if commit_row is None or target_row is None:
+            raise OwnerConflict("target_root_commit_transition_invalid")
+        commit = _target_commit(commit_row)
+        target = _accepted_target(target_row)
+        completion_reader = self._target_root_completion_reader
+        manifest_reader = self._target_root_manifest_reader
+        if completion_reader is None or manifest_reader is None:
+            raise OwnerConflict("target_root_commit_issuer_unavailable")
+        completion = completion_reader.query_completion(target_ref)
+        manifest = manifest_reader.query(str(root_row.manifest_ref))
+        if completion is None or manifest is None:
+            raise OwnerConflict("target_root_commit_issuer_invalid")
+        completion, manifest = self._verify_target_root_issuers(
+            completion=completion,
+            manifest=manifest,
+            result_document=manifest.result_document,
+        )
+        context = self._target_root_domain_context(
+            completion=completion,
+            manifest=manifest,
+            result_document=manifest.result_document,
+        )
+        current_target, authority, projection, candidate_projection = context
+        if current_target != target:
+            raise OwnerConflict("target_root_commit_transition_invalid")
+        try:
+            variant_binding_value = decoded_object(
+                root_row.variant_input_binding_json
+            )
+            evaluation_binding_value = decoded_object(
+                root_row.evaluation_input_binding_json
+            )
+            variant_binding_ref = variant_binding_value["binding_ref"]
+            variant_receipt_ref = variant_binding_value[
+                "acceptance_receipt"
+            ]["receipt_ref"]
+            evaluation_binding_ref = evaluation_binding_value["binding_ref"]
+            evaluation_receipt_ref = evaluation_binding_value[
+                "acceptance_receipt"
+            ]["receipt_ref"]
+            values = (
+                variant_binding_ref,
+                variant_receipt_ref,
+                evaluation_binding_ref,
+                evaluation_receipt_ref,
+            )
+            if any(type(value) is not str or not value for value in values):
+                raise TypeError("binding refs")
+        except (KeyError, TypeError, ValueError) as error:
+            raise OwnerConflict(
+                "target_root_commit_transition_invalid"
+            ) from error
+        material = _target_root_commit_material(
+            target=target,
+            authority=authority,
+            projection=projection,
+            candidate_projection=candidate_projection,
+            completion=completion,
+            manifest=manifest,
+            result_document=manifest.result_document,
+            measurement_ref=str(root_row.measurement_ref),
+            variant_run_ref=str(root_row.variant_run_ref),
+            evaluation_attempt_ref=str(root_row.evaluation_attempt_ref),
+            metric_result_ref=str(root_row.metric_result_ref),
+            variant_binding_ref=variant_binding_ref,
+            variant_binding_receipt_ref=variant_receipt_ref,
+            evaluation_binding_ref=evaluation_binding_ref,
+            evaluation_binding_receipt_ref=evaluation_receipt_ref,
+            measurement_receipt_ref=str(root_row.receipt_ref),
+            commit_ref=commit.commit_ref,
+            commit_receipt_ref=commit.receipt.receipt_ref,
+        )
+        request_hash = _target_root_commit_request_hash(
+            completion=completion,
+            manifest=manifest,
+            result_document=manifest.result_document,
+        )
+        terminal_value = projection_plain_value(material.canonical_terminal)
+        variant_value = projection_plain_value(material.variant_input_binding)
+        evaluation_value = projection_plain_value(
+            material.evaluation_input_binding
+        )
+        checkpoint_value = list(material.checkpoint_refs)
+        if (
+            root_row.target_run_ref != completion.handle.target_run_ref
+            or root_row.completion_ref != completion.completion_ref
+            or root_row.manifest_ref != manifest.manifest_ref
+            or root_row.authority_ref != authority.authority_ref
+            or root_row.authority_hash != authority.authority_hash
+            or root_row.metrics_json != canonical_json(material.metrics)
+            or root_row.metrics_hash != canonical_hash(material.metrics)
+            or root_row.checkpoint_refs_json != canonical_json(checkpoint_value)
+            or root_row.checkpoint_refs_hash != canonical_hash(checkpoint_value)
+            or root_row.variant_input_binding_json != canonical_json(variant_value)
+            or root_row.variant_input_binding_hash != canonical_hash(variant_value)
+            or root_row.evaluation_input_binding_json
+            != canonical_json(evaluation_value)
+            or root_row.evaluation_input_binding_hash
+            != canonical_hash(evaluation_value)
+            or root_row.measurement_payload_json
+            != canonical_json(material.measurement_payload)
+            or root_row.measurement_payload_hash
+            != canonical_hash(material.measurement_payload)
+            or root_row.accepted_measurement_json != canonical_json(terminal_value)
+            or root_row.accepted_measurement_hash != canonical_hash(terminal_value)
+            or root_row.completion_payload_hash != completion.payload_hash
+            or root_row.completion_receipt_ref
+            != completion.receipt.receipt_ref
+            or root_row.completion_receipt_hash
+            != completion.receipt.payload_hash
+            or root_row.manifest_payload_hash != manifest.payload_hash
+            or root_row.manifest_receipt_ref != manifest.receipt.receipt_ref
+            or root_row.manifest_receipt_hash != manifest.receipt.payload_hash
+            or root_row.request_hash != request_hash
+            or root_row.receipt_hash
+            != material.measurement_receipt.payload_hash
+            or commit.target_ref != target_ref
+            or commit.target_run_ref != completion.handle.target_run_ref
+            or commit.evaluation_attempt_ref
+            != material.canonical_terminal.evaluation_attempt_ref
+            or commit.target_spec_hash != target.spec_hash
+            or commit.closure != material.closure
+            or commit.closure_hash != material.closure_hash
+            or commit.result_disposition != material.result_disposition
+        ):
+            raise OwnerConflict("target_root_commit_transition_invalid")
+
+        # A transition is usable only if a second issuer read and RG row read
+        # reproduce the exact same immutable view.
+        latest_completion = completion_reader.query_completion(target_ref)
+        latest_manifest = manifest_reader.query(manifest.manifest_ref)
+        latest_context = self._target_root_domain_context(
+            completion=completion,
+            manifest=manifest,
+            result_document=manifest.result_document,
+        )
+        with self._database.read() as connection:
+            latest_root_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_root_measurements WHERE "
+                    "target_ref = :target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            latest_commit_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_commits WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        if (
+            latest_completion != completion
+            or latest_manifest != manifest
+            or latest_context != context
+            or latest_root_row is None
+            or tuple(latest_root_row) != tuple(root_row)
+            or latest_commit_row is None
+            or _target_commit(latest_commit_row) != commit
+        ):
+            raise OwnerConflict("target_root_commit_issuer_stale")
+        return AcceptedTargetCommitTransition(
+            target_ref=target_ref,
+            target_run_ref=completion.handle.target_run_ref,
+            execution_attempt_ref=completion.handle.execution_attempt_ref,
+            execution_fence_ref=completion.handle.execution_fence_ref,
+            target_commit_ref=commit.commit_ref,
+            target_execution_closure_ref=completion.completion_ref,
+            canonical_terminal=material.canonical_terminal,
+            issuer_receipt=commit.receipt,
+        )
+
+    def bind_target_formal_plan_projection_verifier(
+        self, verifier: TargetFormalPlanProjectionVerifier
+    ) -> None:
+        self._receipt_verifier.bind_target_formal_plan_projection_verifier(
+            verifier
+        )
+
+    def accept_target_formal_plan_projection(
+        self, *, graph_ref: str, idempotency_key: str
+    ) -> AcceptedTargetFormalPlanProjection:
+        return self._receipt_verifier.accept_target_formal_plan_projection(
+            graph_ref=graph_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def query_target_formal_plan_projection(
+        self, *, graph_ref: str
+    ) -> AcceptedTargetFormalPlanProjection | None:
+        return self._receipt_verifier.query_target_formal_plan_projection(
+            graph_ref=graph_ref
+        )
+
+    def accept_target_candidate_projection(
+        self, *, target_ref: str, idempotency_key: str
+    ) -> AcceptedTargetCandidateProjection:
+        return self._receipt_verifier.accept_target_candidate_projection(
+            target_ref=target_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def query_target_candidate_projection(
+        self, *, target_ref: str
+    ) -> AcceptedTargetCandidateProjection | None:
+        return self._receipt_verifier.query_target_candidate_projection(
+            target_ref=target_ref
+        )
+
+    def accept_target_protocol_aggregation_from_result(
+        self,
+        *,
+        target_ref: str,
+        protected_binding_ref: str,
+        result_manifest_ref: str,
+        idempotency_key: str,
+    ) -> tuple[tuple[ProtocolPart, ...], ProtocolAggregationProof]:
+        return self._receipt_verifier.accept_target_protocol_aggregation_from_result(
+            target_ref=target_ref,
+            protected_binding_ref=protected_binding_ref,
+            result_manifest_ref=result_manifest_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def query_target_protocol_aggregation(
+        self,
+        *,
+        target_ref: str,
+        protected_binding_ref: str,
+        result_manifest_ref: str,
+    ) -> tuple[tuple[ProtocolPart, ...], ProtocolAggregationProof] | None:
+        return self._receipt_verifier.query_target_protocol_aggregation(
+            target_ref=target_ref,
+            protected_binding_ref=protected_binding_ref,
+            result_manifest_ref=result_manifest_ref,
+        )
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
@@ -5352,6 +8023,492 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
     def verify_formal_plan_decision(self, **values) -> None:
         self._receipt_verifier.verify_formal_plan_decision(**values)
 
+    def accept_formal_plan_content(
+        self, *, formal_plan_ref: str, idempotency_key: str
+    ) -> AcceptedFormalPlanContent:
+        if (
+            not isinstance(formal_plan_ref, str)
+            or not formal_plan_ref
+            or not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or len(idempotency_key) > 128
+        ):
+            raise OwnerConflict("formal_plan_content_acceptance_invalid")
+        request_hash = canonical_hash(
+            {
+                "command": "accept_formal_plan_content",
+                "formal_plan_ref": formal_plan_ref,
+            }
+        )
+        with self._database.read() as connection:
+            decision = connection.execute(
+                text(
+                    "SELECT * FROM rg_formal_plan_decisions WHERE "
+                    "formal_plan_ref = :formal_plan_ref AND decision = 'accepted'"
+                ),
+                {"formal_plan_ref": formal_plan_ref},
+            ).first()
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM rg_formal_plan_content_acceptances WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM rg_formal_plan_content_acceptances WHERE "
+                    "formal_plan_ref = :formal_plan_ref"
+                ),
+                {"formal_plan_ref": formal_plan_ref},
+            ).first()
+        if replay is not None:
+            if replay.request_hash != request_hash:
+                raise OwnerConflict("idempotency_conflict")
+            accepted = self.query_formal_plan_content_acceptance(formal_plan_ref)
+            if accepted is None or accepted.acceptance_ref != replay.acceptance_ref:
+                raise OwnerConflict("formal_plan_content_receipt_invalid")
+            return accepted
+        if existing is not None:
+            accepted = self.query_formal_plan_content_acceptance(formal_plan_ref)
+            if accepted is None:
+                raise OwnerConflict("formal_plan_content_receipt_invalid")
+            return accepted
+        if decision is None:
+            raise OwnerConflict("formal_plan_not_accepted")
+        decided = _formal_plan_decision(decision)
+        self._receipt_verifier.verify_formal_plan_decision(
+            request_ref=decision.request_ref,
+            submission_ref=decision.submission_ref,
+            decision="accepted",
+            formal_plan_ref=formal_plan_ref,
+            receipt=decided.receipt,
+        )
+        acceptance_ref = new_ref("formal_plan_content_acceptance")
+        receipt_ref = new_ref("rg_formal_plan_content_receipt")
+        bindings = {
+            "acceptance_ref": acceptance_ref,
+            "formal_plan_ref": formal_plan_ref,
+            "decision_ref": decision.decision_ref,
+            "request_ref": decision.request_ref,
+            "submission_ref": decision.submission_ref,
+            "plan_content_ref": decision.plan_content_ref,
+            "plan_document_hash": decision.plan_document_hash,
+            "plan_content_receipt_ref": decision.plan_content_receipt_ref,
+            "plan_content_receipt_hash": decision.plan_content_receipt_hash,
+            "formal_plan_receipt_ref": decision.receipt_ref,
+            "formal_plan_receipt_hash": decision.receipt_hash,
+        }
+        receipt_hash = _receipt_hash(
+            FORMAL_PLAN_CONTENT_ACCEPTED_RECEIPT_KIND,
+            decision.plan_document_hash,
+            bindings,
+        )
+        try:
+            with self._database.write() as connection:
+                current = connection.execute(
+                    text(
+                        "SELECT * FROM rg_formal_plan_decisions WHERE "
+                        "decision_ref = :decision_ref"
+                    ),
+                    {"decision_ref": decision.decision_ref},
+                ).first()
+                if current is None or _formal_plan_decision(current) != decided:
+                    raise OwnerConflict("formal_plan_content_acceptance_stale")
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_formal_plan_content_acceptances "
+                        "(acceptance_ref, formal_plan_ref, decision_ref, "
+                        "request_ref, submission_ref, plan_content_ref, "
+                        "plan_document_hash, plan_content_receipt_ref, "
+                        "plan_content_receipt_hash, formal_plan_receipt_ref, "
+                        "formal_plan_receipt_hash, idempotency_key, request_hash, "
+                        "receipt_ref, receipt_hash, accepted_at) VALUES "
+                        "(:acceptance_ref, :formal_plan_ref, :decision_ref, "
+                        ":request_ref, :submission_ref, :plan_content_ref, "
+                        ":plan_document_hash, :plan_content_receipt_ref, "
+                        ":plan_content_receipt_hash, :formal_plan_receipt_ref, "
+                        ":formal_plan_receipt_hash, :idempotency_key, "
+                        ":request_hash, :receipt_ref, :receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": time.time(),
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE research_graph_state SET revision = revision + 1, "
+                        "formal_plan_content_acceptance_count = "
+                        "formal_plan_content_acceptance_count + 1 WHERE "
+                        "singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "research_graph.formal_plan_content_accepted",
+                    {
+                        "acceptance_ref": acceptance_ref,
+                        "formal_plan_ref": formal_plan_ref,
+                        "plan_document_hash": decision.plan_document_hash,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+        except IntegrityError as error:
+            raise OwnerConflict("formal_plan_content_acceptance_conflict") from error
+        accepted = self.query_formal_plan_content_acceptance(formal_plan_ref)
+        if accepted is None:
+            raise OwnerConflict("formal_plan_content_acceptance_missing_after_commit")
+        return accepted
+
+    def query_formal_plan_content_acceptance(
+        self, formal_plan_ref: str
+    ) -> AcceptedFormalPlanContent | None:
+        return self._receipt_verifier.query_formal_plan_content_acceptance(
+            formal_plan_ref
+        )
+
+    def verify_formal_plan_content_acceptance(self, **values) -> None:
+        self._receipt_verifier.verify_formal_plan_content_acceptance(**values)
+
+    def query_bundle_report_contract(self, **values) -> dict[str, object]:
+        return self._receipt_verifier.query_bundle_report_contract(**values)
+
+    def query_target_formal_plan_projection_source(
+        self, **values: object
+    ) -> dict[str, object]:
+        return self._receipt_verifier.query_target_formal_plan_projection_source(
+            **values
+        )
+
+    def query_target_candidate_projection_source(
+        self, *, target_ref: str
+    ) -> dict[str, object]:
+        return self._receipt_verifier.query_target_candidate_projection_source(
+            target_ref=target_ref
+        )
+
+    def verify_bundle_report_target_commits(self, **values) -> None:
+        self._receipt_verifier.verify_bundle_report_target_commits(**values)
+
+    def decide_target_graph_submission(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        context_pack_ref: str,
+        target_plan: dict[str, object],
+        target_plan_hash: str,
+        execution_payload_hash: str,
+        execution_receipt: AcceptanceReceipt,
+    ) -> AcceptedTargetGraph | TargetGraphRejection:
+        """Accept one TargetGraph or durably record RG's exact domain rejection.
+
+        The caller cannot select a reason.  RG first revalidates the executed
+        submission and frozen FormalPlan, then derives the sole currently
+        supported rejection from its own candidate-proof admission gate.
+        """
+
+        existing_graph = self.query_target_graph(request_ref)
+        if existing_graph is not None:
+            if (
+                existing_graph.run_ref != run_ref
+                or existing_graph.attempt_ref != attempt_ref
+                or existing_graph.fence_ref != fence_ref
+                or existing_graph.submission_ref != submission_ref
+                or existing_graph.context_pack_ref != context_pack_ref
+                or existing_graph.target_plan != target_plan
+                or existing_graph.target_plan_hash != target_plan_hash
+                or existing_graph.execution_receipt != execution_receipt
+            ):
+                raise OwnerConflict("target_graph_conflict")
+            for target in existing_graph.targets:
+                if (
+                    self.query_target_measurement_domain_authority(
+                        target.target_ref
+                    )
+                    is None
+                ):
+                    raise OwnerConflict(
+                        "target_measurement_domain_authority_missing"
+                    )
+            return existing_graph
+        existing_rejection = self.query_target_graph_rejection(submission_ref)
+        if existing_rejection is not None:
+            if (
+                existing_rejection.request_ref != request_ref
+                or existing_rejection.run_ref != run_ref
+                or existing_rejection.attempt_ref != attempt_ref
+                or existing_rejection.fence_ref != fence_ref
+                or existing_rejection.context_pack_ref != context_pack_ref
+                or existing_rejection.target_plan != target_plan
+                or existing_rejection.target_plan_hash != target_plan_hash
+                or existing_rejection.execution_payload_hash
+                != execution_payload_hash
+                or existing_rejection.execution_receipt != execution_receipt
+            ):
+                raise OwnerConflict("target_graph_rejection_conflict")
+            return existing_rejection
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        verified = self._stage_request_verifier.query_verified_bundle_stage_request(
+            request_ref=request_ref,
+            context_pack_ref=context_pack_ref,
+        )
+        accepted_formal_plan = verified.accepted_formal_plan
+        if accepted_formal_plan is None:
+            raise OwnerConflict("bundle_formal_plan_binding_invalid")
+        try:
+            question_binding = verified.context_pack.get(
+                "accepted_question_binding"
+            )
+            if not isinstance(question_binding, dict):
+                raise BundleContractError("bundle_context_pack_invalid")
+            validate_bundle_context_pack(
+                verified.context_pack,
+                cycle_ref=verified.cycle_ref,
+                accepted_question_binding=question_binding,
+                accepted_formal_plan_binding=accepted_formal_plan.as_dict(),
+            )
+            validated_hash = validate_target_plan(
+                target_plan,
+                formal_plan_ref=accepted_formal_plan.formal_plan_ref,
+                context_pack_ref=context_pack_ref,
+                context_pack_hash=verified.context_pack_hash,
+                plan_document=accepted_formal_plan.plan_document,
+            )
+            _completion, initial_state = _formal_target_plan_state(
+                target_plan,
+                accepted_formal_plan.plan_document,
+            )
+        except (BundleContractError, BundleTargetContractError) as error:
+            raise OwnerConflict(str(error)) from error
+        if validated_hash != target_plan_hash:
+            raise OwnerConflict("target_plan_hash_invalid")
+        if self._execution_verifier is None:
+            raise OwnerConflict("attempt_execution_verifier_unavailable")
+        executed_hash = self._execution_verifier.verify_attempt_execution_receipt(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            submission_ref=submission_ref,
+            payload_hash=execution_payload_hash,
+            receipt=execution_receipt,
+        )
+        if executed_hash != validated_hash:
+            raise OwnerConflict("target_plan_execution_binding_invalid")
+        self._receipt_verifier.verify_accepted_formal_plan_binding(
+            accepted_formal_plan
+        )
+        update_value = target_plan.get("initial_strategy_update")
+        target_values = (
+            update_value.get("candidates") if isinstance(update_value, dict) else None
+        )
+        if (
+            not isinstance(target_values, list)
+            or len(target_values) != len(initial_state.candidates)
+        ):
+            raise OwnerConflict("target_plan_formal_contract_invalid")
+        if self._target_candidate_proof_verifier is None:
+            raise OwnerConflict("target_candidate_owner_proof_unverified")
+        try:
+            for candidate in initial_state.candidates:
+                _verify_target_candidate_owner_proofs(
+                    candidate,
+                    self._target_candidate_proof_verifier,
+                )
+        except OwnerConflict as error:
+            if error.code != "target_candidate_owner_proof_unverified":
+                raise
+            return self._record_target_graph_rejection(
+                request_ref=request_ref,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                submission_ref=submission_ref,
+                context_pack_ref=context_pack_ref,
+                context_pack_hash=verified.context_pack_hash,
+                formal_plan_ref=accepted_formal_plan.formal_plan_ref,
+                plan_document_hash=accepted_formal_plan.plan_document_hash,
+                target_plan=target_plan,
+                target_plan_hash=target_plan_hash,
+                execution_payload_hash=execution_payload_hash,
+                execution_receipt=execution_receipt,
+                reason_code=error.code,
+            )
+        return self.accept_target_graph(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            submission_ref=submission_ref,
+            context_pack_ref=context_pack_ref,
+            target_plan=target_plan,
+            target_plan_hash=target_plan_hash,
+            execution_payload_hash=execution_payload_hash,
+            execution_receipt=execution_receipt,
+        )
+
+    def _record_target_graph_rejection(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        formal_plan_ref: str,
+        plan_document_hash: str,
+        target_plan: dict[str, object],
+        target_plan_hash: str,
+        execution_payload_hash: str,
+        execution_receipt: AcceptanceReceipt,
+        reason_code: str,
+    ) -> TargetGraphRejection:
+        if reason_code != "target_candidate_owner_proof_unverified":
+            raise OwnerConflict("target_graph_rejection_reason_invalid")
+        feedback = (
+            "Research Graph rejected the exact TargetPlan because its candidate "
+            "Owner proofs were not accepted.",
+        )
+        feedback_hash = canonical_hash(list(feedback))
+        rejection_ref = new_ref("target_graph_rejection")
+        receipt_ref = new_ref("rg_target_graph_rejection_receipt")
+        values = SimpleNamespace(
+            rejection_ref=rejection_ref,
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            submission_ref=submission_ref,
+            context_pack_ref=context_pack_ref,
+            context_pack_hash=context_pack_hash,
+            formal_plan_ref=formal_plan_ref,
+            plan_document_hash=plan_document_hash,
+            target_plan_hash=target_plan_hash,
+            execution_payload_hash=execution_payload_hash,
+            execution_receipt_ref=execution_receipt.receipt_ref,
+            execution_receipt_hash=execution_receipt.payload_hash,
+            reason_code=reason_code,
+            feedback_hash=feedback_hash,
+        )
+        receipt_hash = _receipt_hash(
+            TARGET_GRAPH_REJECTED_RECEIPT_KIND,
+            submission_ref,
+            _target_graph_rejection_bindings(values, feedback),
+        )
+        now = time.time()
+        try:
+            with self._database.write() as connection:
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM rg_target_graph_rejections WHERE "
+                        "submission_ref = :submission_ref OR attempt_ref = "
+                        ":attempt_ref OR fence_ref = :fence_ref"
+                    ),
+                    {
+                        "submission_ref": submission_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                    },
+                ).first()
+                graph = connection.execute(
+                    text(
+                        "SELECT graph_ref FROM rg_target_graphs WHERE request_ref = "
+                        ":request_ref OR submission_ref = :submission_ref"
+                    ),
+                    {
+                        "request_ref": request_ref,
+                        "submission_ref": submission_ref,
+                    },
+                ).first()
+                if graph is not None:
+                    raise OwnerConflict("target_graph_rejection_conflict")
+                if existing is None:
+                    connection.execute(
+                        text(
+                            "INSERT INTO rg_target_graph_rejections "
+                            "(rejection_ref, request_ref, run_ref, attempt_ref, "
+                            "fence_ref, submission_ref, context_pack_ref, "
+                            "context_pack_hash, formal_plan_ref, plan_document_hash, "
+                            "target_plan_json, target_plan_hash, "
+                            "execution_payload_hash, execution_receipt_ref, "
+                            "execution_receipt_hash, reason_code, feedback_json, "
+                            "feedback_hash, receipt_ref, receipt_hash, rejected_at) "
+                            "VALUES (:rejection_ref, :request_ref, :run_ref, "
+                            ":attempt_ref, :fence_ref, :submission_ref, "
+                            ":context_pack_ref, :context_pack_hash, "
+                            ":formal_plan_ref, :plan_document_hash, "
+                            ":target_plan_json, :target_plan_hash, "
+                            ":execution_payload_hash, :execution_receipt_ref, "
+                            ":execution_receipt_hash, :reason_code, :feedback_json, "
+                            ":feedback_hash, :receipt_ref, :receipt_hash, "
+                            ":rejected_at)"
+                        ),
+                        {
+                            **vars(values),
+                            "target_plan_json": canonical_json(target_plan),
+                            "feedback_json": canonical_json(list(feedback)),
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "rejected_at": now,
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE research_graph_state SET revision = revision + "
+                            "1, target_graph_rejection_count = "
+                            "target_graph_rejection_count + 1 WHERE singleton = "
+                            "'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "research_graph.target_graph_rejected",
+                        {
+                            "rejection_ref": rejection_ref,
+                            "request_ref": request_ref,
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "submission_ref": submission_ref,
+                            "target_plan_hash": target_plan_hash,
+                            "reason_code": reason_code,
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+        except IntegrityError as error:
+            raise OwnerConflict("target_graph_rejection_conflict") from error
+        rejected = self.query_target_graph_rejection(submission_ref)
+        if rejected is None:
+            raise OwnerConflict("target_graph_rejection_missing_after_commit")
+        if (
+            rejected.request_ref != request_ref
+            or rejected.run_ref != run_ref
+            or rejected.attempt_ref != attempt_ref
+            or rejected.fence_ref != fence_ref
+            or rejected.context_pack_ref != context_pack_ref
+            or rejected.context_pack_hash != context_pack_hash
+            or rejected.formal_plan_ref != formal_plan_ref
+            or rejected.plan_document_hash != plan_document_hash
+            or rejected.target_plan != target_plan
+            or rejected.target_plan_hash != target_plan_hash
+            or rejected.execution_payload_hash != execution_payload_hash
+            or rejected.execution_receipt != execution_receipt
+            or rejected.reason_code != reason_code
+        ):
+            raise OwnerConflict("target_graph_rejection_conflict")
+        return rejected
+
     def accept_target_graph(
         self,
         *,
@@ -5411,11 +8568,61 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         if executed_target_plan_hash != validated_hash:
             raise OwnerConflict("target_plan_execution_binding_invalid")
         self._receipt_verifier.verify_accepted_formal_plan_binding(accepted_formal_plan)
-        target_values = target_plan.get("targets")
-        if not isinstance(target_values, list):
-            raise OwnerConflict("target_plan_invalid")
+        completion, initial_state = _formal_target_plan_state(
+            target_plan,
+            accepted_formal_plan.plan_document,
+        )
+        update_value = target_plan.get("initial_strategy_update")
+        target_values = (
+            update_value.get("candidates")
+            if isinstance(update_value, dict)
+            else None
+        )
+        if (
+            not isinstance(target_values, list)
+            or len(target_values) != len(initial_state.candidates)
+        ):
+            raise OwnerConflict("target_plan_formal_contract_invalid")
+        for candidate in initial_state.candidates:
+            _verify_target_candidate_owner_proofs(
+                candidate,
+                self._target_candidate_proof_verifier,
+            )
 
         with self._database.write() as connection:
+            _acquire_research_graph_writer_lock(connection)
+            locked_verified = (
+                self._stage_request_verifier.query_verified_bundle_stage_request(
+                    request_ref=request_ref,
+                    context_pack_ref=context_pack_ref,
+                )
+            )
+            if locked_verified != verified:
+                raise OwnerConflict("bundle_stage_request_binding_stale")
+            locked_plan_binding = locked_verified.accepted_formal_plan
+            if locked_plan_binding != accepted_formal_plan:
+                raise OwnerConflict("bundle_formal_plan_binding_invalid")
+            self._receipt_verifier.verify_accepted_formal_plan_binding(
+                locked_plan_binding
+            )
+            locked_target_plan_hash = (
+                self._execution_verifier.verify_attempt_execution_receipt(
+                    request_ref=request_ref,
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                    submission_ref=submission_ref,
+                    payload_hash=execution_payload_hash,
+                    receipt=execution_receipt,
+                )
+            )
+            if locked_target_plan_hash != validated_hash:
+                raise OwnerConflict("target_plan_execution_binding_invalid")
+            for candidate in initial_state.candidates:
+                _verify_target_candidate_owner_proofs(
+                    candidate,
+                    self._target_candidate_proof_verifier,
+                )
             existing = connection.execute(
                 text("SELECT * FROM rg_target_graphs WHERE request_ref = :request_ref"),
                 {"request_ref": request_ref},
@@ -5444,7 +8651,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                 for value in target_values:
                     if not isinstance(value, dict):
                         raise OwnerConflict("target_spec_invalid")
-                    target_refs[cast(str, value["target_key"])] = new_ref("target")
+                    target_refs[_formal_target_key(value)] = new_ref("target")
                 graph_bindings = {
                     "request_ref": request_ref,
                     "run_ref": run_ref,
@@ -5465,6 +8672,13 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                 receipt_ref = new_ref("rg_target_graph_receipt")
                 receipt_hash = _receipt_hash(
                     TARGET_GRAPH_RECEIPT_KIND, graph_ref, graph_bindings
+                )
+                graph_receipt = AcceptanceReceipt(
+                    issuer=RG_OWNER,
+                    kind=TARGET_GRAPH_RECEIPT_KIND,
+                    receipt_ref=receipt_ref,
+                    subject_ref=graph_ref,
+                    payload_hash=receipt_hash,
                 )
                 connection.execute(
                     text(
@@ -5491,14 +8705,27 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                         "accepted_at": now,
                     },
                 )
+                formal_by_label = {
+                    candidate.candidate.local_label: candidate
+                    for candidate in initial_state.candidates
+                }
+                identity_counts = {
+                    "baseline_count": 0,
+                    "variant_count": 0,
+                    "evaluation_protocol_count": 0,
+                    "protocol_version_count": 0,
+                    "evaluation_count": 0,
+                    "authority_count": 0,
+                }
                 for ordinal, value in enumerate(target_values):
                     spec = cast(dict[str, object], value)
-                    target_key = cast(str, spec["target_key"])
-                    dependencies = [
-                        target_refs[key] for key in cast(list[str], spec["depends_on"])
-                    ]
+                    target_key = _formal_target_key(spec)
+                    dependencies = tuple(
+                        target_refs[key]
+                        for key in _formal_target_dependencies(spec)
+                    )
                     spec_hash = canonical_hash(spec)
-                    dependency_hash = canonical_hash(dependencies)
+                    dependency_hash = canonical_hash(list(dependencies))
                     target_ref = target_refs[target_key]
                     target_bindings = {
                         "graph_ref": graph_ref,
@@ -5511,35 +8738,57 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                     target_receipt_hash = _receipt_hash(
                         TARGET_RECEIPT_KIND, target_ref, target_bindings
                     )
-                    connection.execute(
-                        text(
-                            "INSERT INTO rg_targets (target_ref, graph_ref, "
-                            "target_key, ordinal, spec_json, spec_hash, "
-                            "dependency_refs_json, dependency_refs_hash, "
-                            "receipt_ref, receipt_hash, accepted_at) VALUES "
-                            "(:target_ref, :graph_ref, :target_key, :ordinal, "
-                            ":spec_json, :spec_hash, :dependency_refs_json, "
-                            ":dependency_refs_hash, :receipt_ref, :receipt_hash, "
-                            ":accepted_at)"
+                    target = AcceptedTarget(
+                        target_ref=target_ref,
+                        graph_ref=graph_ref,
+                        target_key=target_key,
+                        ordinal=ordinal,
+                        spec=spec,
+                        spec_hash=spec_hash,
+                        dependency_refs=dependencies,
+                        receipt=AcceptanceReceipt(
+                            issuer=RG_OWNER,
+                            kind=TARGET_RECEIPT_KIND,
+                            receipt_ref=target_receipt_ref,
+                            subject_ref=target_ref,
+                            payload_hash=target_receipt_hash,
                         ),
-                        {
-                            **target_bindings,
-                            "target_ref": target_ref,
-                            "spec_json": canonical_json(spec),
-                            "dependency_refs_json": canonical_json(dependencies),
-                            "receipt_ref": target_receipt_ref,
-                            "receipt_hash": target_receipt_hash,
-                            "accepted_at": now,
-                        },
                     )
+                    created = _insert_target_with_measurement_authority(
+                        connection,
+                        target=target,
+                        append_ref=None,
+                        quest_ref=verified.accepted_question.quest_ref,
+                        target_plan_hash=target_plan_hash,
+                        graph_generation=0,
+                        graph_acceptance_receipt=graph_receipt,
+                        rolling_append_source=None,
+                        stage_request_ref=request_ref,
+                        plan_binding=accepted_formal_plan,
+                        completion_contract=completion,
+                        formal_candidate=formal_by_label[target_key],
+                        accepted_at=now,
+                    )
+                    for name, count in created.items():
+                        identity_counts[name] += count
                 connection.execute(
                     text(
                         "UPDATE research_graph_state SET revision = revision + 1, "
                         "target_graph_count = target_graph_count + 1, "
-                        "target_count = target_count + :target_count "
+                        "target_count = target_count + :target_count, "
+                        "experiment_baseline_count = experiment_baseline_count + "
+                        ":baseline_count, experiment_variant_count = "
+                        "experiment_variant_count + :variant_count, "
+                        "evaluation_protocol_count = evaluation_protocol_count + "
+                        ":evaluation_protocol_count, protocol_version_count = "
+                        "protocol_version_count + :protocol_version_count, "
+                        "evaluation_count = evaluation_count + :evaluation_count, "
+                        "target_measurement_domain_authority_count = "
+                        "target_measurement_domain_authority_count + "
+                        ":authority_count "
                         "WHERE singleton = 'owner'"
                     ),
-                    {"target_count": len(target_values)},
+                    {"target_count": len(target_values), **identity_counts},
                 )
                 self._feed.record(
                     connection,
@@ -5556,6 +8805,9 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         accepted = self.query_target_graph(request_ref)
         if accepted is None:
             raise OwnerConflict("target_graph_missing_after_commit")
+        for target in accepted.targets:
+            if self.query_target_measurement_domain_authority(target.target_ref) is None:
+                raise OwnerConflict("target_measurement_domain_authority_missing")
         return accepted
 
     def query_target_graph(self, request_ref: str) -> AcceptedTargetGraph | None:
@@ -5573,7 +8825,2539 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                 ),
                 {"graph_ref": row.graph_ref},
             ).fetchall()
-        return _accepted_target_graph(row, target_rows)
+            append_rows = connection.execute(
+                text(
+                    "SELECT a.*, p.proposal_json AS proposal_json FROM "
+                    "rg_target_graph_appends a JOIN ar_bundle_target_proposals p "
+                    "ON p.proposal_ref = a.proposal_ref WHERE a.graph_ref = "
+                    ":graph_ref ORDER BY a.generation"
+                ),
+                {"graph_ref": row.graph_ref},
+            ).fetchall()
+            plan_row = connection.execute(
+                text(
+                    "SELECT plan_document_json, plan_document_hash FROM "
+                    "rm_plan_documents WHERE content_ref = :content_ref"
+                ),
+                {"content_ref": row.plan_content_ref},
+            ).first()
+        try:
+            plan_document = (
+                None if plan_row is None else decoded_object(plan_row.plan_document_json)
+            )
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("target_graph_integrity_invalid") from error
+        if plan_row is None or (
+            canonical_hash(plan_document) != plan_row.plan_document_hash
+            or plan_row.plan_document_hash != row.plan_document_hash
+        ):
+            raise OwnerConflict("target_graph_integrity_invalid")
+        return _accepted_target_graph(row, target_rows, append_rows, plan_document)
+
+    def query_target_measurement_domain_authority(
+        self, target_ref: str
+    ) -> AcceptedTargetMeasurementDomainAuthority | None:
+        """Read and re-verify the current Plan-bound domain authority.
+
+        This query intentionally needs no post-graph FormalPlan projection
+        receipt.  It re-verifies the complete StageRunRequest Plan binding that
+        existed before the graph write, then reconstructs the fixed canonical
+        projection digest and every native identity from immutable source rows.
+        """
+
+        if not isinstance(target_ref, str) or not target_ref:
+            raise OwnerConflict("target_measurement_domain_authority_invalid")
+        with self._database.read() as connection:
+            target_row = connection.execute(
+                text("SELECT * FROM rg_targets WHERE target_ref = :target_ref"),
+                {"target_ref": target_ref},
+            ).first()
+            authority_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_measurement_domain_authorities "
+                    "WHERE target_ref = :target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            target_spec_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_spec_acceptances WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            graph_row = (
+                None
+                if target_row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_target_graphs WHERE graph_ref = "
+                        ":graph_ref"
+                    ),
+                    {"graph_ref": target_row.graph_ref},
+                ).first()
+            )
+            append_row = (
+                None
+                if target_row is None or target_row.append_ref is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_target_graph_appends WHERE append_ref = "
+                        ":append_ref"
+                    ),
+                    {"append_ref": target_row.append_ref},
+                ).first()
+            )
+            baseline_row = (
+                None
+                if authority_row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_experiment_baselines WHERE baseline_ref "
+                        "= :ref"
+                    ),
+                    {"ref": authority_row.baseline_ref},
+                ).first()
+            )
+            variant_row = (
+                None
+                if authority_row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_experiment_variants WHERE variant_ref "
+                        "= :ref"
+                    ),
+                    {"ref": authority_row.variant_ref},
+                ).first()
+            )
+            evaluation_protocol_row = (
+                None
+                if authority_row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_evaluation_protocols WHERE "
+                        "evaluation_protocol_ref = :ref"
+                    ),
+                    {"ref": authority_row.evaluation_protocol_ref},
+                ).first()
+            )
+            protocol_version_row = (
+                None
+                if authority_row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_protocol_versions WHERE "
+                        "protocol_version_ref = :ref"
+                    ),
+                    {"ref": authority_row.protocol_version_ref},
+                ).first()
+            )
+            evaluation_row = (
+                None
+                if authority_row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_evaluations WHERE evaluation_ref = "
+                        ":ref"
+                    ),
+                    {"ref": authority_row.evaluation_ref},
+                ).first()
+            )
+        if target_row is None and authority_row is None:
+            return None
+        if target_row is not None and authority_row is None:
+            raise OwnerConflict("target_measurement_domain_authority_required")
+        if (
+            target_row is None
+            or graph_row is None
+            or target_spec_row is None
+        ):
+            raise OwnerConflict(
+                "target_measurement_domain_authority_integrity_invalid"
+            )
+        graph = self.query_target_graph(graph_row.request_ref)
+        if graph is None:
+            raise OwnerConflict(
+                "target_measurement_domain_authority_integrity_invalid"
+            )
+        target = next(
+            (candidate for candidate in graph.targets if candidate.target_ref == target_ref),
+            None,
+        )
+        if target is None:
+            raise OwnerConflict(
+                "target_measurement_domain_authority_integrity_invalid"
+            )
+        _verify_target_spec_acceptance_row(
+            target=target,
+            row=target_spec_row,
+        )
+        target_spec_acceptance_receipt = AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=TARGET_SPEC_CONTENT_RECEIPT_KIND,
+            receipt_ref=target_spec_row.receipt_ref,
+            subject_ref=target.spec_hash,
+            payload_hash=target_spec_row.receipt_hash,
+        )
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        verified = self._stage_request_verifier.query_verified_bundle_stage_request(
+            request_ref=graph.request_ref,
+            context_pack_ref=graph.context_pack_ref,
+        )
+        plan_binding = verified.accepted_formal_plan
+        if (
+            plan_binding is None
+            or plan_binding.formal_plan_ref != graph.formal_plan_ref
+            or plan_binding.content_ref != graph.plan_content_ref
+            or plan_binding.plan_document_hash != graph.plan_document_hash
+        ):
+            raise OwnerConflict(
+                "target_measurement_domain_authority_plan_source_invalid"
+            )
+        self._receipt_verifier.verify_accepted_formal_plan_binding(plan_binding)
+        try:
+            completion, _state = _formal_target_plan_state(
+                graph.target_plan,
+                plan_binding.plan_document,
+            )
+            formal_candidate = formal_target_candidate_from_dict(
+                target.spec,
+                completion_contract=completion,
+            )
+            stored_completion = decoded_object(
+                authority_row.completion_contract_json
+            )
+            stored_contract = decoded_object(
+                authority_row.measurement_contract_json
+            )
+            stored_experiment_keys = json.loads(authority_row.experiment_keys_json)
+        except (
+            BundleTargetContractError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
+            raise OwnerConflict(
+                "target_measurement_domain_authority_integrity_invalid"
+            ) from error
+        contract = formal_candidate.measurement_contract
+        identities = TargetMeasurementDomainIdentities(
+            baseline_ref=authority_row.baseline_ref,
+            variant_ref=authority_row.variant_ref,
+            evaluation_protocol_ref=authority_row.evaluation_protocol_ref,
+            protocol_version_ref=authority_row.protocol_version_ref,
+            evaluation_ref=authority_row.evaluation_ref,
+        )
+        _verify_target_measurement_native_identity_rows(
+            contract=contract,
+            identities=identities,
+            baseline_row=baseline_row,
+            variant_row=variant_row,
+            evaluation_protocol_row=evaluation_protocol_row,
+            protocol_version_row=protocol_version_row,
+            evaluation_row=evaluation_row,
+        )
+        (
+            protocol_parts,
+            protocol_aggregation_proof,
+            aggregation_content,
+            aggregation_receipt,
+        ) = _target_measurement_protocol_aggregation_facts(
+            stage_request_ref=graph.request_ref,
+            accepted_formal_plan_binding_hash=canonical_hash(
+                plan_binding.as_dict()
+            ),
+            completion_contract_hash_value=completion_contract_hash(completion),
+            target=target,
+            target_spec_acceptance_receipt=target_spec_acceptance_receipt,
+            measurement_contract=contract,
+            protocol_version_ref=identities.protocol_version_ref,
+            aggregation_evidence_ref=authority_row.aggregation_evidence_ref,
+            aggregation_receipt_ref=authority_row.aggregation_receipt_ref,
+        )
+        expected_aggregation_columns = {
+            "aggregation_evidence_ref": (
+                None
+                if protocol_aggregation_proof is None
+                else protocol_aggregation_proof.aggregation_evidence_binding.subject_ref
+            ),
+            "aggregation_content_json": (
+                None
+                if aggregation_content is None
+                else canonical_json(aggregation_content)
+            ),
+            "aggregation_content_hash": (
+                None
+                if aggregation_content is None
+                else canonical_hash(aggregation_content)
+            ),
+            "aggregation_part_keys_json": (
+                None
+                if not protocol_parts
+                else canonical_json([part.part_key for part in protocol_parts])
+            ),
+            "aggregation_part_keys_hash": (
+                None
+                if not protocol_parts
+                else canonical_hash([part.part_key for part in protocol_parts])
+            ),
+            "aggregation_rule_ref": (
+                None
+                if protocol_aggregation_proof is None
+                else protocol_aggregation_proof.aggregation_rule_ref
+            ),
+            "aggregation_receipt_ref": (
+                None if aggregation_receipt is None else aggregation_receipt.receipt_ref
+            ),
+            "aggregation_receipt_hash": (
+                None if aggregation_receipt is None else aggregation_receipt.payload_hash
+            ),
+        }
+        if any(
+            getattr(authority_row, name) != value
+            for name, value in expected_aggregation_columns.items()
+        ):
+            raise OwnerConflict(
+                "target_measurement_protocol_aggregation_integrity_invalid"
+            )
+        if target_row.append_ref is None:
+            graph_generation = 0
+            graph_acceptance_receipt = graph.receipt
+            rolling_append_source = None
+        else:
+            if append_row is None:
+                raise OwnerConflict(
+                    "target_measurement_domain_authority_integrity_invalid"
+                )
+            graph_generation = int(append_row.generation)
+            graph_acceptance_receipt = AcceptanceReceipt(
+                issuer=RG_OWNER,
+                kind=TARGET_GRAPH_RECEIPT_KIND,
+                receipt_ref=append_row.receipt_ref,
+                subject_ref=graph.graph_ref,
+                payload_hash=append_row.receipt_hash,
+            )
+            rolling_append_source = {
+                "append_ref": append_row.append_ref,
+                "predecessor_head_receipt_ref": (
+                    append_row.predecessor_head_receipt_ref
+                ),
+                "predecessor_head_receipt_hash": (
+                    append_row.predecessor_head_receipt_hash
+                ),
+                "proposal_ref": append_row.proposal_ref,
+                "proposal_hash": append_row.proposal_hash,
+                "proposal_receipt_ref": append_row.proposal_receipt_ref,
+                "proposal_receipt_hash": append_row.proposal_receipt_hash,
+            }
+        # The authority row must not merely be self-consistent with RG's copy
+        # of the graph lineage.  Re-enter the issuer-backed graph verifier so
+        # generation zero authenticates the AR execution receipt and rolling
+        # generations authenticate every AR proposal receipt in the chain.
+        self._receipt_verifier.verify_target_graph_receipt(
+            request_ref=graph.request_ref,
+            run_ref=graph.run_ref,
+            graph_ref=graph.graph_ref,
+            receipt=graph_acceptance_receipt,
+            require_current=False,
+        )
+        projection_digest = _canonical_formal_plan_projection_digest(
+            formal_plan_ref=plan_binding.formal_plan_ref,
+            completion_contract=completion,
+        )
+        authority_payload = _target_measurement_authority_payload(
+            target=target,
+            target_plan_hash=graph.target_plan_hash,
+            graph_generation=graph_generation,
+            graph_acceptance_receipt=graph_acceptance_receipt,
+            rolling_append_source=rolling_append_source,
+            stage_request_ref=graph.request_ref,
+            plan_binding=plan_binding,
+            completion_contract=completion,
+            formal_plan_projection_digest=projection_digest,
+            measurement_contract=contract,
+            identities=identities,
+            target_spec_acceptance_ref=target_spec_row.acceptance_ref,
+            target_spec_acceptance_receipt=target_spec_acceptance_receipt,
+            protocol_parts=protocol_parts,
+            protocol_aggregation_proof=protocol_aggregation_proof,
+        )
+        authority_hash = canonical_hash(authority_payload)
+        expected_receipt = AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=TARGET_MEASUREMENT_DOMAIN_AUTHORITY_RECEIPT_KIND,
+            receipt_ref=authority_row.receipt_ref,
+            subject_ref=authority_hash,
+            payload_hash=_receipt_hash(
+                TARGET_MEASUREMENT_DOMAIN_AUTHORITY_RECEIPT_KIND,
+                authority_hash,
+                {
+                    "authority_ref": authority_row.authority_ref,
+                    "authority": authority_payload,
+                },
+            ),
+        )
+        expected_columns = {
+            "authority_hash": authority_hash,
+            "target_ref": target.target_ref,
+            "graph_ref": graph.graph_ref,
+            "graph_generation": graph_generation,
+            "graph_acceptance_receipt_ref": (
+                graph_acceptance_receipt.receipt_ref
+            ),
+            "graph_acceptance_receipt_hash": (
+                graph_acceptance_receipt.payload_hash
+            ),
+            "append_ref": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["append_ref"]
+            ),
+            "predecessor_head_receipt_ref": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["predecessor_head_receipt_ref"]
+            ),
+            "predecessor_head_receipt_hash": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["predecessor_head_receipt_hash"]
+            ),
+            "proposal_ref": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["proposal_ref"]
+            ),
+            "proposal_hash": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["proposal_hash"]
+            ),
+            "proposal_receipt_ref": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["proposal_receipt_ref"]
+            ),
+            "proposal_receipt_hash": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["proposal_receipt_hash"]
+            ),
+            "formal_plan_ref": plan_binding.formal_plan_ref,
+            "stage_request_ref": graph.request_ref,
+            "plan_content_ref": plan_binding.content_ref,
+            "plan_document_hash": plan_binding.plan_document_hash,
+            "answer_contract_hash": plan_binding.answer_contract_hash,
+            "accepted_formal_plan_binding_hash": canonical_hash(
+                plan_binding.as_dict()
+            ),
+            "plan_content_receipt_ref": plan_binding.content_receipt.receipt_ref,
+            "plan_content_receipt_hash": plan_binding.content_receipt.payload_hash,
+            "formal_plan_receipt_ref": (
+                plan_binding.formal_plan_receipt.receipt_ref
+            ),
+            "formal_plan_receipt_hash": (
+                plan_binding.formal_plan_receipt.payload_hash
+            ),
+            "stage_commit_ref": plan_binding.stage_commit_ref,
+            "stage_commit_receipt_ref": (
+                plan_binding.stage_commit_receipt.receipt_ref
+            ),
+            "stage_commit_receipt_hash": (
+                plan_binding.stage_commit_receipt.payload_hash
+            ),
+            "completion_contract_hash": completion_contract_hash(completion),
+            "formal_plan_projection_digest": projection_digest,
+            "target_plan_hash": graph.target_plan_hash,
+            "target_key": target.target_key,
+            "target_ordinal": target.ordinal,
+            "target_spec_hash": target.spec_hash,
+            "target_receipt_ref": target.receipt.receipt_ref,
+            "target_receipt_hash": target.receipt.payload_hash,
+            "target_spec_acceptance_ref": target_spec_row.acceptance_ref,
+            "target_spec_receipt_ref": target_spec_acceptance_receipt.receipt_ref,
+            "target_spec_receipt_hash": target_spec_acceptance_receipt.payload_hash,
+            "measurement_contract_hash": measurement_contract_hash(contract),
+            "experiment_keys_hash": canonical_hash(list(contract.experiment_keys)),
+            "measurement_unit_key": contract.measurement_unit_key,
+            "baseline_ref": identities.baseline_ref,
+            "variant_ref": identities.variant_ref,
+            "evaluation_protocol_ref": identities.evaluation_protocol_ref,
+            "protocol_version_ref": identities.protocol_version_ref,
+            "evaluation_ref": identities.evaluation_ref,
+            "native_identity_set_hash": canonical_hash(
+                identities.as_public_dict()
+            ),
+            "receipt_hash": expected_receipt.payload_hash,
+        }
+        if (
+            any(
+                getattr(authority_row, name) != value
+                for name, value in expected_columns.items()
+            )
+            or canonical_json(stored_completion)
+            != canonical_json(normalized_completion_contract_to_dict(completion))
+            or canonical_json(stored_contract)
+            != canonical_json(measurement_contract_to_dict(contract))
+            or stored_experiment_keys != list(contract.experiment_keys)
+            or canonical_json(stored_experiment_keys)
+            != authority_row.experiment_keys_json
+        ):
+            raise OwnerConflict(
+                "target_measurement_domain_authority_integrity_invalid"
+            )
+        return AcceptedTargetMeasurementDomainAuthority(
+            authority_ref=authority_row.authority_ref,
+            authority_hash=authority_hash,
+            target_ref=target.target_ref,
+            graph_ref=graph.graph_ref,
+            graph_generation=graph_generation,
+            stage_request_ref=graph.request_ref,
+            formal_plan_ref=plan_binding.formal_plan_ref,
+            plan_document_hash=plan_binding.plan_document_hash,
+            accepted_formal_plan_binding_hash=canonical_hash(
+                plan_binding.as_dict()
+            ),
+            completion_contract_hash=completion_contract_hash(completion),
+            formal_plan_projection_digest=projection_digest,
+            target_spec_hash=target.spec_hash,
+            measurement_contract=contract,
+            measurement_contract_hash=measurement_contract_hash(contract),
+            experiment_keys=contract.experiment_keys,
+            measurement_unit_key=contract.measurement_unit_key,
+            identities=identities,
+            protocol_parts=protocol_parts,
+            protocol_aggregation_proof=protocol_aggregation_proof,
+            target_receipt=target.receipt,
+            graph_acceptance_receipt=graph_acceptance_receipt,
+            receipt=expected_receipt,
+            accepted_at=float(authority_row.accepted_at),
+        )
+
+    def verify_target_measurement_domain_authority(
+        self,
+        *,
+        target_ref: str,
+        measurement_contract_hash: str,
+        identities: TargetMeasurementDomainIdentities,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        accepted = self.query_target_measurement_domain_authority(target_ref)
+        if accepted is None or (
+            not isinstance(identities, TargetMeasurementDomainIdentities)
+            or accepted.measurement_contract_hash != measurement_contract_hash
+            or accepted.identities != identities
+            or accepted.receipt != receipt
+        ):
+            raise OwnerConflict("target_measurement_domain_authority_invalid")
+
+    def verify_target_measurement_protocol_aggregation(
+        self,
+        *,
+        target_ref: str,
+        parts: tuple[ProtocolPart, ...],
+        proof: ProtocolAggregationProof | None,
+    ) -> None:
+        accepted = self.query_target_measurement_domain_authority(target_ref)
+        if accepted is None or (
+            type(parts) is not tuple
+            or accepted.protocol_parts != parts
+            or accepted.protocol_aggregation_proof != proof
+        ):
+            raise OwnerConflict("target_measurement_protocol_aggregation_invalid")
+
+    def _target_measurement_runtime_facts(
+        self,
+        *,
+        target_ref: str,
+        generic_binding_ref: str,
+        result_manifest_ref: str,
+    ) -> tuple[
+        AcceptedTargetMeasurementDomainAuthority,
+        TargetGenericExecutionBinding,
+        TargetExecutionRequest,
+        TargetExecutionTerminalResult,
+        AcceptedTargetExecutionInputBinding,
+        AcceptedTargetGenericResultManifest,
+    ]:
+        execution_reader = self._target_measurement_execution_reader
+        result_reader = self._target_measurement_result_reader
+        if execution_reader is None or result_reader is None:
+            raise OwnerConflict("target_measurement_runtime_reader_unavailable")
+        authority = self.query_target_measurement_domain_authority(target_ref)
+        terminal_facts = execution_reader.query_generic_execution_terminal(
+            generic_binding_ref
+        )
+        manifest = result_reader.query_generic_result_manifest(
+            result_manifest_ref
+        )
+        if authority is None or terminal_facts is None or manifest is None:
+            raise OwnerConflict("target_measurement_runtime_source_missing")
+        binding, request, terminal, target_input = terminal_facts
+        expected_authority = TargetMeasurementAuthorityBinding(
+            authority_ref=authority.authority_ref,
+            acceptance_receipt=receipt_proof(
+                authority.receipt,
+                subject_ref=authority.authority_hash,
+            ),
+        )
+        handle = request.handle
+        if (
+            binding.binding_ref != generic_binding_ref
+            or binding.target_ref != target_ref
+            or binding.target_run_ref != handle.target_run_ref
+            or binding.target_attempt_ref != handle.execution_attempt_ref
+            or binding.target_fence_ref != handle.execution_fence_ref
+            or binding.input_binding_ref != target_input.proof.binding_ref
+            or binding.terminal_status != "succeeded"
+            or binding.process_tree_drained is not True
+            or binding.currentness_known is not True
+            or binding.current is not True
+            or terminal.exit_receipt.status != "succeeded"
+            or terminal.exit_receipt.process_tree_drained is not True
+            or request.measurement_authority != expected_authority
+            or target_input.target_ref != target_ref
+            or target_input.target_run_ref != binding.target_run_ref
+            or target_input.target_attempt_ref != binding.target_attempt_ref
+            or target_input.target_fence_ref != binding.target_fence_ref
+            or manifest.manifest_ref != result_manifest_ref
+            or manifest.target_ref != target_ref
+            or manifest.target_run_ref != binding.target_run_ref
+            or manifest.target_attempt_ref != binding.target_attempt_ref
+            or manifest.target_fence_ref != binding.target_fence_ref
+            or manifest.generic_binding_ref != generic_binding_ref
+            or manifest.operation_handle != binding.operation_handle
+            or len({entry.binding.version_ref for entry in manifest.entries})
+            != len(manifest.entries)
+            or sum(entry.role == "result_content" for entry in manifest.entries)
+            != 1
+            or any(
+                entry.role
+                not in {
+                    "checkpoint_artifact",
+                    "log_asset",
+                    "analysis_asset",
+                    "result_content",
+                }
+                for entry in manifest.entries
+            )
+        ):
+            raise OwnerConflict("target_measurement_runtime_source_invalid")
+        return (
+            authority,
+            binding,
+            request,
+            terminal,
+            target_input,
+            manifest,
+        )
+
+    def accept_target_measurement_attempt(
+        self,
+        *,
+        target_ref: str,
+        generic_binding_ref: str,
+        result_manifest_ref: str,
+        idempotency_key: str,
+    ) -> AcceptedTargetMeasurementAttempt:
+        """Bind one terminal Target to native RG identities and asset roles."""
+
+        _target_measurement_runtime_ref(target_ref)
+        _target_measurement_runtime_ref(generic_binding_ref)
+        _target_measurement_runtime_ref(result_manifest_ref)
+        _target_measurement_idempotency_key(idempotency_key)
+        request_hash = canonical_hash(
+            {
+                "command": "accept_target_measurement_attempt",
+                "target_ref": target_ref,
+                "generic_binding_ref": generic_binding_ref,
+                "result_manifest_ref": result_manifest_ref,
+            }
+        )
+        with self._database.read() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_measurement_attempt_bindings WHERE "
+                    "idempotency_key = :key OR generic_binding_ref = "
+                    ":generic_binding_ref OR manifest_ref = "
+                    ":manifest_ref"
+                ),
+                {
+                    "target_ref": target_ref,
+                    "key": idempotency_key,
+                    "generic_binding_ref": generic_binding_ref,
+                    "manifest_ref": result_manifest_ref,
+                },
+            ).first()
+        if replay is not None:
+            if replay.request_hash != request_hash:
+                raise OwnerConflict("target_measurement_attempt_conflict")
+            accepted = self.query_target_measurement_attempt(
+                replay.evaluation_attempt_ref
+            )
+            if accepted is None:
+                raise OwnerConflict("target_measurement_attempt_integrity_invalid")
+            return accepted
+
+        (
+            authority,
+            generic_binding,
+            execution_request,
+            _terminal,
+            target_input,
+            manifest,
+        ) = self._target_measurement_runtime_facts(
+            target_ref=target_ref,
+            generic_binding_ref=generic_binding_ref,
+            result_manifest_ref=result_manifest_ref,
+        )
+        execution_reader = self._target_measurement_execution_reader
+        if execution_reader is None:
+            raise OwnerConflict("target_measurement_runtime_reader_unavailable")
+        accepted_input_assets = execution_reader.query_generic_execution_input_assets(
+            generic_binding_ref
+        )
+        with self._database.read() as connection:
+            checkpoint_rows = connection.execute(
+                text(
+                    "SELECT r.*, v.variant_ref, v.input_binding_ref, v.status AS "
+                    "variant_run_status FROM rg_experiment_asset_roles r JOIN "
+                    "rg_variant_runs v ON v.variant_run_ref = r.subject_ref WHERE "
+                    "r.role = 'checkpoint_artifact' AND r.subject_kind = "
+                    "'variant_run' ORDER BY r.subject_ref, r.ordinal"
+                )
+            ).all()
+        selected_checkpoint_rows_list = []
+        for accepted_input_asset in accepted_input_assets:
+            exact_matches = tuple(
+                row
+                for row in checkpoint_rows
+                if _accepted_experiment_asset_role(row).binding
+                == accepted_input_asset
+            )
+            if len(exact_matches) > 1:
+                raise OwnerConflict(
+                    "target_measurement_checkpoint_source_ambiguous"
+                )
+            if exact_matches:
+                selected_checkpoint_rows_list.append(exact_matches[0])
+        selected_checkpoint_rows = tuple(selected_checkpoint_rows_list)
+        selected_checkpoints = tuple(
+            _accepted_experiment_asset_role(row)
+            for row in selected_checkpoint_rows
+        )
+        for role in selected_checkpoints:
+            self._asset_verifier.verify_asset_binding(
+                asset_ref=role.binding.asset_ref,
+                version_ref=role.binding.version_ref,
+                content_hash=role.binding.content_hash,
+                manifest_hash=role.binding.manifest_hash,
+                receipt=role.binding.receipt,
+            )
+        if len({role.subject_ref for role in selected_checkpoints}) > 1:
+            raise OwnerConflict("target_measurement_checkpoint_source_ambiguous")
+
+        output_checkpoints = tuple(
+            entry
+            for entry in manifest.entries
+            if entry.role == "checkpoint_artifact"
+        )
+        checkpoint_policy = authority.measurement_contract.checkpoint_policy
+        if (
+            (checkpoint_policy == "required" and not output_checkpoints)
+            or (checkpoint_policy == "forbidden" and output_checkpoints)
+        ):
+            raise OwnerConflict("target_measurement_checkpoint_policy_invalid")
+        variant_run_disposition = (
+            "created"
+            if output_checkpoints or not selected_checkpoints
+            else "reused"
+        )
+        if variant_run_disposition == "reused" and checkpoint_policy == "required":
+            raise OwnerConflict("target_measurement_checkpoint_policy_invalid")
+
+        now = time.time()
+        attempt_binding_ref = new_ref("target_measurement_attempt")
+        evaluation_attempt_ref = new_ref("evaluation_attempt")
+        evaluation_binding_ref = new_ref("experiment_input_binding")
+        if variant_run_disposition == "created":
+            variant_run_ref = new_ref("variant_run")
+            variant_binding_ref = new_ref("experiment_input_binding")
+            variant_input_refs = tuple(
+                sorted(
+                    {
+                        target_input.proof.binding_ref,
+                        generic_binding.execution_eligibility_ref,
+                        *(role.role_ref for role in selected_checkpoints),
+                    }
+                )
+            )
+            variant_inputs = {
+                "schema_ref": EXPERIMENT_INPUT_BINDING_SCHEMA,
+                "subject_kind": "variant_run",
+                "source_kind": "target_generic_execution",
+                "target_ref": target_ref,
+                "authority_ref": authority.authority_ref,
+                "generic_binding_ref": generic_binding_ref,
+                "input_refs": list(variant_input_refs),
+            }
+            variant_receipt_ref = new_ref("rg_experiment_binding_receipt")
+            variant_receipt_hash = _receipt_hash(
+                EXPERIMENT_INPUT_BINDING_RECEIPT_KIND,
+                variant_binding_ref,
+                {
+                    "schema_ref": EXPERIMENT_INPUT_BINDING_SCHEMA,
+                    "subject_kind": "variant_run",
+                    "subject_ref": variant_run_ref,
+                    "inputs_hash": canonical_hash(variant_inputs),
+                },
+            )
+            variant_input_proof = ExecutionInputBindingProof(
+                binding_ref=variant_binding_ref,
+                subject_ref=variant_run_ref,
+                input_refs=variant_input_refs,
+                acceptance_receipt=receipt_proof(
+                    AcceptanceReceipt(
+                        issuer=RG_OWNER,
+                        kind=EXPERIMENT_INPUT_BINDING_RECEIPT_KIND,
+                        receipt_ref=variant_receipt_ref,
+                        subject_ref=variant_binding_ref,
+                        payload_hash=variant_receipt_hash,
+                    ),
+                    subject_ref=variant_binding_ref,
+                ),
+            )
+        else:
+            source_row = selected_checkpoint_rows[0]
+            if (
+                source_row.variant_ref != authority.identities.variant_ref
+                or source_row.variant_run_status != "executed"
+            ):
+                raise OwnerConflict("target_measurement_checkpoint_source_invalid")
+            variant_run_ref = source_row.subject_ref
+            variant_binding_ref = source_row.input_binding_ref
+            with self._database.read() as connection:
+                variant_binding_row = connection.execute(
+                    text(
+                        "SELECT * FROM rg_experiment_input_bindings WHERE "
+                        "binding_ref = :binding_ref"
+                    ),
+                    {"binding_ref": variant_binding_ref},
+                ).first()
+            if variant_binding_row is None:
+                raise OwnerConflict("target_measurement_checkpoint_source_invalid")
+            variant_input_proof = _target_native_input_proof(variant_binding_row)
+            variant_inputs = None
+            variant_receipt_ref = None
+            variant_receipt_hash = None
+
+        role_records: list[dict[str, object]] = []
+        for role_name in (
+            "checkpoint_artifact",
+            "log_asset",
+            "analysis_asset",
+            "result_content",
+        ):
+            for ordinal, entry in enumerate(
+                item for item in manifest.entries if item.role == role_name
+            ):
+                role_ref = new_ref("experiment_asset_role")
+                subject_kind = (
+                    "variant_run"
+                    if role_name == "checkpoint_artifact"
+                    else "evaluation_attempt"
+                )
+                subject_ref = (
+                    variant_run_ref
+                    if role_name == "checkpoint_artifact"
+                    else evaluation_attempt_ref
+                )
+                receipt_ref = new_ref("rg_experiment_asset_role_receipt")
+                role_bindings = {
+                    "subject_kind": subject_kind,
+                    "subject_ref": subject_ref,
+                    "role": role_name,
+                    "ordinal": ordinal,
+                    "asset": entry.binding.as_dict(),
+                }
+                role_records.append(
+                    {
+                        "role_ref": role_ref,
+                        "subject_kind": subject_kind,
+                        "subject_ref": subject_ref,
+                        "role": role_name,
+                        "ordinal": ordinal,
+                        "binding": entry.binding,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": _receipt_hash(
+                            EXPERIMENT_ASSET_ROLE_RECEIPT_KIND,
+                            role_ref,
+                            role_bindings,
+                        ),
+                    }
+                )
+        generated_checkpoint_refs = tuple(
+            cast(str, row["role_ref"])
+            for row in role_records
+            if row["role"] == "checkpoint_artifact"
+        )
+        checkpoint_role_refs = (
+            generated_checkpoint_refs
+            if generated_checkpoint_refs
+            else tuple(role.role_ref for role in selected_checkpoints)
+        )
+        result_role_refs = tuple(
+            cast(str, row["role_ref"])
+            for row in role_records
+            if row["role"] == "result_content"
+        )
+        if len(result_role_refs) != 1:
+            raise OwnerConflict("target_measurement_result_role_invalid")
+        result_role_ref = result_role_refs[0]
+        evaluation_input_refs = tuple(
+            sorted(
+                {
+                    generic_binding_ref,
+                    variant_run_ref,
+                    authority.identities.protocol_version_ref,
+                    *checkpoint_role_refs,
+                }
+            )
+        )
+        evaluation_inputs = {
+            "schema_ref": EXPERIMENT_INPUT_BINDING_SCHEMA,
+            "subject_kind": "evaluation_attempt",
+            "source_kind": "target_generic_execution",
+            "target_ref": target_ref,
+            "target_run_ref": generic_binding.target_run_ref,
+            "target_attempt_ref": generic_binding.target_attempt_ref,
+            "target_fence_ref": generic_binding.target_fence_ref,
+            "authority_ref": authority.authority_ref,
+            "generic_binding_ref": generic_binding_ref,
+            "manifest_ref": result_manifest_ref,
+            "input_refs": list(evaluation_input_refs),
+        }
+        evaluation_receipt_ref = new_ref("rg_experiment_binding_receipt")
+        evaluation_receipt_hash = _receipt_hash(
+            EXPERIMENT_INPUT_BINDING_RECEIPT_KIND,
+            evaluation_binding_ref,
+            {
+                "schema_ref": EXPERIMENT_INPUT_BINDING_SCHEMA,
+                "subject_kind": "evaluation_attempt",
+                "subject_ref": evaluation_attempt_ref,
+                "inputs_hash": canonical_hash(evaluation_inputs),
+            },
+        )
+        evaluation_input_proof = ExecutionInputBindingProof(
+            binding_ref=evaluation_binding_ref,
+            subject_ref=evaluation_attempt_ref,
+            input_refs=evaluation_input_refs,
+            acceptance_receipt=receipt_proof(
+                AcceptanceReceipt(
+                    issuer=RG_OWNER,
+                    kind=EXPERIMENT_INPUT_BINDING_RECEIPT_KIND,
+                    receipt_ref=evaluation_receipt_ref,
+                    subject_ref=evaluation_binding_ref,
+                    payload_hash=evaluation_receipt_hash,
+                ),
+                subject_ref=evaluation_binding_ref,
+            ),
+        )
+        asset_role_projection = [
+            {
+                "role_ref": row["role_ref"],
+                "subject_kind": row["subject_kind"],
+                "subject_ref": row["subject_ref"],
+                "role": row["role"],
+                "ordinal": row["ordinal"],
+                "asset": cast(AcceptedAssetBinding, row["binding"]).as_dict(),
+            }
+            for row in role_records
+        ]
+        payload = {
+            "target_ref": target_ref,
+            "target_run_ref": generic_binding.target_run_ref,
+            "target_attempt_ref": generic_binding.target_attempt_ref,
+            "target_fence_ref": generic_binding.target_fence_ref,
+            "authority_ref": authority.authority_ref,
+            "authority_hash": authority.authority_hash,
+            "generic_binding_ref": generic_binding_ref,
+            "manifest_ref": result_manifest_ref,
+            "variant_run_ref": variant_run_ref,
+            "variant_run_disposition": variant_run_disposition,
+            "evaluation_attempt_ref": evaluation_attempt_ref,
+            "variant_run_input_binding": projection_plain_value(
+                variant_input_proof
+            ),
+            "evaluation_attempt_input_binding": projection_plain_value(
+                evaluation_input_proof
+            ),
+            "checkpoint_role_refs": list(checkpoint_role_refs),
+            "result_role_ref": result_role_ref,
+            "asset_roles": asset_role_projection,
+        }
+        payload_hash = canonical_hash(payload)
+        receipt_ref = new_ref("rg_target_measurement_attempt_receipt")
+        receipt_hash = _receipt_hash(
+            TARGET_MEASUREMENT_ATTEMPT_RECEIPT_KIND,
+            attempt_binding_ref,
+            {
+                "attempt_binding_ref": attempt_binding_ref,
+                "payload_hash": payload_hash,
+                **payload,
+            },
+        )
+        try:
+            with self._database.fenced_write() as connection:
+                # SQLAlchemy/pysqlite does not actually begin a transaction for
+                # a leading SELECT.  Acquire the SQLite writer before checking
+                # the current Attempt/Fence so a second runtime cannot commit a
+                # recovery CAS between verification and the first RG write.
+                from meta_research.owners.agent_runtime import (
+                    verify_current_target_run_frontier_in_transaction,
+                )
+
+                verify_current_target_run_frontier_in_transaction(
+                    connection,
+                    execution_request.handle,
+                )
+                # The write transaction closes the TOCTOU window: exact issuer
+                # rows and the current Harness Attempt/Fence must still match.
+                authority_row = connection.execute(
+                    text(
+                        "SELECT authority_hash FROM "
+                        "rg_target_measurement_domain_authorities WHERE "
+                        "authority_ref = :authority_ref AND target_ref = :target_ref"
+                    ),
+                    {
+                        "authority_ref": authority.authority_ref,
+                        "target_ref": target_ref,
+                    },
+                ).first()
+                binding_row = connection.execute(
+                    text(
+                        "SELECT * FROM rg_target_generic_execution_bindings_v3 "
+                        "WHERE binding_ref = :binding_ref"
+                    ),
+                    {"binding_ref": generic_binding_ref},
+                ).first()
+                manifest_row = connection.execute(
+                    text(
+                        "SELECT * FROM rm_target_generic_result_manifests WHERE "
+                        "manifest_ref = :manifest_ref"
+                    ),
+                    {"manifest_ref": result_manifest_ref},
+                ).first()
+                harness_row = connection.execute(
+                    text(
+                        "SELECT attempt_ref, fence_ref FROM ar_harness_runs WHERE "
+                        "run_ref = :run_ref"
+                    ),
+                    {"run_ref": generic_binding.target_run_ref},
+                ).first()
+                if (
+                    authority_row is None
+                    or authority_row.authority_hash != authority.authority_hash
+                    or binding_row is None
+                    or binding_row.target_ref != target_ref
+                    or binding_row.target_attempt_ref
+                    != generic_binding.target_attempt_ref
+                    or binding_row.target_fence_ref
+                    != generic_binding.target_fence_ref
+                    or binding_row.operation_request_hash
+                    != generic_binding.request_hash
+                    or manifest_row is None
+                    or manifest_row.generic_binding_ref != generic_binding_ref
+                    or manifest_row.payload_hash != manifest.payload_hash
+                    or harness_row is None
+                    or harness_row.attempt_ref != generic_binding.target_attempt_ref
+                    or harness_row.fence_ref != generic_binding.target_fence_ref
+                ):
+                    raise OwnerConflict("target_measurement_attempt_stale")
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM rg_target_measurement_attempt_bindings "
+                        "WHERE generic_binding_ref = :generic_binding_ref OR "
+                        "manifest_ref = :manifest_ref OR idempotency_key = :key"
+                    ),
+                    {
+                        "generic_binding_ref": generic_binding_ref,
+                        "manifest_ref": result_manifest_ref,
+                        "key": idempotency_key,
+                    },
+                ).first()
+                if existing is not None:
+                    if existing.request_hash != request_hash:
+                        raise OwnerConflict("target_measurement_attempt_conflict")
+                    evaluation_attempt_ref = existing.evaluation_attempt_ref
+                else:
+                    if variant_run_disposition == "created":
+                        connection.execute(
+                            text(
+                                "INSERT INTO rg_variant_runs (variant_run_ref, "
+                                "variant_ref, input_binding_ref, status, created_at, "
+                                "updated_at) VALUES (:variant_run_ref, "
+                                ":variant_ref, :binding_ref, 'planned', :now, :now)"
+                            ),
+                            {
+                                "variant_run_ref": variant_run_ref,
+                                "variant_ref": authority.identities.variant_ref,
+                                "binding_ref": variant_binding_ref,
+                                "now": now,
+                            },
+                        )
+                        _insert_target_measurement_input_binding(
+                            connection,
+                            binding_ref=variant_binding_ref,
+                            subject_kind="variant_run",
+                            subject_ref=variant_run_ref,
+                            inputs=cast(dict[str, object], variant_inputs),
+                            receipt_ref=cast(str, variant_receipt_ref),
+                            receipt_hash=cast(str, variant_receipt_hash),
+                            accepted_at=now,
+                        )
+                    _insert_target_measurement_input_binding(
+                        connection,
+                        binding_ref=evaluation_binding_ref,
+                        subject_kind="evaluation_attempt",
+                        subject_ref=evaluation_attempt_ref,
+                        inputs=evaluation_inputs,
+                        receipt_ref=evaluation_receipt_ref,
+                        receipt_hash=evaluation_receipt_hash,
+                        accepted_at=now,
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO rg_evaluation_attempts "
+                            "(evaluation_attempt_ref, evaluation_ref, "
+                            "variant_run_ref, input_binding_ref, "
+                            "checkpoint_role_refs_json, "
+                            "checkpoint_role_refs_hash, status, created_at, "
+                            "updated_at) VALUES (:evaluation_attempt_ref, "
+                            ":evaluation_ref, :variant_run_ref, :binding_ref, "
+                            ":checkpoint_json, :checkpoint_hash, 'planned', "
+                            ":now, :now)"
+                        ),
+                        {
+                            "evaluation_attempt_ref": evaluation_attempt_ref,
+                            "evaluation_ref": authority.identities.evaluation_ref,
+                            "variant_run_ref": variant_run_ref,
+                            "binding_ref": evaluation_binding_ref,
+                            "checkpoint_json": canonical_json(
+                                list(checkpoint_role_refs)
+                            ),
+                            "checkpoint_hash": canonical_hash(
+                                list(checkpoint_role_refs)
+                            ),
+                            "now": now,
+                        },
+                    )
+                    for role in role_records:
+                        _insert_target_measurement_asset_role(
+                            connection,
+                            role=role,
+                            accepted_at=now,
+                        )
+                    for ordinal, role_ref_value in enumerate(
+                        checkpoint_role_refs
+                    ):
+                        connection.execute(
+                            text(
+                                "INSERT INTO rg_evaluation_attempt_checkpoints "
+                                "(evaluation_attempt_ref, ordinal, "
+                                "checkpoint_role_ref) VALUES "
+                                "(:evaluation_attempt_ref, :ordinal, :role_ref)"
+                            ),
+                            {
+                                "evaluation_attempt_ref": evaluation_attempt_ref,
+                                "ordinal": ordinal,
+                                "role_ref": role_ref_value,
+                            },
+                        )
+                    connection.execute(
+                        text(
+                            "UPDATE rg_evaluation_attempts SET status = "
+                            "'assets_accepted', updated_at = :now WHERE "
+                            "evaluation_attempt_ref = :evaluation_attempt_ref"
+                        ),
+                        {
+                            "now": now,
+                            "evaluation_attempt_ref": evaluation_attempt_ref,
+                        },
+                    )
+                    if variant_run_disposition == "created":
+                        connection.execute(
+                            text(
+                                "UPDATE rg_variant_runs SET status = 'executed', "
+                                "updated_at = :now WHERE variant_run_ref = "
+                                ":variant_run_ref"
+                            ),
+                            {"now": now, "variant_run_ref": variant_run_ref},
+                        )
+                    connection.execute(
+                        text(
+                            "INSERT INTO rg_target_measurement_attempt_bindings "
+                            "(attempt_binding_ref, target_ref, authority_ref, "
+                            "target_run_ref, target_attempt_ref, target_fence_ref, "
+                            "authority_hash, generic_binding_ref, manifest_ref, "
+                            "variant_run_ref, variant_run_disposition, "
+                            "evaluation_attempt_ref, variant_input_binding_ref, "
+                            "evaluation_input_binding_ref, "
+                            "checkpoint_role_refs_json, checkpoint_role_refs_hash, "
+                            "result_role_ref, payload_json, payload_hash, "
+                            "idempotency_key, request_hash, receipt_ref, "
+                            "receipt_hash, accepted_at) VALUES "
+                            "(:attempt_binding_ref, :target_ref, :authority_ref, "
+                            ":target_run_ref, :target_attempt_ref, "
+                            ":target_fence_ref, "
+                            ":authority_hash, :generic_binding_ref, :manifest_ref, "
+                            ":variant_run_ref, :variant_run_disposition, "
+                            ":evaluation_attempt_ref, :variant_input_binding_ref, "
+                            ":evaluation_input_binding_ref, :checkpoint_json, "
+                            ":checkpoint_hash, :result_role_ref, :payload_json, "
+                            ":payload_hash, :idempotency_key, :request_hash, "
+                            ":receipt_ref, :receipt_hash, :accepted_at)"
+                        ),
+                        {
+                            "attempt_binding_ref": attempt_binding_ref,
+                            "target_ref": target_ref,
+                            "target_run_ref": generic_binding.target_run_ref,
+                            "target_attempt_ref": generic_binding.target_attempt_ref,
+                            "target_fence_ref": generic_binding.target_fence_ref,
+                            "authority_ref": authority.authority_ref,
+                            "authority_hash": authority.authority_hash,
+                            "generic_binding_ref": generic_binding_ref,
+                            "manifest_ref": result_manifest_ref,
+                            "variant_run_ref": variant_run_ref,
+                            "variant_run_disposition": variant_run_disposition,
+                            "evaluation_attempt_ref": evaluation_attempt_ref,
+                            "variant_input_binding_ref": variant_binding_ref,
+                            "evaluation_input_binding_ref": evaluation_binding_ref,
+                            "checkpoint_json": canonical_json(
+                                list(checkpoint_role_refs)
+                            ),
+                            "checkpoint_hash": canonical_hash(
+                                list(checkpoint_role_refs)
+                            ),
+                            "result_role_ref": result_role_ref,
+                            "payload_json": canonical_json(payload),
+                            "payload_hash": payload_hash,
+                            "idempotency_key": idempotency_key,
+                            "request_hash": request_hash,
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "accepted_at": now,
+                        },
+                    )
+                    increments = {
+                        "variant_runs": int(variant_run_disposition == "created"),
+                        "input_bindings": 1
+                        + int(variant_run_disposition == "created"),
+                        "asset_roles": len(role_records),
+                    }
+                    connection.execute(
+                        text(
+                            "UPDATE research_graph_state SET revision = "
+                            "revision + 1, variant_run_count = variant_run_count + "
+                            ":variant_runs, evaluation_attempt_count = "
+                            "evaluation_attempt_count + 1, "
+                            "experiment_input_binding_count = "
+                            "experiment_input_binding_count + :input_bindings, "
+                            "experiment_asset_role_count = "
+                            "experiment_asset_role_count + :asset_roles, "
+                            "target_measurement_attempt_count = "
+                            "target_measurement_attempt_count + 1 WHERE "
+                            "singleton = 'owner'"
+                        ),
+                        increments,
+                    )
+                    self._feed.record(
+                        connection,
+                        "research_graph.target_measurement_attempt_accepted",
+                        {
+                            "attempt_binding_ref": attempt_binding_ref,
+                            "target_ref": target_ref,
+                            "variant_run_ref": variant_run_ref,
+                            "variant_run_disposition": variant_run_disposition,
+                            "evaluation_attempt_ref": evaluation_attempt_ref,
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+        except OperationalError as error:
+            raise OwnerConflict("target_measurement_attempt_stale") from error
+        except IntegrityError as error:
+            raise OwnerConflict("target_measurement_attempt_conflict") from error
+        accepted = self.query_target_measurement_attempt(evaluation_attempt_ref)
+        if accepted is None:
+            raise OwnerConflict("target_measurement_attempt_missing_after_commit")
+        return accepted
+
+    def query_target_measurement_attempt(
+        self, evaluation_attempt_ref: str
+    ) -> AcceptedTargetMeasurementAttempt | None:
+        _target_measurement_runtime_ref(evaluation_attempt_ref)
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_measurement_attempt_bindings WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref"
+                ),
+                {"evaluation_attempt_ref": evaluation_attempt_ref},
+            ).first()
+        if row is None:
+            return None
+        (
+            authority,
+            generic_binding,
+            _request,
+            _terminal,
+            _target_input,
+            manifest,
+        ) = self._target_measurement_runtime_facts(
+            target_ref=row.target_ref,
+            generic_binding_ref=row.generic_binding_ref,
+            result_manifest_ref=row.manifest_ref,
+        )
+        with self._database.read() as connection:
+            variant_run = connection.execute(
+                text(
+                    "SELECT * FROM rg_variant_runs WHERE variant_run_ref = "
+                    ":variant_run_ref"
+                ),
+                {"variant_run_ref": row.variant_run_ref},
+            ).first()
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM rg_evaluation_attempts WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref"
+                ),
+                {"evaluation_attempt_ref": evaluation_attempt_ref},
+            ).first()
+            variant_binding_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_experiment_input_bindings WHERE "
+                    "binding_ref = :binding_ref"
+                ),
+                {"binding_ref": row.variant_input_binding_ref},
+            ).first()
+            evaluation_binding_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_experiment_input_bindings WHERE "
+                    "binding_ref = :binding_ref"
+                ),
+                {"binding_ref": row.evaluation_input_binding_ref},
+            ).first()
+            checkpoint_rows = connection.execute(
+                text(
+                    "SELECT c.ordinal, r.* FROM "
+                    "rg_evaluation_attempt_checkpoints c JOIN "
+                    "rg_experiment_asset_roles r ON r.role_ref = "
+                    "c.checkpoint_role_ref WHERE c.evaluation_attempt_ref = "
+                    ":evaluation_attempt_ref ORDER BY c.ordinal"
+                ),
+                {"evaluation_attempt_ref": evaluation_attempt_ref},
+            ).all()
+            role_rows = connection.execute(
+                text(
+                    "SELECT * FROM rg_experiment_asset_roles WHERE "
+                    "subject_ref = :evaluation_attempt_ref OR (subject_ref = "
+                    ":variant_run_ref AND role = 'checkpoint_artifact') ORDER BY "
+                    "role, ordinal"
+                ),
+                {
+                    "evaluation_attempt_ref": evaluation_attempt_ref,
+                    "variant_run_ref": row.variant_run_ref,
+                },
+            ).all()
+        if any(
+            value is None
+            for value in (
+                variant_run,
+                attempt,
+                variant_binding_row,
+                evaluation_binding_row,
+            )
+        ):
+            raise OwnerConflict("target_measurement_attempt_integrity_invalid")
+        variant_input = _target_native_input_proof(variant_binding_row)
+        evaluation_input = _target_native_input_proof(evaluation_binding_row)
+        checkpoint_roles = tuple(
+            _accepted_experiment_asset_role(checkpoint) for checkpoint in checkpoint_rows
+        )
+        accepted_roles = tuple(
+            _accepted_experiment_asset_role(role) for role in role_rows
+        )
+        for role in accepted_roles:
+            self._asset_verifier.verify_asset_binding(
+                asset_ref=role.binding.asset_ref,
+                version_ref=role.binding.version_ref,
+                content_hash=role.binding.content_hash,
+                manifest_hash=role.binding.manifest_hash,
+                receipt=role.binding.receipt,
+            )
+        checkpoint_role_refs = tuple(role.role_ref for role in checkpoint_roles)
+        try:
+            stored_checkpoints = tuple(json.loads(row.checkpoint_role_refs_json))
+            stored_payload = decoded_object(row.payload_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OwnerConflict("target_measurement_attempt_integrity_invalid") from error
+        role_by_key = {
+            (role.subject_kind, role.subject_ref, role.role, role.ordinal): role
+            for role in accepted_roles
+        }
+        manifest_roles: list[AcceptedExperimentAssetRole] = []
+        role_ordinals: dict[str, int] = {}
+        for entry in manifest.entries:
+            ordinal = role_ordinals.get(entry.role, 0)
+            role_ordinals[entry.role] = ordinal + 1
+            subject_kind = (
+                "variant_run"
+                if entry.role == "checkpoint_artifact"
+                else "evaluation_attempt"
+            )
+            subject_ref = (
+                row.variant_run_ref
+                if entry.role == "checkpoint_artifact"
+                else evaluation_attempt_ref
+            )
+            role = role_by_key.get(
+                (subject_kind, subject_ref, entry.role, ordinal)
+            )
+            if role is None or role.binding != entry.binding:
+                raise OwnerConflict("target_measurement_attempt_integrity_invalid")
+            manifest_roles.append(role)
+        asset_role_projection = [
+            {
+                "role_ref": role.role_ref,
+                "subject_kind": role.subject_kind,
+                "subject_ref": role.subject_ref,
+                "role": role.role,
+                "ordinal": role.ordinal,
+                "asset": role.binding.as_dict(),
+            }
+            for role in manifest_roles
+        ]
+        expected_payload = {
+            "target_ref": row.target_ref,
+            "target_run_ref": row.target_run_ref,
+            "target_attempt_ref": row.target_attempt_ref,
+            "target_fence_ref": row.target_fence_ref,
+            "authority_ref": authority.authority_ref,
+            "authority_hash": authority.authority_hash,
+            "generic_binding_ref": generic_binding.binding_ref,
+            "manifest_ref": manifest.manifest_ref,
+            "variant_run_ref": row.variant_run_ref,
+            "variant_run_disposition": row.variant_run_disposition,
+            "evaluation_attempt_ref": evaluation_attempt_ref,
+            "variant_run_input_binding": projection_plain_value(variant_input),
+            "evaluation_attempt_input_binding": projection_plain_value(
+                evaluation_input
+            ),
+            "checkpoint_role_refs": list(checkpoint_role_refs),
+            "result_role_ref": row.result_role_ref,
+            "asset_roles": asset_role_projection,
+        }
+        payload_hash = canonical_hash(expected_payload)
+        receipt = AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=TARGET_MEASUREMENT_ATTEMPT_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.attempt_binding_ref,
+            payload_hash=_receipt_hash(
+                TARGET_MEASUREMENT_ATTEMPT_RECEIPT_KIND,
+                row.attempt_binding_ref,
+                {
+                    "attempt_binding_ref": row.attempt_binding_ref,
+                    "payload_hash": payload_hash,
+                    **expected_payload,
+                },
+            ),
+        )
+        if (
+            stored_payload != expected_payload
+            or row.payload_hash != payload_hash
+            or row.receipt_hash != receipt.payload_hash
+            or row.authority_ref != authority.authority_ref
+            or row.authority_hash != authority.authority_hash
+            or row.generic_binding_ref != generic_binding.binding_ref
+            or row.target_run_ref != generic_binding.target_run_ref
+            or row.target_attempt_ref != generic_binding.target_attempt_ref
+            or row.target_fence_ref != generic_binding.target_fence_ref
+            or row.manifest_ref != manifest.manifest_ref
+            or row.request_hash
+            != canonical_hash(
+                {
+                    "command": "accept_target_measurement_attempt",
+                    "target_ref": row.target_ref,
+                    "generic_binding_ref": row.generic_binding_ref,
+                    "result_manifest_ref": row.manifest_ref,
+                }
+            )
+            or stored_checkpoints != checkpoint_role_refs
+            or row.checkpoint_role_refs_hash
+            != canonical_hash(list(checkpoint_role_refs))
+            or row.result_role_ref
+            != next(
+                (
+                    role.role_ref
+                    for role in manifest_roles
+                    if role.role == "result_content"
+                ),
+                None,
+            )
+            or variant_run.variant_ref != authority.identities.variant_ref
+            or variant_run.input_binding_ref != row.variant_input_binding_ref
+            or variant_run.status != "executed"
+            or attempt.evaluation_ref != authority.identities.evaluation_ref
+            or attempt.variant_run_ref != row.variant_run_ref
+            or attempt.input_binding_ref != row.evaluation_input_binding_ref
+            or attempt.status not in {"assets_accepted", "measurement_accepted"}
+            or attempt.checkpoint_role_refs_json
+            != canonical_json(list(checkpoint_role_refs))
+            or attempt.checkpoint_role_refs_hash
+            != canonical_hash(list(checkpoint_role_refs))
+            or variant_input.subject_ref != row.variant_run_ref
+            or evaluation_input.subject_ref != evaluation_attempt_ref
+            or row.variant_run_disposition not in {"created", "reused"}
+        ):
+            raise OwnerConflict("target_measurement_attempt_integrity_invalid")
+        return AcceptedTargetMeasurementAttempt(
+            attempt_binding_ref=row.attempt_binding_ref,
+            target_ref=row.target_ref,
+            target_run_ref=row.target_run_ref,
+            target_attempt_ref=row.target_attempt_ref,
+            target_fence_ref=row.target_fence_ref,
+            authority_ref=row.authority_ref,
+            authority_hash=row.authority_hash,
+            generic_binding_ref=row.generic_binding_ref,
+            manifest_ref=row.manifest_ref,
+            variant_run_ref=row.variant_run_ref,
+            variant_run_disposition=row.variant_run_disposition,
+            evaluation_attempt_ref=evaluation_attempt_ref,
+            variant_run_input_binding=variant_input,
+            evaluation_attempt_input_binding=evaluation_input,
+            checkpoint_role_refs=checkpoint_role_refs,
+            result_role_ref=row.result_role_ref,
+            payload_hash=payload_hash,
+            receipt=receipt,
+            accepted_at=float(row.accepted_at),
+        )
+
+    def query_target_measurement_attempt_for_binding(
+        self,
+        generic_binding_ref: str,
+    ) -> AcceptedTargetMeasurementAttempt | None:
+        """Reconcile the unique native Attempt for one generic operation."""
+
+        _target_measurement_runtime_ref(generic_binding_ref)
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT evaluation_attempt_ref FROM "
+                    "rg_target_measurement_attempt_bindings WHERE "
+                    "generic_binding_ref = :generic_binding_ref"
+                ),
+                {"generic_binding_ref": generic_binding_ref},
+            ).all()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise OwnerConflict("target_measurement_attempt_integrity_invalid")
+        return self.query_target_measurement_attempt(
+            rows[0].evaluation_attempt_ref
+        )
+
+    def _target_formal_measurement_facts(
+        self,
+        evaluation_attempt_ref: str,
+    ) -> tuple[
+        AcceptedTargetMeasurementDomainAuthority,
+        AcceptedTargetMeasurementAttempt,
+        TargetGenericExecutionBinding,
+        TargetExecutionRequest,
+        TargetExecutionTerminalResult,
+        AcceptedTargetGenericResultManifest,
+        AcceptedExperimentAssetRole,
+        dict[str, object],
+        dict[str, float],
+        str,
+    ]:
+        """Rebuild one current Target result solely from native Owner facts."""
+
+        accepted_attempt = self.query_target_measurement_attempt(
+            evaluation_attempt_ref
+        )
+        if accepted_attempt is None:
+            raise OwnerConflict("target_formal_measurement_attempt_missing")
+        (
+            authority,
+            generic_binding,
+            execution_request,
+            terminal,
+            _target_input,
+            manifest,
+        ) = self._target_measurement_runtime_facts(
+            target_ref=accepted_attempt.target_ref,
+            generic_binding_ref=accepted_attempt.generic_binding_ref,
+            result_manifest_ref=accepted_attempt.manifest_ref,
+        )
+        if (
+            accepted_attempt.authority_ref != authority.authority_ref
+            or accepted_attempt.authority_hash != authority.authority_hash
+            or accepted_attempt.target_run_ref != generic_binding.target_run_ref
+            or accepted_attempt.target_attempt_ref
+            != generic_binding.target_attempt_ref
+            or accepted_attempt.target_fence_ref
+            != generic_binding.target_fence_ref
+            or accepted_attempt.evaluation_attempt_ref
+            != evaluation_attempt_ref
+        ):
+            raise OwnerConflict("target_formal_measurement_source_invalid")
+        result_entries = tuple(
+            entry for entry in manifest.entries if entry.role == "result_content"
+        )
+        if len(result_entries) != 1:
+            raise OwnerConflict("target_formal_measurement_result_role_invalid")
+        result_entry = result_entries[0]
+        with self._database.read() as connection:
+            result_role_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_experiment_asset_roles WHERE role_ref = "
+                    ":role_ref"
+                ),
+                {"role_ref": accepted_attempt.result_role_ref},
+            ).first()
+        if result_role_row is None:
+            raise OwnerConflict("target_formal_measurement_result_role_invalid")
+        result_role = _accepted_experiment_asset_role(result_role_row)
+        self._asset_verifier.verify_asset_binding(
+            asset_ref=result_role.binding.asset_ref,
+            version_ref=result_role.binding.version_ref,
+            content_hash=result_role.binding.content_hash,
+            manifest_hash=result_role.binding.manifest_hash,
+            receipt=result_role.binding.receipt,
+        )
+        if (
+            result_role.subject_kind != "evaluation_attempt"
+            or result_role.subject_ref != evaluation_attempt_ref
+            or result_role.role != "result_content"
+            or result_role.ordinal != 0
+            or result_role.binding != result_entry.binding
+        ):
+            raise OwnerConflict("target_formal_measurement_result_role_invalid")
+        result_reader = self._target_measurement_result_reader
+        if result_reader is None:
+            raise OwnerConflict("target_measurement_runtime_reader_unavailable")
+        raw_content = result_reader.materialize_generic_result_asset(
+            manifest_ref=manifest.manifest_ref,
+            version_ref=result_entry.binding.version_ref,
+        )
+        if hashlib.sha256(raw_content).hexdigest() != result_role.binding.content_hash:
+            raise OwnerConflict("target_formal_measurement_result_content_invalid")
+        result_content = _decode_target_result_content(raw_content)
+        if result_content.get("schema_ref") != authority.measurement_contract.result_schema_ref:
+            raise OwnerConflict("target_measurement_result_schema_ref_invalid")
+        result_disposition = result_content.get("result_disposition")
+        if (
+            type(result_disposition) is not str
+            or result_disposition not in EXPERIMENT_RESULT_DISPOSITIONS
+        ):
+            raise OwnerConflict("target_measurement_result_disposition_invalid")
+        schema = authority.measurement_contract.result_schema.as_dict()
+        _validate_target_result_schema(
+            schema=schema,
+            result_content=result_content,
+        )
+        protocol = authority.measurement_contract.protocol_version
+        metrics = _target_metric_values(
+            result_content=result_content,
+            required_metric_keys=protocol.required_metric_keys,
+            optional_metric_keys=protocol.optional_metric_keys,
+        )
+        return (
+            authority,
+            accepted_attempt,
+            generic_binding,
+            execution_request,
+            terminal,
+            manifest,
+            result_role,
+            result_content,
+            metrics,
+            result_disposition,
+        )
+
+    def accept_target_formal_measurement(
+        self,
+        *,
+        target_ref: str,
+        evaluation_attempt_ref: str,
+        idempotency_key: str,
+    ) -> FormalMetricResult:
+        """Accept metrics under the frozen 0027 ProtocolVersion authority."""
+
+        _target_measurement_runtime_ref(target_ref)
+        _target_measurement_runtime_ref(evaluation_attempt_ref)
+        _target_measurement_idempotency_key(idempotency_key)
+        (
+            authority,
+            accepted_attempt,
+            generic_binding,
+            execution_request,
+            terminal,
+            manifest,
+            result_role,
+            _result_content,
+            metrics,
+            result_disposition,
+        ) = self._target_formal_measurement_facts(evaluation_attempt_ref)
+        if accepted_attempt.target_ref != target_ref:
+            raise OwnerConflict("target_formal_measurement_target_invalid")
+        protocol = authority.measurement_contract.protocol_version
+        metrics_hash = canonical_hash(metrics)
+        required_metrics_hash = canonical_hash(list(protocol.required_metric_keys))
+        receipt_bindings = _target_formal_measurement_receipt_bindings(
+            authority=authority,
+            accepted_attempt=accepted_attempt,
+            generic_binding=generic_binding,
+            terminal=terminal,
+            manifest=manifest,
+            result_role=result_role,
+            result_schema_hash=canonical_hash(
+                authority.measurement_contract.result_schema.as_dict()
+            ),
+            result_disposition=result_disposition,
+            metrics_hash=metrics_hash,
+        )
+        try:
+            with self._database.fenced_write() as connection:
+                from meta_research.owners.agent_runtime import (
+                    verify_current_target_run_frontier_in_transaction,
+                )
+
+                verify_current_target_run_frontier_in_transaction(
+                    connection,
+                    execution_request.handle,
+                )
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM rg_metric_results WHERE "
+                        "evaluation_attempt_ref = :evaluation_attempt_ref"
+                    ),
+                    {"evaluation_attempt_ref": evaluation_attempt_ref},
+                ).first()
+                if existing is None:
+                    authority_row = connection.execute(
+                        text(
+                            "SELECT authority_hash FROM "
+                            "rg_target_measurement_domain_authorities WHERE "
+                            "authority_ref = :authority_ref AND target_ref = "
+                            ":target_ref"
+                        ),
+                        {
+                            "authority_ref": authority.authority_ref,
+                            "target_ref": target_ref,
+                        },
+                    ).first()
+                    bridge_row = connection.execute(
+                        text(
+                            "SELECT * FROM "
+                            "rg_target_measurement_attempt_bindings WHERE "
+                            "attempt_binding_ref = :attempt_binding_ref"
+                        ),
+                        {
+                            "attempt_binding_ref": (
+                                accepted_attempt.attempt_binding_ref
+                            )
+                        },
+                    ).first()
+                    generic_row = connection.execute(
+                        text(
+                            "SELECT * FROM "
+                            "rg_target_generic_execution_bindings_v3 WHERE "
+                            "binding_ref = :binding_ref"
+                        ),
+                        {"binding_ref": generic_binding.binding_ref},
+                    ).first()
+                    manifest_row = connection.execute(
+                        text(
+                            "SELECT payload_hash FROM "
+                            "rm_target_generic_result_manifests WHERE "
+                            "manifest_ref = :manifest_ref"
+                        ),
+                        {"manifest_ref": manifest.manifest_ref},
+                    ).first()
+                    harness_row = connection.execute(
+                        text(
+                            "SELECT attempt_ref, fence_ref FROM ar_harness_runs "
+                            "WHERE run_ref = :run_ref"
+                        ),
+                        {"run_ref": generic_binding.target_run_ref},
+                    ).first()
+                    attempt_row = connection.execute(
+                        text(
+                            "SELECT status FROM rg_evaluation_attempts WHERE "
+                            "evaluation_attempt_ref = :evaluation_attempt_ref"
+                        ),
+                        {"evaluation_attempt_ref": evaluation_attempt_ref},
+                    ).first()
+                    role_row = connection.execute(
+                        text(
+                            "SELECT content_hash, receipt_hash FROM "
+                            "rg_experiment_asset_roles WHERE role_ref = "
+                            ":role_ref"
+                        ),
+                        {"role_ref": result_role.role_ref},
+                    ).first()
+                    if (
+                        authority_row is None
+                        or authority_row.authority_hash != authority.authority_hash
+                        or bridge_row is None
+                        or bridge_row.target_ref != target_ref
+                        or bridge_row.target_run_ref
+                        != generic_binding.target_run_ref
+                        or bridge_row.target_attempt_ref
+                        != generic_binding.target_attempt_ref
+                        or bridge_row.target_fence_ref
+                        != generic_binding.target_fence_ref
+                        or bridge_row.authority_hash != authority.authority_hash
+                        or bridge_row.generic_binding_ref
+                        != generic_binding.binding_ref
+                        or bridge_row.manifest_ref != manifest.manifest_ref
+                        or bridge_row.evaluation_attempt_ref
+                        != evaluation_attempt_ref
+                        or bridge_row.result_role_ref != result_role.role_ref
+                        or generic_row is None
+                        or generic_row.operation_request_hash
+                        != generic_binding.request_hash
+                        or generic_row.exit_receipt_hash
+                        != generic_binding.exit_receipt_hash
+                        or generic_row.terminal_status != "succeeded"
+                        or generic_row.process_tree_drained != 1
+                        or generic_row.currentness_known != 1
+                        or generic_row.current != 1
+                        or manifest_row is None
+                        or manifest_row.payload_hash != manifest.payload_hash
+                        or harness_row is None
+                        or harness_row.attempt_ref
+                        != generic_binding.target_attempt_ref
+                        or harness_row.fence_ref
+                        != generic_binding.target_fence_ref
+                        or attempt_row is None
+                        or attempt_row.status != "assets_accepted"
+                        or role_row is None
+                        or role_row.content_hash
+                        != result_role.binding.content_hash
+                        or role_row.receipt_hash != result_role.receipt.payload_hash
+                    ):
+                        raise OwnerConflict("target_formal_measurement_stale")
+                    metric_result_ref = new_ref("metric_result")
+                    receipt_ref = new_ref("rg_formal_measurement_receipt")
+                    receipt_hash = _receipt_hash(
+                        FORMAL_MEASUREMENT_RECEIPT_KIND,
+                        evaluation_attempt_ref,
+                        receipt_bindings,
+                    )
+                    accepted_at = time.time()
+                    connection.execute(
+                        text(
+                            "INSERT INTO rg_metric_results "
+                            "(metric_result_ref, evaluation_attempt_ref, "
+                            "result_role_ref, metrics_json, metrics_hash, "
+                            "required_metrics_hash, run_ref, "
+                            "execution_attempt_ref, fence_ref, "
+                            "execution_result_hash, execution_receipt_ref, "
+                            "execution_receipt_hash, receipt_ref, receipt_hash, "
+                            "accepted_at) VALUES (:metric_result_ref, "
+                            ":evaluation_attempt_ref, :result_role_ref, "
+                            ":metrics_json, :metrics_hash, "
+                            ":required_metrics_hash, :run_ref, "
+                            ":execution_attempt_ref, :fence_ref, "
+                            ":execution_result_hash, :execution_receipt_ref, "
+                            ":execution_receipt_hash, :receipt_ref, "
+                            ":receipt_hash, :accepted_at)"
+                        ),
+                        {
+                            "metric_result_ref": metric_result_ref,
+                            "evaluation_attempt_ref": evaluation_attempt_ref,
+                            "result_role_ref": result_role.role_ref,
+                            "metrics_json": canonical_json(metrics),
+                            "metrics_hash": metrics_hash,
+                            "required_metrics_hash": required_metrics_hash,
+                            "run_ref": generic_binding.target_run_ref,
+                            "execution_attempt_ref": (
+                                generic_binding.target_attempt_ref
+                            ),
+                            "fence_ref": generic_binding.target_fence_ref,
+                            "execution_result_hash": (
+                                generic_binding.exit_receipt_hash
+                            ),
+                            "execution_receipt_ref": (
+                                generic_binding.receipt.receipt_ref
+                            ),
+                            "execution_receipt_hash": (
+                                generic_binding.receipt.payload_hash
+                            ),
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "accepted_at": accepted_at,
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE rg_evaluation_attempts SET status = "
+                            "'measurement_accepted', updated_at = :accepted_at "
+                            "WHERE evaluation_attempt_ref = "
+                            ":evaluation_attempt_ref"
+                        ),
+                        {
+                            "accepted_at": accepted_at,
+                            "evaluation_attempt_ref": evaluation_attempt_ref,
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE research_graph_state SET revision = "
+                            "revision + 1, formal_measurement_count = "
+                            "formal_measurement_count + 1 WHERE singleton = "
+                            "'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "research_graph.target_formal_measurement_accepted",
+                        {
+                            "target_ref": target_ref,
+                            "attempt_binding_ref": (
+                                accepted_attempt.attempt_binding_ref
+                            ),
+                            "evaluation_attempt_ref": evaluation_attempt_ref,
+                            "metric_result_ref": metric_result_ref,
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+                else:
+                    if (
+                        existing.result_role_ref != result_role.role_ref
+                        or existing.metrics_json != canonical_json(metrics)
+                        or existing.metrics_hash != metrics_hash
+                        or existing.required_metrics_hash
+                        != required_metrics_hash
+                        or existing.run_ref != generic_binding.target_run_ref
+                        or existing.execution_attempt_ref
+                        != generic_binding.target_attempt_ref
+                        or existing.fence_ref != generic_binding.target_fence_ref
+                        or existing.execution_result_hash
+                        != generic_binding.exit_receipt_hash
+                        or existing.execution_receipt_ref
+                        != generic_binding.receipt.receipt_ref
+                        or existing.execution_receipt_hash
+                        != generic_binding.receipt.payload_hash
+                    ):
+                        raise OwnerConflict("target_formal_measurement_conflict")
+        except OperationalError as error:
+            raise OwnerConflict("target_formal_measurement_stale") from error
+        except IntegrityError as error:
+            raise OwnerConflict("target_formal_measurement_conflict") from error
+        accepted = self.query_target_formal_metric_result(evaluation_attempt_ref)
+        if accepted is None:
+            raise OwnerConflict("target_formal_measurement_missing_after_commit")
+        return accepted
+
+    def query_target_formal_metric_result(
+        self, evaluation_attempt_ref: str
+    ) -> FormalMetricResult | None:
+        _target_measurement_runtime_ref(evaluation_attempt_ref)
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_metric_results WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref"
+                ),
+                {"evaluation_attempt_ref": evaluation_attempt_ref},
+            ).first()
+            attempt_row = connection.execute(
+                text(
+                    "SELECT status FROM rg_evaluation_attempts WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref"
+                ),
+                {"evaluation_attempt_ref": evaluation_attempt_ref},
+            ).first()
+        if row is None:
+            return None
+        (
+            authority,
+            accepted_attempt,
+            generic_binding,
+            _execution_request,
+            terminal,
+            manifest,
+            result_role,
+            _result_content,
+            expected_metrics,
+            result_disposition,
+        ) = self._target_formal_measurement_facts(evaluation_attempt_ref)
+        try:
+            stored_metrics = decoded_object(row.metrics_json)
+            metrics = {
+                name: float(value)
+                for name, value in stored_metrics.items()
+                if type(name) is str and type(value) in {int, float}
+            }
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("target_formal_measurement_integrity_invalid") from error
+        protocol = authority.measurement_contract.protocol_version
+        metrics_hash = canonical_hash(expected_metrics)
+        required_metrics_hash = canonical_hash(list(protocol.required_metric_keys))
+        receipt_bindings = _target_formal_measurement_receipt_bindings(
+            authority=authority,
+            accepted_attempt=accepted_attempt,
+            generic_binding=generic_binding,
+            terminal=terminal,
+            manifest=manifest,
+            result_role=result_role,
+            result_schema_hash=canonical_hash(
+                authority.measurement_contract.result_schema.as_dict()
+            ),
+            result_disposition=result_disposition,
+            metrics_hash=metrics_hash,
+        )
+        expected_receipt_hash = _receipt_hash(
+            FORMAL_MEASUREMENT_RECEIPT_KIND,
+            evaluation_attempt_ref,
+            receipt_bindings,
+        )
+        if (
+            attempt_row is None
+            or attempt_row.status != "measurement_accepted"
+            or stored_metrics != expected_metrics
+            or metrics != expected_metrics
+            or canonical_json(expected_metrics) != row.metrics_json
+            or row.metrics_hash != metrics_hash
+            or row.required_metrics_hash != required_metrics_hash
+            or row.result_role_ref != result_role.role_ref
+            or row.run_ref != generic_binding.target_run_ref
+            or row.execution_attempt_ref != generic_binding.target_attempt_ref
+            or row.fence_ref != generic_binding.target_fence_ref
+            or row.execution_result_hash != generic_binding.exit_receipt_hash
+            or row.execution_receipt_ref
+            != generic_binding.receipt.receipt_ref
+            or row.execution_receipt_hash
+            != generic_binding.receipt.payload_hash
+            or row.receipt_hash != expected_receipt_hash
+        ):
+            raise OwnerConflict("target_formal_measurement_integrity_invalid")
+        return FormalMetricResult(
+            metric_result_ref=row.metric_result_ref,
+            evaluation_attempt_ref=evaluation_attempt_ref,
+            result_role_ref=result_role.role_ref,
+            metrics=metrics,
+            metrics_hash=metrics_hash,
+            receipt=AcceptanceReceipt(
+                issuer=RG_OWNER,
+                kind=FORMAL_MEASUREMENT_RECEIPT_KIND,
+                receipt_ref=row.receipt_ref,
+                subject_ref=evaluation_attempt_ref,
+                payload_hash=row.receipt_hash,
+            ),
+        )
+
+    def query_target_graph_rejection(
+        self, submission_ref: str
+    ) -> TargetGraphRejection | None:
+        return self._receipt_verifier.query_target_graph_rejection(submission_ref)
+
+    def verify_target_graph_rejection_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_target_graph_rejection_receipt(**values)
+
+    def query_target_graph_head(self, graph_ref: str) -> TargetGraphHead:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT request_ref FROM rg_target_graphs WHERE graph_ref = "
+                    ":graph_ref"
+                ),
+                {"graph_ref": graph_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("target_graph_not_found")
+        graph = self.query_target_graph(row.request_ref)
+        if graph is None:
+            raise OwnerConflict("target_graph_not_found")
+        return TargetGraphHead(
+            graph_ref=graph.graph_ref,
+            generation=graph.head_generation,
+            strategy_complete=graph.strategy_complete,
+            target_set_hash=graph.target_set_hash,
+            coverage_hash=graph.coverage_hash,
+            receipt=graph.head_receipt,
+        )
+
+    def append_target_batch(
+        self,
+        *,
+        graph_ref: str,
+        proposal_ref: str,
+        proposal: dict[str, object],
+        proposal_hash: str,
+        proposal_receipt: AcceptanceReceipt,
+    ) -> TargetGraphHead:
+        """CAS one immutable Target batch (or final seal) onto the RG head."""
+
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        if self._execution_verifier is None:
+            raise OwnerConflict("attempt_execution_verifier_unavailable")
+        try:
+            validated_proposal_hash = validate_target_graph_append_proposal(proposal)
+        except BundleContractError as error:
+            raise OwnerConflict(str(error)) from error
+        if validated_proposal_hash != proposal_hash:
+            raise OwnerConflict("target_graph_append_proposal_hash_invalid")
+        with self._database.read() as connection:
+            graph_row = connection.execute(
+                text("SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"),
+                {"graph_ref": graph_ref},
+            ).first()
+            already = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_graph_appends WHERE proposal_ref = "
+                    ":proposal_ref"
+                ),
+                {"proposal_ref": proposal_ref},
+            ).first()
+        if graph_row is None:
+            raise OwnerConflict("target_graph_not_found")
+        graph = self.query_target_graph(graph_row.request_ref)
+        if graph is None:
+            raise OwnerConflict("target_graph_not_found")
+        if already is not None:
+            if (
+                already.graph_ref != graph_ref
+                or already.proposal_hash != proposal_hash
+                or already.proposal_receipt_ref != proposal_receipt.receipt_ref
+                or already.proposal_receipt_hash != proposal_receipt.payload_hash
+            ):
+                raise OwnerConflict("target_graph_append_conflict")
+            for target in graph.targets:
+                if (
+                    self.query_target_measurement_domain_authority(
+                        target.target_ref
+                    )
+                    is None
+                ):
+                    raise OwnerConflict(
+                        "target_measurement_domain_authority_missing"
+                    )
+            return self.query_target_graph_head(graph_ref)
+        base_generation = proposal.get("base_generation")
+        base_receipt_value = proposal.get("base_head_receipt")
+        if (
+            proposal.get("graph_ref") != graph_ref
+            or not isinstance(base_generation, int)
+            or isinstance(base_generation, bool)
+            or base_receipt_value != graph.head_receipt.as_public_dict()
+            or base_generation != graph.head_generation
+        ):
+            raise OwnerConflict("target_graph_append_base_stale")
+        if graph.strategy_complete:
+            raise OwnerConflict("target_graph_strategy_complete")
+        verified = self._stage_request_verifier.query_verified_bundle_stage_request(
+            request_ref=graph.request_ref,
+            context_pack_ref=graph.context_pack_ref,
+        )
+        accepted_formal_plan = verified.accepted_formal_plan
+        if (
+            accepted_formal_plan is None
+            or accepted_formal_plan.formal_plan_ref != graph.formal_plan_ref
+            or accepted_formal_plan.plan_document_hash != graph.plan_document_hash
+        ):
+            raise OwnerConflict("bundle_formal_plan_binding_invalid")
+        self._receipt_verifier.verify_accepted_formal_plan_binding(
+            accepted_formal_plan
+        )
+        try:
+            completion, root_state = _formal_target_plan_state(
+                graph.target_plan,
+                accepted_formal_plan.plan_document,
+            )
+            state = rolling_strategy_state_from_dict(
+                {
+                    "schema_ref": ROLLING_STRATEGY_STATE_SCHEMA_REF,
+                    "completion_contract_hash": (
+                        root_state.completion_contract_hash
+                    ),
+                    "revision": graph.head_generation + 1,
+                    "candidates": [target.spec for target in graph.targets],
+                    "strategy_complete": graph.strategy_complete,
+                },
+                completion_contract=completion,
+            )
+            update_value = proposal.get("strategy_update")
+            update = strategy_update_from_dict(
+                update_value,
+                completion_contract=completion,
+            )
+            if update.update.revision != state.strategy.revision + 1:
+                raise BundleTargetContractError("strategy_revision_not_monotonic")
+            target_values = (
+                update_value.get("candidates")
+                if isinstance(update_value, dict)
+                else None
+            )
+            if not isinstance(target_values, list):
+                raise BundleTargetContractError(
+                    "formal_strategy_update_invalid"
+                )
+            committed_refs = {
+                commit.target_ref
+                for commit in self.query_target_commits(graph.graph_ref)
+            }
+            label_by_ref = {
+                target.target_ref: target.target_key for target in graph.targets
+            }
+            accepted_labels = frozenset(
+                label_by_ref[target_ref]
+                for target_ref in committed_refs
+                if target_ref in label_by_ref
+            )
+            next_state = apply_strategy_update(
+                state,
+                update,
+                completion_contract=completion,
+                accepted_labels=accepted_labels,
+            )
+        except (BundleTargetContractError, OwnerConflict) as error:
+            raise OwnerConflict(str(error)) from error
+        strategy_complete = next_state.strategy.strategy_complete
+        self._execution_verifier.verify_bundle_target_proposal_receipt(
+            proposal_ref=proposal_ref,
+            run_ref=graph.run_ref,
+            attempt_ref=graph.attempt_ref,
+            fence_ref=graph.fence_ref,
+            graph_ref=graph_ref,
+            base_generation=base_generation,
+            base_head_receipt=graph.head_receipt,
+            proposal_hash=proposal_hash,
+            receipt=proposal_receipt,
+            require_checkpoint_current=False,
+        )
+        for candidate in update.candidates:
+            _verify_target_candidate_owner_proofs(
+                candidate,
+                self._target_candidate_proof_verifier,
+            )
+
+        new_head: TargetGraphHead | None = None
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_graph_appends WHERE proposal_ref = "
+                    ":proposal_ref"
+                ),
+                {"proposal_ref": proposal_ref},
+            ).first()
+            if replay is not None:
+                if (
+                    replay.graph_ref != graph_ref
+                    or replay.proposal_hash != proposal_hash
+                    or replay.proposal_receipt_ref != proposal_receipt.receipt_ref
+                    or replay.proposal_receipt_hash != proposal_receipt.payload_hash
+                ):
+                    raise OwnerConflict("target_graph_append_conflict")
+            else:
+                _cas_current_bundle_inbox_operation_checkpoint(
+                    connection,
+                    operation_kind="target_proposal",
+                    operation_ref=proposal_ref,
+                    run_ref=graph.run_ref,
+                    attempt_ref=graph.attempt_ref,
+                    fence_ref=graph.fence_ref,
+                )
+                # The CAS above acquires the SQLite writer lock before this
+                # second issuer verification.  A notice published after the
+                # earlier validation therefore cannot race the RG append.
+                self._execution_verifier.verify_bundle_target_proposal_receipt(
+                    proposal_ref=proposal_ref,
+                    run_ref=graph.run_ref,
+                    attempt_ref=graph.attempt_ref,
+                    fence_ref=graph.fence_ref,
+                    graph_ref=graph_ref,
+                    base_generation=base_generation,
+                    base_head_receipt=graph.head_receipt,
+                    proposal_hash=proposal_hash,
+                    receipt=proposal_receipt,
+                    require_checkpoint_current=True,
+                )
+                locked_verified = (
+                    self._stage_request_verifier.query_verified_bundle_stage_request(
+                        request_ref=graph.request_ref,
+                        context_pack_ref=graph.context_pack_ref,
+                    )
+                )
+                locked_plan_binding = locked_verified.accepted_formal_plan
+                if (
+                    locked_verified != verified
+                    or locked_plan_binding != accepted_formal_plan
+                ):
+                    raise OwnerConflict("bundle_stage_request_binding_stale")
+                self._receipt_verifier.verify_accepted_formal_plan_binding(
+                    locked_plan_binding
+                )
+                self._receipt_verifier.verify_target_graph_receipt(
+                    request_ref=graph.request_ref,
+                    run_ref=graph.run_ref,
+                    graph_ref=graph.graph_ref,
+                    receipt=graph.head_receipt,
+                    require_current=True,
+                )
+                for candidate in update.candidates:
+                    _verify_target_candidate_owner_proofs(
+                        candidate,
+                        self._target_candidate_proof_verifier,
+                    )
+                latest = connection.execute(
+                    text(
+                        "SELECT generation, receipt_ref, receipt_hash, "
+                        "strategy_complete FROM rg_target_graph_appends WHERE "
+                        "graph_ref = :graph_ref ORDER BY generation DESC LIMIT 1"
+                    ),
+                    {"graph_ref": graph_ref},
+                ).first()
+                current_generation = 0 if latest is None else int(latest.generation)
+                current_receipt_ref = (
+                    graph.receipt.receipt_ref if latest is None else latest.receipt_ref
+                )
+                current_receipt_hash = (
+                    graph.receipt.payload_hash if latest is None else latest.receipt_hash
+                )
+                current_complete = (
+                    graph.strategy_complete
+                    if latest is None
+                    else bool(latest.strategy_complete)
+                )
+                if (
+                    current_generation != base_generation
+                    or current_receipt_ref != graph.head_receipt.receipt_ref
+                    or current_receipt_hash != graph.head_receipt.payload_hash
+                ):
+                    raise OwnerConflict("target_graph_append_base_stale")
+                if current_complete:
+                    raise OwnerConflict("target_graph_strategy_complete")
+                existing_rows = connection.execute(
+                    text(
+                        "SELECT * FROM rg_targets WHERE graph_ref = :graph_ref "
+                        "ORDER BY ordinal"
+                    ),
+                    {"graph_ref": graph_ref},
+                ).all()
+                existing_targets = tuple(_accepted_target(row) for row in existing_rows)
+                append_ref = new_ref("target_graph_append")
+                generation = base_generation + 1
+                refs_by_key = {
+                    target.target_key: target.target_ref for target in existing_targets
+                }
+                new_refs: dict[str, str] = {}
+                for value in target_values:
+                    spec = cast(dict[str, object], value)
+                    new_refs[_formal_target_key(spec)] = new_ref("target")
+                refs_by_key.update(new_refs)
+                accepted_targets: list[AcceptedTarget] = []
+                now = time.time()
+                first_ordinal = len(existing_targets)
+                for offset, value in enumerate(target_values):
+                    spec = cast(dict[str, object], value)
+                    target_key = _formal_target_key(spec)
+                    dependency_refs = tuple(
+                        refs_by_key[key]
+                        for key in _formal_target_dependencies(spec)
+                    )
+                    spec_hash = canonical_hash(spec)
+                    dependency_hash = canonical_hash(list(dependency_refs))
+                    target_ref = new_refs[target_key]
+                    ordinal = first_ordinal + offset
+                    target_bindings = {
+                        "graph_ref": graph_ref,
+                        "target_key": target_key,
+                        "ordinal": ordinal,
+                        "spec_hash": spec_hash,
+                        "dependency_refs_hash": dependency_hash,
+                        "append_ref": append_ref,
+                    }
+                    target_receipt = AcceptanceReceipt(
+                        issuer=RG_OWNER,
+                        kind=TARGET_RECEIPT_KIND,
+                        receipt_ref=new_ref("rg_target_receipt"),
+                        subject_ref=target_ref,
+                        payload_hash=_receipt_hash(
+                            TARGET_RECEIPT_KIND,
+                            target_ref,
+                            target_bindings,
+                        ),
+                    )
+                    accepted_targets.append(
+                        AcceptedTarget(
+                            target_ref=target_ref,
+                            graph_ref=graph_ref,
+                            target_key=target_key,
+                            ordinal=ordinal,
+                            spec=spec,
+                            spec_hash=spec_hash,
+                            dependency_refs=dependency_refs,
+                            receipt=target_receipt,
+                        )
+                    )
+                cumulative = existing_targets + tuple(accepted_targets)
+                target_set_hash = _target_set_hash(cumulative)
+                coverage_hash = _rolling_strategy_hash(next_state, completion)
+                target_refs = tuple(target.target_ref for target in accepted_targets)
+                append_bindings = {
+                    "append_ref": append_ref,
+                    "graph_ref": graph_ref,
+                    "generation": generation,
+                    "predecessor_head_receipt_ref": graph.head_receipt.receipt_ref,
+                    "predecessor_head_receipt_hash": graph.head_receipt.payload_hash,
+                    "proposal_ref": proposal_ref,
+                    "proposal_hash": proposal_hash,
+                    "proposal_receipt_ref": proposal_receipt.receipt_ref,
+                    "proposal_receipt_hash": proposal_receipt.payload_hash,
+                    "target_refs": list(target_refs),
+                    "target_set_hash": target_set_hash,
+                    "coverage_hash": coverage_hash,
+                    "strategy_complete": strategy_complete,
+                }
+                receipt_ref = new_ref("rg_target_graph_receipt")
+                receipt_hash = _receipt_hash(
+                    TARGET_GRAPH_RECEIPT_KIND,
+                    graph_ref,
+                    append_bindings,
+                )
+                graph_acceptance_receipt = AcceptanceReceipt(
+                    issuer=RG_OWNER,
+                    kind=TARGET_GRAPH_RECEIPT_KIND,
+                    receipt_ref=receipt_ref,
+                    subject_ref=graph_ref,
+                    payload_hash=receipt_hash,
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_target_graph_appends (append_ref, graph_ref, "
+                        "generation, predecessor_head_receipt_ref, "
+                        "predecessor_head_receipt_hash, proposal_ref, "
+                        "proposal_hash, proposal_receipt_ref, "
+                        "proposal_receipt_hash, target_refs_json, target_set_hash, "
+                        "coverage_hash, strategy_complete, receipt_ref, "
+                        "receipt_hash, accepted_at) VALUES (:append_ref, "
+                        ":graph_ref, :generation, :predecessor_head_receipt_ref, "
+                        ":predecessor_head_receipt_hash, :proposal_ref, "
+                        ":proposal_hash, :proposal_receipt_ref, "
+                        ":proposal_receipt_hash, :target_refs_json, "
+                        ":target_set_hash, :coverage_hash, :strategy_complete, "
+                        ":receipt_ref, :receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        **append_bindings,
+                        "target_refs_json": canonical_json(list(target_refs)),
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": now,
+                    },
+                )
+                formal_by_label = {
+                    candidate.candidate.local_label: candidate
+                    for candidate in update.candidates
+                }
+                identity_counts = {
+                    "baseline_count": 0,
+                    "variant_count": 0,
+                    "evaluation_protocol_count": 0,
+                    "protocol_version_count": 0,
+                    "evaluation_count": 0,
+                    "authority_count": 0,
+                }
+                for target in accepted_targets:
+                    created = _insert_target_with_measurement_authority(
+                        connection,
+                        target=target,
+                        append_ref=append_ref,
+                        quest_ref=graph.quest_ref,
+                        target_plan_hash=graph.target_plan_hash,
+                        graph_generation=generation,
+                        graph_acceptance_receipt=graph_acceptance_receipt,
+                        rolling_append_source={
+                            "append_ref": append_ref,
+                            "predecessor_head_receipt_ref": (
+                                graph.head_receipt.receipt_ref
+                            ),
+                            "predecessor_head_receipt_hash": (
+                                graph.head_receipt.payload_hash
+                            ),
+                            "proposal_ref": proposal_ref,
+                            "proposal_hash": proposal_hash,
+                            "proposal_receipt_ref": proposal_receipt.receipt_ref,
+                            "proposal_receipt_hash": proposal_receipt.payload_hash,
+                        },
+                        stage_request_ref=graph.request_ref,
+                        plan_binding=accepted_formal_plan,
+                        completion_contract=completion,
+                        formal_candidate=formal_by_label[target.target_key],
+                        accepted_at=now,
+                    )
+                    for name, count in created.items():
+                        identity_counts[name] += count
+                connection.execute(
+                    text(
+                        "UPDATE research_graph_state SET revision = revision + 1, "
+                        "target_count = target_count + :target_count, "
+                        "experiment_baseline_count = experiment_baseline_count + "
+                        ":baseline_count, experiment_variant_count = "
+                        "experiment_variant_count + :variant_count, "
+                        "evaluation_protocol_count = evaluation_protocol_count + "
+                        ":evaluation_protocol_count, protocol_version_count = "
+                        "protocol_version_count + :protocol_version_count, "
+                        "evaluation_count = evaluation_count + :evaluation_count, "
+                        "target_measurement_domain_authority_count = "
+                        "target_measurement_domain_authority_count + "
+                        ":authority_count WHERE "
+                        "singleton = 'owner'"
+                    ),
+                    {"target_count": len(accepted_targets), **identity_counts},
+                )
+                self._feed.record(
+                    connection,
+                    "research_graph.target_graph_appended",
+                    {
+                        "append_ref": append_ref,
+                        "graph_ref": graph_ref,
+                        "generation": generation,
+                        "target_count": len(accepted_targets),
+                        "strategy_complete": strategy_complete,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+                new_head = TargetGraphHead(
+                    graph_ref=graph_ref,
+                    generation=generation,
+                    strategy_complete=strategy_complete,
+                    target_set_hash=target_set_hash,
+                    coverage_hash=coverage_hash,
+                    receipt=AcceptanceReceipt(
+                        issuer=graph_acceptance_receipt.issuer,
+                        kind=graph_acceptance_receipt.kind,
+                        receipt_ref=graph_acceptance_receipt.receipt_ref,
+                        subject_ref=graph_acceptance_receipt.subject_ref,
+                        payload_hash=graph_acceptance_receipt.payload_hash,
+                    ),
+                )
+        result = new_head or self.query_target_graph_head(graph_ref)
+        current_graph = self.query_target_graph(graph.request_ref)
+        if current_graph is None:
+            raise OwnerConflict("target_graph_not_found")
+        for target in current_graph.targets:
+            if self.query_target_measurement_domain_authority(target.target_ref) is None:
+                raise OwnerConflict("target_measurement_domain_authority_missing")
+        return result
 
     def query_target_frontier(self, graph_ref: str) -> tuple[AcceptedTarget, ...]:
         with self._database.read() as connection:
@@ -5615,6 +11399,11 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             and set(target.dependency_refs) <= committed
         )
 
+    def query_target_launch_request(self, target_ref: str) -> TargetLaunchRequest:
+        """Return the sole fixed TargetCandidate-projection launch envelope."""
+
+        return self._receipt_verifier.query_target_launch_request(target_ref)
+
     def bind_target_run(
         self,
         *,
@@ -5625,153 +11414,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         definition_hash: str,
         admission_receipt: AcceptanceReceipt,
     ) -> AcceptedTargetRunBinding:
-        if self._execution_verifier is None:
-            raise OwnerConflict("attempt_execution_verifier_unavailable")
-        with self._database.read() as connection:
-            target_row = connection.execute(
-                text(
-                    "SELECT t.*, g.request_ref, g.quest_ref FROM rg_targets t "
-                    "JOIN rg_target_graphs g ON g.graph_ref = t.graph_ref WHERE "
-                    "t.target_ref = :target_ref"
-                ),
-                {"target_ref": target_ref},
-            ).first()
-        if target_row is None:
-            raise OwnerConflict("target_run_binding_invalid")
-        target = _accepted_target(target_row)
-        expected_intent = ExperimentIntent(
-            execution_request_ref=f"bundle-target-{target_ref}",
-            quest_ref=target_row.quest_ref,
-            title=cast(str, target.spec["title"]),
-            hypothesis=cast(str, target.spec["hypothesis"]),
-            variant_parameter=float(target.spec["variant_parameter"]),
-            sample_count=cast(int, target.spec["sample_count"]),
-        )
-        domain = self.query_experiment(evaluation_attempt_ref)
-        if (
-            domain is None
-            or domain.intent != expected_intent
-            or execution_request_ref != expected_intent.execution_request_ref
-            or domain.execution_request.execution_request_ref != execution_request_ref
-            or domain.execution_request.quest_ref != target_row.quest_ref
-            or domain.execution_request.definition_hash != definition_hash
-        ):
-            raise OwnerConflict("target_run_semantic_binding_invalid")
-        self._execution_verifier.verify_target_run_admission_receipt(
-            target_ref=target_ref,
-            target_spec_hash=target.spec_hash,
-            graph_ref=target.graph_ref,
-            stage_request_ref=target_row.request_ref,
-            quest_ref=target_row.quest_ref,
-            target_run_ref=target_run_ref,
-            evaluation_attempt_ref=evaluation_attempt_ref,
-            execution_request_ref=execution_request_ref,
-            definition_hash=definition_hash,
-            receipt=admission_receipt,
-        )
-        bindings = {
-            "target_ref": target_ref,
-            "target_spec_hash": target.spec_hash,
-            "target_run_ref": target_run_ref,
-            "evaluation_attempt_ref": evaluation_attempt_ref,
-            "execution_request_ref": execution_request_ref,
-            "definition_hash": definition_hash,
-            "admission_ref": admission_receipt.subject_ref,
-            "admission_receipt_ref": admission_receipt.receipt_ref,
-            "admission_receipt_hash": admission_receipt.payload_hash,
-        }
-        with self._database.write() as connection:
-            current = connection.execute(
-                text(
-                    "SELECT t.spec_hash, t.graph_ref, g.request_ref, g.quest_ref "
-                    "FROM rg_targets t JOIN rg_target_graphs g ON g.graph_ref = "
-                    "t.graph_ref WHERE t.target_ref = :target_ref"
-                ),
-                {"target_ref": target_ref},
-            ).first()
-            if current is None or (
-                current.spec_hash != target.spec_hash
-                or current.graph_ref != target.graph_ref
-                or current.request_ref != target_row.request_ref
-                or current.quest_ref != target_row.quest_ref
-            ):
-                raise OwnerConflict("target_run_binding_stale")
-            existing = connection.execute(
-                text(
-                    "SELECT * FROM rg_target_run_bindings WHERE target_ref = "
-                    ":target_ref"
-                ),
-                {"target_ref": target_ref},
-            ).first()
-            if existing is not None:
-                if (
-                    existing.target_run_ref != target_run_ref
-                    or existing.evaluation_attempt_ref != evaluation_attempt_ref
-                    or existing.execution_request_ref != execution_request_ref
-                    or existing.definition_hash != definition_hash
-                    or existing.admission_ref != admission_receipt.subject_ref
-                    or existing.admission_receipt_ref != admission_receipt.receipt_ref
-                    or existing.admission_receipt_hash != admission_receipt.payload_hash
-                    or existing.receipt_hash
-                    != _receipt_hash(
-                        TARGET_RUN_BINDING_RECEIPT_KIND,
-                        existing.binding_ref,
-                        bindings,
-                    )
-                ):
-                    raise OwnerConflict("target_run_binding_conflict")
-                binding_ref = existing.binding_ref
-            else:
-                binding_ref = new_ref("target_run_binding")
-                receipt_ref = new_ref("rg_target_run_binding_receipt")
-                receipt_hash = _receipt_hash(
-                    TARGET_RUN_BINDING_RECEIPT_KIND, binding_ref, bindings
-                )
-                now = time.time()
-                connection.execute(
-                    text(
-                        "INSERT INTO rg_target_run_bindings (binding_ref, "
-                        "target_ref, target_run_ref, evaluation_attempt_ref, "
-                        "execution_request_ref, definition_hash, "
-                        "admission_ref, admission_receipt_ref, "
-                        "admission_receipt_hash, "
-                        "receipt_ref, receipt_hash, bound_at) "
-                        "VALUES (:binding_ref, :target_ref, :target_run_ref, "
-                        ":evaluation_attempt_ref, :execution_request_ref, "
-                        ":definition_hash, :admission_ref, "
-                        ":admission_receipt_ref, "
-                        ":admission_receipt_hash, "
-                        ":receipt_ref, :receipt_hash, :bound_at)"
-                    ),
-                    {
-                        **bindings,
-                        "binding_ref": binding_ref,
-                        "receipt_ref": receipt_ref,
-                        "receipt_hash": receipt_hash,
-                        "bound_at": now,
-                    },
-                )
-                connection.execute(
-                    text(
-                        "UPDATE research_graph_state SET revision = revision + 1 "
-                        "WHERE singleton = 'owner'"
-                    )
-                )
-                self._feed.record(
-                    connection,
-                    "research_graph.target_run_bound",
-                    {
-                        "binding_ref": binding_ref,
-                        "target_ref": target_ref,
-                        "target_run_ref": target_run_ref,
-                        "evaluation_attempt_ref": evaluation_attempt_ref,
-                        "receipt_ref": receipt_ref,
-                    },
-                )
-        bound = self.query_target_run_binding(target_ref)
-        if bound is None:
-            raise OwnerConflict("target_run_binding_missing_after_commit")
-        return bound
+        raise OwnerConflict("legacy_target_run_binding_write_forbidden")
 
     def query_target_run_binding(
         self, target_ref: str
@@ -5817,168 +11460,659 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         execution_receipt: AcceptanceReceipt,
         result_content: dict[str, object],
     ) -> TargetCommit:
-        binding = self.query_target_run_binding(target_ref)
-        if binding is None or binding.target_run_ref != target_run_ref:
-            raise OwnerConflict("target_run_binding_invalid")
-        domain = self.query_experiment(binding.evaluation_attempt_ref)
-        roles = self.query_experiment_asset_roles(binding.evaluation_attempt_ref)
-        metric = self.query_formal_metric_result(binding.evaluation_attempt_ref)
-        if (
-            domain is None
-            or metric is None
-            or domain.formal_measurement_status != "accepted"
-            or domain.execution_request.execution_request_ref
-            != binding.execution_request_ref
-        ):
-            raise OwnerConflict("target_commit_measurement_incomplete")
-        if self._execution_verifier is None:
-            raise OwnerConflict("attempt_execution_verifier_unavailable")
-        manifest = self._execution_verifier.verify_experiment_execution_receipt(
-            run_ref=target_run_ref,
-            attempt_ref=execution_attempt_ref,
-            fence_ref=fence_ref,
-            evaluation_attempt_ref=binding.evaluation_attempt_ref,
-            result_hash=execution_result_hash,
-            receipt=execution_receipt,
+        raise OwnerConflict("legacy_target_commit_write_forbidden")
+
+    def accept_target_commit_from_measurement_closure(
+        self,
+        *,
+        target_ref: str,
+        target_execution_closure_ref: str,
+        target_execution_closure_receipt: AcceptanceReceipt,
+        implementation_revision_ref: str,
+        implementation_provenance_refs: tuple[str, ...],
+        held_fixed_bindings: tuple[HeldFixedBinding, ...],
+        code_review: CodeReviewRecord,
+        result_review: ResultReviewRecord,
+        protocol_internal_parts: tuple[ProtocolPart, ...],
+        protocol_aggregation_proof: ProtocolAggregationProof | None,
+        result_content: dict[str, object],
+    ) -> TargetCommit:
+        """Retain the historical Experiment-backed closure path for old data.
+
+        Formal-v3 Targets are written only through the generic measurement
+        closure path.  This guard runs before consulting any legacy Experiment
+        verifier so the forbidden path is a zero-write, fail-closed operation.
+        """
+
+        raise OwnerConflict("legacy_target_experiment_commit_write_forbidden")
+
+    def accept_target_commit_from_root_completion(
+        self,
+        *,
+        completion: AcceptedTargetRootCompletion,
+        manifest: AcceptedTargetRootCompletionManifest,
+        result_document: TargetRootResultDocument,
+        idempotency_key: str,
+    ) -> TargetRootGraphAcceptance:
+        """Accept the one final root handoff after fresh AR and RM reads."""
+
+        from meta_research.target_run_finalizer import (
+            TargetRootGraphAcceptance,
+            TargetRootOwnerRejection,
         )
-        by_role = {
-            name: tuple(role for role in roles if role.role == name)
-            for name in (
-                "checkpoint_artifact",
-                "log_asset",
-                "analysis_asset",
-                "result_content",
-            )
-        }
+
         if (
-            tuple(role.binding.content_hash for role in by_role["checkpoint_artifact"])
-            != manifest.checkpoint_content_hashes
-            or len(by_role["log_asset"]) != 1
-            or by_role["log_asset"][0].binding.content_hash != manifest.log_content_hash
-            or len(by_role["analysis_asset"]) != 1
-            or by_role["analysis_asset"][0].binding.content_hash
-            != manifest.analysis_content_hash
-            or len(by_role["result_content"]) != 1
-            or by_role["result_content"][0].binding.content_hash
-            != manifest.result_content_hash
-            or metric.result_role_ref != by_role["result_content"][0].role_ref
-            or canonical_hash(result_content)
-            != by_role["result_content"][0].binding.content_hash
-            or result_content.get("schema_ref") != EXPERIMENT_RESULT_SCHEMA
-            or result_content.get("metrics") != metric.metrics
+            type(idempotency_key) is not str
+            or not idempotency_key
+            or len(idempotency_key) > 128
         ):
-            raise OwnerConflict("target_commit_artifact_closure_invalid")
+            raise OwnerConflict("target_root_commit_idempotency_invalid")
+        completion, manifest = self._verify_target_root_issuers(
+            completion=completion,
+            manifest=manifest,
+            result_document=result_document,
+        )
+        try:
+            target, authority, projection, candidate_projection = (
+                self._target_root_domain_context(
+                    completion=completion,
+                    manifest=manifest,
+                    result_document=result_document,
+                )
+            )
+        except OwnerConflict as error:
+            if error.code != "target_root_commit_domain_invalid":
+                raise
+            rejection_material = {
+                "schema_ref": "meta-research/target-root-rg-rejection/v1",
+                "completion_ref": completion.completion_ref,
+                "manifest_ref": manifest.manifest_ref,
+                "target_ref": completion.handle.target_ref,
+                "target_run_ref": completion.handle.target_run_ref,
+                "code": error.code,
+                "feedback": (
+                    "The selected result or checkpoint roles do not satisfy "
+                    "the accepted Target measurement contract. Revise the "
+                    "workspace result and submit a successor handoff."
+                ),
+            }
+            rejection_hash = canonical_hash(rejection_material)
+            rejection_ref = "rg_target_root_rejection_" + rejection_hash[:32]
+            receipt_ref = "rg_target_root_rejection_receipt_" + rejection_hash[:24]
+            receipt = AcceptanceReceipt(
+                issuer="research_graph",
+                kind="target_root_completion_rejected",
+                receipt_ref=receipt_ref,
+                subject_ref=completion.completion_ref,
+                payload_hash=canonical_hash(
+                    {
+                        **rejection_material,
+                        "rejection_ref": rejection_ref,
+                        "receipt_ref": receipt_ref,
+                    }
+                ),
+            )
+            return TargetRootOwnerRejection(
+                issuer="research_graph",
+                rejection_ref=rejection_ref,
+                code=error.code,
+                feedback=rejection_material["feedback"],
+                receipt=receipt,
+            )
+        request_hash = _target_root_commit_request_hash(
+            completion=completion,
+            manifest=manifest,
+            result_document=result_document,
+        )
+        with self._database.read() as connection:
+            existing_measurement = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_root_measurements WHERE "
+                    "target_ref = :target_ref OR idempotency_key = :key"
+                ),
+                {"target_ref": target.target_ref, "key": idempotency_key},
+            ).first()
+            existing_commit_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_commits WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target.target_ref},
+            ).first()
+        if existing_measurement is not None or existing_commit_row is not None:
+            if (
+                existing_measurement is None
+                or existing_commit_row is None
+                or existing_measurement.idempotency_key != idempotency_key
+                or existing_measurement.request_hash != request_hash
+                or existing_measurement.completion_ref
+                != completion.completion_ref
+                or existing_measurement.manifest_ref != manifest.manifest_ref
+            ):
+                raise OwnerConflict("target_root_commit_conflict")
+            transition = self._query_target_root_commit_transition(
+                target.target_ref
+            )
+            if transition is None:
+                raise OwnerConflict("target_root_commit_integrity_invalid")
+            return TargetRootGraphAcceptance(
+                target_ref=transition.target_ref,
+                target_run_ref=transition.target_run_ref,
+                target_commit_ref=transition.target_commit_ref,
+                receipt=transition.issuer_receipt,
+            )
+
+        measurement_ref = new_ref("target_root_measurement")
+        variant_run_ref = new_ref("target_root_variant_run")
+        evaluation_attempt_ref = new_ref("target_root_evaluation_attempt")
+        metric_result_ref = new_ref("target_root_metric_result")
+        variant_binding_ref = new_ref("target_root_variant_input")
+        variant_binding_receipt_ref = new_ref(
+            "rg_target_root_variant_input_receipt"
+        )
+        evaluation_binding_ref = new_ref("target_root_evaluation_input")
+        evaluation_binding_receipt_ref = new_ref(
+            "rg_target_root_evaluation_input_receipt"
+        )
+        measurement_receipt_ref = new_ref(
+            "rg_target_root_measurement_receipt"
+        )
+        commit_ref = new_ref("target_commit")
+        commit_receipt_ref = new_ref("rg_target_commit_receipt")
+        material = _target_root_commit_material(
+            target=target,
+            authority=authority,
+            projection=projection,
+            candidate_projection=candidate_projection,
+            completion=completion,
+            manifest=manifest,
+            result_document=result_document,
+            measurement_ref=measurement_ref,
+            variant_run_ref=variant_run_ref,
+            evaluation_attempt_ref=evaluation_attempt_ref,
+            metric_result_ref=metric_result_ref,
+            variant_binding_ref=variant_binding_ref,
+            variant_binding_receipt_ref=variant_binding_receipt_ref,
+            evaluation_binding_ref=evaluation_binding_ref,
+            evaluation_binding_receipt_ref=evaluation_binding_receipt_ref,
+            measurement_receipt_ref=measurement_receipt_ref,
+            commit_ref=commit_ref,
+            commit_receipt_ref=commit_receipt_ref,
+        )
+        receipt_bindings = {
+            "target_ref": target.target_ref,
+            "target_run_ref": completion.handle.target_run_ref,
+            "evaluation_attempt_ref": evaluation_attempt_ref,
+            "target_spec_hash": target.spec_hash,
+            "closure_hash": material.closure_hash,
+            "result_disposition": material.result_disposition,
+        }
+        commit_receipt_hash = _receipt_hash(
+            TARGET_COMMIT_RECEIPT_KIND,
+            commit_ref,
+            receipt_bindings,
+        )
+
+        # Repeat every external Owner read immediately before the fenced RG
+        # write.  A changed issuer view fails without creating either fact.
+        latest_completion, latest_manifest = self._verify_target_root_issuers(
+            completion=completion,
+            manifest=manifest,
+            result_document=result_document,
+        )
+        latest_context = self._target_root_domain_context(
+            completion=completion,
+            manifest=manifest,
+            result_document=result_document,
+        )
+        if (
+            latest_completion != completion
+            or latest_manifest != manifest
+            or latest_context
+            != (target, authority, projection, candidate_projection)
+        ):
+            raise OwnerConflict("target_root_commit_issuer_stale")
+        accepted_at = time.time()
+        try:
+            with self._database.fenced_write() as connection:
+                ar_row = connection.execute(
+                    text(
+                        "SELECT payload_hash, receipt_ref, receipt_hash FROM "
+                        "ar_target_root_completions WHERE completion_ref = "
+                        ":completion_ref"
+                    ),
+                    {"completion_ref": completion.completion_ref},
+                ).first()
+                rm_row = connection.execute(
+                    text(
+                        "SELECT payload_hash, receipt_ref, receipt_hash FROM "
+                        "rm_target_root_completion_manifests WHERE manifest_ref "
+                        "= :manifest_ref"
+                    ),
+                    {"manifest_ref": manifest.manifest_ref},
+                ).first()
+                target_row = connection.execute(
+                    text(
+                        "SELECT spec_hash FROM rg_targets WHERE target_ref = "
+                        ":target_ref"
+                    ),
+                    {"target_ref": target.target_ref},
+                ).first()
+                if (
+                    ar_row is None
+                    or ar_row.payload_hash != completion.payload_hash
+                    or ar_row.receipt_ref != completion.receipt.receipt_ref
+                    or ar_row.receipt_hash != completion.receipt.payload_hash
+                    or rm_row is None
+                    or rm_row.payload_hash != manifest.payload_hash
+                    or rm_row.receipt_ref != manifest.receipt.receipt_ref
+                    or rm_row.receipt_hash != manifest.receipt.payload_hash
+                    or target_row is None
+                    or target_row.spec_hash != target.spec_hash
+                ):
+                    raise OwnerConflict("target_root_commit_issuer_stale")
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_target_root_measurements "
+                        "(measurement_ref, target_ref, target_run_ref, "
+                        "completion_ref, manifest_ref, authority_ref, "
+                        "authority_hash, variant_run_ref, "
+                        "evaluation_attempt_ref, metric_result_ref, metrics_json, "
+                        "metrics_hash, checkpoint_refs_json, "
+                        "checkpoint_refs_hash, variant_input_binding_json, "
+                        "variant_input_binding_hash, "
+                        "evaluation_input_binding_json, "
+                        "evaluation_input_binding_hash, measurement_payload_json, "
+                        "measurement_payload_hash, accepted_measurement_json, "
+                        "accepted_measurement_hash, completion_payload_hash, "
+                        "completion_receipt_ref, completion_receipt_hash, "
+                        "manifest_payload_hash, manifest_receipt_ref, "
+                        "manifest_receipt_hash, idempotency_key, request_hash, "
+                        "receipt_ref, receipt_hash, accepted_at) VALUES "
+                        "(:measurement_ref, :target_ref, :target_run_ref, "
+                        ":completion_ref, :manifest_ref, :authority_ref, "
+                        ":authority_hash, :variant_run_ref, "
+                        ":evaluation_attempt_ref, :metric_result_ref, "
+                        ":metrics_json, :metrics_hash, :checkpoint_refs_json, "
+                        ":checkpoint_refs_hash, :variant_input_binding_json, "
+                        ":variant_input_binding_hash, "
+                        ":evaluation_input_binding_json, "
+                        ":evaluation_input_binding_hash, "
+                        ":measurement_payload_json, :measurement_payload_hash, "
+                        ":accepted_measurement_json, "
+                        ":accepted_measurement_hash, :completion_payload_hash, "
+                        ":completion_receipt_ref, :completion_receipt_hash, "
+                        ":manifest_payload_hash, :manifest_receipt_ref, "
+                        ":manifest_receipt_hash, :idempotency_key, :request_hash, "
+                        ":receipt_ref, :receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        "measurement_ref": measurement_ref,
+                        "target_ref": target.target_ref,
+                        "target_run_ref": completion.handle.target_run_ref,
+                        "completion_ref": completion.completion_ref,
+                        "manifest_ref": manifest.manifest_ref,
+                        "authority_ref": authority.authority_ref,
+                        "authority_hash": authority.authority_hash,
+                        "variant_run_ref": variant_run_ref,
+                        "evaluation_attempt_ref": evaluation_attempt_ref,
+                        "metric_result_ref": metric_result_ref,
+                        "metrics_json": canonical_json(material.metrics),
+                        "metrics_hash": canonical_hash(material.metrics),
+                        "checkpoint_refs_json": canonical_json(
+                            list(material.checkpoint_refs)
+                        ),
+                        "checkpoint_refs_hash": canonical_hash(
+                            list(material.checkpoint_refs)
+                        ),
+                        "variant_input_binding_json": canonical_json(
+                            projection_plain_value(material.variant_input_binding)
+                        ),
+                        "variant_input_binding_hash": canonical_hash(
+                            projection_plain_value(material.variant_input_binding)
+                        ),
+                        "evaluation_input_binding_json": canonical_json(
+                            projection_plain_value(
+                                material.evaluation_input_binding
+                            )
+                        ),
+                        "evaluation_input_binding_hash": canonical_hash(
+                            projection_plain_value(
+                                material.evaluation_input_binding
+                            )
+                        ),
+                        "measurement_payload_json": canonical_json(
+                            material.measurement_payload
+                        ),
+                        "measurement_payload_hash": canonical_hash(
+                            material.measurement_payload
+                        ),
+                        "accepted_measurement_json": canonical_json(
+                            projection_plain_value(material.canonical_terminal)
+                        ),
+                        "accepted_measurement_hash": canonical_hash(
+                            projection_plain_value(material.canonical_terminal)
+                        ),
+                        "completion_payload_hash": completion.payload_hash,
+                        "completion_receipt_ref": (
+                            completion.receipt.receipt_ref
+                        ),
+                        "completion_receipt_hash": (
+                            completion.receipt.payload_hash
+                        ),
+                        "manifest_payload_hash": manifest.payload_hash,
+                        "manifest_receipt_ref": manifest.receipt.receipt_ref,
+                        "manifest_receipt_hash": manifest.receipt.payload_hash,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "receipt_ref": material.measurement_receipt.receipt_ref,
+                        "receipt_hash": material.measurement_receipt.payload_hash,
+                        "accepted_at": accepted_at,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_target_commits (commit_ref, target_ref, "
+                        "target_run_ref, evaluation_attempt_ref, target_spec_hash, "
+                        "closure_json, closure_hash, result_disposition, "
+                        "receipt_ref, receipt_hash, committed_at) VALUES "
+                        "(:commit_ref, :target_ref, :target_run_ref, "
+                        ":evaluation_attempt_ref, :target_spec_hash, "
+                        ":closure_json, :closure_hash, :result_disposition, "
+                        ":receipt_ref, :receipt_hash, :committed_at)"
+                    ),
+                    {
+                        **receipt_bindings,
+                        "commit_ref": commit_ref,
+                        "closure_json": canonical_json(material.closure),
+                        "receipt_ref": commit_receipt_ref,
+                        "receipt_hash": commit_receipt_hash,
+                        "committed_at": accepted_at,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE research_graph_state SET revision = revision + "
+                        "1, target_root_measurement_count = "
+                        "target_root_measurement_count + 1, target_commit_count = "
+                        "target_commit_count + 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "research_graph.target_root_committed",
+                    {
+                        "measurement_ref": measurement_ref,
+                        "commit_ref": commit_ref,
+                        "target_ref": target.target_ref,
+                        "target_run_ref": completion.handle.target_run_ref,
+                        "completion_ref": completion.completion_ref,
+                        "manifest_ref": manifest.manifest_ref,
+                        "receipt_ref": commit_receipt_ref,
+                    },
+                )
+        except IntegrityError as error:
+            with self._database.read() as connection:
+                raced = connection.execute(
+                    text(
+                        "SELECT commit_ref FROM rg_target_commits WHERE "
+                        "target_ref = :target_ref"
+                    ),
+                    {"target_ref": target.target_ref},
+                ).first()
+            if raced is None:
+                raise OwnerConflict("target_root_commit_conflict") from error
+            return self.accept_target_commit_from_root_completion(
+                completion=completion,
+                manifest=manifest,
+                result_document=result_document,
+                idempotency_key=idempotency_key,
+            )
+        transition = self._query_target_root_commit_transition(target.target_ref)
+        if transition is None or transition.target_commit_ref != commit_ref:
+            raise OwnerConflict("target_root_commit_missing_after_commit")
+        return TargetRootGraphAcceptance(
+            target_ref=transition.target_ref,
+            target_run_ref=transition.target_run_ref,
+            target_commit_ref=transition.target_commit_ref,
+            receipt=transition.issuer_receipt,
+        )
+
+    def accept_target_commit_from_native_execution_closure(
+        self,
+        *,
+        target_ref: str,
+        target_execution_closure_ref: str,
+        target_execution_closure_receipt: AcceptanceReceipt,
+    ) -> TargetCommit:
+        """Accept one refs-only TargetCommit from the native Owner chain."""
+
+        verifier = self._target_execution_closure_verifier
+        if verifier is None:
+            raise OwnerConflict("target_execution_closure_verifier_unavailable")
+        facts = verifier.verify_execution_closure(
+            closure_ref=target_execution_closure_ref,
+            receipt=target_execution_closure_receipt,
+        )
+        execution_closure = facts.get("closure")
+        handle = facts.get("handle")
+        if (
+            type(execution_closure) is not AcceptedTargetNativeExecutionClosure
+            or type(handle) is not TargetWorkHandle
+            or execution_closure.target_ref != target_ref
+            or execution_closure.closure_ref
+            != target_execution_closure_ref
+            or execution_closure.receipt != target_execution_closure_receipt
+        ):
+            raise OwnerConflict("formal_v3_native_execution_closure_invalid")
+
         with self._database.read() as connection:
             target_row = connection.execute(
                 text("SELECT * FROM rg_targets WHERE target_ref = :target_ref"),
                 {"target_ref": target_ref},
             ).first()
+            existing_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_commits WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
         if target_row is None:
             raise OwnerConflict("target_not_found")
         target = _accepted_target(target_row)
-        mean_delta = metric.metrics.get("mean_delta")
-        if not isinstance(mean_delta, (int, float)) or isinstance(mean_delta, bool):
-            raise OwnerConflict("target_commit_metric_invalid")
-        declared_disposition = result_content.get("result_disposition")
-        if declared_disposition is None:
-            result_disposition = (
-                "positive"
-                if mean_delta > 0
-                else "negative"
-                if mean_delta < 0
-                else "zero"
+        projection = self._receipt_verifier.query_target_formal_plan_projection(
+            graph_ref=target.graph_ref
+        )
+        candidate_projection = (
+            self._receipt_verifier.query_target_candidate_projection(
+                target_ref=target_ref
             )
-        elif declared_disposition in EXPERIMENT_RESULT_DISPOSITIONS:
-            result_disposition = cast(str, declared_disposition)
-        else:
-            raise OwnerConflict("target_commit_result_disposition_invalid")
-        closure = {
-            "schema_ref": "meta-research/target-commit-closure/v1",
-            "target": {
-                "target_ref": target.target_ref,
-                "spec_hash": target.spec_hash,
-                "receipt": target.receipt.as_public_dict(),
-            },
-            "target_run": {
-                "target_run_ref": target_run_ref,
-                "evaluation_attempt_ref": binding.evaluation_attempt_ref,
-                "execution_attempt_ref": execution_attempt_ref,
-                "fence_ref": fence_ref,
-                "execution_receipt": execution_receipt.as_public_dict(),
-                "result_component_manifest": manifest.as_dict(),
-            },
-            "target_run_binding": {
-                "binding_ref": binding.binding_ref,
-                "target_ref": binding.target_ref,
-                "target_run_ref": binding.target_run_ref,
-                "evaluation_attempt_ref": binding.evaluation_attempt_ref,
-                "execution_request_ref": binding.execution_request_ref,
-                "definition_hash": binding.definition_hash,
-                "admission_receipt": binding.admission_receipt.as_public_dict(),
-                "receipt": binding.receipt.as_public_dict(),
-            },
-            "execution_request": domain.execution_request.as_public_dict(),
-            "implementation": (
-                domain.execution_request.implementation_binding.as_dict()
+        )
+        if projection is None or candidate_projection is None:
+            raise OwnerConflict("formal_v3_target_projection_invalid")
+        self._receipt_verifier.verify_target_candidate_projection(
+            target_ref=target_ref,
+            candidate=candidate_projection.candidate,
+            source_spec_hash=candidate_projection.source_spec_hash,
+            source_acceptance_receipt=(
+                candidate_projection.source_acceptance_receipt
             ),
-            "definition": domain.execution_request.definition_binding.as_dict(),
-            "protocol": {
-                "evaluation_protocol_ref": (domain.identities.evaluation_protocol_ref),
-                "protocol_version_ref": domain.identities.protocol_version_ref,
-                "required_metrics": list(domain.required_metrics),
-            },
-            "input_bindings": {
-                "variant_run": domain.variant_run_binding.as_public_dict(),
-                "evaluation_attempt": (
-                    domain.evaluation_attempt_binding.as_public_dict()
-                ),
-            },
-            "checkpoint_artifacts": [
-                role.as_public_dict() for role in by_role["checkpoint_artifact"]
-            ],
-            "metric_result": metric.as_public_dict(),
-            "log_assets": [role.as_public_dict() for role in by_role["log_asset"]],
-            "analysis_assets": [
-                role.as_public_dict() for role in by_role["analysis_asset"]
-            ],
-            "result_content": by_role["result_content"][0].as_public_dict(),
-        }
-        closure_hash = canonical_hash(closure)
+            receipt=candidate_projection.receipt,
+        )
+        self._receipt_verifier.verify_target_formal_plan_projection(
+            graph_ref=target.graph_ref,
+            formal_plan=projection.formal_plan,
+            plan_document_hash=projection.plan_document_hash,
+            source_acceptance_receipt=projection.source_acceptance_receipt,
+            completion_contract_hash=projection.completion_contract_hash,
+            receipt=projection.receipt,
+        )
+
+        existing = (
+            None if existing_row is None else _target_commit(existing_row)
+        )
+        commit_ref = (
+            existing.commit_ref
+            if existing is not None
+            else new_ref("target_commit")
+        )
+        commit_receipt_ref = (
+            existing.receipt.receipt_ref
+            if existing is not None
+            else new_ref("rg_target_commit_receipt")
+        )
+        material = _native_target_commit_material(
+            target=target,
+            commit_ref=commit_ref,
+            commit_receipt_ref=commit_receipt_ref,
+            projection=projection,
+            candidate_projection=candidate_projection,
+            facts=facts,
+        )
         receipt_bindings = {
             "target_ref": target_ref,
-            "target_run_ref": target_run_ref,
-            "evaluation_attempt_ref": binding.evaluation_attempt_ref,
+            "target_run_ref": execution_closure.target_run_ref,
+            "evaluation_attempt_ref": (
+                material.canonical_terminal.evaluation_attempt_ref
+            ),
             "target_spec_hash": target.spec_hash,
-            "closure_hash": closure_hash,
-            "result_disposition": result_disposition,
+            "closure_hash": material.closure_hash,
+            "result_disposition": material.result_disposition,
         }
-        with self._database.write() as connection:
-            existing = connection.execute(
-                text("SELECT * FROM rg_target_commits WHERE target_ref = :target_ref"),
-                {"target_ref": target_ref},
-            ).first()
-            if existing is not None:
-                if (
-                    existing.target_run_ref != target_run_ref
-                    or existing.closure_hash != closure_hash
-                    or existing.result_disposition != result_disposition
-                ):
-                    raise OwnerConflict("target_commit_conflict")
-                commit_ref = existing.commit_ref
-            else:
-                commit_ref = new_ref("target_commit")
-                receipt_ref = new_ref("rg_target_commit_receipt")
-                receipt_hash = _receipt_hash(
-                    TARGET_COMMIT_RECEIPT_KIND, commit_ref, receipt_bindings
+        receipt_hash = _receipt_hash(
+            TARGET_COMMIT_RECEIPT_KIND,
+            commit_ref,
+            receipt_bindings,
+        )
+        if existing is not None:
+            if (
+                existing.target_ref != target_ref
+                or existing.target_run_ref
+                != execution_closure.target_run_ref
+                or existing.evaluation_attempt_ref
+                != material.canonical_terminal.evaluation_attempt_ref
+                or existing.target_spec_hash != target.spec_hash
+                or existing.closure != material.closure
+                or existing.closure_hash != material.closure_hash
+                or existing.result_disposition
+                != material.result_disposition
+                or existing.receipt.receipt_ref != commit_receipt_ref
+                or existing.receipt.payload_hash != receipt_hash
+            ):
+                raise OwnerConflict("target_commit_conflict")
+            return existing
+
+        # Repeat the entire issuer query immediately before entering the RG
+        # commit transaction.  The transaction then fences the exact current
+        # TargetRun handle so a successor cannot win between verification and
+        # INSERT.
+        with self._database.read() as connection:
+            issuer_revisions = _target_commit_issuer_revision_snapshot(
+                connection
+            )
+        latest_facts = verifier.verify_execution_closure(
+            closure_ref=target_execution_closure_ref,
+            receipt=target_execution_closure_receipt,
+        )
+        with self._database.read() as connection:
+            latest_issuer_revisions = (
+                _target_commit_issuer_revision_snapshot(connection)
+            )
+        if (
+            latest_facts != facts
+            or latest_issuer_revisions != issuer_revisions
+        ):
+            raise OwnerConflict("formal_v3_native_execution_closure_stale")
+        try:
+            with self._database.fenced_write() as connection:
+                from meta_research.owners.agent_runtime import (
+                    verify_current_target_run_frontier_in_transaction,
                 )
-                now = time.time()
+
+                verify_current_target_run_frontier_in_transaction(
+                    connection,
+                    handle,
+                )
+                if (
+                    _target_commit_issuer_revision_snapshot(connection)
+                    != issuer_revisions
+                ):
+                    raise OwnerConflict(
+                        "formal_v3_native_execution_closure_stale"
+                    )
+                current_target = connection.execute(
+                    text(
+                        "SELECT spec_hash FROM rg_targets WHERE target_ref = "
+                        ":target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+                current_closure = connection.execute(
+                    text(
+                        "SELECT * FROM "
+                        "ar_target_native_execution_closures WHERE "
+                        "closure_ref = :closure_ref"
+                    ),
+                    {"closure_ref": target_execution_closure_ref},
+                ).first()
+                closure_payload_json = canonical_json(
+                    material.execution_closure_payload
+                )
+                closure_payload_hash = canonical_hash(
+                    material.execution_closure_payload
+                )
+                closure_request_hash = canonical_hash(
+                    {
+                        "command": "accept_target_native_execution_closure",
+                        "payload": material.execution_closure_payload,
+                    }
+                )
+                if (
+                    current_target is None
+                    or current_target.spec_hash != target.spec_hash
+                    or current_closure is None
+                    or current_closure.target_ref != target_ref
+                    or current_closure.target_run_ref != handle.target_run_ref
+                    or current_closure.target_attempt_ref
+                    != handle.execution_attempt_ref
+                    or current_closure.target_fence_ref
+                    != handle.execution_fence_ref
+                    or current_closure.generic_binding_ref
+                    != execution_closure.generic_binding_ref
+                    or current_closure.manifest_ref
+                    != execution_closure.result_manifest_ref
+                    or current_closure.attempt_binding_ref
+                    != execution_closure.attempt_binding_ref
+                    or current_closure.evaluation_attempt_ref
+                    != material.canonical_terminal.evaluation_attempt_ref
+                    or current_closure.metric_result_ref
+                    != material.canonical_terminal.metric_result_ref
+                    or current_closure.result_review_ref
+                    != execution_closure.result_review_ref
+                    or current_closure.payload_json != closure_payload_json
+                    or current_closure.payload_hash != closure_payload_hash
+                    or current_closure.payload_hash
+                    != execution_closure.payload_hash
+                    or current_closure.request_hash != closure_request_hash
+                    or float(current_closure.accepted_at)
+                    != execution_closure.accepted_at
+                    or current_closure.receipt_ref
+                    != target_execution_closure_receipt.receipt_ref
+                    or current_closure.receipt_hash
+                    != target_execution_closure_receipt.payload_hash
+                ):
+                    raise OwnerConflict(
+                        "formal_v3_native_execution_closure_stale"
+                    )
                 connection.execute(
                     text(
                         "INSERT INTO rg_target_commits (commit_ref, target_ref, "
-                        "target_run_ref, evaluation_attempt_ref, target_spec_hash, "
-                        "closure_json, closure_hash, result_disposition, receipt_ref, "
-                        "receipt_hash, committed_at) VALUES (:commit_ref, "
-                        ":target_ref, :target_run_ref, :evaluation_attempt_ref, "
+                        "target_run_ref, evaluation_attempt_ref, "
+                        "target_spec_hash, closure_json, closure_hash, "
+                        "result_disposition, receipt_ref, receipt_hash, "
+                        "committed_at) VALUES (:commit_ref, :target_ref, "
+                        ":target_run_ref, :evaluation_attempt_ref, "
                         ":target_spec_hash, :closure_json, :closure_hash, "
                         ":result_disposition, :receipt_ref, :receipt_hash, "
                         ":committed_at)"
@@ -5986,10 +12120,10 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                     {
                         **receipt_bindings,
                         "commit_ref": commit_ref,
-                        "closure_json": canonical_json(closure),
-                        "receipt_ref": receipt_ref,
+                        "closure_json": canonical_json(material.closure),
+                        "receipt_ref": commit_receipt_ref,
                         "receipt_hash": receipt_hash,
-                        "committed_at": now,
+                        "committed_at": time.time(),
                     },
                 )
                 connection.execute(
@@ -6001,26 +12135,72 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                 )
                 self._feed.record(
                     connection,
-                    "research_graph.target_committed",
+                    "research_graph.formal_v3_native_target_committed",
                     {
                         "commit_ref": commit_ref,
                         "target_ref": target_ref,
-                        "target_run_ref": target_run_ref,
-                        "result_disposition": result_disposition,
-                        "receipt_ref": receipt_ref,
+                        "target_run_ref": execution_closure.target_run_ref,
+                        "evaluation_attempt_ref": (
+                            material.canonical_terminal.evaluation_attempt_ref
+                        ),
+                        "target_execution_closure_ref": (
+                            target_execution_closure_ref
+                        ),
+                        "receipt_ref": commit_receipt_ref,
                     },
                 )
-        committed = next(
-            (
-                value
-                for value in self.query_target_commits(target.graph_ref)
-                if value.target_ref == target_ref
-            ),
-            None,
-        )
-        if committed is None:
+        except OperationalError as error:
+            raise OwnerConflict(
+                "formal_v3_native_execution_closure_stale"
+            ) from error
+        except IntegrityError as error:
+            with self._database.read() as connection:
+                raced = connection.execute(
+                    text(
+                        "SELECT commit_ref FROM rg_target_commits WHERE "
+                        "target_ref = :target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+            if raced is None:
+                raise OwnerConflict("target_commit_conflict") from error
+            return self.accept_target_commit_from_native_execution_closure(
+                target_ref=target_ref,
+                target_execution_closure_ref=target_execution_closure_ref,
+                target_execution_closure_receipt=(
+                    target_execution_closure_receipt
+                ),
+            )
+        committed = self.query_target_frontier_commit_transition(target_ref)
+        if committed is None or committed.target_commit_ref != commit_ref:
             raise OwnerConflict("target_commit_missing_after_commit")
-        return committed
+        with self._database.read() as connection:
+            committed_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_target_commits WHERE commit_ref = "
+                    ":commit_ref"
+                ),
+                {"commit_ref": commit_ref},
+            ).first()
+        if committed_row is None:
+            raise OwnerConflict("target_commit_missing_after_commit")
+        return _target_commit(committed_row)
+
+    def accept_target_commit_from_generic_measurement_closure(
+        self,
+        *,
+        target_ref: str,
+        target_execution_closure_ref: str,
+        target_execution_closure_receipt: AcceptanceReceipt,
+    ) -> TargetCommit:
+        """Accept formal-v3 from the generic operation/result Owner chain.
+
+        No Experiment Run or provider identity is read by this path.  Every
+        closure value is reconstructed from the AR/RM/RG issuers behind the
+        supplied AR closure receipt.
+        """
+
+        raise OwnerConflict("target_generic_measurement_shadow_write_forbidden")
 
     def query_target_commits(self, graph_ref: str) -> tuple[TargetCommit, ...]:
         with self._database.read() as connection:
@@ -6049,8 +12229,218 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             ).fetchall()
         return tuple(_target_commit(row) for row in rows)
 
+    def accept_reuse_eligibility(
+        self,
+        *,
+        tier: str,
+        target_commit_ref: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        implementation_content_hash_ref: str,
+        idempotency_key: str,
+    ) -> AcceptedReuseEligibility:
+        tier = _reuse_eligibility_tier(tier)
+        target_commit_ref = _rg_reuse_ref(
+            target_commit_ref, "reuse_eligibility_anchor_ref_invalid"
+        )
+        source_ref = _rg_reuse_ref(source_ref, "reuse_source_ref_invalid")
+        exact_version_ref = _rg_reuse_ref(
+            exact_version_ref, "reuse_exact_version_ref_invalid"
+        )
+        implementation_revision_ref = _rg_reuse_ref(
+            implementation_revision_ref,
+            "implementation_revision_ref_invalid",
+        )
+        implementation_content_hash_ref = _rg_sha256(
+            implementation_content_hash_ref,
+            "implementation_content_hash_ref_invalid",
+        )
+        idempotency_key = _rg_reuse_idempotency_key(idempotency_key)
+        commit, target = self._query_reuse_anchor(target_commit_ref)
+        _verify_reuse_anchor_candidate(
+            commit=commit,
+            target=target,
+            source_ref=source_ref,
+            exact_version_ref=exact_version_ref,
+            implementation_revision_ref=implementation_revision_ref,
+            implementation_content_hash_ref=implementation_content_hash_ref,
+        )
+        payload = _reuse_eligibility_payload(
+            tier=tier,
+            target_commit_ref=target_commit_ref,
+            source_ref=source_ref,
+            exact_version_ref=exact_version_ref,
+            implementation_revision_ref=implementation_revision_ref,
+            implementation_content_hash_ref=implementation_content_hash_ref,
+        )
+        payload_json = canonical_json(payload)
+        payload_hash = canonical_hash(payload)
+        request_hash = payload_hash
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM rg_reuse_eligibilities WHERE idempotency_key = "
+                    ":idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if replay is not None:
+                if replay.request_hash != request_hash:
+                    raise OwnerConflict("reuse_eligibility_conflict")
+                eligibility_ref = replay.eligibility_ref
+            else:
+                eligibility_ref = new_ref("reuse_eligibility")
+                receipt_ref = new_ref("rg_reuse_eligibility_receipt")
+                values: dict[str, object] = {
+                    "eligibility_ref": eligibility_ref,
+                    "tier": tier,
+                    "target_commit_ref": target_commit_ref,
+                    "source_ref": source_ref,
+                    "exact_version_ref": exact_version_ref,
+                    "implementation_revision_ref": implementation_revision_ref,
+                    "implementation_content_hash_ref": (
+                        implementation_content_hash_ref
+                    ),
+                    "payload_json": payload_json,
+                    "payload_hash": payload_hash,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "receipt_ref": receipt_ref,
+                    "accepted_at": time.time(),
+                }
+                values["receipt_hash"] = _reuse_eligibility_receipt_hash(values)
+                try:
+                    connection.execute(
+                        text(
+                            "INSERT INTO rg_reuse_eligibilities (eligibility_ref, "
+                            "tier, target_commit_ref, source_ref, exact_version_ref, "
+                            "implementation_revision_ref, "
+                            "implementation_content_hash_ref, payload_json, "
+                            "payload_hash, idempotency_key, request_hash, receipt_ref, "
+                            "receipt_hash, accepted_at) VALUES (:eligibility_ref, "
+                            ":tier, :target_commit_ref, :source_ref, "
+                            ":exact_version_ref, :implementation_revision_ref, "
+                            ":implementation_content_hash_ref, :payload_json, "
+                            ":payload_hash, :idempotency_key, :request_hash, "
+                            ":receipt_ref, :receipt_hash, :accepted_at)"
+                        ),
+                        values,
+                    )
+                except IntegrityError as error:
+                    raise OwnerConflict("reuse_eligibility_conflict") from error
+                connection.execute(
+                    text(
+                        "UPDATE research_graph_state SET revision = revision + 1, "
+                        "reuse_eligibility_count = reuse_eligibility_count + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "research_graph.reuse_eligibility_accepted",
+                    {
+                        "eligibility_ref": eligibility_ref,
+                        "tier": tier,
+                        "target_commit_ref": target_commit_ref,
+                        "payload_hash": payload_hash,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+        accepted = self.query_reuse_eligibility(eligibility_ref)
+        if accepted is None:
+            raise OwnerConflict("reuse_eligibility_missing_after_commit")
+        return accepted
+
+    def query_reuse_eligibility(
+        self, eligibility_ref: str
+    ) -> AcceptedReuseEligibility | None:
+        eligibility_ref = _rg_reuse_ref(
+            eligibility_ref, "reuse_eligibility_ref_invalid"
+        )
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_reuse_eligibilities WHERE eligibility_ref = "
+                    ":eligibility_ref"
+                ),
+                {"eligibility_ref": eligibility_ref},
+            ).first()
+        if row is None:
+            return None
+        accepted = _accepted_reuse_eligibility(row)
+        commit, target = self._query_reuse_anchor(accepted.target_commit_ref)
+        _verify_reuse_anchor_candidate(
+            commit=commit,
+            target=target,
+            source_ref=accepted.source_ref,
+            exact_version_ref=accepted.exact_version_ref,
+            implementation_revision_ref=accepted.implementation_revision_ref,
+            implementation_content_hash_ref=(
+                accepted.implementation_content_hash_ref
+            ),
+        )
+        return accepted
+
+    def verify_reuse_eligibility(
+        self,
+        *,
+        tier: str,
+        source_ref: str,
+        exact_version_ref: str,
+        implementation_revision_ref: str,
+        implementation_content_hash_ref: str,
+        eligibility_anchor_ref: str,
+        eligibility_ref: str,
+        eligibility_content_hash_ref: str,
+        receipt_ref: str,
+        receipt_subject_ref: str,
+    ) -> None:
+        accepted = self.query_reuse_eligibility(eligibility_ref)
+        if accepted is None or (
+            accepted.tier != tier
+            or accepted.target_commit_ref != eligibility_anchor_ref
+            or accepted.source_ref != source_ref
+            or accepted.exact_version_ref != exact_version_ref
+            or accepted.implementation_revision_ref != implementation_revision_ref
+            or accepted.implementation_content_hash_ref
+            != implementation_content_hash_ref
+            or accepted.payload_hash != eligibility_content_hash_ref
+            or accepted.receipt.receipt_ref != receipt_ref
+            or receipt_subject_ref != eligibility_content_hash_ref
+            or accepted.receipt.subject_ref != receipt_subject_ref
+        ):
+            raise OwnerConflict("reuse_eligibility_receipt_invalid")
+
+    def _query_reuse_anchor(
+        self, target_commit_ref: str
+    ) -> tuple[TargetCommit, AcceptedTarget]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT c.*, g.request_ref FROM rg_target_commits c JOIN "
+                    "rg_targets t ON t.target_ref = c.target_ref JOIN "
+                    "rg_target_graphs g ON g.graph_ref = t.graph_ref WHERE "
+                    "c.commit_ref = :target_commit_ref"
+                ),
+                {"target_commit_ref": target_commit_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("reuse_eligibility_anchor_invalid")
+        commit = _target_commit(row)
+        graph = self.query_target_graph(row.request_ref)
+        if graph is None:
+            raise OwnerConflict("reuse_eligibility_anchor_invalid")
+        target = next(
+            (value for value in graph.targets if value.target_ref == commit.target_ref),
+            None,
+        )
+        if target is None or commit.target_spec_hash != target.spec_hash:
+            raise OwnerConflict("reuse_eligibility_anchor_invalid")
+        return commit, target
+
     def preflight_experiment(
-        self, *, intent: ExperimentIntent, idempotency_key: str
+        self, *, intent: ExperimentIntentLike, idempotency_key: str
     ) -> ExperimentDomainAdmission | None:
         """Read-only authority gate before RM, provider, or AR side effects."""
 
@@ -6216,12 +12606,13 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
     def admit_experiment(
         self,
         *,
-        intent: ExperimentIntent,
+        intent: ExperimentIntentLike,
         runtime_binding: ExperimentRuntimeBinding,
         definition_binding: AcceptedAssetBinding,
         implementation_binding: AcceptedAssetBinding,
         idempotency_key: str,
     ) -> ExperimentDomainAdmission:
+        _forbid_bundle_target_experiment_write(intent.execution_request_ref)
         intent_document = intent.as_dict()
         intent_hash = canonical_hash(intent_document)
         if not idempotency_key or len(idempotency_key) > 128:
@@ -6267,7 +12658,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         forward_contract = definition["baseline_forward_contract"]
         recipe = definition["variant_recipe"]
         protocol_lineage = definition["evaluation_protocol_lineage"]
-        required_metrics = EXPERIMENT_REQUIRED_METRICS
+        required_metrics = experiment_required_metrics(intent)
         protocol = definition["protocol_version"]
         if not all(
             isinstance(value, dict)
@@ -6419,31 +12810,21 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                     measurement_binding_ref = new_ref("experiment_binding")
                     variant_binding_ref: str
                     variant_inputs: dict[str, object]
-                    variant_run_created = intent.request_kind == "retrain"
+                    variant_run_created = experiment_forms_new_variant(intent)
                     if variant_run_created:
                         variant_run_ref = new_ref("variant_run")
                         variant_binding_ref = new_ref("experiment_binding")
-                        variant_inputs = {
+                        binding_core = {
                             "schema_ref": EXPERIMENT_INPUT_BINDING_SCHEMA,
                             "subject_kind": "variant_run",
                             "definition_binding": definition_binding.as_dict(),
-                            "implementation_binding": (
-                                implementation_binding.as_dict()
-                            ),
+                            "implementation_binding": implementation_binding.as_dict(),
                             "baseline_ref": baseline_ref,
                             "variant_ref": variant_ref,
-                            "implementation_revision": (
-                                runtime_binding.runner_bundle_hash
-                            ),
+                            "implementation_revision": runtime_binding.runner_bundle_hash,
                             "code": {
                                 "adapter_ref": runtime_binding.adapter_ref,
                                 "interpreter_ref": runtime_binding.interpreter_ref,
-                            },
-                            "configuration": {"title": intent.title},
-                            "data": recipe["training_data"],
-                            "recipe": recipe["state_formation"],
-                            "protocol": {
-                                "checkpoint_selection": recipe["checkpoint_selection"]
                             },
                             "resources": {
                                 "capabilities": list(
@@ -6452,6 +12833,29 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                                 "bindings": list(runtime_binding.resource_bindings),
                             },
                         }
+                        if isinstance(intent, ProtocolExperimentIntent):
+                            variant_inputs = {
+                                **binding_core,
+                                "configuration": {
+                                    "title": intent.title,
+                                    "objective": intent.objective,
+                                },
+                                "variant_recipe": recipe,
+                                "execution": intent.execution,
+                                "checkpoint_policy": intent.checkpoint_policy,
+                            }
+                        else:
+                            variant_inputs = {
+                                **binding_core,
+                                "configuration": {"title": intent.title},
+                                "data": recipe["training_data"],
+                                "recipe": recipe["state_formation"],
+                                "protocol": {
+                                    "checkpoint_selection": recipe[
+                                        "checkpoint_selection"
+                                    ]
+                                },
+                            }
                     else:
                         variant_run_ref = str(intent.source_variant_run_ref)
                         source_run = connection.execute(
@@ -6523,7 +12927,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                             receipt=accepted_checkpoint.binding.receipt,
                         )
                         checkpoint_rows.append(accepted_checkpoint)
-                    measurement_inputs = {
+                    measurement_inputs: dict[str, object] = {
                         "schema_ref": EXPERIMENT_INPUT_BINDING_SCHEMA,
                         "subject_kind": "evaluation_attempt",
                         "definition_binding": definition_binding.as_dict(),
@@ -6539,14 +12943,30 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                             "adapter_ref": runtime_binding.adapter_ref,
                             "interpreter_ref": runtime_binding.interpreter_ref,
                         },
-                        "configuration": {"hypothesis": intent.hypothesis},
-                        "data": protocol["evaluation_data"],
                         "protocol": protocol,
                         "resources": {
                             "capabilities": list(runtime_binding.capability_bindings),
                             "bindings": list(runtime_binding.resource_bindings),
                         },
                     }
+                    if isinstance(intent, ProtocolExperimentIntent):
+                        measurement_inputs.update(
+                            {
+                                "configuration": {
+                                    "objective": intent.objective,
+                                    "checkpoint_policy": intent.checkpoint_policy,
+                                },
+                                "evaluation_protocol_lineage": protocol_lineage,
+                                "execution": intent.execution,
+                            }
+                        )
+                    else:
+                        measurement_inputs.update(
+                            {
+                                "configuration": {"hypothesis": intent.hypothesis},
+                                "data": protocol["evaluation_data"],
+                            }
+                        )
                     if variant_run_created:
                         connection.execute(
                             text(
@@ -6925,26 +13345,15 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         try:
             intent_value = decoded_object(command.intent_json)
             definition = decoded_object(command.definition_json)
-            intent = ExperimentIntent(
-                execution_request_ref=str(intent_value["execution_request_ref"]),
-                quest_ref=str(intent_value["quest_ref"]),
-                title=str(intent_value["title"]),
-                hypothesis=str(intent_value["hypothesis"]),
-                variant_parameter=float(intent_value["variant_parameter"]),
-                sample_count=int(intent_value["sample_count"]),
-                request_kind=str(intent_value["request_kind"]),
-                source_variant_run_ref=(
-                    None
-                    if intent_value["source_variant_run_ref"] is None
-                    else str(intent_value["source_variant_run_ref"])
-                ),
-                selected_checkpoint_role_refs=tuple(
-                    str(value)
-                    for value in intent_value["selected_checkpoint_role_refs"]
-                ),
-            )
+            intent = experiment_intent_from_document(intent_value)
             required_value = json.loads(version.required_metrics_json)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            OwnerConflict,
+        ) as error:
             raise OwnerConflict("experiment_domain_integrity_invalid") from error
         intent.validate()
         definition_binding = AcceptedAssetBinding(
@@ -7116,6 +13525,70 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             None if row is None else self.query_experiment(row.evaluation_attempt_ref)
         )
 
+    def query_writing_experiment_terminal_cut(
+        self, quest_ref: str
+    ) -> WritingExperimentTerminalCut:
+        """Freeze this Quest's complete formal Experiment identity set.
+
+        Filtering, ordering, and the hard cardinality bound all live behind
+        this RG Interface.  One SQLite statement therefore observes one closed
+        cut even while unrelated admissions or live attempts keep arriving.
+        Terminal attempt rows are immutable; Writing subsequently exact-reads
+        only these frozen identities through the existing receipt-verifying
+        RG seams.
+        """
+
+        if type(quest_ref) is not str or not quest_ref or len(quest_ref) > 96:
+            raise OwnerConflict("writing_experiment_quest_ref_invalid")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT requests.evaluation_attempt_ref, attempts.status, "
+                    "attempts.formal_rejection_code FROM "
+                    "rg_experiment_requests requests JOIN "
+                    "rg_evaluation_attempts attempts ON "
+                    "attempts.evaluation_attempt_ref = "
+                    "requests.evaluation_attempt_ref WHERE "
+                    "requests.quest_ref = :quest_ref AND attempts.status IN "
+                    "('measurement_accepted', 'measurement_rejected') "
+                    "ORDER BY attempts.updated_at, "
+                    "requests.evaluation_attempt_ref LIMIT :limit"
+                ),
+                {
+                    "quest_ref": quest_ref,
+                    "limit": WRITING_EXPERIMENT_TERMINAL_CUT_MAX_FACTS + 1,
+                },
+            ).all()
+        if len(rows) > WRITING_EXPERIMENT_TERMINAL_CUT_MAX_FACTS:
+            raise OwnerConflict("writing_snapshot_experiment_limit_exceeded")
+        facts: list[WritingExperimentTerminalFactRef] = []
+        for row in rows:
+            status: Literal["accepted", "rejected"] = (
+                "accepted"
+                if row.status == "measurement_accepted"
+                else "rejected"
+            )
+            rejection_code = row.formal_rejection_code
+            if (
+                (status == "accepted" and rejection_code is not None)
+                or (
+                    status == "rejected"
+                    and (
+                        type(rejection_code) is not str
+                        or not rejection_code
+                    )
+                )
+            ):
+                raise OwnerConflict("writing_experiment_result_invalid")
+            facts.append(
+                WritingExperimentTerminalFactRef(
+                    evaluation_attempt_ref=str(row.evaluation_attempt_ref),
+                    formal_measurement_status=status,
+                    formal_rejection_code=cast(str | None, rejection_code),
+                )
+            )
+        return WritingExperimentTerminalCut(quest_ref=quest_ref, facts=tuple(facts))
+
     def query_experiment_admission_refs(
         self,
         *,
@@ -7162,6 +13635,12 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         execution_result_hash: str,
         execution_receipt: AcceptanceReceipt,
     ) -> tuple[AcceptedExperimentAssetRole, ...]:
+        domain = self.query_experiment(evaluation_attempt_ref)
+        if domain is None:
+            raise OwnerConflict("evaluation_attempt_not_found")
+        _forbid_bundle_target_experiment_write(
+            domain.intent.execution_request_ref
+        )
         if set(roles) != {
             "checkpoint_artifact",
             "log_asset",
@@ -7197,9 +13676,6 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             )
         if self._execution_verifier is None:
             raise OwnerConflict("experiment_execution_verifier_unavailable")
-        domain = self.query_experiment(evaluation_attempt_ref)
-        if domain is None:
-            raise OwnerConflict("evaluation_attempt_not_found")
         manifest = self._execution_verifier.verify_experiment_execution_receipt(
             run_ref=run_ref,
             attempt_ref=execution_attempt_ref,
@@ -7214,7 +13690,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             manifest=manifest,
             error_code="experiment_asset_execution_component_mismatch",
         )
-        execution_backed_retrain = domain.intent.request_kind == "retrain"
+        execution_backed_retrain = experiment_forms_new_variant(domain.intent)
         with self._database.write() as connection:
             attempt = connection.execute(
                 text(
@@ -7406,6 +13882,9 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         domain = self.query_experiment(evaluation_attempt_ref)
         if domain is None:
             raise OwnerConflict("evaluation_attempt_not_found")
+        _forbid_bundle_target_experiment_write(
+            domain.intent.execution_request_ref
+        )
         roles = self.query_experiment_asset_roles(evaluation_attempt_ref)
         result_roles = tuple(role for role in roles if role.role == "result_content")
         if len(result_roles) != 1 or result_roles[0].role_ref != result_role_ref:
@@ -7415,7 +13894,8 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             result_role.subject_kind != "evaluation_attempt"
             or result_role.subject_ref != evaluation_attempt_ref
             or canonical_hash(result_content) != result_role.binding.content_hash
-            or result_content.get("schema_ref") != EXPERIMENT_RESULT_SCHEMA
+            or result_content.get("schema_ref")
+            != experiment_result_schema_ref(domain.intent)
         ):
             raise OwnerConflict("formal_measurement_result_content_invalid")
         raw_metrics = result_content.get("metrics")
@@ -7434,6 +13914,12 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             metrics[name] = float(value)
         if any(name not in metrics for name in domain.required_metrics):
             raise OwnerConflict("formal_measurement_metrics_incomplete")
+        if isinstance(domain.intent, ProtocolExperimentIntent):
+            allowed_metrics = set(domain.required_metrics) | set(
+                experiment_optional_metrics(domain.intent)
+            )
+            if any(name not in allowed_metrics for name in metrics):
+                raise OwnerConflict("formal_measurement_metric_unknown")
         if self._execution_verifier is None:
             raise OwnerConflict("experiment_execution_verifier_unavailable")
         result_manifest = self._execution_verifier.verify_experiment_execution_receipt(
@@ -7579,6 +14065,12 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             or len(rejection_code) > 96
         ):
             raise OwnerConflict("formal_measurement_rejection_code_invalid")
+        domain = self.query_experiment(evaluation_attempt_ref)
+        if domain is None:
+            raise OwnerConflict("evaluation_attempt_not_found")
+        _forbid_bundle_target_experiment_write(
+            domain.intent.execution_request_ref
+        )
         with self._database.write() as connection:
             attempt = connection.execute(
                 text(
@@ -7753,13 +14245,17 @@ def _verify_experiment_asset_binding_components(
     checkpoint_hashes = tuple(
         binding.content_hash for binding in roles["checkpoint_artifact"]
     )
-    if domain.intent.request_kind == "retrain":
-        if (
-            not manifest.checkpoint_content_hashes
-            or checkpoint_hashes != manifest.checkpoint_content_hashes
-        ):
+    if not experiment_forms_new_variant(domain.intent):
+        if checkpoint_hashes or manifest.checkpoint_content_hashes:
             raise OwnerConflict(error_code)
-    elif checkpoint_hashes or manifest.checkpoint_content_hashes:
+        return
+    policy = experiment_checkpoint_policy(domain.intent)
+    if checkpoint_hashes != manifest.checkpoint_content_hashes:
+        raise OwnerConflict(error_code)
+    if (
+        (policy == "required" and not checkpoint_hashes)
+        or (policy == "forbidden" and checkpoint_hashes)
+    ):
         raise OwnerConflict(error_code)
 
 
@@ -7786,7 +14282,7 @@ def _verify_formal_measurement_result_components(
             or matching[0].binding.content_hash != content_hash
         ):
             raise OwnerConflict(error_code)
-    if domain.intent.request_kind != "retrain":
+    if not experiment_forms_new_variant(domain.intent):
         if manifest.checkpoint_content_hashes:
             raise OwnerConflict(error_code)
         return
@@ -7796,9 +14292,9 @@ def _verify_formal_measurement_result_components(
             key=lambda role: role.ordinal,
         )
     )
+    policy = experiment_checkpoint_policy(domain.intent)
     if (
-        not manifest.checkpoint_content_hashes
-        or tuple(role.ordinal for role in checkpoints) != tuple(range(len(checkpoints)))
+        tuple(role.ordinal for role in checkpoints) != tuple(range(len(checkpoints)))
         or any(
             role.subject_kind != "variant_run"
             or role.subject_ref != domain.identities.variant_run_ref
@@ -7806,6 +14302,8 @@ def _verify_formal_measurement_result_components(
         )
         or tuple(role.binding.content_hash for role in checkpoints)
         != manifest.checkpoint_content_hashes
+        or (policy == "required" and not manifest.checkpoint_content_hashes)
+        or (policy == "forbidden" and bool(manifest.checkpoint_content_hashes))
     ):
         raise OwnerConflict(error_code)
 
@@ -7910,7 +14408,7 @@ def _experiment_implementation_binding(row) -> AcceptedAssetBinding:
 
 def _experiment_request_matches(
     row,
-    intent: ExperimentIntent,
+    intent: ExperimentIntentLike,
     definition: dict[str, object],
     definition_binding: AcceptedAssetBinding,
     implementation_binding: AcceptedAssetBinding,
@@ -7985,6 +14483,342 @@ def _accepted_experiment_input_binding(row) -> AcceptedExperimentInputBinding:
     )
 
 
+_MAX_EXACT_JSON_INTEGER = (1 << 53) - 1
+
+
+def _target_jsonschema_number(_checker: object, value: object) -> bool:
+    if type(value) is int:
+        return abs(value) <= _MAX_EXACT_JSON_INTEGER
+    return type(value) is float and math.isfinite(value)
+
+
+def _target_jsonschema_integer(_checker: object, value: object) -> bool:
+    return type(value) is int and abs(value) <= _MAX_EXACT_JSON_INTEGER
+
+
+_TargetResultSchemaValidator = validators.extend(
+    Draft202012Validator,
+    type_checker=(
+        Draft202012Validator.TYPE_CHECKER.redefine(
+            "number", _target_jsonschema_number
+        ).redefine("integer", _target_jsonschema_integer)
+    ),
+)
+
+
+def _validate_target_json_numeric_tree(value: object) -> None:
+    if type(value) is int:
+        if abs(value) > _MAX_EXACT_JSON_INTEGER:
+            raise OwnerConflict("target_measurement_result_number_invalid")
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise OwnerConflict("target_measurement_result_number_invalid")
+        return
+    if type(value) is list:
+        for item in value:
+            _validate_target_json_numeric_tree(item)
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise OwnerConflict("target_measurement_result_content_invalid")
+            _validate_target_json_numeric_tree(item)
+
+
+def _reject_external_target_schema_refs(value: object) -> None:
+    if type(value) is list:
+        for item in value:
+            _reject_external_target_schema_refs(item)
+        return
+    if type(value) is not dict:
+        return
+    for key, item in value.items():
+        if key in {"$ref", "$dynamicRef", "$recursiveRef"}:
+            if type(item) is not str or not item.startswith("#"):
+                raise OwnerConflict("target_measurement_result_schema_ref_forbidden")
+        _reject_external_target_schema_refs(item)
+
+
+def _validate_target_result_schema(
+    *, schema: dict[str, object], result_content: dict[str, object]
+) -> None:
+    """Validate the complete frozen schema without any external resolution."""
+
+    _validate_target_json_numeric_tree(schema)
+    _validate_target_json_numeric_tree(result_content)
+    _reject_external_target_schema_refs(schema)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except Exception as error:
+        raise OwnerConflict("target_measurement_result_schema_invalid") from error
+
+    # ``schema_ref`` and ``result_disposition`` are the fixed Owner envelope.
+    # A contract may explicitly include them in its schema.  Otherwise they
+    # are validated mechanically here and removed only from the instance seen
+    # by the contract's domain-payload schema; every other field remains under
+    # the frozen schema, including additionalProperties and nested refs.
+    schema_instance = dict(result_content)
+    properties = schema.get("properties")
+    declared = set(properties) if type(properties) is dict else set()
+    for reserved in ("schema_ref", "result_disposition"):
+        if reserved not in declared:
+            schema_instance.pop(reserved, None)
+    try:
+        errors = tuple(_TargetResultSchemaValidator(schema).iter_errors(schema_instance))
+    except Exception as error:
+        raise OwnerConflict("target_measurement_result_schema_unresolved") from error
+    if errors:
+        raise OwnerConflict("target_measurement_result_content_invalid")
+
+
+def _decode_target_result_content(content: bytes) -> dict[str, object]:
+    if type(content) is not bytes or not content:
+        raise OwnerConflict("target_measurement_result_content_invalid")
+
+    def reject_constant(_value: str) -> object:
+        raise ValueError("non-finite JSON number")
+
+    def exact_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=exact_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("target_measurement_result_content_invalid") from error
+    if type(value) is not dict:
+        raise OwnerConflict("target_measurement_result_content_invalid")
+    _validate_target_json_numeric_tree(value)
+    return cast(dict[str, object], value)
+
+
+def _target_metric_values(
+    *,
+    result_content: dict[str, object],
+    required_metric_keys: tuple[str, ...],
+    optional_metric_keys: tuple[str, ...],
+) -> dict[str, float]:
+    raw_metrics = result_content.get("metrics")
+    raw_ordered = result_content.get("metric_values")
+    metrics: dict[str, object]
+    if type(raw_metrics) is dict and raw_ordered is None:
+        metrics = cast(dict[str, object], raw_metrics)
+        if any(
+            type(key) is not str
+            or key not in {*required_metric_keys, *optional_metric_keys}
+            for key in metrics
+        ):
+            raise OwnerConflict("target_measurement_metric_unknown")
+    elif type(raw_ordered) is list and raw_metrics is None:
+        if len(raw_ordered) != len(required_metric_keys):
+            raise OwnerConflict("target_measurement_metrics_incomplete")
+        metrics = dict(zip(required_metric_keys, raw_ordered, strict=True))
+    else:
+        raise OwnerConflict("target_measurement_metrics_incomplete")
+    if any(key not in metrics for key in required_metric_keys):
+        raise OwnerConflict("target_measurement_metrics_incomplete")
+    accepted: dict[str, float] = {}
+    for key, value in metrics.items():
+        if (
+            type(value) not in {int, float}
+            or (type(value) is int and abs(value) > _MAX_EXACT_JSON_INTEGER)
+            or (type(value) is float and not math.isfinite(value))
+        ):
+            raise OwnerConflict("target_measurement_metric_invalid")
+        accepted[key] = float(value)
+    return accepted
+
+
+def _target_native_input_proof(row) -> ExecutionInputBindingProof:
+    accepted = _accepted_experiment_input_binding(row)
+    raw_refs = accepted.inputs.get("input_refs")
+    if (
+        type(raw_refs) is not list
+        or any(type(value) is not str or not value for value in raw_refs)
+        or raw_refs != sorted(set(raw_refs))
+    ):
+        raise OwnerConflict("target_measurement_input_binding_invalid")
+    return ExecutionInputBindingProof(
+        binding_ref=accepted.binding_ref,
+        subject_ref=accepted.subject_ref,
+        input_refs=tuple(raw_refs),
+        acceptance_receipt=receipt_proof(
+            accepted.receipt,
+            subject_ref=accepted.binding_ref,
+        ),
+    )
+
+
+def _target_formal_measurement_receipt_bindings(
+    *,
+    authority: AcceptedTargetMeasurementDomainAuthority,
+    accepted_attempt: AcceptedTargetMeasurementAttempt,
+    generic_binding: TargetGenericExecutionBinding,
+    terminal: TargetExecutionTerminalResult,
+    manifest: AcceptedTargetGenericResultManifest,
+    result_role: AcceptedExperimentAssetRole,
+    result_schema_hash: str,
+    result_disposition: str,
+    metrics_hash: str,
+) -> dict[str, object]:
+    protocol = authority.measurement_contract.protocol_version
+    return {
+        "target_ref": accepted_attempt.target_ref,
+        "target_run_ref": accepted_attempt.target_run_ref,
+        "target_attempt_ref": accepted_attempt.target_attempt_ref,
+        "target_fence_ref": accepted_attempt.target_fence_ref,
+        "authority_ref": authority.authority_ref,
+        "authority_hash": authority.authority_hash,
+        "authority_receipt": authority.receipt.as_public_dict(),
+        "attempt_binding_ref": accepted_attempt.attempt_binding_ref,
+        "attempt_payload_hash": accepted_attempt.payload_hash,
+        "attempt_receipt": accepted_attempt.receipt.as_public_dict(),
+        "generic_binding_ref": generic_binding.binding_ref,
+        "generic_request_hash": generic_binding.request_hash,
+        "generic_exit_receipt_hash": generic_binding.exit_receipt_hash,
+        "generic_receipt": generic_binding.receipt.as_public_dict(),
+        "terminal_exit_receipt": projection_plain_value(terminal.exit_receipt),
+        "manifest_ref": manifest.manifest_ref,
+        "manifest_payload_hash": manifest.payload_hash,
+        "manifest_receipt": manifest.receipt.as_public_dict(),
+        "evaluation_attempt_ref": accepted_attempt.evaluation_attempt_ref,
+        "result_role_ref": result_role.role_ref,
+        "result_asset": result_role.binding.as_dict(),
+        "result_schema_ref": authority.measurement_contract.result_schema_ref,
+        "result_schema_hash": result_schema_hash,
+        "result_disposition": result_disposition,
+        "experiment_keys": list(authority.experiment_keys),
+        "measurement_unit_key": authority.measurement_unit_key,
+        "protocol_version_ref": authority.identities.protocol_version_ref,
+        "required_metric_keys": list(protocol.required_metric_keys),
+        "optional_metric_keys": list(protocol.optional_metric_keys),
+        "protocol_part_keys": [part.part_key for part in authority.protocol_parts],
+        "protocol_aggregation_proof": projection_plain_value(
+            authority.protocol_aggregation_proof
+        ),
+        "metrics_hash": metrics_hash,
+    }
+
+
+def _target_measurement_runtime_ref(value: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or any(character in value for character in ("\x00", "\r", "\n"))
+    ):
+        raise OwnerConflict("target_measurement_runtime_ref_invalid")
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeEncodeError as error:
+        raise OwnerConflict("target_measurement_runtime_ref_invalid") from error
+    if len(encoded) > 256:
+        raise OwnerConflict("target_measurement_runtime_ref_invalid")
+    return value
+
+
+def _target_measurement_idempotency_key(value: str) -> str:
+    value = _target_measurement_runtime_ref(value)
+    if len(value.encode("utf-8")) > 128:
+        raise OwnerConflict("target_measurement_idempotency_key_invalid")
+    return value
+
+
+def _insert_target_measurement_input_binding(
+    connection,
+    *,
+    binding_ref: str,
+    subject_kind: str,
+    subject_ref: str,
+    inputs: dict[str, object],
+    receipt_ref: str,
+    receipt_hash: str,
+    accepted_at: float,
+) -> None:
+    if subject_kind not in {"variant_run", "evaluation_attempt"}:
+        raise OwnerConflict("target_measurement_input_binding_invalid")
+    inputs_json = canonical_json(inputs)
+    inputs_hash = canonical_hash(inputs)
+    expected_receipt_hash = _receipt_hash(
+        EXPERIMENT_INPUT_BINDING_RECEIPT_KIND,
+        binding_ref,
+        {
+            "schema_ref": EXPERIMENT_INPUT_BINDING_SCHEMA,
+            "subject_kind": subject_kind,
+            "subject_ref": subject_ref,
+            "inputs_hash": inputs_hash,
+        },
+    )
+    if receipt_hash != expected_receipt_hash:
+        raise OwnerConflict("target_measurement_input_binding_invalid")
+    connection.execute(
+        text(
+            "INSERT INTO rg_experiment_input_bindings (binding_ref, "
+            "subject_kind, subject_ref, inputs_json, inputs_hash, receipt_ref, "
+            "receipt_hash, accepted_at) VALUES (:binding_ref, :subject_kind, "
+            ":subject_ref, :inputs_json, :inputs_hash, :receipt_ref, "
+            ":receipt_hash, :accepted_at)"
+        ),
+        {
+            "binding_ref": binding_ref,
+            "subject_kind": subject_kind,
+            "subject_ref": subject_ref,
+            "inputs_json": inputs_json,
+            "inputs_hash": inputs_hash,
+            "receipt_ref": receipt_ref,
+            "receipt_hash": receipt_hash,
+            "accepted_at": accepted_at,
+        },
+    )
+
+
+def _insert_target_measurement_asset_role(
+    connection,
+    *,
+    role: dict[str, object],
+    accepted_at: float,
+) -> None:
+    binding = role.get("binding")
+    if type(binding) is not AcceptedAssetBinding:
+        raise OwnerConflict("target_measurement_asset_role_invalid")
+    connection.execute(
+        text(
+            "INSERT INTO rg_experiment_asset_roles (role_ref, subject_kind, "
+            "subject_ref, role, ordinal, asset_ref, version_ref, content_hash, "
+            "manifest_hash, asset_receipt_ref, asset_receipt_hash, receipt_ref, "
+            "receipt_hash, accepted_at) VALUES (:role_ref, :subject_kind, "
+            ":subject_ref, :role, :ordinal, :asset_ref, :version_ref, "
+            ":content_hash, :manifest_hash, :asset_receipt_ref, "
+            ":asset_receipt_hash, :receipt_ref, :receipt_hash, :accepted_at)"
+        ),
+        {
+            "role_ref": role["role_ref"],
+            "subject_kind": role["subject_kind"],
+            "subject_ref": role["subject_ref"],
+            "role": role["role"],
+            "ordinal": role["ordinal"],
+            "asset_ref": binding.asset_ref,
+            "version_ref": binding.version_ref,
+            "content_hash": binding.content_hash,
+            "manifest_hash": binding.manifest_hash,
+            "asset_receipt_ref": binding.receipt.receipt_ref,
+            "asset_receipt_hash": binding.receipt.payload_hash,
+            "receipt_ref": role["receipt_ref"],
+            "receipt_hash": role["receipt_hash"],
+            "accepted_at": accepted_at,
+        },
+    )
+
+
 def _accepted_experiment_asset_role(row) -> AcceptedExperimentAssetRole:
     binding = AcceptedAssetBinding(
         asset_ref=row.asset_ref,
@@ -8050,6 +14884,1013 @@ def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> s
             "bindings": bindings,
         }
     )
+
+
+def _rg_stored_value(row, name: str):
+    if isinstance(row, dict):
+        return row[name]
+    return getattr(row, name)
+
+
+def _reuse_eligibility_payload(
+    *,
+    tier: str,
+    target_commit_ref: str,
+    source_ref: str,
+    exact_version_ref: str,
+    implementation_revision_ref: str,
+    implementation_content_hash_ref: str,
+) -> dict[str, object]:
+    # Direct production mapping of
+    # bundle_stage_mvp._reuse_eligibility_payload_digest.
+    return {
+        "eligible_tier": tier,
+        "eligibility_anchor_ref": target_commit_ref,
+        "source_ref": source_ref,
+        "exact_version_ref": exact_version_ref,
+        "implementation_revision_ref": implementation_revision_ref,
+        "implementation_content_hash_ref": implementation_content_hash_ref,
+    }
+
+
+def _reuse_eligibility_receipt_hash(row) -> str:
+    return _receipt_hash(
+        REUSE_ELIGIBILITY_RECEIPT_KIND,
+        _rg_stored_value(row, "payload_hash"),
+        {
+            "receipt_ref": _rg_stored_value(row, "receipt_ref"),
+            "eligibility_ref": _rg_stored_value(row, "eligibility_ref"),
+            "tier": _rg_stored_value(row, "tier"),
+            "target_commit_ref": _rg_stored_value(row, "target_commit_ref"),
+            "source_ref": _rg_stored_value(row, "source_ref"),
+            "exact_version_ref": _rg_stored_value(row, "exact_version_ref"),
+            "implementation_revision_ref": _rg_stored_value(
+                row, "implementation_revision_ref"
+            ),
+            "implementation_content_hash_ref": _rg_stored_value(
+                row, "implementation_content_hash_ref"
+            ),
+        },
+    )
+
+
+def _accepted_reuse_eligibility(row) -> AcceptedReuseEligibility:
+    try:
+        payload = decoded_object(_rg_stored_value(row, "payload_json"))
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("reuse_eligibility_invalid") from error
+    tier = _reuse_eligibility_tier(_rg_stored_value(row, "tier"))
+    expected = _reuse_eligibility_payload(
+        tier=tier,
+        target_commit_ref=_rg_stored_value(row, "target_commit_ref"),
+        source_ref=_rg_stored_value(row, "source_ref"),
+        exact_version_ref=_rg_stored_value(row, "exact_version_ref"),
+        implementation_revision_ref=_rg_stored_value(
+            row, "implementation_revision_ref"
+        ),
+        implementation_content_hash_ref=_rg_stored_value(
+            row, "implementation_content_hash_ref"
+        ),
+    )
+    if (
+        payload != expected
+        or canonical_json(payload) != _rg_stored_value(row, "payload_json")
+        or canonical_hash(payload) != _rg_stored_value(row, "payload_hash")
+        or _rg_stored_value(row, "request_hash")
+        != _rg_stored_value(row, "payload_hash")
+        or _rg_stored_value(row, "receipt_hash")
+        != _reuse_eligibility_receipt_hash(row)
+    ):
+        raise OwnerConflict("reuse_eligibility_invalid")
+    return AcceptedReuseEligibility(
+        eligibility_ref=_rg_stored_value(row, "eligibility_ref"),
+        tier=tier,
+        target_commit_ref=_rg_stored_value(row, "target_commit_ref"),
+        source_ref=_rg_stored_value(row, "source_ref"),
+        exact_version_ref=_rg_stored_value(row, "exact_version_ref"),
+        implementation_revision_ref=_rg_stored_value(
+            row, "implementation_revision_ref"
+        ),
+        implementation_content_hash_ref=_rg_stored_value(
+            row, "implementation_content_hash_ref"
+        ),
+        payload=payload,
+        payload_hash=_rg_stored_value(row, "payload_hash"),
+        accepted_at=float(_rg_stored_value(row, "accepted_at")),
+        receipt=AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=REUSE_ELIGIBILITY_RECEIPT_KIND,
+            receipt_ref=_rg_stored_value(row, "receipt_ref"),
+            subject_ref=_rg_stored_value(row, "payload_hash"),
+            payload_hash=_rg_stored_value(row, "receipt_hash"),
+        ),
+    )
+
+
+def _verify_reuse_anchor_candidate(
+    *,
+    commit: TargetCommit,
+    target: AcceptedTarget,
+    source_ref: str,
+    exact_version_ref: str,
+    implementation_revision_ref: str,
+    implementation_content_hash_ref: str,
+) -> None:
+    candidate = target.spec.get("candidate")
+    trace = candidate.get("reuse_trace") if isinstance(candidate, dict) else None
+    decisions = trace.get("tier_decisions") if isinstance(trace, dict) else None
+    if (
+        commit.target_ref != target.target_ref
+        or commit.target_spec_hash != target.spec_hash
+        or not isinstance(candidate, dict)
+        or candidate.get("implementation_revision_ref")
+        != implementation_revision_ref
+        or not isinstance(decisions, list)
+    ):
+        raise OwnerConflict("reuse_eligibility_anchor_invalid")
+    supported = False
+    for decision in decisions:
+        if not isinstance(decision, dict) or decision.get("disposition") != "selected":
+            continue
+        proofs = decision.get("source_proofs")
+        if not isinstance(proofs, list):
+            continue
+        for proof in proofs:
+            binding = proof.get("implementation_binding") if isinstance(proof, dict) else None
+            if (
+                isinstance(proof, dict)
+                and isinstance(binding, dict)
+                and proof.get("source_ref") == source_ref
+                and proof.get("exact_version_ref") == exact_version_ref
+                and proof.get("implementation_revision_ref")
+                == implementation_revision_ref
+                and binding.get("subject_ref") == implementation_revision_ref
+                and binding.get("content_hash_ref")
+                == implementation_content_hash_ref
+            ):
+                supported = True
+                break
+        if supported:
+            break
+    if not supported:
+        raise OwnerConflict("reuse_eligibility_anchor_invalid")
+
+
+def _reuse_eligibility_tier(value: str) -> str:
+    if value not in {
+        "accepted-local",
+        "related-history",
+        "global-baseline-pool",
+    }:
+        raise OwnerConflict("reuse_eligibility_tier_invalid")
+    return value
+
+
+def _rg_reuse_ref(value: str, code: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(character in value for character in ("\x00", "\r", "\n"))
+    ):
+        raise OwnerConflict(code)
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeEncodeError as error:
+        raise OwnerConflict(code) from error
+    if len(encoded) > 256:
+        raise OwnerConflict(code)
+    return value
+
+
+def _rg_sha256(value: str, code: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise OwnerConflict(code)
+    return value
+
+
+def _rg_reuse_idempotency_key(value: str) -> str:
+    value = _rg_reuse_ref(value, "reuse_eligibility_idempotency_key_invalid")
+    if len(value.encode("utf-8")) > 128:
+        raise OwnerConflict("reuse_eligibility_idempotency_key_invalid")
+    return value
+
+
+def _target_spec_acceptance_bindings(
+    *,
+    target_ref: str,
+    graph_ref: str,
+    target_receipt_ref: str,
+    target_receipt_hash: str,
+) -> dict[str, object]:
+    return {
+        "target_ref": target_ref,
+        "graph_ref": graph_ref,
+        "target_acceptance_receipt_ref": target_receipt_ref,
+        "target_acceptance_receipt_hash": target_receipt_hash,
+    }
+
+
+def _insert_target_spec_acceptance(
+    connection,
+    *,
+    target_ref: str,
+    graph_ref: str,
+    spec_hash: str,
+    target_receipt_ref: str,
+    target_receipt_hash: str,
+    accepted_at: float,
+) -> tuple[str, AcceptanceReceipt]:
+    acceptance_ref = new_ref("target_spec_acceptance")
+    receipt_ref = new_ref("rg_target_spec_receipt")
+    receipt_hash = _receipt_hash(
+        TARGET_SPEC_CONTENT_RECEIPT_KIND,
+        spec_hash,
+        _target_spec_acceptance_bindings(
+            target_ref=target_ref,
+            graph_ref=graph_ref,
+            target_receipt_ref=target_receipt_ref,
+            target_receipt_hash=target_receipt_hash,
+        ),
+    )
+    connection.execute(
+        text(
+            "INSERT INTO rg_target_spec_acceptances (acceptance_ref, target_ref, "
+            "graph_ref, spec_content_hash_ref, target_acceptance_receipt_ref, "
+            "target_acceptance_receipt_hash, receipt_ref, receipt_hash, "
+            "accepted_at) VALUES (:acceptance_ref, :target_ref, :graph_ref, "
+            ":spec_content_hash_ref, :target_acceptance_receipt_ref, "
+            ":target_acceptance_receipt_hash, :receipt_ref, :receipt_hash, "
+            ":accepted_at)"
+        ),
+        {
+            "acceptance_ref": acceptance_ref,
+            "target_ref": target_ref,
+            "graph_ref": graph_ref,
+            "spec_content_hash_ref": spec_hash,
+            "target_acceptance_receipt_ref": target_receipt_ref,
+            "target_acceptance_receipt_hash": target_receipt_hash,
+            "receipt_ref": receipt_ref,
+            "receipt_hash": receipt_hash,
+            "accepted_at": accepted_at,
+        },
+    )
+    return acceptance_ref, AcceptanceReceipt(
+        issuer=RG_OWNER,
+        kind=TARGET_SPEC_CONTENT_RECEIPT_KIND,
+        receipt_ref=receipt_ref,
+        subject_ref=spec_hash,
+        payload_hash=receipt_hash,
+    )
+
+
+def _verify_target_spec_acceptance_row(
+    *, target: AcceptedTarget, row
+) -> ReceiptProof:
+    bindings = _target_spec_acceptance_bindings(
+        target_ref=target.target_ref,
+        graph_ref=target.graph_ref,
+        target_receipt_ref=target.receipt.receipt_ref,
+        target_receipt_hash=target.receipt.payload_hash,
+    )
+    if (
+        row.target_ref != target.target_ref
+        or row.graph_ref != target.graph_ref
+        or row.spec_content_hash_ref != target.spec_hash
+        or row.target_acceptance_receipt_ref != target.receipt.receipt_ref
+        or row.target_acceptance_receipt_hash != target.receipt.payload_hash
+        or row.receipt_hash
+        != _receipt_hash(
+            TARGET_SPEC_CONTENT_RECEIPT_KIND,
+            target.spec_hash,
+            bindings,
+        )
+    ):
+        raise OwnerConflict("target_spec_content_receipt_invalid")
+    return ReceiptProof(
+        receipt_ref=row.receipt_ref,
+        subject_ref=target.spec_hash,
+        verified=True,
+        currentness_known=True,
+        current=True,
+    )
+
+
+def _canonical_formal_plan_projection_digest(
+    *,
+    formal_plan_ref: str,
+    completion_contract: NormalizedCompletionContract,
+) -> str:
+    """Recompute the fixed FormalPlan value without claiming a later receipt."""
+
+    return canonical_hash(
+        {
+            "formal_plan_ref": formal_plan_ref,
+            "briefs": projection_plain_value(
+                tuple(item.brief for item in completion_contract.experiments)
+            ),
+        }
+    )
+
+
+def _get_or_create_target_measurement_identity(
+    connection,
+    *,
+    table: str,
+    ref_column: str,
+    ref_prefix: str,
+    natural: dict[str, object],
+    immutable: dict[str, object],
+    insert_only: dict[str, object],
+) -> tuple[str, bool]:
+    """Get one native identity and reject altered bytes behind its hash.
+
+    The 0012 tables are also used by the standalone Experiment compatibility
+    path.  This Target seam therefore reuses their documented natural keys but
+    independently verifies every immutable column it consumes.
+    """
+
+    allowed = {
+        "rg_experiment_baselines",
+        "rg_experiment_variants",
+        "rg_evaluation_protocols",
+        "rg_protocol_versions",
+        "rg_evaluations",
+    }
+    if table not in allowed:
+        raise AssertionError("unsupported Target measurement identity table")
+    where = " AND ".join(f"{name} = :{name}" for name in natural)
+    row = connection.execute(
+        text(f"SELECT * FROM {table} WHERE {where}"), natural
+    ).first()
+    if row is not None:
+        expected = {**natural, **immutable}
+        if any(getattr(row, name) != value for name, value in expected.items()):
+            raise OwnerConflict("target_measurement_native_identity_integrity_invalid")
+        return str(getattr(row, ref_column)), False
+    ref = new_ref(ref_prefix)
+    document = {
+        ref_column: ref,
+        **natural,
+        **immutable,
+        **insert_only,
+    }
+    columns = ", ".join(document)
+    placeholders = ", ".join(f":{name}" for name in document)
+    connection.execute(
+        text(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"),
+        document,
+    )
+    return ref, True
+
+
+def _verify_target_measurement_native_identity_rows(
+    *,
+    contract: TargetMeasurementContractCandidate,
+    identities: TargetMeasurementDomainIdentities,
+    baseline_row,
+    variant_row,
+    evaluation_protocol_row,
+    protocol_version_row,
+    evaluation_row,
+) -> None:
+    if any(
+        row is None
+        for row in (
+            baseline_row,
+            variant_row,
+            evaluation_protocol_row,
+            protocol_version_row,
+            evaluation_row,
+        )
+    ):
+        raise OwnerConflict("target_measurement_native_identity_integrity_invalid")
+    forward = contract.baseline_forward_contract.as_dict()
+    recipe = contract.variant_recipe.as_dict()
+    lineage = contract.evaluation_protocol_lineage.as_dict()
+    protocol_document = measurement_contract_to_dict(contract)["protocol_version"]
+    required_metric_keys = list(contract.protocol_version.required_metric_keys)
+    if (
+        baseline_row.baseline_ref != identities.baseline_ref
+        or baseline_row.forward_contract_json != canonical_json(forward)
+        or baseline_row.forward_contract_hash != canonical_hash(forward)
+        or variant_row.variant_ref != identities.variant_ref
+        or variant_row.baseline_ref != identities.baseline_ref
+        or variant_row.recipe_json != canonical_json(recipe)
+        or variant_row.recipe_hash != canonical_hash(recipe)
+        or evaluation_protocol_row.evaluation_protocol_ref
+        != identities.evaluation_protocol_ref
+        or evaluation_protocol_row.lineage_json != canonical_json(lineage)
+        or evaluation_protocol_row.lineage_hash != canonical_hash(lineage)
+        or protocol_version_row.protocol_version_ref
+        != identities.protocol_version_ref
+        or protocol_version_row.evaluation_protocol_ref
+        != identities.evaluation_protocol_ref
+        or protocol_version_row.protocol_json
+        != canonical_json(protocol_document)
+        or protocol_version_row.protocol_hash
+        != canonical_hash(protocol_document)
+        or protocol_version_row.required_metrics_json
+        != canonical_json(required_metric_keys)
+        or protocol_version_row.required_metrics_hash
+        != canonical_hash(required_metric_keys)
+        or evaluation_row.evaluation_ref != identities.evaluation_ref
+        or evaluation_row.variant_ref != identities.variant_ref
+        or evaluation_row.protocol_version_ref
+        != identities.protocol_version_ref
+    ):
+        raise OwnerConflict("target_measurement_native_identity_integrity_invalid")
+
+
+def _target_measurement_authority_payload(
+    *,
+    target: AcceptedTarget,
+    target_plan_hash: str,
+    graph_generation: int,
+    graph_acceptance_receipt: AcceptanceReceipt,
+    rolling_append_source: dict[str, str] | None,
+    stage_request_ref: str,
+    plan_binding: AcceptedFormalPlanBinding,
+    completion_contract: NormalizedCompletionContract,
+    formal_plan_projection_digest: str,
+    measurement_contract: TargetMeasurementContractCandidate,
+    identities: TargetMeasurementDomainIdentities,
+    target_spec_acceptance_ref: str,
+    target_spec_acceptance_receipt: AcceptanceReceipt,
+    protocol_parts: tuple[ProtocolPart, ...],
+    protocol_aggregation_proof: ProtocolAggregationProof | None,
+) -> dict[str, object]:
+    append_fields = {
+        "append_ref",
+        "predecessor_head_receipt_ref",
+        "predecessor_head_receipt_hash",
+        "proposal_ref",
+        "proposal_hash",
+        "proposal_receipt_ref",
+        "proposal_receipt_hash",
+    }
+    if (graph_generation == 0) != (rolling_append_source is None) or (
+        rolling_append_source is not None
+        and set(rolling_append_source) != append_fields
+    ):
+        raise OwnerConflict("target_measurement_graph_source_invalid")
+    if bool(protocol_parts) != (protocol_aggregation_proof is not None):
+        raise OwnerConflict("target_measurement_protocol_aggregation_invalid")
+    return {
+        "schema_ref": "meta-research/target-measurement-domain-authority/v1",
+        "plan_source": {
+            "stage_request_ref": stage_request_ref,
+            "formal_plan_ref": plan_binding.formal_plan_ref,
+            "plan_content_ref": plan_binding.content_ref,
+            "plan_document_hash": plan_binding.plan_document_hash,
+            "answer_contract_hash": plan_binding.answer_contract_hash,
+            "content_receipt": plan_binding.content_receipt.as_public_dict(),
+            "formal_plan_receipt": (
+                plan_binding.formal_plan_receipt.as_public_dict()
+            ),
+            "stage_commit_ref": plan_binding.stage_commit_ref,
+            "stage_commit_receipt": (
+                plan_binding.stage_commit_receipt.as_public_dict()
+            ),
+            "accepted_formal_plan_binding_hash": canonical_hash(
+                plan_binding.as_dict()
+            ),
+        },
+        "formal_plan_projection_digest": formal_plan_projection_digest,
+        "completion_contract": normalized_completion_contract_to_dict(
+            completion_contract
+        ),
+        "completion_contract_hash": completion_contract_hash(
+            completion_contract
+        ),
+        "graph": {
+            "graph_ref": target.graph_ref,
+            "generation": graph_generation,
+            "target_plan_hash": target_plan_hash,
+            "acceptance_receipt": graph_acceptance_receipt.as_public_dict(),
+            "rolling_append_source": rolling_append_source,
+        },
+        "target": {
+            "target_ref": target.target_ref,
+            "target_key": target.target_key,
+            "ordinal": target.ordinal,
+            "spec_hash": target.spec_hash,
+            "acceptance_receipt": target.receipt.as_public_dict(),
+            "spec_content_acceptance_ref": target_spec_acceptance_ref,
+            "spec_content_acceptance_receipt": (
+                target_spec_acceptance_receipt.as_public_dict()
+            ),
+        },
+        "measurement_contract": measurement_contract_to_dict(
+            measurement_contract
+        ),
+        "measurement_contract_hash": measurement_contract_hash(
+            measurement_contract
+        ),
+        "experiment_keys": list(measurement_contract.experiment_keys),
+        "measurement_unit_key": measurement_contract.measurement_unit_key,
+        "native_identities": identities.as_public_dict(),
+        "native_identity_set_hash": canonical_hash(identities.as_public_dict()),
+        "protocol_aggregation": (
+            None
+            if protocol_aggregation_proof is None
+            else {
+                "parts": projection_plain_value(protocol_parts),
+                "proof": projection_plain_value(protocol_aggregation_proof),
+            }
+        ),
+    }
+
+
+def _target_measurement_protocol_aggregation_facts(
+    *,
+    stage_request_ref: str,
+    accepted_formal_plan_binding_hash: str,
+    completion_contract_hash_value: str,
+    target: AcceptedTarget,
+    target_spec_acceptance_receipt: AcceptanceReceipt,
+    measurement_contract: TargetMeasurementContractCandidate,
+    protocol_version_ref: str,
+    aggregation_evidence_ref: str | None = None,
+    aggregation_receipt_ref: str | None = None,
+) -> tuple[
+    tuple[ProtocolPart, ...],
+    ProtocolAggregationProof | None,
+    dict[str, object] | None,
+    AcceptanceReceipt | None,
+]:
+    part_keys = measurement_contract.protocol_version.internal_part_keys
+    aggregation = measurement_contract.protocol_version.aggregation
+    if not part_keys:
+        if aggregation is not None:
+            raise OwnerConflict("target_measurement_protocol_aggregation_invalid")
+        return (), None, None, None
+    if aggregation is None:
+        raise OwnerConflict("target_measurement_protocol_aggregation_invalid")
+    evidence_ref = aggregation_evidence_ref or new_ref(
+        "target_measurement_protocol_aggregation"
+    )
+    receipt_ref = aggregation_receipt_ref or new_ref(
+        "rg_target_measurement_aggregation_receipt"
+    )
+    content = {
+        "schema_ref": "meta-research/target-measurement-protocol-aggregation/v1",
+        "stage_request_ref": stage_request_ref,
+        "accepted_formal_plan_binding_hash": accepted_formal_plan_binding_hash,
+        "completion_contract_hash": completion_contract_hash_value,
+        "target_ref": target.target_ref,
+        "target_spec_hash": target.spec_hash,
+        "target_spec_acceptance_receipt": (
+            target_spec_acceptance_receipt.as_public_dict()
+        ),
+        "measurement_contract_hash": measurement_contract_hash(
+            measurement_contract
+        ),
+        "protocol_version_ref": protocol_version_ref,
+        "part_keys": list(part_keys),
+        "aggregation_rule_ref": aggregation.rule_ref,
+        "aggregation_rule": aggregation.rule.as_dict(),
+    }
+    content_hash = canonical_hash(content)
+    aggregation_binding_hash = canonical_hash(
+        {
+            "protocol_version_ref": protocol_version_ref,
+            "part_keys": part_keys,
+            "aggregation_rule_ref": aggregation.rule_ref,
+        }
+    )
+    receipt = AcceptanceReceipt(
+        issuer=RG_OWNER,
+        kind=TARGET_MEASUREMENT_PROTOCOL_AGGREGATION_RECEIPT_KIND,
+        receipt_ref=receipt_ref,
+        subject_ref=aggregation_binding_hash,
+        payload_hash=_receipt_hash(
+            TARGET_MEASUREMENT_PROTOCOL_AGGREGATION_RECEIPT_KIND,
+            aggregation_binding_hash,
+            {
+                "aggregation_evidence_ref": evidence_ref,
+                "aggregation_content_hash": content_hash,
+                "aggregation": content,
+            },
+        ),
+    )
+    parts = tuple(
+        ProtocolPart(
+            part_key=part_key,
+            protocol_version_ref=protocol_version_ref,
+        )
+        for part_key in part_keys
+    )
+    proof = ProtocolAggregationProof(
+        protocol_version_ref=protocol_version_ref,
+        part_keys=part_keys,
+        aggregation_rule_ref=aggregation.rule_ref,
+        aggregation_evidence_binding=ContentBindingProof(
+            subject_ref=evidence_ref,
+            content_hash_ref=aggregation_binding_hash,
+        ),
+        aggregation_evidence_receipt=receipt_proof(
+            receipt,
+            subject_ref=aggregation_binding_hash,
+        ),
+    )
+    return parts, proof, content, receipt
+
+
+def _insert_target_with_measurement_authority(
+    connection,
+    *,
+    target: AcceptedTarget,
+    append_ref: str | None,
+    quest_ref: str,
+    target_plan_hash: str,
+    graph_generation: int,
+    graph_acceptance_receipt: AcceptanceReceipt,
+    rolling_append_source: dict[str, str] | None,
+    stage_request_ref: str,
+    plan_binding: AcceptedFormalPlanBinding,
+    completion_contract: NormalizedCompletionContract,
+    formal_candidate: FormalTargetCandidate,
+    accepted_at: float,
+) -> dict[str, int]:
+    """Atomically insert a Target, its spec receipt, and pure domain roles."""
+
+    if (
+        target.spec_hash != canonical_hash(target.spec)
+        or target.target_key != formal_candidate.candidate.local_label
+        or formal_candidate.measurement_contract.experiment_keys
+        != formal_candidate.candidate.experiment_keys
+        or formal_candidate.measurement_contract.measurement_unit_key
+        != formal_candidate.candidate.measurement_unit_keys[0]
+    ):
+        raise OwnerConflict("target_measurement_contract_binding_invalid")
+    connection.execute(
+        text(
+            "INSERT INTO rg_targets (target_ref, graph_ref, target_key, ordinal, "
+            "spec_json, spec_hash, dependency_refs_json, dependency_refs_hash, "
+            "receipt_ref, receipt_hash, accepted_at, append_ref) VALUES "
+            "(:target_ref, :graph_ref, :target_key, :ordinal, :spec_json, "
+            ":spec_hash, :dependency_refs_json, :dependency_refs_hash, "
+            ":receipt_ref, :receipt_hash, :accepted_at, :append_ref)"
+        ),
+        {
+            "target_ref": target.target_ref,
+            "graph_ref": target.graph_ref,
+            "target_key": target.target_key,
+            "ordinal": target.ordinal,
+            "spec_json": canonical_json(target.spec),
+            "spec_hash": target.spec_hash,
+            "dependency_refs_json": canonical_json(list(target.dependency_refs)),
+            "dependency_refs_hash": canonical_hash(list(target.dependency_refs)),
+            "receipt_ref": target.receipt.receipt_ref,
+            "receipt_hash": target.receipt.payload_hash,
+            "accepted_at": accepted_at,
+            "append_ref": append_ref,
+        },
+    )
+    target_spec_acceptance_ref, target_spec_acceptance_receipt = (
+        _insert_target_spec_acceptance(
+        connection,
+        target_ref=target.target_ref,
+        graph_ref=target.graph_ref,
+        spec_hash=target.spec_hash,
+        target_receipt_ref=target.receipt.receipt_ref,
+        target_receipt_hash=target.receipt.payload_hash,
+        accepted_at=accepted_at,
+        )
+    )
+
+    contract = formal_candidate.measurement_contract
+    contract_document = measurement_contract_to_dict(contract)
+    forward = contract.baseline_forward_contract.as_dict()
+    recipe = contract.variant_recipe.as_dict()
+    lineage = contract.evaluation_protocol_lineage.as_dict()
+    protocol = cast(dict[str, object], contract_document["protocol_version"])
+    required_metric_keys = list(contract.protocol_version.required_metric_keys)
+    baseline_ref, baseline_created = _get_or_create_target_measurement_identity(
+        connection,
+        table="rg_experiment_baselines",
+        ref_column="baseline_ref",
+        ref_prefix="baseline",
+        natural={"forward_contract_hash": canonical_hash(forward)},
+        immutable={"forward_contract_json": canonical_json(forward)},
+        insert_only={"quest_ref": quest_ref, "accepted_at": accepted_at},
+    )
+    variant_ref, variant_created = _get_or_create_target_measurement_identity(
+        connection,
+        table="rg_experiment_variants",
+        ref_column="variant_ref",
+        ref_prefix="variant",
+        natural={
+            "baseline_ref": baseline_ref,
+            "recipe_hash": canonical_hash(recipe),
+        },
+        immutable={"recipe_json": canonical_json(recipe)},
+        insert_only={"accepted_at": accepted_at},
+    )
+    evaluation_protocol_ref, evaluation_protocol_created = (
+        _get_or_create_target_measurement_identity(
+            connection,
+            table="rg_evaluation_protocols",
+            ref_column="evaluation_protocol_ref",
+            ref_prefix="evaluation_protocol",
+            natural={"lineage_hash": canonical_hash(lineage)},
+            immutable={"lineage_json": canonical_json(lineage)},
+            insert_only={"quest_ref": quest_ref, "accepted_at": accepted_at},
+        )
+    )
+    protocol_version_ref, protocol_version_created = (
+        _get_or_create_target_measurement_identity(
+            connection,
+            table="rg_protocol_versions",
+            ref_column="protocol_version_ref",
+            ref_prefix="protocol_version",
+            natural={
+                "evaluation_protocol_ref": evaluation_protocol_ref,
+                "protocol_hash": canonical_hash(protocol),
+            },
+            immutable={
+                "protocol_json": canonical_json(protocol),
+                "required_metrics_json": canonical_json(required_metric_keys),
+                "required_metrics_hash": canonical_hash(required_metric_keys),
+            },
+            insert_only={"accepted_at": accepted_at},
+        )
+    )
+    evaluation_ref, evaluation_created = _get_or_create_target_measurement_identity(
+        connection,
+        table="rg_evaluations",
+        ref_column="evaluation_ref",
+        ref_prefix="evaluation",
+        natural={
+            "variant_ref": variant_ref,
+            "protocol_version_ref": protocol_version_ref,
+        },
+        immutable={},
+        insert_only={"accepted_at": accepted_at},
+    )
+    identities = TargetMeasurementDomainIdentities(
+        baseline_ref=baseline_ref,
+        variant_ref=variant_ref,
+        evaluation_protocol_ref=evaluation_protocol_ref,
+        protocol_version_ref=protocol_version_ref,
+        evaluation_ref=evaluation_ref,
+    )
+    projection_digest = _canonical_formal_plan_projection_digest(
+        formal_plan_ref=plan_binding.formal_plan_ref,
+        completion_contract=completion_contract,
+    )
+    (
+        protocol_parts,
+        protocol_aggregation_proof,
+        aggregation_content,
+        aggregation_receipt,
+    ) = _target_measurement_protocol_aggregation_facts(
+        stage_request_ref=stage_request_ref,
+        accepted_formal_plan_binding_hash=canonical_hash(plan_binding.as_dict()),
+        completion_contract_hash_value=completion_contract_hash(
+            completion_contract
+        ),
+        target=target,
+        target_spec_acceptance_receipt=target_spec_acceptance_receipt,
+        measurement_contract=contract,
+        protocol_version_ref=identities.protocol_version_ref,
+    )
+    aggregation_evidence_ref = (
+        None
+        if protocol_aggregation_proof is None
+        else protocol_aggregation_proof.aggregation_evidence_binding.subject_ref
+    )
+    aggregation_content_hash = (
+        None if aggregation_content is None else canonical_hash(aggregation_content)
+    )
+    part_keys = contract.protocol_version.internal_part_keys
+    authority_payload = _target_measurement_authority_payload(
+        target=target,
+        target_plan_hash=target_plan_hash,
+        graph_generation=graph_generation,
+        graph_acceptance_receipt=graph_acceptance_receipt,
+        rolling_append_source=rolling_append_source,
+        stage_request_ref=stage_request_ref,
+        plan_binding=plan_binding,
+        completion_contract=completion_contract,
+        formal_plan_projection_digest=projection_digest,
+        measurement_contract=contract,
+        identities=identities,
+        target_spec_acceptance_ref=target_spec_acceptance_ref,
+        target_spec_acceptance_receipt=target_spec_acceptance_receipt,
+        protocol_parts=protocol_parts,
+        protocol_aggregation_proof=protocol_aggregation_proof,
+    )
+    authority_hash = canonical_hash(authority_payload)
+    authority_ref = new_ref("target_measurement_domain_authority")
+    receipt_ref = new_ref("rg_target_measurement_domain_receipt")
+    receipt_hash = _receipt_hash(
+        TARGET_MEASUREMENT_DOMAIN_AUTHORITY_RECEIPT_KIND,
+        authority_hash,
+        {"authority_ref": authority_ref, "authority": authority_payload},
+    )
+    completion_document = normalized_completion_contract_to_dict(
+        completion_contract
+    )
+    experiment_keys = list(contract.experiment_keys)
+    identity_document = identities.as_public_dict()
+    connection.execute(
+        text(
+            "INSERT INTO rg_target_measurement_domain_authorities "
+            "(authority_ref, authority_hash, target_ref, graph_ref, "
+            "graph_generation, graph_acceptance_receipt_ref, "
+            "graph_acceptance_receipt_hash, append_ref, "
+            "predecessor_head_receipt_ref, predecessor_head_receipt_hash, "
+            "proposal_ref, proposal_hash, proposal_receipt_ref, "
+            "proposal_receipt_hash, formal_plan_ref, stage_request_ref, "
+            "plan_content_ref, plan_document_hash, answer_contract_hash, "
+            "accepted_formal_plan_binding_hash, plan_content_receipt_ref, "
+            "plan_content_receipt_hash, formal_plan_receipt_ref, "
+            "formal_plan_receipt_hash, stage_commit_ref, "
+            "stage_commit_receipt_ref, stage_commit_receipt_hash, "
+            "completion_contract_json, completion_contract_hash, "
+            "formal_plan_projection_digest, target_plan_hash, target_key, "
+            "target_ordinal, target_spec_hash, target_receipt_ref, "
+            "target_receipt_hash, target_spec_acceptance_ref, "
+            "target_spec_receipt_ref, target_spec_receipt_hash, "
+            "measurement_contract_json, "
+            "measurement_contract_hash, experiment_keys_json, "
+            "experiment_keys_hash, measurement_unit_key, baseline_ref, "
+            "variant_ref, evaluation_protocol_ref, protocol_version_ref, "
+            "evaluation_ref, native_identity_set_hash, "
+            "aggregation_evidence_ref, aggregation_content_json, "
+            "aggregation_content_hash, aggregation_part_keys_json, "
+            "aggregation_part_keys_hash, aggregation_rule_ref, "
+            "aggregation_receipt_ref, aggregation_receipt_hash, receipt_ref, "
+            "receipt_hash, accepted_at) VALUES (:authority_ref, "
+            ":authority_hash, :target_ref, :graph_ref, :graph_generation, "
+            ":graph_acceptance_receipt_ref, :graph_acceptance_receipt_hash, "
+            ":append_ref, :predecessor_head_receipt_ref, "
+            ":predecessor_head_receipt_hash, :proposal_ref, :proposal_hash, "
+            ":proposal_receipt_ref, :proposal_receipt_hash, "
+            ":formal_plan_ref, :stage_request_ref, :plan_content_ref, "
+            ":plan_document_hash, :answer_contract_hash, "
+            ":accepted_formal_plan_binding_hash, :plan_content_receipt_ref, "
+            ":plan_content_receipt_hash, :formal_plan_receipt_ref, "
+            ":formal_plan_receipt_hash, :stage_commit_ref, "
+            ":stage_commit_receipt_ref, :stage_commit_receipt_hash, "
+            ":completion_contract_json, :completion_contract_hash, "
+            ":formal_plan_projection_digest, :target_plan_hash, :target_key, "
+            ":target_ordinal, :target_spec_hash, :target_receipt_ref, "
+            ":target_receipt_hash, :target_spec_acceptance_ref, "
+            ":target_spec_receipt_ref, :target_spec_receipt_hash, "
+            ":measurement_contract_json, "
+            ":measurement_contract_hash, :experiment_keys_json, "
+            ":experiment_keys_hash, :measurement_unit_key, :baseline_ref, "
+            ":variant_ref, :evaluation_protocol_ref, :protocol_version_ref, "
+            ":evaluation_ref, :native_identity_set_hash, "
+            ":aggregation_evidence_ref, :aggregation_content_json, "
+            ":aggregation_content_hash, :aggregation_part_keys_json, "
+            ":aggregation_part_keys_hash, :aggregation_rule_ref, "
+            ":aggregation_receipt_ref, :aggregation_receipt_hash, :receipt_ref, "
+            ":receipt_hash, :accepted_at)"
+        ),
+        {
+            "authority_ref": authority_ref,
+            "authority_hash": authority_hash,
+            "target_ref": target.target_ref,
+            "graph_ref": target.graph_ref,
+            "graph_generation": graph_generation,
+            "graph_acceptance_receipt_ref": (
+                graph_acceptance_receipt.receipt_ref
+            ),
+            "graph_acceptance_receipt_hash": (
+                graph_acceptance_receipt.payload_hash
+            ),
+            "append_ref": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["append_ref"]
+            ),
+            "predecessor_head_receipt_ref": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["predecessor_head_receipt_ref"]
+            ),
+            "predecessor_head_receipt_hash": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["predecessor_head_receipt_hash"]
+            ),
+            "proposal_ref": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["proposal_ref"]
+            ),
+            "proposal_hash": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["proposal_hash"]
+            ),
+            "proposal_receipt_ref": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["proposal_receipt_ref"]
+            ),
+            "proposal_receipt_hash": (
+                None
+                if rolling_append_source is None
+                else rolling_append_source["proposal_receipt_hash"]
+            ),
+            "formal_plan_ref": plan_binding.formal_plan_ref,
+            "stage_request_ref": stage_request_ref,
+            "plan_content_ref": plan_binding.content_ref,
+            "plan_document_hash": plan_binding.plan_document_hash,
+            "answer_contract_hash": plan_binding.answer_contract_hash,
+            "accepted_formal_plan_binding_hash": canonical_hash(
+                plan_binding.as_dict()
+            ),
+            "plan_content_receipt_ref": (
+                plan_binding.content_receipt.receipt_ref
+            ),
+            "plan_content_receipt_hash": (
+                plan_binding.content_receipt.payload_hash
+            ),
+            "formal_plan_receipt_ref": (
+                plan_binding.formal_plan_receipt.receipt_ref
+            ),
+            "formal_plan_receipt_hash": (
+                plan_binding.formal_plan_receipt.payload_hash
+            ),
+            "stage_commit_ref": plan_binding.stage_commit_ref,
+            "stage_commit_receipt_ref": (
+                plan_binding.stage_commit_receipt.receipt_ref
+            ),
+            "stage_commit_receipt_hash": (
+                plan_binding.stage_commit_receipt.payload_hash
+            ),
+            "completion_contract_json": canonical_json(completion_document),
+            "completion_contract_hash": completion_contract_hash(
+                completion_contract
+            ),
+            "formal_plan_projection_digest": projection_digest,
+            "target_plan_hash": target_plan_hash,
+            "target_key": target.target_key,
+            "target_ordinal": target.ordinal,
+            "target_spec_hash": target.spec_hash,
+            "target_receipt_ref": target.receipt.receipt_ref,
+            "target_receipt_hash": target.receipt.payload_hash,
+            "target_spec_acceptance_ref": target_spec_acceptance_ref,
+            "target_spec_receipt_ref": (
+                target_spec_acceptance_receipt.receipt_ref
+            ),
+            "target_spec_receipt_hash": (
+                target_spec_acceptance_receipt.payload_hash
+            ),
+            "measurement_contract_json": canonical_json(contract_document),
+            "measurement_contract_hash": measurement_contract_hash(contract),
+            "experiment_keys_json": canonical_json(experiment_keys),
+            "experiment_keys_hash": canonical_hash(experiment_keys),
+            "measurement_unit_key": contract.measurement_unit_key,
+            **identity_document,
+            "native_identity_set_hash": canonical_hash(identity_document),
+            "aggregation_evidence_ref": aggregation_evidence_ref,
+            "aggregation_content_json": (
+                None
+                if aggregation_content is None
+                else canonical_json(aggregation_content)
+            ),
+            "aggregation_content_hash": aggregation_content_hash,
+            "aggregation_part_keys_json": (
+                None if not part_keys else canonical_json(list(part_keys))
+            ),
+            "aggregation_part_keys_hash": (
+                None if not part_keys else canonical_hash(list(part_keys))
+            ),
+            "aggregation_rule_ref": (
+                None
+                if contract.protocol_version.aggregation is None
+                else contract.protocol_version.aggregation.rule_ref
+            ),
+            "aggregation_receipt_ref": (
+                None if aggregation_receipt is None else aggregation_receipt.receipt_ref
+            ),
+            "aggregation_receipt_hash": (
+                None if aggregation_receipt is None else aggregation_receipt.payload_hash
+            ),
+            "receipt_ref": receipt_ref,
+            "receipt_hash": receipt_hash,
+            "accepted_at": accepted_at,
+        },
+    )
+    return {
+        "baseline_count": int(baseline_created),
+        "variant_count": int(variant_created),
+        "evaluation_protocol_count": int(evaluation_protocol_created),
+        "protocol_version_count": int(protocol_version_created),
+        "evaluation_count": int(evaluation_created),
+        "authority_count": 1,
+    }
 
 
 def _asset_role_bindings(row) -> dict[str, object]:
@@ -8667,6 +16508,69 @@ def _formal_plan_decision(row) -> FormalPlanDecision:
     )
 
 
+def _formal_plan_content_acceptance_bindings(row) -> dict[str, object]:
+    return {
+        "acceptance_ref": row.acceptance_ref,
+        "formal_plan_ref": row.formal_plan_ref,
+        "decision_ref": row.decision_ref,
+        "request_ref": row.request_ref,
+        "submission_ref": row.submission_ref,
+        "plan_content_ref": row.plan_content_ref,
+        "plan_document_hash": row.plan_document_hash,
+        "plan_content_receipt_ref": row.plan_content_receipt_ref,
+        "plan_content_receipt_hash": row.plan_content_receipt_hash,
+        "formal_plan_receipt_ref": row.formal_plan_receipt_ref,
+        "formal_plan_receipt_hash": row.formal_plan_receipt_hash,
+    }
+
+
+def _formal_plan_content_acceptance_receipt_hash(row) -> str:
+    return _receipt_hash(
+        FORMAL_PLAN_CONTENT_ACCEPTED_RECEIPT_KIND,
+        row.plan_document_hash,
+        _formal_plan_content_acceptance_bindings(row),
+    )
+
+
+def _formal_plan_content_acceptance(row) -> AcceptedFormalPlanContent:
+    if (
+        row.receipt_hash != _formal_plan_content_acceptance_receipt_hash(row)
+        or not row.formal_plan_ref
+        or not row.plan_document_hash
+    ):
+        raise OwnerConflict("formal_plan_content_receipt_invalid")
+    return AcceptedFormalPlanContent(
+        acceptance_ref=row.acceptance_ref,
+        formal_plan_ref=row.formal_plan_ref,
+        decision_ref=row.decision_ref,
+        request_ref=row.request_ref,
+        submission_ref=row.submission_ref,
+        plan_content_ref=row.plan_content_ref,
+        plan_document_hash=row.plan_document_hash,
+        plan_content_receipt=AcceptanceReceipt(
+            issuer="research_memory",
+            kind="plan_document_content_acceptance",
+            receipt_ref=row.plan_content_receipt_ref,
+            subject_ref=row.plan_content_ref,
+            payload_hash=row.plan_content_receipt_hash,
+        ),
+        formal_plan_receipt=AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=FORMAL_PLAN_ACCEPTED_RECEIPT_KIND,
+            receipt_ref=row.formal_plan_receipt_ref,
+            subject_ref=row.formal_plan_ref,
+            payload_hash=row.formal_plan_receipt_hash,
+        ),
+        receipt=AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=FORMAL_PLAN_CONTENT_ACCEPTED_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.plan_document_hash,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
 def _target_graph_bindings(row) -> dict[str, object]:
     return {
         "request_ref": row.request_ref,
@@ -8687,6 +16591,180 @@ def _target_graph_bindings(row) -> dict[str, object]:
     }
 
 
+def _formal_target_plan_state(
+    target_plan: dict[str, object],
+    plan_document: dict[str, object],
+) -> tuple[NormalizedCompletionContract, RollingStrategyState]:
+    completion_value = target_plan.get("completion_contract")
+    update_value = target_plan.get("initial_strategy_update")
+    if not isinstance(completion_value, dict) or not isinstance(update_value, dict):
+        raise OwnerConflict("target_plan_formal_contract_invalid")
+    try:
+        completion = normalized_completion_contract_from_dict(
+            completion_value,
+            plan_document=plan_document,
+        )
+        update = strategy_update_from_dict(
+            update_value,
+            completion_contract=completion,
+        )
+        if (
+            update.update.revision != 1
+            or update.update.requires_accepted_labels
+            or not update.candidates
+        ):
+            raise BundleTargetContractError("initial_strategy_update_invalid")
+        state = apply_strategy_update(
+            start_rolling_strategy(completion),
+            update,
+            completion_contract=completion,
+        )
+    except BundleTargetContractError as error:
+        raise OwnerConflict(str(error)) from error
+    return completion, state
+
+
+def _formal_target_key(spec: dict[str, object]) -> str:
+    candidate = spec.get("candidate")
+    local_label = (
+        candidate.get("local_label") if isinstance(candidate, dict) else None
+    )
+    if not isinstance(local_label, str) or not local_label:
+        raise OwnerConflict("target_integrity_invalid")
+    return local_label
+
+
+def _formal_target_dependencies(spec: dict[str, object]) -> tuple[str, ...]:
+    candidate = spec.get("candidate")
+    dependencies = (
+        candidate.get("depends_on_labels") if isinstance(candidate, dict) else None
+    )
+    if not isinstance(dependencies, list) or any(
+        not isinstance(label, str) or not label for label in dependencies
+    ):
+        raise OwnerConflict("target_integrity_invalid")
+    return tuple(cast(list[str], dependencies))
+
+
+def _acquire_research_graph_writer_lock(connection) -> None:
+    """Acquire SQLite's writer lock without changing RG observable state."""
+
+    locked = connection.execute(
+        text(
+            "UPDATE research_graph_state SET revision = revision WHERE "
+            "singleton = 'owner'"
+        )
+    )
+    if locked.rowcount != 1:
+        raise OwnerConflict("research_graph_state_missing")
+
+
+def _cas_current_bundle_inbox_operation_checkpoint(
+    connection,
+    *,
+    operation_kind: str,
+    operation_ref: str,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+) -> None:
+    """Acquire the writer lock only while the bound Inbox head is current."""
+
+    updated = connection.execute(
+        text(
+            "UPDATE ar_bundle_inbox_scopes SET current_checkpoint_ref = "
+            "current_checkpoint_ref WHERE run_ref = :run_ref AND "
+            "wake_pending = 0 AND acknowledged_cursor = next_sequence - 1 AND "
+            "current_checkpoint_ref IS NOT NULL AND EXISTS (SELECT 1 FROM "
+            "ar_bundle_inbox_operation_checkpoints bindings JOIN "
+            "ar_bundle_inbox_checkpoints checkpoints ON "
+            "checkpoints.checkpoint_ref = bindings.checkpoint_ref WHERE "
+            "bindings.operation_kind = :operation_kind AND "
+            "bindings.operation_ref = :operation_ref AND "
+            "bindings.checkpoint_ref = current_checkpoint_ref AND "
+            "bindings.checkpoint_hash = checkpoints.checkpoint_hash AND "
+            "checkpoints.run_ref = :run_ref AND checkpoints.attempt_ref = "
+            ":attempt_ref AND checkpoints.fence_ref = :fence_ref AND "
+            "checkpoints.cursor = acknowledged_cursor AND "
+            "checkpoints.generation = generation)"
+        ),
+        {
+            "operation_kind": operation_kind,
+            "operation_ref": operation_ref,
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "fence_ref": fence_ref,
+        },
+    )
+    if updated.rowcount != 1:
+        raise OwnerConflict("bundle_inbox_operation_checkpoint_stale")
+
+
+def _verify_target_candidate_owner_proofs(
+    candidate: FormalTargetCandidate,
+    verifier: TargetCandidateOwnerProofVerifier | None,
+) -> None:
+    if verifier is None:
+        raise OwnerConflict("target_candidate_owner_proof_unverified")
+    try:
+        for decision in candidate.candidate.reuse_trace.tier_decisions:
+            for source in decision.source_proofs:
+                verifier.verify_reuse_source_receipt(
+                    tier=decision.tier,
+                    source_ref=source.source_ref,
+                    exact_version_ref=source.exact_version_ref,
+                    implementation_revision_ref=(
+                        source.implementation_revision_ref
+                    ),
+                    license_ref=source.license_ref,
+                    source_content_hash_ref=source.content_hash_ref,
+                    patch_ref=source.patch_ref,
+                    receipt=source.verification_receipt,
+                )
+                verifier.verify_reuse_content_receipt(
+                    tier=decision.tier,
+                    source_ref=source.source_ref,
+                    exact_version_ref=source.exact_version_ref,
+                    implementation_revision_ref=(
+                        source.implementation_revision_ref
+                    ),
+                    license_ref=source.license_ref,
+                    source_content_hash_ref=source.content_hash_ref,
+                    patch_ref=source.patch_ref,
+                    binding=source.implementation_binding,
+                    receipt=source.implementation_acceptance_receipt,
+                )
+                if (
+                    source.eligibility_anchor_ref is not None
+                    or source.eligibility_binding is not None
+                    or source.eligibility_receipt is not None
+                ):
+                    if (
+                        source.eligibility_anchor_ref is None
+                        or source.eligibility_binding is None
+                        or source.eligibility_receipt is None
+                    ):
+                        raise OwnerConflict(
+                            "target_candidate_owner_proof_unverified"
+                        )
+                    verifier.verify_reuse_eligibility_receipt(
+                        tier=decision.tier,
+                        source_ref=source.source_ref,
+                        exact_version_ref=source.exact_version_ref,
+                        implementation_revision_ref=(
+                            source.implementation_revision_ref
+                        ),
+                        implementation_content_hash_ref=(
+                            source.implementation_binding.content_hash_ref
+                        ),
+                        eligibility_anchor_ref=source.eligibility_anchor_ref,
+                        binding=source.eligibility_binding,
+                        receipt=source.eligibility_receipt,
+                    )
+    except (AttributeError, TypeError, ValueError, OwnerConflict) as error:
+        raise OwnerConflict("target_candidate_owner_proof_unverified") from error
+
+
 def _accepted_target(row) -> AcceptedTarget:
     try:
         spec = decoded_object(row.spec_json)
@@ -8705,8 +16783,11 @@ def _accepted_target(row) -> AcceptedTarget:
         "spec_hash": row.spec_hash,
         "dependency_refs_hash": row.dependency_refs_hash,
     }
+    append_ref = getattr(row, "append_ref", None)
+    if append_ref is not None:
+        bindings["append_ref"] = append_ref
     if (
-        spec.get("target_key") != row.target_key
+        _formal_target_key(spec) != row.target_key
         or canonical_json(spec) != row.spec_json
         or canonical_hash(spec) != row.spec_hash
         or canonical_json(list(dependencies)) != row.dependency_refs_json
@@ -8733,20 +16814,48 @@ def _accepted_target(row) -> AcceptedTarget:
     )
 
 
-def _accepted_target_graph(row, target_rows) -> AcceptedTargetGraph:
+def _accepted_target_graph(
+    row,
+    target_rows,
+    append_rows=(),
+    plan_document: dict[str, object] | None = None,
+) -> AcceptedTargetGraph:
+    if plan_document is None:
+        raise OwnerConflict("target_graph_integrity_invalid")
     try:
         target_plan = decoded_object(row.target_plan_json)
-    except (TypeError, ValueError) as error:
+        validate_target_plan(
+            target_plan,
+            formal_plan_ref=row.formal_plan_ref,
+            context_pack_ref=row.context_pack_ref,
+            context_pack_hash=row.context_pack_hash,
+            plan_document=plan_document,
+        )
+        completion, root_state = _formal_target_plan_state(
+            target_plan,
+            plan_document,
+        )
+        update_value = target_plan["initial_strategy_update"]
+        if not isinstance(update_value, dict):
+            raise TypeError("initial strategy update")
+        target_values = update_value["candidates"]
+        if not isinstance(target_values, list):
+            raise TypeError("initial candidates")
+    except (TypeError, ValueError, BundleContractError, OwnerConflict) as error:
         raise OwnerConflict("target_graph_integrity_invalid") from error
     targets = tuple(_accepted_target(target_row) for target_row in target_rows)
-    target_values = target_plan.get("targets")
+    initial_targets = tuple(
+        target
+        for target, target_row in zip(targets, target_rows)
+        if getattr(target_row, "append_ref", None) is None
+    )
     if (
         canonical_json(target_plan) != row.target_plan_json
         or canonical_hash(target_plan) != row.target_plan_hash
-        or not isinstance(target_values, list)
-        or len(target_values) != len(targets)
+        or len(target_values) != len(initial_targets)
         or any(
-            target.spec != target_values[index] for index, target in enumerate(targets)
+            target.spec != target_values[index]
+            for index, target in enumerate(initial_targets)
         )
         or row.receipt_hash
         != _receipt_hash(
@@ -8756,6 +16865,23 @@ def _accepted_target_graph(row, target_rows) -> AcceptedTargetGraph:
         )
     ):
         raise OwnerConflict("target_graph_integrity_invalid")
+    root_receipt = AcceptanceReceipt(
+        issuer=RG_OWNER,
+        kind=TARGET_GRAPH_RECEIPT_KIND,
+        receipt_ref=row.receipt_ref,
+        subject_ref=row.graph_ref,
+        payload_hash=row.receipt_hash,
+    )
+    head = _target_graph_head(
+        graph_row=row,
+        target_plan=target_plan,
+        targets=targets,
+        target_rows=target_rows,
+        append_rows=append_rows,
+        root_receipt=root_receipt,
+        completion_contract=completion,
+        root_state=root_state,
+    )
     return AcceptedTargetGraph(
         graph_ref=row.graph_ref,
         request_ref=row.request_ref,
@@ -8779,15 +16905,319 @@ def _accepted_target_graph(row, target_rows) -> AcceptedTargetGraph:
             subject_ref=row.submission_ref,
             payload_hash=row.execution_receipt_hash,
         ),
-        receipt=AcceptanceReceipt(
-            issuer=RG_OWNER,
-            kind=TARGET_GRAPH_RECEIPT_KIND,
-            receipt_ref=row.receipt_ref,
-            subject_ref=row.graph_ref,
-            payload_hash=row.receipt_hash,
-        ),
+        receipt=root_receipt,
+        head_generation=head.generation,
+        strategy_complete=head.strategy_complete,
+        target_set_hash=head.target_set_hash,
+        coverage_hash=head.coverage_hash,
+        head_receipt=head.receipt,
         targets=targets,
     )
+
+
+def _target_graph_rejection(row) -> TargetGraphRejection:
+    try:
+        target_plan = decoded_object(row.target_plan_json)
+        feedback_value = json.loads(row.feedback_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("target_graph_rejection_integrity_invalid") from error
+    if (
+        not isinstance(feedback_value, list)
+        or not feedback_value
+        or any(not isinstance(item, str) or not item for item in feedback_value)
+    ):
+        raise OwnerConflict("target_graph_rejection_integrity_invalid")
+    feedback = tuple(cast(list[str], feedback_value))
+    bindings = _target_graph_rejection_bindings(row, feedback)
+    if (
+        canonical_json(target_plan) != row.target_plan_json
+        or canonical_hash(target_plan) != row.target_plan_hash
+        or canonical_json(list(feedback)) != row.feedback_json
+        or canonical_hash(list(feedback)) != row.feedback_hash
+        or row.reason_code != "target_candidate_owner_proof_unverified"
+        or row.receipt_hash
+        != _receipt_hash(
+            TARGET_GRAPH_REJECTED_RECEIPT_KIND,
+            row.submission_ref,
+            bindings,
+        )
+    ):
+        raise OwnerConflict("target_graph_rejection_integrity_invalid")
+    return TargetGraphRejection(
+        rejection_ref=row.rejection_ref,
+        request_ref=row.request_ref,
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        submission_ref=row.submission_ref,
+        context_pack_ref=row.context_pack_ref,
+        context_pack_hash=row.context_pack_hash,
+        formal_plan_ref=row.formal_plan_ref,
+        plan_document_hash=row.plan_document_hash,
+        target_plan=target_plan,
+        target_plan_hash=row.target_plan_hash,
+        execution_payload_hash=row.execution_payload_hash,
+        execution_receipt=AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind="bundle_attempt_execution",
+            receipt_ref=row.execution_receipt_ref,
+            subject_ref=row.submission_ref,
+            payload_hash=row.execution_receipt_hash,
+        ),
+        reason_code=row.reason_code,
+        feedback=feedback,
+        receipt=AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=TARGET_GRAPH_REJECTED_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.submission_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
+def _target_graph_rejection_bindings(
+    row, feedback: tuple[str, ...]
+) -> dict[str, object]:
+    return {
+        "rejection_ref": row.rejection_ref,
+        "request_ref": row.request_ref,
+        "run_ref": row.run_ref,
+        "attempt_ref": row.attempt_ref,
+        "fence_ref": row.fence_ref,
+        "submission_ref": row.submission_ref,
+        "context_pack_ref": row.context_pack_ref,
+        "context_pack_hash": row.context_pack_hash,
+        "formal_plan_ref": row.formal_plan_ref,
+        "plan_document_hash": row.plan_document_hash,
+        "target_plan_hash": row.target_plan_hash,
+        "execution_payload_hash": row.execution_payload_hash,
+        "execution_receipt_ref": row.execution_receipt_ref,
+        "execution_receipt_hash": row.execution_receipt_hash,
+        "reason_code": row.reason_code,
+        "feedback": list(feedback),
+        "feedback_hash": row.feedback_hash,
+    }
+
+
+def _target_graph_head(
+    *,
+    graph_row,
+    target_plan: dict[str, object],
+    targets: tuple[AcceptedTarget, ...],
+    target_rows,
+    append_rows,
+    root_receipt: AcceptanceReceipt,
+    completion_contract: NormalizedCompletionContract,
+    root_state: RollingStrategyState,
+) -> TargetGraphHead:
+    target_by_ref = {target.target_ref: target for target in targets}
+    row_by_ref = {target_row.target_ref: target_row for target_row in target_rows}
+    root_targets = tuple(
+        target
+        for target in targets
+        if getattr(row_by_ref[target.target_ref], "append_ref", None) is None
+    )
+    current_targets = list(root_targets)
+    state = root_state
+    target_set_hash = _target_set_hash(tuple(current_targets))
+    coverage_hash = _rolling_strategy_hash(state, completion_contract)
+    head = TargetGraphHead(
+        graph_ref=graph_row.graph_ref,
+        generation=0,
+        strategy_complete=state.strategy.strategy_complete,
+        target_set_hash=target_set_hash,
+        coverage_hash=coverage_hash,
+        receipt=root_receipt,
+    )
+    for expected_generation, append_row in enumerate(append_rows, start=1):
+        try:
+            target_refs_value = json.loads(append_row.target_refs_json)
+            proposal = decoded_object(append_row.proposal_json)
+            validated_proposal_hash = validate_target_graph_append_proposal(proposal)
+            update_value = proposal["strategy_update"]
+            update = strategy_update_from_dict(
+                update_value,
+                completion_contract=completion_contract,
+            )
+            if not isinstance(update_value, dict):
+                raise TypeError("strategy update")
+            update_candidate_values = update_value["candidates"]
+            if not isinstance(update_candidate_values, list):
+                raise TypeError("strategy candidates")
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            BundleContractError,
+            BundleTargetContractError,
+        ) as error:
+            raise OwnerConflict("target_graph_append_integrity_invalid") from error
+        if not isinstance(target_refs_value, list) or any(
+            not isinstance(value, str) or value not in target_by_ref
+            for value in target_refs_value
+        ):
+            raise OwnerConflict("target_graph_append_integrity_invalid")
+        target_refs = tuple(cast(list[str], target_refs_value))
+        appended_targets = tuple(target_by_ref[value] for value in target_refs)
+        expected_ordinals = tuple(
+            range(len(current_targets), len(current_targets) + len(target_refs))
+        )
+        if (
+            int(append_row.generation) != expected_generation
+            or append_row.graph_ref != graph_row.graph_ref
+            or append_row.predecessor_head_receipt_ref
+            != head.receipt.receipt_ref
+            or append_row.predecessor_head_receipt_hash
+            != head.receipt.payload_hash
+            or head.strategy_complete
+            or validated_proposal_hash != append_row.proposal_hash
+            or proposal.get("graph_ref") != graph_row.graph_ref
+            or proposal.get("base_generation") != expected_generation - 1
+            or proposal.get("base_head_receipt")
+            != head.receipt.as_public_dict()
+            or update.update.revision != state.strategy.revision + 1
+            or len(target_refs) != len(set(target_refs))
+            or len(target_refs) != len(update.candidates)
+            or canonical_json(list(target_refs)) != append_row.target_refs_json
+            or tuple(target.ordinal for target in appended_targets)
+            != expected_ordinals
+            or any(
+                target.spec != update_candidate_values[index]
+                for index, target in enumerate(appended_targets)
+            )
+            or any(
+                getattr(row_by_ref[target.target_ref], "append_ref", None)
+                != append_row.append_ref
+                for target in appended_targets
+            )
+        ):
+            raise OwnerConflict("target_graph_append_integrity_invalid")
+        try:
+            state = apply_strategy_update(
+                state,
+                update,
+                completion_contract=completion_contract,
+                # Admission proves these labels were committed at the CAS.  A
+                # durable replay still verifies they name an existing prefix
+                # and that every new candidate depends on them.
+                accepted_labels=frozenset(
+                    update.update.requires_accepted_labels
+                ),
+            )
+        except BundleTargetContractError as error:
+            raise OwnerConflict("target_graph_append_integrity_invalid") from error
+        current_targets.extend(appended_targets)
+        current = tuple(sorted(current_targets, key=lambda value: value.ordinal))
+        target_set_hash = _target_set_hash(current)
+        coverage_hash = _rolling_strategy_hash(state, completion_contract)
+        strategy_complete = state.strategy.strategy_complete
+        bindings = _target_graph_append_bindings(append_row, target_refs)
+        if (
+            append_row.target_set_hash != target_set_hash
+            or append_row.coverage_hash != coverage_hash
+            or bool(append_row.strategy_complete) != strategy_complete
+            or append_row.receipt_hash
+            != _receipt_hash(
+                TARGET_GRAPH_RECEIPT_KIND,
+                graph_row.graph_ref,
+                bindings,
+            )
+        ):
+            raise OwnerConflict("target_graph_append_integrity_invalid")
+        head = TargetGraphHead(
+            graph_ref=graph_row.graph_ref,
+            generation=expected_generation,
+            strategy_complete=strategy_complete,
+            target_set_hash=target_set_hash,
+            coverage_hash=coverage_hash,
+            receipt=AcceptanceReceipt(
+                issuer=RG_OWNER,
+                kind=TARGET_GRAPH_RECEIPT_KIND,
+                receipt_ref=append_row.receipt_ref,
+                subject_ref=graph_row.graph_ref,
+                payload_hash=append_row.receipt_hash,
+            ),
+        )
+    current_refs = tuple(target.target_ref for target in current_targets)
+    if (
+        len(current_refs) != len(set(current_refs))
+        or set(current_refs) != set(target_by_ref)
+    ):
+        raise OwnerConflict("target_graph_append_integrity_invalid")
+    return head
+
+
+def _target_graph_append_bindings(
+    row, target_refs: tuple[str, ...]
+) -> dict[str, object]:
+    return {
+        "append_ref": row.append_ref,
+        "graph_ref": row.graph_ref,
+        "generation": int(row.generation),
+        "predecessor_head_receipt_ref": row.predecessor_head_receipt_ref,
+        "predecessor_head_receipt_hash": row.predecessor_head_receipt_hash,
+        "proposal_ref": row.proposal_ref,
+        "proposal_hash": row.proposal_hash,
+        "proposal_receipt_ref": row.proposal_receipt_ref,
+        "proposal_receipt_hash": row.proposal_receipt_hash,
+        "target_refs": list(target_refs),
+        "target_set_hash": row.target_set_hash,
+        "coverage_hash": row.coverage_hash,
+        "strategy_complete": bool(row.strategy_complete),
+    }
+
+
+def _target_set_hash(targets: tuple[AcceptedTarget, ...]) -> str:
+    return canonical_hash(
+        [
+            {
+                "target_ref": target.target_ref,
+                "target_key": target.target_key,
+                "ordinal": target.ordinal,
+                "spec_hash": target.spec_hash,
+                "dependency_refs": list(target.dependency_refs),
+                "receipt_ref": target.receipt.receipt_ref,
+                "receipt_hash": target.receipt.payload_hash,
+            }
+            for target in sorted(targets, key=lambda value: value.ordinal)
+        ]
+    )
+
+
+def _rolling_strategy_hash(
+    state: RollingStrategyState,
+    completion_contract: NormalizedCompletionContract,
+) -> str:
+    return canonical_hash(
+        rolling_strategy_state_to_dict(
+            state,
+            completion_contract=completion_contract,
+        )
+    )
+
+
+def _target_direct_accepted_input_asset_refs(
+    target_spec: dict[str, object],
+) -> tuple[str, ...]:
+    """Read the fixed prototype's direct accepted-asset slot, if present.
+
+    Legacy production TargetPlan rows predate this slot and therefore freeze
+    the exact empty set.  Future TargetPlan acceptance may expose the same
+    prototype field without changing launch admission semantics.
+    """
+
+    candidate = target_spec.get("candidate")
+    if not isinstance(candidate, dict):
+        raise OwnerConflict("target_launch_asset_refs_invalid")
+    value = candidate.get("direct_accepted_input_asset_refs")
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(item, str) or not item for item in value)
+        or value != sorted(set(value))
+    ):
+        raise OwnerConflict("target_launch_asset_refs_invalid")
+    return tuple(cast(list[str], value))
 
 
 def _accepted_target_run_binding(row) -> AcceptedTargetRunBinding:
@@ -8868,6 +17298,654 @@ def _target_commit(row) -> TargetCommit:
             subject_ref=row.commit_ref,
             payload_hash=row.receipt_hash,
         ),
+    )
+
+
+def _acceptance_receipt_from_document(
+    value: object,
+    *,
+    error_code: str,
+) -> AcceptanceReceipt:
+    fields = {
+        "issuer",
+        "kind",
+        "receipt_ref",
+        "subject_ref",
+        "payload_hash",
+    }
+    if (
+        type(value) is not dict
+        or set(value) != fields
+        or any(type(value.get(name)) is not str or not value[name] for name in fields)
+    ):
+        raise OwnerConflict(error_code)
+    return AcceptanceReceipt(
+        issuer=cast(dict[str, str], value)["issuer"],
+        kind=cast(dict[str, str], value)["kind"],
+        receipt_ref=cast(dict[str, str], value)["receipt_ref"],
+        subject_ref=cast(dict[str, str], value)["subject_ref"],
+        payload_hash=cast(dict[str, str], value)["payload_hash"],
+    )
+
+
+def _target_commit_issuer_revision_snapshot(
+    connection,
+) -> tuple[int, int, int]:
+    row = connection.execute(
+        text(
+            "SELECT "
+            "(SELECT revision FROM agent_runtime_state WHERE singleton = "
+            "'owner') AS agent_revision, "
+            "(SELECT revision FROM research_memory_state WHERE singleton = "
+            "'owner') AS memory_revision, "
+            "(SELECT revision FROM research_graph_state WHERE singleton = "
+            "'owner') AS graph_revision"
+        )
+    ).one()
+    return (
+        int(row.agent_revision),
+        int(row.memory_revision),
+        int(row.graph_revision),
+    )
+
+
+def _native_target_commit_material(
+    *,
+    target: AcceptedTarget,
+    commit_ref: str,
+    commit_receipt_ref: str,
+    projection: AcceptedTargetFormalPlanProjection,
+    candidate_projection: AcceptedTargetCandidateProjection,
+    facts: dict[str, object],
+) -> _NativeTargetCommitMaterial:
+    """Build a TargetCommit only from freshly issuer-reverified native facts."""
+
+    execution_closure = facts.get("closure")
+    handle = facts.get("handle")
+    candidate = facts.get("candidate")
+    formal_plan = facts.get("formal_plan")
+    preflights = facts.get("preflights")
+    eligibility = facts.get("execution_eligibility")
+    bundles = facts.get("implementation_bundles")
+    generic_execution = facts.get("generic_execution")
+    target_input = facts.get("target_execution_input")
+    manifest = facts.get("result_manifest")
+    measurement_attempt = facts.get("measurement_attempt")
+    metric = facts.get("formal_metric")
+    authority = facts.get("measurement_authority")
+    result_review = facts.get("result_review")
+    result_review_receipt = facts.get("result_review_acceptance_receipt")
+    result_content = facts.get("result_content")
+    if (
+        type(execution_closure) is not AcceptedTargetNativeExecutionClosure
+        or type(handle) is not TargetWorkHandle
+        or type(candidate) is not TargetCandidate
+        or type(formal_plan) is not FormalPlan
+        or type(preflights) is not tuple
+        or not preflights
+        or any(type(item) is not TargetExecutionPreflight for item in preflights)
+        or type(eligibility) is not AcceptedTargetExecutionEligibility
+        or type(bundles) is not tuple
+        or len(bundles) != len(preflights)
+        or any(
+            type(item) is not AcceptedTargetImplementationBundle for item in bundles
+        )
+        or type(generic_execution) is not TargetGenericExecutionBinding
+        or type(target_input) is not AcceptedTargetExecutionInputBinding
+        or type(manifest) is not AcceptedTargetGenericResultManifest
+        or type(measurement_attempt) is not AcceptedTargetMeasurementAttempt
+        or type(metric) is not FormalMetricResult
+        or type(authority) is not AcceptedTargetMeasurementDomainAuthority
+        or type(result_review) is not ResultReviewRecord
+        or type(result_review_receipt) is not AcceptanceReceipt
+        or type(result_content) is not dict
+    ):
+        raise OwnerConflict("formal_v3_native_execution_closure_invalid")
+
+    final_preflight = preflights[-1]
+    final_bundle = bundles[-1]
+    if (
+        target.spec.get("schema_ref") != FORMAL_TARGET_CANDIDATE_SCHEMA_REF
+        or execution_closure.target_ref != target.target_ref
+        or execution_closure.target_run_ref != handle.target_run_ref
+        or execution_closure.target_attempt_ref != handle.execution_attempt_ref
+        or execution_closure.target_fence_ref != handle.execution_fence_ref
+        or handle.target_ref != target.target_ref
+        or authority.target_ref != target.target_ref
+        or authority.graph_ref != target.graph_ref
+        or authority.target_spec_hash != target.spec_hash
+        or candidate_projection.candidate != candidate
+        or candidate_projection.source_spec_hash != target.spec_hash
+        or projection.formal_plan != formal_plan
+        or eligibility.handle != handle
+        or eligibility.preflight != final_preflight
+        or eligibility.implementation_bundle != final_bundle
+        or generic_execution.target_ref != target.target_ref
+        or generic_execution.target_run_ref != handle.target_run_ref
+        or generic_execution.target_attempt_ref != handle.execution_attempt_ref
+        or generic_execution.target_fence_ref != handle.execution_fence_ref
+        or target_input.target_ref != target.target_ref
+        or target_input.target_run_ref != handle.target_run_ref
+        or target_input.target_attempt_ref != handle.execution_attempt_ref
+        or target_input.target_fence_ref != handle.execution_fence_ref
+        or manifest.target_ref != target.target_ref
+        or manifest.target_run_ref != handle.target_run_ref
+        or manifest.target_attempt_ref != handle.execution_attempt_ref
+        or manifest.target_fence_ref != handle.execution_fence_ref
+        or measurement_attempt.target_ref != target.target_ref
+        or measurement_attempt.target_run_ref != handle.target_run_ref
+        or measurement_attempt.target_attempt_ref != handle.execution_attempt_ref
+        or measurement_attempt.target_fence_ref != handle.execution_fence_ref
+        or measurement_attempt.authority_ref != authority.authority_ref
+        or measurement_attempt.authority_hash != authority.authority_hash
+        or measurement_attempt.generic_binding_ref != generic_execution.binding_ref
+        or measurement_attempt.manifest_ref != manifest.manifest_ref
+        or metric.evaluation_attempt_ref
+        != measurement_attempt.evaluation_attempt_ref
+        or metric.result_role_ref != measurement_attempt.result_role_ref
+        or execution_closure.generic_binding_ref != generic_execution.binding_ref
+        or execution_closure.result_manifest_ref != manifest.manifest_ref
+        or execution_closure.attempt_binding_ref
+        != measurement_attempt.attempt_binding_ref
+        or execution_closure.evaluation_attempt_ref
+        != measurement_attempt.evaluation_attempt_ref
+        or execution_closure.metric_result_ref != metric.metric_result_ref
+        or result_review.reviewed_evaluation_attempt_ref
+        != measurement_attempt.evaluation_attempt_ref
+        or result_review.reviewed_metric_result_ref != metric.metric_result_ref
+        or result_review.reviewed_asset_manifest_ref != manifest.manifest_ref
+        or result_review_receipt.issuer != "agent_runtime"
+        or result_review_receipt.kind != "target_result_review_accepted"
+        or result_review_receipt.subject_ref
+        != canonical_hash(projection_plain_value(result_review))
+    ):
+        raise OwnerConflict("formal_v3_native_execution_closure_invalid")
+
+    for preflight, bundle in zip(preflights, bundles, strict=True):
+        if (
+            bundle.implementation_revision_ref
+            != preflight.implementation_revision_ref
+            or preflight.review_scope.candidate_revision_binding
+            != ContentBindingProof(
+                subject_ref=bundle.implementation_revision_ref,
+                content_hash_ref=bundle.bundle_content_hash_ref,
+            )
+            or preflight.implementation_acceptance_receipt
+            != receipt_proof(
+                bundle.receipt,
+                subject_ref=bundle.bundle_content_hash_ref,
+            )
+        ):
+            raise OwnerConflict("formal_v3_implementation_provenance_invalid")
+    if (
+        preflights[0].implementation_revision_ref
+        != candidate.implementation_revision_ref
+        or final_preflight.implementation_revision_ref
+        != final_bundle.implementation_revision_ref
+        or final_preflight.code_review.candidate_revision_ref
+        != final_bundle.implementation_revision_ref
+    ):
+        raise OwnerConflict("formal_v3_implementation_or_review_drift")
+
+    try:
+        provenance_values = list(
+            verify_reuse_trace(
+                candidate.reuse_trace,
+                candidate.implementation_revision_ref,
+            )
+        )
+    except BundleProtocolError as error:
+        raise OwnerConflict(
+            "formal_v3_implementation_provenance_invalid"
+        ) from error
+    for preflight in preflights:
+        provenance_values.extend(
+            (
+                preflight.implementation_revision_ref,
+                preflight.review_scope.candidate_revision_binding.content_hash_ref,
+                preflight.implementation_acceptance_receipt.receipt_ref,
+            )
+        )
+    implementation_provenance_refs = tuple(dict.fromkeys(provenance_values))
+    if not implementation_provenance_refs:
+        raise OwnerConflict("formal_v3_implementation_provenance_invalid")
+
+    result_entries = tuple(
+        entry for entry in manifest.entries if entry.role == "result_content"
+    )
+    result_disposition = result_content.get("result_disposition")
+    if (
+        len(result_entries) != 1
+        or result_disposition not in EXPERIMENT_RESULT_DISPOSITIONS
+    ):
+        raise OwnerConflict("formal_v3_result_content_invalid")
+
+    measurement_closure = AcceptedMeasurementClosure(
+        target_ref=target.target_ref,
+        target_run_ref=execution_closure.target_run_ref,
+        target_commit_ref=commit_ref,
+        experiment_keys=authority.experiment_keys,
+        measurement_unit_key=authority.measurement_unit_key,
+        variant_run_ref=measurement_attempt.variant_run_ref,
+        evaluation_ref=authority.identities.evaluation_ref,
+        protocol_version_ref=authority.identities.protocol_version_ref,
+        evaluation_attempt_ref=measurement_attempt.evaluation_attempt_ref,
+        metric_result_ref=metric.metric_result_ref,
+        metric_values=tuple(metric.metrics[key] for key in sorted(metric.metrics)),
+        asset_manifest_ref=manifest.manifest_ref,
+        execution_attempt_ref=execution_closure.target_attempt_ref,
+        execution_fence_ref=execution_closure.target_fence_ref,
+        checkpoint_artifact_refs=measurement_attempt.checkpoint_role_refs,
+        implementation_revision_ref=final_bundle.implementation_revision_ref,
+        held_fixed_bindings=candidate.held_fixed_bindings,
+        implementation_provenance_refs=implementation_provenance_refs,
+        variant_run_input_binding=measurement_attempt.variant_run_input_binding,
+        evaluation_attempt_input_binding=(
+            measurement_attempt.evaluation_attempt_input_binding
+        ),
+        rm_asset_receipt=receipt_proof(
+            manifest.receipt,
+            subject_ref=manifest.manifest_ref,
+        ),
+        ar_execution_receipt=receipt_proof(
+            execution_closure.receipt,
+            subject_ref=execution_closure.target_attempt_ref,
+        ),
+        rg_formal_measurement_receipt=receipt_proof(
+            metric.receipt,
+            subject_ref=metric.evaluation_attempt_ref,
+        ),
+        rg_target_commit_receipt=ReceiptProof(
+            receipt_ref=commit_receipt_ref,
+            subject_ref=commit_ref,
+            verified=True,
+            currentness_known=True,
+            current=True,
+        ),
+        code_review=final_preflight.code_review,
+        result_review=result_review,
+        formal_measurement_accepted=True,
+        currentness_known=True,
+        current=True,
+        protocol_internal_parts=authority.protocol_parts,
+        protocol_aggregation_proof=authority.protocol_aggregation_proof,
+    )
+    try:
+        verify_accepted_closure(
+            measurement_closure,
+            {brief.experiment_key: brief for brief in formal_plan.briefs},
+        )
+    except (BundleProtocolError, TypeError, ValueError) as error:
+        raise OwnerConflict("formal_v3_measurement_closure_invalid") from error
+
+    closure: dict[str, object] = {
+        "schema_ref": "meta-research/target-commit-closure/v3",
+        "accepted_measurement": projection_plain_value(measurement_closure),
+        "target": {
+            "target_ref": target.target_ref,
+            "spec_hash": target.spec_hash,
+            "receipt": target.receipt.as_public_dict(),
+        },
+        "formal_plan_projection": projection_plain_value(projection),
+        "target_candidate_projection": projection_plain_value(
+            candidate_projection
+        ),
+        "target_execution_closure": projection_plain_value(execution_closure),
+        "generic_execution": projection_plain_value(generic_execution),
+        "result_manifest": projection_plain_value(manifest),
+        "measurement_attempt": projection_plain_value(measurement_attempt),
+        "formal_metric": metric.as_public_dict(),
+        "measurement_authority": projection_plain_value(authority),
+        "implementation": {
+            "revision_ref": final_bundle.implementation_revision_ref,
+            "provenance_refs": list(implementation_provenance_refs),
+            "bundle": projection_plain_value(final_bundle),
+        },
+        "input_bindings": {
+            "target_execution": projection_plain_value(target_input),
+            "variant_run": projection_plain_value(
+                measurement_attempt.variant_run_input_binding
+            ),
+            "evaluation_attempt": projection_plain_value(
+                measurement_attempt.evaluation_attempt_input_binding
+            ),
+        },
+        "protocol": {
+            "protocol_version_ref": authority.identities.protocol_version_ref,
+            "internal_parts": projection_plain_value(authority.protocol_parts),
+            "aggregation_proof": projection_plain_value(
+                authority.protocol_aggregation_proof
+            ),
+        },
+        "code_review": projection_plain_value(final_preflight.code_review),
+        "result_review": projection_plain_value(result_review),
+        "result_review_acceptance_receipt": (
+            result_review_receipt.as_public_dict()
+        ),
+        "result_content": {
+            "role": projection_plain_value(result_entries[0]),
+            "content": result_content,
+        },
+    }
+    execution_closure_payload: dict[str, object] = {
+        "target_ref": execution_closure.target_ref,
+        "target_run_ref": execution_closure.target_run_ref,
+        "target_attempt_ref": execution_closure.target_attempt_ref,
+        "target_fence_ref": execution_closure.target_fence_ref,
+        "generic_execution": projection_plain_value(generic_execution),
+        "result_manifest": projection_plain_value(manifest),
+        "measurement_attempt": projection_plain_value(measurement_attempt),
+        "formal_metric": metric.as_public_dict(),
+        "result_review": projection_plain_value(result_review),
+        "result_review_acceptance_receipt": (
+            result_review_receipt.as_public_dict()
+        ),
+    }
+    return _NativeTargetCommitMaterial(
+        canonical_terminal=measurement_closure,
+        closure=closure,
+        closure_hash=canonical_hash(closure),
+        result_disposition=cast(str, result_disposition),
+        execution_closure=execution_closure,
+        execution_closure_payload=execution_closure_payload,
+    )
+
+
+def _target_root_commit_request_hash(
+    *,
+    completion: AcceptedTargetRootCompletion,
+    manifest: AcceptedTargetRootCompletionManifest,
+    result_document: TargetRootResultDocument,
+) -> str:
+    return canonical_hash(
+        {
+            "command": "accept_target_commit_from_root_completion",
+            "completion_ref": completion.completion_ref,
+            "completion_payload_hash": completion.payload_hash,
+            "completion_receipt": completion.receipt.as_public_dict(),
+            "manifest_ref": manifest.manifest_ref,
+            "manifest_payload_hash": manifest.payload_hash,
+            "manifest_receipt": manifest.receipt.as_public_dict(),
+            "result_document": result_document.as_dict(),
+        }
+    )
+
+
+def _target_root_commit_material(
+    *,
+    target: AcceptedTarget,
+    authority: AcceptedTargetMeasurementDomainAuthority,
+    projection: AcceptedTargetFormalPlanProjection,
+    candidate_projection: AcceptedTargetCandidateProjection,
+    completion: AcceptedTargetRootCompletion,
+    manifest: AcceptedTargetRootCompletionManifest,
+    result_document: TargetRootResultDocument,
+    measurement_ref: str,
+    variant_run_ref: str,
+    evaluation_attempt_ref: str,
+    metric_result_ref: str,
+    variant_binding_ref: str,
+    variant_binding_receipt_ref: str,
+    evaluation_binding_ref: str,
+    evaluation_binding_receipt_ref: str,
+    measurement_receipt_ref: str,
+    commit_ref: str,
+    commit_receipt_ref: str,
+) -> _TargetRootCommitMaterial:
+    """Build the root TargetCommit solely from freshly verified issuer facts."""
+
+    candidate = candidate_projection.candidate
+    try:
+        provenance = list(
+            verify_reuse_trace(
+                candidate.reuse_trace,
+                candidate.implementation_revision_ref,
+            )
+        )
+    except BundleProtocolError as error:
+        raise OwnerConflict("target_root_commit_provenance_invalid") from error
+    provenance.extend(
+        (
+            candidate.implementation_revision_ref,
+            manifest.implementation_revision_ref,
+            manifest.implementation_tree_hash,
+            completion.receipt.receipt_ref,
+            completion.receipt.payload_hash,
+            manifest.receipt.receipt_ref,
+            manifest.receipt.payload_hash,
+        )
+    )
+    implementation_provenance_refs = tuple(dict.fromkeys(provenance))
+    checkpoint_refs = tuple(
+        entry.binding.version_ref
+        for entry in manifest.entries
+        if entry.role == "checkpoint"
+    )
+    variant_inputs = tuple(
+        dict.fromkeys(
+            (
+                *completion.handle.accepted_input_target_commit_refs,
+                *(
+                    proof.asset_ref
+                    for proof in completion.handle.accepted_input_asset_proofs
+                ),
+                manifest.implementation_revision_ref,
+            )
+        )
+    )
+    variant_binding_payload = {
+        "target_ref": target.target_ref,
+        "target_run_ref": completion.handle.target_run_ref,
+        "completion_ref": completion.completion_ref,
+        "manifest_ref": manifest.manifest_ref,
+        "binding_ref": variant_binding_ref,
+        "subject_ref": variant_run_ref,
+        "input_refs": list(variant_inputs),
+    }
+    variant_binding_receipt = AcceptanceReceipt(
+        issuer=RG_OWNER,
+        kind=TARGET_ROOT_VARIANT_INPUT_RECEIPT_KIND,
+        receipt_ref=variant_binding_receipt_ref,
+        subject_ref=variant_binding_ref,
+        payload_hash=_receipt_hash(
+            TARGET_ROOT_VARIANT_INPUT_RECEIPT_KIND,
+            variant_binding_ref,
+            variant_binding_payload,
+        ),
+    )
+    variant_binding = ExecutionInputBindingProof(
+        binding_ref=variant_binding_ref,
+        subject_ref=variant_run_ref,
+        input_refs=variant_inputs,
+        acceptance_receipt=receipt_proof(
+            variant_binding_receipt,
+            subject_ref=variant_binding_ref,
+        ),
+    )
+    evaluation_inputs = tuple(
+        dict.fromkeys(
+            (
+                variant_run_ref,
+                authority.identities.protocol_version_ref,
+                *checkpoint_refs,
+            )
+        )
+    )
+    evaluation_binding_payload = {
+        "target_ref": target.target_ref,
+        "target_run_ref": completion.handle.target_run_ref,
+        "completion_ref": completion.completion_ref,
+        "manifest_ref": manifest.manifest_ref,
+        "binding_ref": evaluation_binding_ref,
+        "subject_ref": evaluation_attempt_ref,
+        "input_refs": list(evaluation_inputs),
+    }
+    evaluation_binding_receipt = AcceptanceReceipt(
+        issuer=RG_OWNER,
+        kind=TARGET_ROOT_EVALUATION_INPUT_RECEIPT_KIND,
+        receipt_ref=evaluation_binding_receipt_ref,
+        subject_ref=evaluation_binding_ref,
+        payload_hash=_receipt_hash(
+            TARGET_ROOT_EVALUATION_INPUT_RECEIPT_KIND,
+            evaluation_binding_ref,
+            evaluation_binding_payload,
+        ),
+    )
+    evaluation_binding = ExecutionInputBindingProof(
+        binding_ref=evaluation_binding_ref,
+        subject_ref=evaluation_attempt_ref,
+        input_refs=evaluation_inputs,
+        acceptance_receipt=receipt_proof(
+            evaluation_binding_receipt,
+            subject_ref=evaluation_binding_ref,
+        ),
+    )
+    metrics = dict(result_document.metrics)
+    measurement_payload = {
+        "schema_ref": "meta-research/target-root-formal-measurement/v1",
+        "measurement_ref": measurement_ref,
+        "target_ref": target.target_ref,
+        "target_run_ref": completion.handle.target_run_ref,
+        "completion_ref": completion.completion_ref,
+        "completion_payload_hash": completion.payload_hash,
+        "completion_receipt": completion.receipt.as_public_dict(),
+        "manifest_ref": manifest.manifest_ref,
+        "manifest_payload_hash": manifest.payload_hash,
+        "manifest_receipt": manifest.receipt.as_public_dict(),
+        "authority_ref": authority.authority_ref,
+        "authority_hash": authority.authority_hash,
+        "variant_run_ref": variant_run_ref,
+        "evaluation_attempt_ref": evaluation_attempt_ref,
+        "metric_result_ref": metric_result_ref,
+        "metrics": metrics,
+        "metrics_hash": canonical_hash(metrics),
+        "checkpoint_refs": list(checkpoint_refs),
+        "variant_input_binding": projection_plain_value(variant_binding),
+        "evaluation_input_binding": projection_plain_value(evaluation_binding),
+        "result_document": result_document.as_dict(),
+    }
+    measurement_receipt = AcceptanceReceipt(
+        issuer=RG_OWNER,
+        kind=FORMAL_MEASUREMENT_RECEIPT_KIND,
+        receipt_ref=measurement_receipt_ref,
+        subject_ref=evaluation_attempt_ref,
+        payload_hash=_receipt_hash(
+            FORMAL_MEASUREMENT_RECEIPT_KIND,
+            evaluation_attempt_ref,
+            {"root_measurement": measurement_payload},
+        ),
+    )
+    completion_proof = receipt_proof(
+        completion.receipt,
+        subject_ref=completion.handle.execution_attempt_ref,
+    )
+    terminal = AcceptedMeasurementClosure(
+        target_ref=target.target_ref,
+        target_run_ref=completion.handle.target_run_ref,
+        target_commit_ref=commit_ref,
+        experiment_keys=authority.experiment_keys,
+        measurement_unit_key=authority.measurement_unit_key,
+        variant_run_ref=variant_run_ref,
+        evaluation_ref=authority.identities.evaluation_ref,
+        protocol_version_ref=authority.identities.protocol_version_ref,
+        evaluation_attempt_ref=evaluation_attempt_ref,
+        metric_result_ref=metric_result_ref,
+        metric_values=tuple(metrics[key] for key in sorted(metrics)),
+        asset_manifest_ref=manifest.manifest_ref,
+        execution_attempt_ref=completion.handle.execution_attempt_ref,
+        execution_fence_ref=completion.handle.execution_fence_ref,
+        checkpoint_artifact_refs=checkpoint_refs,
+        implementation_revision_ref=manifest.implementation_revision_ref,
+        held_fixed_bindings=candidate.held_fixed_bindings,
+        implementation_provenance_refs=implementation_provenance_refs,
+        variant_run_input_binding=variant_binding,
+        evaluation_attempt_input_binding=evaluation_binding,
+        rm_asset_receipt=receipt_proof(
+            manifest.receipt,
+            subject_ref=manifest.manifest_ref,
+        ),
+        ar_execution_receipt=completion_proof,
+        rg_formal_measurement_receipt=receipt_proof(
+            measurement_receipt,
+            subject_ref=evaluation_attempt_ref,
+        ),
+        rg_target_commit_receipt=ReceiptProof(
+            receipt_ref=commit_receipt_ref,
+            subject_ref=commit_ref,
+            verified=True,
+            currentness_known=True,
+            current=True,
+        ),
+        code_review=None,
+        result_review=None,
+        formal_measurement_accepted=True,
+        currentness_known=True,
+        current=True,
+        root_completion_receipt=completion_proof,
+        protocol_internal_parts=authority.protocol_parts,
+        protocol_aggregation_proof=authority.protocol_aggregation_proof,
+    )
+    try:
+        verify_accepted_closure(
+            terminal,
+            {
+                brief.experiment_key: brief
+                for brief in projection.formal_plan.briefs
+            },
+        )
+    except (BundleProtocolError, TypeError, ValueError) as error:
+        raise OwnerConflict("target_root_measurement_closure_invalid") from error
+    closure = {
+        "schema_ref": TARGET_ROOT_COMMIT_CLOSURE_SCHEMA_REF,
+        "accepted_measurement": projection_plain_value(terminal),
+        "target": {
+            "target_ref": target.target_ref,
+            "spec_hash": target.spec_hash,
+            "receipt": target.receipt.as_public_dict(),
+        },
+        "formal_plan_projection": projection_plain_value(projection),
+        "target_candidate_projection": projection_plain_value(
+            candidate_projection
+        ),
+        "measurement_authority": projection_plain_value(authority),
+        "target_root_completion": projection_plain_value(completion),
+        "target_root_manifest": projection_plain_value(manifest),
+        "root_measurement": {
+            **measurement_payload,
+            "receipt": measurement_receipt.as_public_dict(),
+        },
+        "implementation": {
+            "revision_ref": manifest.implementation_revision_ref,
+            "tree_hash": manifest.implementation_tree_hash,
+            "provenance_refs": list(implementation_provenance_refs),
+        },
+        "input_bindings": {
+            "variant_run": projection_plain_value(variant_binding),
+            "evaluation_attempt": projection_plain_value(evaluation_binding),
+        },
+        "protocol": {
+            "protocol_version_ref": authority.identities.protocol_version_ref,
+            "internal_parts": projection_plain_value(authority.protocol_parts),
+            "aggregation_proof": projection_plain_value(
+                authority.protocol_aggregation_proof
+            ),
+        },
+        "code_review": None,
+        "result_review": None,
+        "result_content": result_document.as_dict(),
+    }
+    return _TargetRootCommitMaterial(
+        canonical_terminal=terminal,
+        closure=closure,
+        closure_hash=canonical_hash(closure),
+        result_disposition=result_document.result_disposition,
+        measurement_ref=measurement_ref,
+        metrics=metrics,
+        checkpoint_refs=checkpoint_refs,
+        variant_input_binding=variant_binding,
+        evaluation_input_binding=evaluation_binding,
+        measurement_payload=measurement_payload,
+        measurement_receipt=measurement_receipt,
     )
 
 
@@ -9011,6 +18089,10 @@ def create_research_graph_interface(
     human_response_verifier: HumanResponseVerifier | None = None,
     plan_content_verifier: PlanContentReceiptVerifier | None = None,
     runtime_control_verifier: RuntimeControlReceiptVerifier | None = None,
+    target_candidate_proof_verifier: TargetCandidateOwnerProofVerifier
+    | None = None,
+    target_execution_closure_verifier: TargetExecutionClosureVerifier
+    | None = None,
 ) -> ResearchGraphInterface:
     return SQLiteResearchGraph(
         database,
@@ -9026,4 +18108,6 @@ def create_research_graph_interface(
         human_response_verifier,
         plan_content_verifier,
         runtime_control_verifier,
+        target_candidate_proof_verifier,
+        target_execution_closure_verifier,
     )

@@ -2,27 +2,50 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import cast
 
 from meta_research.bundle_contract import (
     BUNDLE_CONTEXT_PACK_SCHEMA_REF,
     target_execution_assertion,
     target_execution_authorization_requirement,
 )
+from meta_research.bundle_exhaustion import (
+    BUNDLE_EXHAUSTION_BASIS_KIND,
+    BundleExhaustionEvidence,
+    BundleExhaustionProposal,
+    bundle_exhaustion_exploration_record_from_claim,
+)
+from meta_research.bundle_protocol import (
+    AcceptedMeasurementClosure,
+    BundleReport,
+    SemanticBarrier,
+    TechnicalBlocker,
+    projection_plain_value,
+)
 from meta_research.bundle_skill import (
     BundleDispatchRequest,
     BundleSkillContractError,
     BundleSkillDraft,
+    BundleExhaustionSkillResult,
     BundleSkillProvider,
     BundleSkillRequest,
+    BundleSkillResult,
     BundleSkillUnavailable,
+    BundleTargetBatchRequest,
+    bind_bundle_runtime_to_full_conformance,
     review_record,
     validate_bundle_dispatch_result,
     validate_bundle_skill_draft,
+    validate_bundle_exhaustion_skill_result,
     validate_bundle_skill_result,
+    validate_bundle_target_batch_result,
+)
+from meta_research.bundle_target_contract import (
+    BundleTargetContractError,
+    normalized_completion_contract_from_dict,
 )
 from meta_research.feed import DurableFeed
-from meta_research.experiment_contract import ExperimentIntent
+from meta_research.harness import HarnessAdmissionError, HarnessRuntime
 from meta_research.idea_stage import _public_run
 from meta_research.owners.advancement_engine import (
     AdvancementEngineInterface,
@@ -31,12 +54,15 @@ from meta_research.owners.advancement_engine import (
 )
 from meta_research.owners.agent_runtime import (
     AgentRuntimeInterface,
+    BundleInboxCheckpoint,
     BundleRuntimeBinding,
     BundleStageRun,
 )
 from meta_research.owners.common import (
     AcceptedFormalPlanBinding,
+    AcceptanceReceipt,
     OwnerConflict,
+    VerifiedBundleReportReceipt,
     canonical_hash,
     canonical_json,
 )
@@ -62,16 +88,6 @@ from meta_research.target_commit_evidence import (
 
 
 _CYCLE_EVENT = "advancement_engine.initial_cycle_activated"
-
-
-class ExperimentCoordinator(Protocol):
-    def start(
-        self,
-        intent: ExperimentIntent,
-        idempotency_key: str,
-        *,
-        require_idle: bool = False,
-    ) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -126,8 +142,8 @@ class BundleStageWorker:
         research_memory: ResearchMemoryInterface,
         research_graph: ResearchGraphInterface,
         provider: BundleSkillProvider,
-        experiment: ExperimentCoordinator,
         human_collaboration: HumanCollaborationInterface | None = None,
+        harnesses: HarnessRuntime | None = None,
     ) -> None:
         self._feed = feed
         self._advancement_engine = advancement_engine
@@ -135,13 +151,18 @@ class BundleStageWorker:
         self._research_memory = research_memory
         self._research_graph = research_graph
         self._provider = provider
-        self._experiment = experiment
         self._human_collaboration = human_collaboration
+        self._harnesses = harnesses
         self._transient_error: str | None = None
 
     @property
     def transient_error(self) -> str | None:
         return self._transient_error
+
+    def configure_resident_mcp_endpoint(self, base_url: str) -> None:
+        configure = getattr(self._provider, "configure_resident_mcp_endpoint", None)
+        if callable(configure):
+            configure(base_url)
 
     def process_once(self) -> bool:
         """Advance at most one durable Bundle boundary."""
@@ -149,11 +170,33 @@ class BundleStageWorker:
         current = self._discover_current_cycle()
         if current is None:
             return False
+        foreground = self._advancement_engine.query_foreground(
+            current.question.quest_ref
+        )
+        if (
+            foreground is None
+            or foreground.get("cycle_ref") != current.cycle_ref
+            or foreground.get("stage") != "bundle"
+            or foreground.get("status") != "active"
+        ):
+            return False
         eligible, _reason, _next = self._qualify(current)
         if eligible is None:
             return False
         request = self._advancement_engine.query_bundle_stage_request(current.cycle_ref)
         if request is None:
+            foreground = self._advancement_engine.query_foreground(
+                current.question.quest_ref
+            )
+            epoch = None if foreground is None else foreground.get("epoch")
+            if (
+                foreground is None
+                or foreground.get("cycle_ref") != current.cycle_ref
+                or foreground.get("stage") != "bundle"
+                or type(epoch) is not int
+                or epoch < 1
+            ):
+                raise OwnerConflict("bundle_foreground_epoch_stale")
             accepted_formal_plan = eligible.accepted_formal_plan()
             self._advancement_engine.ensure_bundle_stage_request(
                 cycle_ref=current.cycle_ref,
@@ -166,7 +209,7 @@ class BundleStageWorker:
                     "accepted_formal_plan_binding": accepted_formal_plan.as_dict(),
                 },
                 idempotency_key=_operation_key(
-                    "bundle-request", current.cycle_ref, "worker"
+                    "bundle-request", current.cycle_ref, str(epoch)
                 ),
             )
             return True
@@ -189,10 +232,8 @@ class BundleStageWorker:
             return True
         run = self._agent_runtime.query_bundle_stage_run(request.request_ref)
         if run is None:
-            try:
-                runtime_binding = self._provider.runtime_binding()
-            except BundleSkillUnavailable as error:
-                self._transient_error = error.code
+            runtime_binding = self._current_runtime_binding()
+            if runtime_binding is None:
                 return False
             self._agent_runtime.admit_bundle_stage(
                 request,
@@ -201,12 +242,46 @@ class BundleStageWorker:
             )
             self._transient_error = None
             return True
+        if run.status in {"running", "awaiting_acceptance"}:
+            self._drain_bundle_inbox(run)
+        if _bundle_primary_output_kind(run) == "exhaustion_assessment":
+            if run.review_invocation.status == "prepared":
+                return self._execute_target_plan(request, run)
+            return self._advance_exhaustion(request, run)
         if run.execution is None:
             return self._execute_target_plan(request, run)
         graph = self._research_graph.query_target_graph(request.request_ref)
         if graph is None:
             execution = run.execution
-            self._research_graph.accept_target_graph(
+            rejection = self._research_graph.query_target_graph_rejection(
+                execution.submission_ref
+            )
+            if rejection is not None:
+                if (
+                    rejection.request_ref != request.request_ref
+                    or rejection.run_ref != run.run_ref
+                    or rejection.attempt_ref != run.attempt_ref
+                    or rejection.fence_ref != run.fence_ref
+                    or rejection.target_plan_hash
+                    != execution.material_outcome_hash
+                    or rejection.execution_payload_hash != execution.payload_hash
+                    or rejection.execution_receipt != execution.receipt
+                ):
+                    raise OwnerConflict("target_graph_rejection_binding_invalid")
+                self._agent_runtime.continue_after_bundle_rejection(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    decision_receipt=rejection.receipt,
+                    idempotency_key=_operation_key(
+                        "bundle-target-graph-rejection-successor",
+                        run.run_ref,
+                        run.attempt_ref,
+                        rejection.rejection_ref,
+                    ),
+                )
+                return True
+            self._research_graph.decide_target_graph_submission(
                 request_ref=request.request_ref,
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
@@ -219,6 +294,51 @@ class BundleStageWorker:
                 execution_receipt=execution.receipt,
             )
             return True
+        formal_plan_content = (
+            self._research_graph.query_formal_plan_content_acceptance(
+                graph.formal_plan_ref
+            )
+        )
+        if formal_plan_content is None:
+            self._research_graph.accept_formal_plan_content(
+                formal_plan_ref=graph.formal_plan_ref,
+                idempotency_key=_operation_key(
+                    "bundle-formal-plan-content",
+                    request.request_ref,
+                    graph.formal_plan_ref,
+                ),
+            )
+            return True
+        if (
+            formal_plan_content.formal_plan_ref != graph.formal_plan_ref
+            or formal_plan_content.plan_document_hash
+            != accepted_formal_plan.plan_document_hash
+        ):
+            raise OwnerConflict("bundle_formal_plan_content_acceptance_invalid")
+        formal_plan_projection = (
+            self._research_graph.query_target_formal_plan_projection(
+                graph_ref=graph.graph_ref
+            )
+        )
+        if formal_plan_projection is None:
+            self._research_graph.accept_target_formal_plan_projection(
+                graph_ref=graph.graph_ref,
+                idempotency_key=_operation_key(
+                    "bundle-formal-plan-projection",
+                    request.request_ref,
+                    graph.graph_ref,
+                ),
+            )
+            return True
+        if (
+            formal_plan_projection.formal_plan.formal_plan_ref
+            != graph.formal_plan_ref
+            or formal_plan_projection.plan_document_hash
+            != formal_plan_content.plan_document_hash
+            or formal_plan_projection.source_acceptance_receipt
+            != formal_plan_content.receipt
+        ):
+            raise OwnerConflict("bundle_formal_plan_projection_invalid")
         commits = self._research_graph.query_target_commits(graph.graph_ref)
         committed_refs = {commit.target_ref for commit in commits}
         _evidence_revision, evidence_catalog = (
@@ -235,38 +355,117 @@ class BundleStageWorker:
                     commit=commit,
                 )
                 return True
-        if len(commits) == len(graph.targets):
-            if run.completion is None:
-                self._agent_runtime.complete_bundle_run(
+        report_progress = self._advance_bundle_report_closure(
+            request=request,
+            run=run,
+            graph=graph,
+            formal_plan_content_receipt=formal_plan_content.receipt,
+            formal_plan_projection_receipt=formal_plan_projection.receipt,
+        )
+        if report_progress is not None:
+            return report_progress
+        # A complete set of commits is only an input to the rolling planner.
+        # Stage completion is exclusively authorized by the durable report
+        # path above, after AR has reread every current terminal handoff and
+        # exact FormalPlan measurement cell.
+        if len(commits) == len(graph.targets) and not graph.strategy_complete:
+            inbox_checkpoint = self._drain_bundle_inbox(run)
+            proposals = self._agent_runtime.query_bundle_target_proposals(
+                run.run_ref
+            )
+            pending = next(
+                (
+                    proposal
+                    for proposal in reversed(proposals)
+                    if proposal.graph_ref == graph.graph_ref
+                    and proposal.base_generation == graph.head_generation
+                    and proposal.base_head_receipt == graph.head_receipt
+                    and self._operation_uses_inbox_checkpoint(
+                        operation_kind="target_proposal",
+                        operation_ref=proposal.proposal_ref,
+                        checkpoint=inbox_checkpoint,
+                    )
+                ),
+                None,
+            )
+            if pending is None:
+                if run.native_session_ref is None:
+                    raise OwnerConflict("bundle_native_session_missing")
+                batch_request = BundleTargetBatchRequest(
+                    stage_request_ref=request.request_ref,
                     run_ref=run.run_ref,
                     attempt_ref=run.attempt_ref,
                     fence_ref=run.fence_ref,
-                    target_graph_ref=graph.graph_ref,
-                    decision_receipt=graph.receipt,
-                    idempotency_key=_operation_key(
-                        "bundle-complete", run.run_ref, graph.graph_ref
+                    graph_ref=graph.graph_ref,
+                    formal_plan_ref=graph.formal_plan_ref,
+                    context_pack_ref=graph.context_pack_ref,
+                    context_pack_hash=graph.context_pack_hash,
+                    plan_document=accepted_formal_plan.plan_document,
+                    initial_target_plan=graph.target_plan,
+                    base_generation=graph.head_generation,
+                    base_head_receipt=graph.head_receipt.as_public_dict(),
+                    current_targets=tuple(
+                        self._dispatch_target(target)
+                        for target in graph.targets
                     ),
+                    target_commits=tuple(
+                        self._target_commit_projection(commit)
+                        for commit in commits
+                    ),
+                    root_session_ref=run.root_session_ref,
+                    native_session_ref=run.native_session_ref,
+                    runtime_binding=cast(
+                        BundleRuntimeBinding, run.runtime_binding
+                    ),
+                    inbox_checkpoint=inbox_checkpoint.as_public_dict(),
+                    job_ref=run.review_invocation.invocation_ref,
                 )
-                return True
-            if (
-                self._advancement_engine.query_bundle_stage_commit(request.request_ref)
-                is None
-            ):
-                self._advancement_engine.commit_bundle_stage(
-                    request_ref=request.request_ref,
+                if not self._runtime_binding_is_current(run):
+                    return False
+                try:
+                    result = self._provider.propose_target_batch(batch_request)
+                    validate_bundle_target_batch_result(batch_request, result)
+                except BundleSkillUnavailable as error:
+                    self._transient_error = error.code
+                    return False
+                except BundleSkillContractError as error:
+                    self._transient_error = str(error)
+                    return False
+                self._agent_runtime.record_bundle_target_proposal(
                     run_ref=run.run_ref,
-                    target_graph_ref=graph.graph_ref,
-                    target_commit_receipts=tuple(commit.receipt for commit in commits),
-                    run_completion_receipt=run.completion.receipt,
-                    target_graph_receipt=graph.receipt,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=result.native_session_ref,
+                    graph_ref=graph.graph_ref,
+                    base_generation=graph.head_generation,
+                    base_head_receipt=graph.head_receipt,
+                    strategy_update=result.strategy_update,
+                    inbox_checkpoint=inbox_checkpoint,
                     idempotency_key=_operation_key(
-                        "bundle-commit", request.request_ref, graph.graph_ref
+                        "bundle-target-batch",
+                        run.run_ref,
+                        graph.head_receipt.receipt_ref,
+                        inbox_checkpoint.checkpoint_ref,
+                        inbox_checkpoint.checkpoint_hash,
                     ),
                 )
-                self._finish_bundle_jobs(run)
+                self._transient_error = None
                 return True
-            self._finish_bundle_jobs(run)
-            return False
+            try:
+                self._research_graph.append_target_batch(
+                    graph_ref=graph.graph_ref,
+                    proposal_ref=pending.proposal_ref,
+                    proposal=pending.proposal,
+                    proposal_hash=pending.proposal_hash,
+                    proposal_receipt=pending.receipt,
+                )
+            except OwnerConflict as error:
+                if error.code == "completed_strategy_cell_coverage_invalid":
+                    self._transient_error = "bundle_strategy_incomplete"
+                    return False
+                raise
+            self._transient_error = None
+            return True
         frontier = self._research_graph.query_target_frontier(graph.graph_ref)
         authorizations: dict[str, _TargetAuthorization] = {}
         for target in frontier:
@@ -290,12 +489,18 @@ class BundleStageWorker:
             self._dispatch_target(target) for target in dispatchable
         )
         dispatch_state = self._dispatch_state(graph, commits)
+        inbox_checkpoint = self._drain_bundle_inbox(run)
         decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
         latest = decisions[-1] if decisions else None
         same_input = latest is not None and (
             latest.graph_ref == graph.graph_ref
             and latest.frontier == dispatch_frontier
             and latest.state == dispatch_state
+            and self._operation_uses_inbox_checkpoint(
+                operation_kind="dispatch",
+                operation_ref=latest.decision_ref,
+                checkpoint=inbox_checkpoint,
+            )
         )
         pending_dispatch = (
             latest
@@ -318,10 +523,14 @@ class BundleStageWorker:
                 generation=len(decisions) + 1,
                 frontier=dispatch_frontier,
                 state=dispatch_state,
+                root_session_ref=run.root_session_ref,
                 native_session_ref=run.native_session_ref,
                 runtime_binding=cast(BundleRuntimeBinding, run.runtime_binding),
+                inbox_checkpoint=inbox_checkpoint.as_public_dict(),
                 job_ref=run.review_invocation.invocation_ref,
             )
+            if not self._runtime_binding_is_current(run):
+                return False
             try:
                 result = self._provider.schedule_target(dispatch_request)
                 validate_bundle_dispatch_result(dispatch_request, result)
@@ -343,6 +552,7 @@ class BundleStageWorker:
                 action=result.action,
                 selected_target_ref=result.selected_target_ref,
                 rationale=result.rationale,
+                inbox_checkpoint=inbox_checkpoint,
                 idempotency_key=_operation_key(
                     "bundle-dispatch", run.run_ref, str(len(decisions) + 1)
                 ),
@@ -356,46 +566,45 @@ class BundleStageWorker:
             )
             return True
         if pending_dispatch is not None:
+            launch_checkpoint = self._drain_bundle_inbox(run)
+            if not self._operation_uses_inbox_checkpoint(
+                operation_kind="dispatch",
+                operation_ref=pending_dispatch.decision_ref,
+                checkpoint=launch_checkpoint,
+            ):
+                self._transient_error = None
+                return True
             target = next(
                 target
                 for target in dispatchable
                 if target.target_ref == pending_dispatch.selected_target_ref
             )
-            binding = self._research_graph.query_target_run_binding(target.target_ref)
-            if binding is None:
-                execution = self._experiment.start(
-                    _target_experiment_intent(graph.quest_ref, target),
-                    _operation_key("target-start", target.target_ref),
+            ack = self._agent_runtime.query_target_launch_ack(target.target_ref)
+            admitted_now = False
+            if ack is None:
+                candidate_projection = (
+                    self._research_graph.query_target_candidate_projection(
+                        target_ref=target.target_ref
+                    )
                 )
-                identities = execution.get("identities")
-                runtime = execution.get("execution")
-                intent = execution.get("intent")
-                if (
-                    not isinstance(identities, dict)
-                    or not isinstance(runtime, dict)
-                    or not isinstance(intent, dict)
-                    or not isinstance(identities.get("evaluation_attempt_ref"), str)
-                    or not isinstance(runtime.get("run_ref"), str)
-                    or not isinstance(intent.get("execution_request_ref"), str)
-                ):
-                    raise OwnerConflict("target_run_admission_invalid")
-                evaluation_attempt_ref = cast(str, identities["evaluation_attempt_ref"])
-                domain = self._research_graph.query_experiment(evaluation_attempt_ref)
-                if domain is None:
-                    raise OwnerConflict("target_run_domain_admission_missing")
+                if candidate_projection is None:
+                    self._research_graph.accept_target_candidate_projection(
+                        target_ref=target.target_ref,
+                        idempotency_key=_operation_key(
+                            "target-candidate-projection", target.target_ref
+                        ),
+                    )
+                    self._transient_error = None
+                    return True
+                launch_request = self._research_graph.query_target_launch_request(
+                    target.target_ref
+                )
                 authorization = authorizations.get(target.target_ref)
-                admission = self._agent_runtime.admit_target_run(
-                    target_ref=target.target_ref,
-                    target_spec_hash=target.spec_hash,
-                    graph_ref=graph.graph_ref,
-                    stage_request_ref=request.request_ref,
-                    quest_ref=graph.quest_ref,
-                    target_run_ref=cast(str, runtime["run_ref"]),
-                    evaluation_attempt_ref=evaluation_attempt_ref,
-                    execution_request_ref=cast(str, intent["execution_request_ref"]),
-                    definition_hash=domain.execution_request.definition_hash,
+                ack = self._agent_runtime.admit_target_launch(
+                    launch_request,
+                    dispatch_decision_ref=pending_dispatch.decision_ref,
                     idempotency_key=_operation_key(
-                        "target-run-admit", target.target_ref
+                        "target-launch-admit", target.target_ref
                     ),
                     human_request_ref=(
                         None if authorization is None else authorization.request_ref
@@ -412,65 +621,261 @@ class BundleStageWorker:
                         else authorization.authorization_receipt_ref
                     ),
                 )
-                self._research_graph.bind_target_run(
-                    target_ref=target.target_ref,
-                    target_run_ref=cast(str, runtime["run_ref"]),
-                    evaluation_attempt_ref=evaluation_attempt_ref,
-                    execution_request_ref=cast(str, intent["execution_request_ref"]),
-                    definition_hash=domain.execution_request.definition_hash,
-                    admission_receipt=admission.receipt,
+                admitted_now = True
+            if ack.target_ref != target.target_ref:
+                raise OwnerConflict("target_launch_ack_invalid")
+            if admitted_now:
+                self._transient_error = "target_launch_admitted"
+                return True
+            current_frontier = self._agent_runtime.query_target_frontier_entry(
+                target.target_ref
+            )
+            if current_frontier is not None:
+                # Bundle owns launch and pre-activation only.  Once AR has a
+                # durable TargetRun frontier, the independent Target daemon is
+                # the sole lifecycle driver; Bundle only consumes Inbox and
+                # authoritative frontier/handoff projections.
+                self._transient_error = "target_root_running"
+                return False
+            # Launch is the last Bundle-owned Target mutation.  The light
+            # Target daemon discovers this admitted launch independently and
+            # wakes the one long-lived root Session; Bundle never drives that
+            # Session or interprets its implementation/training progress.
+            self._transient_error = "target_launch_pending"
+            return False
+        return False
+
+    def _advance_bundle_report_closure(
+        self,
+        *,
+        request: StageRunRequest,
+        run: BundleStageRun,
+        graph: AcceptedTargetGraph,
+        formal_plan_content_receipt: AcceptanceReceipt,
+        formal_plan_projection_receipt: AcceptanceReceipt,
+    ) -> bool | None:
+        """Advance one report boundary, or return ``None`` while work is open."""
+
+        # A completed or retired Run can no longer build another candidate.
+        # Reconcile its already accepted report instead.
+        if run.completion is not None or run.status == "cancelled":
+            accepted = self._agent_runtime.query_bundle_run_report(run.run_ref)
+            if accepted is None:
+                raise OwnerConflict("bundle_report_terminal_run_missing")
+            return self._consume_bundle_report(request, run, accepted)
+
+        disposition = self._bundle_report_disposition_hint(graph)
+        if disposition is None:
+            return None
+        try:
+            candidate = self._agent_runtime.build_bundle_report_candidate(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                disposition=disposition,
+                formal_plan_content_receipt=formal_plan_content_receipt,
+                formal_plan_projection_receipt=formal_plan_projection_receipt,
+                target_graph_ref=graph.graph_ref,
+                target_graph_receipt=graph.head_receipt,
+            )
+        except OwnerConflict as error:
+            if error.code in {
+                "bundle_report_realized_incomplete",
+                "bundle_report_blocked_incomplete",
+                "bundle_report_replan_incomplete",
+                "bundle_report_replan_not_closed",
+            }:
+                return None
+            raise
+
+        latest = self._agent_runtime.query_bundle_run_report(run.run_ref)
+        if latest is None or latest.report != candidate:
+            report_hash = canonical_hash(projection_plain_value(candidate))
+            self._agent_runtime.accept_bundle_report(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                report=candidate,
+                formal_plan_content_receipt=formal_plan_content_receipt,
+                formal_plan_projection_receipt=formal_plan_projection_receipt,
+                target_graph_ref=graph.graph_ref,
+                target_graph_receipt=graph.head_receipt,
+                idempotency_key=_operation_key(
+                    "bundle-report-accept", run.run_ref, report_hash
+                ),
+            )
+            self._transient_error = None
+            return True
+        return self._consume_bundle_report(request, run, latest)
+
+    def _bundle_report_disposition_hint(
+        self,
+        graph: AcceptedTargetGraph,
+    ) -> str | None:
+        """Read current AR terminal projections without inventing completion."""
+
+        terminals: list[object] = []
+        unlaunched = False
+        for target in graph.targets:
+            frontier = self._agent_runtime.query_target_frontier_entry(
+                target.target_ref
+            )
+            notice = self._agent_runtime.query_target_work_notice(target.target_ref)
+            if frontier is None:
+                if notice is not None:
+                    raise OwnerConflict("bundle_report_handoff_invalid")
+                unlaunched = True
+                continue
+            if (
+                frontier.state != "terminal"
+                or frontier.currentness_known is not True
+                or frontier.current is not True
+            ):
+                return None
+            if notice is None:
+                raise OwnerConflict("bundle_report_handoff_missing")
+            if notice.target_ref != target.target_ref:
+                raise OwnerConflict("bundle_report_handoff_invalid")
+            handoff = self._agent_runtime.read_target_run_handoff(
+                notice.handoff_manifest_ref
+            )
+            terminals.append(handoff.terminal)
+
+        # The fixed prototype gives a technical blocker precedence.  Targets
+        # that were never launched may only be omitted if AR later proves they
+        # are descendants of that blocker while building the report.
+        if any(type(terminal) is TechnicalBlocker for terminal in terminals):
+            return "blocked"
+        if unlaunched:
+            return None
+        if any(type(terminal) is SemanticBarrier for terminal in terminals):
+            return "replan_required"
+        if terminals and all(
+            type(terminal) is AcceptedMeasurementClosure for terminal in terminals
+        ):
+            return "realized"
+        return None
+
+    def _consume_bundle_report(
+        self,
+        request: StageRunRequest,
+        run: BundleStageRun,
+        accepted: VerifiedBundleReportReceipt,
+    ) -> bool:
+        """Mechanically map one accepted report to its next Owner boundary."""
+
+        disposition = accepted.report.disposition
+        if disposition == "realized":
+            completion = run.completion
+            if completion is None:
+                self._agent_runtime.complete_bundle_run(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    report_ref=accepted.report_ref,
+                    decision_receipt=accepted.receipt,
+                    idempotency_key=_operation_key(
+                        "bundle-report-complete", run.run_ref, accepted.report_ref
+                    ),
                 )
                 self._transient_error = None
                 return True
-        for target in graph.targets:
-            if target.target_ref in committed_refs:
-                continue
-            binding = self._research_graph.query_target_run_binding(target.target_ref)
-            if binding is None:
-                continue
-            domain = self._research_graph.query_experiment(
-                binding.evaluation_attempt_ref
-            )
-            target_run = self._agent_runtime.query_experiment_run(
-                binding.evaluation_attempt_ref
-            )
             if (
-                domain is None
-                or target_run is None
-                or domain.formal_measurement_status != "accepted"
-                or target_run.status != "executed"
-                or target_run.result_hash is None
-                or target_run.execution_receipt is None
+                completion.outcome_ref != accepted.report_ref
+                or completion.decision_receipt != accepted.receipt
             ):
-                continue
-            result_roles = tuple(
-                role
-                for role in self._research_graph.query_experiment_asset_roles(
-                    binding.evaluation_attempt_ref
+                raise OwnerConflict("bundle_report_completion_invalid")
+            if (
+                self._advancement_engine.query_bundle_stage_commit(
+                    request.request_ref
                 )
-                if role.role == "result_content"
+                is None
+            ):
+                self._advancement_engine.commit_bundle_stage(
+                    request_ref=request.request_ref,
+                    run_ref=run.run_ref,
+                    bundle_report_ref=accepted.report_ref,
+                    run_completion_receipt=completion.receipt,
+                    bundle_report_receipt=accepted.receipt,
+                    idempotency_key=_operation_key(
+                        "bundle-report-commit",
+                        request.request_ref,
+                        accepted.report_ref,
+                    ),
+                )
+                self._finish_bundle_jobs(run)
+                self._transient_error = None
+                return True
+            self._finish_bundle_jobs(run)
+            self._transient_error = None
+            return False
+
+        recorded = self._advancement_engine.query_bundle_report_disposition(
+            accepted.report_ref
+        )
+        if recorded is None:
+            self._advancement_engine.record_bundle_report_disposition(
+                request_ref=request.request_ref,
+                run_ref=run.run_ref,
+                bundle_report_ref=accepted.report_ref,
+                bundle_report_receipt=accepted.receipt,
+                idempotency_key=_operation_key(
+                    "bundle-report-disposition",
+                    request.request_ref,
+                    accepted.report_ref,
+                ),
             )
-            if len(result_roles) != 1:
-                raise OwnerConflict("target_commit_result_content_invalid")
-            materialized = self._research_memory.materialize_asset(
-                result_roles[0].binding.version_ref
-            )
-            try:
-                result_content = json.loads(materialized.content.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise OwnerConflict("target_commit_result_content_invalid") from error
-            if not isinstance(result_content, dict):
-                raise OwnerConflict("target_commit_result_content_invalid")
-            self._research_graph.accept_target_commit(
-                target_ref=target.target_ref,
-                target_run_ref=target_run.run_ref,
-                execution_attempt_ref=target_run.attempt_ref,
-                fence_ref=target_run.fence_ref,
-                execution_result_hash=target_run.result_hash,
-                execution_receipt=target_run.execution_receipt,
-                result_content=result_content,
-            )
+            self._transient_error = None
             return True
+        if (
+            recorded.request_ref != request.request_ref
+            or recorded.run_ref != run.run_ref
+            or recorded.report_ref != accepted.report_ref
+            or recorded.report_hash != accepted.report_hash
+            or recorded.disposition != disposition
+            or recorded.report_receipt != accepted.receipt
+        ):
+            raise OwnerConflict("bundle_report_disposition_invalid")
+        if disposition == "blocked":
+            self._transient_error = "bundle_report_blocked"
+            return False
+        if disposition != "replan_required":
+            raise OwnerConflict("bundle_report_disposition_invalid")
+
+        retirement = self._agent_runtime.query_bundle_replan_run_retirement(
+            recorded.disposition_ref
+        )
+        if retirement is None:
+            self._agent_runtime.retire_bundle_run_for_replan(
+                disposition_ref=recorded.disposition_ref,
+                disposition_receipt=recorded.receipt,
+                idempotency_key=_operation_key(
+                    "bundle-replan-retire",
+                    run.run_ref,
+                    recorded.disposition_ref,
+                ),
+            )
+            self._transient_error = None
+            return True
+        activation = self._advancement_engine.query_bundle_replan_activation(
+            recorded.disposition_ref
+        )
+        if activation is None:
+            self._advancement_engine.activate_bundle_replan(
+                disposition_ref=recorded.disposition_ref,
+                retirement_ref=retirement.retirement_ref,
+                retirement_receipt=retirement.receipt,
+                idempotency_key=_operation_key(
+                    "bundle-replan-activate",
+                    request.request_ref,
+                    recorded.disposition_ref,
+                ),
+            )
+            self._finish_bundle_jobs(run)
+            self._transient_error = None
+            return True
+        self._finish_bundle_jobs(run)
+        self._transient_error = "bundle_replan_activated"
         return False
 
     def _advance_target_authorization(
@@ -482,8 +887,30 @@ class BundleStageWorker:
         if self._human_collaboration is None:
             self._transient_error = "human_collaboration_unavailable"
             return None, False
-        assertion = _target_authorization_assertion(graph, target)
-        requirement = _target_authorization_requirement(graph, target)
+        projection = self._research_graph.query_target_candidate_projection(
+            target_ref=target.target_ref
+        )
+        if projection is None:
+            self._research_graph.accept_target_candidate_projection(
+                target_ref=target.target_ref,
+                idempotency_key=_operation_key(
+                    "target-candidate-projection", target.target_ref
+                ),
+            )
+            self._transient_error = None
+            return None, True
+        if projection.source_spec_hash != target.spec_hash:
+            raise OwnerConflict("target_candidate_projection_source_invalid")
+        assertion = _target_authorization_assertion(
+            graph,
+            target,
+            target_spec_hash=projection.projection_digest,
+        )
+        requirement = _target_authorization_requirement(
+            graph,
+            target,
+            target_spec_hash=projection.projection_digest,
+        )
         request = self._target_human_request(graph.quest_ref, assertion)
         waiter = {
             "waiter_ref": target.target_ref,
@@ -661,31 +1088,62 @@ class BundleStageWorker:
         for target in graph.targets:
             if target.target_ref in committed:
                 continue
-            binding = self._research_graph.query_target_run_binding(target.target_ref)
-            if binding is not None:
-                target_run = self._agent_runtime.query_experiment_run(
-                    binding.evaluation_attempt_ref
+            frontier = self._agent_runtime.query_target_frontier_entry(
+                target.target_ref
+            )
+            notice = self._agent_runtime.query_target_work_notice(
+                target.target_ref
+            )
+            launch = self._agent_runtime.query_admitted_target_launch(
+                target.target_ref
+            )
+            if notice is not None and notice.kind in {
+                "coordination_required",
+                "semantic_change_required",
+            }:
+                blocked.append(
+                    {
+                        "target_ref": target.target_ref,
+                        "reason": {
+                            "code": "target_" + notice.kind,
+                            "compact_reason": notice.compact_reason,
+                            "pending_obligation_refs": list(
+                                notice.pending_obligation_refs
+                            ),
+                        },
+                    }
                 )
-                if target_run is not None and target_run.status == "failed":
-                    blocked.append(
-                        {
-                            "target_ref": target.target_ref,
-                            "reason": {
-                                "code": target_run.failure_code or "target_run_failed"
-                            },
-                        }
-                    )
-                else:
-                    running.append(
-                        {
-                            "target_ref": target.target_ref,
-                            "target_run_ref": binding.target_run_ref,
-                        }
-                    )
+                continue
+            if frontier is not None or launch is not None:
+                running.append(
+                    {
+                        "target_ref": target.target_ref,
+                        "target_run_ref": (
+                            frontier.current_handle.target_run_ref
+                            if frontier is not None
+                            else launch.target_run_ref
+                        ),
+                    }
+                )
                 continue
             if target.spec.get("risk_class") == "high":
-                assertion = _target_authorization_assertion(graph, target)
-                request = self._target_human_request(graph.quest_ref, assertion)
+                projection = (
+                    self._research_graph.query_target_candidate_projection(
+                        target_ref=target.target_ref
+                    )
+                )
+                request = (
+                    None
+                    if projection is None
+                    else self._target_human_request(
+                        graph.quest_ref,
+                        _target_authorization_assertion(
+                            graph,
+                            target,
+                            target_spec_hash=projection.projection_digest,
+                        ),
+                    )
+                )
                 if request is None or request.get("status") != "satisfied":
                     blocked.append(
                         {
@@ -709,13 +1167,37 @@ class BundleStageWorker:
 
     @staticmethod
     def _dispatch_target(target: AcceptedTarget) -> dict[str, object]:
+        candidate = target.spec.get("candidate")
+        risk_class = target.spec.get("risk_class")
+        if (
+            not isinstance(candidate, dict)
+            or risk_class not in {"normal", "high"}
+        ):
+            raise OwnerConflict("target_dispatch_formal_spec_invalid")
         return {
             "target_ref": target.target_ref,
             "target_key": target.target_key,
             "spec_hash": target.spec_hash,
             "spec": target.spec,
+            "candidate": candidate,
+            "risk_class": risk_class,
             "dependency_refs": list(target.dependency_refs),
             "receipt": target.receipt.as_public_dict(),
+        }
+
+    @staticmethod
+    def _target_commit_projection(commit: TargetCommit) -> dict[str, object]:
+        return {
+            "commit_ref": commit.commit_ref,
+            "target_ref": commit.target_ref,
+            "target_run_ref": commit.target_run_ref,
+            "evaluation_attempt_ref": commit.evaluation_attempt_ref,
+            "target_spec_hash": commit.target_spec_hash,
+            "closure_hash": commit.closure_hash,
+            "result_disposition": commit.result_disposition,
+            "protocol": commit.closure["protocol"],
+            "metric_result": commit.closure["metric_result"],
+            "receipt": commit.receipt.as_public_dict(),
         }
 
     def _publish_target_commit_evidence(
@@ -780,6 +1262,49 @@ class BundleStageWorker:
             if request is None
             else self._advancement_engine.query_bundle_stage_commit(request.request_ref)
         )
+        exhaustion_operation = (
+            None
+            if request is None
+            else self._advancement_engine.query_bundle_exhaustion_for_request(
+                request.request_ref
+            )
+        )
+        exhaustion_evidence = (
+            None
+            if run is None
+            else self._agent_runtime.query_bundle_exhaustion_evidence_for_run(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+            )
+        )
+        bundle_report = (
+            None
+            if run is None
+            else self._agent_runtime.query_bundle_run_report(run.run_ref)
+        )
+        report_disposition = (
+            None
+            if bundle_report is None
+            else self._advancement_engine.query_bundle_report_disposition(
+                bundle_report.report_ref
+            )
+        )
+        replan_retirement = (
+            None
+            if report_disposition is None
+            or report_disposition.disposition != "replan_required"
+            else self._agent_runtime.query_bundle_replan_run_retirement(
+                report_disposition.disposition_ref
+            )
+        )
+        replan_activation = (
+            None
+            if report_disposition is None
+            or report_disposition.disposition != "replan_required"
+            else self._advancement_engine.query_bundle_replan_activation(
+                report_disposition.disposition_ref
+            )
+        )
         graph_projection = {
             "status": "not_attempted",
             "targets": [],
@@ -792,45 +1317,66 @@ class BundleStageWorker:
             frontier_refs = {target.target_ref for target in frontier}
             commits = self._research_graph.query_target_commits(graph.graph_ref)
             commit_by_target = {commit.target_ref: commit for commit in commits}
-            run_by_target = {
-                target.target_ref: self._research_graph.query_target_run_binding(
+            frontier_by_target = {
+                target.target_ref: self._agent_runtime.query_target_frontier_entry(
                     target.target_ref
                 )
                 for target in graph.targets
             }
-            execution_by_target = {}
-            for target in graph.targets:
-                target_binding = run_by_target[target.target_ref]
-                execution_by_target[target.target_ref] = (
-                    None
-                    if target_binding is None
-                    else self._agent_runtime.query_experiment_run(
-                        target_binding.evaluation_attempt_ref
-                    )
+            notice_by_target = {
+                target.target_ref: self._agent_runtime.query_target_work_notice(
+                    target.target_ref
                 )
+                for target in graph.targets
+            }
+            launch_by_target = {
+                target.target_ref: self._agent_runtime.query_admitted_target_launch(
+                    target.target_ref
+                )
+                for target in graph.targets
+            }
             target_rows: list[dict[str, object]] = []
             for target in graph.targets:
-                target_binding = run_by_target[target.target_ref]
-                target_execution = execution_by_target[target.target_ref]
+                target_frontier = frontier_by_target[target.target_ref]
+                target_notice = notice_by_target[target.target_ref]
+                target_launch = launch_by_target[target.target_ref]
                 blocker = None
                 if target.target_ref in commit_by_target:
                     status = "committed"
-                elif (
-                    target_execution is not None and target_execution.status == "failed"
-                ):
+                elif target_notice is not None and target_notice.kind in {
+                    "coordination_required",
+                    "semantic_change_required",
+                }:
                     status = "blocked"
                     blocker = {
-                        "code": (target_execution.failure_code or "target_run_failed")
+                        "code": "target_" + target_notice.kind,
+                        "compact_reason": target_notice.compact_reason,
+                        "pending_obligation_refs": list(
+                            target_notice.pending_obligation_refs
+                        ),
                     }
-                elif target_binding is not None:
+                elif target_frontier is not None or target_launch is not None:
                     status = "running"
                 elif (
                     target.spec.get("risk_class") == "high"
                     and target.target_ref in frontier_refs
                 ):
-                    assertion = _target_authorization_assertion(graph, target)
-                    human_request = self._target_human_request(
-                        graph.quest_ref, assertion
+                    projection = (
+                        self._research_graph.query_target_candidate_projection(
+                            target_ref=target.target_ref
+                        )
+                    )
+                    human_request = (
+                        None
+                        if projection is None
+                        else self._target_human_request(
+                            graph.quest_ref,
+                            _target_authorization_assertion(
+                                graph,
+                                target,
+                                target_spec_hash=projection.projection_digest,
+                            ),
+                        )
                     )
                     waiter = (
                         None
@@ -874,13 +1420,16 @@ class BundleStageWorker:
                     {
                         "target_ref": target.target_ref,
                         "target_key": target.target_key,
-                        "target_type": target.spec["target_type"],
                         "spec_hash": target.spec_hash,
                         "dependency_refs": list(target.dependency_refs),
                         "target_run_ref": (
-                            None
-                            if target_binding is None
-                            else target_binding.target_run_ref
+                            target_frontier.current_handle.target_run_ref
+                            if target_frontier is not None
+                            else (
+                                None
+                                if target_launch is None
+                                else target_launch.target_run_ref
+                            )
                         ),
                         "status": status,
                         "blocker": blocker,
@@ -892,7 +1441,13 @@ class BundleStageWorker:
                 "graph_ref": graph.graph_ref,
                 "formal_plan_ref": graph.formal_plan_ref,
                 "target_plan_hash": graph.target_plan_hash,
-                "receipt": graph.receipt.as_public_dict(),
+                "head_generation": graph.head_generation,
+                "strategy_complete": graph.strategy_complete,
+                "target_set_hash": graph.target_set_hash,
+                "coverage_hash": graph.coverage_hash,
+                "root_receipt": graph.receipt.as_public_dict(),
+                "head_receipt": graph.head_receipt.as_public_dict(),
+                "receipt": graph.head_receipt.as_public_dict(),
                 "targets": target_rows,
                 "frontier": [target.target_ref for target in frontier],
             }
@@ -936,8 +1491,126 @@ class BundleStageWorker:
                 for commit in commits
                 if (evidence := evidence_by_commit.get(commit.commit_ref)) is not None
             ]
+        report_projection = (
+            None
+            if bundle_report is None
+            else {
+                "status": "accepted",
+                "report_ref": bundle_report.report_ref,
+                "report_hash": bundle_report.report_hash,
+                "disposition": bundle_report.report.disposition,
+                "formal_plan_ref": bundle_report.formal_plan_ref,
+                "plan_document_hash": bundle_report.plan_document_hash,
+                "formal_plan_content_receipt": (
+                    bundle_report.formal_plan_content_receipt.as_public_dict()
+                ),
+                "formal_plan_projection_digest": (
+                    bundle_report.formal_plan_projection_digest
+                ),
+                "formal_plan_projection_receipt": (
+                    bundle_report.formal_plan_projection_receipt.as_public_dict()
+                ),
+                "target_graph_ref": bundle_report.target_graph_ref,
+                "target_graph_generation": (
+                    bundle_report.target_graph_generation
+                ),
+                "report": projection_plain_value(bundle_report.report),
+                "receipt": bundle_report.receipt.as_public_dict(),
+            }
+        )
+        exhaustion_projection = (
+            None
+            if exhaustion_operation is None
+            else {
+                "kind": "BundleExhaustion",
+                "status": exhaustion_operation.status,
+                "operation_ref": exhaustion_operation.operation_ref,
+                "proposal_identity": exhaustion_operation.proposal_identity,
+                "proposal_hash": exhaustion_operation.proposal_hash,
+                "proposal_ref": exhaustion_operation.accepted_proposal_ref,
+                "decision_receipt": (
+                    exhaustion_operation.decision_receipt.as_public_dict()
+                ),
+                "evidence": (
+                    None
+                    if exhaustion_evidence is None
+                    else exhaustion_evidence.as_dict()
+                ),
+                "basis_kind": (
+                    None if stage_commit is None else stage_commit.basis_kind
+                ),
+                "basis_ref": (
+                    None if stage_commit is None else stage_commit.basis_ref
+                ),
+                "basis_receipt": (
+                    None
+                    if stage_commit is None or stage_commit.basis_receipt is None
+                    else stage_commit.basis_receipt.as_public_dict()
+                ),
+            }
+        )
         disposition: dict[str, object] = {"status": "not_attempted"}
-        if graph is not None:
+        if bundle_report is not None:
+            if stage_commit is not None:
+                report_status = "completed"
+            elif report_disposition is None:
+                report_status = "report_accepted"
+            elif replan_activation is not None:
+                report_status = "replan_activated"
+            elif replan_retirement is not None:
+                report_status = "pending_replan_activation"
+            else:
+                report_status = report_disposition.status
+            disposition = {
+                "status": report_status,
+                "report_ref": bundle_report.report_ref,
+                "report_hash": bundle_report.report_hash,
+                "report_disposition": bundle_report.report.disposition,
+                "disposition_ref": (
+                    None
+                    if report_disposition is None
+                    else report_disposition.disposition_ref
+                ),
+                "disposition_receipt": (
+                    None
+                    if report_disposition is None
+                    else report_disposition.receipt.as_public_dict()
+                ),
+                "retirement_ref": (
+                    None
+                    if replan_retirement is None
+                    else replan_retirement.retirement_ref
+                ),
+                "activation_ref": (
+                    None
+                    if replan_activation is None
+                    else replan_activation.activation_ref
+                ),
+            }
+        elif exhaustion_operation is not None:
+            disposition = {
+                "status": (
+                    "completed"
+                    if stage_commit is not None
+                    else exhaustion_operation.status
+                ),
+                "report_disposition": (
+                    "exhausted"
+                    if stage_commit is not None
+                    else None
+                ),
+                "operation_ref": exhaustion_operation.operation_ref,
+                "proposal_ref": exhaustion_operation.accepted_proposal_ref,
+                "decision_receipt": (
+                    exhaustion_operation.decision_receipt.as_public_dict()
+                ),
+                "basis_receipt": (
+                    None
+                    if stage_commit is None or stage_commit.basis_receipt is None
+                    else stage_commit.basis_receipt.as_public_dict()
+                ),
+            }
+        elif graph is not None:
             blocked_targets = [
                 target
                 for target in cast(list[dict[str, object]], graph_projection["targets"])
@@ -986,6 +1659,12 @@ class BundleStageWorker:
             "target_graph": graph_projection,
             "target_commits": target_commit_projection,
             "baseline_pool": baseline_pool,
+            "bundle_report": report_projection,
+            **(
+                {"bundle_exhaustion": exhaustion_projection}
+                if exhaustion_projection is not None
+                else {}
+            ),
             "disposition": disposition,
             "stage_commit": (
                 None if stage_commit is None else _public_commit(stage_commit)
@@ -1045,18 +1724,187 @@ class BundleStageWorker:
         ):
             raise OwnerConflict("bundle_stage_request_lineage_invalid")
 
+    def _advance_exhaustion(
+        self,
+        request: StageRunRequest,
+        run: BundleStageRun,
+    ) -> bool:
+        """Advance the fixed exhaustion path by one durable Owner boundary."""
+
+        accepted_formal_plan = request.accepted_formal_plan
+        if accepted_formal_plan is None:
+            raise OwnerConflict("bundle_formal_plan_binding_invalid")
+        evidence = self._agent_runtime.query_bundle_exhaustion_evidence_for_run(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+        )
+        if evidence is None:
+            raise OwnerConflict("bundle_exhaustion_evidence_missing")
+        if (
+            evidence.evidence.stage_run_request_ref != request.request_ref
+            or evidence.evidence.run_ref != run.run_ref
+            or evidence.evidence.attempt_ref != run.attempt_ref
+            or evidence.evidence.execution_fence_ref != run.fence_ref
+            or evidence.evidence.formal_plan_ref
+            != accepted_formal_plan.formal_plan_ref
+            or evidence.evidence.formal_plan_content_hash
+            != accepted_formal_plan.plan_document_hash
+        ):
+            raise OwnerConflict("bundle_exhaustion_evidence_binding_invalid")
+
+        formal_content = (
+            self._research_graph.query_formal_plan_content_acceptance(
+                accepted_formal_plan.formal_plan_ref
+            )
+        )
+        if formal_content is None:
+            self._research_graph.accept_formal_plan_content(
+                formal_plan_ref=accepted_formal_plan.formal_plan_ref,
+                idempotency_key=_operation_key(
+                    "bundle-exhaustion-formal-plan-content",
+                    request.request_ref,
+                    accepted_formal_plan.formal_plan_ref,
+                ),
+            )
+            return True
+        if (
+            formal_content.plan_document_hash
+            != accepted_formal_plan.plan_document_hash
+            or formal_content.formal_plan_ref
+            != accepted_formal_plan.formal_plan_ref
+        ):
+            raise OwnerConflict(
+                "bundle_exhaustion_formal_plan_content_acceptance_invalid"
+            )
+
+        operation = self._advancement_engine.query_bundle_exhaustion_for_request(
+            request.request_ref
+        )
+        proposal = BundleExhaustionProposal(
+            proposal_identity=(
+                "bundle-exhaustion-proposal:"
+                + canonical_hash(
+                    {
+                        "request_ref": request.request_ref,
+                        "run_ref": run.run_ref,
+                        "attempt_ref": run.attempt_ref,
+                        "fence_ref": run.fence_ref,
+                        "evidence_ref": evidence.evidence_ref,
+                        "evidence_hash": evidence.evidence.evidence_hash,
+                    }
+                )[:48]
+            ),
+            stage_run_request_ref=request.request_ref,
+            stage_run_request_receipt_ref=request.receipt.receipt_ref,
+            stage_run_request_receipt_hash=request.receipt.payload_hash,
+            cycle_ref=request.cycle_ref,
+            epoch=request.epoch,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            root_session_ref=run.root_session_ref,
+            execution_fence_ref=run.fence_ref,
+            context_pack_ref=request.context_pack_ref,
+            context_pack_hash=request.context_pack_hash,
+            formal_plan_ref=formal_content.formal_plan_ref,
+            formal_plan_content_hash=formal_content.plan_document_hash,
+            formal_plan_content_receipt=formal_content.receipt,
+            evidence_ref=evidence.evidence_ref,
+            evidence_hash=evidence.evidence.evidence_hash,
+            evidence_receipt=evidence.receipt,
+        )
+        if operation is None:
+            self._advancement_engine.submit_bundle_exhaustion_proposal(
+                proposal=proposal,
+                idempotency_key=_operation_key(
+                    "bundle-exhaustion-submit",
+                    request.request_ref,
+                    proposal.proposal_identity,
+                ),
+            )
+            return True
+        if (
+            operation.proposal_identity != proposal.proposal_identity
+            or operation.proposal_hash != proposal.proposal_hash
+        ):
+            raise OwnerConflict("bundle_exhaustion_proposal_conflict")
+        if operation.status in {"outcome_unknown", "technical_blocker"}:
+            reconciled = (
+                self._advancement_engine.reconcile_bundle_exhaustion_proposal(
+                    proposal_identity=proposal.proposal_identity,
+                    expected_proposal_hash=proposal.proposal_hash,
+                )
+            )
+            if reconciled is None:
+                self._transient_error = "bundle_exhaustion_outcome_unknown"
+                return False
+            changed = (
+                reconciled.status != operation.status
+                or reconciled.decision_receipt != operation.decision_receipt
+            )
+            self._transient_error = (
+                None
+                if reconciled.status == "accepted"
+                else f"bundle_exhaustion_{reconciled.status}"
+            )
+            return changed
+        if operation.status != "accepted":
+            self._transient_error = f"bundle_exhaustion_{operation.status}"
+            return False
+        if operation.accepted_proposal_ref is None:
+            raise OwnerConflict("bundle_exhaustion_acceptance_invalid")
+        if run.completion is None:
+            self._agent_runtime.complete_bundle_exhaustion_run(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                proposal_ref=operation.accepted_proposal_ref,
+                decision_receipt=operation.decision_receipt,
+                idempotency_key=_operation_key(
+                    "bundle-exhaustion-complete",
+                    run.run_ref,
+                    operation.accepted_proposal_ref,
+                ),
+            )
+            self._transient_error = None
+            return True
+        if (
+            self._advancement_engine.query_bundle_stage_commit(
+                request.request_ref
+            )
+            is None
+        ):
+            self._advancement_engine.commit_stage_disposition(
+                request_ref=request.request_ref,
+                run_ref=run.run_ref,
+                disposition="exhausted",
+                basis_kind=BUNDLE_EXHAUSTION_BASIS_KIND,
+                basis_ref=operation.accepted_proposal_ref,
+                basis_receipt=operation.decision_receipt,
+                run_completion_receipt=run.completion.receipt,
+                idempotency_key=_operation_key(
+                    "bundle-exhaustion-commit",
+                    request.request_ref,
+                    operation.accepted_proposal_ref,
+                ),
+            )
+            self._finish_bundle_jobs(run)
+            self._transient_error = None
+            return True
+        self._finish_bundle_jobs(run)
+        self._transient_error = None
+        return False
+
     def _execute_target_plan(
         self, request: StageRunRequest, run: BundleStageRun
     ) -> bool:
+        inbox_checkpoint = self._drain_bundle_inbox(run)
         accepted_formal_plan = request.accepted_formal_plan
         if accepted_formal_plan is None or not isinstance(
             run.runtime_binding, BundleRuntimeBinding
         ):
             raise OwnerConflict("bundle_runtime_binding_invalid")
-        try:
-            runtime_binding = self._provider.runtime_binding()
-        except BundleSkillUnavailable as error:
-            self._transient_error = error.code
+        runtime_binding = self._current_runtime_binding()
+        if runtime_binding is None:
             return False
         if runtime_binding != run.runtime_binding:
             self._transient_error = "bundle_runtime_binding_drift"
@@ -1068,8 +1916,18 @@ class BundleStageWorker:
         )
         job_ref = invocation.operation_ref
         unit_ref = invocation.invocation_ref
+        predecessor_rejections = (
+            self._agent_runtime.query_bundle_exhaustion_rejected_submissions(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+            )
+        )
         skill_request = BundleSkillRequest(
             stage_request_ref=request.request_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
             cycle_ref=request.cycle_ref,
             question_ref=request.accepted_question.question_ref,
             formal_plan_ref=accepted_formal_plan.formal_plan_ref,
@@ -1079,8 +1937,12 @@ class BundleStageWorker:
             plan_document=accepted_formal_plan.plan_document,
             root_session_ref=run.root_session_ref,
             runtime_binding=run.runtime_binding,
+            inbox_checkpoint=inbox_checkpoint.as_public_dict(),
             native_session_ref=run.native_session_ref,
             job_ref=job_ref,
+            predecessor_rejections=tuple(
+                item.as_dict() for item in predecessor_rejections
+            ),
         )
         if run.primary_draft is None:
             self._agent_runtime.begin_provider_unit(
@@ -1132,6 +1994,7 @@ class BundleStageWorker:
             draft=run.primary_draft.draft,
             primary_session_ref=run.primary_draft.native_session_ref,
             adapter_kind=run.primary_draft.adapter_kind,
+            output_kind=cast(str, _bundle_primary_output_kind(run)),
         )
         self._agent_runtime.begin_provider_unit(
             unit_ref=unit_ref,
@@ -1145,9 +2008,19 @@ class BundleStageWorker:
         try:
             try:
                 result = self._provider.review_draft(skill_request, draft)
-                draft_hash, target_plan_hash, _review_hash = (
-                    validate_bundle_skill_result(skill_request, result)
-                )
+                if isinstance(result, BundleExhaustionSkillResult):
+                    validate_bundle_exhaustion_skill_result(
+                        skill_request,
+                        result,
+                    )
+                elif isinstance(result, BundleSkillResult):
+                    draft_hash, target_plan_hash, _review_hash = (
+                        validate_bundle_skill_result(skill_request, result)
+                    )
+                else:
+                    raise BundleSkillContractError(
+                        "bundle_skill_result_invalid"
+                    )
             except BundleSkillUnavailable as error:
                 if error.code == "codex_operation_reconciliation_pending":
                     provider_safe = False
@@ -1156,6 +2029,17 @@ class BundleStageWorker:
             except BundleSkillContractError as error:
                 self._transient_error = str(error)
                 return False
+            if isinstance(result, BundleExhaustionSkillResult):
+                self._accept_exhaustion_review(
+                    request=request,
+                    run=run,
+                    result=result,
+                )
+                self._transient_error = None
+                finish_job = getattr(self._provider, "finish_job", None)
+                if callable(finish_job):
+                    finish_job(job_ref)
+                return True
             review = review_record(
                 result,
                 draft_hash=draft_hash,
@@ -1200,6 +2084,192 @@ class BundleStageWorker:
                     attempt_ref=run.attempt_ref,
                     fence_ref=run.fence_ref,
                 )
+
+    def _accept_exhaustion_review(
+        self,
+        *,
+        request: StageRunRequest,
+        run: BundleStageRun,
+        result: BundleExhaustionSkillResult,
+    ) -> None:
+        accepted_formal_plan = request.accepted_formal_plan
+        checkpoint = run.primary_draft
+        primary_response_hash = run.primary_invocation.response_hash
+        if (
+            accepted_formal_plan is None
+            or checkpoint is None
+            or primary_response_hash is None
+            or result.reviewed_assessment != checkpoint.draft
+            or result.reviewed_assessment_hash != checkpoint.draft_hash
+        ):
+            raise OwnerConflict("bundle_exhaustion_primary_binding_invalid")
+        assessment_value = result.reviewed_assessment.get(
+            "exhaustion_assessment"
+        )
+        if not isinstance(assessment_value, dict):
+            raise OwnerConflict("bundle_exhaustion_assessment_invalid")
+        try:
+            completion = normalized_completion_contract_from_dict(
+                assessment_value.get("completion_contract"),
+                plan_document=accepted_formal_plan.plan_document,
+            )
+        except BundleTargetContractError as error:
+            raise OwnerConflict(
+                "bundle_exhaustion_completion_contract_invalid"
+            ) from error
+        raw_records = assessment_value.get("exploration_records")
+        if not isinstance(raw_records, list):
+            raise OwnerConflict("bundle_exhaustion_exploration_invalid")
+        assessment_receipt = (
+            self._agent_runtime.query_bundle_exhaustion_assessment_receipt(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+            )
+        )
+        rejected_submissions = (
+            self._agent_runtime.query_bundle_exhaustion_rejected_submissions(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+            )
+        )
+        records = tuple(
+            bundle_exhaustion_exploration_record_from_claim(
+                raw,
+                assessment_content_hash=result.reviewed_assessment_hash,
+                assessment_receipt=assessment_receipt,
+            )
+            for raw in cast(list[dict[str, object]], raw_records)
+        )
+        evidence_identity = (
+            "bundle-exhaustion-evidence:"
+            + canonical_hash(
+                {
+                    "request_ref": request.request_ref,
+                    "run_ref": run.run_ref,
+                    "attempt_ref": run.attempt_ref,
+                    "fence_ref": run.fence_ref,
+                    "assessment_hash": result.reviewed_assessment_hash,
+                    "review_trace": result.review_trace.as_dict(),
+                }
+            )[:48]
+        )
+        evidence = BundleExhaustionEvidence(
+            evidence_identity=evidence_identity,
+            stage_run_request_ref=request.request_ref,
+            stage_run_request_receipt_ref=request.receipt.receipt_ref,
+            stage_run_request_receipt_hash=request.receipt.payload_hash,
+            cycle_ref=request.cycle_ref,
+            epoch=request.epoch,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            root_session_ref=run.root_session_ref,
+            execution_fence_ref=run.fence_ref,
+            context_pack_ref=request.context_pack_ref,
+            context_pack_hash=request.context_pack_hash,
+            formal_plan_ref=accepted_formal_plan.formal_plan_ref,
+            formal_plan_content_hash=(
+                accepted_formal_plan.plan_document_hash
+            ),
+            native_session_ref=result.primary_session_ref,
+            primary_invocation_ref=run.primary_invocation.invocation_ref,
+            primary_response_hash=primary_response_hash,
+            primary_assessment_hash=result.reviewed_assessment_hash,
+            review_invocation_ref=run.review_invocation.invocation_ref,
+            reviewer_agent_ref=result.reviewer_agent_ref,
+            review_findings=result.findings,
+            review_trace=result.review_trace,
+            completion_contract=completion,
+            exploration_records=records,
+            rejected_submissions=rejected_submissions,
+        )
+        accepted = self._agent_runtime.accept_bundle_exhaustion_evidence(
+            evidence=evidence,
+            idempotency_key=_operation_key(
+                "bundle-exhaustion-evidence",
+                run.run_ref,
+                run.attempt_ref,
+                evidence.evidence_hash,
+            ),
+        )
+        if accepted.evidence != evidence:
+            raise OwnerConflict("bundle_exhaustion_evidence_conflict")
+
+    def _drain_bundle_inbox(
+        self, run: BundleStageRun
+    ) -> BundleInboxCheckpoint:
+        """Read, validate, then CAS-ack one complete run-scoped notice prefix."""
+
+        batch = self._agent_runtime.read_bundle_inbox(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+        )
+        checkpoint = self._agent_runtime.acknowledge_bundle_inbox(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            batch=batch,
+            idempotency_key=_operation_key(
+                "bundle-inbox-ack",
+                run.run_ref,
+                run.attempt_ref,
+                run.fence_ref,
+                str(batch.after_cursor),
+                str(batch.next_cursor),
+                str(batch.generation),
+                canonical_hash(projection_plain_value(batch)),
+            ),
+        )
+        self._agent_runtime.verify_bundle_inbox_checkpoint(
+            checkpoint=checkpoint,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            require_current=True,
+        )
+        return checkpoint
+
+    def _operation_uses_inbox_checkpoint(
+        self,
+        *,
+        operation_kind: str,
+        operation_ref: str,
+        checkpoint: BundleInboxCheckpoint,
+    ) -> bool:
+        bound = self._agent_runtime.query_bundle_inbox_operation_checkpoint(
+            operation_kind=operation_kind,
+            operation_ref=operation_ref,
+        )
+        return bound == checkpoint
+
+    def _current_runtime_binding(self) -> BundleRuntimeBinding | None:
+        if self._harnesses is None:
+            self._transient_error = (
+                "bundle_harness_full_conformance_unavailable"
+            )
+            return None
+        try:
+            conformance = self._harnesses.require_full_conformance_binding()
+            runtime_binding = self._provider.runtime_binding()
+        except (BundleSkillUnavailable, HarnessAdmissionError) as error:
+            self._transient_error = error.code
+            return None
+        return bind_bundle_runtime_to_full_conformance(
+            runtime_binding, conformance
+        )
+
+    def _runtime_binding_is_current(self, run: BundleStageRun) -> bool:
+        if not isinstance(run.runtime_binding, BundleRuntimeBinding):
+            raise OwnerConflict("bundle_runtime_binding_invalid")
+        current = self._current_runtime_binding()
+        if current is None:
+            return False
+        if current != run.runtime_binding:
+            self._transient_error = "bundle_runtime_binding_drift"
+            return False
+        return True
 
     def _finish_bundle_jobs(self, run: BundleStageRun) -> None:
         finish_job = getattr(self._provider, "finish_job", None)
@@ -1271,6 +2341,17 @@ def _not_eligible_projection(
     }
 
 
+def _bundle_primary_output_kind(run: BundleStageRun) -> str | None:
+    checkpoint = run.primary_draft
+    if checkpoint is None:
+        return None
+    if set(checkpoint.draft) == {"exhaustion_assessment"} and isinstance(
+        checkpoint.draft.get("exhaustion_assessment"), dict
+    ):
+        return "exhaustion_assessment"
+    return "target_plan"
+
+
 def _public_request(request: StageRunRequest) -> dict[str, object]:
     if request.stage != "bundle" or request.accepted_formal_plan is None:
         raise OwnerConflict("bundle_stage_request_invalid")
@@ -1289,11 +2370,25 @@ def _public_request(request: StageRunRequest) -> dict[str, object]:
 
 
 def _public_commit(commit: StageCommit) -> dict[str, object]:
-    if commit.stage != "bundle" or commit.closure is None:
+    is_bundle_exhaustion = (
+        commit.disposition == "exhausted"
+        and commit.basis_kind == BUNDLE_EXHAUSTION_BASIS_KIND
+    )
+    if commit.stage != "bundle" or (
+        commit.closure is None and not is_bundle_exhaustion
+    ):
         raise OwnerConflict("bundle_stage_commit_invalid")
-    target_commit_refs = commit.closure.get("target_commit_refs")
+    target_commit_refs = (
+        [] if commit.closure is None else commit.closure.get("target_commit_refs")
+    )
     if not isinstance(target_commit_refs, list):
         raise OwnerConflict("bundle_stage_commit_invalid")
+    if is_bundle_exhaustion:
+        public_outcome_kind = "BundleExhaustion"
+    elif commit.outcome_kind == "bundle_skip":
+        public_outcome_kind = "BundleSkip"
+    else:
+        public_outcome_kind = "TargetGraph"
     return {
         "status": "Skipped" if commit.disposition == "skipped" else "Completed",
         "commit_ref": commit.commit_ref,
@@ -1304,9 +2399,7 @@ def _public_commit(commit: StageCommit) -> dict[str, object]:
         "epoch": commit.epoch,
         "run_ref": commit.run_ref,
         "outcome_ref": commit.outcome_ref,
-        "outcome_kind": (
-            "BundleSkip" if commit.outcome_kind == "bundle_skip" else "TargetGraph"
-        ),
+        "outcome_kind": public_outcome_kind,
         "disposition": commit.disposition,
         "target_commit_refs": target_commit_refs,
         "run_completion_receipt": (
@@ -1314,48 +2407,54 @@ def _public_commit(commit: StageCommit) -> dict[str, object]:
             if commit.run_completion_receipt is None
             else commit.run_completion_receipt.as_public_dict()
         ),
-        "outcome_receipt": commit.outcome_receipt.as_public_dict(),
-        "closure_hash": canonical_hash(commit.closure),
+        "outcome_receipt": (
+            None
+            if commit.outcome_receipt is None
+            else commit.outcome_receipt.as_public_dict()
+        ),
+        "basis_kind": commit.basis_kind,
+        "basis_ref": commit.basis_ref,
+        "basis_receipt": (
+            None
+            if commit.basis_receipt is None
+            else commit.basis_receipt.as_public_dict()
+        ),
+        "closure_hash": (
+            None if commit.closure is None else canonical_hash(commit.closure)
+        ),
         "receipt": commit.receipt.as_public_dict(),
         "next_stage": "Reasoning",
     }
 
 
-def _target_experiment_intent(
-    quest_ref: str, target: AcceptedTarget
-) -> ExperimentIntent:
-    return ExperimentIntent(
-        execution_request_ref=f"bundle-target-{target.target_ref}",
-        quest_ref=quest_ref,
-        title=cast(str, target.spec["title"]),
-        hypothesis=cast(str, target.spec["hypothesis"]),
-        variant_parameter=float(target.spec["variant_parameter"]),
-        sample_count=cast(int, target.spec["sample_count"]),
-    )
-
-
 def _target_authorization_assertion(
-    graph: AcceptedTargetGraph, target: AcceptedTarget
+    graph: AcceptedTargetGraph,
+    target: AcceptedTarget,
+    *,
+    target_spec_hash: str,
 ) -> dict[str, object]:
     return target_execution_assertion(
         quest_ref=graph.quest_ref,
         stage_request_ref=graph.request_ref,
         graph_ref=graph.graph_ref,
         target_ref=target.target_ref,
-        target_spec_hash=target.spec_hash,
+        target_spec_hash=target_spec_hash,
         risk_class=cast(str, target.spec["risk_class"]),
     )
 
 
 def _target_authorization_requirement(
-    graph: AcceptedTargetGraph, target: AcceptedTarget
+    graph: AcceptedTargetGraph,
+    target: AcceptedTarget,
+    *,
+    target_spec_hash: str,
 ) -> dict[str, object]:
     return target_execution_authorization_requirement(
         quest_ref=graph.quest_ref,
         stage_request_ref=graph.request_ref,
         graph_ref=graph.graph_ref,
         target_ref=target.target_ref,
-        target_spec_hash=target.spec_hash,
+        target_spec_hash=target_spec_hash,
     )
 
 

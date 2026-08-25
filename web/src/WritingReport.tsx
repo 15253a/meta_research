@@ -541,7 +541,7 @@ export function WritingReportWorkbench({
                   <div><dt>内容</dt><dd>{activeComparison.content.changed ? "changed" : "same"}</dd></div>
                   <div><dt>证据</dt><dd>{activeComparison.evidence.changed ? "changed" : "same"}</dd></div>
                   <div><dt>引用</dt><dd>{activeComparison.citation.changed ? "changed" : "same"} · {activeComparison.citation.left_status} → {activeComparison.citation.right_status}</dd></div>
-                  <div><dt>Snapshot</dt><dd>{activeComparison.stale ? "stale" : "current"}</dd></div>
+                  <div><dt>Snapshot</dt><dd>frozen · {activeComparison.snapshot.snapshot_hash.slice(0, 12)}</dd></div>
                 </dl>
                 <div className="writing-comparison-axis">
                   <b>内容 diff</b>

@@ -2,6 +2,7 @@ import {
   StrictMode,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -21,6 +22,7 @@ import {
   fetchLiteratureSnapshot,
   fetchManualQuestionCreation,
   fetchSnapshot,
+  fetchTargetRootObservations,
   followProjection,
   openManualQuestionCreation,
   ProductError,
@@ -32,6 +34,8 @@ import {
   type AssetIntakeResult,
   type AssetReceipt,
   type BundleStageProjection,
+  type BundleTargetCommitProjection,
+  type BundleTargetProjection,
   type ExperimentProjection,
   type IdeaQuestionSummary,
   type IdeaStageProjection,
@@ -42,6 +46,8 @@ import {
   type PublicSnapshot,
   type QuestionTreeItem,
   type ResearchControlAction,
+  type TargetRootObservationPage,
+  type TargetRootObservationPointer,
   type UnavailableCapability,
 } from "./api";
 import {
@@ -1761,12 +1767,275 @@ function bundleFactRows(
   ];
 }
 
+const targetRootObservationPageSize = 128;
+const targetRootObservationRenderLimit = 512;
+
+type TargetRootTerminalState = TargetRootObservationPage & {
+  trimmed_count: number;
+};
+
+function observationClock(recordedAt: number): string {
+  if (!Number.isFinite(recordedAt)) return "time unavailable";
+  return new Date(recordedAt * 1_000).toISOString().slice(11, 19);
+}
+
+function mergeTargetRootObservationPage(
+  current: TargetRootTerminalState | null,
+  incoming: TargetRootObservationPage,
+): TargetRootTerminalState {
+  if (!current || current.stream_ref !== incoming.stream_ref) {
+    const visible = incoming.items.slice(-targetRootObservationRenderLimit);
+    return {
+      ...incoming,
+      items: visible,
+      trimmed_count: Math.max(0, incoming.items.length - visible.length),
+    };
+  }
+  const eventRefs = new Set(current.items.map((item) => item.event_ref));
+  const appended = incoming.items.filter((item) => !eventRefs.has(item.event_ref));
+  const combined = [...current.items, ...appended].sort((left, right) =>
+    left.operation_generation - right.operation_generation
+    || left.sequence - right.sequence
+    || left.event_ref.localeCompare(right.event_ref)
+  );
+  const visible = combined.slice(-targetRootObservationRenderLimit);
+  return {
+    ...incoming,
+    items: visible,
+    trimmed_count:
+      current.trimmed_count + Math.max(0, combined.length - visible.length),
+  };
+}
+
+function BundleTargetCard({
+  target,
+  targetCommit,
+  observationPointer,
+}: {
+  target: BundleTargetProjection;
+  targetCommit: BundleTargetCommitProjection | undefined;
+  observationPointer: TargetRootObservationPointer | null;
+}) {
+  const terminalId = useId();
+  const [open, setOpen] = useState(false);
+  const [terminal, setTerminal] = useState<TargetRootTerminalState | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [terminalError, setTerminalError] = useState<string | null>(null);
+  const terminalRef = useRef<TargetRootTerminalState | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
+  const requestSequence = useRef(0);
+
+  const loadObservations = useCallback(async (restart: boolean) => {
+    const request = requestSequence.current + 1;
+    requestSequence.current = request;
+    activeRequest.current?.abort();
+    const controller = new AbortController();
+    activeRequest.current = controller;
+    const current = terminalRef.current;
+    const after = restart || !current ? null : current.next_cursor;
+    setLoading(true);
+    setTerminalError(null);
+    try {
+      const page = await fetchTargetRootObservations(target.target_ref, {
+        after,
+        limit: targetRootObservationPageSize,
+        signal: controller.signal,
+      });
+      if (
+        page.target_ref !== target.target_ref
+        || page.observation_only !== true
+      ) {
+        throw new ProductError("target_root_observation_identity_invalid");
+      }
+      if (request !== requestSequence.current) return;
+      setTerminal((previous) => {
+        const next = mergeTargetRootObservationPage(previous, page);
+        terminalRef.current = next;
+        return next;
+      });
+    } catch (caught) {
+      if ((caught as Error).name === "AbortError") return;
+      if (request !== requestSequence.current) return;
+      const code = caught instanceof ProductError
+        ? caught.code
+        : "target_root_observation_unavailable";
+      setTerminalError(code);
+    } finally {
+      if (request === requestSequence.current) {
+        activeRequest.current = null;
+        setLoading(false);
+      }
+    }
+  }, [target.target_ref]);
+
+  useEffect(() => {
+    if (!open) {
+      activeRequest.current?.abort();
+      return;
+    }
+    void loadObservations(terminalRef.current === null);
+    return () => activeRequest.current?.abort();
+  }, [loadObservations, open]);
+
+  useEffect(() => {
+    if (
+      !open
+      || observationPointer?.target_ref !== target.target_ref
+    ) return;
+    const current = terminalRef.current;
+    if (current === null) return;
+    if (
+      current.stream_ref === observationPointer.stream_ref
+      && current.head_cursor === observationPointer.head_cursor
+    ) return;
+    void loadObservations(
+      current.stream_ref !== observationPointer.stream_ref,
+    );
+  }, [
+    loadObservations,
+    observationPointer,
+    open,
+    target.target_ref,
+    terminal?.head_cursor,
+    terminal?.stream_ref,
+  ]);
+
+  useEffect(() => () => {
+    requestSequence.current += 1;
+    activeRequest.current?.abort();
+  }, []);
+
+  const result = targetCommit?.result_disposition
+    ?? target.blocker?.code
+    ?? target.status;
+  const atHead = Boolean(
+    terminal
+    && terminal.next_cursor === terminal.head_cursor
+    && !terminal.has_more,
+  );
+
+  return (
+    <article
+      className="lumen-bundle-target"
+      data-target-status={target.status}
+      data-target-ref={target.target_ref}
+    >
+      <div className="lumen-bundle-target-summary">
+        <span className="lumen-bundle-target-mark" aria-hidden="true">
+          {target.status === "committed" ? "✓" : target.status === "ready" ? "→" : "·"}
+        </span>
+        <p>
+          <b>{target.target_key}</b>
+          <small>
+            {target.target_ref} · {target.target_run_ref ?? "TargetRun pending"}
+          </small>
+        </p>
+        <div className="lumen-bundle-target-actions">
+          <code>{result}</code>
+          {target.target_run_ref ? (
+            <button
+              type="button"
+              aria-expanded={open}
+              aria-controls={terminalId}
+              onClick={() => setOpen((current) => !current)}
+            >
+              {open ? "收起根 Session" : "查看根 Session"}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      {open ? (
+        <section
+          id={terminalId}
+          className="lumen-target-terminal"
+          aria-label={`${target.target_key} 根 Session 输出`}
+          data-terminal-state={terminal?.status ?? (loading ? "loading" : "unavailable")}
+        >
+          <header>
+            <div>
+              <small>ROOT SESSION / REDACTED OUTPUT</small>
+              <b>已脱敏的根命令输出</b>
+            </div>
+            <span data-live={terminal?.status === "live" ? "true" : "false"}>
+              {loading ? "读取中" : terminal?.status ?? "等待连接"}
+            </span>
+          </header>
+          <p className="lumen-target-terminal-boundary">
+            仅观察 · 不作为 TargetCommit、measurement 或 Stage 推进依据
+          </p>
+          {terminal ? (
+            <dl className="lumen-target-terminal-identity">
+              <div><dt>Attempt</dt><dd>{terminal.attempt_ref} · g{terminal.attempt_generation}</dd></div>
+              <div><dt>Root</dt><dd>{terminal.root_session_ref}</dd></div>
+              <div><dt>Native</dt><dd>{terminal.native_session_ref ?? "connecting"}</dd></div>
+            </dl>
+          ) : null}
+          {terminalError ? (
+            <div className="lumen-target-terminal-error" role="alert">
+              <b>根 Session 输出暂不可读</b>
+              <code>{terminalError}</code>
+              <button type="button" onClick={() => void loadObservations(true)}>
+                重新读取
+              </button>
+            </div>
+          ) : null}
+          {!terminalError && terminal?.items.length ? (
+            <ol className="lumen-target-terminal-log" role="log" aria-live="off">
+              {terminal.items.map((item) => (
+                <li
+                  key={item.event_ref}
+                  data-output-gap={item.kind === "output_gap" ? "true" : "false"}
+                >
+                  <span>
+                    {observationClock(item.recorded_at)} · g{item.operation_generation}/#{item.sequence}
+                    {item.truncated ? " · TRUNCATED" : ""}
+                    {item.kind === "output_gap"
+                      ? ` · OUTPUT GAP · ${item.dropped_bytes} bytes / ${item.dropped_events} events`
+                      : ""}
+                  </span>
+                  <pre>{item.text}</pre>
+                </li>
+              ))}
+            </ol>
+          ) : null}
+          {!terminalError && terminal && terminal.items.length === 0 ? (
+            <p className="lumen-target-terminal-empty">
+              当前还没有可观察的根命令输出；保持打开会随全局 Projection 流读取。
+            </p>
+          ) : null}
+          {terminal ? (
+            <footer>
+              <small>
+                {terminal.trimmed_count > 0
+                  ? `界面已收束 ${terminal.trimmed_count} 条较早片段 · `
+                  : ""}
+                {atHead ? "已到当前流头" : "还有后续片段"}
+              </small>
+              {terminal.has_more ? (
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={() => void loadObservations(false)}
+                >
+                  读取下一页
+                </button>
+              ) : null}
+            </footer>
+          ) : null}
+        </section>
+      ) : null}
+    </article>
+  );
+}
+
 function BundleStageCard({
   bundleStage,
   healthBlocker,
+  observationPointers,
 }: {
   bundleStage: BundleStageProjection;
   healthBlocker: IdeaStageHealthBlocker | null;
+  observationPointers: Record<string, TargetRootObservationPointer>;
 }) {
   const phase = currentBundleStageState(bundleStage);
   const rows = bundleFactRows(bundleStage, phase);
@@ -1825,20 +2094,14 @@ function BundleStageCard({
               (candidate) => candidate.target_ref === target.target_ref,
             );
             return (
-              <article key={target.target_ref} data-target-status={target.status}>
-                <span>{target.status === "committed" ? "✓" : target.status === "ready" ? "→" : "·"}</span>
-                <p>
-                  <b>{target.target_key}</b>
-                  <small>
-                    {target.target_ref} · {target.target_run_ref ?? "TargetRun pending"}
-                  </small>
-                </p>
-                <code>
-                  {targetCommit?.result_disposition
-                    ?? target.blocker?.code
-                    ?? target.status}
-                </code>
-              </article>
+              <BundleTargetCard
+                key={target.target_ref}
+                target={target}
+                targetCommit={targetCommit}
+                observationPointer={
+                  observationPointers[target.target_ref] ?? null
+                }
+              />
             );
           })}
         </div>
@@ -1879,6 +2142,7 @@ function WorkspaceMain({
   state,
   error,
   streamInterrupted,
+  targetRootObservationPointers,
   retry,
   onOpenExperiment,
   onExperimentStarted,
@@ -1887,6 +2151,7 @@ function WorkspaceMain({
   state: ShellState;
   error: string | null;
   streamInterrupted: boolean;
+  targetRootObservationPointers: Record<string, TargetRootObservationPointer>;
   retry: () => void;
   onOpenExperiment: (trigger: HTMLElement) => void;
   onExperimentStarted: (experiment: ExperimentProjection) => void;
@@ -1984,6 +2249,7 @@ function WorkspaceMain({
           <BundleStageCard
             bundleStage={bundleStage}
             healthBlocker={bundleHealthBlocker}
+            observationPointers={targetRootObservationPointers}
           />
         ) : planStage ? (
           <PlanStageCard
@@ -2119,6 +2385,8 @@ function App() {
   );
   const [selectedHumanRequestRef, setSelectedHumanRequestRef] = useState<string | null>(null);
   const [streamCursor, setStreamCursor] = useState<number | null>(null);
+  const [targetRootObservationPointers, setTargetRootObservationPointers] =
+    useState<Record<string, TargetRootObservationPointer>>({});
   const [snapshotRetrySequence, setSnapshotRetrySequence] = useState(0);
   const reloadInFlight = useRef(false);
   const reloadQueued = useRef(false);
@@ -2209,6 +2477,10 @@ function App() {
       () => void reload(),
       handleConnection,
       () => streamCursorRef.current,
+      (pointer) => setTargetRootObservationPointers((current) => ({
+        ...current,
+        [pointer.target_ref]: pointer,
+      })),
     );
     // followProjection advances its own monotonic cursor. Reconnecting this
     // long-lived stream for every Snapshot revision can briefly occupy every
@@ -2675,6 +2947,7 @@ function App() {
             state={state}
             error={error}
             streamInterrupted={streamInterrupted}
+            targetRootObservationPointers={targetRootObservationPointers}
             retry={() => void reload()}
             onOpenExperiment={executionObserver.open}
             onExperimentStarted={handleExperimentStarted}

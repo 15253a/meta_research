@@ -76,7 +76,7 @@ from meta_research.quest_drafting import (
     ProposalDraftRequest,
     QUESTION_FIELD_MAX_LENGTHS,
 )
-from meta_research.writing_snapshot import WritingResearchSnapshotReader
+from meta_research.writing_contract import validate_frozen_writing_snapshot
 
 
 QUESTION_FIELDS = tuple(QUESTION_FIELD_MAX_LENGTHS)
@@ -166,6 +166,10 @@ class HumanCollaborationInterface(Protocol):
     """Whole public Interface for intent, preview, confirmation, and recovery."""
 
     def query_snapshot(self) -> OwnerSnapshot: ...
+
+    def query_open_human_requests(
+        self, *, quest_ref: str
+    ) -> tuple[dict[str, object], ...]: ...
 
     def respond_to_human_request(
         self,
@@ -1279,19 +1283,13 @@ class SQLiteHumanCollaboration:
         )
         self._fact_verifier = SQLiteHumanCollaborationFactVerifier(database)
         self._fact_verifier.bind_quest_receipt_verifier(research_graph)
-        writing_snapshots = WritingResearchSnapshotReader(
-            research_graph,
-            advancement_engine,
-            research_memory,
-            agent_runtime,
-        )
         self._collaboration_ladder = SQLiteHumanCollaborationLadder(
             database,
             feed,
             intent_drafting_provider,
             context_resolver=self._resolve_companion_context,
             control_preview_resolver=self._resolve_control_preview,
-            writing_snapshot_verifier=writing_snapshots.verify_current,
+            writing_snapshot_validator=validate_frozen_writing_snapshot,
         )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._preview_refresh_lock = threading.Lock()
@@ -1473,6 +1471,32 @@ class SQLiteHumanCollaboration:
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
+
+    def query_open_human_requests(
+        self, *, quest_ref: str
+    ) -> tuple[dict[str, object], ...]:
+        """Return the exact cross-issuer open HumanRequest inventory."""
+
+        if not isinstance(quest_ref, str) or not quest_ref or len(quest_ref) > 256:
+            raise OwnerConflict("human_request_quest_ref_invalid")
+        by_ref: dict[str, dict[str, object]] = {}
+        for owner in (
+            self._research_graph,
+            self._research_memory,
+            self._agent_runtime,
+            self._advancement_engine,
+        ):
+            for request in owner.query_human_requests(quest_ref=quest_ref):
+                if request.get("status") != "open":
+                    continue
+                request_ref = request.get("request_ref")
+                if not isinstance(request_ref, str) or not request_ref:
+                    raise OwnerConflict("human_request_integrity_invalid")
+                existing = by_ref.get(request_ref)
+                if existing is not None and existing != request:
+                    raise OwnerConflict("human_request_identity_conflict")
+                by_ref[request_ref] = request
+        return tuple(by_ref[key] for key in sorted(by_ref))
 
     def send_companion_message(
         self, scope_ref: str, message: str, idempotency_key: str
