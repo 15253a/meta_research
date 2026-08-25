@@ -482,7 +482,7 @@ def test_target_measurement_schema_and_pre_0027_target_fail_closed_contract(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0029_target_root_lifecycle",)
+        ).fetchone() == ("0030_writing_delivery",)
         foreign_keys = {
             (row[2], row[3], row[4])
             for row in connection.execute(

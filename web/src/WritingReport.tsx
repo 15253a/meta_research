@@ -8,10 +8,13 @@ import {
 import {
   compareWritingVersions,
   confirmWritingCancellation,
+  confirmWritingDeliveryIntent,
   confirmWritingIntent,
   controlWritingRun,
+  createWritingDeliveryIntent,
   createWritingIntent,
   fetchWritingVersionContent,
+  previewWritingDeliveryIntent,
   previewWritingIntent,
   previewWritingCancellation,
   ProductError,
@@ -19,6 +22,9 @@ import {
   writingRenderUrl,
   type WritingComparison,
   type WritingCancellationPreview,
+  type WritingDeliveryPayload,
+  type WritingDeliveryView,
+  type WritingDocumentType,
   type WritingOverview,
   type WritingVersionContent,
   type WritingReportView,
@@ -48,6 +54,7 @@ export function WritingReportWorkbench({
   const [cancellation, setCancellation] =
     useState<WritingCancellationPreview | null>(null);
   const [title, setTitle] = useState("阶段性研究报告");
+  const [documentType, setDocumentType] = useState<WritingDocumentType>("report");
   const [audience, setAudience] = useState("研究负责人");
   const [purpose, setPurpose] = useState("复核当前证据、结论与未知边界");
   const [instructions, setInstructions] = useState("突出可证伪结论与局限。");
@@ -60,6 +67,15 @@ export function WritingReportWorkbench({
   const [rendered, setRendered] = useState<
     (WritingVersionContent & { run_ref: string }) | null
   >(null);
+  const [deliveryDraft, setDeliveryDraft] = useState<WritingDeliveryView | null>(null);
+  const [selectedDeliveryId, setSelectedDeliveryId] = useState<string | null>(null);
+  const [deliveryCreatingNew, setDeliveryCreatingNew] = useState(false);
+  const [deliveryAction, setDeliveryAction] =
+    useState<WritingDeliveryPayload["action"]>("publish");
+  const [deliveryProvider, setDeliveryProvider] = useState("local-filesystem");
+  const [deliveryPath, setDeliveryPath] = useState("");
+  const [deliveryExpectedHash, setDeliveryExpectedHash] = useState("");
+  const [deliveryFormat, setDeliveryFormat] = useState("");
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -94,6 +110,85 @@ export function WritingReportWorkbench({
     [overview.runs, selectedRef],
   );
   const versions = selected?.versions ?? [];
+  const providerCapabilities = overview.delivery_capabilities?.providers ?? [];
+  const selectedRendererCapability = overview.delivery_capabilities?.renderers.find(
+    (item) => item.document_type === selected?.document_type,
+  );
+  const availableDeliveryFormats = useMemo(
+    () => selected?.renderer.formats ?? selectedRendererCapability?.formats ?? [],
+    [selected?.renderer.formats, selectedRendererCapability?.formats],
+  );
+  const defaultDeliveryFormat = selected?.renderer.default_format
+    ?? selectedRendererCapability?.default_format
+    ?? availableDeliveryFormats[0]
+    ?? "";
+  const selectedProviderCapability = providerCapabilities.find(
+    (item) => item.provider_ref === deliveryProvider,
+  );
+  const deliveryReady = selected?.citation.status === "accepted"
+    && selected.renderer.status === "ready";
+  const selectedDelivery = (() => {
+    if (deliveryCreatingNew) return null;
+    const desiredId = selectedDeliveryId ?? deliveryDraft?.intent_id;
+    const persisted = desiredId
+      ? selected?.deliveries?.find((item) => item.intent_id === desiredId)
+      : selected?.deliveries?.[0];
+    if (persisted) return persisted;
+    const payload = deliveryDraft ? deliveryPayload(deliveryDraft) : null;
+    return payload?.run_ref === selected?.run?.run_ref ? deliveryDraft : null;
+  })();
+  const currentDeliveryPayload = selectedDelivery
+    ? deliveryPayload(selectedDelivery)
+    : null;
+  const currentDeliveryPreview = selectedDelivery
+    ? deliveryOwnerPreview(selectedDelivery)
+    : null;
+  const currentDeliveryOperation = selectedDelivery?.operation ?? null;
+
+  useEffect(() => {
+    const supportedActions = selectedProviderCapability?.supported_actions ?? [];
+    setDeliveryAction((current) => (
+      supportedActions.includes(current) ? current : supportedActions[0] ?? "publish"
+    ));
+  }, [selectedProviderCapability]);
+
+  useEffect(() => {
+    if (!selected) return;
+    const supportedFormats = availableDeliveryFormats;
+    const fallback = defaultDeliveryFormat;
+    setDeliveryFormat((current) => (
+      current && supportedFormats.includes(current) ? current : fallback
+    ));
+    setDeliveryDraft((current) => {
+      const desiredId = selectedDeliveryId ?? current?.intent_id;
+      const persisted = desiredId
+        ? selected.deliveries?.find((item) => item.intent_id === desiredId)
+        : selected.deliveries?.[0];
+      if (persisted) return persisted;
+      const payload = current ? deliveryPayload(current) : null;
+      return payload?.run_ref === selected.run?.run_ref ? current : null;
+    });
+    setSelectedDeliveryId((current) => {
+      if (current && selected.deliveries?.some((item) => item.intent_id === current)) {
+        return current;
+      }
+      const localPayload = deliveryDraft ? deliveryPayload(deliveryDraft) : null;
+      if (
+        current
+        && deliveryDraft?.intent_id === current
+        && localPayload?.run_ref === selected.run?.run_ref
+      ) {
+        return current;
+      }
+      return selected.deliveries?.[0]?.intent_id ?? null;
+    });
+  }, [
+    availableDeliveryFormats,
+    defaultDeliveryFormat,
+    deliveryDraft,
+    selected,
+    selectedDeliveryId,
+  ]);
 
   useEffect(() => {
     if (versions.length < 2) {
@@ -155,6 +250,7 @@ export function WritingReportWorkbench({
     setError(null);
     try {
       const drafted = await createWritingIntent({
+        document_type: documentType,
         quest_ref: questRef,
         title,
         audience,
@@ -325,6 +421,75 @@ export function WritingReportWorkbench({
     }
   };
 
+  const createDelivery = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!selected?.run || busy || deliveryProvider !== "local-filesystem") return;
+    setBusy("delivery-create");
+    setError(null);
+    try {
+      const drafted = await createWritingDeliveryIntent(selected.run.run_ref, {
+        action: deliveryAction,
+        provider_ref: deliveryProvider,
+        target: {
+          path: deliveryPath,
+          permissions: 384,
+          expected_existing_hash: deliveryAction === "publish"
+            ? null
+            : deliveryExpectedHash,
+        },
+        output_format: deliveryFormat || defaultDeliveryFormat,
+      });
+      setDeliveryDraft(drafted);
+      setSelectedDeliveryId(drafted.intent_id);
+      setDeliveryCreatingNew(false);
+      onChanged();
+    } catch (caught) {
+      setError(errorCode(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const previewDelivery = async () => {
+    if (!selectedDelivery || busy) return;
+    setBusy("delivery-preview");
+    setError(null);
+    try {
+      const previewed = await previewWritingDeliveryIntent(selectedDelivery.intent_id);
+      setDeliveryDraft(previewed);
+      setSelectedDeliveryId(previewed.intent_id);
+      onChanged();
+    } catch (caught) {
+      setError(errorCode(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const confirmDelivery = async () => {
+    if (!selectedDelivery?.impact_preview || busy) return;
+    setBusy("delivery-confirm");
+    setError(null);
+    try {
+      const confirmed = await confirmWritingDeliveryIntent(selectedDelivery);
+      setDeliveryDraft(confirmed);
+      setSelectedDeliveryId(confirmed.intent_id);
+      onChanged();
+    } catch (caught) {
+      setError(errorCode(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const resetDelivery = () => {
+    setDeliveryDraft(null);
+    setDeliveryCreatingNew(true);
+    setDeliveryPath("");
+    setDeliveryExpectedHash("");
+    setError(null);
+  };
+
   return (
     <dialog
       ref={dialogRef}
@@ -360,12 +525,17 @@ export function WritingReportWorkbench({
         </header>
 
         <div className="writing-body">
-          <aside className="writing-compose" aria-label="创建 report Writing Run">
+          <aside className="writing-compose" aria-label="创建 Writing Run">
             <small>01 · INTENT</small>
             <h3>冻结一次精确请求</h3>
             {questRef ? (
               <form onSubmit={create}>
                 <fieldset disabled={busy !== null}>
+                <label>交付类型<select value={documentType} onChange={(event) => setDocumentType(event.target.value as WritingDocumentType)}>
+                  <option value="report">Report · 阶段报告</option>
+                  <option value="paper">Paper · 论文</option>
+                  <option value="presentation">PPT · 演示文稿</option>
+                </select></label>
                 <label>标题<input value={title} onChange={(event) => setTitle(event.target.value)} required /></label>
                 <label>受众<input value={audience} onChange={(event) => setAudience(event.target.value)} required /></label>
                 <label>目的<textarea value={purpose} onChange={(event) => setPurpose(event.target.value)} required /></label>
@@ -425,10 +595,13 @@ export function WritingReportWorkbench({
                     setCancellation(null);
                     setRendered(null);
                     setComparison(null);
+                    setDeliveryDraft(null);
+                    setSelectedDeliveryId(null);
+                    setDeliveryCreatingNew(false);
                   }}
                 >
                   <b>{item.intent.title}</b>
-                  <small>{item.status} · r{item.run?.content_revision ?? 0}</small>
+                  <small>{documentTypeLabel(item.document_type)} · {item.status} · r{item.run?.content_revision ?? 0}</small>
                 </button>
               )) : <p className="writing-empty">尚无 Writing Run。左侧确认后，daemon 会独立运行。</p>}
             </div>
@@ -436,7 +609,7 @@ export function WritingReportWorkbench({
             {selected?.run ? (
               <article className="writing-run" data-testid="writing-run-detail">
                 <div className="writing-run-title">
-                  <div><small>RUN / {shortRef(selected.run.run_ref)}</small><h3>{selected.intent.title}</h3></div>
+                  <div><small>{documentTypeLabel(selected.document_type)} / RUN / {shortRef(selected.run.run_ref)}</small><h3>{selected.intent.title}</h3></div>
                   <div className="writing-controls">
                     {selected.status === "paused" ? (
                       <button type="button" onClick={() => void control("resume")} disabled={busy !== null}>继续</button>
@@ -475,8 +648,227 @@ export function WritingReportWorkbench({
                   <div className="writing-feedback">
                     <label>反馈形成 successor revision<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="写下必须修改的内容；历史版本不会被覆盖。" /></label>
                     <button type="button" disabled={!feedback.trim() || busy !== null} onClick={() => void revise()}>提交修订</button>
-                    <a href={writingRenderUrl(selected.run.run_ref)} download>下载确定性 Markdown</a>
+                    <a href={writingRenderUrl(selected.run.run_ref, undefined, selected.renderer.default_format)} download>
+                      下载确定性 {renderFormatLabel(selected.renderer.default_format)}
+                    </a>
                   </div>
+                ) : null}
+                {deliveryReady || Boolean(selected.deliveries?.length) ? (
+                  <details
+                    className="writing-delivery"
+                    data-testid="writing-external-delivery"
+                  >
+                    <summary>
+                      <span>外部交付</span>
+                      <b>{selectedDelivery ? deliveryOutcomeStatus(selectedDelivery) : "按需启用"}</b>
+                    </summary>
+                    <section className="writing-delivery-capabilities" aria-label="Writing Provider capabilities">
+                      <small>PROVIDER CAPABILITIES</small>
+                      {providerCapabilities.length ? (
+                        <ul>
+                          {providerCapabilities.map((capability) => (
+                            <li key={capability.provider_ref}>
+                              <code>{capability.provider_ref}</code>
+                              <span>{capability.production_ready ? "production" : "non-production"}</span>
+                              <span>{capability.supported_actions.join(" · ")}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p>当前没有可用的 production Provider；不会尝试外部动作。</p>
+                      )}
+                    </section>
+                    {selected.deliveries?.length ? (
+                      <nav
+                        className="writing-delivery-history"
+                        aria-label="Writing delivery intent 历史"
+                      >
+                        <small>DELIVERY INTENTS</small>
+                        <ul>
+                          {selected.deliveries.map((item) => (
+                            <li key={item.intent_id}>
+                              <button
+                                type="button"
+                                aria-pressed={!deliveryCreatingNew
+                                  && selectedDelivery?.intent_id === item.intent_id}
+                                onClick={() => {
+                                  setDeliveryDraft(item);
+                                  setSelectedDeliveryId(item.intent_id);
+                                  setDeliveryCreatingNew(false);
+                                  setError(null);
+                                }}
+                              >
+                                <span>{deliveryTargetLabel(item)}</span>
+                                <small>{item.confirmation_status} · {item.status}</small>
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </nav>
+                    ) : null}
+                    {!deliveryReady ? (
+                      <p
+                        className="writing-delivery-blocker"
+                        data-testid="writing-delivery-current-blocker"
+                        role="status"
+                      >
+                        asset custody / Citation / Renderer 当前不可用于新外部动作；
+                        durable 历史 receipts 与 observations 保持可读。
+                      </p>
+                    ) : null}
+                    {!selectedDelivery ? (
+                      deliveryReady ? (
+                      <form className="writing-delivery-form" onSubmit={createDelivery}>
+                        <label>Provider<select
+                          aria-label="Provider"
+                          value={deliveryProvider}
+                          onChange={(event) => setDeliveryProvider(event.target.value)}
+                          disabled={busy !== null}
+                        >
+                          {providerCapabilities.map((capability) => (
+                            <option key={capability.provider_ref} value={capability.provider_ref}>
+                              {capability.provider_ref}{capability.production_ready ? "" : " · unavailable"}
+                            </option>
+                          ))}
+                        </select></label>
+                        {deliveryProvider === "local-filesystem" ? <>
+                          <label>Action<select
+                            aria-label="Action"
+                            value={deliveryAction}
+                            onChange={(event) => {
+                              const action = event.target.value as WritingDeliveryPayload["action"];
+                              setDeliveryAction(action);
+                              if (action === "publish") setDeliveryExpectedHash("");
+                            }}
+                            disabled={busy !== null}
+                          >
+                            {(selectedProviderCapability?.supported_actions ?? []).map((action) => (
+                              <option key={action} value={action}>{deliveryActionLabel(action)}</option>
+                            ))}
+                          </select></label>
+                          <label>绝对 path<input
+                            aria-label="绝对 path"
+                            value={deliveryPath}
+                            onChange={(event) => setDeliveryPath(event.target.value)}
+                            placeholder="/absolute/path/output.docx"
+                            required
+                            disabled={busy !== null}
+                          /></label>
+                          <label>Permissions<input aria-label="Permissions" value="0600" readOnly /></label>
+                          {deliveryAction === "publish" ? null : (
+                            <label>Expected existing SHA-256<input
+                              aria-label="Expected existing SHA-256"
+                              value={deliveryExpectedHash}
+                              onChange={(event) => setDeliveryExpectedHash(event.target.value)}
+                              minLength={64}
+                              maxLength={64}
+                              pattern="[0-9a-f]{64}"
+                              required
+                              disabled={busy !== null}
+                            /></label>
+                          )}
+                          <label>Renderer format<select
+                            aria-label="Renderer format"
+                            value={deliveryFormat}
+                            onChange={(event) => setDeliveryFormat(event.target.value)}
+                            disabled={busy !== null}
+                          >
+                            {availableDeliveryFormats.map((value) => (
+                              <option key={value} value={value}>{renderFormatLabel(value)}</option>
+                            ))}
+                          </select></label>
+                        </> : (
+                          <p className="writing-delivery-adapter-note">
+                            此 Provider 的 target editor 未安装；capability 列表不会被固化为本地 Provider 矩阵。
+                          </p>
+                        )}
+                        <button
+                          type="submit"
+                          disabled={
+                            busy !== null
+                            || !selectedProviderCapability?.production_ready
+                            || !selectedProviderCapability.supported_actions.includes(deliveryAction)
+                            || deliveryProvider !== "local-filesystem"
+                            || !isAbsoluteDeliveryPath(deliveryPath)
+                            || (deliveryAction !== "publish" && !isSha256(deliveryExpectedHash))
+                            || !deliveryFormat
+                          }
+                        >
+                          {busy === "delivery-create" ? "正在冻结…" : "创建交付 Draft"}
+                        </button>
+                      </form>
+                      ) : (
+                        <p className="writing-delivery-adapter-note">
+                          当前状态 fail-closed：选择既有 intent 可查看事实，恢复 ready 后才能创建新 Draft。
+                        </p>
+                      )
+                    ) : (
+                      <section className="writing-delivery-intent">
+                        <header>
+                          <div>
+                            <small>HC COMMAND · {selectedDelivery.confirmation_status}</small>
+                            <b>{currentDeliveryPayload?.provider_ref} / {currentDeliveryPayload?.action}</b>
+                          </div>
+                          <span data-status={deliveryOutcomeStatus(selectedDelivery)}>
+                            {deliveryOutcomeStatus(selectedDelivery)}
+                          </span>
+                        </header>
+                        {currentDeliveryPayload ? (
+                          <dl className="writing-delivery-bindings">
+                            <div><dt>Stable operation</dt><dd>{currentDeliveryPayload.operation_ref}</dd></div>
+                            <div><dt>Exact target</dt><dd>{JSON.stringify(currentDeliveryPayload.target)}</dd></div>
+                            <div><dt>Exact effects</dt><dd>{JSON.stringify(currentDeliveryPayload.effects)}</dd></div>
+                            <div><dt>Writing version</dt><dd>{currentDeliveryPayload.version_ref} · {currentDeliveryPayload.content_hash}</dd></div>
+                            <div><dt>RG citation</dt><dd>{currentDeliveryPayload.citation_decision_ref} · {receiptRef(currentDeliveryPayload.citation_receipt)}</dd></div>
+                            <div><dt>Renderer artifact</dt><dd>{currentDeliveryPayload.renderer_version_ref} · {currentDeliveryPayload.renderer_artifact_sha256} · {currentDeliveryPayload.renderer_format}</dd></div>
+                          </dl>
+                        ) : null}
+                        {currentDeliveryPreview ? (
+                          <section className="writing-delivery-preview" data-testid="writing-delivery-preview">
+                            <b>精确影响预览</b>
+                            <code>{JSON.stringify(currentDeliveryPreview.target_assertion)}</code>
+                            <ul>{currentDeliveryPreview.will_happen.map((item) => <li key={item}>{item}</li>)}</ul>
+                            <ul className="will-not">{currentDeliveryPreview.will_not_happen.map((item) => <li key={item}>{item}</li>)}</ul>
+                            <ul className="risks">{currentDeliveryPreview.risks.map((item) => <li key={item}>{item}</li>)}</ul>
+                          </section>
+                        ) : null}
+                        <div className="writing-delivery-actions">
+                          {!selectedDelivery.impact_preview ? (
+                            <button type="button" disabled={busy !== null || !deliveryReady} onClick={() => void previewDelivery()}>
+                              {busy === "delivery-preview" ? "正在校验…" : "生成精确影响预览"}
+                            </button>
+                          ) : !selectedDelivery.confirmation_receipt ? (
+                            <button type="button" disabled={busy !== null || !deliveryReady} onClick={() => void confirmDelivery()}>
+                              {busy === "delivery-confirm" ? "正在接纳…" : "确认本次外部交付"}
+                            </button>
+                          ) : (
+                            <button type="button" disabled={busy !== null || !deliveryReady} onClick={resetDelivery}>
+                              为新的外部副作用创建新 Draft
+                            </button>
+                          )}
+                        </div>
+                        <dl className="writing-delivery-custody" aria-label="Writing 交付 receipts 与 observations">
+                          <div><dt>HC confirmation</dt><dd>{receiptRef(selectedDelivery.confirmation_receipt) ?? "not_confirmed"}</dd></div>
+                          <div><dt>AR admission</dt><dd>{receiptRef(currentDeliveryOperation?.operation_receipt) ?? "not_admitted"}</dd></div>
+                          <div><dt>AR execution</dt><dd>{receiptRef(currentDeliveryOperation?.execution_receipt) ?? "not_attempted"}</dd></div>
+                          <div><dt>AR reconciliation</dt><dd>{receiptRef(currentDeliveryOperation?.reconciliation_receipt) ?? "none"}</dd></div>
+                        </dl>
+                        <section className="writing-delivery-observations">
+                          <b>Provider observations</b>
+                          <p>Provider ACK 不是 Owner receipt；这里只展示外部系统观测。</p>
+                          {currentDeliveryOperation?.provider_observations.length ? (
+                            <ul>{currentDeliveryOperation.provider_observations.map((observation) => (
+                              <li key={observation.observation_ref}>
+                                <code>{observation.provider_operation_ref}</code>
+                                <span>{observation.outcome}</span>
+                                <small>{JSON.stringify(observation.details)}</small>
+                              </li>
+                            ))}</ul>
+                          ) : <p>none</p>}
+                        </section>
+                      </section>
+                    )}
+                  </details>
                 ) : null}
                 {selected.citation.status === "rejected" ? (
                   <p className="writing-rejection">RG feedback：{(selected.citation.feedback ?? []).join(" · ")}</p>
@@ -520,8 +912,8 @@ export function WritingReportWorkbench({
                       查看 v{version.version_number} 正文
                     </button>
                     {version.citation_status === "accepted" ? (
-                      <a href={writingRenderUrl(selected.run.run_ref, version.version_ref)} download>
-                        下载 Markdown
+                      <a href={writingRenderUrl(selected.run.run_ref, version.version_ref, selected.renderer.default_format)} download>
+                        下载 {renderFormatLabel(selected.renderer.default_format)}
                       </a>
                     ) : null}
                   </div>
@@ -586,6 +978,70 @@ function receiptRef(value: unknown): string | null {
   if (!value || typeof value !== "object") return null;
   const receipt = value as { receipt_ref?: unknown };
   return typeof receipt.receipt_ref === "string" ? receipt.receipt_ref : null;
+}
+
+function documentTypeLabel(value: WritingDocumentType): string {
+  return value === "presentation" ? "PPT" : value.toUpperCase();
+}
+
+function renderFormatLabel(value: string | undefined): string {
+  return (value ?? "markdown").toUpperCase();
+}
+
+function deliveryPayload(delivery: WritingDeliveryView): WritingDeliveryPayload | null {
+  return delivery.payload ?? delivery.operation?.payload ?? null;
+}
+
+function deliveryOwnerPreview(delivery: WritingDeliveryView): {
+  target_assertion: Record<string, unknown>;
+  will_happen: string[];
+  will_not_happen: string[];
+  risks: string[];
+  stale_conditions: string[];
+} | null {
+  const preview = delivery.impact_preview;
+  if (!preview) return null;
+  const owner = preview.owner_previews?.[0];
+  if (owner) return owner;
+  if (!preview.target_assertion) return null;
+  return {
+    target_assertion: preview.target_assertion,
+    will_happen: preview.will_happen ?? [],
+    will_not_happen: preview.will_not_happen ?? [],
+    risks: preview.risks ?? [],
+    stale_conditions: preview.stale_conditions ?? [],
+  };
+}
+
+function deliveryOutcomeStatus(
+  delivery: WritingDeliveryView,
+): "not_attempted" | "partial" | "outcome_unknown" | "completed" {
+  return delivery.status;
+}
+
+function deliveryTargetLabel(delivery: WritingDeliveryView): string {
+  const payload = deliveryPayload(delivery);
+  if (!payload) return shortRef(delivery.intent_id);
+  return "path" in payload.target ? payload.target.path : payload.target.target_ref;
+}
+
+function deliveryActionLabel(action: WritingDeliveryPayload["action"]): string {
+  if (action === "publish") return "publish · 新建文件";
+  if (action === "overwrite") return "overwrite · 精确覆盖";
+  if (action === "delete") return "delete · 精确删除";
+  if (action === "send") return "send · 发送";
+  return "submit · 提交";
+}
+
+function isAbsoluteDeliveryPath(value: string): boolean {
+  if (!value.startsWith("/") || value === "/" || value.includes("\0")) return false;
+  return value.split("/").slice(1).every(
+    (part) => part.length > 0 && part !== "." && part !== "..",
+  );
+}
+
+function isSha256(value: string): boolean {
+  return /^[0-9a-f]{64}$/.test(value);
 }
 
 function shortRef(value: string): string {

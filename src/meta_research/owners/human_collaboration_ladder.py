@@ -27,10 +27,12 @@ from meta_research.quest_drafting import (
     IntentTurnRequest,
 )
 from meta_research.writing_contract import (
+    WRITING_DOCUMENT_TYPES,
     WRITING_RESEARCH_SNAPSHOT_SCHEMA,
-    normalize_report_intent,
+    normalize_writing_intent,
     validate_writing_execution_budget,
 )
+from meta_research.writing_delivery import normalize_writing_delivery_payload
 
 
 HC_OWNER = "human_collaboration"
@@ -76,6 +78,7 @@ _HARD_COMMAND_KINDS = {
     "research_control",
     "writing_report_start",
     "writing_report_cancel",
+    "writing_external_delivery",
 }
 _MAX_PENDING_COMPANION_TURNS = 64
 
@@ -180,6 +183,9 @@ class SQLiteHumanCollaborationLadder:
         ]
         | None = None,
         writing_snapshot_validator: Callable[[dict[str, object]], None] | None = None,
+        writing_delivery_binding_validator: (
+            Callable[[dict[str, object]], None] | None
+        ) = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -187,6 +193,9 @@ class SQLiteHumanCollaborationLadder:
         self._context_resolver = context_resolver
         self._control_preview_resolver = control_preview_resolver
         self._writing_snapshot_validator = writing_snapshot_validator
+        self._writing_delivery_binding_validator = (
+            writing_delivery_binding_validator
+        )
         with self._database.write() as connection:
             recovered = connection.execute(
                 text(
@@ -210,6 +219,14 @@ class SQLiteHumanCollaborationLadder:
                     "human_collaboration.companion_turns_recovered",
                     {"recovered_turn_count": int(recovered.rowcount)},
                 )
+
+    def bind_writing_delivery_binding_validator(
+        self, validator: Callable[[dict[str, object]], None]
+    ) -> None:
+        current = self._writing_delivery_binding_validator
+        if current is not None and current is not validator:
+            raise OwnerConflict("writing_delivery_verifier_already_bound")
+        self._writing_delivery_binding_validator = validator
 
     def send_companion_message(
         self,
@@ -1334,11 +1351,21 @@ class SQLiteHumanCollaborationLadder:
                 if self._writing_snapshot_validator is None:
                     raise OwnerConflict("writing_snapshot_verifier_unavailable")
                 self._writing_snapshot_validator(snapshot)
+                document_type = cast(str, payload["document_type"])
                 target_assertion = {
                     "owner": HC_OWNER,
-                    "operation": "start_writing_report",
+                    "operation": (
+                        "start_writing_report"
+                        if document_type == "report"
+                        else f"start_writing_{document_type}"
+                    ),
                     "intent_id": intent_id,
                     "quest_ref": payload["quest_ref"],
+                    **(
+                        {}
+                        if document_type == "report"
+                        else {"document_type": document_type}
+                    ),
                     "intent_hash": payload["intent_hash"],
                     "snapshot_ref": payload["snapshot_ref"],
                     "snapshot_hash": payload["snapshot_hash"],
@@ -1347,24 +1374,47 @@ class SQLiteHumanCollaborationLadder:
                     ),
                     "authorization_head": authorization_count,
                 }
-                owner_preview = {
-                    "source_owner": HC_OWNER,
-                    "target_assertion": target_assertion,
-                    "will_happen": [
-                        "记录精确的 report Writing Intent 与冻结研究 Snapshot",
-                        "确认后允许 Agent Runtime 建立独立 Writing Run",
-                    ],
-                    "will_not_happen": [
-                        "主 Quest Stage 不会被暂停或推进",
-                        "确认本身不会接受交付物、引用或渲染结果",
-                        "不会发布、发送或提交到外部系统",
-                    ],
-                    "risks": ["研究 Snapshot 变化后必须重新确认"],
-                    "stale_conditions": [
-                        "Writing Intent 或冻结 Snapshot 发生变化",
-                        "Quest 的广义研究授权发生变化",
-                    ],
-                }
+                if document_type == "report":
+                    # Keep the accepted #125 preview byte-for-byte stable.  New
+                    # document profiles are additive and must not rewrite old
+                    # report confirmations or their hashes.
+                    owner_preview = {
+                        "source_owner": HC_OWNER,
+                        "target_assertion": target_assertion,
+                        "will_happen": [
+                            "记录精确的 report Writing Intent 与冻结研究 Snapshot",
+                            "确认后允许 Agent Runtime 建立独立 Writing Run",
+                        ],
+                        "will_not_happen": [
+                            "主 Quest Stage 不会被暂停或推进",
+                            "确认本身不会接受交付物、引用或渲染结果",
+                            "不会发布、发送或提交到外部系统",
+                        ],
+                        "risks": ["研究 Snapshot 变化后必须重新确认"],
+                        "stale_conditions": [
+                            "Writing Intent 或冻结 Snapshot 发生变化",
+                            "Quest 的广义研究授权发生变化",
+                        ],
+                    }
+                else:
+                    owner_preview = {
+                        "source_owner": HC_OWNER,
+                        "target_assertion": target_assertion,
+                        "will_happen": [
+                            f"记录精确的 {document_type} Writing Intent 与冻结研究 Snapshot",
+                            "确认后允许 Agent Runtime 在同一 Writing Run 模型中起草、自检与修订",
+                        ],
+                        "will_not_happen": [
+                            "主 Quest Stage 不会被暂停或推进",
+                            "确认本身不会接受 RM 交付物、RG 引用或 renderer artifact",
+                            "不会发布、发送或提交到外部系统",
+                        ],
+                        "risks": ["Intent 或冻结 Snapshot 变化后必须重新确认"],
+                        "stale_conditions": [
+                            "Writing Intent 或冻结 Snapshot 发生变化",
+                            "Quest 的广义研究授权发生变化",
+                        ],
+                    }
             elif draft["command_kind"] == "writing_report_cancel":
                 target_assertion = {
                     "owner": HC_OWNER,
@@ -1393,6 +1443,60 @@ class SQLiteHumanCollaborationLadder:
                     "stale_conditions": [
                         "Writing Run 的 current Attempt 或 Fence 发生变化",
                         "Quest 的授权策略发生变化",
+                    ],
+                }
+            elif draft["command_kind"] == "writing_external_delivery":
+                if self._writing_delivery_binding_validator is None:
+                    raise OwnerConflict("writing_delivery_verifier_unavailable")
+                self._writing_delivery_binding_validator(payload)
+                target_assertion = {
+                    "owner": HC_OWNER,
+                    "operation": "confirm_writing_external_delivery",
+                    "intent_id": intent_id,
+                    "operation_ref": payload["operation_ref"],
+                    "action": payload["action"],
+                    "provider_ref": payload["provider_ref"],
+                    "run_ref": payload["run_ref"],
+                    "document_type": payload["document_type"],
+                    "version_ref": payload["version_ref"],
+                    "content_hash": payload["content_hash"],
+                    "citation_decision_ref": payload[
+                        "citation_decision_ref"
+                    ],
+                    "renderer_version_ref": payload[
+                        "renderer_version_ref"
+                    ],
+                    "renderer_artifact_sha256": payload[
+                        "renderer_artifact_sha256"
+                    ],
+                    "renderer_format": payload["renderer_format"],
+                    "target": payload["target"],
+                    "target_binding": payload["target_binding"],
+                    "effects": payload["effects"],
+                    "authorization_head": authorization_count,
+                }
+                owner_preview = {
+                    "source_owner": HC_OWNER,
+                    "target_assertion": target_assertion,
+                    "will_happen": [
+                        "仅确认预览中这一项精确外部副作用",
+                        "确认后由 Agent Runtime 以稳定 operation identity 接纳并执行",
+                        "连接或 ACK 丢失时先对账，不重复外部动作",
+                    ],
+                    "will_not_happen": [
+                        "确认本身不会调用外部 Provider",
+                        "不会授权未来版本、其他收件人、其他路径或其他 action",
+                        "Provider observation 不会替代 RM、RG、HC 或 AR receipt",
+                        "不会推进或改变主 Quest Stage",
+                    ],
+                    "risks": [
+                        "外部系统可能返回 partial 或 outcome_unknown",
+                        "目标内容、权限或绑定变化后本次确认不能执行",
+                    ],
+                    "stale_conditions": [
+                        "Writing version、RG citation 或 renderer artifact 变化",
+                        "provider、action、目标、收件人、权限、路径或 effects 变化",
+                        "当前 RM custody 不再可用",
                     ],
                 }
             else:
@@ -1549,12 +1653,20 @@ class SQLiteHumanCollaborationLadder:
                 raise OwnerConflict("command_preview_stale") from error
             raise
         writing_snapshot: dict[str, object] | None = None
+        writing_delivery: dict[str, object] | None = None
         if confirmed_draft.get("command_kind") == "writing_report_start":
             payload = cast(dict[str, object], confirmed_draft["payload"])
             writing_snapshot = cast(dict[str, object], payload["snapshot"])
             if self._writing_snapshot_validator is None:
                 raise OwnerConflict("writing_snapshot_verifier_unavailable")
             self._writing_snapshot_validator(writing_snapshot)
+        elif confirmed_draft.get("command_kind") == "writing_external_delivery":
+            writing_delivery = cast(
+                dict[str, object], confirmed_draft["payload"]
+            )
+            if self._writing_delivery_binding_validator is None:
+                raise OwnerConflict("writing_delivery_verifier_unavailable")
+            self._writing_delivery_binding_validator(writing_delivery)
         with self._database.write() as connection:
             replay = _collaboration_command(
                 connection, idempotency_key, "command_confirm", command_hash
@@ -1566,6 +1678,12 @@ class SQLiteHumanCollaborationLadder:
                     # Recheck the frozen value itself under the writer lock;
                     # live research may advance independently of this intent.
                     self._writing_snapshot_validator(writing_snapshot)
+                elif writing_delivery is not None:
+                    if self._writing_delivery_binding_validator is None:
+                        raise OwnerConflict("writing_delivery_verifier_unavailable")
+                    # External effects require the exact RM/RG/renderer/target
+                    # binding to remain current at the final confirmation edge.
+                    self._writing_delivery_binding_validator(writing_delivery)
                 preview = connection.execute(
                     text(
                         "SELECT * FROM hc_command_previews WHERE preview_ref = "
@@ -1661,6 +1779,65 @@ class SQLiteHumanCollaborationLadder:
                     self._feed,
                     "human_collaboration.command_confirmed",
                     {"intent_id": intent_id, "confirmation_ref": confirmation_ref},
+                )
+        return self.query_command(intent_id)
+
+    def invalidate_command_preview(
+        self,
+        intent_id: str,
+        draft_revision: int,
+        draft_hash: str,
+        preview_ref: str,
+        preview_hash: str,
+    ) -> dict[str, object]:
+        """Persist that an exact external binding can no longer be confirmed."""
+
+        _scope_ref(intent_id, "command_preview_invalid")
+        _scope_ref(preview_ref, "command_preview_invalid")
+        if (
+            type(draft_revision) is not int
+            or draft_revision < 1
+            or re.fullmatch(r"[0-9a-f]{64}", draft_hash) is None
+            or re.fullmatch(r"[0-9a-f]{64}", preview_hash) is None
+        ):
+            raise OwnerConflict("command_preview_invalid")
+        with self._database.write() as connection:
+            preview = connection.execute(
+                text(
+                    "SELECT status FROM hc_command_previews WHERE preview_ref = "
+                    ":preview_ref AND intent_id = :intent_id AND draft_revision = "
+                    ":draft_revision AND draft_hash = :draft_hash AND preview_hash = "
+                    ":preview_hash"
+                ),
+                {
+                    "preview_ref": preview_ref,
+                    "intent_id": intent_id,
+                    "draft_revision": draft_revision,
+                    "draft_hash": draft_hash,
+                    "preview_hash": preview_hash,
+                },
+            ).first()
+            if preview is not None and preview.status == "current":
+                now = time.time()
+                connection.execute(
+                    text(
+                        "UPDATE hc_command_previews SET status = 'stale' WHERE "
+                        "preview_ref = :preview_ref AND status = 'current'"
+                    ),
+                    {"preview_ref": preview_ref},
+                )
+                connection.execute(
+                    text(
+                        "UPDATE hc_command_intents SET status = 'draft', updated_at = "
+                        ":now WHERE intent_id = :intent_id AND status = 'previewed'"
+                    ),
+                    {"intent_id": intent_id, "now": now},
+                )
+                _advance_hc(
+                    connection,
+                    self._feed,
+                    "human_collaboration.command_preview_stale",
+                    {"intent_id": intent_id, "preview_ref": preview_ref},
                 )
         return self.query_command(intent_id)
 
@@ -1856,7 +2033,11 @@ class SQLiteHumanCollaborationLadder:
         return self.query_command(str(row.result_ref))
 
     def query_commands(self, *, command_kind: str) -> tuple[dict[str, object], ...]:
-        if command_kind not in {"writing_report_start", "writing_report_cancel"}:
+        if command_kind not in {
+            "writing_report_start",
+            "writing_report_cancel",
+            "writing_external_delivery",
+        }:
             raise OwnerConflict("command_kind_invalid")
         with self._database.read() as connection:
             refs = connection.execute(
@@ -1904,11 +2085,12 @@ class SQLiteHumanCollaborationLadder:
                 "execution_budget",
             }:
                 raise OwnerConflict("command_payload_invalid")
-            if payload["document_type"] != "report":
+            document_type = payload["document_type"]
+            if document_type not in WRITING_DOCUMENT_TYPES:
                 raise OwnerConflict("writing_document_type_invalid")
             _scope_ref(payload["quest_ref"], "writing_quest_ref_invalid")
             intent = _document(payload["intent"], "writing_intent_invalid")
-            if normalize_report_intent(intent) != intent:
+            if normalize_writing_intent(str(document_type), intent) != intent:
                 raise OwnerConflict("writing_intent_invalid")
             if canonical_hash(intent) != payload["intent_hash"]:
                 raise OwnerConflict("writing_intent_hash_mismatch")
@@ -1937,6 +2119,8 @@ class SQLiteHumanCollaborationLadder:
                 _scope_ref(payload[field], f"writing_cancel_{field}_invalid")
             if payload["effect"] != "terminal_cancel_preserve_history":
                 raise OwnerConflict("writing_cancel_effect_invalid")
+        elif command["command_kind"] == "writing_external_delivery":
+            command["payload"] = normalize_writing_delivery_payload(payload)
         elif command["command_kind"] == "capability_authorization":
             if set(payload) != {"capability", "decision", "scope"}:
                 raise OwnerConflict("command_payload_invalid")

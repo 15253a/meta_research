@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import builtins
 from dataclasses import dataclass, replace
 import hashlib
 from importlib.resources import files
@@ -8,9 +7,6 @@ import json
 import os
 from pathlib import Path
 import stat
-import sys
-import threading
-from types import ModuleType
 from typing import Protocol, cast
 
 from meta_research.idea_skill import (
@@ -30,10 +26,6 @@ from meta_research.writing_contract import (
     WRITING_CHILD_REVIEW_RUBRIC,
     WRITING_CHILD_REVIEW_TASK_SCHEMA,
     WritingRuntimeBinding,
-    normalize_writing_intent,
-    validate_writing_document,
-    writing_child_review_document_profile,
-    writing_document_profile,
     writing_child_review_task_hash,
 )
 
@@ -47,33 +39,6 @@ _WRITING_CHILD_REVIEW_RESULT_SCHEMA = (
 )
 _CHILD_TASK_BEGIN = "<<<WRITING_CHILD_REVIEW_TASK_BEGIN>>>"
 _CHILD_TASK_END = "<<<WRITING_CHILD_REVIEW_TASK_END>>>"
-# 0030 changed this module's source hash when paper and presentation became
-# first-class document types. Runs admitted by the immediately preceding 0029
-# runtime keep this exact report-only executable and Skill bundle instead of
-# having their persisted binding rewritten during upgrade. Provenance:
-# c8322e93d02e18d3c8c2cd8ccd35c2705a46deb9.
-_LEGACY_REPORT_BUNDLE = "legacy-report-c8322e93"
-_LEGACY_REPORT_MODULE_NAME = (
-    "meta_research._legacy_writing_report_c8322e93"
-)
-_LEGACY_REPORT_SUPERVISOR_MODULE_NAME = (
-    "meta_research._legacy_provider_supervisor_c8322e93"
-)
-_LEGACY_REPORT_HASHES = {
-    "writing_skill.py": (
-        "a6ef050f866709ac6620d982caaf8f5e0d7bf21e548490968c9fa550b21bd453"
-    ),
-    "provider_supervisor.py": (
-        "623fa83da2893790aaee02351865db1d2a1c9cc90987e11795ef34c3a24b7ab1"
-    ),
-    "SKILL.md": (
-        "1a5a101300c8b86eabd74940fedc81afd1e40578436506589677439c222e9701"
-    ),
-    "agents/openai.yaml": (
-        "5f344c6c9036d5f146efc38249c2b5166001673c3da8cd81428b15e82f576376"
-    ),
-}
-_LEGACY_REPORT_LOAD_LOCK = threading.Lock()
 
 
 class WritingSkillUnavailable(RuntimeError):
@@ -110,8 +75,6 @@ class WritingSkillRequest:
     feedback: tuple[str, ...] = ()
     source_materials: tuple[WritingSourceMaterial, ...] = ()
     job_ref: str | None = None
-    document_type: str = "report"
-    profile_ref: str = "report-v1"
 
 
 @dataclass(frozen=True)
@@ -137,9 +100,7 @@ class WritingSkillResult:
 
 
 class WritingSkillProvider(Protocol):
-    def runtime_binding(
-        self, document_type: str = "report"
-    ) -> WritingRuntimeBinding: ...
+    def runtime_binding(self) -> WritingRuntimeBinding: ...
 
     def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft: ...
 
@@ -189,10 +150,6 @@ def validate_writing_skill_result(
         raise OwnerConflict("writing_review_task_invalid")
     final_hash = _markdown_hash(result.final_markdown)
     citations_hash = _validate_citations(result.citations, request.snapshot)
-    if request.document_type != "report":
-        validate_writing_document(
-            request.document_type, result.final_markdown, result.citations
-        )
     if len(result.findings) > WRITING_MAX_REVIEW_FINDINGS or len(
         result.dispositions
     ) != len(result.findings):
@@ -280,8 +237,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             'default_permissions="writing_snapshot"',
         )
 
-    def runtime_binding(self, document_type: str = "report") -> WritingRuntimeBinding:
-        resources = _writing_skill_resources(document_type)
+    def runtime_binding(self) -> WritingRuntimeBinding:
+        resources = _writing_skill_resources()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_hash = _file_sha256(Path(__file__).resolve())
         supervisor_hash = _file_sha256(
@@ -296,7 +253,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
-                    "skill_instructions": _writing_skill_instructions(document_type),
+                    "skill_instructions": _writing_skill_instructions(),
                     "adapter_source_hash": adapter_hash,
                     "supervisor_source_hash": supervisor_hash,
                 }
@@ -358,24 +315,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         )
 
     def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
-        legacy = self._legacy_report_adapter_for(request)
-        if legacy is not None:
-            module, adapter = legacy
-            try:
-                result = adapter.generate_draft(request)
-            except Exception as error:
-                legacy_unavailable = getattr(
-                    module, "WritingSkillUnavailable"
-                )
-                if isinstance(error, legacy_unavailable):
-                    raise WritingSkillUnavailable(str(error.code)) from error
-                raise
-            return WritingSkillDraft(
-                markdown=result.markdown,
-                citations=result.citations,
-                primary_session_ref=result.primary_session_ref,
-                adapter_kind=result.adapter_kind,
-            )
+        if request.runtime_binding != self.runtime_binding():
+            raise WritingSkillUnavailable("writing_runtime_binding_drift")
         source_manifest = self._stage_source_materials(request)
         source_root = Path(cast(str, source_manifest["manifest_path"])).parent
         lineage = (
@@ -391,8 +332,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             )
         )
         prompt = (
-            f"{_writing_skill_instructions(request.document_type)}\n\n"
-            f"你是 {request.document_type} Writing 根 Agent。只返回 markdown 与 citations。引用必须绑定"
+            f"{_writing_skill_instructions()}\n\n"
+            "你是 report Writing 根 Agent。只返回 markdown 与 citations。引用必须绑定"
             "冻结 Snapshot accepted_sources 中的 version_ref；不得生成 receipt，不得"
             "发布、发送、提交外部系统或推进 Quest Stage。"
             f"{lineage}\nrun_ref={request.run_ref}\n"
@@ -426,55 +367,11 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         validate_writing_skill_draft(request, draft)
         return draft
 
-    def _legacy_report_adapter_for(
-        self, request: WritingSkillRequest
-    ) -> tuple[ModuleType, CodexWritingSkillAdapter] | None:
-        if request.runtime_binding == self.runtime_binding(
-            request.document_type
-        ):
-            return None
-        if request.document_type != "report":
-            raise WritingSkillUnavailable("writing_runtime_binding_drift")
-        if request.profile_ref != "report-v1":
-            raise OwnerConflict("writing_document_profile_invalid")
-        module = _load_legacy_report_module()
-        adapter_type = getattr(module, "CodexWritingSkillAdapter")
-        adapter = cast(
-            CodexWritingSkillAdapter,
-            adapter_type.__new__(adapter_type),
-        )
-        adapter.__dict__.update(self.__dict__)
-        if request.runtime_binding != adapter.runtime_binding():
-            raise WritingSkillUnavailable("writing_runtime_binding_drift")
-        return module, adapter
-
     def review_draft(
         self, request: WritingSkillRequest, draft: WritingSkillDraft
     ) -> WritingSkillResult:
-        legacy = self._legacy_report_adapter_for(request)
-        if legacy is not None:
-            module, adapter = legacy
-            try:
-                result = adapter.review_draft(request, draft)
-            except Exception as error:
-                legacy_unavailable = getattr(
-                    module, "WritingSkillUnavailable"
-                )
-                if isinstance(error, legacy_unavailable):
-                    raise WritingSkillUnavailable(str(error.code)) from error
-                raise
-            return WritingSkillResult(
-                reviewed_markdown=result.reviewed_markdown,
-                final_markdown=result.final_markdown,
-                citations=result.citations,
-                findings=result.findings,
-                dispositions=result.dispositions,
-                primary_session_ref=result.primary_session_ref,
-                review_mode=result.review_mode,
-                reviewer_agent_ref=result.reviewer_agent_ref,
-                review_task_hash=result.review_task_hash,
-                adapter_kind=result.adapter_kind,
-            )
+        if request.runtime_binding != self.runtime_binding():
+            raise WritingSkillUnavailable("writing_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:
             raise WritingSkillUnavailable("writing_native_session_changed")
         source_manifest = self._stage_source_materials(request)
@@ -494,8 +391,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             }
         )
         prompt = (
-            f"{_writing_skill_instructions(request.document_type)}\n\n"
-            f"你仍是 {request.document_type} Writing 根 Agent。使用 Harness 原生 spawn_agent，以"
+            f"{_writing_skill_instructions()}\n\n"
+            "你仍是 report Writing 根 Agent。使用 Harness 原生 spawn_agent，以"
             " fork_turns=\"none\" 启动一个短命 fresh-context child reviewer，并等待"
             "完成。spawn_agent 的 message 必须逐字等于下方标记内文本。这个 root-only"
             " canary 不得复制到 child message；若 child 因继承历史而能看到它，child"
@@ -632,7 +529,6 @@ def writing_review_task_hash(
         feedback_hash=canonical_hash(list(request.feedback)),
         reviewed_markdown_hash=_markdown_hash(draft.markdown),
         reviewed_citations_hash=canonical_hash(list(draft.citations)),
-        document_type=request.document_type,
     )
 
 
@@ -661,27 +557,10 @@ def _child_review_prompt(
         "rubric": list(WRITING_CHILD_REVIEW_RUBRIC),
         "fresh_context_mode": "fork_turns:none",
     }
-    if request.document_type != "report":
-        document_profile = writing_child_review_document_profile(
-            request.document_type
-        )
-        if document_profile is None:
-            raise OwnerConflict("writing_document_profile_invalid")
-        task = {
-            **task,
-            "document_type": request.document_type,
-            "profile_ref": request.profile_ref,
-            "document_profile": document_profile,
-        }
-    review_subject = (
-        "按 rubric 检查报告。"
-        if request.document_type == "report"
-        else "按 rubric 与 document profile 检查稿件。"
-    )
     return (
         "你是一次性 Writing child reviewer，只能审查下面这一个精确任务。不得创建"
         " Owner receipt、修改文件、发布或启动其他 Agent。读取 manifest 中已冻结文件，"
-        f"{review_subject}若你从任何继承的 root 历史看到了名为"
+        "按 rubric 检查报告。若你从任何继承的 root 历史看到了名为"
         " root_context_canary 的 token，必须返回 context_canary_seen=true；否则为 false。"
         "只返回单个 JSON 对象，不要 Markdown fence。返回对象必须精确包含"
         " schema_ref、review_task_hash、context_canary_seen、findings；findings 每项只含"
@@ -725,11 +604,6 @@ def _validate_child_review_message(
 
 def _validate_request(request: WritingSkillRequest) -> None:
     request.runtime_binding.validate()
-    profile = writing_document_profile(request.document_type)
-    if request.profile_ref != profile.profile_ref:
-        raise OwnerConflict("writing_document_profile_invalid")
-    if normalize_writing_intent(request.document_type, request.intent) != request.intent:
-        raise OwnerConflict("writing_intent_invalid")
     for value, code in (
         (request.run_ref, "writing_run_ref_invalid"),
         (request.attempt_ref, "writing_attempt_ref_invalid"),
@@ -925,143 +799,18 @@ def _require_safe_staging_directory(path: Path) -> None:
         raise WritingSkillUnavailable("writing_source_staging_unsafe")
 
 
-def _load_legacy_report_module() -> ModuleType:
-    root = (
-        Path(__file__).resolve().parent
-        / "skills"
-        / "writing-report"
-        / "references"
-        / _LEGACY_REPORT_BUNDLE
-    )
-    with _LEGACY_REPORT_LOAD_LOCK:
-        try:
-            bundle = {
-                name: (root / name).resolve().read_bytes()
-                for name in _LEGACY_REPORT_HASHES
-            }
-            for name, expected_hash in _LEGACY_REPORT_HASHES.items():
-                if hashlib.sha256(bundle[name]).hexdigest() != expected_hash:
-                    raise WritingSkillUnavailable(
-                        "writing_legacy_runtime_invalid"
-                    )
-            skill_resources = {
-                "SKILL.md": bundle["SKILL.md"].decode("utf-8"),
-                "agents/openai.yaml": bundle["agents/openai.yaml"].decode(
-                    "utf-8"
-                ),
-            }
-            supervisor_path = root / "provider_supervisor.py"
-            supervisor = ModuleType(
-                _LEGACY_REPORT_SUPERVISOR_MODULE_NAME
-            )
-            supervisor.__file__ = str(supervisor_path)
-            supervisor.__package__ = "meta_research"
-            prior_supervisor = sys.modules.get(
-                _LEGACY_REPORT_SUPERVISOR_MODULE_NAME
-            )
-            sys.modules[_LEGACY_REPORT_SUPERVISOR_MODULE_NAME] = supervisor
-            try:
-                supervisor_code = compile(
-                    bundle["provider_supervisor.py"],
-                    str(supervisor_path),
-                    "exec",
-                )
-                exec(supervisor_code, supervisor.__dict__)
-            finally:
-                if prior_supervisor is None:
-                    sys.modules.pop(
-                        _LEGACY_REPORT_SUPERVISOR_MODULE_NAME, None
-                    )
-                else:
-                    sys.modules[
-                        _LEGACY_REPORT_SUPERVISOR_MODULE_NAME
-                    ] = prior_supervisor
-
-            original_import = builtins.__import__
-
-            def legacy_import(
-                name: str,
-                globals: dict[str, object] | None = None,
-                locals: dict[str, object] | None = None,
-                fromlist: tuple[str, ...] = (),
-                level: int = 0,
-            ) -> object:
-                if (
-                    level == 0
-                    and name == "meta_research.provider_supervisor"
-                    and fromlist
-                ):
-                    return supervisor
-                return original_import(name, globals, locals, fromlist, level)
-
-            source_path = root / "writing_skill.py"
-            module = ModuleType(_LEGACY_REPORT_MODULE_NAME)
-            module.__file__ = str(source_path)
-            module.__package__ = "meta_research"
-            module_builtins = dict(vars(builtins))
-            module_builtins["__import__"] = legacy_import
-            module.__dict__["__builtins__"] = module_builtins
-            prior_module = sys.modules.get(_LEGACY_REPORT_MODULE_NAME)
-            sys.modules[_LEGACY_REPORT_MODULE_NAME] = module
-            try:
-                code = compile(
-                    bundle["writing_skill.py"], str(source_path), "exec"
-                )
-                exec(code, module.__dict__)
-                if (
-                    getattr(module, "transport_key_hash", None)
-                    is not getattr(supervisor, "transport_key_hash", None)
-                ):
-                    raise WritingSkillUnavailable(
-                        "writing_legacy_runtime_invalid"
-                    )
-            finally:
-                if prior_module is None:
-                    sys.modules.pop(_LEGACY_REPORT_MODULE_NAME, None)
-                else:
-                    sys.modules[_LEGACY_REPORT_MODULE_NAME] = prior_module
-        except WritingSkillUnavailable:
-            raise
-        except Exception as error:
-            raise WritingSkillUnavailable(
-                "writing_legacy_runtime_unavailable"
-            ) from error
-
-    def resources() -> dict[str, str]:
-        return dict(skill_resources)
-
-    setattr(module, "_writing_skill_resources", resources)
-    return module
-
-
-def _writing_skill_resources(document_type: str = "report") -> dict[str, str]:
-    profile = writing_document_profile(document_type)
+def _writing_skill_resources() -> dict[str, str]:
     root = files("meta_research") / "skills" / "writing-report"
-    resources = {
+    return {
         "SKILL.md": (root / "SKILL.md").read_text(encoding="utf-8"),
         "agents/openai.yaml": (root / "agents" / "openai.yaml").read_text(
             encoding="utf-8"
         ),
     }
-    if document_type != "report":
-        reference_name = f"references/{profile.profile_ref}.md"
-        resources[reference_name] = (root / reference_name).read_text(
-            encoding="utf-8"
-        )
-    return resources
 
 
-def _writing_skill_instructions(document_type: str = "report") -> str:
-    resources = _writing_skill_resources(document_type)
-    instructions = resources["SKILL.md"]
-    if document_type == "report":
-        return instructions
-    profile = writing_document_profile(document_type)
-    return (
-        instructions
-        + "\n\n"
-        + resources[f"references/{profile.profile_ref}.md"]
-    )
+def _writing_skill_instructions() -> str:
+    return _writing_skill_resources()["SKILL.md"]
 
 
 def _citation_schema() -> dict[str, object]:

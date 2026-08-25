@@ -1,6 +1,13 @@
 import type { Page } from "@playwright/test";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -17,6 +24,7 @@ type DeterministicProductOptions = {
   legacyState?: "draft" | "recovering";
   manualRoot?: boolean;
   stagePipeline?: "plan-gap";
+  writingDeliveryFaults?: "history-boundaries";
 };
 
 export type PlanProviderPhase = "plan-primary" | "plan-review";
@@ -60,6 +68,9 @@ export class DeterministicProduct {
     }
     if (options.stagePipeline) {
       argv.push("--stage-pipeline", options.stagePipeline);
+    }
+    if (options.writingDeliveryFaults) {
+      argv.push("--writing-delivery-faults", options.writingDeliveryFaults);
     }
     const child = spawn(
       "uv",
@@ -134,7 +145,12 @@ export class DeterministicProduct {
           cause: error,
         });
       }
-      rmSync(dataRoot, { recursive: true, force: true });
+      rmSync(dataRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
       throw error;
     }
   }
@@ -187,6 +203,52 @@ export class DeterministicProduct {
     });
   }
 
+  prepareWritingDeliveryTarget(fileName: string): string {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(fileName)) {
+      throw new Error("invalid deterministic Writing delivery file name");
+    }
+    const directory = join(this.dataRoot, "writing-deliveries");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    return join(directory, fileName);
+  }
+
+  writingDeliveryExists(fileName: string): boolean {
+    return existsSync(this.writingDeliveryPath(fileName));
+  }
+
+  readWritingDelivery(fileName: string): string {
+    return readFileSync(this.writingDeliveryPath(fileName), "utf8");
+  }
+
+  readWritingDeliveryBytes(fileName: string): Buffer {
+    return readFileSync(this.writingDeliveryPath(fileName));
+  }
+
+  damageWritingAssetCustody(contentHash: string): void {
+    if (!/^[0-9a-f]{64}$/.test(contentHash)) {
+      throw new Error("invalid deterministic Writing asset hash");
+    }
+    const objectPath = join(
+      this.dataRoot,
+      "objects",
+      "sha256",
+      "assets",
+      contentHash.slice(0, 2),
+      contentHash,
+    );
+    if (!existsSync(objectPath)) {
+      throw new Error("deterministic Writing asset custody is missing");
+    }
+    rmSync(objectPath);
+  }
+
+  private writingDeliveryPath(fileName: string): string {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(fileName)) {
+      throw new Error("invalid deterministic Writing delivery file name");
+    }
+    return join(this.dataRoot, "writing-deliveries", fileName);
+  }
+
   private providerMarker(
     phase: PlanProviderPhase,
     state: "started" | "release",
@@ -203,7 +265,12 @@ export class DeterministicProduct {
     if (this.unexpectedExit || this.process.exitCode !== null || this.process.signalCode !== null) {
       const detail = this.unexpectedExit ??
         `code=${String(this.process.exitCode)} signal=${String(this.process.signalCode)}`;
-      rmSync(this.dataRoot, { recursive: true, force: true });
+      rmSync(this.dataRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
       throw new Error(`deterministic product exited before teardown (${detail})`);
     }
     this.stopRequested = true;
@@ -215,7 +282,12 @@ export class DeterministicProduct {
         }
       }
     }
-    rmSync(this.dataRoot, { recursive: true, force: true });
+    rmSync(this.dataRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 50,
+    });
     if (this.processErrors.length) {
       throw new Error("deterministic product child process emitted an error", {
         cause: this.processErrors[0],

@@ -43,6 +43,11 @@ from meta_research.quest_drafting import (
 )
 from meta_research.web import create_app
 from meta_research.writing_contract import WritingRuntimeBinding
+from meta_research.writing_delivery import (
+    LocalFilesystemWritingDeliveryProvider,
+    WritingDeliveryOutcomeUnknown,
+    WritingDeliveryProviderRegistry,
+)
 from meta_research.writing_skill import (
     WritingSkillDraft,
     WritingSkillRequest,
@@ -288,12 +293,8 @@ class DeterministicWritingSkill:
         # Keep the active Session observable long enough for pause and browser-close
         # recovery checks without introducing a test-only product endpoint.
         time.sleep(0.35)
-        feedback = "；".join(request.feedback) or "无追加反馈"
         return WritingSkillDraft(
-            markdown=(
-                f"# {request.intent['title']} · draft r{request.revision}\n\n"
-                f"当前草稿依据冻结 Snapshot。反馈：{feedback}。\n"
-            ),
+            markdown=deterministic_writing_markdown(request, draft=True),
             citations=(),
             primary_session_ref=request.native_session_ref
             or f"chrome-writing-native-session:{request.run_ref}",
@@ -306,14 +307,7 @@ class DeterministicWritingSkill:
         time.sleep(0.35)
         return WritingSkillResult(
             reviewed_markdown=draft.markdown,
-            final_markdown=(
-                f"# {request.intent['title']} · r{request.revision}\n\n"
-                "<!-- meta-research-structure -->\n"
-                "## 结论\n\n"
-                "<!-- meta-research-claim:evidence-gap -->\n"
-                "**Evidence gap:** "
-                "当前冻结 Snapshot 尚无可引用研究资产，因此不形成超出证据的确定性结论。\n"
-            ),
+            final_markdown=deterministic_writing_markdown(request, draft=False),
             citations=(),
             findings=(
                 {
@@ -334,6 +328,100 @@ class DeterministicWritingSkill:
             review_task_hash=writing_review_task_hash(request, draft),
             adapter_kind=draft.adapter_kind,
         )
+
+
+class DeterministicHistoryWritingDeliveryProvider(
+    LocalFilesystemWritingDeliveryProvider
+):
+    """Exercise durable delivery boundary states through the real daemon seam."""
+
+    @staticmethod
+    def _fault_mode(request) -> str | None:
+        file_name = Path(str(request.target["path"])).name
+        if file_name.startswith("history-partial."):
+            return "partial"
+        if file_name.startswith("history-unknown."):
+            return "outcome_unknown"
+        return None
+
+    def execute(self, request):
+        fault_mode = self._fault_mode(request)
+        if fault_mode is None:
+            return super().execute(request)
+        super().execute(request)
+        if fault_mode == "outcome_unknown":
+            raise WritingDeliveryOutcomeUnknown("deterministic_ack_lost")
+        return self._observation(
+            request,
+            "partial",
+            {
+                "fault_mode": "stable_partial",
+                "target_hash": request.artifact_sha256,
+            },
+        )
+
+    def reconcile(self, request):
+        fault_mode = self._fault_mode(request)
+        if fault_mode is None:
+            return super().reconcile(request)
+        if fault_mode == "outcome_unknown":
+            raise WritingDeliveryOutcomeUnknown(
+                "deterministic_reconcile_outcome_unknown"
+            )
+        return self._observation(
+            request,
+            "partial",
+            {
+                "fault_mode": "stable_partial",
+                "target_hash": request.artifact_sha256,
+            },
+        )
+
+
+def deterministic_writing_markdown(
+    request: WritingSkillRequest, *, draft: bool
+) -> str:
+    suffix = f"draft r{request.revision}" if draft else f"r{request.revision}"
+    title = f"# {request.intent['title']} · {suffix}"
+    evidence_gap = (
+        "当前冻结 Snapshot 尚无可引用研究资产，因此不形成超出证据的确定性结论。"
+    )
+    if request.document_type == "paper":
+        sections = []
+        for role, heading in (
+            ("abstract", "摘要"),
+            ("framing", "研究问题"),
+            ("methods", "证据方法"),
+            ("results", "有界结果"),
+            ("limitations", "局限"),
+            ("conclusion", "结论"),
+        ):
+            sections.extend(
+                (
+                    f"<!-- meta-research-paper-section role={role} -->\n## {heading}",
+                    "<!-- meta-research-claim:evidence-gap -->\n"
+                    f"**Evidence gap:** {heading}：{evidence_gap}",
+                )
+            )
+        return title + "\n\n" + "\n\n".join(sections) + "\n"
+    if request.document_type == "presentation":
+        return (
+            title
+            + "\n\n<!-- meta-research-structure -->\n## Slide 1: 证据边界\n\n"
+            + "<!-- meta-research-claim:evidence-gap -->\n"
+            + f"**Evidence gap:** {evidence_gap}\n\n"
+            + "<!-- meta-research-structure -->\n## Slide 2: 下一步\n\n"
+            + "<!-- meta-research-claim:uncertainty -->\n"
+            + "**Uncertainty:** 尚需接纳研究资产后才能形成可复核结论。\n"
+        )
+    feedback = "；".join(request.feedback) or "无追加反馈"
+    if draft:
+        return f"{title}\n\n当前草稿依据冻结 Snapshot。反馈：{feedback}。\n"
+    return (
+        f"{title}\n\n<!-- meta-research-structure -->\n## 结论\n\n"
+        "<!-- meta-research-claim:evidence-gap -->\n"
+        f"**Evidence gap:** {evidence_gap}\n"
+    )
 
 
 class ProviderPhaseControl:
@@ -676,6 +764,7 @@ async def serve(
     manual_root: bool,
     web_root: Path | None,
     stage_pipeline: str | None,
+    writing_delivery_faults: str | None,
 ) -> None:
     intent_started = threading.Event()
     adapter = DeterministicDraftingAdapter(intent_started)
@@ -689,6 +778,13 @@ async def serve(
                 prepared_data_root.run / "chrome-provider-control"
             )
         )
+    writing_delivery_registry = (
+        WritingDeliveryProviderRegistry(
+            (DeterministicHistoryWritingDeliveryProvider(),)
+        )
+        if writing_delivery_faults == "history-boundaries"
+        else None
+    )
     runtime = build_production_runtime(
         prepared_data_root,
         proposal_drafter=adapter,
@@ -697,6 +793,7 @@ async def serve(
         idea_skill_provider=idea_skill,
         plan_skill_provider=plan_skill,
         writing_skill_provider=DeterministicWritingSkill(),
+        writing_delivery_provider_registry=writing_delivery_registry,
         deepfetch_provider=DeterministicDeepFetchProvider(),
     )
     human_collaboration = runtime.owners.human_collaboration
@@ -771,6 +868,9 @@ def main() -> None:
     parser.add_argument("--legacy-state", choices=("draft", "recovering"))
     parser.add_argument("--manual-root", action="store_true")
     parser.add_argument("--stage-pipeline", choices=("plan-gap",))
+    parser.add_argument(
+        "--writing-delivery-faults", choices=("history-boundaries",)
+    )
     parser.add_argument("--web-root", type=Path)
     args = parser.parse_args()
     asyncio.run(
@@ -780,6 +880,7 @@ def main() -> None:
             args.manual_root,
             args.web_root,
             args.stage_pipeline,
+            args.writing_delivery_faults,
         )
     )
 

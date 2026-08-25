@@ -4,7 +4,7 @@ import json
 import math
 import threading
 import time
-from typing import Protocol, cast
+from typing import Callable, Protocol, cast
 from urllib.parse import parse_qsl, urlsplit
 
 from sqlalchemy import text
@@ -227,6 +227,10 @@ class HumanCollaborationInterface(Protocol):
 
     def verify_guidance_binding(self, binding: dict[str, object]) -> None: ...
 
+    def bind_writing_delivery_binding_validator(
+        self, validator: Callable[[dict[str, object]], None]
+    ) -> None: ...
+
     def create_command_draft(
         self, scope_ref: str, command: dict[str, object], idempotency_key: str
     ) -> dict[str, object]: ...
@@ -255,6 +259,15 @@ class HumanCollaborationInterface(Protocol):
         preview_ref: str,
         preview_hash: str,
         idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def invalidate_command_preview(
+        self,
+        intent_id: str,
+        draft_revision: int,
+        draft_hash: str,
+        preview_ref: str,
+        preview_hash: str,
     ) -> dict[str, object]: ...
 
     def query_command(self, intent_id: str) -> dict[str, object]: ...
@@ -1632,6 +1645,13 @@ class SQLiteHumanCollaboration:
     def verify_guidance_binding(self, binding: dict[str, object]) -> None:
         self._collaboration_ladder.verify_guidance_binding(binding)
 
+    def bind_writing_delivery_binding_validator(
+        self, validator: Callable[[dict[str, object]], None]
+    ) -> None:
+        self._collaboration_ladder.bind_writing_delivery_binding_validator(
+            validator
+        )
+
     def create_command_draft(
         self, scope_ref: str, command: dict[str, object], idempotency_key: str
     ) -> dict[str, object]:
@@ -1677,6 +1697,22 @@ class SQLiteHumanCollaboration:
             preview_ref,
             preview_hash,
             idempotency_key,
+        )
+
+    def invalidate_command_preview(
+        self,
+        intent_id: str,
+        draft_revision: int,
+        draft_hash: str,
+        preview_ref: str,
+        preview_hash: str,
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.invalidate_command_preview(
+            intent_id,
+            draft_revision,
+            draft_hash,
+            preview_ref,
+            preview_hash,
         )
 
     def query_command(self, intent_id: str) -> dict[str, object]:
