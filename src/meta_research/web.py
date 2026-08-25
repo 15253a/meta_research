@@ -420,11 +420,23 @@ class EmptyCommandRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CompanionQuestionViewContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["question"]
+    quest_ref: str = Field(min_length=1, max_length=128)
+    question_ref: str = Field(min_length=1, max_length=128)
+    content_ref: str = Field(min_length=1, max_length=256)
+    content_hash: str = Field(min_length=64, max_length=64)
+    lifecycle_revision: int = Field(ge=1)
+
+
 class CompanionMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope_ref: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=INTENT_MESSAGE_MAX_LENGTH)
+    view_context: CompanionQuestionViewContext | None = None
 
 
 class HumanRequestResponseRequest(BaseModel):
@@ -1417,6 +1429,11 @@ def create_app(
             message.scope_ref or "workspace",
             message.message,
             _idempotency_key(request),
+            view_context=(
+                None
+                if message.view_context is None
+                else message.view_context.model_dump()
+            ),
         )
 
     @app.post("/api/v1/human-requests/{request_ref}/responses", status_code=201)
@@ -2278,6 +2295,20 @@ def create_app(
             timeout_code="asset_release_io_timeout",
         )
         return result.as_public_dict()
+
+    @app.get("/api/v1/questions/{question_ref}/history")
+    def query_question_history(
+        question_ref: str,
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> dict[str, object]:
+        return runtime.projection.query_question_history(
+            question_ref, offset=offset, limit=limit
+        )
+
+    @app.get("/api/v1/questions/{question_ref}/evidence")
+    def query_question_evidence(question_ref: str) -> dict[str, object]:
+        return runtime.projection.query_question_evidence(question_ref)
 
     @app.get("/api/v1/snapshot")
     def query_snapshot() -> dict[str, object]:

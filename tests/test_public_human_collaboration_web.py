@@ -519,6 +519,43 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
         restarted.close()
 
 
+def test_companion_web_rejects_a_noncurrent_question_view_context(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "companion-question-view-context-web")
+    client, auth = _authenticated_client(runtime)
+    scope_ref = "quest:missing-question-quest"
+    try:
+        with client:
+            response = client.post(
+                "/api/v1/companion/messages",
+                headers=_write_headers(auth, "companion-stale-question-web"),
+                json={
+                    "scope_ref": scope_ref,
+                    "message": "Do not enqueue a Question the Owner cannot rebind.",
+                    "view_context": {
+                        "kind": "question",
+                        "quest_ref": "missing-question-quest",
+                        "question_ref": "missing-question",
+                        "content_ref": "missing-content",
+                        "content_hash": "a" * 64,
+                        "lifecycle_revision": 1,
+                    },
+                },
+            )
+
+            assert response.status_code == 409
+            assert response.json()["detail"]["code"] == (
+                "companion_question_view_context_stale"
+            )
+            assert runtime.owners.human_collaboration.query_companion(scope_ref)[
+                "turns"
+            ] == []
+    finally:
+        client.close()
+        runtime.close()
+
+
 def test_command_web_requires_exact_preview_then_separate_authorization(
     tmp_path: Path,
 ) -> None:

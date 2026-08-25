@@ -78,7 +78,7 @@ def test_bundle_inbox_runtime_migration_is_atomic_and_retryable(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0035_runtime_protection",)
+        ).fetchone() == ("0037_question_stage_identity",)
         tables = {
             row[0]
             for row in connection.execute(

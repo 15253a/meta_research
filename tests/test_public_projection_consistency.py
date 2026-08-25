@@ -142,8 +142,12 @@ class _QuestionTreeResearchGraph(_StaticResearchGraph):
         assert quest_ref == "quest_projection"
         return self._goal_revision
 
-    def query_question_tree(self):
-        return self._questions
+    def query_question_tree(self, quest_ref: str | None = None):
+        return tuple(
+            question
+            for question in self._questions
+            if quest_ref is None or question.quest_ref == quest_ref
+        )
 
     def query_question_lifecycle(self, question_ref: str) -> dict[str, object]:
         assert question_ref in {item.question_ref for item in self._questions}
@@ -528,6 +532,19 @@ def test_question_tree_projects_only_exact_public_goal_cycle_and_request_binding
             "target_assertion": {"quest_ref": "quest_projection"},
             "direct_waiters": [],
         },
+        {
+            "request_ref": "human_request_unscoped_collision",
+            "issuer": "agent_runtime",
+            "revision": 1,
+            "kind": "unrelated",
+            "status": "open",
+            "created_at": 4.0,
+            "target_assertion": {
+                "question_ref": "question_projection_root",
+                "cycle_ref": "cycle_projection_root",
+            },
+            "direct_waiters": [],
+        },
     )
     collaboration = _HumanCollaboration("human_collaboration", {})
     collaboration.collaboration_scope = "quest:quest_projection"
@@ -617,6 +634,76 @@ def test_question_tree_projects_only_exact_public_goal_cycle_and_request_binding
     ] == ["human_request_child_exact"]
 
 
+def test_question_tree_is_bounded_to_the_current_collaboration_quest(
+    tmp_path: Path,
+) -> None:
+    goal_revision = {
+        "kind": "QuestGoalRevision",
+        "goal_revision_ref": "quest_goal_revision_projection",
+        "quest_ref": "quest_projection",
+        "draft_revision": 1,
+        "draft_hash": "d" * 64,
+        "goal": {
+            "goal": "Keep the active Quest isolated.",
+            "completion_criteria": "No foreign Question enters the public tree.",
+            "background_and_initial_direction": "Use the HC collaboration scope.",
+        },
+        "rg_quest_acceptance_receipt_ref": "receipt:quest-projection",
+    }
+    foreign_request = {
+        "request_ref": "human_request_foreign_question",
+        "issuer": "research_graph",
+        "revision": 1,
+        "quest_ref": "quest_foreign",
+        "kind": "question_input",
+        "status": "open",
+        "created_at": 1.0,
+        "target_assertion": {"question_ref": "question_foreign"},
+        "direct_waiters": [],
+    }
+    graph = _QuestionTreeResearchGraph(
+        goal_revision=goal_revision,
+        requests=(foreign_request,),
+    )
+    graph._questions = (  # noqa: SLF001 - projection contract fixture
+        SimpleNamespace(
+            question_ref="question_foreign",
+            quest_ref="quest_foreign",
+            parent_question_ref=None,
+            content_ref="memory:foreign",
+            content_hash="f" * 64,
+            schema_ref="question/v1",
+            receipt=SimpleNamespace(receipt_ref="receipt:foreign"),
+        ),
+        *graph._questions,  # noqa: SLF001 - projection contract fixture
+    )
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_projection"
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=graph,  # type: ignore[arg-type]
+        advancement_engine=_QuestionForegroundOwner(
+            "advancement_engine", {"foreground_cycle_count": 1}
+        ),  # type: ignore[arg-type]
+        research_memory=_QuestionTreeResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+    )
+
+    snapshot = projection.query_snapshot()
+
+    assert snapshot["question_tree"]["status"] == "ready"
+    assert {
+        item["quest_ref"] for item in snapshot["question_tree"]["items"]
+    } == {"quest_projection"}
+    assert {
+        item["question_ref"] for item in snapshot["question_tree"]["items"]
+    } == {"question_projection_root", "question_projection_child"}
+
+
 def test_projection_reports_typed_nulls_when_goal_and_cycle_seams_are_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -634,7 +721,9 @@ def test_projection_reports_typed_nulls_when_goal_and_cycle_seams_are_unavailabl
         schema_ref="question/v1",
         receipt=SimpleNamespace(receipt_ref="receipt:unavailable"),
     )
-    graph.query_question_tree = lambda: (question,)  # type: ignore[attr-defined]
+    graph.query_question_tree = lambda _quest_ref=None: (  # type: ignore[attr-defined]
+        question,
+    )
     graph.query_question_lifecycle = lambda _ref: {  # type: ignore[attr-defined]
         "status": "active",
         "revision": 1,

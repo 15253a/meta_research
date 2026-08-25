@@ -232,7 +232,10 @@ class SQLiteHumanCollaborationLadder:
         database: Database,
         feed: DurableFeed,
         drafting_provider: IntentDraftingProvider,
-        context_resolver: Callable[[str], dict[str, object]] | None = None,
+        context_resolver: Callable[
+            [str, dict[str, object] | None], dict[str, object]
+        ]
+        | None = None,
         control_preview_resolver: Callable[
             [str, dict[str, object]],
             tuple[list[dict[str, object]], dict[str, int]],
@@ -291,18 +294,52 @@ class SQLiteHumanCollaborationLadder:
         scope_ref: str,
         message: str,
         idempotency_key: str,
+        *,
+        view_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
         scope_ref = _scope_ref(scope_ref, "companion_scope_required")
         message = _text(message, "companion_message_required", INTENT_MESSAGE_MAX_LENGTH)
         _reject_secret_content(message)
         _idempotency_key(idempotency_key)
+        if view_context is not None:
+            view_context = _document(
+                view_context,
+                "companion_view_context_invalid",
+            )
+            _reject_secret_content(view_context)
         command_hash = canonical_hash(
             {
                 "command": "send_companion_message",
                 "scope_ref": scope_ref,
                 "message": message,
+                **(
+                    {}
+                    if view_context is None
+                    else {"view_context": view_context}
+                ),
             }
         )
+        with self._database.read() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT interaction_ref, command_hash FROM "
+                    "hc_companion_turns WHERE idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        if replay is not None:
+            if replay.command_hash != command_hash:
+                raise OwnerConflict("idempotency_conflict")
+            return self._query_turn(str(replay.interaction_ref))
+        if view_context is not None:
+            if self._context_resolver is None:
+                raise OwnerConflict(
+                    "companion_view_context_verifier_unavailable"
+                )
+            resolved = self._context_resolver(scope_ref, view_context)
+            _reject_secret_content(
+                _document(resolved, "companion_context_invalid")
+            )
         with self._database.write() as connection:
             existing = connection.execute(
                 text(
@@ -361,10 +398,12 @@ class SQLiteHumanCollaborationLadder:
                 connection.execute(
                     text(
                         "INSERT INTO hc_companion_turns (interaction_ref, session_ref, "
-                        "ordinal, message, message_hash, assistant_status, "
+                        "ordinal, message, message_hash, view_context_json, "
+                        "view_context_hash, assistant_status, "
                         "attempt_count, idempotency_key, command_hash, created_at, "
                         "updated_at) VALUES (:interaction_ref, :session_ref, :ordinal, "
-                        ":message, :message_hash, 'queued', 0, :idempotency_key, "
+                        ":message, :message_hash, :view_context_json, "
+                        ":view_context_hash, 'queued', 0, :idempotency_key, "
                         ":command_hash, :now, :now)"
                     ),
                     {
@@ -373,6 +412,16 @@ class SQLiteHumanCollaborationLadder:
                         "ordinal": ordinal,
                         "message": message,
                         "message_hash": canonical_hash(message),
+                        "view_context_json": (
+                            None
+                            if view_context is None
+                            else canonical_json(view_context)
+                        ),
+                        "view_context_hash": (
+                            None
+                            if view_context is None
+                            else canonical_hash(view_context)
+                        ),
                         "idempotency_key": idempotency_key,
                         "command_hash": command_hash,
                         "now": now,
@@ -463,14 +512,18 @@ class SQLiteHumanCollaborationLadder:
                 self._finish_companion_runtime_boundary(boundary)
                 return True
         try:
-            context = (
-                {
+            view_context = _turn_view_context(row)
+            if self._context_resolver is None:
+                if view_context is not None:
+                    raise OwnerConflict(
+                        "companion_view_context_verifier_unavailable"
+                    )
+                context = {
                     "schema_ref": "meta-research/companion-context/v1",
                     "scope_ref": row.scope_ref,
                 }
-                if self._context_resolver is None
-                else self._context_resolver(row.scope_ref)
-            )
+            else:
+                context = self._context_resolver(row.scope_ref, view_context)
             context = _document(context, "companion_context_invalid")
             _reject_secret_content(context)
             draft = {
@@ -886,6 +939,11 @@ class SQLiteHumanCollaborationLadder:
             companion = self.query_companion(scope_ref)
             for turn in cast(list[dict[str, object]], companion["turns"]):
                 interaction_ref = cast(str, turn["interaction_ref"])
+                context_projection = (
+                    {}
+                    if "view_context" not in turn
+                    else {"view_context": turn["view_context"]}
+                )
                 messages.append(
                     {
                         "message_ref": f"{interaction_ref}:user",
@@ -894,6 +952,7 @@ class SQLiteHumanCollaborationLadder:
                         "content": turn["message"],
                         "status": "completed",
                         "created_at": turn["created_at"],
+                        **context_projection,
                     }
                 )
                 assistant_status = cast(str, turn["assistant_status"])
@@ -906,6 +965,7 @@ class SQLiteHumanCollaborationLadder:
                         "status": assistant_status,
                         "created_at": turn["updated_at"],
                         "reason": turn["reason"],
+                        **context_projection,
                     }
                 )
         return {
@@ -2952,6 +3012,19 @@ def public_authorization_from_row(row) -> dict[str, object]:
     }
 
 
+def _turn_view_context(row) -> dict[str, object] | None:
+    encoded = getattr(row, "view_context_json", None)
+    digest = getattr(row, "view_context_hash", None)
+    if encoded is None and digest is None:
+        return None
+    if not isinstance(encoded, str) or not isinstance(digest, str):
+        raise OwnerConflict("companion_interaction_invalid")
+    context = decoded_object(encoded)
+    if canonical_hash(context) != digest:
+        raise OwnerConflict("companion_interaction_invalid")
+    return context
+
+
 def _public_turn(row) -> dict[str, object]:
     if canonical_hash(row.message) != row.message_hash:
         raise OwnerConflict("companion_interaction_invalid")
@@ -2959,12 +3032,18 @@ def _public_turn(row) -> dict[str, object]:
         canonical_hash(row.assistant_content) != row.assistant_content_hash
     ):
         raise OwnerConflict("companion_interaction_invalid")
+    view_context = _turn_view_context(row)
     return {
         "interaction_ref": row.interaction_ref,
         "interaction_kind": "conversation",
         "scope_ref": getattr(row, "scope_ref", None),
         "ordinal": int(row.ordinal),
         "message": row.message,
+        **(
+            {}
+            if view_context is None
+            else {"view_context": view_context}
+        ),
         "assistant_status": row.assistant_status,
         "assistant_content": row.assistant_content,
         "adapter_kind": row.adapter_kind,

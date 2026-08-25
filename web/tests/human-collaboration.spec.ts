@@ -1796,7 +1796,7 @@ test("an orphaned material delivery is discarded when its request revision is no
 test("a quest-wide wait auto-opens once while a local request only remains visible", async ({
   page,
 }) => {
-  await installHumanCollaborationSnapshot(page, { questBlock: true });
+  const snapshot = await installHumanCollaborationSnapshot(page, { questBlock: true });
   await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
 
   const dialog = page.getByRole("dialog", { name: "HumanRequest" });
@@ -1810,6 +1810,19 @@ test("a quest-wide wait auto-opens once while a local request only remains visib
   await expect(page.getByRole("complementary", { name: "Quest Companion" })).toContainText(
     "需要你处理",
   );
+
+  const requests = ((snapshot.human_collaboration as JsonRecord)
+    .human_requests as JsonRecord).items as JsonRecord[];
+  const questWide = requests.find(
+    (item) => item.request_ref === "research_graph:HR-52:r1",
+  )!;
+  questWide.revision = 2;
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("按已接纳协议完成线下校准");
+  await dialog.getByRole("button", { name: "关闭 HumanRequest" }).click();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(dialog).toBeHidden();
 });
 
 test("quest-wide auto presentation skips an already presented request and ignores another Quest", async ({
@@ -1838,7 +1851,7 @@ test("quest-wide auto presentation skips an already presented request and ignore
   items.push(secondCurrent, foreignQuest);
   await page.addInitScript(() => {
     sessionStorage.setItem(
-      "meta_research:human_request:auto_presented:research_graph:HR-52:r1",
+      "meta_research:human_request:auto_presented:research_graph:research_graph:HR-52:r1:r1",
       "presented",
     );
   });

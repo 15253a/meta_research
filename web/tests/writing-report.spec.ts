@@ -500,6 +500,7 @@ const officeDeliveryViewports = [
 for (const viewport of officeDeliveryViewports) {
   test(
     `Paper and Presentation become ready with real deterministic Office downloads at ${viewport.width}px`,
+    viewport.visualSnapshot ? { tag: "@writing-fixed-raster" } : {},
     async ({ page }) => {
       await exerciseOfficeDeliveryFlow(page, viewport);
     },

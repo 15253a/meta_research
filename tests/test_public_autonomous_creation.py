@@ -16,6 +16,7 @@ providers only.  They never read an Owner table or fabricate an Owner receipt.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from meta_research.acquisition import (
     AcquisitionRuntimeBinding,
 )
 from meta_research.composition import build_production_runtime
+from meta_research.idea_skill import IdeaSkillDraft, IdeaSkillRequest
 from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.paths import prepare_data_root
@@ -49,6 +51,7 @@ from meta_research.reasoning_skill import (
 from test_public_reasoning_stage import (
     _confirm_deepfetch_quest,
     _finish_idea_stage,
+    _force_question_switch,
     _owner_revisions,
     _reasoning_runtime,
     _research_synthesis,
@@ -56,9 +59,13 @@ from test_public_reasoning_stage import (
 )
 from test_public_plan_stage import (
     _DeterministicDraftingAdapter,
+    _DeterministicIdeaSkill,
+    _DeterministicPlanSkill,
     _DeterministicProbe as DeterministicPlanProbe,
     _confirm_direct_quest,
+    _runtime as _plan_runtime,
 )
+from test_public_manual_question_lifecycle import _confirm_waived_manual_question
 from test_public_advancement_runtime_control import (
     _confirmed_control,
     _execute_control,
@@ -77,6 +84,20 @@ AUTONOMOUS_QUESTION = {
     "background_context": "来源 Reasoning 只肯定了当前数据域内的有界结论。",
     "requirements_constraints": "保持原标注口径，并显式报告域偏移限制。",
 }
+
+
+class _AutonomousSuccessorIdeaSkill(_DeterministicIdeaSkill):
+    """Keep deterministic native Session identities unique across Cycles."""
+
+    def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
+        draft = super().generate_draft(request)
+        return IdeaSkillDraft(
+            draft=draft.draft,
+            primary_session_ref=(
+                f"autonomous-successor-idea-{request.stage_request_ref}"
+            ),
+            adapter_kind=draft.adapter_kind,
+        )
 
 
 class _ReadyAutonomousAcquisitionProvider:
@@ -609,6 +630,253 @@ def _drive_autonomous_creation_ready(runtime, checkpoint, *, key: str):
         lambda value: value["status"] == "ready_for_reasoning_resume",
     )
     return ready
+
+
+def test_autonomous_successor_runs_idea_set_and_formal_plan(
+    tmp_path: Path,
+) -> None:
+    """A successor Question must traverse the same public Stage Owners.
+
+    Autonomous Question identity and content live in their dedicated RG/RM
+    authorities.  Idea and Plan may verify those polymorphic bindings, but
+    their durable decision tables must not require the manual/root-only
+    ``rg_questions`` or ``rm_formal_question_contents`` rows.
+    """
+
+    data_path = tmp_path / "autonomous-successor-idea-plan"
+    idea_skill = _AutonomousSuccessorIdeaSkill(no_viable=True)
+    plan_skill = _DeterministicPlanSkill(no_gap=False)
+    runtime = _reasoning_runtime(
+        data_path,
+        reasoning_skill=_AutonomousReasoningSkill(),
+        idea_skill=idea_skill,
+        plan_skill=plan_skill,
+    )
+    try:
+        _quest, _view, checkpoint = _reach_autonomous_checkpoint(runtime)
+        ready = _drive_autonomous_creation_ready(
+            runtime,
+            checkpoint,
+            key="autonomous-successor-idea-plan-create",
+        )
+        anchor = ready["question_anchor"]
+        assert isinstance(anchor, dict)
+        _finish_reasoning_after_creation(runtime)
+
+        successor = runtime.owners.advancement_engine.query_foreground(
+            str(checkpoint["scientific_outcome"]["quest_ref"])
+        )
+        assert successor is not None
+        assert successor["question_ref"] == anchor["question_ref"]
+        assert successor["stage"] == "idea"
+
+        # The source Cycle intentionally routes through Reasoning; the new
+        # autonomous Question now exercises the normal IdeaSet -> Plan path.
+        idea_skill.no_viable = False
+        idea = _finish_idea_stage(runtime)
+        assert idea["stage_commit"]["outcome_kind"] == "IdeaSet"
+
+        for _step in range(12):
+            plan = runtime.plan_stage.query_current()
+            if plan["stage_commit"] is not None:
+                break
+            assert runtime.plan_stage.process_once()
+        else:
+            raise AssertionError("autonomous successor Plan did not commit")
+
+        assert plan["stage_commit"]["outcome_kind"] == "FormalPlan"
+        request = runtime.owners.advancement_engine.query_plan_stage_request(
+            successor["cycle_ref"]
+        )
+        assert request is not None
+        assert request.accepted_question.question_ref == anchor["question_ref"]
+        assert request.accepted_question.content_receipt.kind == (
+            "autonomous_question_content_acceptance"
+        )
+        assert request.accepted_question.question_receipt.kind == (
+            "autonomous_question_acceptance"
+        )
+        forged_bindings = (
+            replace(
+                request.accepted_question,
+                question_ref=f"forged-{request.accepted_question.question_ref}",
+            ),
+            replace(request.accepted_question, content_hash="0" * 64),
+            replace(
+                request.accepted_question,
+                question_receipt=replace(
+                    request.accepted_question.question_receipt,
+                    payload_hash="0" * 64,
+                ),
+            ),
+        )
+        for forged in forged_bindings:
+            with pytest.raises(OwnerConflict, match="accepted_question_binding_invalid"):
+                runtime.owners.research_graph.verify_accepted_question_binding(
+                    forged
+                )
+        submission_ref = plan["run"]["submission_ref"]
+        accepted_plan = runtime.owners.research_memory.query_plan_document(
+            submission_ref
+        )
+        formal_plan = runtime.owners.research_graph.query_formal_plan_decision(
+            submission_ref
+        )
+        assert accepted_plan is not None
+        assert formal_plan is not None
+        assert accepted_plan.question_content_receipt == (
+            request.accepted_question.content_receipt
+        )
+        assert accepted_plan.question_receipt == (
+            request.accepted_question.question_receipt
+        )
+    finally:
+        runtime.close()
+
+    restarted = _reasoning_runtime(
+        data_path,
+        reasoning_skill=_AutonomousReasoningSkill(),
+        idea_skill=_AutonomousSuccessorIdeaSkill(no_viable=False),
+        plan_skill=_DeterministicPlanSkill(no_gap=False),
+    )
+    try:
+        request = restarted.owners.advancement_engine.query_plan_stage_request(
+            successor["cycle_ref"]
+        )
+        accepted_plan = restarted.owners.research_memory.query_plan_document(
+            submission_ref
+        )
+        autonomous_content = (
+            restarted.owners.research_memory.query_autonomous_question_content(
+                anchor["content_ref"]
+            )
+        )
+        assert request is not None
+        assert request.accepted_idea_set is not None
+        assert accepted_plan is not None
+        assert autonomous_content is not None
+
+        replayed_content = restarted.owners.research_memory.accept_plan_document(
+            accepted_question=request.accepted_question,
+            accepted_idea_set=request.accepted_idea_set,
+            context_pack_ref=request.context_pack_ref,
+            request_ref=accepted_plan.request_ref,
+            run_ref=accepted_plan.run_ref,
+            attempt_ref=accepted_plan.attempt_ref,
+            fence_ref=accepted_plan.fence_ref,
+            submission_ref=accepted_plan.submission_ref,
+            plan_document=accepted_plan.plan_document,
+            reviewed_draft=accepted_plan.reviewed_draft,
+            review=accepted_plan.review,
+            execution_receipt=accepted_plan.execution_receipt,
+        )
+        replayed_decision = restarted.owners.research_graph.decide_formal_plan(
+            accepted_question=request.accepted_question,
+            accepted_idea_set=request.accepted_idea_set,
+            question_content=autonomous_content.question,
+            content=replayed_content,
+            execution_receipt=replayed_content.execution_receipt,
+        )
+        assert replayed_content == accepted_plan
+        assert replayed_decision == formal_plan
+    finally:
+        restarted.close()
+
+
+def test_manual_successor_idea_decision_uses_polymorphic_question_binding(
+    tmp_path: Path,
+) -> None:
+    runtime = _plan_runtime(
+        tmp_path / "manual-successor-idea",
+        idea_skill=_DeterministicIdeaSkill(),
+        plan_skill=_DeterministicPlanSkill(no_gap=False),
+    )
+    try:
+        root = _confirm_direct_quest(runtime)
+        seeded = _confirm_waived_manual_question(
+            runtime.owners.human_collaboration,
+            quest_ref=root["quest_ref"],
+            parent_question_ref=root["question_ref"],
+            key_prefix="manual-successor-idea",
+        )
+        for _step in range(6):
+            created = (
+                runtime.owners.human_collaboration.query_manual_question_creation(
+                    seeded["context_ref"]
+                )
+            )
+            if created["status"] == "completed":
+                break
+            assert runtime.owners.human_collaboration.reconcile_once()
+        assert created["status"] == "completed"
+        question_ref = created["question_anchor"]["question_ref"]
+        successor = _force_question_switch(
+            runtime,
+            target_question_ref=question_ref,
+            key_prefix="manual-successor-idea-switch",
+        )
+        assert successor["stage"] == "idea"
+
+        idea = _finish_idea_stage(runtime)
+        request = runtime.owners.advancement_engine.query_idea_stage_request(
+            successor["cycle_ref"]
+        )
+        decision = runtime.owners.research_graph.query_idea_outcome_decision(
+            idea["run"]["submission_ref"]
+        )
+        assert request is not None
+        assert request.accepted_question.question_ref == question_ref
+        assert request.accepted_question.content_receipt.kind == (
+            "manual_question_content_acceptance"
+        )
+        assert request.accepted_question.question_receipt.kind == (
+            "manual_question_acceptance"
+        )
+        assert decision is not None
+        assert decision.outcome_ref == idea["stage_commit"]["outcome_ref"]
+    finally:
+        runtime.close()
+
+
+def test_reasoning_successor_context_ignores_later_no_viable_route_skips(
+    tmp_path: Path,
+) -> None:
+    """Successor provenance is stable while that Cycle keeps progressing."""
+
+    runtime = _reasoning_runtime(
+        tmp_path / "autonomous-successor-later-skips",
+        reasoning_skill=_AutonomousReasoningSkill(),
+        idea_skill=_AutonomousSuccessorIdeaSkill(no_viable=True),
+    )
+    try:
+        _quest, _view, checkpoint = _reach_autonomous_checkpoint(runtime)
+        _drive_autonomous_creation_ready(
+            runtime,
+            checkpoint,
+            key="autonomous-successor-later-skips-create",
+        )
+        _finish_reasoning_after_creation(runtime)
+        successor = runtime.owners.advancement_engine.query_foreground(
+            str(checkpoint["scientific_outcome"]["quest_ref"])
+        )
+        assert successor is not None
+        assert successor["stage"] == "idea"
+
+        idea = _finish_idea_stage(runtime)
+        assert idea["stage_commit"]["outcome_kind"] == "NoViableCandidate"
+        # Reasoning admission materializes the later Plan/Bundle route skips
+        # derived from this successor's own NoViableCandidate commit.
+        assert runtime.reasoning_stage.process_once()
+        context = (
+            runtime.owners.advancement_engine.query_reasoning_successor_context(
+                successor["cycle_ref"]
+            )
+        )
+        assert context is not None
+        assert context["entry_stage"] == "idea"
+        assert context["skipped_stage_commits"] == []
+    finally:
+        runtime.close()
 
 
 def test_direct_quest_autonomous_creation_prepares_and_binds_acquisition(

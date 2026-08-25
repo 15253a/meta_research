@@ -118,6 +118,11 @@ PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND = (
 PRIOR_ACCEPTED_FORMAL_PLAN_SKIP_BASIS_KIND = (
     "prior_accepted_formal_plan_stage_commit"
 )
+REASONING_SUCCESSOR_ROUTE_SKIP_BASIS_KINDS = (
+    AUTONOMOUS_REASONING_SKIP_BASIS_KIND,
+    PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND,
+    PRIOR_ACCEPTED_FORMAL_PLAN_SKIP_BASIS_KIND,
+)
 BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND = "bundle_report_disposition_recorded"
 BUNDLE_REPLAN_ACTIVATED_RECEIPT_KIND = "bundle_replan_activated"
 BUNDLE_SKIP_OUTCOME_KIND = "bundle_skip"
@@ -2289,10 +2294,23 @@ class SQLiteAdvancementEngine(
             skip_rows = connection.execute(
                 text(
                     "SELECT * FROM ae_stage_commits WHERE cycle_ref = :cycle_ref "
-                    "AND epoch = :epoch AND disposition = 'skipped' ORDER BY "
-                    "committed_at, stage"
+                    "AND epoch = :epoch AND disposition = 'skipped' AND "
+                    "basis_kind IN (:autonomous_basis_kind, :idea_basis_kind, "
+                    ":plan_basis_kind) ORDER BY committed_at, stage"
                 ),
-                {"cycle_ref": cycle_ref, "epoch": int(source.epoch) + 1},
+                {
+                    "cycle_ref": cycle_ref,
+                    "epoch": int(source.epoch) + 1,
+                    "autonomous_basis_kind": (
+                        REASONING_SUCCESSOR_ROUTE_SKIP_BASIS_KINDS[0]
+                    ),
+                    "idea_basis_kind": (
+                        REASONING_SUCCESSOR_ROUTE_SKIP_BASIS_KINDS[1]
+                    ),
+                    "plan_basis_kind": (
+                        REASONING_SUCCESSOR_ROUTE_SKIP_BASIS_KINDS[2]
+                    ),
+                },
             ).all()
         if {str(row.stage) for row in skip_rows} != set(expected_skipped):
             if skip_rows or expected_skipped:

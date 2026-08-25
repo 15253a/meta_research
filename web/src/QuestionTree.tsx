@@ -10,7 +10,14 @@ import {
   type WheelEvent as ReactWheelEvent,
 } from "react";
 
-import type { ExperimentProjection, QuestionTreeItem } from "./api";
+import {
+  fetchQuestionEvidence,
+  fetchQuestionHistory,
+  type ExperimentProjection,
+  type QuestionEvidenceView,
+  type QuestionHistoryView,
+  type QuestionTreeItem,
+} from "./api";
 import "./QuestionTree.css";
 
 export type QuestionTreeProps = {
@@ -24,6 +31,8 @@ export type QuestionTreeProps = {
   openingParentRef?: string | null;
   openError?: string | null;
   currentExperiment?: ExperimentProjection | null;
+  initialInspectorMode?: "evidence" | "history" | null;
+  onInspectorModeChange?: (mode: "evidence" | "history" | null) => void;
   onClose: () => void;
   onOpenExperiment?: (opener: HTMLButtonElement) => void;
   onSelectionChange?: (selected: QuestionTreeItem | null) => void;
@@ -47,6 +56,35 @@ type CanvasQuestion = QuestionTreeItem & {
   x: number;
   y: number;
 };
+
+type InspectorQuery =
+  | {
+      mode: "evidence" | "history";
+      status: "loading";
+      questionRef: string;
+      basisKey: string;
+    }
+  | {
+      mode: "evidence";
+      status: "ready";
+      questionRef: string;
+      basisKey: string;
+      value: QuestionEvidenceView;
+    }
+  | {
+      mode: "history";
+      status: "ready";
+      questionRef: string;
+      basisKey: string;
+      value: QuestionHistoryView;
+    }
+  | {
+      mode: "evidence" | "history";
+      status: "error";
+      questionRef: string;
+      basisKey: string;
+      code: string;
+    };
 
 type CanvasEdge = {
   parentRef: string;
@@ -225,6 +263,203 @@ function nodeLabel(item: CanvasQuestion): string {
   return "Research branch · RG topology";
 }
 
+function questionInspectorBasis(item: QuestionTreeItem): string {
+  return [
+    item.quest_ref,
+    item.question_ref,
+    item.content_hash,
+    item.question_receipt_ref,
+    item.lifecycle_revision,
+  ].join(":");
+}
+
+function validateEvidenceResponse(
+  value: QuestionEvidenceView,
+  question: QuestionTreeItem,
+): QuestionEvidenceView {
+  if (
+    value.question_ref !== question.question_ref
+    || value.quest_ref !== question.quest_ref
+    || (value.status === "ready" && (
+      value.binding?.question_receipt_ref !== question.question_receipt_ref
+      || value.items.some((item) => (
+        item.evidence_ref !== item.role.version_ref
+        || item.evidence_ref !== item.asset.version_ref
+        || item.role.quest_ref !== question.quest_ref
+      ))
+    ))
+  ) {
+    throw new Error("question_evidence_response_identity_invalid");
+  }
+  return value;
+}
+
+function validateHistoryResponse(
+  value: QuestionHistoryView,
+  question: QuestionTreeItem,
+): QuestionHistoryView {
+  const readyPageInvalid = value.status === "ready" && (
+    !value.question
+    || !value.lifecycle
+    || !Number.isInteger(value.offset)
+    || value.offset < 0
+    || !Number.isInteger(value.limit)
+    || value.limit < 1
+    || !Number.isInteger(value.total_count)
+    || value.total_count < 1
+    || value.total_count !== value.lifecycle.revision
+    || value.offset >= value.total_count
+    || value.events.length < 1
+    || value.events.length > value.limit
+    || value.events.length !== Math.min(
+      value.limit,
+      value.total_count - value.offset,
+    )
+    || value.has_more !== (
+      value.offset + value.events.length < value.total_count
+    )
+    || value.events.some((event, index) => {
+      const revision = value.offset + index + 1;
+      return !event.affected_question_refs.includes(question.question_ref)
+        || event.lifecycle_revision !== revision
+        || (event.action === "accepted" && (
+          revision !== 1
+          || event.question_ref !== question.question_ref
+          || event.record_ref !== question.question_ref
+          || event.status !== "active"
+          || event.receipt_ref
+            !== value.question?.receipts.question_acceptance.receipt_ref
+        ))
+        || (event.action === "prune" && event.status !== "pruned")
+        || (event.action === "restore" && event.status !== "active")
+        || (revision !== 1 && event.action === "accepted");
+    })
+    || (value.offset === 0 && value.events[0]?.action !== "accepted")
+    || (!value.has_more
+      && value.events.at(-1)?.status !== value.lifecycle.status)
+  );
+  if (
+    value.question_ref !== question.question_ref
+    || readyPageInvalid
+    || (value.status === "ready" && (
+      value.question?.question_ref !== question.question_ref
+      || value.question.quest_ref !== question.quest_ref
+      || value.question.parent_question_ref !== question.parent_question_ref
+      || value.question.content.content_ref !== question.content_ref
+      || value.question.content.content_hash !== question.content_hash
+      || value.question.receipts.question_acceptance.receipt_ref
+        !== question.question_receipt_ref
+      || value.lifecycle?.question_ref !== question.question_ref
+      || value.lifecycle.quest_ref !== question.quest_ref
+      || value.lifecycle.revision < question.lifecycle_revision
+    ))
+  ) {
+    throw new Error("question_history_response_identity_invalid");
+  }
+  return value;
+}
+
+function EvidenceInspector({ value }: { value: QuestionEvidenceView }) {
+  if (value.status !== "ready") {
+    return (
+      <div className="question-query-state">
+        <b>{value.status === "absent" ? "没有精确 Question 证据绑定" : "证据查询暂不可用"}</b>
+        <code>{value.reason?.code ?? "question_evidence_unavailable"}</code>
+        {typeof value.reason?.quest_evidence_role_count === "number" ? (
+          <small>Quest 有 {value.reason.quest_evidence_role_count} 个 evidence role；未把它们冒充为当前 Question 的来源。</small>
+        ) : null}
+      </div>
+    );
+  }
+  return (
+    <>
+      <div className="question-query-binding">
+        <span><small>Question binding / AE</small><b>{value.binding?.request_ref}</b></span>
+        <span><small>ContextPack</small><b>{value.binding?.context_pack_ref} · evidence r{value.binding?.evidence_reference_revision}</b></span>
+        <span><small>Question receipt / RG</small><b>{value.binding?.question_receipt_ref}</b></span>
+      </div>
+      <div className="question-evidence-list">
+        {value.items.map((item) => (
+          <article key={item.evidence_ref}>
+            <small>EVIDENCE REF · {item.asset.media_type}</small>
+            <h3>{item.asset.display_name}</h3>
+            <code>{item.evidence_ref}</code>
+            <dl>
+              <div><dt>RG role receipt</dt><dd>{item.role.receipt.receipt_ref}</dd></div>
+              <div><dt>RM asset receipt</dt><dd>{item.asset.receipt.receipt_ref}</dd></div>
+              <div><dt>Integrity / availability</dt><dd>{item.asset.integrity} · {item.asset.availability}</dd></div>
+              <div><dt>Content hash</dt><dd>{item.asset.content_hash}</dd></div>
+            </dl>
+          </article>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function HistoryInspector({
+  value,
+  loadingMore,
+  onLoadMore,
+}: {
+  value: QuestionHistoryView;
+  loadingMore: boolean;
+  onLoadMore: () => void;
+}) {
+  if (value.status !== "ready" || !value.question || !value.lifecycle) {
+    return (
+      <div className="question-query-state">
+        <b>{value.status === "absent" ? "未找到已接纳 Question" : "问题历史暂不可用"}</b>
+        <code>{value.reason?.code ?? "question_history_unavailable"}</code>
+      </div>
+    );
+  }
+  const content = value.question.content.document;
+  return (
+    <>
+      <div className="question-history-content">
+        <div>
+          <small>ACCEPTED CONTENT / RM</small>
+          <h3>{content.title}</h3>
+          <p>{content.unknown_statement}</p>
+        </div>
+        <dl>
+          <div><dt>Identity / RG</dt><dd>{value.question.question_ref} · parent {value.question.parent_question_ref ?? "root"}</dd></div>
+          <div><dt>Lifecycle / RG</dt><dd>{value.lifecycle.status} · r{value.lifecycle.revision}</dd></div>
+          <div><dt>Content receipt</dt><dd>{value.question.receipts.content_acceptance.receipt_ref}</dd></div>
+          <div><dt>Question receipt</dt><dd>{value.question.receipts.question_acceptance.receipt_ref}</dd></div>
+        </dl>
+      </div>
+      <ol className="question-history-events">
+        {value.events.map((event) => (
+          <li key={`${event.action}:${event.record_ref}`}>
+            <span aria-hidden="true" />
+            <div>
+              <small>{event.action.toUpperCase()} · lifecycle r{event.lifecycle_revision}</small>
+              <b>{event.record_ref}</b>
+              <code>{event.receipt_ref}</code>
+              {event.prune_record_ref ? <p>PruneRecord {event.prune_record_ref}</p> : null}
+              {event.restore_record_ref ? <p>RestoreRecord {event.restore_record_ref}</p> : null}
+            </div>
+          </li>
+        ))}
+      </ol>
+      {value.has_more ? (
+        <button
+          className="question-history-more"
+          type="button"
+          disabled={loadingMore}
+          onClick={onLoadMore}
+        >
+          {loadingMore
+            ? "正在读取下一页…"
+            : `继续读取历史 · ${value.events.length}/${value.total_count}`}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
 export function QuestionTree({
   items,
   graphRevision,
@@ -236,6 +471,8 @@ export function QuestionTree({
   openingParentRef = null,
   openError = null,
   currentExperiment = null,
+  initialInspectorMode = null,
+  onInspectorModeChange,
   onClose,
   onOpenExperiment,
   onSelectionChange,
@@ -245,7 +482,10 @@ export function QuestionTree({
 }: QuestionTreeProps) {
   const mainRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const evidenceButtonRef = useRef<HTMLButtonElement>(null);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
   const reportedSelectionKeyRef = useRef<string | null | undefined>(undefined);
+  const appliedInitialQuestionRef = useRef<string | null>(initialQuestionRef);
   const dragRef = useRef<null | {
     pointerId: number;
     clientX: number;
@@ -271,8 +511,165 @@ export function QuestionTree({
     () => typeof window !== "undefined" && window.matchMedia(OUTLINE_MEDIA_QUERY).matches,
   );
   const selected = selectedRef ? layout.byRef.get(selectedRef) ?? null : null;
+  const inspectorAbortRef = useRef<AbortController | null>(null);
+  const [inspectorQuery, setInspectorQuery] = useState<InspectorQuery | null>(null);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
+  const selectedInspectorBasis = selected ? questionInspectorBasis(selected) : null;
+  const routedInspectorQuestion = initialQuestionRef
+    ? layout.byRef.get(initialQuestionRef) ?? null
+    : null;
+  const inspectorTarget = initialInspectorMode && routedInspectorQuestion
+    ? routedInspectorQuestion
+    : selected;
+  const inspectorTargetBasis = inspectorTarget
+    ? questionInspectorBasis(inspectorTarget)
+    : null;
   const experimentObservable = currentExperimentHasFence(currentExperiment) &&
     Boolean(onOpenExperiment);
+
+  const loadInspector = useCallback(async (
+    mode: "evidence" | "history",
+    question: QuestionTreeItem,
+  ) => {
+    const basisKey = questionInspectorBasis(question);
+    inspectorAbortRef.current?.abort();
+    const controller = new AbortController();
+    inspectorAbortRef.current = controller;
+    setInspectorQuery({
+      mode,
+      status: "loading",
+      questionRef: question.question_ref,
+      basisKey,
+    });
+    onInspectorModeChange?.(mode);
+    try {
+      if (mode === "evidence") {
+        const value = validateEvidenceResponse(await fetchQuestionEvidence(
+          question.question_ref,
+          controller.signal,
+        ), question);
+        if (!controller.signal.aborted) {
+          setInspectorQuery({
+            mode,
+            status: "ready",
+            questionRef: question.question_ref,
+            basisKey,
+            value,
+          });
+        }
+      } else {
+        const value = validateHistoryResponse(await fetchQuestionHistory(
+          question.question_ref,
+          { signal: controller.signal },
+        ), question);
+        if (!controller.signal.aborted) {
+          setInspectorQuery({
+            mode,
+            status: "ready",
+            questionRef: question.question_ref,
+            basisKey,
+            value,
+          });
+        }
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setInspectorQuery({
+          mode,
+          status: "error",
+          questionRef: question.question_ref,
+          basisKey,
+          code: error instanceof Error ? error.message : "question_query_failed",
+        });
+      }
+    }
+  }, [onInspectorModeChange]);
+
+  const loadMoreHistory = useCallback(async () => {
+    if (
+      !selected
+      || inspectorQuery?.status !== "ready"
+      || inspectorQuery.mode !== "history"
+      || !inspectorQuery.value.has_more
+      || historyLoadingMore
+    ) return;
+    inspectorAbortRef.current?.abort();
+    const controller = new AbortController();
+    inspectorAbortRef.current = controller;
+    setHistoryLoadingMore(true);
+    try {
+      const current = inspectorQuery.value;
+      const next = validateHistoryResponse(await fetchQuestionHistory(
+        selected.question_ref,
+        {
+          offset: current.offset + current.events.length,
+          limit: current.limit,
+          signal: controller.signal,
+        },
+      ), selected);
+      if (
+        next.status !== "ready"
+        || next.offset !== current.offset + current.events.length
+        || next.total_count !== current.total_count
+      ) {
+        throw new Error("question_history_page_invalid");
+      }
+      if (!controller.signal.aborted) {
+        setInspectorQuery({
+          mode: "history",
+          status: "ready",
+          questionRef: selected.question_ref,
+          basisKey: questionInspectorBasis(selected),
+          value: {
+            ...next,
+            offset: current.offset,
+            events: [...current.events, ...next.events],
+          },
+        });
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setInspectorQuery({
+          mode: "history",
+          status: "error",
+          questionRef: selected.question_ref,
+          basisKey: questionInspectorBasis(selected),
+          code: error instanceof Error ? error.message : "question_history_failed",
+        });
+      }
+    } finally {
+      if (!controller.signal.aborted) setHistoryLoadingMore(false);
+    }
+  }, [historyLoadingMore, inspectorQuery, selected]);
+
+  useEffect(() => {
+    if (!inspectorTarget) {
+      inspectorAbortRef.current?.abort();
+      setHistoryLoadingMore(false);
+      setInspectorQuery(null);
+      return;
+    }
+    if (initialInspectorMode) {
+      if (
+        inspectorQuery?.mode !== initialInspectorMode
+        || inspectorQuery.questionRef !== inspectorTarget.question_ref
+        || inspectorQuery.basisKey !== inspectorTargetBasis
+      ) {
+        void loadInspector(initialInspectorMode, inspectorTarget);
+      }
+      return;
+    }
+    if (
+      inspectorQuery?.questionRef !== selected?.question_ref
+      || inspectorQuery?.basisKey !== selectedInspectorBasis
+    ) {
+      inspectorAbortRef.current?.abort();
+      setHistoryLoadingMore(false);
+      setInspectorQuery(null);
+    }
+  }, [initialInspectorMode, inspectorTargetBasis, loadInspector]);
+
+  useEffect(() => () => inspectorAbortRef.current?.abort(), []);
 
   useEffect(() => {
     mainRef.current?.focus({ preventScroll: true });
@@ -287,12 +684,23 @@ export function QuestionTree({
   }, []);
 
   useEffect(() => {
-    if (selectedRef && layout.byRef.has(selectedRef)) return;
-    setSelectedRef(
-      initialQuestionRef && layout.byRef.has(initialQuestionRef)
-        ? initialQuestionRef
-        : layout.nodes[0]?.question_ref ?? null,
-    );
+    const navigationChanged = appliedInitialQuestionRef.current !== initialQuestionRef;
+    appliedInitialQuestionRef.current = initialQuestionRef;
+    if (
+      navigationChanged
+      && initialQuestionRef
+      && layout.byRef.has(initialQuestionRef)
+    ) {
+      setSelectedRef(initialQuestionRef);
+      return;
+    }
+    if (!selectedRef || !layout.byRef.has(selectedRef)) {
+      setSelectedRef(
+        initialQuestionRef && layout.byRef.has(initialQuestionRef)
+          ? initialQuestionRef
+          : layout.nodes[0]?.question_ref ?? null,
+      );
+    }
   }, [initialQuestionRef, layout, selectedRef]);
 
   useEffect(() => {
@@ -763,9 +1171,68 @@ export function QuestionTree({
                 >
                   与 Companion 讨论此题
                 </button>
-                <button type="button" disabled title="capability_unavailable · question_evidence">查看证据与来源</button>
-                <button type="button" disabled title="capability_unavailable · question_history">问题历史 ↗</button>
+                <button
+                  ref={evidenceButtonRef}
+                  type="button"
+                  disabled={controlsInert}
+                  aria-expanded={inspectorQuery?.mode === "evidence"}
+                  onClick={() => void loadInspector("evidence", selected)}
+                >
+                  查看证据与来源
+                </button>
+                <button
+                  ref={historyButtonRef}
+                  type="button"
+                  disabled={controlsInert}
+                  aria-expanded={inspectorQuery?.mode === "history"}
+                  onClick={() => void loadInspector("history", selected)}
+                >
+                  问题历史 ↗
+                </button>
               </div>
+              {inspectorQuery ? (
+                <section
+                  className="question-tree-query-panel"
+                  role="region"
+                  aria-label={inspectorQuery.mode === "evidence" ? "问题证据与来源" : "问题历史"}
+                  data-query-status={inspectorQuery.status}
+                >
+                  <header>
+                    <div>
+                      <small>{inspectorQuery.mode === "evidence" ? "EVIDENCE / OWNER BINDINGS" : "HISTORY / OWNER RECEIPTS"}</small>
+                      <b>{inspectorQuery.mode === "evidence" ? "证据与来源" : "问题历史"}</b>
+                    </div>
+                    <button
+                      type="button"
+                      aria-label="关闭问题只读下钻"
+                      onClick={() => {
+                        const returnFocus = inspectorQuery.mode === "evidence"
+                          ? evidenceButtonRef.current
+                          : historyButtonRef.current;
+                        inspectorAbortRef.current?.abort();
+                        setInspectorQuery(null);
+                        onInspectorModeChange?.(null);
+                        requestAnimationFrame(() => returnFocus?.focus({ preventScroll: true }));
+                      }}
+                    >
+                      ×
+                    </button>
+                  </header>
+                  {inspectorQuery.status === "loading" ? (
+                    <div className="question-query-state"><b>正在读取 Owner facts…</b></div>
+                  ) : inspectorQuery.status === "error" ? (
+                    <div className="question-query-state"><b>只读查询失败</b><code>{inspectorQuery.code}</code></div>
+                  ) : inspectorQuery.mode === "evidence" ? (
+                    <EvidenceInspector value={inspectorQuery.value} />
+                  ) : (
+                    <HistoryInspector
+                      value={inspectorQuery.value}
+                      loadingMore={historyLoadingMore}
+                      onLoadMore={() => void loadMoreHistory()}
+                    />
+                  )}
+                </section>
+              ) : null}
             </div>
             <div className="question-tree-inspector-facts">
               <div><small>Topology / RG</small><b>{selected.parent_question_ref ? `${selected.parent_question_ref} 的直接子题` : "Quest 根问题"} · {graphLabel}</b></div>

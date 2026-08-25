@@ -48,6 +48,7 @@ export class DeterministicProduct {
     private readonly bootstrapToken: string,
     private readonly dataRoot: string,
     private readonly process: ChildProcessByStdio<null, Readable, Readable>,
+    private readonly processClose: Promise<void>,
     private readonly processErrors: Error[],
   ) {
     process.once("exit", (code, signal) => {
@@ -83,10 +84,17 @@ export class DeterministicProduct {
       argv,
       {
         cwd: repositoryRoot,
+        detached: process.platform !== "win32",
         env: { ...process.env, PYTHONUNBUFFERED: "1" },
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
+    // `uv run` may report its own exit before the Python child that inherited
+    // these pipes has stopped. Capture `close` immediately so teardown waits
+    // for both the wrapper and its inherited stdio writers to quiesce.
+    const childClose = new Promise<void>((resolveClose) => {
+      child.once("close", () => resolveClose());
+    });
     let stderr = "";
     const processErrors: Error[] = [];
     child.on("error", (error) => {
@@ -140,14 +148,18 @@ export class DeterministicProduct {
         started.bootstrap_token,
         dataRoot,
         child,
+        childClose,
         processErrors,
       );
     } catch (error) {
-      const exited = child.exitCode !== null || child.signalCode !== null
-        ? true
-        : await terminateAndWait(child, "SIGKILL", 5_000);
-      if (!exited) {
-        throw new Error("failed deterministic product did not exit after SIGKILL", {
+      const closed = await terminateAndWait(
+        child,
+        childClose,
+        "SIGKILL",
+        5_000,
+      );
+      if (!closed) {
+        throw new Error("failed deterministic product did not close after SIGKILL", {
           cause: error,
         });
       }
@@ -296,6 +308,16 @@ export class DeterministicProduct {
     if (this.unexpectedExit || this.process.exitCode !== null || this.process.signalCode !== null) {
       const detail = this.unexpectedExit ??
         `code=${String(this.process.exitCode)} signal=${String(this.process.signalCode)}`;
+      if (!await terminateAndWait(
+        this.process,
+        this.processClose,
+        "SIGKILL",
+        5_000,
+      )) {
+        throw new Error(
+          `deterministic product exited before teardown without close quiescence (${detail})`,
+        );
+      }
       rmSync(this.dataRoot, {
         recursive: true,
         force: true,
@@ -306,10 +328,20 @@ export class DeterministicProduct {
     }
     this.stopRequested = true;
     if (this.process.exitCode === null && this.process.signalCode === null) {
-      const stopped = await terminateAndWait(this.process, "SIGTERM", 5_000);
+      const stopped = await terminateAndWait(
+        this.process,
+        this.processClose,
+        "SIGTERM",
+        5_000,
+      );
       if (!stopped) {
-        if (!await terminateAndWait(this.process, "SIGKILL", 5_000)) {
-          throw new Error("deterministic product did not exit after SIGKILL");
+        if (!await terminateAndWait(
+          this.process,
+          this.processClose,
+          "SIGKILL",
+          5_000,
+        )) {
+          throw new Error("deterministic product did not close after SIGKILL");
         }
       }
     }
@@ -329,32 +361,46 @@ export class DeterministicProduct {
 
 async function terminateAndWait(
   child: ChildProcessByStdio<null, Readable, Readable>,
+  childClose: Promise<void>,
   signal: NodeJS.Signals,
   timeoutMs: number,
 ): Promise<boolean> {
-  const exited = waitForExit(child, timeoutMs);
-  child.kill(signal);
-  return exited;
+  const closed = waitForClose(childClose, timeoutMs);
+  signalProcessTree(child, signal);
+  return closed;
 }
 
-async function waitForExit(
+function signalProcessTree(
   child: ChildProcessByStdio<null, Readable, Readable>,
+  signal: NodeJS.Signals,
+): void {
+  if (process.platform !== "win32" && child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+  }
+  if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+}
+
+async function waitForClose(
+  childClose: Promise<void>,
   timeoutMs: number,
 ): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return true;
-  return new Promise<boolean>((resolveExit) => {
-    const finish = (exited: boolean) => {
-      clearTimeout(timeout);
-      child.off("exit", onExit);
-      child.off("close", onExit);
-      resolveExit(exited);
-    };
-    const onExit = () => finish(true);
-    const timeout = setTimeout(() => finish(false), timeoutMs);
-    child.once("exit", onExit);
-    child.once("close", onExit);
-    if (child.exitCode !== null || child.signalCode !== null) finish(true);
-  });
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      childClose.then(() => true),
+      new Promise<boolean>((resolveTimeout) => {
+        timeout = setTimeout(() => resolveTimeout(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 export async function openAuthenticatedProduct(

@@ -1339,6 +1339,10 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
 
     def query_question_lifecycle(self, question_ref: str) -> dict[str, object]: ...
 
+    def query_question_lifecycle_history(
+        self, question_ref: str, *, offset: int = 0, limit: int = 100
+    ) -> dict[str, object]: ...
+
     def query_restorable_prune_records(
         self, quest_ref: str
     ) -> tuple[dict[str, object], ...]: ...
@@ -4637,34 +4641,35 @@ class SQLiteResearchGraphReceiptVerifier:
             raise OwnerConflict("idea_outcome_receipt_invalid")
         _idea_decision(row)
         with self._database.read() as connection:
-            question = connection.execute(
-                text("SELECT * FROM rg_questions WHERE question_ref = :question_ref"),
-                {"question_ref": row.question_ref},
-            ).first()
-        if question is None or (
-            question.initialization_id != row.initialization_id
-            or question.quest_ref != row.quest_ref
-            or question.content_ref != row.question_content_ref
-            or question.content_hash != row.question_content_hash
-            or question.receipt_ref != row.question_receipt_ref
-            or question.receipt_hash != row.question_receipt_hash
+            question_kind, question = _query_question_record(
+                connection, row.question_ref
+            )
+        if question_kind == "root":
+            accepted_question_record = _accepted_question(question)
+        elif question_kind == "manual":
+            accepted_question_record = _accepted_manual_question(question)
+        elif question_kind == "autonomous":
+            accepted_question_record = _accepted_autonomous_question_record(
+                question
+            )
+        else:
+            raise OwnerConflict("idea_outcome_question_lineage_invalid")
+        accepted_question = accepted_question_record.as_binding()
+        if (
+            accepted_question.initialization_id != row.initialization_id
+            or accepted_question.quest_ref != row.quest_ref
+            or accepted_question.question_ref != row.question_ref
+            or accepted_question.content_ref != row.question_content_ref
+            or accepted_question.content_hash != row.question_content_hash
+            or accepted_question.question_receipt.receipt_ref
+            != row.question_receipt_ref
+            or accepted_question.question_receipt.payload_hash
+            != row.question_receipt_hash
         ):
             raise OwnerConflict("idea_outcome_question_lineage_invalid")
-        self.verify_root_question_receipt(
-            initialization_id=row.initialization_id,
-            quest_ref=row.quest_ref,
-            question_ref=row.question_ref,
-            receipt=AcceptanceReceipt(
-                issuer=RG_OWNER,
-                kind=QUESTION_RECEIPT_KIND,
-                receipt_ref=row.question_receipt_ref,
-                subject_ref=row.question_ref,
-                payload_hash=row.question_receipt_hash,
-            ),
-        )
+        self.verify_accepted_question_binding(accepted_question)
         if self._stage_request_verifier is None:
             raise OwnerConflict("stage_request_verifier_unavailable")
-        accepted_question = _accepted_question(question).as_binding()
         verified_request = (
             self._stage_request_verifier.verify_idea_stage_request_binding(
                 request_ref=row.request_ref,
@@ -7132,6 +7137,120 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             "revision": int(row.revision),
             "owner_revision": int(row.owner_revision),
             "updated_at": float(row.updated_at),
+        }
+
+    def query_question_lifecycle_history(
+        self, question_ref: str, *, offset: int = 0, limit: int = 100
+    ) -> dict[str, object]:
+        """Return receipt-verified lifecycle facts affecting one Question.
+
+        A prune rooted at an ancestor is still part of the selected Question's
+        history when the immutable affected-ref closure contains that identity.
+        This read seam deliberately includes restored records instead of using
+        the narrower ``query_restorable_prune_records`` recovery view.
+        """
+
+        if (
+            not isinstance(question_ref, str)
+            or not question_ref
+            or len(question_ref) > 64
+        ):
+            raise OwnerConflict("question_ref_invalid")
+        if offset < 0 or not 1 <= limit <= 100:
+            raise OwnerConflict("question_lifecycle_history_page_invalid")
+        accepted = self.query_question_history_by_ref(question_ref)
+        if accepted is None:
+            return {
+                "items": (),
+                "offset": offset,
+                "limit": limit,
+                "total_count": 0,
+                "has_more": False,
+            }
+        lifecycle = self.query_question_lifecycle(question_ref)
+        control_offset = max(0, offset - 1)
+        control_limit = limit - (1 if offset == 0 else 0)
+        affected_clause = (
+            "commands.question_ref = :question_ref OR EXISTS (SELECT 1 FROM "
+            "json_each(commands.affected_refs_json) affected WHERE "
+            "affected.value = :question_ref)"
+        )
+        with self._database.read() as connection:
+            control_count = int(
+                connection.execute(
+                    text(
+                        "SELECT COUNT(*) FROM rg_question_lifecycle_commands "
+                        f"commands WHERE {affected_clause}"
+                    ),
+                    {"question_ref": question_ref},
+                ).scalar_one()
+            )
+            rows = (
+                connection.execute(
+                    text(
+                        "SELECT commands.* FROM rg_question_lifecycle_commands "
+                        f"commands WHERE {affected_clause} ORDER BY "
+                        "committed_version, operation_ref LIMIT :limit OFFSET :offset"
+                    ),
+                    {
+                        "question_ref": question_ref,
+                        "limit": control_limit,
+                        "offset": control_offset,
+                    },
+                ).all()
+                if control_limit > 0
+                else []
+            )
+        total_count = control_count + 1
+        if total_count != lifecycle["revision"]:
+            raise OwnerConflict("question_lifecycle_history_invalid")
+        events: list[dict[str, object]] = []
+        if offset == 0:
+            events.append(
+                {
+                    "action": "accepted",
+                    "question_ref": question_ref,
+                    "affected_question_refs": [question_ref],
+                    "status": "active",
+                    "lifecycle_revision": 1,
+                    "record_ref": question_ref,
+                    "prune_record_ref": None,
+                    "restore_record_ref": None,
+                    "base_graph_version": None,
+                    "committed_graph_version": None,
+                    "receipt_ref": accepted.receipt.receipt_ref,
+                    "receipt_hash": accepted.receipt.payload_hash,
+                    "recorded_at": None,
+                }
+            )
+        for index, row in enumerate(rows):
+            receipt = _question_control_receipt(row)
+            if question_ref not in receipt["affected_question_refs"]:
+                raise OwnerConflict("question_lifecycle_history_invalid")
+            self._receipt_verifier.verify_question_control_receipt(
+                operation_ref=row.operation_ref,
+                action=row.action,
+                target={
+                    "quest_ref": accepted.quest_ref,
+                    "target_question_ref": row.question_ref,
+                    "prune_record_ref": row.prune_record_ref,
+                },
+                receipt=receipt,
+            )
+            events.append(
+                {
+                    **receipt,
+                    "status": "pruned" if row.action == "prune" else "active",
+                    "lifecycle_revision": control_offset + index + 2,
+                    "recorded_at": float(row.recorded_at),
+                }
+            )
+        return {
+            "items": tuple(events),
+            "offset": offset,
+            "limit": limit,
+            "total_count": total_count,
+            "has_more": offset + len(events) < total_count,
         }
 
     def query_restorable_prune_records(

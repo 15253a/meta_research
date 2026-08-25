@@ -86,6 +86,279 @@ class PublicProjection:
             "human_collaboration": human_collaboration,
         }
 
+    def query_question_history(
+        self, question_ref: str, *, offset: int = 0, limit: int = 50
+    ) -> dict[str, object]:
+        """Compose one accepted Question's immutable identity and RG history."""
+
+        if (
+            not isinstance(question_ref, str)
+            or not question_ref
+            or len(question_ref) > 64
+        ):
+            raise OwnerConflict("question_ref_invalid")
+
+        history_query = getattr(
+            self._research_graph, "query_question_lifecycle_history", None
+        )
+        if not callable(history_query):
+            return {
+                "status": "unavailable",
+                "question_ref": question_ref,
+                "question": None,
+                "lifecycle": None,
+                "events": [],
+                "offset": offset,
+                "limit": limit,
+                "total_count": 0,
+                "has_more": False,
+                "reason": {"code": "question_history_owner_seam_unavailable"},
+            }
+        question = self._research_graph.query_question_history_by_ref(question_ref)
+        if question is None:
+            return {
+                "status": "absent",
+                "question_ref": question_ref,
+                "question": None,
+                "lifecycle": None,
+                "events": [],
+                "offset": offset,
+                "limit": limit,
+                "total_count": 0,
+                "has_more": False,
+                "reason": {"code": "accepted_question_not_found"},
+            }
+        content = self._research_memory.read_question_content(
+            question.content_ref, question.content_hash
+        )
+        lifecycle: dict[str, object] | None = None
+        page: dict[str, object] | None = None
+        events: list[dict[str, object]] = []
+        for _attempt in range(_MAX_SNAPSHOT_ATTEMPTS):
+            lifecycle_before = self._research_graph.query_question_lifecycle(
+                question_ref
+            )
+            try:
+                candidate = history_query(
+                    question_ref, offset=offset, limit=limit
+                )
+            except OwnerConflict as exc:
+                if str(exc) != "question_lifecycle_history_invalid":
+                    raise
+                continue
+            lifecycle_after = self._research_graph.query_question_lifecycle(
+                question_ref
+            )
+            if not isinstance(candidate, dict) or not isinstance(
+                candidate.get("items"), tuple
+            ):
+                raise OwnerConflict("question_history_projection_invalid")
+            candidate_events = list(candidate["items"])
+            if (
+                lifecycle_before == lifecycle_after
+                and candidate.get("total_count")
+                == lifecycle_after.get("revision")
+                and (
+                    candidate.get("has_more")
+                    or not candidate_events
+                    or candidate_events[-1].get("status")
+                    == lifecycle_after.get("status")
+                )
+            ):
+                lifecycle = lifecycle_after
+                page = candidate
+                events = candidate_events
+                break
+        if lifecycle is None or page is None:
+            raise SnapshotConsistencyUnavailable
+        return {
+            "status": "ready",
+            "question_ref": question_ref,
+            "question": {
+                "question_ref": question.question_ref,
+                "quest_ref": question.quest_ref,
+                "parent_question_ref": question.parent_question_ref,
+                "initialization_id": question.initialization_id,
+                "context_ref": question.context_ref,
+                "content": {
+                    "content_ref": question.content_ref,
+                    "content_hash": question.content_hash,
+                    "schema_ref": question.schema_ref,
+                    "document": content,
+                },
+                "receipts": {
+                    "content_acceptance": (
+                        question.content_receipt.as_public_dict()
+                    ),
+                    "question_acceptance": question.receipt.as_public_dict(),
+                    "confirmation_ref": question.confirmation_ref,
+                    "confirmation_hash": question.confirmation_hash,
+                },
+            },
+            "lifecycle": lifecycle,
+            "events": events,
+            "offset": page["offset"],
+            "limit": page["limit"],
+            "total_count": page["total_count"],
+            "has_more": page["has_more"],
+            "reason": None,
+        }
+
+    def query_question_evidence(self, question_ref: str) -> dict[str, object]:
+        """Resolve only EvidenceRefs frozen against this exact Question.
+
+        An RG asset role is Quest-scoped.  It becomes selectable here only when
+        an issuer-owned AE StageRunRequest binds both the accepted Question and
+        its exact ``accepted_evidence_refs``.  Quest roles alone therefore
+        produce a typed absence, never an invented Question association.
+        """
+
+        if (
+            not isinstance(question_ref, str)
+            or not question_ref
+            or len(question_ref) > 64
+        ):
+            raise OwnerConflict("question_ref_invalid")
+        question = self._research_graph.query_question_history_by_ref(question_ref)
+        if question is None:
+            return {
+                "status": "absent",
+                "question_ref": question_ref,
+                "quest_ref": None,
+                "binding": None,
+                "items": [],
+                "reason": {"code": "accepted_question_not_found"},
+            }
+        _reference_revision, quest_evidence_refs = (
+            self._research_graph.query_evidence_reference_state(
+                question.quest_ref
+            )
+        )
+
+        def absent(code: str) -> dict[str, object]:
+            return {
+                "status": "absent",
+                "question_ref": question_ref,
+                "quest_ref": question.quest_ref,
+                "binding": None,
+                "items": [],
+                "reason": {
+                    "code": code,
+                    "quest_evidence_role_count": len(quest_evidence_refs),
+                },
+            }
+
+        foreground_query = getattr(
+            self._advancement_engine, "query_foreground", None
+        )
+        idea_request_query = getattr(
+            self._advancement_engine, "query_idea_stage_request", None
+        )
+        inventory_query = getattr(
+            self._research_memory, "query_asset_projection_inventory_item", None
+        )
+        if not all(
+            callable(query)
+            for query in (foreground_query, idea_request_query, inventory_query)
+        ):
+            return {
+                "status": "unavailable",
+                "question_ref": question_ref,
+                "quest_ref": question.quest_ref,
+                "binding": None,
+                "items": [],
+                "reason": {"code": "question_evidence_owner_seam_unavailable"},
+            }
+        foreground = foreground_query(question.quest_ref)
+        if (
+            not isinstance(foreground, dict)
+            or foreground.get("question_ref") != question.question_ref
+            or not isinstance(foreground.get("cycle_ref"), str)
+        ):
+            return absent("question_evidence_binding_absent")
+        request = idea_request_query(foreground["cycle_ref"])
+        if request is None:
+            return absent("question_evidence_binding_absent")
+        if request.accepted_question.as_dict() != question.as_binding().as_dict():
+            raise OwnerConflict("question_evidence_question_binding_invalid")
+        refs = request.context_pack.get("accepted_evidence_refs")
+        if (
+            not isinstance(refs, list)
+            or any(not isinstance(ref, str) or not ref for ref in refs)
+            or len(refs) != len(set(refs))
+        ):
+            raise OwnerConflict("question_evidence_refs_invalid")
+        binding = {
+            "cycle_ref": request.cycle_ref,
+            "request_ref": request.request_ref,
+            "context_pack_ref": request.context_pack_ref,
+            "context_pack_hash": request.context_pack_hash,
+            "evidence_reference_revision": request.context_pack.get(
+                "evidence_reference_revision"
+            ),
+            "question_receipt_ref": question.receipt.receipt_ref,
+            "question_receipt_hash": question.receipt.payload_hash,
+        }
+        if not refs:
+            value = absent("question_evidence_refs_empty")
+            value["binding"] = binding
+            return value
+        projection_roles = self._research_graph.query_asset_projection_roles(
+            version_refs=tuple(refs),
+            limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
+        )
+        roles_by_ref = {
+            role.version_ref: role
+            for role in projection_roles
+            if role.quest_ref == question.quest_ref and role.role == "evidence"
+        }
+        if set(refs) - set(roles_by_ref):
+            return {
+                "status": "unavailable",
+                "question_ref": question_ref,
+                "quest_ref": question.quest_ref,
+                "binding": binding,
+                "items": [],
+                "reason": {"code": "question_evidence_role_binding_unavailable"},
+            }
+        items: list[dict[str, object]] = []
+        for evidence_ref in refs:
+            role = roles_by_ref[evidence_ref]
+            asset = inventory_query(evidence_ref)
+            if asset is None:
+                return {
+                    "status": "unavailable",
+                    "question_ref": question_ref,
+                    "quest_ref": question.quest_ref,
+                    "binding": binding,
+                    "items": [],
+                    "reason": {
+                        "code": "question_evidence_asset_projection_unavailable"
+                    },
+                }
+            if (
+                asset.asset_ref != role.asset_ref
+                or asset.content_hash != role.asset_hash
+                or asset.manifest_hash != role.manifest_hash
+                or asset.receipt != role.asset_receipt
+            ):
+                raise OwnerConflict("question_evidence_asset_binding_invalid")
+            items.append(
+                {
+                    "evidence_ref": evidence_ref,
+                    "role": role.as_public_dict(),
+                    "asset": asset.as_public_dict(),
+                }
+            )
+        return {
+            "status": "ready",
+            "question_ref": question_ref,
+            "quest_ref": question.quest_ref,
+            "binding": binding,
+            "items": items,
+            "reason": None,
+        }
+
     def query_snapshot(
         self,
         *,
@@ -253,9 +526,9 @@ class PublicProjection:
             query_question_tree = getattr(
                 self._research_graph, "query_question_tree", None
             )
-            if callable(query_question_tree):
+            if callable(query_question_tree) and control_quest_ref is not None:
                 try:
-                    for question in query_question_tree():
+                    for question in query_question_tree(control_quest_ref):
                         content = self._research_memory.read_question_content(
                             question.content_ref, question.content_hash
                         )
@@ -660,8 +933,7 @@ def _related_human_requests(
 ) -> dict[str, object]:
     related: list[dict[str, object]] = []
     for request in requests:
-        request_quest_ref = request.get("quest_ref")
-        if isinstance(request_quest_ref, str) and request_quest_ref != quest_ref:
+        if request.get("quest_ref") != quest_ref:
             continue
         bindings = _request_question_bindings(
             request,

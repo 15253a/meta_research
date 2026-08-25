@@ -10,8 +10,14 @@ import pytest
 from sqlalchemy import text
 
 from meta_research.composition import build_production_runtime
+from meta_research.database import Database
+from meta_research.feed import DurableFeed
+from meta_research.migration import upgrade_database
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.paths import prepare_data_root
+from meta_research.owners.human_collaboration_ladder import (
+    SQLiteHumanCollaborationLadder,
+)
 from meta_research.quest_drafting import (
     CodexDraftingAdapter,
     HostComputeDevice,
@@ -418,6 +424,393 @@ def test_companion_receives_current_request_context_and_may_emit_only_a_proposal
         assert projection["authorizations"] == []
     finally:
         runtime.close()
+
+
+def test_companion_binds_an_exact_current_question_view_context_into_the_agent_turn(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicDraftingProvider()
+    runtime = _runtime(tmp_path / "companion-question-context", provider)
+    human = runtime.owners.human_collaboration
+    try:
+        _confirm_direct_quest(runtime)
+        for _step in range(8):
+            if not human.reconcile_once():
+                break
+        [question] = runtime.owners.research_graph.query_question_tree()
+        lifecycle = runtime.owners.research_graph.query_question_lifecycle(
+            question.question_ref
+        )
+        scope_ref = f"quest:{question.quest_ref}"
+        view_context = {
+            "kind": "question",
+            "quest_ref": question.quest_ref,
+            "question_ref": question.question_ref,
+            "content_ref": question.content_ref,
+            "content_hash": question.content_hash,
+            "lifecycle_revision": lifecycle["revision"],
+        }
+
+        queued = human.send_companion_message(
+            scope_ref,
+            "What evidence is still missing for this Question?",
+            "companion-question-context-message",
+            view_context=view_context,
+        )
+
+        assert queued["view_context"] == view_context
+        assert human.process_drafting_once()
+        provider_request = provider.intent_requests[-1]
+        assert provider_request.message == (
+            "What evidence is still missing for this Question?"
+        )
+        assert provider_request.draft["current_context"] == {
+            "schema_ref": "meta-research/companion-context/v1",
+            "scope_ref": scope_ref,
+            "context_kind": "question",
+            "quest_ref": question.quest_ref,
+            "view_context": view_context,
+            "question": {
+                "question_ref": question.question_ref,
+                "quest_ref": question.quest_ref,
+                "parent_question_ref": None,
+                "content_ref": question.content_ref,
+                "content_hash": question.content_hash,
+                "schema_ref": question.schema_ref,
+                "question_receipt_ref": question.receipt.receipt_ref,
+                "content_receipt_ref": question.content_receipt.receipt_ref,
+                "lifecycle_status": "active",
+                "lifecycle_revision": lifecycle["revision"],
+                "title": "A bounded question",
+                "unknown_statement": "What remains unknown?",
+            },
+        }
+        assert human.query_companion(scope_ref)["turns"][-1][
+            "view_context"
+        ] == view_context
+        projected = human.query_collaboration_projection((scope_ref,))["messages"]
+        assert [message["role"] for message in projected] == [
+            "user",
+            "assistant",
+        ]
+        assert [message["view_context"] for message in projected] == [
+            view_context,
+            view_context,
+        ]
+        with pytest.raises(OwnerConflict, match="idempotency_conflict"):
+            human.send_companion_message(
+                scope_ref,
+                "What evidence is still missing for this Question?",
+                "companion-question-context-message",
+            )
+    finally:
+        runtime.close()
+
+
+def test_companion_rejects_a_stale_question_view_context_before_queueing(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicDraftingProvider()
+    runtime = _runtime(tmp_path / "companion-stale-question-context", provider)
+    human = runtime.owners.human_collaboration
+    try:
+        _confirm_direct_quest(runtime)
+        for _step in range(8):
+            if not human.reconcile_once():
+                break
+        [question] = runtime.owners.research_graph.query_question_tree()
+        lifecycle = runtime.owners.research_graph.query_question_lifecycle(
+            question.question_ref
+        )
+        scope_ref = f"quest:{question.quest_ref}"
+
+        with pytest.raises(
+            OwnerConflict,
+            match="companion_question_view_context_stale",
+        ):
+            human.send_companion_message(
+                scope_ref,
+                "Do not enqueue this stale Question selection.",
+                "companion-stale-question-context-message",
+                view_context={
+                    "kind": "question",
+                    "quest_ref": question.quest_ref,
+                    "question_ref": question.question_ref,
+                    "content_ref": question.content_ref,
+                    "content_hash": question.content_hash,
+                    "lifecycle_revision": int(lifecycle["revision"]) + 1,
+                },
+            )
+
+        assert human.query_companion(scope_ref)["turns"] == []
+        assert provider.intent_requests == []
+    finally:
+        runtime.close()
+
+
+def test_companion_fails_closed_when_question_changes_after_queueing(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicDraftingProvider()
+    runtime = _runtime(tmp_path / "companion-queued-question-drift", provider)
+    human = runtime.owners.human_collaboration
+    try:
+        _confirm_direct_quest(runtime)
+        for _step in range(8):
+            if not human.reconcile_once():
+                break
+        [question] = runtime.owners.research_graph.query_question_tree()
+        lifecycle = runtime.owners.research_graph.query_question_lifecycle(
+            question.question_ref
+        )
+        scope_ref = f"quest:{question.quest_ref}"
+        view_context = {
+            "kind": "question",
+            "quest_ref": question.quest_ref,
+            "question_ref": question.question_ref,
+            "content_ref": question.content_ref,
+            "content_hash": question.content_hash,
+            "lifecycle_revision": lifecycle["revision"],
+        }
+        queued = human.send_companion_message(
+            scope_ref,
+            "This must not reach drafting after the Question is pruned.",
+            "companion-question-drift-message",
+            view_context=view_context,
+        )
+
+        foreground = runtime.owners.advancement_engine.query_foreground(
+            question.quest_ref
+        )
+        assert foreground is not None
+        payload = {
+            "action": "prune",
+            "target": {
+                "quest_ref": question.quest_ref,
+                "cycle_ref": foreground["cycle_ref"],
+                "question_ref": question.question_ref,
+                "epoch": foreground["epoch"],
+                "target_question_ref": question.question_ref,
+            },
+            "reason": "question_context_drift_test",
+        }
+        drafted = human.create_command_draft(
+            scope_ref,
+            {"command_kind": "research_control", "payload": payload},
+            "companion-question-drift-control-draft",
+        )
+        previewed = human.preview_command(
+            drafted["intent_id"],
+            drafted["draft_revision"],
+            drafted["draft_hash"],
+            "companion-question-drift-control-preview",
+        )
+        preview = previewed["impact_preview"]
+        assert preview is not None
+        confirmed = human.confirm_command(
+            drafted["intent_id"],
+            drafted["draft_revision"],
+            drafted["draft_hash"],
+            preview["preview_ref"],
+            preview["preview_hash"],
+            "companion-question-drift-control-confirm",
+        )
+        confirmation = confirmed["confirmation_receipt"]
+        assert confirmation is not None
+        executed = human.execute_confirmed_command(
+            confirmed["intent_id"],
+            confirmation["receipt_ref"],
+            "companion-question-drift-control-execute",
+        )
+        assert executed["executed"] is True
+        assert runtime.owners.research_graph.query_question_lifecycle(
+            question.question_ref
+        )["status"] == "pruned"
+
+        replayed = human.send_companion_message(
+            scope_ref,
+            "This must not reach drafting after the Question is pruned.",
+            "companion-question-drift-message",
+            view_context=view_context,
+        )
+        assert replayed["interaction_ref"] == queued["interaction_ref"]
+        assert replayed["assistant_status"] == "queued"
+        with pytest.raises(OwnerConflict, match="idempotency_conflict"):
+            human.send_companion_message(
+                scope_ref,
+                "This must not reach drafting after the Question is pruned.",
+                "companion-question-drift-message",
+            )
+
+        assert human.process_drafting_once()
+        [turn] = human.query_companion(scope_ref)["turns"]
+        assert turn["assistant_status"] == "failed"
+        assert turn["reason"] == {
+            "code": "companion_question_view_context_stale"
+        }
+        terminal_replay = human.send_companion_message(
+            scope_ref,
+            "This must not reach drafting after the Question is pruned.",
+            "companion-question-drift-message",
+            view_context=view_context,
+        )
+        assert terminal_replay["interaction_ref"] == queued["interaction_ref"]
+        assert terminal_replay["assistant_status"] == "failed"
+        assert provider.intent_requests == []
+    finally:
+        runtime.close()
+
+
+def test_companion_question_view_context_survives_restart_before_drafting(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "companion-question-context-restart"
+    first_provider = _DeterministicDraftingProvider()
+    runtime = _runtime(data_path, first_provider)
+    human = runtime.owners.human_collaboration
+    _confirm_direct_quest(runtime)
+    for _step in range(8):
+        if not human.reconcile_once():
+            break
+    [question] = runtime.owners.research_graph.query_question_tree()
+    lifecycle = runtime.owners.research_graph.query_question_lifecycle(
+        question.question_ref
+    )
+    scope_ref = f"quest:{question.quest_ref}"
+    view_context = {
+        "kind": "question",
+        "quest_ref": question.quest_ref,
+        "question_ref": question.question_ref,
+        "content_ref": question.content_ref,
+        "content_hash": question.content_hash,
+        "lifecycle_revision": lifecycle["revision"],
+    }
+    runtime.owners.human_collaboration.send_companion_message(
+        scope_ref,
+        "Recover this exact Question context after restart.",
+        "companion-question-context-restart-message",
+        view_context=view_context,
+    )
+    runtime.close()
+
+    restarted_provider = _DeterministicDraftingProvider()
+    restarted = _runtime(data_path, restarted_provider)
+    try:
+        [queued] = restarted.owners.human_collaboration.query_companion(scope_ref)[
+            "turns"
+        ]
+        assert queued["assistant_status"] == "queued"
+        assert queued["view_context"] == view_context
+
+        assert restarted.owners.human_collaboration.process_drafting_once()
+        [request] = restarted_provider.intent_requests
+        assert request.draft["current_context"]["view_context"] == view_context
+        [completed] = restarted.owners.human_collaboration.query_companion(
+            scope_ref
+        )["turns"]
+        assert completed["assistant_status"] == "completed"
+        assert completed["view_context"] == view_context
+    finally:
+        restarted.close()
+
+
+def test_companion_durable_view_context_requires_a_resolver_when_consumed(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "companion-context-consumption-verifier-unavailable"
+    first_provider = _DeterministicDraftingProvider()
+    runtime = _runtime(data_path, first_provider)
+    human = runtime.owners.human_collaboration
+    _confirm_direct_quest(runtime)
+    for _step in range(8):
+        if not human.reconcile_once():
+            break
+    [question] = runtime.owners.research_graph.query_question_tree()
+    lifecycle = runtime.owners.research_graph.query_question_lifecycle(
+        question.question_ref
+    )
+    scope_ref = f"quest:{question.quest_ref}"
+    view_context = {
+        "kind": "question",
+        "quest_ref": question.quest_ref,
+        "question_ref": question.question_ref,
+        "content_ref": question.content_ref,
+        "content_hash": question.content_hash,
+        "lifecycle_revision": lifecycle["revision"],
+    }
+    human.send_companion_message(
+        scope_ref,
+        "Fail closed if the Owner resolver is missing after restart.",
+        "companion-context-consumption-verifier-unavailable",
+        view_context=view_context,
+    )
+    runtime.close()
+
+    database = Database(prepare_data_root(data_path).database)
+    provider_without_resolver = _DeterministicDraftingProvider()
+    ladder = SQLiteHumanCollaborationLadder(
+        database,
+        DurableFeed(database),
+        provider_without_resolver,
+    )
+    try:
+        assert ladder.process_drafting_once()
+        [failed] = ladder.query_companion(scope_ref)["turns"]
+        assert failed["assistant_status"] == "failed"
+        assert failed["reason"] == {
+            "code": "companion_view_context_verifier_unavailable"
+        }
+        assert failed["view_context"] == view_context
+        assert provider_without_resolver.intent_requests == []
+    finally:
+        database.close()
+
+
+def test_companion_view_context_requires_an_owner_resolver(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "companion-context-verifier-unavailable.sqlite3"
+    upgrade_database(database_path)
+    database = Database(database_path)
+    provider = _DeterministicDraftingProvider()
+    ladder = SQLiteHumanCollaborationLadder(
+        database,
+        DurableFeed(database),
+        provider,
+    )
+    try:
+        with pytest.raises(
+            OwnerConflict,
+            match="companion_view_context_verifier_unavailable",
+        ):
+            ladder.send_companion_message(
+                "quest:unverified",
+                "Never pass unverified browser context to a provider.",
+                "companion-unverified-context-message",
+                view_context={
+                    "kind": "question",
+                    "quest_ref": "unverified",
+                    "question_ref": "question-unverified",
+                    "content_ref": "content-unverified",
+                    "content_hash": "a" * 64,
+                    "lifecycle_revision": 1,
+                },
+            )
+        assert ladder.query_companion("quest:unverified")["turns"] == []
+
+        contextless = ladder.send_companion_message(
+            "workspace",
+            "Legacy contextless conversation remains available.",
+            "companion-contextless-without-resolver",
+        )
+        assert contextless["assistant_status"] == "queued"
+        assert ladder.process_drafting_once()
+        assert len(provider.intent_requests) == 1
+        [completed] = ladder.query_companion("workspace")["turns"]
+        assert completed["assistant_status"] == "completed"
+        assert "view_context" not in completed
+    finally:
+        database.close()
 
 
 def test_companion_backlog_cannot_starve_quest_proposal_generation(

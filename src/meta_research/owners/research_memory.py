@@ -6582,10 +6582,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 ):
                     raise OwnerConflict("plan_content_acceptance_conflict")
                 _verify_plan_object(self._object_store, existing)
-                _verify_plan_payload(existing, None)
                 if existing.receipt_hash != _plan_content_receipt_hash(existing):
                     raise OwnerConflict("plan_content_receipt_invalid")
-                return _accepted_plan_document(existing)
+                return _accepted_plan_document(existing, verified_request)
 
             content_ref = new_ref("plan_content")
             receipt_ref = new_ref("rm_plan_content_receipt")
@@ -6703,7 +6702,15 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             ).first()
         if row is None:
             return None
-        accepted = _accepted_plan_document(row)
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        verified_request = (
+            self._stage_request_verifier.query_verified_plan_stage_request(
+                request_ref=row.request_ref,
+                context_pack_ref=row.context_pack_ref,
+            )
+        )
+        accepted = _accepted_plan_document(row, verified_request)
         self._receipt_verifier.verify_plan_content_receipt(
             request_ref=row.request_ref,
             submission_ref=row.submission_ref,
@@ -12516,9 +12523,12 @@ def _accepted_idea_content(row) -> AcceptedIdeaOutcomeContent:
     )
 
 
-def _accepted_plan_document(row) -> AcceptedPlanDocument:
-    plan_document, reviewed_draft, review = _verify_plan_payload(row, None)
+def _accepted_plan_document(row, verified_request) -> AcceptedPlanDocument:
+    plan_document, reviewed_draft, review = _verify_plan_payload(
+        row, verified_request
+    )
     _verify_plan_object_path_shape(row)
+    accepted_question = verified_request.accepted_question
     return AcceptedPlanDocument(
         request_ref=row.request_ref,
         run_ref=row.run_ref,
@@ -12531,20 +12541,8 @@ def _accepted_plan_document(row) -> AcceptedPlanDocument:
         context_pack_ref=row.context_pack_ref,
         question_content_ref=row.question_content_ref,
         question_content_hash=row.question_content_hash,
-        question_content_receipt=AcceptanceReceipt(
-            issuer=RM_OWNER,
-            kind=CONTENT_RECEIPT_KIND,
-            receipt_ref=row.question_content_receipt_ref,
-            subject_ref=row.question_content_ref,
-            payload_hash=row.question_content_receipt_hash,
-        ),
-        question_receipt=AcceptanceReceipt(
-            issuer="research_graph",
-            kind="root_question_acceptance",
-            receipt_ref=row.question_receipt_ref,
-            subject_ref=row.question_ref,
-            payload_hash=row.question_receipt_hash,
-        ),
+        question_content_receipt=accepted_question.content_receipt,
+        question_receipt=accepted_question.question_receipt,
         idea_outcome_ref=row.idea_outcome_ref,
         idea_content_ref=row.idea_content_ref,
         idea_content_hash=row.idea_content_hash,

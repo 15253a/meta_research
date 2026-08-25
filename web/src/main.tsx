@@ -388,24 +388,53 @@ function isHumanRequestPanel(panel: string | null): boolean {
   return panel === "human-requests" || humanRequestKindFromPanel(panel) !== null;
 }
 
+function currentQuestRef(snapshot: PublicSnapshot | null): string | null {
+  const scopeRef = snapshot?.human_collaboration?.companion.scope_ref;
+  if (!scopeRef) return null;
+  if (scopeRef.startsWith("quest:")) {
+    const questRef = scopeRef.slice("quest:".length);
+    return questRef || null;
+  }
+  const projectedQuest = snapshot?.research_space.current_quest;
+  if (projectedQuest?.status === "ready" && projectedQuest.quest_ref === scopeRef) {
+    return scopeRef;
+  }
+  return snapshot?.human_collaboration?.human_requests.items.some(
+    (item) => item.quest_ref === scopeRef,
+  ) ? scopeRef : null;
+}
+
+function currentQuestHumanRequests(
+  snapshot: PublicSnapshot | null,
+): HumanRequestItem[] {
+  const humanRequests = snapshot?.human_collaboration?.human_requests;
+  const questRef = currentQuestRef(snapshot);
+  if (humanRequests?.status !== "ready" || !questRef) return [];
+  return humanRequests.items.filter((item) => item.quest_ref === questRef);
+}
+
+function humanRequestPresentationKey(item: HumanRequestItem): string {
+  return [
+    "meta_research:human_request:auto_presented",
+    item.issuer,
+    item.request_ref,
+    `r${item.revision}`,
+  ].join(":");
+}
+
 function questWideBlockingHumanRequests(
   snapshot: PublicSnapshot | null,
 ): HumanRequestItem[] {
   const humanRequests = snapshot?.human_collaboration?.human_requests;
-  const scopeRef = snapshot?.human_collaboration?.companion.scope_ref;
   if (
     humanRequests?.status !== "ready" ||
-    !scopeRef ||
+    !currentQuestRef(snapshot) ||
     humanRequests.waiting.safe_meaningful_runnable_exists
   ) {
     return [];
   }
-  const questRef = scopeRef.startsWith("quest:")
-    ? scopeRef.slice("quest:".length)
-    : scopeRef;
-  return humanRequests.items.filter((item) => (
+  return currentQuestHumanRequests(snapshot).filter((item) => (
     item.status === "open" &&
-    item.quest_ref === questRef &&
     item.direct_waiters?.some((waiter) => waiter.wait_scope === "quest")
   ));
 }
@@ -414,12 +443,18 @@ if (window.location.pathname === "/auth/launch") {
   window.history.replaceState(null, "", "/");
 }
 
-function questionTreeUrl(questionRef?: string | null): string {
+type QuestionInspectorMode = "evidence" | "history" | null;
+
+function questionTreeUrl(
+  questionRef?: string | null,
+  inspectorMode: QuestionInspectorMode = null,
+): string {
   const parameters = new URLSearchParams({
     variant: "A",
     view: "questions",
   });
   if (questionRef) parameters.set("node", questionRef);
+  if (inspectorMode) parameters.set("inspector", inspectorMode);
   parameters.set("panel", "question-tree");
   return `/?${parameters}`;
 }
@@ -527,12 +562,16 @@ function LumenRail({
   canBrowseAssets,
   canBrowseQuestions,
   questionsActive,
+  canBrowseHistory,
+  historyActive,
   canBrowseWriting,
   writingOpen,
   questionUnavailableReason,
   questionButtonRef,
+  historyButtonRef,
   writingButtonRef,
   onBrowseQuestions,
+  onBrowseHistory,
   canBrowseHumanRequests,
   humanRequestCount,
   humanRequestsOpen,
@@ -545,10 +584,13 @@ function LumenRail({
   canBrowseAssets: boolean;
   canBrowseQuestions: boolean;
   questionsActive: boolean;
+  canBrowseHistory: boolean;
+  historyActive: boolean;
   canBrowseWriting: boolean;
   writingOpen: boolean;
   questionUnavailableReason: string;
   questionButtonRef: Ref<HTMLButtonElement>;
+  historyButtonRef: Ref<HTMLButtonElement>;
   writingButtonRef: Ref<HTMLButtonElement>;
   canBrowseHumanRequests: boolean;
   humanRequestCount: number;
@@ -557,6 +599,7 @@ function LumenRail({
   onBrowseAssets: () => void;
   onBrowseWriting: () => void;
   onBrowseQuestions: () => void;
+  onBrowseHistory: () => void;
   onBrowseHumanRequests: () => void;
 }) {
   return (
@@ -565,7 +608,7 @@ function LumenRail({
       <RailButton
         label="问题树"
         glyph="树"
-        active={questionsActive}
+        active={questionsActive && !historyActive}
         unavailable={!canBrowseQuestions}
         unavailableReason={questionUnavailableReason}
         buttonRef={questionButtonRef}
@@ -585,7 +628,15 @@ function LumenRail({
         buttonRef={writingButtonRef}
         onClick={onBrowseWriting}
       />
-      <RailButton label="历史" glyph="↺" unavailable />
+      <RailButton
+        label="历史"
+        glyph="↺"
+        active={historyActive}
+        unavailable={!canBrowseHistory}
+        unavailableReason="当前 Quest 没有可下钻的已接纳 Question"
+        buttonRef={historyButtonRef}
+        onClick={onBrowseHistory}
+      />
       <RailButton
         label="HumanRequest"
         glyph="!"
@@ -698,9 +749,9 @@ function acceptedChangeSummary(snapshot: PublicSnapshot): string {
 function currentBlockerSummary(snapshot: PublicSnapshot): string {
   const global = questWideBlockingHumanRequests(snapshot)[0];
   if (global) return `Quest wait · ${global.kind} · ${global.request_ref}`;
-  const openLocal = snapshot.human_collaboration?.human_requests.status === "ready"
-    ? snapshot.human_collaboration.human_requests.items.find((item) => item.status === "open")
-    : null;
+  const openLocal = currentQuestHumanRequests(snapshot).find(
+    (item) => item.status === "open",
+  );
   if (openLocal) return `Local wait · ${openLocal.kind} · 其余安全工作可继续`;
   const unavailable = snapshot.readiness.checks.find((check) => check.status !== "ready");
   if (unavailable) {
@@ -2020,21 +2071,25 @@ function bundleFactRows(
       slot: "root-run",
       label: "Bundle root Run",
       owner: "AR",
-      state: skipped || exhausted
+      state: skipped
         ? "done"
         : run
           ? isRunBlocked(run.status)
             ? "blocked"
             : run.status === "completed" ? "done" : "current"
-          : "pending",
-      title: skipped || exhausted
-        ? exhausted
-          ? "BundleExhaustion 已接纳；没有制造空 root Run"
-          : "GapSet 为空；未创建 Bundle Run"
+          : exhausted ? "blocked" : "pending",
+      title: skipped
+        ? "GapSet 为空；未创建 Bundle Run"
         : run
-          ? "一个 root/native Session 调度正式 Target；child agent 不进入 Target DAG"
-          : "等待 Agent Runtime admission",
-      status: skipped ? "not_created_by_design" : exhausted ? "exhausted" : run?.status ?? "not_created",
+          ? exhausted
+            ? `BundleExhaustion 由真实 root Run ${run.run_ref ?? "identity unavailable"} 的执行证据支撑`
+            : "一个 root/native Session 调度正式 Target；child agent 不进入 Target DAG"
+          : exhausted
+            ? "BundleExhaustion 缺少公开 root Run；不会把缺失伪装成已执行"
+            : "等待 Agent Runtime admission",
+      status: skipped
+        ? "not_created_by_design"
+        : run?.status ?? (exhausted ? "run_projection_missing" : "not_created"),
     },
     {
       slot: "target-dag",
@@ -3373,11 +3428,18 @@ function App() {
   const [questionTreeOpen, setQuestionTreeOpen] = useState(
     () => ["question-tree", "create-question"].includes(
       initialParameters.get("panel") ?? "",
-    ) || initialParameters.get("view") === "questions",
+    ) || initialParameters.get("view") === "questions"
+      || ["evidence", "history"].includes(initialParameters.get("inspector") ?? ""),
   );
   const [questionRouteNodeRef, setQuestionRouteNodeRef] = useState<string | null>(
     () => initialParameters.get("node"),
   );
+  const [questionInspectorMode, setQuestionInspectorMode] = useState<
+    QuestionInspectorMode
+  >(() => {
+    const mode = initialParameters.get("inspector");
+    return mode === "evidence" || mode === "history" ? mode : null;
+  });
   const [selectedQuestionContext, setSelectedQuestionContext] = useState<
     QuestionTreeItem | null
   >(null);
@@ -3413,6 +3475,8 @@ function App() {
   const streamCursorRef = useRef<number | null>(null);
   const manualDetailSequence = useRef(0);
   const questionTreeButtonRef = useRef<HTMLButtonElement>(null);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
+  const questionTreeReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const writingButtonRef = useRef<HTMLButtonElement>(null);
   const humanRequestReturnFocusRef = useRef<HTMLElement | null>(null);
   const questWideRequests = useMemo(
@@ -3571,7 +3635,7 @@ function App() {
 
   useEffect(() => {
     const globalRequest = questWideRequests.find((item) => {
-      const key = `meta_research:human_request:auto_presented:${item.request_ref}`;
+      const key = humanRequestPresentationKey(item);
       try {
         return window.sessionStorage.getItem(key) === null;
       } catch {
@@ -3579,7 +3643,7 @@ function App() {
       }
     });
     if (!globalRequest) return;
-    const presentationKey = `meta_research:human_request:auto_presented:${globalRequest.request_ref}`;
+    const presentationKey = humanRequestPresentationKey(globalRequest);
     try {
       if (window.sessionStorage.getItem(presentationKey)) return;
       window.sessionStorage.setItem(presentationKey, "presented");
@@ -3604,6 +3668,16 @@ function App() {
   const canCreate = questCreationReady(snapshot);
   const canBrowseAssets = snapshot?.research_assets.status === "ready";
   const canBrowseQuestions = snapshot?.question_tree.status === "ready";
+  const projectedCurrentQuestionRef = snapshot?.research_space.current_question
+    ?.question_ref;
+  const scopedQuestRef = currentQuestRef(snapshot);
+  const scopedHistoryQuestions = snapshot?.question_tree.items.filter(
+    (item) => !scopedQuestRef || item.quest_ref === scopedQuestRef,
+  ) ?? [];
+  const historyQuestionRef = scopedHistoryQuestions.find(
+    (item) => item.question_ref === projectedCurrentQuestionRef,
+  )?.question_ref ?? scopedHistoryQuestions[0]?.question_ref ?? null;
+  const canBrowseHistory = Boolean(canBrowseQuestions && historyQuestionRef);
   const canBrowseWriting = snapshot?.writing.status === "ready";
   const manualCreationReady =
     snapshot?.manual_question_creation.status === "ready";
@@ -3657,11 +3731,13 @@ function App() {
   };
   const openQuestionTree = () => {
     if (!canBrowseQuestions) return;
+    questionTreeReturnFocusRef.current = questionTreeButtonRef.current;
     setCreationMode(null);
     setAssetsOpen(false);
     setWritingOpen(false);
     setManualPanel(null);
     setManualOpenError(null);
+    setQuestionInspectorMode(null);
     setQuestionRouteNodeRef(null);
     setSelectedQuestionContext(null);
     setPendingDirectManualParentRef(null);
@@ -3671,21 +3747,42 @@ function App() {
   const closeQuestionTree = () => {
     setManualPanel(null);
     setQuestionTreeOpen(false);
+    setQuestionInspectorMode(null);
     setQuestionRouteNodeRef(null);
     setSelectedQuestionContext(null);
     setPendingDirectManualParentRef(null);
     setManualOpenError(null);
     window.history.replaceState(null, "", "/");
     requestAnimationFrame(() => {
-      questionTreeButtonRef.current?.focus({ preventScroll: true });
+      (questionTreeReturnFocusRef.current ?? questionTreeButtonRef.current)
+        ?.focus({ preventScroll: true });
+      questionTreeReturnFocusRef.current = null;
     });
+  };
+
+  const openQuestionHistory = () => {
+    if (!canBrowseHistory || !historyQuestionRef) return;
+    questionTreeReturnFocusRef.current = historyButtonRef.current;
+    setCreationMode(null);
+    setAssetsOpen(false);
+    setWritingOpen(false);
+    setManualPanel(null);
+    setManualOpenError(null);
+    setQuestionRouteNodeRef(historyQuestionRef);
+    setSelectedQuestionContext(null);
+    setQuestionInspectorMode("history");
+    setPendingDirectManualParentRef(null);
+    window.history.replaceState(
+      null,
+      "",
+      questionTreeUrl(historyQuestionRef, "history"),
+    );
+    setQuestionTreeOpen(true);
   };
 
   const selectQuestionTreeContext = useCallback((question: QuestionTreeItem | null) => {
     setSelectedQuestionContext((current) => (
-      current?.question_ref === question?.question_ref &&
-      current?.content_hash === question?.content_hash &&
-      current?.lifecycle_revision === question?.lifecycle_revision
+      current?.question_ref === question?.question_ref
         ? current
         : question
     ));
@@ -3694,9 +3791,13 @@ function App() {
       return current === next ? current : next;
     });
     if (question && !manualPanel) {
-      window.history.replaceState(null, "", questionTreeUrl(question.question_ref));
+      window.history.replaceState(
+        null,
+        "",
+        questionTreeUrl(question.question_ref, questionInspectorMode),
+      );
     }
-  }, [manualPanel]);
+  }, [manualPanel, questionInspectorMode]);
 
   const discussQuestionWithCompanion = useCallback((
     question: QuestionTreeItem,
@@ -3704,13 +3805,28 @@ function App() {
   ) => {
     setSelectedQuestionContext(question);
     setQuestionRouteNodeRef(question.question_ref);
-    window.history.replaceState(null, "", questionTreeUrl(question.question_ref));
+    window.history.replaceState(
+      null,
+      "",
+      questionTreeUrl(question.question_ref, questionInspectorMode),
+    );
     requestAnimationFrame(() => {
       document.querySelector<HTMLInputElement>(
         "[aria-label='给 Quest Companion 发消息']",
       )?.focus({ preventScroll: false });
     });
-  }, []);
+  }, [questionInspectorMode]);
+
+  const changeQuestionInspectorMode = useCallback((
+    mode: Exclude<QuestionInspectorMode, null> | null,
+  ) => {
+    setQuestionInspectorMode(mode);
+    window.history.replaceState(
+      null,
+      "",
+      questionTreeUrl(questionRouteNodeRef, mode),
+    );
+  }, [questionRouteNodeRef]);
 
   const openWriting = () => {
     if (!canBrowseWriting || !snapshot) return;
@@ -3965,12 +4081,16 @@ function App() {
           canBrowseAssets={canBrowseAssets}
           canBrowseQuestions={canBrowseQuestions}
           questionsActive={questionTreeOpen}
+          canBrowseHistory={canBrowseHistory && manualPanel === null}
+          historyActive={questionTreeOpen && questionInspectorMode === "history"}
           canBrowseWriting={Boolean(canBrowseWriting)}
           writingOpen={writingOpen}
           questionUnavailableReason={questionUnavailableReason}
           questionButtonRef={questionTreeButtonRef}
+          historyButtonRef={historyButtonRef}
           writingButtonRef={writingButtonRef}
           onBrowseQuestions={openQuestionTree}
+          onBrowseHistory={openQuestionHistory}
           canBrowseHumanRequests={canBrowseHumanRequests}
           humanRequestCount={humanRequestCount}
           humanRequestsOpen={humanRequestsOpen}
@@ -3986,6 +4106,8 @@ function App() {
             projectionStatus={snapshot.question_tree.status}
             projectionReason={snapshot.question_tree.reason?.code ?? null}
             initialQuestionRef={questionRouteNodeRef}
+            initialInspectorMode={questionInspectorMode}
+            onInspectorModeChange={changeQuestionInspectorMode}
             manualCreationReady={Boolean(
               manualCreationReady && snapshot.question_tree.status === "ready",
             )}

@@ -271,6 +271,28 @@ def test_rg_accepts_precise_asset_roles_and_revalidates_current_evidence(
         )
         assert "deep" in evidence_checks
         assert "cas" in evidence_checks
+        question_evidence = runtime.projection.query_question_evidence(
+            accepted_question.question_ref
+        )
+        assert question_evidence["status"] == "ready"
+        assert question_evidence["question_ref"] == accepted_question.question_ref
+        assert question_evidence["binding"] == {
+            "cycle_ref": completed["cycle_ref"],
+            "request_ref": stage_request.request_ref,
+            "context_pack_ref": stage_request.context_pack_ref,
+            "context_pack_hash": stage_request.context_pack_hash,
+            "evidence_reference_revision": stage_request.context_pack[
+                "evidence_reference_revision"
+            ],
+            "question_receipt_ref": accepted_question.receipt.receipt_ref,
+            "question_receipt_hash": accepted_question.receipt.payload_hash,
+        }
+        assert len(question_evidence["items"]) == 1
+        assert question_evidence["items"][0]["evidence_ref"] == binding.version_ref
+        assert question_evidence["items"][0]["role"] == evidence.as_public_dict()
+        assert question_evidence["items"][0]["asset"]["version_ref"] == (
+            binding.version_ref
+        )
         later_asset = runtime.owners.research_memory.submit_asset_intake(
             AssetIntakeRequest(
                 source_kind="text",

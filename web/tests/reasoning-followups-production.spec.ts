@@ -78,21 +78,57 @@ async function createAcceptedQuestThroughWeb(
   await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
 }
 
+class PublicReadError extends Error {
+  constructor(
+    readonly path: string,
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(`${path} failed: ${status} ${body}`);
+    this.name = "PublicReadError";
+  }
+}
+
 async function readPublic<T>(page: Page, path: string): Promise<T> {
-  return await page.evaluate(async (requestPath) => {
+  const response = await page.evaluate(async (requestPath) => {
     const response = await fetch(requestPath, {
       credentials: "same-origin",
       headers: { Accept: "application/json" },
     });
-    if (!response.ok) {
-      throw new Error(`${requestPath} failed: ${response.status}`);
-    }
-    return response.json();
-  }, path) as T;
+    return {
+      ok: response.ok,
+      status: response.status,
+      body: await response.text(),
+    };
+  }, path);
+  if (!response.ok) {
+    throw new PublicReadError(path, response.status, response.body);
+  }
+  return JSON.parse(response.body) as T;
 }
 
 async function publicSnapshot(page: Page): Promise<PublicSnapshot> {
-  return readPublic(page, "/api/v1/snapshot");
+  const consistencyBody = (
+    '{"detail":{"code":"snapshot_consistency_unavailable",' +
+    '"status":"capability_unavailable"}}'
+  );
+  let lastConsistencyError: PublicReadError | null = null;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      return await readPublic(page, "/api/v1/snapshot");
+    } catch (error) {
+      if (
+        !(error instanceof PublicReadError)
+        || error.status !== 503
+        || error.body !== consistencyBody
+      ) {
+        throw error;
+      }
+      lastConsistencyError = error;
+      await page.waitForTimeout(100);
+    }
+  }
+  throw lastConsistencyError ?? new Error("snapshot consistency retry exhausted");
 }
 
 async function publicReasoning(page: Page): Promise<ReasoningStageProjection> {
@@ -207,11 +243,20 @@ test("Chrome observes mandatory AutonomousCreation without a browser-authored ef
     await expect(card).toContainText(autonomous?.checkpoint.ref ?? "missing");
     await assertResponsiveWithoutOverflow(page, card);
     expect(autonomousWrites).toEqual([]);
-    await expect.poll(async () => (
-      await publicReasoning(page)
-    ).stage_commit?.transition_kind, { timeout: 30_000 }).toBe(
-      "NextCycleProposal",
-    );
+    const targetQuestionRef = autonomous?.question_anchor?.question_ref;
+    const sourceCycleRef = autonomous?.source.cycle_ref;
+    expect(targetQuestionRef).toEqual(expect.any(String));
+    expect(sourceCycleRef).toEqual(expect.any(String));
+    await expect.poll(async () => {
+      const current = (await publicSnapshot(page)).research_control.foreground;
+      return {
+        question_ref: current?.question_ref,
+        is_successor_cycle: current?.cycle_ref !== sourceCycleRef,
+      };
+    }, { timeout: 30_000 }).toEqual({
+      question_ref: targetQuestionRef,
+      is_successor_cycle: true,
+    });
   } finally {
     await product.stop();
   }

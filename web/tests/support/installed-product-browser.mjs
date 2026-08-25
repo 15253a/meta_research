@@ -41,6 +41,10 @@ async function visible(locator, description) {
 
 async function contains(locator, value, description) {
   await visible(locator, description);
+  await locator.filter({ hasText: value }).waitFor({
+    state: "visible",
+    timeout: 15_000,
+  });
   const text = await locator.innerText();
   assert.ok(text.includes(value), `${description} does not contain ${JSON.stringify(value)}: ${text}`);
 }
@@ -155,7 +159,52 @@ try {
       await contains(observer, expected.execution_fence_key, "QuestionTree-reopened Execution Fence");
       await closeObserver(page);
 
+      await tree.getByRole("button", { name: "问题历史 ↗" }).click();
+      const questionHistory = tree.getByRole("region", { name: "问题历史" });
+      await contains(questionHistory, expected.question_ref, "installed Question history identity");
+      assert.equal(
+        new URL(page.url()).searchParams.get("inspector"),
+        "history",
+        "Question history did not retain its deep-link state",
+      );
+
+      await tree.getByRole("button", { name: "查看证据与来源" }).click();
+      const questionEvidence = tree.getByRole("region", { name: "问题证据与来源" });
+      await contains(
+        questionEvidence,
+        "question_evidence_refs_empty",
+        "installed Question evidence typed absence",
+      );
+      assert.equal(
+        new URL(page.url()).searchParams.get("inspector"),
+        "evidence",
+        "Question evidence did not retain its deep-link state",
+      );
       await assertNoHorizontalOverflow(page, `${viewport.width}px QuestionTree`);
+
+      await tree.getByRole("button", { name: "回到总览" }).click();
+      const historyRail = shell.getByRole("button", { name: "历史", exact: true });
+      await visible(historyRail, "History rail entry");
+      assert.equal(await historyRail.isEnabled(), true, "History rail entry is disabled");
+      await historyRail.click();
+      await contains(
+        page.getByRole("region", { name: "问题历史" }),
+        expected.question_ref,
+        "History rail Question identity",
+      );
+      await page.getByTestId("question-tree").getByRole("button", { name: "回到总览" }).click();
+      await page.waitForFunction(() => (
+        document.activeElement === document.querySelector(
+          '[data-testid="product-shell"] nav[aria-label="主导航"] button[aria-label="历史"]',
+        )
+      ), undefined, { timeout: 15_000 });
+      assert.equal(
+        await historyRail.evaluate((button) => document.activeElement === button),
+        true,
+        "closing History did not restore focus to its rail opener",
+      );
+
+      await assertNoHorizontalOverflow(page, `${viewport.width}px History return`);
       await page.waitForTimeout(100);
       assert.deepEqual(
         researchWrites,

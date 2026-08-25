@@ -272,13 +272,15 @@ test("a real BundleExhaustion closure renders EXHAUSTED with its public basis an
   });
   expect(bundleStage.target_graph.targets).toEqual([]);
   expect(bundleStage.target_commits).toEqual([]);
+  expect(bundleStage.run).toMatchObject({ status: "completed" });
 
   const snapshot = await publicSnapshot(page);
   expect(snapshot.bundle_stage).toEqual(bundleStage);
   const exhaustion = bundleStage.bundle_exhaustion;
-  if (!exhaustion || !bundleStage.stage_commit) {
+  if (!exhaustion || !bundleStage.stage_commit || !bundleStage.run) {
     throw new Error("real exhaustion closure is incomplete");
   }
+  const rootRun = bundleStage.run;
   const basisRef = exhaustion.basis_ref;
   const basisReceiptRef = acceptedReceiptRef(exhaustion.basis_receipt);
   const decisionReceiptRef = acceptedReceiptRef(exhaustion.decision_receipt);
@@ -315,9 +317,16 @@ test("a real BundleExhaustion closure renders EXHAUSTED with its public basis an
 
   const stageCard = page.getByTestId("bundle-stage-card");
   await expect(stageCard).toHaveAttribute("data-bundle-disposition", "exhausted");
+  const rootRunRow = stageCard.locator('[data-bundle-slot="root-run"]');
+  await expect(rootRunRow).toContainText(rootRun.run_ref ?? "missing-root-run");
+  await expect(rootRunRow).toContainText("completed");
+  await expect(rootRunRow).not.toContainText("没有制造空 root Run");
   await expect(stageCard.locator('[data-bundle-slot="target-closure"]'))
     .toContainText("BundleExhaustion");
   await stageCard.getByText("查看 Bundle、Target 与 receipt 身份").click();
+  await expect(stageCard).toContainText(rootRun.attempt_ref ?? "missing-attempt");
+  await expect(stageCard).toContainText(rootRun.root_session_ref ?? "missing-root-session");
+  await expect(stageCard).toContainText(rootRun.fence_ref ?? "missing-fence");
   await expect(stageCard).toContainText(basisRef ?? "missing-basis");
   await expect(stageCard).toContainText(basisReceiptRef);
   await expect(stageCard).toContainText(decisionReceiptRef);

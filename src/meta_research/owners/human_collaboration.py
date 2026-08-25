@@ -235,7 +235,12 @@ class HumanCollaborationInterface(Protocol):
     ) -> dict[str, object]: ...
 
     def send_companion_message(
-        self, scope_ref: str, message: str, idempotency_key: str
+        self,
+        scope_ref: str,
+        message: str,
+        idempotency_key: str,
+        *,
+        view_context: dict[str, object] | None = None,
     ) -> dict[str, object]: ...
 
     def query_companion(self, scope_ref: str) -> dict[str, object]: ...
@@ -1864,10 +1869,18 @@ class SQLiteHumanCollaboration:
         return tuple(by_ref[key] for key in sorted(by_ref))
 
     def send_companion_message(
-        self, scope_ref: str, message: str, idempotency_key: str
+        self,
+        scope_ref: str,
+        message: str,
+        idempotency_key: str,
+        *,
+        view_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
         return self._collaboration_ladder.send_companion_message(
-            scope_ref, message, idempotency_key
+            scope_ref,
+            message,
+            idempotency_key,
+            view_context=view_context,
         )
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
@@ -1895,9 +1908,20 @@ class SQLiteHumanCollaboration:
                 authorizations.append(authorization)
         return {**projection, "authorizations": authorizations}
 
-    def _resolve_companion_context(self, scope_ref: str) -> dict[str, object]:
+    def _resolve_companion_context(
+        self,
+        scope_ref: str,
+        view_context: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         """Resolve current public Owner facts without giving Companion write authority."""
 
+        if view_context is not None:
+            return _companion_question_context(
+                scope_ref,
+                view_context,
+                research_graph=self._research_graph,
+                research_memory=self._research_memory,
+            )
         owners = (
             self._research_graph,
             self._research_memory,
@@ -10872,6 +10896,113 @@ def _finite_json_value(value: object) -> bool:
             for key, item in value.items()
         )
     return False
+
+
+def _companion_question_context(
+    scope_ref: str,
+    view_context: dict[str, object],
+    *,
+    research_graph: ResearchGraphInterface,
+    research_memory: ResearchMemoryInterface,
+) -> dict[str, object]:
+    """Rebind a browser Question selection to exact current Owner facts."""
+
+    expected_fields = {
+        "kind",
+        "quest_ref",
+        "question_ref",
+        "content_ref",
+        "content_hash",
+        "lifecycle_revision",
+    }
+    if set(view_context) != expected_fields or view_context.get("kind") != "question":
+        raise OwnerConflict("companion_question_view_context_invalid")
+    quest_ref = view_context.get("quest_ref")
+    question_ref = view_context.get("question_ref")
+    content_ref = view_context.get("content_ref")
+    content_hash = view_context.get("content_hash")
+    lifecycle_revision = view_context.get("lifecycle_revision")
+    if (
+        not isinstance(quest_ref, str)
+        or not quest_ref
+        or not isinstance(question_ref, str)
+        or not question_ref
+        or not isinstance(content_ref, str)
+        or not content_ref
+        or not isinstance(content_hash, str)
+        or len(content_hash) != 64
+        or not isinstance(lifecycle_revision, int)
+        or isinstance(lifecycle_revision, bool)
+        or lifecycle_revision < 1
+    ):
+        raise OwnerConflict("companion_question_view_context_invalid")
+    if scope_ref != f"quest:{quest_ref}":
+        raise OwnerConflict("companion_question_view_context_stale")
+    try:
+        question = research_graph.query_question_by_ref(question_ref)
+    except OwnerConflict as error:
+        if error.code == "question_lifecycle_not_found":
+            raise OwnerConflict(
+                "companion_question_view_context_stale"
+            ) from error
+        raise
+    if question is None:
+        raise OwnerConflict("companion_question_view_context_stale")
+    try:
+        lifecycle = research_graph.query_question_lifecycle(question_ref)
+    except OwnerConflict as error:
+        if error.code == "question_lifecycle_not_found":
+            raise OwnerConflict(
+                "companion_question_view_context_stale"
+            ) from error
+        raise
+    if (
+        question.quest_ref != quest_ref
+        or question.content_ref != content_ref
+        or question.content_hash != content_hash
+        or lifecycle.get("status") != "active"
+        or lifecycle.get("revision") != lifecycle_revision
+    ):
+        raise OwnerConflict("companion_question_view_context_stale")
+    try:
+        content = research_memory.read_question_content(content_ref, content_hash)
+    except OwnerConflict as error:
+        if error.code == "question_content_not_found":
+            raise OwnerConflict(
+                "companion_question_view_context_stale"
+            ) from error
+        raise
+    if not isinstance(content, dict):
+        raise OwnerConflict("companion_question_view_context_stale")
+    exact_view_context = {
+        "kind": "question",
+        "quest_ref": quest_ref,
+        "question_ref": question_ref,
+        "content_ref": content_ref,
+        "content_hash": content_hash,
+        "lifecycle_revision": lifecycle_revision,
+    }
+    return {
+        "schema_ref": "meta-research/companion-context/v1",
+        "scope_ref": scope_ref,
+        "context_kind": "question",
+        "quest_ref": quest_ref,
+        "view_context": exact_view_context,
+        "question": {
+            "question_ref": question.question_ref,
+            "quest_ref": question.quest_ref,
+            "parent_question_ref": question.parent_question_ref,
+            "content_ref": question.content_ref,
+            "content_hash": question.content_hash,
+            "schema_ref": question.schema_ref,
+            "question_receipt_ref": question.receipt.receipt_ref,
+            "content_receipt_ref": question.content_receipt.receipt_ref,
+            "lifecycle_status": lifecycle["status"],
+            "lifecycle_revision": lifecycle["revision"],
+            "title": content.get("title"),
+            "unknown_statement": content.get("unknown_statement"),
+        },
+    }
 
 
 def _companion_human_request_context(

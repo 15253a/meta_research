@@ -58,48 +58,52 @@ async function acceptedRootQuestionRef(page: Page): Promise<string> {
   return root.question_ref;
 }
 
-test("ManualCreation matches the reviewed production baseline and fixed prototype", async (
-  { page },
-  testInfo,
-) => {
-  test.setTimeout(120_000);
-  if (!product) throw new Error("deterministic product missing");
-  await page.emulateMedia({ reducedMotion: "reduce" });
-  await page.setViewportSize(MANUAL_CREATION_FIXED_VIEWPORTS[0]);
-  await openAuthenticatedProduct(page, product);
-  const parentQuestionRef = await acceptedRootQuestionRef(page);
-  await page.goto(
-    `${product.baseUrl}/?variant=A&view=questions&node=${encodeURIComponent(parentQuestionRef)}&panel=create-question`,
-    { waitUntil: "domcontentloaded" },
-  );
-  const dialog = page.getByRole("dialog", { name: "创建后续研究问题" });
-  await expect(dialog).toBeVisible();
-  await expect(
-    dialog.getByRole("button", { name: "关闭创建 Question 窗口" }),
-  ).toBeFocused();
-  await expect(dialog.getByTestId("manual-confirmation-footer")).toContainText(
-    "描述",
-  );
+test(
+  "ManualCreation matches the reviewed production baseline and fixed prototype",
+  { tag: "@manual-creation-fixed-raster" },
+  async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    if (!product) throw new Error("deterministic product missing");
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.setViewportSize(MANUAL_CREATION_FIXED_VIEWPORTS[0]);
+    await openAuthenticatedProduct(page, product);
+    const parentQuestionRef = await acceptedRootQuestionRef(page);
+    await page.goto(
+      `${product.baseUrl}/?variant=A&view=questions&node=${encodeURIComponent(parentQuestionRef)}&panel=create-question`,
+      { waitUntil: "domcontentloaded" },
+    );
+    const dialog = page.getByRole("dialog", { name: "创建后续研究问题" });
+    await expect(dialog).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "历史", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      dialog.getByRole("button", { name: "关闭创建 Question 窗口" }),
+    ).toBeFocused();
+    await expect(dialog.getByTestId("manual-confirmation-footer")).toContainText(
+      "描述",
+    );
 
-  for (const viewport of MANUAL_CREATION_FIXED_VIEWPORTS) {
-    await page.setViewportSize(viewport);
-    await assertManualCreationFixedVisualState(page);
-    if (capturePending) {
-      const capture = await captureFixedProductionScreenshot(
-        page,
-        "create-question",
-        viewport,
-      );
-      const outputPath = testInfo.outputPath(
-        `reviewed-production-create-question-${viewport.width}.png`,
-      );
-      writeFileSync(outputPath, capture.bytes);
-      await testInfo.attach(
-        `pending-reviewed-production-create-question-${viewport.width}`,
-        { path: outputPath, contentType: "image/png" },
-      );
-    } else {
-      await attachManualCreationFixedVisual(page, testInfo, viewport);
+    for (const viewport of MANUAL_CREATION_FIXED_VIEWPORTS) {
+      await page.setViewportSize(viewport);
+      await assertManualCreationFixedVisualState(page);
+      if (capturePending) {
+        const capture = await captureFixedProductionScreenshot(
+          page,
+          "create-question",
+          viewport,
+        );
+        const outputPath = testInfo.outputPath(
+          `reviewed-production-create-question-${viewport.width}.png`,
+        );
+        writeFileSync(outputPath, capture.bytes);
+        await testInfo.attach(
+          `pending-reviewed-production-create-question-${viewport.width}`,
+          { path: outputPath, contentType: "image/png" },
+        );
+      } else {
+        await attachManualCreationFixedVisual(page, testInfo, viewport);
+      }
     }
-  }
-});
+  },
+);

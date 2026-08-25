@@ -219,7 +219,18 @@ export function QuestCompanion({
     setSending(true);
     setError(null);
     try {
-      await sendCompanionMessage(message, companion.scope_ref);
+      await sendCompanionMessage(
+        message,
+        companion.scope_ref,
+        questionContext ? {
+          kind: "question",
+          quest_ref: questionContext.quest_ref,
+          question_ref: questionContext.question_ref,
+          content_ref: questionContext.content_ref,
+          content_hash: questionContext.content_hash,
+          lifecycle_revision: questionContext.lifecycle_revision,
+        } : null,
+      );
       setDraft("");
       onChanged();
     } catch (caught) {

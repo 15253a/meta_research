@@ -16,7 +16,9 @@ from meta_research.experiment_contract import (
     ExperimentProviderUnavailable,
 )
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
+from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.paths import prepare_data_root
+from meta_research.projection import SnapshotConsistencyUnavailable
 from meta_research.web import create_app
 from test_idea_owner_integrity import (
     _admit_direct_idea_request,
@@ -38,6 +40,7 @@ from test_public_experiment_measurement import (
 )
 from test_public_manual_question_lifecycle import (
     DeterministicManualDeepFetchProvider,
+    QUESTION,
     _accept_root_question,
     _build_runtime as _manual_runtime,
     _confirm_waived_manual_question,
@@ -1881,6 +1884,153 @@ def test_prune_and_restore_are_rg_lifecycle_facts_not_question_deletion(
         assert runtime.projection.query_snapshot()["research_control"][
             "recovery_records"
         ] == []
+
+        evidence_asset = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="quest-level-evidence.txt",
+                content=b"quest-level evidence is not a Question association\n",
+            ),
+            idempotency_key="question-inspector-quest-evidence",
+        ).asset
+        assert evidence_asset is not None
+        quest_evidence_role = runtime.owners.research_graph.accept_asset_role(
+            binding=evidence_asset.as_binding(),
+            role="evidence",
+            quest_ref=completed["quest_ref"],
+            idempotency_key="question-inspector-quest-evidence-role",
+        )
+
+        # Wall-clock order is not lifecycle authority.  A clock rollback must
+        # not move RestoreRecord ahead of its committed PruneRecord.
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE rg_question_lifecycle_commands SET recorded_at = "
+                    "CASE action WHEN 'prune' THEN 200.0 ELSE 100.0 END WHERE "
+                    "question_ref = :question_ref"
+                ),
+                {"question_ref": child.question_ref},
+            )
+
+        revisions_before_reads = {
+            owner: getattr(runtime.owners, owner).query_snapshot().revision
+            for owner in (
+                "research_graph",
+                "research_memory",
+                "advancement_engine",
+                "agent_runtime",
+                "human_collaboration",
+            )
+        }
+        runtime.projection.query_question_history(child.question_ref)
+        runtime.projection.query_question_evidence(child.question_ref)
+        assert {
+            owner: getattr(runtime.owners, owner).query_snapshot().revision
+            for owner in revisions_before_reads
+        } == revisions_before_reads
+
+        graph = runtime.owners.research_graph
+        original_lifecycle_query = graph.query_question_lifecycle
+        graph.query_question_lifecycle = lambda question_ref: {
+            **original_lifecycle_query(question_ref),
+            "revision": 1,
+        }
+        try:
+            with pytest.raises(
+                SnapshotConsistencyUnavailable,
+                match="snapshot_consistency_unavailable",
+            ):
+                runtime.projection.query_question_history(child.question_ref)
+        finally:
+            graph.query_question_lifecycle = original_lifecycle_query
+
+        client, _headers = _authenticated_client(runtime)
+        with client:
+            history_response = client.get(
+                f"/api/v1/questions/{child.question_ref}/history"
+            )
+            assert history_response.status_code == 200
+            history = history_response.json()
+            assert history["status"] == "ready"
+            assert history["question"] == {
+                "question_ref": child.question_ref,
+                "quest_ref": completed["quest_ref"],
+                "parent_question_ref": root.question_ref,
+                "initialization_id": child.initialization_id,
+                "context_ref": child.context_ref,
+                "content": {
+                    "content_ref": child.content_ref,
+                    "content_hash": child.content_hash,
+                    "schema_ref": child.schema_ref,
+                    "document": QUESTION,
+                },
+                "receipts": {
+                    "content_acceptance": child.content_receipt.as_public_dict(),
+                    "question_acceptance": child.receipt.as_public_dict(),
+                    "confirmation_ref": child.confirmation_ref,
+                    "confirmation_hash": child.confirmation_hash,
+                },
+            }
+            assert history["lifecycle"]["status"] == "active"
+            assert history["lifecycle"]["revision"] == 3
+            assert [item["action"] for item in history["events"]] == [
+                "accepted",
+                "prune",
+                "restore",
+            ]
+            assert [item["recorded_at"] for item in history["events"]] == [
+                None,
+                200.0,
+                100.0,
+            ]
+            assert history["events"][1]["prune_record_ref"] == prune_record_ref
+            assert history["events"][1]["receipt_ref"] == owner_receipts[-1][
+                "receipt_ref"
+            ]
+            assert history["events"][2]["prune_record_ref"] == prune_record_ref
+            assert history["events"][2]["restore_record_ref"] is not None
+            assert history["events"][2]["receipt_ref"]
+
+            first_page = client.get(
+                f"/api/v1/questions/{child.question_ref}/history?limit=2"
+            ).json()
+            assert first_page["offset"] == 0
+            assert first_page["limit"] == 2
+            assert first_page["total_count"] == 3
+            assert first_page["has_more"] is True
+            assert [item["action"] for item in first_page["events"]] == [
+                "accepted",
+                "prune",
+            ]
+            final_page = client.get(
+                f"/api/v1/questions/{child.question_ref}/history?offset=2&limit=2"
+            ).json()
+            assert final_page["has_more"] is False
+            assert [item["action"] for item in final_page["events"]] == [
+                "restore"
+            ]
+
+            evidence_response = client.get(
+                f"/api/v1/questions/{child.question_ref}/evidence"
+            )
+            assert evidence_response.status_code == 200
+            evidence = evidence_response.json()
+            assert evidence == {
+                "status": "absent",
+                "question_ref": child.question_ref,
+                "quest_ref": completed["quest_ref"],
+                "binding": None,
+                "items": [],
+                "reason": {
+                    "code": "question_evidence_binding_absent",
+                    "quest_evidence_role_count": 1,
+                },
+            }
+            assert quest_evidence_role.version_ref not in {
+                item.get("version_ref") for item in evidence["items"]
+            }
     finally:
         runtime.close()
 

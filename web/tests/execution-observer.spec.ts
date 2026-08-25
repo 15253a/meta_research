@@ -536,6 +536,7 @@ test("current Fence auto-presents once, remains reopenable, and exposes honest o
 
   const observer = page.getByTestId("execution-observer");
   await expect(observer).toBeVisible();
+  await expect(observer).toHaveAttribute("data-freshness", "live");
   const autoClose = observer.getByRole("button", { name: "关闭当前实验观测窗" });
   await expect(autoClose).toBeFocused();
   await expect(observer).toHaveAttribute(
@@ -548,7 +549,6 @@ test("current Fence auto-presents once, remains reopenable, and exposes honest o
   await expect(observer.getByTestId("experiment-observer-layer-status")).toContainText(
     "execution running / asset not_attempted / Formal Measurement not_attempted",
   );
-  await expect(observer).toHaveAttribute("data-freshness", "live");
   await expect(observer.getByRole("log")).toContainText("state formation complete");
   await expect(observer.getByTestId("stdout-observation-mode")).toContainText(
     "raw_stdout · incomplete · not truncated · dropped 0",

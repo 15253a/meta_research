@@ -550,6 +550,81 @@ export type QuestionTreeProjection =
       items: [];
     };
 
+export type QuestionHistoryEvent = {
+  action: "accepted" | "prune" | "restore";
+  question_ref: string;
+  affected_question_refs: string[];
+  status: "active" | "pruned";
+  lifecycle_revision: number;
+  record_ref: string;
+  prune_record_ref: string | null;
+  restore_record_ref: string | null;
+  base_graph_version: number | null;
+  committed_graph_version: number | null;
+  receipt_ref: string;
+  receipt_hash: string;
+  recorded_at: number | null;
+};
+
+export type QuestionHistoryView = {
+  status: "ready" | "absent" | "unavailable";
+  question_ref: string;
+  question: null | {
+    question_ref: string;
+    quest_ref: string;
+    parent_question_ref: string | null;
+    initialization_id: string;
+    context_ref: string | null;
+    content: {
+      content_ref: string;
+      content_hash: string;
+      schema_ref: string;
+      document: QuestionContent;
+    };
+    receipts: {
+      content_acceptance: AssetReceipt;
+      question_acceptance: AssetReceipt;
+      confirmation_ref: string;
+      confirmation_hash: string | null;
+    };
+  };
+  lifecycle: null | {
+    question_ref: string;
+    quest_ref: string;
+    status: "active" | "pruned";
+    revision: number;
+    owner_revision: number;
+    updated_at: number;
+  };
+  events: QuestionHistoryEvent[];
+  offset: number;
+  limit: number;
+  total_count: number;
+  has_more: boolean;
+  reason: { code: string } | null;
+};
+
+export type QuestionEvidenceView = {
+  status: "ready" | "absent" | "unavailable";
+  question_ref: string;
+  quest_ref: string | null;
+  binding: null | {
+    cycle_ref: string;
+    request_ref: string;
+    context_pack_ref: string;
+    context_pack_hash: string;
+    evidence_reference_revision: number;
+    question_receipt_ref: string;
+    question_receipt_hash: string;
+  };
+  items: Array<{
+    evidence_ref: string;
+    role: ResearchAssetRole;
+    asset: ResearchAssetItem;
+  }>;
+  reason: ({ code: string; quest_evidence_role_count?: number }) | null;
+};
+
 export type ManualQuestionCreationCapability =
   | {
       status: "ready";
@@ -1968,6 +2043,15 @@ export function adaptManualQuestionCreation(
     failure: failure ? { code: failure.code } : null,
   };
 }
+export type CompanionQuestionViewContext = {
+  kind: "question";
+  quest_ref: string;
+  question_ref: string;
+  content_ref: string;
+  content_hash: string;
+  lifecycle_revision: number;
+};
+
 export type CompanionMessage = {
   message_ref?: string;
   scope_ref?: string | null;
@@ -1978,6 +2062,7 @@ export type CompanionMessage = {
   status?: "queued" | "processing" | "running" | "completed" | "failed";
   created_at?: number;
   reason?: { code?: string } | null;
+  view_context?: CompanionQuestionViewContext | null;
 };
 
 export type CompanionSoftConstraint = {
@@ -2330,6 +2415,30 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
     throw new ProductError(`snapshot_unavailable:${response.status}`);
   }
   return (await response.json()) as PublicSnapshot;
+}
+
+export function fetchQuestionHistory(
+  questionRef: string,
+  options: { offset?: number; limit?: number; signal?: AbortSignal } = {},
+): Promise<QuestionHistoryView> {
+  const query = new URLSearchParams({
+    offset: String(options.offset ?? 0),
+    limit: String(options.limit ?? 50),
+  });
+  return readJson(
+    `/api/v1/questions/${encodeURIComponent(questionRef)}/history?${query}`,
+    options.signal,
+  );
+}
+
+export function fetchQuestionEvidence(
+  questionRef: string,
+  signal?: AbortSignal,
+): Promise<QuestionEvidenceView> {
+  return readJson(
+    `/api/v1/questions/${encodeURIComponent(questionRef)}/evidence`,
+    signal,
+  );
 }
 
 export function fetchCurrentAutonomousCreation(
@@ -2767,10 +2876,12 @@ export function cancelManualQuestionCreation(
 export function sendCompanionMessage(
   message: string,
   scopeRef?: string | null,
+  viewContext?: CompanionQuestionViewContext | null,
 ): Promise<Record<string, unknown>> {
   return writeJson("/api/v1/companion/messages", "POST", {
     ...(scopeRef ? { scope_ref: scopeRef } : {}),
     message,
+    ...(viewContext ? { view_context: viewContext } : {}),
   });
 }
 
