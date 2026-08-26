@@ -13,7 +13,7 @@ import {
 } from "./fixed-reference.js";
 
 const FIXED_REFERENCE_MANIFEST_SHA256 =
-  "bf5fcca85188fca3a2df02ff1db92be2275828c4b162cd62e6e76d88fa4d5d2b";
+  "c6e789da1dc116dd07c39d8b18a8ee50e9361a902e9421895e9ad0b27ed2ff98";
 
 type FixedReferenceManifest = {
   references: Record<

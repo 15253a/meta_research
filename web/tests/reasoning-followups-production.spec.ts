@@ -28,9 +28,9 @@ async function createAcceptedQuestThroughWeb(
   options: { deepfetch: boolean } = { deepfetch: false },
 ): Promise<void> {
   const dialog = await openCreation(page);
-  const goal = dialog.getByLabel("这个 Quest 最终要完成什么？");
+  const goal = dialog.getByRole("textbox", { name: "目标", exact: true });
   await goal.fill("判断低照度显微图像去噪能否保留稀有形态");
-  await dialog.getByLabel("什么情况算完成？").fill(
+  await dialog.getByRole("textbox", { name: "边界", exact: true }).fill(
     "形成带反例、证据边界和可执行后继的比较结论",
   );
   await goal.blur();

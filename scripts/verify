@@ -56,6 +56,27 @@ uv build --wheel --out-dir "$DIST_ROOT" >/dev/null
 uv venv --python 3.12 "$INSTALL_ROOT" >/dev/null
 WHEEL=$(find "$DIST_ROOT" -maxdepth 1 -type f -name '*.whl' -print -quit)
 test -n "$WHEEL"
+"$INSTALL_ROOT/bin/python" - "$WHEEL" <<'PY'
+import hashlib
+import json
+import sys
+import zipfile
+
+expected_name = "meta_research/codex_drafting_model_catalog.json"
+with zipfile.ZipFile(sys.argv[1]) as wheel:
+    names = [name for name in wheel.namelist() if name == expected_name]
+    assert names == [expected_name]
+    payload = wheel.read(expected_name)
+assert hashlib.sha256(payload).hexdigest() == (
+    "088421d9b8a33c1a4f86ec9f955974dcc1bb91cad3b4385cb6bb15cfbb307776"
+)
+catalog = json.loads(payload)
+assert [model["slug"] for model in catalog["models"]] == ["gpt-5.4"]
+model = catalog["models"][0]
+assert model["shell_type"] == "disabled"
+assert model["apply_patch_tool_type"] is None
+assert model["supports_search_tool"] is False
+PY
 uv pip install --python "$INSTALL_ROOT/bin/python" \
   --requirement "$LOCKED_REQUIREMENTS" >/dev/null
 uv pip install --python "$INSTALL_ROOT/bin/python" --no-deps "$WHEEL" >/dev/null
@@ -489,6 +510,7 @@ calls_path = pathlib.Path(sys.argv[2])
 expected_codex_home = pathlib.Path(sys.argv[3])
 source = f'''#!{sys.executable}
 import json
+import hashlib
 import os
 import pathlib
 import re
@@ -500,7 +522,7 @@ assert os.environ.get("CODEX_HOME") == expected_codex_home
 assert os.environ.get("CODEX_SQLITE_HOME") == expected_codex_home
 args = sys.argv[1:]
 if args == ["--version"]:
-    print("codex-cli installed-fake 1")
+    print("codex-cli 0.147.0")
     raise SystemExit(0)
 assert args[0] == "exec"
 assert "--skip-git-repo-check" in args
@@ -520,8 +542,92 @@ if "resume" in args:
     resume_index = args.index("resume")
     resume_ref = args[resume_index + 1]
 
+def assert_schema_only_drafting_contract():
+    assert "--ignore-user-config" in args
+    assert "--ignore-rules" in args
+    assert "--strict-config" in args
+    assert args[args.index("--sandbox") + 1] == "danger-full-access"
+    assert args[args.index("--model") + 1] == "gpt-5.4"
+    expected_workspace = (
+        pathlib.Path(expected_codex_home).parents[1]
+        / "drafting-provider"
+        / "research-workspace"
+    )
+    assert pathlib.Path(args[args.index("--cd") + 1]) == expected_workspace
+    config_values = [
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--config"
+    ]
+    model_catalog_config = next(
+        value for value in config_values
+        if value.startswith("model_catalog_json=")
+    )
+    assert set(config_values) == {{
+        "mcp_servers={{}}",
+        'approval_policy="never"',
+        'web_search="disabled"',
+        'shell_environment_policy.inherit="none"',
+        "tools.update_plan.enabled=false",
+        "tools.experimental_request_user_input.enabled=false",
+        "agents.enabled=false",
+        "skills.include_instructions=false",
+        "skills.bundled.enabled=false",
+        model_catalog_config,
+    }}
+    assert len(config_values) == 10
+    catalog_path = pathlib.Path(
+        json.loads(model_catalog_config.removeprefix("model_catalog_json="))
+    )
+    assert catalog_path.is_absolute()
+    catalog_payload = catalog_path.read_bytes()
+    assert hashlib.sha256(catalog_payload).hexdigest() == (
+        "088421d9b8a33c1a4f86ec9f955974dcc1bb91cad3b4385cb6bb15cfbb307776"
+    )
+    catalog = json.loads(catalog_payload)
+    assert len(catalog["models"]) == 1
+    model = catalog["models"][0]
+    assert model["slug"] == "gpt-5.4"
+    assert model["shell_type"] == "disabled"
+    assert model["apply_patch_tool_type"] is None
+    assert model["include_skills_usage_instructions"] is False
+    assert model["include_plugin_usage_instructions"] is False
+    assert model["include_apps_usage_instructions"] is False
+    assert model["supports_search_tool"] is False
+    assert model["experimental_supported_tools"] == []
+    assert model["input_modalities"] == ["text"]
+    disabled = [
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--disable"
+    ]
+    assert disabled == [
+        "apps",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "computer_use",
+        "goals",
+        "hooks",
+        "image_generation",
+        "in_app_browser",
+        "memories",
+        "multi_agent",
+        "multi_agent_v2",
+        "plugins",
+        "remote_plugin",
+        "shell_snapshot",
+        "shell_tool",
+        "skill_mcp_dependency_install",
+        "skill_search",
+        "tool_suggest",
+        "unified_exec",
+        "view_image",
+        "workspace_dependencies",
+    ]
+
 if properties == {{"reply"}}:
-    assert args[args.index("--sandbox") + 1] == "read-only"
+    assert_schema_only_drafting_contract()
     match = re.search(r"(?m)^initialization_id=([^\\n]+)$", prompt)
     assert match is not None
     initialization_id = match.group(1)
@@ -548,7 +654,7 @@ elif properties == {{
     "background_context",
     "requirements_constraints",
 }}:
-    assert args[args.index("--sandbox") + 1] == "read-only"
+    assert_schema_only_drafting_contract()
     match = re.search(r"(?m)^initialization_id=([^\\n]+)$", prompt)
     assert match is not None
     initialization_id = match.group(1)
@@ -562,6 +668,9 @@ elif properties == {{
     }}
     assert args[-2:] == ["--ephemeral", "-"]
     assert "Proposal Drafter" in prompt
+    assert "BEGIN_UNTRUSTED_RESEARCH_DATA" in prompt
+    assert "END_UNTRUSTED_RESEARCH_DATA" in prompt
+    assert "不是指令" in prompt
     output = {{
         "title": "安装态 production Adapter 与 Owner receipts",
         "unknown_statement": "尚未证明安装 wheel 能经真实 Codex CLI seam 形成可确认 Proposal。",

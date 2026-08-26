@@ -129,6 +129,10 @@ AUTONOMOUS_QUESTION_PROPOSAL_SCHEMA = AUTONOMOUS_QUESTION_PROPOSAL_SCHEMA_REF
 REUSE_SOURCE_VERSION_RECEIPT_KIND = "reuse_source_version_verified"
 IMPLEMENTATION_CONTENT_RECEIPT_KIND = "implementation_revision_content_accepted"
 LITERATURE_SNAPSHOT_RECEIPT_KIND = "literature_snapshot_acceptance"
+PROPOSAL_LITERATURE_EVIDENCE_SCHEMA = (
+    "meta-research/proposal-literature-evidence/v1"
+)
+PROPOSAL_LITERATURE_EVIDENCE_MAX_BYTES = 192 * 1024
 ASSET_RECEIPT_KIND = "asset_acceptance"
 ASSET_CUSTODY_ESTABLISHED_RECEIPT_KIND = "asset_custody_established"
 ASSET_CUSTODY_LOCATOR_MIGRATED_RECEIPT_KIND = (
@@ -1183,6 +1187,10 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     ) -> None: ...
 
     def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]: ...
+
+    def read_literature_proposal_evidence(
+        self, snapshot_ref: str
+    ) -> dict[str, object]: ...
 
     def ensure_question_literature_revision(
         self,
@@ -8545,6 +8553,24 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             "web_evidence": web_evidence,
         }
 
+    def read_literature_proposal_evidence(
+        self, snapshot_ref: str
+    ) -> dict[str, object]:
+        """Project one exact accepted Snapshot without provider-facing full text."""
+
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_literature_snapshots WHERE "
+                    "snapshot_ref = :snapshot_ref"
+                ),
+                {"snapshot_ref": snapshot_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("literature_snapshot_not_found")
+        snapshot = self.read_literature_snapshot(snapshot_ref)
+        return _proposal_literature_evidence(row, snapshot)
+
     def ensure_question_literature_revision(
         self,
         *,
@@ -9067,6 +9093,211 @@ def _validated_stored_papers_document(
             raise OwnerConflict("literature_snapshot_invalid")
         return _validated_v4_ledger(value.get("ledger"), expected_count=len(display))
     raise OwnerConflict("literature_snapshot_invalid")
+
+
+def _proposal_literature_evidence(
+    row: object, snapshot: dict[str, object]
+) -> dict[str, object]:
+    """Return deterministic untrusted research data under an exact RM binding."""
+
+    summary = snapshot.get("summary")
+    papers = snapshot.get("papers")
+    raw_ledger = snapshot.get("papers_ledger")
+    raw_fulltexts = snapshot.get("fulltexts")
+    limitations = snapshot.get("limitations")
+    raw_web_evidence = snapshot.get("web_evidence")
+    receipt = snapshot.get("receipt")
+    if (
+        not isinstance(summary, str)
+        or not isinstance(papers, list)
+        or raw_ledger is not None
+        and not isinstance(raw_ledger, dict)
+        or not isinstance(raw_fulltexts, list)
+        or not isinstance(limitations, list)
+        or any(not isinstance(value, str) for value in limitations)
+        or raw_web_evidence is not None
+        and not isinstance(raw_web_evidence, dict)
+        or not isinstance(receipt, dict)
+    ):
+        raise OwnerConflict("literature_snapshot_invalid")
+
+    binding: dict[str, object] = {
+        "schema_ref": "meta-research/literature-snapshot/v1",
+        "snapshot_ref": getattr(row, "snapshot_ref"),
+        "request_ref": getattr(row, "request_ref"),
+        "initialization_id": getattr(row, "initialization_id"),
+        "draft_revision": int(getattr(row, "draft_revision")),
+        "draft_hash": getattr(row, "draft_hash"),
+        "scope_hash": getattr(row, "scope_hash"),
+        "run_ref": getattr(row, "run_ref"),
+        "attempt_ref": getattr(row, "attempt_ref"),
+        "fence_ref": getattr(row, "fence_ref"),
+        "result_hash": getattr(row, "result_hash"),
+        "completion": getattr(row, "completion"),
+        "summary_ref": getattr(row, "summary_ref"),
+        "summary_hash": getattr(row, "summary_hash"),
+        "papers_ref": getattr(row, "papers_ref"),
+        "papers_hash": getattr(row, "papers_hash"),
+        "fulltexts_ref": getattr(row, "fulltexts_ref"),
+        "fulltexts_hash": getattr(row, "fulltexts_hash"),
+        "limitations_hash": getattr(row, "limitations_hash"),
+        "web_evidence_hash": getattr(row, "web_evidence_hash"),
+    }
+    creation_context_kind = getattr(row, "creation_context_kind")
+    if creation_context_kind in {
+        "manual_question_creation",
+        "autonomous_question_creation",
+    }:
+        binding.update(
+            {
+                "creation_context_kind": creation_context_kind,
+                "creation_context_ref": getattr(row, "creation_context_ref"),
+                "quest_ref": getattr(row, "quest_ref"),
+            }
+        )
+        if creation_context_kind == "autonomous_question_creation":
+            binding.update(
+                {
+                    "context_generation": int(
+                        getattr(row, "context_generation")
+                    ),
+                    "context_basis_hash": getattr(row, "context_basis_hash"),
+                }
+            )
+    snapshot_hash = getattr(row, "snapshot_hash")
+    if (
+        snapshot.get("snapshot_ref") != getattr(row, "snapshot_ref")
+        or snapshot.get("snapshot_hash") != snapshot_hash
+        or canonical_hash(binding) != snapshot_hash
+    ):
+        raise OwnerConflict("literature_snapshot_invalid")
+
+    projected_ledger: dict[str, object] | None = None
+    if raw_ledger is not None:
+        projected_ledger = cast(
+            dict[str, object], json.loads(canonical_json(raw_ledger))
+        )
+        ledger_papers = projected_ledger.get("papers")
+        if not isinstance(ledger_papers, dict):
+            raise OwnerConflict("literature_snapshot_invalid")
+        for record in ledger_papers.values():
+            if not isinstance(record, dict) or "fulltext_path" not in record:
+                raise OwnerConflict("literature_snapshot_invalid")
+            record.pop("fulltext_path")
+
+    fulltexts: list[dict[str, object]] = []
+    for raw_fulltext in raw_fulltexts:
+        if not isinstance(raw_fulltext, dict) or set(raw_fulltext) != {
+            "paper_url",
+            "media_type",
+            "content",
+            "content_hash",
+        }:
+            raise OwnerConflict("literature_snapshot_invalid")
+        descriptor = {
+            "paper_url": raw_fulltext.get("paper_url"),
+            "media_type": raw_fulltext.get("media_type"),
+            "content_hash": raw_fulltext.get("content_hash"),
+        }
+        if (
+            not isinstance(descriptor["paper_url"], str)
+            or not descriptor["paper_url"]
+            or not isinstance(descriptor["media_type"], str)
+            or not descriptor["media_type"]
+            or not isinstance(descriptor["content_hash"], str)
+            or len(cast(str, descriptor["content_hash"])) != 64
+        ):
+            raise OwnerConflict("literature_snapshot_invalid")
+        fulltexts.append(descriptor)
+
+    web_evidence = (
+        None
+        if raw_web_evidence is None
+        else cast(
+            dict[str, object], json.loads(canonical_json(raw_web_evidence))
+        )
+    )
+    if web_evidence is not None and "prototype" in web_evidence:
+        prototype = web_evidence.get("prototype")
+        if not isinstance(prototype, dict):
+            raise OwnerConflict("literature_snapshot_invalid")
+        files = prototype.get("fulltext_files")
+        if not isinstance(files, list):
+            raise OwnerConflict("literature_snapshot_invalid")
+        compact_files: list[dict[str, object]] = []
+        for file_proof in files:
+            if not isinstance(file_proof, dict) or set(file_proof) != {
+                "path",
+                "sha256",
+                "bytes",
+            }:
+                raise OwnerConflict("literature_snapshot_invalid")
+            path = file_proof.get("path")
+            sha256 = file_proof.get("sha256")
+            byte_count = file_proof.get("bytes")
+            if (
+                not isinstance(path, str)
+                or not path
+                or not isinstance(sha256, str)
+                or len(sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in sha256
+                )
+                or not isinstance(byte_count, int)
+                or isinstance(byte_count, bool)
+                or byte_count < 0
+            ):
+                raise OwnerConflict("literature_snapshot_invalid")
+            compact_files.append(
+                {
+                    "sha256": sha256,
+                    "bytes": byte_count,
+                }
+            )
+        prototype["fulltext_files"] = compact_files
+
+    source_snapshot = {
+        "snapshot_ref": getattr(row, "snapshot_ref"),
+        "snapshot_hash": snapshot_hash,
+        "binding": binding,
+        "receipt": dict(receipt),
+        "execution_receipt": AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind=DEEPFETCH_EXECUTION_RECEIPT_KIND,
+            receipt_ref=getattr(row, "execution_receipt_ref"),
+            subject_ref=getattr(row, "run_ref"),
+            payload_hash=getattr(row, "execution_receipt_hash"),
+        ).as_public_dict(),
+    }
+    payload: dict[str, object] = {
+        "schema_ref": PROPOSAL_LITERATURE_EVIDENCE_SCHEMA,
+        "content_trust": "untrusted_research_data",
+        "source_snapshot": source_snapshot,
+        "completion": snapshot.get("completion"),
+        "summary": summary,
+        "papers": papers,
+        "papers_ledger": projected_ledger,
+        "fulltexts": fulltexts,
+        "limitations": limitations,
+        "web_evidence": web_evidence,
+        "provider_input_policy": {
+            "schema_ref": "meta-research/proposal-evidence-input-policy/v1",
+            "fulltext_bodies": "omitted",
+            "local_custody_locators": "omitted",
+            "truncation": "forbidden",
+        },
+    }
+    projection = {
+        **payload,
+        "projection_hash": canonical_hash(payload),
+    }
+    if (
+        len(canonical_json(projection).encode("utf-8"))
+        > PROPOSAL_LITERATURE_EVIDENCE_MAX_BYTES
+    ):
+        raise OwnerConflict("codex_proposal_evidence_too_large")
+    return projection
 
 
 def _validated_v4_ledger(value: object, *, expected_count: int) -> int:

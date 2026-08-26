@@ -1,9 +1,11 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 
 import {
   DeterministicProduct,
   openAuthenticatedProduct,
 } from "./support/deterministic-product.js";
+
+type JsonRecord = Record<string, unknown>;
 
 
 let product: DeterministicProduct | undefined;
@@ -90,25 +92,179 @@ test("Research Asset is a real responsive intake, inventory, and receipt surface
   await expect(opener).toBeFocused();
 });
 
-test("Quest creation selects an exact accepted version instead of a raw browser path", async ({
+test("an over-capacity Quest material selection is rejected as one batch before intake", async ({
   page,
 }) => {
   if (!product) throw new Error("deterministic product missing");
   await openAuthenticatedProduct(page, product);
-  await acceptTextAsset(page, "quest-source.md", "exact Quest source material\n");
+
+  let intakePosts = 0;
+  await page.route("**/api/v1/research-assets/intakes", async (route) => {
+    intakePosts += 1;
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "capacity test must not submit" }),
+    });
+  });
+  await page.getByRole("button", { name: "创建 Quest" }).click();
+  const quest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  const materials = quest.locator("[data-journey-section='materials']");
+  await materials.getByLabel("上传研究材料文件", { exact: true }).setInputFiles(
+    Array.from({ length: 101 }, (_, index) => ({
+      name: `capacity-${String(index).padStart(3, "0")}.txt`,
+      mimeType: "text/plain",
+      buffer: Buffer.from(`capacity ${index}\n`),
+    })),
+  );
+
+  const alert = quest.getByRole("alert");
+  await expect(alert).toContainText("quest_material_limit_exceeded");
+  await expect(alert).toContainText("剩余 100 个");
+  expect(intakePosts).toBe(0);
+  await expect(materials.locator(".quest-material-status")).toHaveCount(0);
+  await expect(quest.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
+});
+
+test("pending uploads reserve all Quest material slots across repeat selection and picker append", async ({
+  page,
+}) => {
+  if (!product) throw new Error("deterministic product missing");
+  await openAuthenticatedProduct(page, product);
+  await acceptTextAsset(page, "slot-picker.md", "accepted picker slot\n");
+
+  let intakePosts = 0;
+  let releaseFirstPost!: () => void;
+  const firstPostGate = new Promise<void>((resolve) => {
+    releaseFirstPost = resolve;
+  });
+  const holdFirstPost = async (route: Route) => {
+    intakePosts += 1;
+    await firstPostGate;
+    try {
+      await route.abort("failed");
+    } catch {
+      // The renderer is deliberately gone before the held request is released.
+    }
+  };
+  await page.route("**/api/v1/research-assets/intakes", holdFirstPost);
+
+  await page.getByRole("button", { name: "创建 Quest" }).click();
+  const quest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  const materials = quest.locator("[data-journey-section='materials']");
+  const input = materials.getByLabel("上传研究材料文件", { exact: true });
+  try {
+    await input.setInputFiles(Array.from({ length: 100 }, (_, index) => ({
+      name: `reserved-${String(index).padStart(3, "0")}.txt`,
+      mimeType: "text/plain",
+      buffer: Buffer.from(`reserved ${index}\n`),
+    })));
+    await expect.poll(() => intakePosts).toBe(1);
+    await expect(materials.locator(".quest-material-status")).toHaveCount(100);
+
+    await input.setInputFiles({
+      name: "repeat-overflow.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("must be rejected before read or POST\n"),
+    });
+    const alert = quest.getByRole("alert");
+    await expect(alert).toContainText("quest_material_limit_exceeded");
+    await expect(alert).toContainText("剩余 0 个");
+    expect(intakePosts).toBe(1);
+    await expect(materials.locator(".quest-material-status")).toHaveCount(100);
+
+    await materials.getByText("从已有材料中选择", { exact: true }).click();
+    const pickerAsset = materials.getByRole("group", {
+      name: "选择已接纳 Research Asset",
+    }).getByRole("button").filter({ hasText: "slot-picker.md" });
+    await expect(pickerAsset).toHaveAttribute("aria-pressed", "false");
+    await pickerAsset.click();
+    await expect(pickerAsset).toHaveAttribute("aria-pressed", "false");
+    await expect(alert).toContainText("剩余 0 个");
+    expect(intakePosts).toBe(1);
+    await expect(quest.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
+  } finally {
+    await page.goto("about:blank");
+    releaseFirstPost();
+    await page.unroute("**/api/v1/research-assets/intakes", holdFirstPost);
+  }
+});
+
+test("Quest creation resumes a queued material after its POST ACK and renderer restart", async ({
+  page,
+}) => {
+  if (!product) throw new Error("deterministic product missing");
+  await openAuthenticatedProduct(page, product);
 
   await page.getByRole("button", { name: "创建 Quest" }).click();
   const quest = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" });
   await expect(quest).toBeVisible();
-  await quest.getByText("补充范围、排除项与已有材料", { exact: true }).click();
-  const selectFile = quest.getByRole("button", { name: "选择文件", exact: true });
-  await expect(selectFile).toBeEnabled();
-  await selectFile.click();
-  const picker = quest.getByRole("group", { name: "选择已接纳 Research Asset" });
-  const accepted = picker.getByRole("button").filter({ hasText: "quest-source.md" });
-  await accepted.click();
-  await expect(accepted).toHaveAttribute("aria-pressed", "true");
-  await quest.getByLabel("文献搜索范围").selectOption("provided_only");
+  const materials = quest.locator("[data-journey-section='materials']");
+  let releaseIntakePoll!: () => void;
+  const intakePollGate = new Promise<void>((resolve) => {
+    releaseIntakePoll = resolve;
+  });
+  await page.route("**/api/v1/research-assets/intakes/*", async (route) => {
+    await intakePollGate;
+    await route.fallback();
+  });
+  await page.route("**/api/v1/research-assets/intakes", async (route) => {
+    const response = await route.fetch();
+    const result = await response.json() as JsonRecord;
+    await route.fulfill({
+      response,
+      json: { ...result, status: "queued", asset: null },
+    });
+  });
+  await materials.getByLabel("上传研究材料文件", { exact: true }).setInputFiles({
+    name: "quest-source.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from("exact Quest source material\n"),
+  });
+
+  // Research Memory acceptance is independent background work. The formal
+  // Quest form remains usable while that work settles.
+  await expect(quest.getByRole("textbox", { name: "目标", exact: true })).toBeEnabled();
+  await expect(quest.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
+  await expect(materials.getByText("quest-source.md", { exact: true })).toBeVisible();
+  await expect(materials).toContainText("后台处理中；你可以继续填写");
+  await expect.poll(async () => page.evaluate(() => Object.keys(sessionStorage).filter(
+    (key) => key.startsWith(
+      "meta_research_pending_asset_intake:v2:quest_creation:",
+    ),
+  ).length)).toBe(1);
+  expect(await page.evaluate(() => sessionStorage.getItem(
+    "meta_research_pending_asset_intake",
+  ))).toBeNull();
+  await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(1);
+
+  // The POST was acknowledged with a real queued job. IndexedDB, rather than
+  // the tab-scoped locator, must retain enough information to resume polling
+  // after the renderer disappears.
+  await page.evaluate(() => sessionStorage.clear());
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const resumedQuest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  await expect(resumedQuest).toBeVisible();
+  await expect(
+    resumedQuest.locator("[data-journey-section='materials']")
+      .locator(".quest-material-status")
+      .getByText("quest-source.md", { exact: true }),
+  ).toBeVisible();
+
+  releaseIntakePoll();
+  await page.unroute("**/api/v1/research-assets/intakes/*");
+  await page.unroute("**/api/v1/research-assets/intakes");
+  const acceptedMaterial = resumedQuest.locator("[data-journey-section='materials']")
+    .locator(".quest-material-status.accepted");
+  await expect(acceptedMaterial.getByText("quest-source.md", { exact: true })).toBeVisible();
+  await expect(acceptedMaterial.getByText("已加入本次 Quest", { exact: true })).toBeVisible();
+  await resumedQuest.getByLabel("文献搜索范围").selectOption("provided_only");
 
   await expect.poll(async () => {
     const response = await page.request.get(`${product?.baseUrl}/api/v1/quest-initializations/current`);
@@ -133,17 +289,658 @@ test("Quest creation selects an exact accepted version instead of a raw browser 
     }),
   ]);
 
+  await expect.poll(async () => page.evaluate(() => Object.keys(sessionStorage).filter(
+    (key) => key.startsWith(
+      "meta_research_pending_asset_intake:v2:quest_creation:",
+    ),
+  ).length)).toBe(0);
+  await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(0);
+
+  // Binding acknowledgement removes the durable job descriptor. A second
+  // renderer restart keeps the accepted binding but must not poll or bind the
+  // already-completed job again.
+  await page.evaluate(() => sessionStorage.clear());
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const acknowledgedQuest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  await expect(acknowledgedQuest).toBeVisible();
+  await expect(
+    acknowledgedQuest.locator("[data-journey-section='materials']")
+      .locator(".quest-material-status.accepted")
+      .getByText("quest-source.md", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    acknowledgedQuest.locator("[data-journey-section='materials']")
+      .locator(".quest-material-status.accepted")
+      .getByText("已加入本次 Quest", { exact: true }),
+  ).toBeVisible();
+  expect(await scopedAssetIntakeRecoveryCount(page)).toBe(0);
+});
+
+test("each selected Quest material reaches a durable POST ACK before earlier polling settles", async ({
+  page,
+}) => {
+  if (!product) throw new Error("deterministic product missing");
+  await openAuthenticatedProduct(page, product);
+
+  const submittedNames: string[] = [];
+  const jobRefs: string[] = [];
+  let releasePolls!: () => void;
+  const pollGate = new Promise<void>((resolve) => {
+    releasePolls = resolve;
+  });
+  const holdPolls = async (route: Route) => {
+    await pollGate;
+    await route.fallback();
+  };
+  const recordQueuedAck = async (route: Route) => {
+    const request = route.request().postDataJSON() as { display_name?: string };
+    const response = await route.fetch();
+    const result = await response.json() as JsonRecord;
+    submittedNames.push(String(request.display_name ?? ""));
+    jobRefs.push(String(result.job_ref ?? ""));
+    await route.fulfill({
+      response,
+      json: { ...result, status: "queued", asset: null },
+    });
+  };
+  await page.route("**/api/v1/research-assets/intakes/*", holdPolls);
+  await page.route("**/api/v1/research-assets/intakes", recordQueuedAck);
+
+  await page.getByRole("button", { name: "创建 Quest" }).click();
+  const quest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  const materials = quest.locator("[data-journey-section='materials']");
+  try {
+    await materials.getByLabel("上传研究材料文件", { exact: true }).setInputFiles([
+      {
+        name: "queued-first.md",
+        mimeType: "text/markdown",
+        buffer: Buffer.from("first durable queued material\n"),
+      },
+      {
+        name: "queued-second.md",
+        mimeType: "text/markdown",
+        buffer: Buffer.from("second durable queued material\n"),
+      },
+    ]);
+
+    await expect.poll(() => submittedNames).toEqual([
+      "queued-first.md",
+      "queued-second.md",
+    ]);
+    expect(new Set(jobRefs).size).toBe(2);
+    expect(jobRefs.every(Boolean)).toBe(true);
+    await expect.poll(async () => page.evaluate(() => {
+      const slot = Object.keys(sessionStorage).find((key) => key.startsWith(
+        "meta_research_pending_asset_intake:v2:quest_creation:",
+      ));
+      if (!slot) return [];
+      const parsed = JSON.parse(sessionStorage.getItem(slot) ?? "[]") as Array<{
+        job_ref?: string;
+      }>;
+      return parsed.map((pointer) => pointer.job_ref).sort();
+    })).toEqual([...jobRefs].sort());
+    await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(2);
+    await expect(materials).toContainText("queued-first.md");
+    await expect(materials).toContainText("queued-second.md");
+  } finally {
+    releasePolls();
+    await page.unroute("**/api/v1/research-assets/intakes/*", holdPolls);
+    await page.unroute("**/api/v1/research-assets/intakes", recordQueuedAck);
+  }
+
+  await expect(materials.locator(".quest-material-status.accepted")).toHaveCount(2, {
+    timeout: 15_000,
+  });
+  await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(0);
+});
+
+test("each recovered Quest material starts settlement before an earlier recovered poll finishes", async ({
+  page,
+}) => {
+  if (!product) throw new Error("deterministic product missing");
+  await openAuthenticatedProduct(page, product);
+
+  const jobRefs: string[] = [];
+  let recoveryPhase = false;
+  const recoveryGets = new Map<string, number>();
+  let firstPollHeld = false;
+  let releaseFirstPoll!: () => void;
+  const firstPollGate = new Promise<void>((resolve) => {
+    releaseFirstPoll = resolve;
+  });
+  const queueEveryPostAck = async (route: Route) => {
+    const response = await route.fetch();
+    const result = await response.json() as JsonRecord;
+    jobRefs.push(String(result.job_ref ?? ""));
+    await route.fulfill({
+      response,
+      json: { ...result, status: "queued", asset: null },
+    });
+  };
+  const controlRecoveryPolls = async (route: Route) => {
+    const jobRef = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-1) ?? "");
+    if (!recoveryPhase) {
+      const response = await route.fetch();
+      const result = await response.json() as JsonRecord;
+      await route.fulfill({
+        response,
+        json: { ...result, status: "queued", asset: null },
+      });
+      return;
+    }
+    const count = (recoveryGets.get(jobRef) ?? 0) + 1;
+    recoveryGets.set(jobRef, count);
+    if (jobRef === jobRefs[0]) {
+      if (count === 1) {
+        const response = await route.fetch();
+        const result = await response.json() as JsonRecord;
+        await route.fulfill({
+          response,
+          json: { ...result, status: "queued", asset: null },
+        });
+        return;
+      }
+      firstPollHeld = true;
+      await firstPollGate;
+    }
+    await route.fallback();
+  };
+  await page.route("**/api/v1/research-assets/intakes/*", controlRecoveryPolls);
+  await page.route("**/api/v1/research-assets/intakes", queueEveryPostAck);
+
+  await page.getByRole("button", { name: "创建 Quest" }).click();
+  const quest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  await quest.locator("[data-journey-section='materials']")
+    .getByLabel("上传研究材料文件", { exact: true })
+    .setInputFiles([
+      {
+        name: "recovery-first.md",
+        mimeType: "text/markdown",
+        buffer: Buffer.from("first recovered material\n"),
+      },
+      {
+        name: "recovery-second.md",
+        mimeType: "text/markdown",
+        buffer: Buffer.from("second recovered material\n"),
+      },
+    ]);
+  await expect.poll(() => jobRefs.length).toBe(2);
+  await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(2);
+
+  const questUrl = page.url();
+  await page.evaluate(() => sessionStorage.clear());
+  await page.goto("about:blank");
+  recoveryPhase = true;
+  await page.goto(questUrl, { waitUntil: "domcontentloaded" });
+  const resumed = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  const resumedMaterials = resumed.locator("[data-journey-section='materials']");
+  await expect(resumed).toBeVisible();
+  try {
+    await expect.poll(() => firstPollHeld).toBe(true);
+    await expect.poll(() => recoveryGets.get(jobRefs[1]) ?? 0).toBeGreaterThanOrEqual(1);
+    await expect(
+      resumedMaterials.locator(".quest-material-status.accepted")
+        .getByText("recovery-second.md", { exact: true }),
+    ).toBeVisible();
+    await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(1);
+  } finally {
+    releaseFirstPoll();
+  }
+
+  await expect(resumedMaterials.locator(".quest-material-status.accepted")).toHaveCount(2, {
+    timeout: 15_000,
+  });
+  await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(0);
+  await page.unroute("**/api/v1/research-assets/intakes/*", controlRecoveryPolls);
+  await page.unroute("**/api/v1/research-assets/intakes", queueEveryPostAck);
+});
+
+test("accepted material commits serialize apply and acknowledgement without losing a concurrent edit", async ({
+  page,
+}) => {
+  if (!product) throw new Error("deterministic product missing");
+  await openAuthenticatedProduct(page, product);
+
+  const versionByName = new Map<string, string>();
+  const nameByJobRef = new Map<string, string>();
+  const concurrentGoalWriteRefs: string[][] = [];
+  let firstCommitted = false;
+  let secondCommitted = false;
+  let markFirstCommitted!: () => void;
+  const firstCommitReached = new Promise<void>((resolve) => {
+    markFirstCommitted = resolve;
+  });
+  let markSecondCommitted!: () => void;
+  const secondCommitReached = new Promise<void>((resolve) => {
+    markSecondCommitted = resolve;
+  });
+  let releaseFirst!: () => void;
+  let releaseSecond!: () => void;
+  const firstResponseGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const secondResponseGate = new Promise<void>((resolve) => {
+    releaseSecond = resolve;
+  });
+  const captureAcceptedIntake = async (route: Route) => {
+    const request = route.request().postDataJSON() as { display_name?: string };
+    const response = await route.fetch();
+    const result = await response.json() as {
+      asset?: { version_ref?: string } | null;
+      [key: string]: unknown;
+    };
+    const name = String(request.display_name ?? "");
+    const jobRef = String(result.job_ref ?? "");
+    const versionRef = String(result.asset?.version_ref ?? "");
+    if (name && jobRef) nameByJobRef.set(jobRef, name);
+    if (name && versionRef) versionByName.set(name, versionRef);
+    await route.fulfill({ response, json: result });
+  };
+  const captureAcceptedPoll = async (route: Route) => {
+    const jobRef = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-1) ?? "");
+    const response = await route.fetch();
+    const result = await response.json() as {
+      asset?: { version_ref?: string } | null;
+      [key: string]: unknown;
+    };
+    const name = nameByJobRef.get(jobRef);
+    if (name === "commit-race-b.md") await firstCommitReached;
+    const versionRef = String(result.asset?.version_ref ?? "");
+    if (name && versionRef) versionByName.set(name, versionRef);
+    await route.fulfill({ response, json: result });
+  };
+  const holdAcceptedDraftResponses = async (route: Route) => {
+    if (route.request().method() !== "PUT") {
+      await route.fallback();
+      return;
+    }
+    const body = route.request().postDataJSON() as {
+      draft?: {
+        goal?: string;
+        literature?: {
+          accepted_material_bindings?: Array<{ version_ref?: string }>;
+        };
+      };
+    };
+    const refs = new Set(
+      body.draft?.literature?.accepted_material_bindings
+        ?.map((binding) => binding.version_ref)
+        .filter((value): value is string => Boolean(value)) ?? [],
+    );
+    if (body.draft?.goal === "A/B accepted binding 与本地目标必须一起 durable") {
+      concurrentGoalWriteRefs.push([...refs].sort());
+    }
+    const firstRef = versionByName.get("commit-race-a.md");
+    const secondRef = versionByName.get("commit-race-b.md");
+    if (!firstCommitted && firstRef && refs.has(firstRef) && !refs.has(secondRef ?? "")) {
+      const response = await route.fetch();
+      if (!response.ok()) {
+        await route.fulfill({ response });
+        return;
+      }
+      firstCommitted = true;
+      markFirstCommitted();
+      await firstResponseGate;
+      await route.fulfill({ response });
+      return;
+    }
+    if (!secondCommitted && secondRef && refs.has(secondRef)) {
+      const response = await route.fetch();
+      if (response.ok()) {
+        secondCommitted = true;
+        markSecondCommitted();
+        await secondResponseGate;
+      }
+      await route.fulfill({ response });
+      return;
+    }
+    await route.fallback();
+  };
+  await page.route("**/api/v1/research-assets/intakes", captureAcceptedIntake);
+  await page.route("**/api/v1/research-assets/intakes/*", captureAcceptedPoll);
+  await page.route(
+    "**/api/v1/quest-initializations/*/draft",
+    holdAcceptedDraftResponses,
+  );
+
+  await page.getByRole("button", { name: "创建 Quest" }).click();
+  const quest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  const materials = quest.locator("[data-journey-section='materials']");
+  await materials.getByLabel("上传研究材料文件", { exact: true }).setInputFiles([
+    {
+      name: "commit-race-a.md",
+      mimeType: "text/markdown",
+      buffer: Buffer.from("accepted race material A\n"),
+    },
+    {
+      name: "commit-race-b.md",
+      mimeType: "text/markdown",
+      buffer: Buffer.from("accepted race material B\n"),
+    },
+  ]);
+
+  try {
+    await expect.poll(() => firstCommitted).toBe(true);
+    await expect.poll(() => versionByName.size).toBe(2);
+    await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(2);
+
+    const secondCommittedWhileFirstResponseHeld = await Promise.race([
+      secondCommitReached.then(() => true),
+      new Promise<false>((resolveDelay) => {
+        setTimeout(() => resolveDelay(false), 750);
+      }),
+    ]);
+    expect(secondCommittedWhileFirstResponseHeld).toBe(false);
+    await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(2);
+
+    const concurrentGoal = "A/B accepted binding 与本地目标必须一起 durable";
+    await quest.getByRole("textbox", { name: "目标", exact: true }).fill(concurrentGoal);
+    releaseFirst();
+    await expect.poll(() => secondCommitted).toBe(true);
+    releaseSecond();
+
+    await expect.poll(async () => {
+      const response = await page.request.get(
+        `${product?.baseUrl}/api/v1/quest-initializations/current`,
+      );
+      const current = await response.json() as {
+        quest_draft: {
+          value: {
+            goal: string;
+            literature: {
+              accepted_material_bindings: Array<{ version_ref?: string }>;
+            };
+          };
+        };
+      };
+      return {
+        goal: current.quest_draft.value.goal,
+        refs: current.quest_draft.value.literature.accepted_material_bindings
+          .map((binding) => binding.version_ref)
+          .sort(),
+      };
+    }, { timeout: 15_000 }).toEqual({
+      goal: concurrentGoal,
+      refs: [...versionByName.values()].sort(),
+    });
+    await expect.poll(() => concurrentGoalWriteRefs.at(-1) ?? [])
+      .toEqual([...versionByName.values()].sort());
+    expect(concurrentGoalWriteRefs).not.toContainEqual([
+      versionByName.get("commit-race-b.md"),
+    ]);
+    await expect.poll(() => scopedAssetIntakeRecoveryCount(page)).toBe(0);
+  } finally {
+    releaseFirst();
+    releaseSecond();
+    await page.unroute("**/api/v1/research-assets/intakes", captureAcceptedIntake);
+    await page.unroute("**/api/v1/research-assets/intakes/*", captureAcceptedPoll);
+    await page.unroute(
+      "**/api/v1/quest-initializations/*/draft",
+      holdAcceptedDraftResponses,
+    );
+  }
+});
+
+test("a slow optional material bind never gates the formal Direct Quest flow", async ({
+  page,
+}) => {
+  if (!product) throw new Error("deterministic product missing");
+  await openAuthenticatedProduct(page, product);
+
+  let bindingHeld = false;
+  let releaseBinding!: () => void;
+  const bindingGate = new Promise<void>((resolve) => {
+    releaseBinding = resolve;
+  });
+  const holdAcceptedBinding = async (route: Route) => {
+    if (route.request().method() === "PUT") {
+      const body = route.request().postDataJSON() as {
+        draft?: {
+          literature?: { accepted_material_bindings?: Array<Record<string, unknown>> };
+        };
+      };
+      if (
+        !bindingHeld &&
+        (body.draft?.literature?.accepted_material_bindings?.length ?? 0) > 0
+      ) {
+        bindingHeld = true;
+        await bindingGate;
+      }
+    }
+    await route.fallback();
+  };
+  await page.route(
+    "**/api/v1/quest-initializations/*/draft",
+    holdAcceptedBinding,
+  );
+
+  await page.getByRole("button", { name: "创建 Quest" }).click();
+  const quest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  const materials = quest.locator("[data-journey-section='materials']");
+  for (const viewport of [
+    { width: 800, height: 900 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expect(materials.getByRole("button", { name: "选择文件", exact: true }))
+      .toBeEnabled();
+    await expect(materials.getByRole("button", { name: "选择文件夹", exact: true }))
+      .toBeEnabled();
+    await expect(materials.getByLabel("上传研究材料文件", { exact: true }))
+      .toBeAttached();
+    expect(await page.evaluate(() => (
+      document.documentElement.scrollWidth <= document.documentElement.clientWidth
+    ))).toBe(true);
+  }
+  await materials.getByLabel("上传研究材料文件", { exact: true }).setInputFiles({
+    name: "slow-optional-binding.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from("accepted material whose Quest binding is deliberately slow\n"),
+  });
+  await expect.poll(() => bindingHeld).toBe(true);
+  await expect(materials).toContainText("已接纳，正在加入当前草案");
+
+  const goal = "材料绑定缓慢时 Direct Quest 仍可正式创建";
+  const boundary = "草案、首问与确认资格不依赖可选材料绑定完成";
+  await quest.getByRole("textbox", { name: "目标", exact: true }).fill(goal);
+  await quest.getByRole("textbox", { name: "边界", exact: true }).fill(boundary);
+  await quest.getByRole("textbox", { name: "目标", exact: true }).blur();
+  await expect(quest.getByText("草案已自动保存", { exact: true })).toBeVisible({
+    timeout: 8_000,
+  });
+  await expect.poll(async () => {
+    const response = await page.request.get(
+      `${product?.baseUrl}/api/v1/quest-initializations/current`,
+    );
+    const current = await response.json() as {
+      quest_draft: { value: { goal: string; completion_criteria: string } };
+    };
+    return {
+      goal: current.quest_draft.value.goal,
+      boundary: current.quest_draft.value.completion_criteria,
+    };
+  }).toEqual({ goal, boundary });
+
+  await quest.getByRole("button", { name: "直接根据目标生成" }).click();
+  await quest.getByRole("button", { name: "检测本机计算卡" }).click();
+  await expect(
+    quest.getByText("capability_unavailable · deterministic_probe_unavailable", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await quest.getByRole("button", { name: "重新检测", exact: true }).click();
+  await quest.getByRole("button", {
+    name: /Deterministic GPU.*GPU-deterministic-1/,
+  }).click();
+  await quest.getByRole("button", { name: "生成第一个问题" }).click();
+  await expect(quest.getByLabel("首问题标题")).toHaveValue(
+    "低照度显微图像中的稀有形态保真",
+    { timeout: 15_000 },
+  );
+  await expect(
+    quest.getByText("当前 Impact Preview 已绑定，可以确认", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    quest.getByRole("button", { name: "确认创建 Quest 与第一个问题" }),
+  ).toBeEnabled();
+
   await quest.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
   await expect(quest).toBeHidden();
-  await page.getByRole("button", { name: "创建 Quest", exact: true }).click();
-  await expect(quest).toBeVisible();
-  await quest.getByText("补充范围、排除项与已有材料", { exact: true }).click();
-  await quest.getByRole("button", { name: "选择文件", exact: true }).click();
-  await expect(
-    quest.getByRole("group", { name: "选择已接纳 Research Asset" })
-      .getByRole("button")
-      .filter({ hasText: "quest-source.md" }),
-  ).toHaveAttribute("aria-pressed", "true");
+
+  releaseBinding();
+  await page.unroute(
+    "**/api/v1/quest-initializations/*/draft",
+    holdAcceptedBinding,
+  );
+  await expect.poll(async () => {
+    const response = await page.request.get(
+      `${product?.baseUrl}/api/v1/quest-initializations/current`,
+    );
+    const current = await response.json() as {
+      quest_draft: {
+        value: {
+          goal: string;
+          completion_criteria: string;
+          literature: {
+            accepted_material_bindings: Array<{ version_ref?: string }>;
+          };
+        };
+      };
+    };
+    return {
+      goal: current.quest_draft.value.goal,
+      boundary: current.quest_draft.value.completion_criteria,
+      bindingCount:
+        current.quest_draft.value.literature.accepted_material_bindings.length,
+    };
+  }, { timeout: 12_000 }).toEqual({ goal, boundary, bindingCount: 1 });
+});
+
+test("a committed scoped Quest intake replays the exact POST after its ACK is lost", async ({
+  page,
+}) => {
+  if (!product) throw new Error("deterministic product missing");
+  await openAuthenticatedProduct(page, product);
+
+  const requestBodies: string[] = [];
+  const idempotencyKeys: string[] = [];
+  const jobRefs: string[] = [];
+  let committedWithoutAck = false;
+  let releaseReplayAck!: () => void;
+  const replayAckGate = new Promise<void>((resolve) => {
+    releaseReplayAck = resolve;
+  });
+  await page.route("**/api/v1/research-assets/intakes", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    requestBodies.push(route.request().postData() ?? "");
+    idempotencyKeys.push(route.request().headers()["idempotency-key"] ?? "");
+    const response = await route.fetch();
+    const result = await response.json() as JsonRecord;
+    jobRefs.push(String(result.job_ref ?? ""));
+    if (!committedWithoutAck) {
+      committedWithoutAck = true;
+      await route.abort("connectionreset");
+      return;
+    }
+    await replayAckGate;
+    await route.fulfill({ response, json: result });
+  });
+
+  await page.getByRole("button", { name: "创建 Quest" }).click();
+  const quest = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" });
+  const materials = quest.locator("[data-journey-section='materials']");
+  const exactBytes = "scoped ACK-loss bytes must be replayed exactly\n";
+  await materials.getByLabel("上传研究材料文件", { exact: true }).setInputFiles({
+    name: "quest-ack-loss.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from(exactBytes),
+  });
+
+  await expect.poll(() => committedWithoutAck).toBe(true);
+  await expect.poll(async () => page.evaluate(() => {
+    const slot = Object.keys(sessionStorage).find((key) => key.startsWith(
+      "meta_research_pending_asset_intake:v2:quest_creation:",
+    ));
+    return slot ? sessionStorage.getItem(slot) : null;
+  })).not.toBeNull();
+  expect(await page.evaluate(() => Object.values(sessionStorage).join("\n")))
+    .not.toContain(Buffer.from(exactBytes).toString("base64"));
+
+  // IndexedDB is the durable source of truth. Losing the tab-scoped locator
+  // must not orphan an exact operation after a renderer/browser restart.
+  await page.evaluate(() => sessionStorage.clear());
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const reopened = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  await expect(reopened).toBeVisible();
+  const concurrentGoal = "ACK 丢失恢复时继续编辑的研究目标";
+  const concurrentBoundary = "用户文本与 accepted material 必须一起 durable";
+  await reopened.getByRole("textbox", { name: "目标", exact: true }).fill(concurrentGoal);
+  await reopened.getByRole("textbox", { name: "边界", exact: true }).fill(concurrentBoundary);
+  releaseReplayAck();
+  const acceptedMaterial = reopened.locator("[data-journey-section='materials']")
+    .locator(".quest-material-status.accepted");
+  await expect(acceptedMaterial.getByText("quest-ack-loss.md", { exact: true })).toBeVisible();
+  await expect(acceptedMaterial.getByText("已加入本次 Quest", { exact: true })).toBeVisible();
+  await expect(reopened.getByRole("alert").filter({ hasText: "quest_draft_stale" }))
+    .toHaveCount(0);
+
+  await expect.poll(() => idempotencyKeys.length).toBe(2);
+  expect(idempotencyKeys[0]).not.toBe("");
+  expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]);
+  expect(requestBodies[1]).toBe(requestBodies[0]);
+  expect(jobRefs[0]).not.toBe("");
+  expect(jobRefs[1]).toBe(jobRefs[0]);
+
+  await expect.poll(async () => {
+    const response = await page.request.get(
+      `${product?.baseUrl}/api/v1/research-assets?offset=0&limit=50`,
+    );
+    const inventory = await response.json() as { items: Array<{ display_name: string }> };
+    return inventory.items.filter((item) => item.display_name === "quest-ack-loss.md").length;
+  }).toBe(1);
+  await expect.poll(async () => {
+    const response = await page.request.get(
+      `${product?.baseUrl}/api/v1/quest-initializations/current`,
+    );
+    const current = await response.json() as {
+      quest_draft: {
+        value: {
+          goal: string;
+          completion_criteria: string;
+          literature: { accepted_material_bindings: Array<{ version_ref?: string }> };
+        };
+      };
+    };
+    return {
+      goal: current.quest_draft.value.goal,
+      completionCriteria: current.quest_draft.value.completion_criteria,
+      bindingCount: current.quest_draft.value.literature.accepted_material_bindings.length,
+    };
+  }).toEqual({
+    goal: concurrentGoal,
+    completionCriteria: concurrentBoundary,
+    bindingCount: 1,
+  });
+  await expect.poll(async () => page.evaluate(() => Object.keys(sessionStorage).filter(
+    (key) => key.startsWith("meta_research_pending_asset_intake:v2:quest_creation:"),
+  ).length)).toBe(0);
 });
 
 test("paged inventory and Quest materials keep an exact off-page version reachable", async ({
@@ -201,8 +998,7 @@ test("paged inventory and Quest materials keep an exact off-page version reachab
   const quest = page.getByRole("dialog", {
     name: "创建 Quest，并决定第一个研究问题",
   });
-  await quest.getByText("补充范围、排除项与已有材料", { exact: true }).click();
-  await quest.getByRole("button", { name: "选择文件", exact: true }).click();
+  await quest.getByText("从已有材料中选择", { exact: true }).click();
   const picker = quest.getByRole("group", { name: "选择已接纳 Research Asset" });
   await expect(
     picker.getByRole("button").filter({ hasText: "paged-00.txt" }),
@@ -313,6 +1109,38 @@ async function acceptTextAsset(page: Page, name: string, content: string): Promi
   await expect(dialog.getByText("已接纳精确版本", { exact: false })).toBeVisible();
   await dialog.getByRole("button", { name: "关闭 Research Asset 工作台" }).click();
   await expect(dialog).toBeHidden();
+}
+
+async function scopedAssetIntakeRecoveryCount(page: Page): Promise<number> {
+  return page.evaluate(() => new Promise<number>((resolve, reject) => {
+    const openRequest = indexedDB.open("meta_research_human_request_recovery");
+    openRequest.onerror = () => reject(openRequest.error);
+    openRequest.onsuccess = () => {
+      const database = openRequest.result;
+      const transaction = database.transaction("recovery_manifests", "readonly");
+      const keysRequest = transaction.objectStore("recovery_manifests").getAllKeys();
+      let count = 0;
+      keysRequest.onsuccess = () => {
+        count = keysRequest.result.filter((key) =>
+          typeof key === "string" && key.startsWith(
+            "meta-research/human-request-recovery/v2:scoped-asset-intake:",
+          )
+        ).length;
+      };
+      transaction.oncomplete = () => {
+        database.close();
+        resolve(count);
+      };
+      transaction.onerror = () => {
+        database.close();
+        reject(transaction.error);
+      };
+      transaction.onabort = () => {
+        database.close();
+        reject(transaction.error);
+      };
+    };
+  }));
 }
 
 async function ownerRevision(

@@ -171,10 +171,10 @@ test("an upgraded recovering v1 Quest remains readable through the corrected Web
   });
 
   const { dialog, opener } = await openCreation(page);
-  await expect(dialog.getByLabel("这个 Quest 最终要完成什么？")).toHaveValue(
+  await expect(dialog.getByRole("textbox", { name: "目标", exact: true })).toHaveValue(
     "保留升级前已确认的 legacy Quest。",
   );
-  await expect(dialog.getByLabel("什么情况算完成？")).toHaveValue(
+  await expect(dialog.getByRole("textbox", { name: "边界", exact: true })).toHaveValue(
     "恢复期间仍可从公开 Web 检查既有 bundle。",
   );
   await expect(dialog.getByLabel("文献搜索范围")).toHaveValue("oa_only");
@@ -245,9 +245,9 @@ async function fillRequiredBasis(
   goal: string,
   completionCriteria: string,
 ) {
-  const goalField = dialog.getByLabel("这个 Quest 最终要完成什么？");
+  const goalField = dialog.getByRole("textbox", { name: "目标", exact: true });
   await goalField.fill(goal);
-  await dialog.getByLabel("什么情况算完成？").fill(completionCriteria);
+  await dialog.getByRole("textbox", { name: "边界", exact: true }).fill(completionCriteria);
   await goalField.blur();
   await expect(dialog.getByText("草案已自动保存", { exact: true })).toBeVisible();
 }
@@ -423,6 +423,121 @@ test("DeepFetch unfolds real progress and its accepted snapshot inside the same 
     }));
     expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
   }
+});
+
+test("non-retryable DeepFetch failures fail closed without promising another Attempt", async ({
+  page,
+}) => {
+  await openAuthenticatedProduct(page, runningProduct());
+  const opened = await openCreation(page);
+  await fillRequiredBasis(
+    opened.dialog,
+    "验证 DeepFetch hard failure 不会误导重试",
+    "身份冲突或 provider_operation_retry_permitted=false 必须要求新 initialization 或人工检查",
+  );
+
+  let failureCode = "deepfetch_run_identity_conflict";
+  let providerOperationRetryPermitted = true;
+  const projectFailedDeepFetch = async (route: Route) => {
+    const response = await route.fetch();
+    const snapshot = await response.json() as {
+      quest_creation?: { current?: Record<string, unknown> | null };
+      [key: string]: unknown;
+    };
+    const current = snapshot.quest_creation?.current;
+    if (!current) {
+      await route.fulfill({ response, json: snapshot });
+      return;
+    }
+    const questDraft = current.quest_draft as {
+      revision: number;
+      hash: string;
+      value: Record<string, unknown>;
+    };
+    current.route = "deepfetch";
+    questDraft.value = {
+      ...questDraft.value,
+      route: "deepfetch",
+      resource_envelope_ref: "resource-envelope-fail-closed",
+      resource_envelope_hash: "d".repeat(64),
+    };
+    current.resource_envelope = {
+      ref: "resource-envelope-fail-closed",
+      hash: "d".repeat(64),
+      schema_ref: "meta-research/quest-resource-envelope/v1",
+      status: "current",
+      host_snapshot_ref: "host-snapshot-fail-closed",
+      time_budget: "30d",
+      hard_ceiling: { kind: "wall_clock", seconds: 2_592_000 },
+      selected_device_uuids: ["GPU-deterministic-1"],
+    };
+    current.deepfetch = {
+      request_ref: "deepfetch-request-fail-closed",
+      correlation_ref: "deepfetch-correlation-fail-closed",
+      basis_revision: questDraft.revision,
+      basis_hash: questDraft.hash,
+      scope_hash: "a".repeat(64),
+      status: "failed",
+      activity: "needs_retry",
+      progress: { completed: 1, total: 5 },
+      freshness: "current",
+      authorization_receipt: {
+        status: "accepted",
+        issuer: "human_collaboration",
+        kind: "deepfetch_request",
+        receipt_ref: "receipt-deepfetch-fail-closed",
+        subject_ref: "deepfetch-request-fail-closed",
+        payload_hash: "b".repeat(64),
+      },
+      run: {
+        run_ref: "deepfetch-run-fail-closed",
+        status: "failed",
+        attempt_ref: "deepfetch-attempt-fail-closed",
+        attempt_generation: 2,
+        root_session_ref: "deepfetch-root-fail-closed",
+        native_session_ref: null,
+        fence_ref: null,
+        runtime_binding_hash: "c".repeat(64),
+        provider_operation_retry_permitted: providerOperationRetryPermitted,
+        execution_receipt: null,
+        failure: { code: failureCode },
+      },
+      literature_snapshot: null,
+      failure: { code: failureCode },
+    };
+    await route.fulfill({ response, json: snapshot });
+  };
+  await page.route("**/api/v1/snapshot", projectFailedDeepFetch);
+
+  const assertHardFailure = async () => {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    const dialog = page.getByRole("dialog", {
+      name: "创建 Quest，并决定第一个研究问题",
+    });
+    const runway = dialog.getByTestId("deepfetch-runway");
+    await expect(runway).toContainText("需要新建 initialization 或交由人工检查");
+    await expect(runway).toContainText("当前记录不会自动重试");
+    await expect(runway).not.toContainText("重新点击“生成第一个问题”");
+    await expect(dialog.locator(".quest-footer")).not.toContainText("可沿同一 correlation 重试");
+  };
+
+  await assertHardFailure();
+  failureCode = "codex_deepfetch_timeout";
+  providerOperationRetryPermitted = false;
+  await assertHardFailure();
+
+  providerOperationRetryPermitted = true;
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const retryable = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  await expect(retryable.getByTestId("deepfetch-runway")).toContainText(
+    "重新点击“生成第一个问题”会沿同一 correlation 创建新 Attempt",
+  );
+  await expect(retryable.locator(".quest-footer")).toContainText(
+    "可沿同一 correlation 重试",
+  );
+  await page.unroute("**/api/v1/snapshot", projectFailedDeepFetch);
 });
 
 async function publicCurrent(page: Page) {
@@ -653,7 +768,7 @@ test("compute and Intent stay independent without losing an unsaved draft edit",
   await expect(cancel).toBeEnabled();
   await expect(intent).toBeDisabled();
 
-  const goal = dialog.getByLabel("这个 Quest 最终要完成什么？");
+  const goal = dialog.getByRole("textbox", { name: "目标", exact: true });
   const editedWhileComputeWasPending = "并行响应回来后仍须保留的人工草案";
   await expect(goal).toBeEnabled();
   await goal.fill(editedWhileComputeWasPending);
@@ -715,7 +830,7 @@ for (const conflictExit of [
 
     const staleLocalGoal = `stale local ${conflictExit.name}`;
     const durableCriteria = `durable remote ${conflictExit.name}`;
-    const goal = dialog.getByLabel("这个 Quest 最终要完成什么？");
+    const goal = dialog.getByRole("textbox", { name: "目标", exact: true });
     await goal.fill(staleLocalGoal);
     const remote = await publicPut(
       page,
@@ -744,10 +859,10 @@ for (const conflictExit of [
 
     ({ dialog, opener } = await openCreation(page));
     await expect(dialog.getByRole("alert")).toBeHidden();
-    await expect(dialog.getByLabel("这个 Quest 最终要完成什么？")).toHaveValue(
+    await expect(dialog.getByRole("textbox", { name: "目标", exact: true })).toHaveValue(
       originalGoal,
     );
-    await expect(dialog.getByLabel("什么情况算完成？")).toHaveValue(
+    await expect(dialog.getByRole("textbox", { name: "边界", exact: true })).toHaveValue(
       durableCriteria,
     );
     await expect(opener).not.toBeFocused();
@@ -767,7 +882,7 @@ test("a remote same-init draft write cannot steal a local dirty CAS basis", asyn
 
   const localGoal = "仍停留在浏览器里的未保存人工目标";
   const remoteCriteria = "另一标签已经保存的完成标准";
-  const goal = dialog.getByLabel("这个 Quest 最终要完成什么？");
+  const goal = dialog.getByRole("textbox", { name: "目标", exact: true });
   const remote = await publicPut(
     page,
     `/api/v1/quest-initializations/${basis!.initialization_id}/draft`,
@@ -831,7 +946,7 @@ test("a remote same-init draft write cannot steal a local dirty CAS basis", asyn
   await reloadLatest.click();
   await expect(dialog.getByRole("alert")).toBeHidden();
   await expect(goal).toHaveValue(originalGoal);
-  await expect(dialog.getByLabel("什么情况算完成？")).toHaveValue(remoteCriteria);
+  await expect(dialog.getByRole("textbox", { name: "边界", exact: true })).toHaveValue(remoteCriteria);
 
   const recoveredGoal = "显式载入远端版本后可以继续编辑";
   await goal.fill(recoveredGoal);
@@ -839,6 +954,87 @@ test("a remote same-init draft write cannot steal a local dirty CAS basis", asyn
   await expect.poll(async () => (await publicCurrent(page))?.quest_draft.value.goal).toBe(
     recoveredGoal,
   );
+});
+
+test("the unified Boundary reversibly preserves both legacy text segments at their limits", async ({
+  page,
+}) => {
+  await openAuthenticatedProduct(page, runningProduct());
+  const { dialog } = await openCreation(page);
+  await fillRequiredBasis(dialog, "验证统一边界的可逆映射", "建立初始边界");
+  const background = dialog.getByRole("textbox", { name: "背景（可选）", exact: true });
+  await expect(background).toHaveAttribute("maxlength", "12000");
+  const fullBackground = "背".repeat(12_000);
+  await background.fill(fullBackground);
+  await background.blur();
+  await expect.poll(async () => (
+    await publicCurrent(page)
+  )?.quest_draft.value.background_and_initial_direction).toBe(fullBackground);
+  const boundary = dialog.getByRole("textbox", { name: "边界", exact: true });
+  await expect(boundary).toHaveAttribute("maxlength", "12000");
+  const basis = await publicCurrent(page);
+  expect(basis).not.toBeNull();
+
+  const completion = "完".repeat(4_000);
+  const exclusions = "界".repeat(8_000);
+  const separator = "\n\n范围与排除：";
+  const literature = basis!.quest_draft.value.literature as Record<string, unknown>;
+  const remote = await publicPut(
+    page,
+    `/api/v1/quest-initializations/${basis!.initialization_id}/draft`,
+    {
+      expected_draft_revision: basis!.quest_draft.revision,
+      expected_draft_hash: basis!.quest_draft.hash,
+      draft: {
+        ...basis!.quest_draft.value,
+        completion_criteria: completion,
+        literature: {
+          ...literature,
+          scope_exclusions: exclusions,
+        },
+      },
+    },
+  );
+  expect(remote.status).toBe(200);
+
+  const combined = `${completion}${separator}${exclusions}`;
+  await expect(boundary).toHaveValue(combined);
+  await expect(boundary).toHaveAttribute("maxlength", String(combined.length));
+
+  // Replacing a canonical legacy value with an over-capacity raw string must
+  // fail visibly. It may not silently discard the tail that occupies the
+  // separator's display-only character budget.
+  await boundary.fill("裸".repeat(12_001));
+  await expect(dialog.getByRole("alert")).toContainText("quest_boundary_too_long");
+  await expect(boundary).toHaveValue(combined);
+  await expect.poll(async () => {
+    const current = await publicCurrent(page);
+    const currentLiterature = current?.quest_draft.value.literature as
+      | { scope_exclusions?: string }
+      | undefined;
+    return {
+      completion: current?.quest_draft.value.completion_criteria,
+      exclusions: currentLiterature?.scope_exclusions,
+    };
+  }).toEqual({ completion, exclusions });
+
+  const editedCompletion = `成${completion.slice(1)}`;
+  const editedExclusions = `${exclusions.slice(0, -1)}止`;
+  await boundary.fill(`${editedCompletion}${separator}${editedExclusions}`);
+  await boundary.blur();
+  await expect.poll(async () => {
+    const current = await publicCurrent(page);
+    const currentLiterature = current?.quest_draft.value.literature as
+      | { scope_exclusions?: string }
+      | undefined;
+    return {
+      completion: current?.quest_draft.value.completion_criteria,
+      exclusions: currentLiterature?.scope_exclusions,
+    };
+  }).toEqual({
+    completion: editedCompletion,
+    exclusions: editedExclusions,
+  });
 });
 
 test("a delayed conflict reload cannot replace a newer SSE view with stale form data", async ({
@@ -853,7 +1049,7 @@ test("a delayed conflict reload cannot replace a newer SSE view with stale form 
   expect(initial).not.toBeNull();
 
   const localGoal = "本地尚未放弃的冲突目标";
-  const goal = dialog.getByLabel("这个 Quest 最终要完成什么？");
+  const goal = dialog.getByRole("textbox", { name: "目标", exact: true });
   await goal.fill(localGoal);
   const remoteB = await publicPut(
     page,
@@ -926,7 +1122,7 @@ test("a delayed conflict reload cannot replace a newer SSE view with stale form 
   await reloadLatest.click();
   await expect(dialog.getByRole("alert")).toBeHidden();
   await expect(goal).toHaveValue(originalGoal);
-  await expect(dialog.getByLabel("什么情况算完成？")).toHaveValue(
+  await expect(dialog.getByRole("textbox", { name: "边界", exact: true })).toHaveValue(
     "远端版本 C（reload 在途时推进）",
   );
 });
@@ -1129,10 +1325,10 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   });
   const afterUnavailableIntent = await publicCurrent(page);
   expect(afterUnavailableIntent?.quest_draft).toEqual(beforeIntent?.quest_draft);
-  await expect(dialog.getByLabel("这个 Quest 最终要完成什么？")).toHaveValue(
+  await expect(dialog.getByRole("textbox", { name: "目标", exact: true })).toHaveValue(
     beforeIntent!.quest_draft.value.goal,
   );
-  await expect(dialog.getByLabel("什么情况算完成？")).toHaveValue(
+  await expect(dialog.getByRole("textbox", { name: "边界", exact: true })).toHaveValue(
     beforeIntent!.quest_draft.value.completion_criteria,
   );
   expect(
@@ -1420,7 +1616,7 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   const second = await publicCurrent(page);
   expect(second).not.toBeNull();
   expect(second?.initialization_id).not.toBe(first?.initialization_id);
-  await expect(dialog.getByLabel("这个 Quest 最终要完成什么？")).toHaveValue("");
+  await expect(dialog.getByRole("textbox", { name: "目标", exact: true })).toHaveValue("");
 
   await fillRequiredBasis(
     dialog,

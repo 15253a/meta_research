@@ -243,9 +243,10 @@
   text-align: right;
 }
 
-.quest-goal-card,
+.quest-basis-card,
 .quest-config-card,
 .quest-literature-card,
+.quest-material-card,
 .quest-route-card,
 .quest-proposal,
 .quest-optional-card {
@@ -255,26 +256,28 @@
   border-radius: 17px;
 }
 
-.quest-goal-card {
-  display: block;
+.quest-basis-card {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 11px;
   padding: 16px 17px;
   background: linear-gradient(135deg, #f4f3ff, #fff 72%);
   border-color: #cbc9f6;
 }
 
-.quest-goal-card .quest-field + .quest-field {
-  margin-top: 12px;
-}
-
-.quest-goal-card .quest-field > span {
+.quest-basis-card .quest-field > span {
   color: #474392;
 }
 
-.quest-goal-card .quest-field em {
+.quest-basis-card .quest-field em {
   padding: 3px 6px;
   color: #5652ca;
   background: #e5e3ff;
   border-radius: 999px;
+}
+
+.quest-basis-card textarea {
+  min-height: 116px;
 }
 
 .quest-field,
@@ -636,6 +639,134 @@
 .quest-material-picker small {
   color: var(--quest-muted);
   font: 750 7px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+}
+
+.quest-material-card {
+  display: grid;
+  gap: 11px;
+  background:
+    linear-gradient(115deg, rgba(21, 153, 135, 0.055), transparent 46%),
+    #fff;
+}
+
+.quest-material-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.quest-material-actions > span {
+  color: var(--quest-muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.quest-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.quest-material-statuses {
+  display: grid;
+  gap: 6px;
+}
+
+.quest-material-status {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto auto;
+  gap: 4px 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 9px 10px;
+  color: #596579;
+  background: #f7f8fb;
+  border: 1px solid #e0e5ed;
+  border-radius: 10px;
+}
+
+.quest-material-status > span {
+  grid-row: 1 / 3;
+  color: #66738a;
+  font-weight: 900;
+  text-align: center;
+}
+
+.quest-material-status b {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--quest-ink);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quest-material-status small {
+  grid-column: 2 / 3;
+  font-size: 8.5px;
+}
+
+.quest-material-status button {
+  grid-column: 4;
+  grid-row: 1 / 3;
+  padding: 5px 8px;
+  color: #667287;
+  background: transparent;
+  border: 1px solid #d7dde7;
+  border-radius: 7px;
+  font-size: 8px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.quest-material-status.accepted {
+  background: #eef9f6;
+  border-color: #a8dbd1;
+}
+
+.quest-material-status.accepted > span {
+  color: var(--quest-jade);
+}
+
+.quest-material-status.failed {
+  background: #fff6f2;
+  border-color: #f2c0b2;
+}
+
+.quest-material-status.failed > span {
+  color: #c85d43;
+}
+
+.quest-material-empty,
+.quest-material-footnote {
+  margin: 0;
+  color: var(--quest-muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.quest-material-library {
+  padding-top: 8px;
+  border-top: 1px solid #e3e7ef;
+}
+
+.quest-material-library summary {
+  width: max-content;
+  color: #596579;
+  font-size: 9px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.quest-material-library[open] summary {
+  margin-bottom: 8px;
 }
 
 .quest-route-options {
@@ -1350,6 +1481,14 @@
     width: calc(100vw - 20px);
     height: calc(100dvh - 20px);
   }
+
+  .quest-basis-card {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .quest-basis-card .quest-field:first-child {
+    grid-column: 1 / -1;
+  }
 }
 
 @media (max-width: 760px) {
@@ -1426,7 +1565,7 @@
     font-size: 22px;
   }
 
-  .quest-goal-card,
+  .quest-basis-card,
   .quest-config-grid,
   .quest-optional-fields,
   .quest-route-options,

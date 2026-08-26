@@ -18,6 +18,7 @@ from meta_research.acquisition import (
 )
 from meta_research.deepfetch import (
     CodexDeepFetchAdapter,
+    DEEPFETCH_PROVIDER_STREAM_MAX_BYTES,
     DeepFetchProviderRequest,
     DeepFetchResult,
     DeepFetchRuntimeBinding,
@@ -31,6 +32,7 @@ from meta_research.provider_supervisor import (
     read_transport_envelope,
     write_exit_receipt,
 )
+from meta_research.quest_drafting import _CancellableProcessRunner
 
 RESULT = {
     "completion": "limited",
@@ -228,11 +230,15 @@ class RecordingRunner:
         *,
         emit_web_evidence: bool = True,
         emit_reader_evidence: bool = True,
+        terminal_reader_tool: str = "wait",
+        emit_close_after_wait: bool = False,
         fetch_query: str = "https://example.org/paper",
     ) -> None:
         self.output = output
         self.emit_web_evidence = emit_web_evidence
         self.emit_reader_evidence = emit_reader_evidence
+        self.terminal_reader_tool = terminal_reader_tool
+        self.emit_close_after_wait = emit_close_after_wait
         self.fetch_query = fetch_query
         self.calls: list[tuple[list[str], str, float]] = []
         self.schemas: list[dict[str, object]] = []
@@ -294,15 +300,44 @@ class RecordingRunner:
                                 "pending_init",
                             ),
                             _reader_event(
-                                "wait",
+                                self.terminal_reader_tool,
                                 "native-web-research-1",
                                 reader_ref,
                                 "completed",
                             ),
                         ]
                     )
+                    if self.emit_close_after_wait:
+                        events.append(
+                            _reader_event(
+                                "close_agent",
+                                "native-web-research-1",
+                                reader_ref,
+                                "completed",
+                            )
+                        )
         stdout = "\n".join(json.dumps(event) for event in events)
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+
+class NamespaceRestrictedRunner(RecordingRunner):
+    """Mirror the deployed host where a bubblewrap user namespace cannot start."""
+
+    def __call__(
+        self, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        sandbox = argv[argv.index("--sandbox") + 1]
+        if sandbox == "workspace-write":
+            self.calls.append((argv, prompt, timeout))
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout=json.dumps(
+                    {"type": "thread.started", "thread_id": "native-no-userns"}
+                ),
+                stderr="bwrap: No permissions to create a new namespace",
+            )
+        return super().__call__(argv, prompt, timeout)
 
 
 def _write_empty_v4_artifacts_if_needed(prompt: str) -> None:
@@ -504,6 +539,99 @@ class DurableSegmentSequenceRunner:
         )
 
 
+class OversizedDurableStreamRunner:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+
+    def __call__(
+        self, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:  # pragma: no cover - durable seam only
+        raise AssertionError("non-durable provider seam used")
+
+    def run_durable_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        prompt: str,
+        timeout: float,
+        stdout_path: Path,
+        pid_path: Path,
+        supervisor_request_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        del job_ref, pid_path, supervisor_request_path, timeout
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(
+            json.dumps(PROTOTYPE_EMPTY_FINAL), encoding="utf-8"
+        )
+        with stdout_path.open("wb") as stream:
+            stream.truncate(DEEPFETCH_PROVIDER_STREAM_MAX_BYTES + 1)
+        _key_path, key = ensure_transport_key(self.workspace)
+        invocation = read_transport_envelope(
+            stdout_path.parent / "invocation.json", key
+        )
+        write_exit_receipt(
+            stdout_path.parent / "supervisor-exit.json",
+            key=key,
+            invocation_hash=canonical_hash(invocation),
+            prompt_path=stdout_path.parent / "prompt.txt",
+            schema_path=stdout_path.parent / "output-schema.json",
+            stdout_path=stdout_path,
+            result_path=result_path,
+            returncode=0,
+            input_bytes=len(prompt.encode("utf-8")),
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+
+class OutputLimitedDurableStreamRunner:
+    """Mirror the real supervisor receipt after it caps stdout at the limit."""
+
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+
+    def __call__(
+        self, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:  # pragma: no cover - durable seam only
+        raise AssertionError("non-durable provider seam used")
+
+    def run_durable_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        prompt: str,
+        timeout: float,
+        stdout_path: Path,
+        pid_path: Path,
+        supervisor_request_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        del job_ref, pid_path, supervisor_request_path, timeout
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text("", encoding="utf-8")
+        stdout_path.write_text(
+            json.dumps(
+                {"type": "thread.started", "thread_id": "native-output-limit"}
+            ),
+            encoding="utf-8",
+        )
+        _key_path, key = ensure_transport_key(self.workspace)
+        invocation = read_transport_envelope(
+            stdout_path.parent / "invocation.json", key
+        )
+        write_exit_receipt(
+            stdout_path.parent / "supervisor-exit.json",
+            key=key,
+            invocation_hash=canonical_hash(invocation),
+            prompt_path=stdout_path.parent / "prompt.txt",
+            schema_path=stdout_path.parent / "output-schema.json",
+            stdout_path=stdout_path,
+            result_path=result_path,
+            returncode=0,
+            input_bytes=len(prompt.encode("utf-8")),
+            termination_reason="output_limit",
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+
 class RecordingAcquisitionClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, AcquisitionBatchRequest]] = []
@@ -599,6 +727,34 @@ def _request() -> DeepFetchProviderRequest:
     )
 
 
+def test_non_durable_runner_overflow_maps_to_deepfetch_typed_failure(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "fake-codex-overflow"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import sys
+
+sys.stdout.write('x' * 8192)
+sys.stdout.flush()
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    adapter = CodexDeepFetchAdapter(
+        tmp_path / "provider",
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+        process_runner=_CancellableProcessRunner(stream_max_bytes=1024),
+    )
+
+    with pytest.raises(DeepFetchUnavailable) as failure:
+        adapter.execute(_request())
+
+    assert failure.value.code == "codex_deepfetch_output_too_large"
+
+
 def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -621,13 +777,20 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
     binding = adapter.runtime_binding()
     assert binding.provider_version == PROTOTYPE_COMMIT
     assert {
+        "agent-workspace-policy:dedicated-research-workspace-v1",
         "deepfetch-v4-main-agent",
+        "filesystem-danger-full-access",
         "hosted-acquisition-session",
         "native-child-readers",
         "papers-v4-finalize",
+        "provider-output-limits:stream=67108864;result=1048576",
+        "sandbox-policy:danger-full-access",
     } <= set(binding.capability_bindings)
     argv, prompt, _timeout = runner.calls[0]
-    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
+    assert argv[argv.index("--cd") + 1] == str(
+        tmp_path / "provider" / "research-workspace"
+    )
     assert "DeepFetch v4 main agent" in prompt
     assert "Acquisition" in prompt
     assert "independent Readers" in prompt
@@ -637,6 +800,244 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
     assert result.web_evidence["prototype"]["prototype_commit"] == (
         PROTOTYPE_COMMIT
     )
+
+
+@pytest.mark.parametrize(
+    "file_proof",
+    [
+        {
+            "path": "fulltext/example.html",
+            "sha256": "a" * 64,
+            "bytes": 41,
+            "absolute_path": "/private/custody/example.html",
+        },
+        {
+            "path": "fulltext/example.html",
+            "sha256": "a" * 64,
+            "bytes": 41,
+            "local_uri": "file:///private/custody/example.html",
+        },
+        {
+            "path": "/private/custody/example.html",
+            "sha256": "a" * 64,
+            "bytes": 41,
+        },
+        {
+            "path": "fulltext/../private/example.html",
+            "sha256": "a" * 64,
+            "bytes": 41,
+        },
+        {
+            "path": "artifacts/example.html",
+            "sha256": "a" * 64,
+            "bytes": 41,
+        },
+        {
+            "path": "fulltext/example.txt",
+            "sha256": "a" * 64,
+            "bytes": 41,
+        },
+        {
+            "path": "fulltext/example.html",
+            "sha256": "A" * 64,
+            "bytes": 41,
+        },
+        {
+            "path": "fulltext/example.html",
+            "sha256": "a" * 63,
+            "bytes": 41,
+        },
+        {
+            "path": "fulltext/example.html",
+            "sha256": "g" * 64,
+            "bytes": 41,
+        },
+        {
+            "path": 41,
+            "sha256": "a" * 64,
+            "bytes": 41,
+        },
+        {
+            "path": "fulltext/example.html",
+            "sha256": "a" * 64,
+            "bytes": True,
+        },
+        {
+            "path": "fulltext/example.html",
+            "sha256": "a" * 64,
+            "bytes": "41",
+        },
+        {
+            "path": "fulltext/example.html",
+            "sha256": "a" * 64,
+            "bytes": -1,
+        },
+        "fulltext/example.html",
+    ],
+    ids=[
+        "absolute-path-field",
+        "local-uri-field",
+        "absolute-path-value",
+        "parent-traversal",
+        "non-fulltext-root",
+        "unsupported-suffix",
+        "uppercase-sha256",
+        "short-sha256",
+        "non-hex-sha256",
+        "non-string-path",
+        "boolean-byte-count",
+        "non-integer-byte-count",
+        "negative-byte-count",
+        "non-object-proof",
+    ],
+)
+def test_deepfetch_result_rejects_malformed_fulltext_file_proof(
+    tmp_path: Path,
+    file_proof: object,
+) -> None:
+    adapter = CodexDeepFetchAdapter(
+        tmp_path / "provider",
+        model_ref="gpt-test",
+        process_runner=PrototypeRecordingRunner(PROTOTYPE_FINAL),
+    )
+    result = adapter.execute(_request())
+    web_evidence = copy.deepcopy(result.web_evidence)
+    assert isinstance(web_evidence, dict)
+    prototype = web_evidence.get("prototype")
+    assert isinstance(prototype, dict)
+    prototype["fulltext_files"] = [file_proof]
+
+    with pytest.raises(DeepFetchUnavailable) as failure:
+        validate_deepfetch_result(
+            _request(), replace(result, web_evidence=web_evidence)
+        )
+
+    assert failure.value.code == "deepfetch_prototype_evidence_invalid"
+
+
+@pytest.mark.parametrize(
+    "job_ref",
+    [None, "deepfetch-run:large-skill-trace"],
+    ids=["non-durable", "durable"],
+)
+def test_adapter_preserves_large_skill_trace_before_valid_web_evidence(
+    tmp_path: Path,
+    job_ref: str | None,
+) -> None:
+    executable = tmp_path / "fake-codex"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+result_path = pathlib.Path(arguments[arguments.index('--output-last-message') + 1])
+prompt = sys.stdin.read()
+print(json.dumps({
+    'type': 'thread.started',
+    'thread_id': 'native-large-skill-trace',
+}), flush=True)
+print(json.dumps({
+    'type': 'item.completed',
+    'item': {
+        'id': 'read-deepfetch-v4-references',
+        'type': 'command_execution',
+        'command': 'read official deepfetch_v4 skill references',
+        'aggregated_output': 'x' * (272 * 1024),
+        'exit_code': 0,
+        'status': 'completed',
+    },
+}), flush=True)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'search-after-skill-read', 'type': 'web_search',
+    'query': 'verifiable paper', 'action': {'type': 'search'}}}), flush=True)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'fetch-after-skill-read', 'type': 'web_search',
+    'query': 'https://example.org/paper', 'action': {'type': 'other'}}}),
+    flush=True)
+output_root = pathlib.Path(next(
+    line.split('=', 1)[1] for line in prompt.splitlines()
+    if line.startswith('public_output_root=')
+))
+(output_root / 'fulltext').mkdir(parents=True, exist_ok=True)
+(output_root / 'papers.json').write_text(
+    json.dumps({ledger!r}, ensure_ascii=False), encoding='utf-8')
+(output_root / 'summary.md').write_text(
+    '# 范围\\n\\n本轮检索未形成可纳入的精确论文。\\n', encoding='utf-8')
+result_path.write_text(json.dumps({result!r}), encoding='utf-8')
+""".replace("{result!r}", repr(PROTOTYPE_EMPTY_FINAL)).replace(
+            "{ledger!r}", repr(PROTOTYPE_EMPTY_LEDGER)
+        ),
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    workspace = tmp_path / "provider"
+    adapter = CodexDeepFetchAdapter(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=30,
+    )
+
+    result = adapter.execute(
+        replace(
+            _request(),
+            runtime_binding=adapter.runtime_binding(),
+            job_ref=job_ref,
+        )
+    )
+
+    assert result.completion == "honest_empty"
+    assert result.native_session_ref == "native-large-skill-trace"
+    assert result.web_evidence is not None
+    assert result.web_evidence["search_event_count"] == 1
+    assert result.web_evidence["fetch_event_count"] == 1
+    if job_ref is not None:
+        stdout_path = next(workspace.glob("provider-operations/*/*/stdout.jsonl"))
+        assert stdout_path.stat().st_size > 256 * 1024
+
+
+def test_durable_adapter_rejects_a_signed_stream_over_the_deepfetch_limit(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "provider"
+    adapter = CodexDeepFetchAdapter(
+        workspace,
+        process_runner=OversizedDurableStreamRunner(workspace),
+    )
+
+    with pytest.raises(
+        DeepFetchUnavailable, match="codex_deepfetch_output_too_large"
+    ):
+        adapter.execute(
+            replace(
+                _request(),
+                runtime_binding=adapter.runtime_binding(),
+                job_ref="deepfetch-run:oversized-stream",
+            )
+        )
+
+
+def test_durable_adapter_types_a_signed_supervisor_output_limit(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "provider"
+    adapter = CodexDeepFetchAdapter(
+        workspace,
+        process_runner=OutputLimitedDurableStreamRunner(workspace),
+    )
+
+    with pytest.raises(
+        DeepFetchUnavailable, match="codex_deepfetch_output_too_large"
+    ):
+        adapter.execute(
+            replace(
+                _request(),
+                runtime_binding=adapter.runtime_binding(),
+                job_ref="deepfetch-run:supervisor-output-limit",
+            )
+        )
 
 
 def test_codex_deepfetch_rejects_oversized_fulltext_before_validator_reads_it(
@@ -838,7 +1239,42 @@ def test_codex_deepfetch_rejects_unproven_reader_assignments(
     assert rejected.value.code == "deepfetch_reader_agent_trace_invalid"
 
 
-def test_codex_deepfetch_uses_live_web_in_a_workspace_write_root_session(
+def test_codex_deepfetch_accepts_completed_close_agent_reader_evidence(
+    tmp_path: Path,
+) -> None:
+    runner = PrototypeRecordingRunner(
+        PROTOTYPE_FINAL,
+        terminal_reader_tool="close_agent",
+    )
+    adapter = CodexDeepFetchAdapter(
+        tmp_path / "provider",
+        process_runner=runner,
+    )
+
+    result = adapter.execute(_request())
+
+    assert result.completion == "complete"
+    assert result.papers_ledger is not None
+
+
+def test_codex_deepfetch_deduplicates_wait_and_close_for_one_reader(
+    tmp_path: Path,
+) -> None:
+    runner = PrototypeRecordingRunner(
+        PROTOTYPE_FINAL,
+        emit_close_after_wait=True,
+    )
+    adapter = CodexDeepFetchAdapter(
+        tmp_path / "provider",
+        process_runner=runner,
+    )
+
+    result = adapter.execute(_request())
+
+    assert result.completion == "complete"
+
+
+def test_codex_deepfetch_uses_live_web_in_a_dedicated_full_access_root_session(
     tmp_path: Path,
 ) -> None:
     runner = RecordingRunner(PROTOTYPE_EMPTY_FINAL)
@@ -857,7 +1293,7 @@ def test_codex_deepfetch_uses_live_web_in_a_workspace_write_root_session(
     assert argv[:2] == ["codex", "exec"]
     assert "--ignore-user-config" in argv
     assert "--strict-config" in argv
-    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
     config_values = [
         argv[index + 1] for index, value in enumerate(argv) if value == "--config"
     ]
@@ -876,6 +1312,26 @@ def test_codex_deepfetch_uses_live_web_in_a_workspace_write_root_session(
         "web-fetch-live",
         "web-search-live",
     )
+
+
+def test_codex_deepfetch_does_not_require_user_namespaces_on_the_deployed_host(
+    tmp_path: Path,
+) -> None:
+    runner = NamespaceRestrictedRunner(PROTOTYPE_EMPTY_FINAL)
+    adapter = CodexDeepFetchAdapter(
+        tmp_path / "provider", model_ref="gpt-test", process_runner=runner
+    )
+
+    result = adapter.execute(_request())
+
+    assert result.completion == "honest_empty"
+    argv, _prompt, _timeout = runner.calls[0]
+    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
+    assert {
+        "filesystem-danger-full-access",
+        "sandbox-policy:danger-full-access",
+        "workspace-write-public-artifacts",
+    } <= set(adapter.runtime_binding().capability_bindings)
 
 
 def test_codex_deepfetch_rejects_a_forged_receipt_field_even_if_runner_bypasses_schema(

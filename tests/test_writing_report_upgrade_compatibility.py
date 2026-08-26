@@ -306,7 +306,9 @@ def test_0030_upgrade_resumes_a_pre_checkpoint_report_with_its_immutable_binding
     )
     restarted = _runtime(root, current_adapter)
     try:
-        assert _database_revision(data_root.database) == "0037_question_stage_identity"
+        assert _database_revision(data_root.database) == (
+            "0038_deepfetch_binding_audit"
+        )
         before = restarted.writing.query_writing_report(run_ref)
         assert before["run"]["runtime_binding_hash"] == binding_hash
         assert before["execution"]["checkpoint"] is None
@@ -375,7 +377,9 @@ def test_0030_upgrade_resumes_a_checkpointed_report_before_review_execution(
     )
     restarted = _runtime(root, current_adapter)
     try:
-        assert _database_revision(data_root.database) == "0037_question_stage_identity"
+        assert _database_revision(data_root.database) == (
+            "0038_deepfetch_binding_audit"
+        )
         before = restarted.writing.query_writing_report(run_ref)
         checkpoint = before["execution"]["checkpoint"]
         assert checkpoint is not None

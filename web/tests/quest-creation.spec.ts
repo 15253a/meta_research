@@ -176,16 +176,27 @@ test("create Quest is one continuous production window with fixed responsibiliti
     .locator("[data-journey-section]")
     .evaluateAll((sections) => sections.map((section) => section.getAttribute("data-journey-section")));
   expect(visibleSections).toEqual([
-    "goal",
+    "basis",
     "configuration",
     "literature",
-    "optional-basis",
+    "materials",
     "route",
     "question-proposal",
   ]);
 
-  await expect(form.getByLabel("这个 Quest 最终要完成什么？")).toBeVisible();
-  await expect(form.getByLabel("什么情况算完成？")).toBeVisible();
+  const basis = form.locator("[data-journey-section='basis']");
+  await expect(basis.getByLabel("背景（可选）")).toBeVisible();
+  await expect(basis.getByLabel("目标")).toBeVisible();
+  await expect(basis.getByLabel("边界")).toBeVisible();
+  await expect(basis.locator("label")).toHaveCount(3);
+  await expect(form.getByLabel("这个 Quest 最终要完成什么？")).toHaveCount(0);
+  await expect(form.getByLabel("什么情况算完成？")).toHaveCount(0);
+  const materials = form.locator("[data-journey-section='materials']");
+  await expect(materials.getByRole("button", { name: "选择文件", exact: true })).toBeVisible();
+  await expect(materials.getByRole("button", { name: "选择文件夹", exact: true })).toBeVisible();
+  await expect(materials.getByLabel("上传研究材料文件", { exact: true })).toBeAttached();
+  await expect(materials.getByLabel("上传研究材料文件夹", { exact: true })).toBeAttached();
+  await expect(form.getByText("先从左侧 Research Asset 工作台完成 Intake。")).toHaveCount(0);
   await expect(form.getByLabel("时间预算")).toBeVisible();
   await expect(form.getByRole("button", { name: "检测本机计算卡" })).toBeVisible();
   await expect(form.getByText("Quest Resource Envelope：", { exact: true })).toBeVisible();
@@ -298,9 +309,9 @@ test("draft autosaves, closes without cancellation, and restores from the fixed 
   await page.setViewportSize({ width: 800, height: 900 });
   await openAuthenticatedProduct(page);
   const { dialog, opener } = await openCreation(page);
-  const goal = dialog.getByLabel("这个 Quest 最终要完成什么？");
+  const goal = dialog.getByRole("textbox", { name: "目标", exact: true });
   await goal.fill("确定低照度显微图像去噪的可证伪边界");
-  await dialog.getByLabel("什么情况算完成？").fill("形成证据、反例和适用范围");
+  await dialog.getByRole("textbox", { name: "边界", exact: true }).fill("形成证据、反例和适用范围");
   // Closing must flush the latest controlled values even when the debounce has
   // not fired and the currently focused field has never blurred.
   await page.keyboard.press("Escape");
@@ -309,14 +320,14 @@ test("draft autosaves, closes without cancellation, and restores from the fixed 
 
   await opener.click();
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByLabel("这个 Quest 最终要完成什么？")).toHaveValue(
+  await expect(dialog.getByRole("textbox", { name: "目标", exact: true })).toHaveValue(
     "确定低照度显微图像去噪的可证伪边界",
   );
-  await expect(dialog.getByLabel("什么情况算完成？")).toHaveValue(
+  await expect(dialog.getByRole("textbox", { name: "边界", exact: true })).toHaveValue(
     "形成证据、反例和适用范围",
   );
 
-  await dialog.getByLabel("这个 Quest 最终要完成什么？").fill(
+  await dialog.getByRole("textbox", { name: "目标", exact: true }).fill(
     "遮罩关闭也必须保留精确 durable 草案",
   );
   await page.mouse.click(3, 3);
@@ -325,17 +336,48 @@ test("draft autosaves, closes without cancellation, and restores from the fixed 
 
   await opener.click();
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByLabel("这个 Quest 最终要完成什么？")).toHaveValue(
+  await expect(dialog.getByRole("textbox", { name: "目标", exact: true })).toHaveValue(
     "遮罩关闭也必须保留精确 durable 草案",
   );
 });
 
-test("small viewport stacks the form before the persistent drafting session", async ({
+test("800 and 390 layouts keep the three-part brief readable and the drafting session reachable", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 800, height: 900 });
   await openAuthenticatedProduct(page);
   const { dialog } = await openCreation(page);
+
+  const basis = dialog.locator("[data-journey-section='basis']");
+  const backgroundAt800 = await basis.getByRole("textbox", {
+    name: "背景（可选）",
+  }).boundingBox();
+  const goalAt800 = await basis.getByRole("textbox", {
+    name: "目标",
+    exact: true,
+  }).boundingBox();
+  const boundaryAt800 = await basis.getByRole("textbox", {
+    name: "边界",
+    exact: true,
+  }).boundingBox();
+  expect(backgroundAt800?.width ?? 0).toBeGreaterThan((goalAt800?.width ?? 0) * 1.8);
+  expect(Math.abs((goalAt800?.y ?? 0) - (boundaryAt800?.y ?? 0))).toBeLessThan(2);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const backgroundAt390 = await basis.getByRole("textbox", {
+    name: "背景（可选）",
+  }).boundingBox();
+  const goalAt390 = await basis.getByRole("textbox", {
+    name: "目标",
+    exact: true,
+  }).boundingBox();
+  const boundaryAt390 = await basis.getByRole("textbox", {
+    name: "边界",
+    exact: true,
+  }).boundingBox();
+  expect(goalAt390?.y ?? 0).toBeGreaterThan(backgroundAt390?.y ?? 0);
+  expect(boundaryAt390?.y ?? 0).toBeGreaterThan(goalAt390?.y ?? 0);
 
   const geometry = await dialog.evaluate((root) => {
     const form = root.querySelector("[data-testid=quest-continuous-form]")!.getBoundingClientRect();

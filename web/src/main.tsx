@@ -3479,12 +3479,27 @@ function App() {
   const questionTreeReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const writingButtonRef = useRef<HTMLButtonElement>(null);
   const humanRequestReturnFocusRef = useRef<HTMLElement | null>(null);
+  const humanRequestReturnUrlRef = useRef<string | null>(null);
+  const humanRequestPresentedKeysRef = useRef<Set<string>>(new Set());
+  const activeHumanRequestPresentationKeyRef = useRef<string | null>(null);
   const questWideRequests = useMemo(
     () => questWideBlockingHumanRequests(snapshot),
     [
       snapshot?.human_collaboration?.companion.scope_ref,
       snapshot?.human_collaboration?.human_requests,
     ],
+  );
+  const nextUnpresentedQuestWideRequest = useCallback(
+    () => questWideRequests.find((item) => {
+      const key = humanRequestPresentationKey(item);
+      if (humanRequestPresentedKeysRef.current.has(key)) return false;
+      try {
+        return window.sessionStorage.getItem(key) === null;
+      } catch {
+        return true;
+      }
+    }),
+    [questWideRequests],
   );
   const executionObserver = useExecutionObserver(
     snapshot?.experiment?.current ?? null,
@@ -3634,26 +3649,39 @@ function App() {
   }, [humanRequestRouteKind, humanRequestsOpen, snapshot?.human_collaboration?.human_requests]);
 
   useEffect(() => {
-    const globalRequest = questWideRequests.find((item) => {
-      const key = humanRequestPresentationKey(item);
-      try {
-        return window.sessionStorage.getItem(key) === null;
-      } catch {
-        return true;
-      }
-    });
+    // A global wait is important, but it must not destroy another formal
+    // workflow that the researcher is actively completing. Keep the request
+    // visible in the Companion queue and present it as soon as that surface
+    // closes; no draft or upload state is discarded.
+    if (
+      creationMode ||
+      assetsOpen ||
+      writingOpen ||
+      manualPanel ||
+      humanRequestsOpen ||
+      activeHumanRequestPresentationKeyRef.current !== null
+    ) return;
+    const globalRequest = nextUnpresentedQuestWideRequest();
     if (!globalRequest) return;
     const presentationKey = humanRequestPresentationKey(globalRequest);
     try {
-      if (window.sessionStorage.getItem(presentationKey)) return;
+      if (window.sessionStorage.getItem(presentationKey)) {
+        humanRequestPresentedKeysRef.current.add(presentationKey);
+        return;
+      }
       window.sessionStorage.setItem(presentationKey, "presented");
     } catch {
-      // The in-memory open still presents the current global request once this render.
+      // The mounted queue still presents this exact request only once.
+    }
+    humanRequestPresentedKeysRef.current.add(presentationKey);
+    activeHumanRequestPresentationKeyRef.current = presentationKey;
+    if (humanRequestReturnUrlRef.current === null) {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement) humanRequestReturnFocusRef.current = active;
+      humanRequestReturnUrlRef.current =
+        `${window.location.pathname}${window.location.search}${window.location.hash}`;
     }
     executionObserver.deferForPrioritySurface();
-    setCreationMode(null);
-    setAssetsOpen(false);
-    setWritingOpen(false);
     setSelectedHumanRequestRef(globalRequest.request_ref);
     setHumanRequestRouteKind(null);
     window.history.replaceState(
@@ -3662,7 +3690,15 @@ function App() {
       `/?panel=${humanRequestPanelByKind[globalRequest.kind]}`,
     );
     setHumanRequestsOpen(true);
-  }, [executionObserver.deferForPrioritySurface, questWideRequests]);
+  }, [
+    assetsOpen,
+    creationMode,
+    executionObserver.deferForPrioritySurface,
+    manualPanel,
+    humanRequestsOpen,
+    nextUnpresentedQuestWideRequest,
+    writingOpen,
+  ]);
 
   const state = shellState(snapshot, error);
   const canCreate = questCreationReady(snapshot);
@@ -4010,12 +4046,11 @@ function App() {
   const openHumanRequests = (requestRef: string | null = null) => {
     if (!canBrowseHumanRequests) return;
     const active = document.activeElement;
-    if (!humanRequestsOpen && active instanceof HTMLElement) {
-      humanRequestReturnFocusRef.current = active;
+    if (!humanRequestsOpen && humanRequestReturnUrlRef.current === null) {
+      if (active instanceof HTMLElement) humanRequestReturnFocusRef.current = active;
+      humanRequestReturnUrlRef.current =
+        `${window.location.pathname}${window.location.search}${window.location.hash}`;
     }
-    setCreationMode(null);
-    setAssetsOpen(false);
-    setWritingOpen(false);
     setHumanRequestRouteKind(null);
     setSelectedHumanRequestRef(requestRef);
     const request = snapshot?.human_collaboration?.human_requests.items.find(
@@ -4044,11 +4079,16 @@ function App() {
   };
   const closeHumanRequests = () => {
     const returnFocus = humanRequestReturnFocusRef.current;
-    window.history.replaceState(null, "", "/");
+    const returnUrl = humanRequestReturnUrlRef.current ?? "/";
+    const queuedRequest = nextUnpresentedQuestWideRequest();
+    activeHumanRequestPresentationKeyRef.current = null;
     setHumanRequestsOpen(false);
     setHumanRequestRouteKind(null);
     setSelectedHumanRequestRef(null);
+    if (queuedRequest) return;
+    window.history.replaceState(null, "", returnUrl);
     humanRequestReturnFocusRef.current = null;
+    humanRequestReturnUrlRef.current = null;
     window.requestAnimationFrame(() => {
       if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
       else document.querySelector<HTMLButtonElement>("[aria-label='HumanRequest']")?.focus();

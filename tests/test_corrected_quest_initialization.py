@@ -129,6 +129,34 @@ class DurableReconciliationDraftingAdapter(CleanupTrackingDraftingAdapter):
         )
 
 
+class LegacyContractTransitionDraftingAdapter(CleanupTrackingDraftingAdapter):
+    """Model one terminal legacy spool followed by a fresh current job."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.legacy_job_ref: str | None = None
+        self.legacy_terminal = False
+        self.proposal_job_refs: list[str] = []
+
+    def reconcile_job(self, job_ref: str) -> str:
+        if job_ref != self.legacy_job_ref or not self.legacy_terminal:
+            return "pending"
+        return "terminal"
+
+    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+        assert request.job_ref is not None
+        self.proposal_job_refs.append(request.job_ref)
+        if self.legacy_job_ref is None:
+            self.legacy_job_ref = request.job_ref
+            raise DraftingUnavailable("codex_job_outcome_unknown")
+        if request.job_ref == self.legacy_job_ref:
+            raise DraftingUnavailable("codex_execution_contract_outdated")
+        self.draft_calls += 1
+        return ProposalDraftResult(
+            content=QUESTION, adapter_kind="test_current_drafting_contract"
+        )
+
+
 class DeterministicProbe:
     def observe(self) -> HostComputeSnapshot:
         return HostComputeSnapshot(
@@ -2244,6 +2272,85 @@ def test_restart_reconciles_pending_proposal_on_one_stable_provider_operation(
         if restarted is not None:
             restarted.close()
         original.close()
+
+
+def test_terminal_legacy_proposal_fails_outdated_then_retries_on_a_new_v2_job(
+    tmp_path: Path,
+) -> None:
+    adapter = LegacyContractTransitionDraftingAdapter()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "proposal-legacy-contract-transition"),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    hc = runtime.owners.human_collaboration
+    try:
+        opened = hc.create_quest({}, "legacy-contract-open")
+        probed = hc.observe_host_compute(
+            opened["initialization_id"],
+            ["GPU-test-1"],
+            "legacy-contract-probe",
+        )
+        draft = {
+            **probed["quest_draft"]["value"],
+            "goal": "旧权限合同终态不得被当前 Proposal 采用。",
+            "completion_criteria": "旧 job 失败释放，新 job 使用当前合同成功。",
+        }
+        saved = hc.revise_quest_draft(
+            opened["initialization_id"],
+            draft,
+            probed["quest_draft"]["hash"],
+            "legacy-contract-save",
+            probed["quest_draft"]["revision"],
+        )
+        first = hc.generate_question_proposal(
+            saved["initialization_id"],
+            saved["quest_draft"]["hash"],
+            "legacy-contract-first-generation",
+            saved["quest_draft"]["revision"],
+        )
+
+        assert not hc.process_drafting_once()
+        running = hc.query_quest_creation(saved["initialization_id"])
+        assert running["proposal_generation"]["status"] == "running"
+        old_job_ref = adapter.legacy_job_ref
+        assert old_job_ref is not None
+        adapter.legacy_terminal = True
+
+        assert hc.process_drafting_once()
+        failed = hc.query_quest_creation(saved["initialization_id"])
+        assert failed["proposal_generation"]["ref"] == first[
+            "proposal_generation"
+        ]["ref"]
+        assert failed["proposal_generation"]["status"] == "failed"
+        assert failed["proposal_generation"]["failure"] == {
+            "code": "codex_execution_contract_outdated"
+        }
+        assert adapter.finished_job_refs == [old_job_ref]
+        assert runtime.query_runtime_observability()["responsibilities"] == []
+
+        second = hc.generate_question_proposal(
+            saved["initialization_id"],
+            saved["quest_draft"]["hash"],
+            "legacy-contract-current-generation",
+            saved["quest_draft"]["revision"],
+        )
+        assert second["proposal_generation"]["ref"] != first[
+            "proposal_generation"
+        ]["ref"]
+        assert hc.process_drafting_once()
+        succeeded = hc.query_quest_creation(saved["initialization_id"])
+        assert succeeded["proposal_generation"]["status"] == "succeeded"
+        assert adapter.proposal_job_refs[-1] != old_job_ref
+        assert adapter.draft_calls == 1
+        assert adapter.finished_job_refs == [
+            old_job_ref,
+            adapter.proposal_job_refs[-1],
+        ]
+        assert runtime.query_runtime_observability()["responsibilities"] == []
+    finally:
+        runtime.close()
 
 
 def test_restart_reconciles_pending_intent_on_one_stable_provider_operation(

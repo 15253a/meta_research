@@ -167,6 +167,19 @@ export type AssetIntakeResult = {
   failure: null | { code: string };
 };
 
+export type ScopedAssetIntakeContext = {
+  kind: "quest_creation";
+  ref: string;
+};
+
+export type ScopedAssetIntakePointer = {
+  job_ref: string;
+  write_slot: string;
+  context: ScopedAssetIntakeContext;
+  display_name: string;
+  operation_ref?: string;
+};
+
 export type LiteratureMode = "oa_then_institution" | "oa_only" | "provided_only";
 
 export type QuestDraft = {
@@ -279,6 +292,7 @@ export type DeepFetchRun = {
   status: "admitted" | "running" | "executed" | "failed" | "cancelled";
   attempt_ref: string | null;
   attempt_generation: number;
+  provider_operation_retry_permitted: boolean;
   root_session_ref: string;
   native_session_ref: string | null;
   fence_ref: string | null;
@@ -2219,6 +2233,30 @@ type PendingHumanRequestAssetIntakeOperation = {
   sealed_operation: PendingHumanRequestAssetResponse["sealed_response"];
 };
 
+type PendingScopedAssetIntakeOperation = {
+  schema: "meta-research/scoped-asset-intake/v1";
+  operation_ref: string;
+  context: ScopedAssetIntakeContext;
+  intake_path: "/api/v1/research-assets/intakes";
+  asset_idempotency_key: string;
+  asset_write_slot: string;
+  display_name: string;
+  sealed_operation: PendingHumanRequestAssetResponse["sealed_response"];
+};
+
+type PendingScopedAssetIntakeJob = {
+  schema: "meta-research/scoped-asset-intake-job/v1";
+  operation_ref: string;
+  context: ScopedAssetIntakeContext;
+  job_ref: string;
+  asset_write_slot: string;
+  display_name: string;
+};
+
+type PendingScopedAssetIntakeRecovery =
+  | PendingScopedAssetIntakeOperation
+  | PendingScopedAssetIntakeJob;
+
 type HumanRequestAssetIntakeOperationBody = {
   intake: AssetIntakeRequest;
   response: HumanRequestResponseBody;
@@ -3706,6 +3744,87 @@ export async function submitAssetIntake(
   return result;
 }
 
+export async function submitScopedAssetIntake(
+  context: ScopedAssetIntakeContext,
+  intake: AssetIntakeRequest,
+): Promise<AssetIntakeResult> {
+  validateScopedAssetIntakeContext(context);
+  await hydratePendingHumanRequestRecovery();
+  const exactIntake = JSON.parse(JSON.stringify(intake)) as AssetIntakeRequest;
+  const intakePath = "/api/v1/research-assets/intakes" as const;
+  const bodyJson = JSON.stringify(exactIntake);
+  const operationRef = crypto.randomUUID();
+  const operationIdentity = scopedAssetIntakeOperationIdentity(context, operationRef);
+  const pendingWrite = await reserveIdempotencyKey(
+    "POST",
+    intakePath,
+    bodyJson,
+    operationIdentity,
+  );
+  let operation: PendingScopedAssetIntakeOperation | null = null;
+  try {
+    operation = await stageScopedAssetIntakeOperation(
+      context,
+      operationRef,
+      pendingWrite,
+      exactIntake,
+    );
+    retainScopedAssetIntakePointer(scopedAssetIntakeOperationPointer(operation));
+  } catch (error) {
+    if (operation) await deleteScopedAssetIntakeOperation(operation);
+    pendingWrite.clear();
+    throw error;
+  }
+  return executeScopedAssetIntakeOperation(operation);
+}
+
+export function pendingScopedAssetIntakes(
+  context: ScopedAssetIntakeContext,
+): ScopedAssetIntakePointer[] {
+  validateScopedAssetIntakeContext(context);
+  const serialized = readSessionValue(scopedAssetIntakeSlot(context));
+  if (!serialized) return [];
+  try {
+    const parsed = JSON.parse(serialized) as unknown;
+    if (!Array.isArray(parsed)) throw new Error("invalid pointer list");
+    return parsed.map((value) => parseScopedAssetIntakePointer(value, context));
+  } catch (caught) {
+    if (caught instanceof ProductError) throw caught;
+    throw new ProductError("asset_intake_recovery_invalid");
+  }
+}
+
+export async function hydrateScopedAssetIntakeRecovery(
+  context: ScopedAssetIntakeContext,
+): Promise<ScopedAssetIntakePointer[]> {
+  validateScopedAssetIntakeContext(context);
+  await hydratePendingHumanRequestRecovery();
+  for (const serialized of recoveryManifestValues("scoped-asset-intake")) {
+    const recovery = parsePendingScopedAssetIntakeRecovery(serialized);
+    if (
+      recovery?.context.kind === context.kind &&
+      recovery.context.ref === context.ref
+    ) {
+      // The durable record is canonical. In particular, a renderer may have
+      // disappeared after the operation was atomically advanced to a real job
+      // but before its session pointer was replaced.
+      retainScopedAssetIntakePointer(scopedAssetIntakeRecoveryPointer(recovery));
+    }
+  }
+  return pendingScopedAssetIntakes(context);
+}
+
+export function acknowledgeScopedAssetIntake(
+  context: ScopedAssetIntakeContext,
+  jobRef: string,
+): void {
+  validateScopedAssetIntakeContext(context);
+  const pointers = pendingScopedAssetIntakes(context);
+  const matched = pointers.find((pointer) => pointer.job_ref === jobRef);
+  if (!matched) return;
+  void acknowledgeScopedAssetIntakeOnce(context, matched).catch(() => undefined);
+}
+
 export async function submitHumanRequestAssetIntake(
   requestRef: string,
   intake: AssetIntakeRequest,
@@ -3764,6 +3883,14 @@ export async function fetchAssetIntake(
   jobRef: string,
   signal?: AbortSignal,
 ): Promise<AssetIntakeResult> {
+  const operationRef = scopedAssetIntakeOperationRefFromJobRef(jobRef);
+  if (operationRef) {
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+    await hydratePendingHumanRequestRecovery();
+    const operation = readPendingScopedAssetIntakeOperation(operationRef);
+    if (!operation) throw new ProductError("asset_intake_recovery_missing");
+    return executeScopedAssetIntakeOperation(operation);
+  }
   const result = await readJson<AssetIntakeResult>(
     `/api/v1/research-assets/intakes/${jobRef}`,
     signal,
@@ -3991,12 +4118,18 @@ async function writeJson<T>(
     retainPending: (payload: T) => boolean;
     onRetained: (payload: T, pendingWrite: PendingWrite) => void | Promise<void>;
     onReserved?: (pendingWrite: PendingWrite) => void;
+    idempotencyScope?: string;
   },
 ): Promise<T> {
   const csrfToken = readCookie("meta_research_csrf");
   if (!csrfToken) throw new ProductError("csrf_token_unavailable");
   const bodyJson = JSON.stringify(body);
-  const pendingWrite = await reserveIdempotencyKey(method, path, bodyJson);
+  const pendingWrite = await reserveIdempotencyKey(
+    method,
+    path,
+    bodyJson,
+    options?.idempotencyScope,
+  );
   options?.onReserved?.(pendingWrite);
   const response = await fetch(path, {
     method,
@@ -4027,6 +4160,8 @@ async function writeJson<T>(
 
 const inMemoryPendingWrites = new Map<string, string>();
 const pendingAssetIntakeSlot = "meta_research_pending_asset_intake";
+const scopedAssetIntakeSlotPrefix = "meta_research_pending_asset_intake:v2";
+const scopedAssetIntakeRecoveryJobPrefix = "local-scoped-asset-intake:";
 const pendingHumanRequestResponseSlot = "meta_research_pending_human_request_response";
 const pendingHumanRequestAssetResponseSlot =
   "meta_research_pending_human_request_asset_response";
@@ -4044,7 +4179,8 @@ type HumanRequestRecoveryManifestKind =
   | "response"
   | "asset-response"
   | "asset-intake"
-  | "accepted-asset";
+  | "accepted-asset"
+  | "scoped-asset-intake";
 const humanRequestRecoveryManifestKinds: Array<{
   kind: HumanRequestRecoveryManifestKind;
   legacySlot: typeof humanRequestRecoveryManifestSlots[number];
@@ -4063,12 +4199,24 @@ function runHumanRequestRecoverySingleFlight<T>(
   requestRef: string,
   operation: () => Promise<T>,
 ): Promise<T> {
+  return runRecoverySingleFlight(
+    identity,
+    `meta-research:human-request-recovery:${requestRef}`,
+    operation,
+  );
+}
+
+function runRecoverySingleFlight<T>(
+  identity: string,
+  lockName: string,
+  operation: () => Promise<T>,
+): Promise<T> {
   const existing = humanRequestRecoveryFlights.get(identity);
   if (existing) return existing as Promise<T>;
   const execute = (): Promise<T> => {
     if (typeof navigator !== "undefined" && navigator.locks) {
       return navigator.locks.request(
-        `meta-research:human-request-recovery:${requestRef}`,
+        lockName,
         { mode: "exclusive" },
         () => operation(),
       ) as unknown as Promise<T>;
@@ -4087,12 +4235,374 @@ function runHumanRequestRecoverySingleFlight<T>(
 type PendingWrite = { key: string; slot: string; clear: () => void };
 type PendingAssetIntake = { job_ref: string; write_slot: string };
 
+function validateScopedAssetIntakeContext(
+  context: ScopedAssetIntakeContext,
+): void {
+  if (
+    context.kind !== "quest_creation" ||
+    !context.ref ||
+    context.ref.length > 512
+  ) {
+    throw new ProductError("asset_intake_context_invalid");
+  }
+}
+
+function scopedAssetIntakeSlot(context: ScopedAssetIntakeContext): string {
+  validateScopedAssetIntakeContext(context);
+  return `${scopedAssetIntakeSlotPrefix}:${context.kind}:${encodeURIComponent(context.ref)}`;
+}
+
+function parseScopedAssetIntakePointer(
+  value: unknown,
+  context: ScopedAssetIntakeContext,
+): ScopedAssetIntakePointer {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new ProductError("asset_intake_recovery_invalid");
+  }
+  const pointer = value as Partial<ScopedAssetIntakePointer>;
+  const operationRef = typeof pointer.operation_ref === "string"
+    ? pointer.operation_ref
+    : null;
+  if (
+    typeof pointer.job_ref !== "string" ||
+    !pointer.job_ref ||
+    pointer.job_ref.length > 512 ||
+    typeof pointer.write_slot !== "string" ||
+    !pointer.write_slot.startsWith("meta_research_pending_write:") ||
+    typeof pointer.display_name !== "string" ||
+    !pointer.display_name ||
+    pointer.display_name.length > 512 ||
+    pointer.context?.kind !== context.kind ||
+    pointer.context.ref !== context.ref ||
+    (operationRef !== null && (!operationRef || operationRef.length > 128)) ||
+    (pointer.job_ref.startsWith(scopedAssetIntakeRecoveryJobPrefix) &&
+      scopedAssetIntakeOperationRefFromJobRef(pointer.job_ref) !== operationRef)
+  ) {
+    throw new ProductError("asset_intake_recovery_invalid");
+  }
+  return pointer as ScopedAssetIntakePointer;
+}
+
+function scopedAssetIntakeOperationJobRef(operationRef: string): string {
+  return `${scopedAssetIntakeRecoveryJobPrefix}${operationRef}`;
+}
+
+function scopedAssetIntakeOperationRefFromJobRef(jobRef: string): string | null {
+  if (!jobRef.startsWith(scopedAssetIntakeRecoveryJobPrefix)) return null;
+  const operationRef = jobRef.slice(scopedAssetIntakeRecoveryJobPrefix.length);
+  if (!operationRef || operationRef.length > 128) {
+    throw new ProductError("asset_intake_recovery_invalid");
+  }
+  return operationRef;
+}
+
+function scopedAssetIntakeOperationIdentity(
+  context: ScopedAssetIntakeContext,
+  operationRef: string,
+): string {
+  validateScopedAssetIntakeContext(context);
+  return `${context.kind}:${encodeURIComponent(context.ref)}:${operationRef}`;
+}
+
+function scopedAssetIntakeOperationBindingJson(
+  operation: Omit<PendingScopedAssetIntakeOperation, "sealed_operation">,
+): string {
+  return JSON.stringify({
+    schema: operation.schema,
+    operation_ref: operation.operation_ref,
+    context: operation.context,
+    intake_path: operation.intake_path,
+    asset_idempotency_key: operation.asset_idempotency_key,
+    asset_write_slot: operation.asset_write_slot,
+    display_name: operation.display_name,
+  });
+}
+
+function scopedAssetIntakeOperationPointer(
+  operation: PendingScopedAssetIntakeOperation,
+): ScopedAssetIntakePointer {
+  return {
+    job_ref: scopedAssetIntakeOperationJobRef(operation.operation_ref),
+    write_slot: operation.asset_write_slot,
+    context: operation.context,
+    display_name: operation.display_name,
+    operation_ref: operation.operation_ref,
+  };
+}
+
+function scopedAssetIntakeJobPointer(
+  job: PendingScopedAssetIntakeJob,
+): ScopedAssetIntakePointer {
+  return {
+    job_ref: job.job_ref,
+    write_slot: job.asset_write_slot,
+    context: job.context,
+    display_name: job.display_name,
+    operation_ref: job.operation_ref,
+  };
+}
+
+function scopedAssetIntakeRecoveryPointer(
+  recovery: PendingScopedAssetIntakeRecovery,
+): ScopedAssetIntakePointer {
+  return recovery.schema === "meta-research/scoped-asset-intake/v1"
+    ? scopedAssetIntakeOperationPointer(recovery)
+    : scopedAssetIntakeJobPointer(recovery);
+}
+
+function retainScopedAssetIntakePointer(pointer: ScopedAssetIntakePointer): void {
+  const current = pendingScopedAssetIntakes(pointer.context);
+  const next = [
+    ...current.filter((item) =>
+      item.job_ref !== pointer.job_ref &&
+      (!pointer.operation_ref || item.operation_ref !== pointer.operation_ref)
+    ),
+    pointer,
+  ];
+  const serialized = JSON.stringify(next);
+  writeSessionValue(scopedAssetIntakeSlot(pointer.context), serialized);
+  if (readSessionValue(scopedAssetIntakeSlot(pointer.context)) !== serialized) {
+    throw new ProductError("asset_intake_recovery_pointer_store_unavailable");
+  }
+}
+
+async function acknowledgeScopedAssetIntakeOnce(
+  context: ScopedAssetIntakeContext,
+  matched: ScopedAssetIntakePointer,
+): Promise<void> {
+  const operationRef = matched.operation_ref;
+  if (operationRef) {
+    await hydratePendingHumanRequestRecovery();
+    const recovery = readPendingScopedAssetIntakeRecovery(operationRef);
+    if (
+      recovery &&
+      recovery.context.kind === context.kind &&
+      recovery.context.ref === context.ref
+    ) {
+      await deleteScopedAssetIntakeRecovery(recovery);
+    }
+  }
+
+  // Remove the volatile locator only after the durable descriptor is gone.
+  // If IndexedDB cleanup is interrupted, reload can still reconstruct and
+  // safely repeat the terminal bind acknowledgement.
+  clearPendingWriteSlot(matched.write_slot);
+  const current = pendingScopedAssetIntakes(context);
+  const remaining = current.filter((pointer) =>
+    pointer.job_ref !== matched.job_ref &&
+    (!operationRef || pointer.operation_ref !== operationRef)
+  );
+  if (remaining.length) {
+    writeSessionValue(scopedAssetIntakeSlot(context), JSON.stringify(remaining));
+  } else {
+    removeSessionValue(scopedAssetIntakeSlot(context));
+  }
+}
+
+function removeScopedAssetIntakeOperationPointer(
+  operation: PendingScopedAssetIntakeOperation,
+): void {
+  const current = pendingScopedAssetIntakes(operation.context);
+  const remaining = current.filter((pointer) =>
+    pointer.operation_ref !== operation.operation_ref &&
+    pointer.job_ref !== scopedAssetIntakeOperationJobRef(operation.operation_ref)
+  );
+  if (remaining.length) {
+    writeSessionValue(scopedAssetIntakeSlot(operation.context), JSON.stringify(remaining));
+  } else {
+    removeSessionValue(scopedAssetIntakeSlot(operation.context));
+  }
+}
+
+async function stageScopedAssetIntakeOperation(
+  context: ScopedAssetIntakeContext,
+  operationRef: string,
+  pendingWrite: PendingWrite,
+  intake: AssetIntakeRequest,
+): Promise<PendingScopedAssetIntakeOperation> {
+  const descriptor: Omit<PendingScopedAssetIntakeOperation, "sealed_operation"> = {
+    schema: "meta-research/scoped-asset-intake/v1",
+    operation_ref: operationRef,
+    context: { ...context },
+    intake_path: "/api/v1/research-assets/intakes",
+    asset_idempotency_key: pendingWrite.key,
+    asset_write_slot: pendingWrite.slot,
+    display_name: intake.display_name,
+  };
+  const bodyJson = JSON.stringify(intake);
+  const preparedOperation = await sealHumanRequestResponse(
+    bodyJson,
+    await sha256Hex(bodyJson),
+    scopedAssetIntakeOperationBindingJson(descriptor),
+  );
+  const operation: PendingScopedAssetIntakeOperation = {
+    ...descriptor,
+    sealed_operation: preparedOperation.sealed,
+  };
+  await storeHumanRequestRecoveryRecord(
+    "scoped-asset-intake",
+    scopedAssetIntakeOperationIdentity(context, operationRef),
+    JSON.stringify(operation),
+    preparedOperation,
+  );
+  return operation;
+}
+
+function executeScopedAssetIntakeOperation(
+  operation: PendingScopedAssetIntakeOperation,
+): Promise<AssetIntakeResult> {
+  const identity = scopedAssetIntakeOperationIdentity(
+    operation.context,
+    operation.operation_ref,
+  );
+  return runRecoverySingleFlight(
+    `scoped-asset-intake:${identity}`,
+    `meta-research:scoped-asset-intake-recovery:${identity}`,
+    () => executeScopedAssetIntakeOperationOnce(operation),
+  );
+}
+
+async function executeScopedAssetIntakeOperationOnce(
+  operation: PendingScopedAssetIntakeOperation,
+): Promise<AssetIntakeResult> {
+  const intake = await unsealScopedAssetIntakeOperation(operation);
+  try {
+    return await writeJson<AssetIntakeResult>(
+      operation.intake_path,
+      "POST",
+      intake,
+      {
+        idempotencyScope: scopedAssetIntakeOperationIdentity(
+          operation.context,
+          operation.operation_ref,
+        ),
+        retainPending: () => true,
+        onReserved: (pendingWrite) => {
+          if (pendingWrite.key !== operation.asset_idempotency_key ||
+              pendingWrite.slot !== operation.asset_write_slot) {
+            throw new ProductError("asset_intake_recovery_idempotency_mismatch");
+          }
+        },
+        onRetained: async (result) => {
+          const job = await transitionScopedAssetIntakeOperationToJob(operation, result);
+          retainScopedAssetIntakePointer(scopedAssetIntakeJobPointer(job));
+        },
+      },
+    );
+  } catch (error) {
+    if (isPermanentScopedAssetIntakeRejection(error)) {
+      await discardScopedAssetIntakeOperation(operation);
+    }
+    throw error;
+  }
+}
+
+async function deleteScopedAssetIntakeOperation(
+  operation: PendingScopedAssetIntakeOperation,
+): Promise<void> {
+  await deleteHumanRequestRecoveryRecord(
+    "scoped-asset-intake",
+    scopedAssetIntakeOperationIdentity(operation.context, operation.operation_ref),
+    JSON.stringify(operation),
+    operation.sealed_operation,
+  );
+}
+
+async function transitionScopedAssetIntakeOperationToJob(
+  operation: PendingScopedAssetIntakeOperation,
+  result: AssetIntakeResult,
+): Promise<PendingScopedAssetIntakeJob> {
+  if (
+    typeof result.job_ref !== "string" ||
+    !result.job_ref ||
+    result.job_ref.length > 512 ||
+    result.job_ref.startsWith(scopedAssetIntakeRecoveryJobPrefix)
+  ) {
+    throw new ProductError("asset_intake_recovery_job_invalid");
+  }
+  const job: PendingScopedAssetIntakeJob = {
+    schema: "meta-research/scoped-asset-intake-job/v1",
+    operation_ref: operation.operation_ref,
+    context: { ...operation.context },
+    job_ref: result.job_ref,
+    asset_write_slot: operation.asset_write_slot,
+    display_name: operation.display_name,
+  };
+  await replaceHumanRequestRecoveryRecord(
+    "scoped-asset-intake",
+    scopedAssetIntakeOperationIdentity(operation.context, operation.operation_ref),
+    JSON.stringify(operation),
+    JSON.stringify(job),
+    operation.sealed_operation,
+  );
+  return job;
+}
+
+async function deleteScopedAssetIntakeRecovery(
+  recovery: PendingScopedAssetIntakeRecovery,
+): Promise<void> {
+  await deleteHumanRequestRecoveryRecord(
+    "scoped-asset-intake",
+    scopedAssetIntakeOperationIdentity(recovery.context, recovery.operation_ref),
+    JSON.stringify(recovery),
+    recovery.schema === "meta-research/scoped-asset-intake/v1"
+      ? recovery.sealed_operation
+      : undefined,
+  );
+}
+
+async function discardScopedAssetIntakeOperation(
+  operation: PendingScopedAssetIntakeOperation,
+): Promise<void> {
+  // Keep the replay locator until the sealed record is durably gone. If local
+  // cleanup is interrupted, the same known rejection can be replayed solely to
+  // finish cleanup instead of leaving an unrecoverable pointer/body split.
+  await deleteScopedAssetIntakeOperation(operation);
+  removeScopedAssetIntakeOperationPointer(operation);
+  clearPendingWriteSlot(operation.asset_write_slot);
+}
+
+function isPermanentScopedAssetIntakeRejection(error: unknown): boolean {
+  if (!(error instanceof ProductError)) return false;
+  return new Set([
+    "idempotency_conflict",
+    "asset_intake_idempotency_conflict",
+    "asset_intake_idempotency_key_invalid",
+    "asset_intake_request_invalid",
+    "asset_content_base64_invalid",
+    "asset_content_encoding_ambiguous",
+    "asset_content_invalid",
+    "asset_content_required",
+    "asset_content_too_large",
+    "asset_custody_mode_invalid",
+    "asset_display_name_invalid",
+    "asset_media_type_invalid",
+    "asset_provenance_invalid",
+    "asset_provenance_too_large",
+    "asset_ref_invalid",
+    "asset_source_kind_invalid",
+    "asset_source_kind_not_supported",
+    "asset_source_locator_absolute_required",
+    "asset_source_locator_invalid",
+    "asset_source_locator_required",
+    "asset_source_payload_ambiguous",
+    "request_failed:400",
+    "request_failed:413",
+    "request_failed:415",
+    "request_failed:422",
+  ]).has(error.code);
+}
+
 async function reserveIdempotencyKey(
   method: string,
   path: string,
   bodyJson: string,
+  scopeIdentity = "",
 ): Promise<PendingWrite> {
-  const bytes = new TextEncoder().encode(`${method}\n${path}\n${bodyJson}`);
+  const fingerprintInput = scopeIdentity
+    ? `${method}\n${path}\n${scopeIdentity}\n${bodyJson}`
+    : `${method}\n${path}\n${bodyJson}`;
+  const bytes = new TextEncoder().encode(fingerprintInput);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, "0"),
@@ -4326,6 +4836,121 @@ function readPendingHumanRequestAssetIntakeOperations():
   });
 }
 
+function parsePendingScopedAssetIntakeOperation(
+  value: string | null,
+): PendingScopedAssetIntakeOperation | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingScopedAssetIntakeOperation>;
+    const context = parsed.context as Partial<ScopedAssetIntakeContext> | undefined;
+    const sealed = parsed.sealed_operation as
+      | Partial<PendingHumanRequestAssetResponse["sealed_response"]>
+      | undefined;
+    const valid = parsed.schema === "meta-research/scoped-asset-intake/v1"
+      && typeof parsed.operation_ref === "string"
+      && parsed.operation_ref.length > 0
+      && parsed.operation_ref.length <= 128
+      && context?.kind === "quest_creation"
+      && typeof context.ref === "string"
+      && context.ref.length > 0
+      && context.ref.length <= 512
+      && parsed.intake_path === "/api/v1/research-assets/intakes"
+      && typeof parsed.asset_idempotency_key === "string"
+      && parsed.asset_idempotency_key.length > 0
+      && parsed.asset_idempotency_key.length <= 128
+      && typeof parsed.asset_write_slot === "string"
+      && parsed.asset_write_slot.startsWith("meta_research_pending_write:")
+      && typeof parsed.display_name === "string"
+      && parsed.display_name.length > 0
+      && parsed.display_name.length <= 512
+      && sealed?.algorithm === "AES-GCM"
+      && typeof sealed.key_ref === "string"
+      && typeof sealed.iv_base64 === "string"
+      && typeof sealed.ciphertext_ref === "string"
+      && typeof sealed.body_hash === "string"
+      && typeof sealed.binding_hash === "string";
+    if (!valid) throw new ProductError("asset_intake_recovery_invalid");
+    return parsed as PendingScopedAssetIntakeOperation;
+  } catch (error) {
+    if (error instanceof ProductError) throw error;
+    throw new ProductError("asset_intake_recovery_invalid");
+  }
+}
+
+function parsePendingScopedAssetIntakeJob(
+  value: string | null,
+): PendingScopedAssetIntakeJob | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingScopedAssetIntakeJob>;
+    const context = parsed.context as Partial<ScopedAssetIntakeContext> | undefined;
+    const valid = parsed.schema === "meta-research/scoped-asset-intake-job/v1"
+      && typeof parsed.operation_ref === "string"
+      && parsed.operation_ref.length > 0
+      && parsed.operation_ref.length <= 128
+      && context?.kind === "quest_creation"
+      && typeof context.ref === "string"
+      && context.ref.length > 0
+      && context.ref.length <= 512
+      && typeof parsed.job_ref === "string"
+      && parsed.job_ref.length > 0
+      && parsed.job_ref.length <= 512
+      && !parsed.job_ref.startsWith(scopedAssetIntakeRecoveryJobPrefix)
+      && typeof parsed.asset_write_slot === "string"
+      && parsed.asset_write_slot.startsWith("meta_research_pending_write:")
+      && typeof parsed.display_name === "string"
+      && parsed.display_name.length > 0
+      && parsed.display_name.length <= 512;
+    if (!valid) throw new ProductError("asset_intake_recovery_invalid");
+    return parsed as PendingScopedAssetIntakeJob;
+  } catch (error) {
+    if (error instanceof ProductError) throw error;
+    throw new ProductError("asset_intake_recovery_invalid");
+  }
+}
+
+function parsePendingScopedAssetIntakeRecovery(
+  value: string | null,
+): PendingScopedAssetIntakeRecovery | null {
+  if (!value) return null;
+  let schema: unknown;
+  try {
+    schema = (JSON.parse(value) as { schema?: unknown }).schema;
+  } catch {
+    throw new ProductError("asset_intake_recovery_invalid");
+  }
+  if (schema === "meta-research/scoped-asset-intake/v1") {
+    return parsePendingScopedAssetIntakeOperation(value);
+  }
+  if (schema === "meta-research/scoped-asset-intake-job/v1") {
+    return parsePendingScopedAssetIntakeJob(value);
+  }
+  throw new ProductError("asset_intake_recovery_invalid");
+}
+
+function readPendingScopedAssetIntakeOperation(
+  operationRef: string,
+): PendingScopedAssetIntakeOperation | null {
+  for (const serialized of recoveryManifestValues("scoped-asset-intake")) {
+    const recovery = parsePendingScopedAssetIntakeRecovery(serialized);
+    if (
+      recovery?.schema === "meta-research/scoped-asset-intake/v1" &&
+      recovery.operation_ref === operationRef
+    ) return recovery;
+  }
+  return null;
+}
+
+function readPendingScopedAssetIntakeRecovery(
+  operationRef: string,
+): PendingScopedAssetIntakeRecovery | null {
+  for (const serialized of recoveryManifestValues("scoped-asset-intake")) {
+    const recovery = parsePendingScopedAssetIntakeRecovery(serialized);
+    if (recovery?.operation_ref === operationRef) return recovery;
+  }
+  return null;
+}
+
 function parsePendingAcceptedHumanRequestAsset(
   value: string | null,
 ): PendingAcceptedHumanRequestAsset | null {
@@ -4535,6 +5160,30 @@ async function unsealHumanRequestAssetIntakeOperation(
     return parsed as HumanRequestAssetIntakeOperationBody;
   } catch {
     throw new ProductError("human_request_asset_intake_body_invalid");
+  }
+}
+
+async function unsealScopedAssetIntakeOperation(
+  operation: PendingScopedAssetIntakeOperation,
+): Promise<AssetIntakeRequest> {
+  const { sealed_operation: _sealed, ...descriptor } = operation;
+  const bodyJson = await unsealRecoveryPayload(
+    operation.sealed_operation,
+    scopedAssetIntakeOperationBindingJson(descriptor),
+  );
+  try {
+    const parsed = JSON.parse(bodyJson) as Partial<AssetIntakeRequest>;
+    const valid = parsed !== null
+      && typeof parsed === "object"
+      && !Array.isArray(parsed)
+      && typeof parsed.source_kind === "string"
+      && typeof parsed.custody_mode === "string"
+      && parsed.display_name === operation.display_name
+      && typeof parsed.media_type === "string";
+    if (!valid) throw new Error("invalid scoped intake operation shape");
+    return parsed as AssetIntakeRequest;
+  } catch {
+    throw new ProductError("asset_intake_recovery_body_invalid");
   }
 }
 
@@ -4802,15 +5451,44 @@ function describeHumanRequestRecoveryManifest(
     }
     return { kind: "accepted-asset", requestRef: accepted.request_ref };
   }
+  if (schema === "meta-research/scoped-asset-intake/v1") {
+    const operation = parsePendingScopedAssetIntakeOperation(serialized);
+    if (!operation) throw new ProductError("asset_intake_recovery_invalid");
+    return {
+      kind: "scoped-asset-intake",
+      requestRef: scopedAssetIntakeOperationIdentity(
+        operation.context,
+        operation.operation_ref,
+      ),
+      sealed: operation.sealed_operation,
+      pendingWrite: {
+        slot: operation.asset_write_slot,
+        key: operation.asset_idempotency_key,
+      },
+    };
+  }
+  if (schema === "meta-research/scoped-asset-intake-job/v1") {
+    const job = parsePendingScopedAssetIntakeJob(serialized);
+    if (!job) throw new ProductError("asset_intake_recovery_invalid");
+    return {
+      kind: "scoped-asset-intake",
+      requestRef: scopedAssetIntakeOperationIdentity(
+        job.context,
+        job.operation_ref,
+      ),
+    };
+  }
   throw new ProductError("human_request_recovery_manifest_invalid");
 }
 
 function syncHumanRequestRecoverySessionCache(
   kind: HumanRequestRecoveryManifestKind,
 ): void {
-  const legacySlot = humanRequestRecoveryManifestKinds.find(
+  const legacy = humanRequestRecoveryManifestKinds.find(
     (entry) => entry.kind === kind,
-  )!.legacySlot;
+  );
+  if (!legacy) return;
+  const legacySlot = legacy.legacySlot;
   const serialized = recoveryManifestValues(kind)[0];
   if (serialized) writeSessionValue(legacySlot, serialized);
   else removeSessionValue(legacySlot);
@@ -4865,6 +5543,60 @@ async function storeHumanRequestRecoveryRecord(
     database.close();
   }
   humanRequestRecoveryManifestCache.set(manifestKey, serialized);
+  syncHumanRequestRecoverySessionCache(kind);
+}
+
+async function replaceHumanRequestRecoveryRecord(
+  kind: HumanRequestRecoveryManifestKind,
+  requestRef: string,
+  expectedSerialized: string,
+  replacementSerialized: string,
+  sealed: PendingHumanRequestAssetResponse["sealed_response"],
+): Promise<void> {
+  const manifestKey = humanRequestRecoveryManifestKey(kind, requestRef);
+  const database = await openHumanRequestRecoveryDatabase();
+  let conflict = false;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(
+        [
+          humanRequestRecoveryKeyStore,
+          humanRequestRecoveryCiphertextStore,
+          humanRequestRecoveryManifestStore,
+        ],
+        "readwrite",
+      );
+      const manifestStore = transaction.objectStore(humanRequestRecoveryManifestStore);
+      const currentRequest = manifestStore.get(manifestKey);
+      currentRequest.onsuccess = () => {
+        const current = currentRequest.result;
+        if (current !== expectedSerialized && current !== replacementSerialized) {
+          conflict = true;
+          transaction.abort();
+          return;
+        }
+        if (current !== replacementSerialized) {
+          manifestStore.put(replacementSerialized, manifestKey);
+        }
+        // Once the server has acknowledged a real job, replaying raw bytes is
+        // no longer required. Delete them in the same transaction that installs
+        // the durable, context-bound job descriptor.
+        transaction.objectStore(humanRequestRecoveryKeyStore).delete(sealed.key_ref);
+        transaction.objectStore(humanRequestRecoveryCiphertextStore)
+          .delete(sealed.ciphertext_ref);
+      };
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(new ProductError(
+        "human_request_recovery_manifest_store_unavailable",
+      ));
+      transaction.onabort = () => reject(new ProductError(conflict
+        ? "human_request_recovery_manifest_conflict"
+        : "human_request_recovery_manifest_store_unavailable"));
+    });
+  } finally {
+    database.close();
+  }
+  humanRequestRecoveryManifestCache.set(manifestKey, replacementSerialized);
   syncHumanRequestRecoverySessionCache(kind);
 }
 

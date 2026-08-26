@@ -1797,7 +1797,10 @@ test("a quest-wide wait auto-opens once while a local request only remains visib
   page,
 }) => {
   const snapshot = await installHumanCollaborationSnapshot(page, { questBlock: true });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  const returnLocation = "/?variant=A&view=questions&panel=question-tree";
+  await page.goto(`${product!.baseUrl}${returnLocation}`, {
+    waitUntil: "domcontentloaded",
+  });
 
   const dialog = page.getByRole("dialog", { name: "HumanRequest" });
   await expect(dialog).toBeVisible();
@@ -1805,6 +1808,8 @@ test("a quest-wide wait auto-opens once while a local request only remains visib
   await expect(dialog).toContainText("当前没有安全且有意义的工作可继续");
   await dialog.getByRole("button", { name: "关闭 HumanRequest" }).click();
   await expect(dialog).toBeHidden();
+  await expect.poll(() => new URL(page.url()).pathname
+    + new URL(page.url()).search + new URL(page.url()).hash).toBe(returnLocation);
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(dialog).toBeHidden();
   await expect(page.getByRole("complementary", { name: "Quest Companion" })).toContainText(
@@ -1823,6 +1828,148 @@ test("a quest-wide wait auto-opens once while a local request only remains visib
   await dialog.getByRole("button", { name: "关闭 HumanRequest" }).click();
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(dialog).toBeHidden();
+});
+
+test("quest-wide auto presentation holds one exact request until its surface closes", async ({
+  page,
+}) => {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  const humanRequests = (snapshot.human_collaboration as JsonRecord).human_requests as JsonRecord;
+  const items = humanRequests.items as JsonRecord[];
+  const first = items.find(
+    (item) => item.request_ref === "research_graph:HR-52:r1",
+  )!;
+  const second = request(
+    "offline_action",
+    "research_graph:HR-53:r1",
+    "research_graph",
+    "处理当前 Quest 的第二个全局阻塞。",
+    "ExperimentBrief-13",
+  );
+  items.push(second);
+
+  const mutableSnapshot = snapshot as JsonRecord;
+  const initialRevision = Number(mutableSnapshot.revision);
+  expect(Number.isSafeInteger(initialRevision)).toBeTruthy();
+  const queueRevision = initialRevision + 1;
+  let releaseQueue!: () => void;
+  const queueGate = new Promise<void>((resolve) => {
+    releaseQueue = resolve;
+  });
+  let eventRequests = 0;
+  await page.unroute("**/api/v1/events*");
+  await page.route("**/api/v1/events*", async (route) => {
+    eventRequests += 1;
+    if (eventRequests > 1) {
+      await route.abort("connectionrefused");
+      return;
+    }
+    await queueGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      headers: { "Cache-Control": "no-cache" },
+      body: `id: ${queueRevision}\nevent: projection.updated\ndata: {"revision":${queueRevision}}\n\n`,
+    });
+  });
+
+  let draftingReloads = 0;
+  await page.route("**/api/v1/companion/messages", async (route) => {
+    draftingReloads += 1;
+    mutableSnapshot.revision = queueRevision + 1;
+    await fulfillJson(
+      route,
+      ((snapshot.human_collaboration as JsonRecord).companion as object),
+    );
+  });
+
+  const returnLocation = "/?variant=A&view=questions&panel=question-tree#queue-return";
+  await page.goto(`${product!.baseUrl}${returnLocation}`, {
+    waitUntil: "domcontentloaded",
+  });
+  const returnFocus = page.getByRole("button", { name: "问题树", exact: true });
+  await expect(returnFocus).toBeEnabled();
+  await returnFocus.focus();
+  await expect(returnFocus).toBeFocused();
+  await expect.poll(() => eventRequests).toBe(1);
+
+  (first.direct_waiters as JsonRecord[])[0].wait_scope = "quest";
+  (second.direct_waiters as JsonRecord[])[0].wait_scope = "quest";
+  humanRequests.waiting = {
+    scope: "quest",
+    safe_meaningful_runnable_exists: false,
+    other_blockers: [],
+  };
+  mutableSnapshot.revision = queueRevision;
+  releaseQueue();
+
+  const firstPresentationKey =
+    "meta_research:human_request:auto_presented:research_graph:research_graph:HR-52:r1:r1";
+  const secondPresentationKey =
+    "meta_research:human_request:auto_presented:research_graph:research_graph:HR-53:r1:r1";
+  const dialog = page.getByRole("dialog", { name: "HumanRequest" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("按已接纳协议完成线下校准并交回原始结果。");
+  await expect(dialog).not.toContainText("处理当前 Quest 的第二个全局阻塞。");
+  await expect.poll(() => page.evaluate(
+    (key) => sessionStorage.getItem(key),
+    firstPresentationKey,
+  )).toBe("presented");
+  await expect.poll(() => page.evaluate(
+    (key) => sessionStorage.getItem(key),
+    secondPresentationKey,
+  )).toBeNull();
+
+  await dialog.getByLabel("在线下操作 Draft Session 中发消息")
+    .fill("刷新 Projection 后仍保持这个精确请求。");
+  await dialog.getByRole("button", { name: "发送 Draft Session 消息" }).click();
+  await expect.poll(() => draftingReloads).toBe(1);
+  await expect(page.locator(".lumen-connection code"))
+    .toHaveText(`rev ${queueRevision + 1}`);
+  await expect(dialog).toContainText("按已接纳协议完成线下校准并交回原始结果。");
+  await expect(dialog).not.toContainText("处理当前 Quest 的第二个全局阻塞。");
+  await expect.poll(() => page.evaluate(
+    (key) => sessionStorage.getItem(key),
+    secondPresentationKey,
+  )).toBeNull();
+
+  await dialog.getByRole("button", { name: "关闭 HumanRequest" }).click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("处理当前 Quest 的第二个全局阻塞。");
+  await expect(dialog).not.toContainText("按已接纳协议完成线下校准并交回原始结果。");
+  await expect.poll(() => page.evaluate(
+    (key) => sessionStorage.getItem(key),
+    secondPresentationKey,
+  )).toBe("presented");
+
+  await dialog.getByRole("button", { name: "关闭 HumanRequest" }).click();
+  await expect(dialog).toBeHidden();
+  await expect.poll(() => new URL(page.url()).pathname
+    + new URL(page.url()).search + new URL(page.url()).hash).toBe(returnLocation);
+  await expect(returnFocus).toBeFocused();
+});
+
+test("a quest-wide wait queues behind an active formal creation window", async ({
+  page,
+}) => {
+  await installHumanCollaborationSnapshot(page, { questBlock: true });
+  await page.goto(`${product!.baseUrl}/?panel=create-quest`, {
+    waitUntil: "domcontentloaded",
+  });
+
+  const quest = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  const humanRequest = page.getByRole("dialog", { name: "HumanRequest" });
+  await expect(quest).toBeVisible();
+  await expect(humanRequest).toBeHidden();
+  await expect(page.getByRole("complementary", { name: "Quest Companion" }))
+    .toContainText("需要你处理");
+
+  await quest.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
+  await expect(quest).toBeHidden();
+  await expect(humanRequest).toBeVisible();
+  await expect(humanRequest).toContainText("按已接纳协议完成线下校准");
 });
 
 test("quest-wide auto presentation skips an already presented request and ignores another Quest", async ({

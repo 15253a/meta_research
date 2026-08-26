@@ -16,7 +16,7 @@ Meta Research 是一个本地优先、人机协作的科研执行系统。它把
 
 一次研究以一个 **Quest** 为边界：
 
-1. **Goal**：研究目标与完成标准。
+1. **Research Brief**：在同一创建窗口中填写背景、目标与边界；可选材料在后台接纳，成功后自动绑定精确版本。
 2. **Question Tree**：正式问题、分支、生命周期、证据和历史。
 3. **Cycle**：围绕一个当前 Question 推进的一轮研究。
 4. **Idea → Plan → Bundle → Reasoning**：四个正式 Stage。
@@ -166,12 +166,14 @@ find "$CODEX_HOME/sessions" "$CODEX_HOME/archived_sessions" \
 
 在左侧 rail 点击 `+`，进入 Quest Creation：
 
-- 填写 Goal。
-- 写出可判断的 Completion Criteria。
+- 用“背景、目标、边界”三个研究语言字段写出 Research Brief；目标与边界必填。
+- 如有本地材料，直接在同一窗口选择文件或文件夹。名称、媒体类型和保管方式由系统推导，Research Memory 在后台接纳，成功后自动绑定精确 AssetVersion。
+- 可选材料仍在处理或处理失败时，可以继续编辑并走 `direct`；`provided_only` 仍只接受已经形成 RM receipt 的材料。
 - 选择时间预算和研究配置。
 - 第一次测试建议选 `direct` 文献路线；DeepFetch 需要额外的外部访问能力。
 - 执行 compute probe，检查检测到的设备并形成 Resource Envelope。
 - 让 Codex 起草第一条 Formal Question。
+- Proposal Drafter 只接纳锁定的 Codex CLI `0.147.0`，并在独立 `research-workspace` 中形成 schema 输出。部署使用随 wheel 打包且校验哈希的单模型目录禁用 shell 与 `apply_patch`，同时显式禁用用户配置、MCP、Web、全部内置本地工具、agent、apps/plugins/memories、Skill 指令与环境继承。Quest/Literature 输入被标记为“不可信研究数据而非指令”，UTF-8 prompt 在启动 effect 前受硬上限约束；宿主不支持 user namespace 时使用的 `danger-full-access` 不会扩大成 Quest 授权。
 - 审阅六字段 Proposal、Impact Preview 和精确 DraftRevision，再确认创建。
 
 关闭创建窗口不会删除 durable draft；发生并发写冲突时，界面会保留可恢复信息，不会用旧的浏览器值覆盖新版本。

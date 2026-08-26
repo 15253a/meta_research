@@ -748,6 +748,7 @@ class DeepFetchRun:
     attempt_generation: int
     provider_operation_ref: str
     provider_operation_generation: int
+    provider_operation_retry_permitted: bool
     root_session_ref: str
     native_session_ref: str | None
     fence_ref: str | None
@@ -764,6 +765,9 @@ class DeepFetchRun:
             "status": self.status,
             "attempt_ref": self.attempt_ref,
             "attempt_generation": self.attempt_generation,
+            "provider_operation_retry_permitted": (
+                self.provider_operation_retry_permitted
+            ),
             "root_session_ref": self.root_session_ref,
             "native_session_ref": self.native_session_ref,
             "fence_ref": self.fence_ref,
@@ -12981,21 +12985,63 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise OwnerConflict("deepfetch_run_request_invalid")
         self._verify_deepfetch_acquisition_binding(request, require_ready=False)
         try:
-            runtime_binding = provider.runtime_binding()
-            runtime_binding_hash = validate_runtime_binding(runtime_binding)
+            provider_runtime_binding = provider.runtime_binding()
+            provider_runtime_binding_hash = validate_runtime_binding(
+                provider_runtime_binding
+            )
         except DeepFetchUnavailable as error:
             raise OwnerConflict(error.code) from error
-        runtime_binding_json = canonical_json(runtime_binding.as_dict())
+        provider_runtime_binding_json = canonical_json(
+            provider_runtime_binding.as_dict()
+        )
+        runtime_binding = provider_runtime_binding
+        runtime_binding_hash = provider_runtime_binding_hash
+        runtime_binding_json = provider_runtime_binding_json
+        reconcile_only = False
         request_hash = canonical_hash(request.payload())
 
         existing = self.query_deepfetch_run(request.request_ref)
         if existing is not None and existing.status == "executed":
             if (
                 existing.correlation_ref != request.correlation_ref
-                or existing.runtime_binding_hash != runtime_binding_hash
+                or existing.runtime_binding_hash != provider_runtime_binding_hash
             ):
                 raise OwnerConflict("deepfetch_run_identity_conflict")
             return existing
+        if existing is not None and (
+            existing.runtime_binding_hash != provider_runtime_binding_hash
+            or canonical_json(existing.runtime_binding.as_dict())
+            != provider_runtime_binding_json
+        ):
+            # A deployed predecessor can have an admitted durable operation
+            # whose provider outcome was not ACKed by AR before restart.  A new
+            # adapter binding may only reconcile that exact operation under its
+            # persisted binding; it cannot relabel predecessor output as new.
+            with self._database.read() as connection:
+                reconciliation_run = connection.execute(
+                    text(
+                        "SELECT status, current_attempt_ref, "
+                        "provider_operation_retry_permitted, "
+                        "runtime_binding_json, runtime_binding_hash FROM "
+                        "ar_deepfetch_runs WHERE run_ref = :run_ref"
+                    ),
+                    {"run_ref": existing.run_ref},
+                ).one()
+            if (
+                reconciliation_run.status == "admitted"
+                and reconciliation_run.current_attempt_ref is None
+                and not bool(
+                    reconciliation_run.provider_operation_retry_permitted
+                )
+                and reconciliation_run.runtime_binding_json
+                == canonical_json(existing.runtime_binding.as_dict())
+                and reconciliation_run.runtime_binding_hash
+                == existing.runtime_binding_hash
+            ):
+                runtime_binding = existing.runtime_binding
+                runtime_binding_hash = existing.runtime_binding_hash
+                runtime_binding_json = canonical_json(runtime_binding.as_dict())
+                reconcile_only = True
 
         (
             run_ref,
@@ -13010,6 +13056,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             request_hash=request_hash,
             runtime_binding_json=runtime_binding_json,
             runtime_binding_hash=runtime_binding_hash,
+            reconcile_only=reconcile_only,
         )
         # Provider effects belong to the logical Run, not to a replaceable
         # Attempt. Interrupted successor Fences reconcile the same operation;
@@ -13039,6 +13086,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             fence_ref=fence_ref,
             native_session_ref=native_ref,
             job_ref=job_ref,
+            reconcile_only=reconcile_only,
         )
         try:
             self.begin_provider_unit(
@@ -13166,7 +13214,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 if current_provider is provider:
                     self._deepfetch_providers.pop(request.request_ref, None)
             finish_job = getattr(provider, "finish_job", None)
-            if provider_safe and callable(finish_job):
+            if provider_safe and not reconcile_only and callable(finish_job):
                 finish_job(job_ref)
 
     def _defer_deepfetch_protection_wait(
@@ -13430,12 +13478,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             connection.execute(
                 text(
                     "UPDATE ar_deepfetch_attempts SET status = 'superseded', "
-                    "failure_code = :reason_code, completed_at = :now WHERE "
+                    "failure_code = :reason_code, native_session_ref = "
+                    "COALESCE(:native_session_ref, native_session_ref), "
+                    "completed_at = :now WHERE "
                     "attempt_ref = :attempt_ref"
                 ),
                 {
                     "attempt_ref": attempt_ref,
                     "reason_code": reason_code,
+                    "native_session_ref": native_session_ref,
                     "now": now,
                 },
             )
@@ -13508,6 +13559,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         request_hash: str,
         runtime_binding_json: str,
         runtime_binding_hash: str,
+        reconcile_only: bool = False,
     ) -> tuple[str, str, str, int, str, str | None, str]:
         now = time.time()
         with self._database.write() as connection:
@@ -13560,14 +13612,78 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ).first()
             is_new = run is None
             was_failed = run is not None and run.status == "failed"
+            binding_transition: dict[str, object] | None = None
             if run is not None:
                 if (
                     run.request_hash != request_hash
                     or run.correlation_ref != request.correlation_ref
+                ):
+                    raise OwnerConflict("deepfetch_run_identity_conflict")
+                if reconcile_only and (
+                    run.status != "admitted"
+                    or run.current_attempt_ref is not None
+                    or bool(run.provider_operation_retry_permitted)
                     or run.runtime_binding_json != runtime_binding_json
                     or run.runtime_binding_hash != runtime_binding_hash
                 ):
                     raise OwnerConflict("deepfetch_run_identity_conflict")
+                binding_changed = (
+                    run.runtime_binding_hash != runtime_binding_hash
+                    or run.runtime_binding_json != runtime_binding_json
+                )
+                if binding_changed:
+                    # A binding hash owns an exact canonical capability set. A
+                    # changed document under the same hash is never an upgrade
+                    # path, and no active or terminal-success Run may be rebound.
+                    if (
+                        run.runtime_binding_hash == runtime_binding_hash
+                        or run.status != "failed"
+                        or not bool(run.provider_operation_retry_permitted)
+                        or run.current_attempt_ref is None
+                    ):
+                        raise OwnerConflict("deepfetch_run_identity_conflict")
+                    old_binding = _deepfetch_runtime_binding(
+                        str(run.runtime_binding_json)
+                    )
+                    if (
+                        canonical_json(old_binding.as_dict())
+                        != run.runtime_binding_json
+                        or canonical_hash(old_binding.as_dict())
+                        != run.runtime_binding_hash
+                    ):
+                        raise OwnerConflict("deepfetch_run_identity_conflict")
+                    terminal_attempt = connection.execute(
+                        text(
+                            "SELECT status, completed_at, runtime_binding_json, "
+                            "runtime_binding_hash, native_session_ref FROM "
+                            "ar_deepfetch_attempts WHERE attempt_ref = "
+                            ":attempt_ref AND run_ref = :run_ref"
+                        ),
+                        {
+                            "attempt_ref": run.current_attempt_ref,
+                            "run_ref": run.run_ref,
+                        },
+                    ).first()
+                    if (
+                        terminal_attempt is None
+                        or terminal_attempt.status != "failed"
+                        or terminal_attempt.completed_at is None
+                        or terminal_attempt.runtime_binding_json
+                        != run.runtime_binding_json
+                        or terminal_attempt.runtime_binding_hash
+                        != run.runtime_binding_hash
+                    ):
+                        raise OwnerConflict("deepfetch_run_identity_conflict")
+                    binding_transition = {
+                        "previous_attempt_ref": str(run.current_attempt_ref),
+                        "old_runtime_binding_hash": str(run.runtime_binding_hash),
+                        "old_provider_operation_ref": str(
+                            run.provider_operation_ref
+                        ),
+                        "old_provider_operation_generation": int(
+                            run.provider_operation_generation
+                        ),
+                    }
                 if run.status == "executed":
                     raise OwnerConflict("deepfetch_run_already_executed")
                 if run.status == "running":
@@ -13617,11 +13733,41 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     {"run_ref": run_ref},
                 ).one()
                 root_session_ref = str(session.root_session_ref)
-                native_session_ref = (
-                    None
-                    if session.native_session_ref is None
-                    else str(session.native_session_ref)
-                )
+                if binding_transition is None:
+                    native_session_ref = (
+                        None
+                        if session.native_session_ref is None
+                        else str(session.native_session_ref)
+                    )
+                else:
+                    if (
+                        session.status != "open"
+                        or terminal_attempt.native_session_ref
+                        != session.native_session_ref
+                    ):
+                        raise OwnerConflict("deepfetch_run_identity_conflict")
+                    native_session_ref = None
+                    connection.execute(
+                        text(
+                            "UPDATE ar_deepfetch_sessions SET "
+                            "native_session_ref = NULL, updated_at = :now "
+                            "WHERE run_ref = :run_ref AND status = 'open'"
+                        ),
+                        {"run_ref": run_ref, "now": now},
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE ar_deepfetch_runs SET "
+                            "runtime_binding_json = :runtime_binding_json, "
+                            "runtime_binding_hash = :runtime_binding_hash "
+                            "WHERE run_ref = :run_ref"
+                        ),
+                        {
+                            "run_ref": run_ref,
+                            "runtime_binding_json": runtime_binding_json,
+                            "runtime_binding_hash": runtime_binding_hash,
+                        },
+                    )
             else:
                 run_ref = new_ref("deepfetch_run")
                 provider_operation_generation = 1
@@ -13686,9 +13832,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             connection.execute(
                 text(
                     "INSERT INTO ar_deepfetch_attempts (attempt_ref, run_ref, "
-                    "generation, root_session_ref, fence_ref, status, started_at) "
+                    "generation, root_session_ref, fence_ref, "
+                    "runtime_binding_json, runtime_binding_hash, "
+                    "native_session_ref, status, started_at) "
                     "VALUES (:attempt_ref, :run_ref, :generation, :root_session_ref, "
-                    ":fence_ref, 'running', :now)"
+                    ":fence_ref, :runtime_binding_json, :runtime_binding_hash, "
+                    ":native_session_ref, 'running', :now)"
                 ),
                 {
                     "attempt_ref": attempt_ref,
@@ -13696,6 +13845,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "generation": generation,
                     "root_session_ref": root_session_ref,
                     "fence_ref": fence_ref,
+                    "runtime_binding_json": runtime_binding_json,
+                    "runtime_binding_hash": runtime_binding_hash,
+                    "native_session_ref": native_session_ref,
                     "now": now,
                 },
             )
@@ -13795,6 +13947,33 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "provider_unit_ref": provider_unit_ref,
                 },
             )
+            if binding_transition is not None:
+                self._feed.record(
+                    connection,
+                    "agent_runtime.deepfetch_runtime_binding_transitioned",
+                    {
+                        "request_ref": request.request_ref,
+                        "run_ref": run_ref,
+                        "previous_attempt_ref": binding_transition[
+                            "previous_attempt_ref"
+                        ],
+                        "attempt_ref": attempt_ref,
+                        "old_runtime_binding_hash": binding_transition[
+                            "old_runtime_binding_hash"
+                        ],
+                        "new_runtime_binding_hash": runtime_binding_hash,
+                        "old_provider_operation_ref": binding_transition[
+                            "old_provider_operation_ref"
+                        ],
+                        "new_provider_operation_ref": provider_operation_ref,
+                        "old_provider_operation_generation": binding_transition[
+                            "old_provider_operation_generation"
+                        ],
+                        "new_provider_operation_generation": (
+                            provider_operation_generation
+                        ),
+                    },
+                )
             self._feed.record(
                 connection,
                 "agent_runtime.provider_unit_started",
@@ -13891,12 +14070,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             connection.execute(
                 text(
                     "UPDATE ar_deepfetch_attempts SET status = 'executed', "
-                    "result_hash = :result_hash, completed_at = :now WHERE "
+                    "result_hash = :result_hash, native_session_ref = "
+                    ":native_session_ref, completed_at = :now WHERE "
                     "attempt_ref = :attempt_ref AND status = 'running'"
                 ),
                 {
                     "attempt_ref": attempt_ref,
                     "result_hash": result_hash,
+                    "native_session_ref": native_session_ref,
                     "now": now,
                 },
             )
@@ -14002,6 +14183,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 if session.native_session_ref not in {None, native_session_ref}:
                     failure_code = "deepfetch_native_session_changed"
                     provider_operation_retry_permitted = False
+                    # Preserve the admitted session identity on the Attempt;
+                    # the conflicting provider value is rejected evidence.
+                    native_session_ref = None
                 else:
                     connection.execute(
                         text(
@@ -14018,12 +14202,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             connection.execute(
                 text(
                     "UPDATE ar_deepfetch_attempts SET status = 'failed', "
-                    "failure_code = :failure_code, completed_at = :now WHERE "
+                    "failure_code = :failure_code, native_session_ref = "
+                    "COALESCE(:native_session_ref, native_session_ref), "
+                    "completed_at = :now WHERE "
                     "attempt_ref = :attempt_ref"
                 ),
                 {
                     "attempt_ref": attempt_ref,
                     "failure_code": failure_code,
+                    "native_session_ref": native_session_ref,
                     "now": now,
                 },
             )
@@ -14084,7 +14271,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "SELECT r.*, s.root_session_ref, s.native_session_ref, "
                     "s.status AS session_status, a.attempt_ref AS joined_attempt_ref, "
                     "a.generation AS joined_generation, a.fence_ref, "
-                    "a.status AS attempt_status FROM ar_deepfetch_runs r "
+                    "a.status AS attempt_status, a.runtime_binding_json AS "
+                    "attempt_runtime_binding_json, a.runtime_binding_hash AS "
+                    "attempt_runtime_binding_hash, a.native_session_ref AS "
+                    "attempt_native_session_ref FROM ar_deepfetch_runs r "
                     "JOIN ar_deepfetch_sessions s ON s.run_ref = r.run_ref "
                     "LEFT JOIN ar_deepfetch_attempts a ON a.attempt_ref = "
                     "r.current_attempt_ref WHERE r.request_ref = :request_ref"
@@ -21840,7 +22030,10 @@ class SQLiteAgentRuntimeReceiptVerifier:
                     "a.attempt_ref AS joined_attempt_ref, "
                     "a.generation AS joined_generation, a.fence_ref, "
                     "a.status AS attempt_status, a.result_hash AS "
-                    "attempt_result_hash FROM ar_deepfetch_runs r JOIN "
+                    "attempt_result_hash, a.runtime_binding_json AS "
+                    "attempt_runtime_binding_json, a.runtime_binding_hash AS "
+                    "attempt_runtime_binding_hash, a.native_session_ref AS "
+                    "attempt_native_session_ref FROM ar_deepfetch_runs r JOIN "
                     "ar_deepfetch_sessions s ON s.run_ref = r.run_ref JOIN "
                     "ar_deepfetch_attempts a ON a.attempt_ref = "
                     "r.current_attempt_ref WHERE r.execution_receipt_ref = "
@@ -22417,6 +22610,16 @@ def _deepfetch_run_from_row(row) -> DeepFetchRun:
         attempt_ref is None or fence_ref is None
     ):
         raise OwnerConflict("deepfetch_attempt_invalid")
+    if attempt_ref is not None:
+        attempt_binding_json = getattr(row, "attempt_runtime_binding_json", None)
+        attempt_binding_hash = getattr(row, "attempt_runtime_binding_hash", None)
+        if (
+            attempt_binding_json != row.runtime_binding_json
+            or attempt_binding_hash != row.runtime_binding_hash
+            or getattr(row, "attempt_native_session_ref", None)
+            != row.native_session_ref
+        ):
+            raise OwnerConflict("deepfetch_attempt_runtime_binding_invalid")
     return DeepFetchRun(
         request_ref=row.request_ref,
         run_ref=row.run_ref,
@@ -22426,6 +22629,9 @@ def _deepfetch_run_from_row(row) -> DeepFetchRun:
         attempt_generation=int(row.attempt_generation),
         provider_operation_ref=provider_operation_ref,
         provider_operation_generation=provider_operation_generation,
+        provider_operation_retry_permitted=bool(
+            row.provider_operation_retry_permitted
+        ),
         root_session_ref=row.root_session_ref,
         native_session_ref=row.native_session_ref,
         fence_ref=fence_ref,

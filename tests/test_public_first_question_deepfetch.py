@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 import threading
 import time
 from dataclasses import replace
@@ -19,7 +20,7 @@ from meta_research.deepfetch import (
     DeepFetchRuntimeBinding,
     DeepFetchUnavailable,
 )
-from meta_research.owners.common import OwnerConflict
+from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
     HostComputeDevice,
@@ -245,6 +246,76 @@ class DeterministicDeepFetchProvider:
         )
 
 
+class OversizedProposalEvidenceProvider(DeterministicDeepFetchProvider):
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        self.requests.append(request)
+        result = self.result()
+        ledger = copy.deepcopy(DETERMINISTIC_LEDGER)
+        ledger["topic"]["interpretation"] = "超出投影上限的证据" * 40_000
+        return replace(result, papers_ledger=ledger)
+
+
+class HonestEmptyDeepFetchProvider(DeterministicDeepFetchProvider):
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        self.requests.append(request)
+        return DeepFetchResult(
+            completion="honest_empty",
+            summary="本轮检索未形成可纳入的精确论文。",
+            papers=(),
+            fulltexts=(),
+            limitations=("检索未形成可纳入的精确论文。",),
+            native_session_ref="native-honest-empty",
+            adapter_kind="test_deepfetch",
+            web_evidence={
+                "schema_ref": "meta-research/deepfetch-web-evidence/v1",
+                "search_event_count": 1,
+                "fetch_event_count": 1,
+                "trace_hash": "e" * 64,
+            },
+            papers_ledger=copy.deepcopy(PROTOTYPE_EMPTY_LEDGER),
+        )
+
+
+class LocalPathEvidenceProvider(DeterministicDeepFetchProvider):
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        self.requests.append(request)
+        result = self.result()
+        return replace(
+            result,
+            web_evidence={
+                **result.web_evidence,
+                "prototype": {
+                    "schema_ref": "meta-research/deepfetch-prototype-evidence/v4",
+                    "prototype_commit": PROTOTYPE_COMMIT,
+                    "acquisition_session_ref": "acquisition-session-test",
+                    "acquisition_request_ids": [],
+                    "main_agent_status": "complete",
+                    "reader_assignments": [],
+                    "finalize_status": "passed",
+                    "papers_json_hash": "a" * 64,
+                    "summary_md_hash": "b" * 64,
+                    "fulltext_files": [
+                        {
+                            "path": "fulltext/paper-one.pdf",
+                            "sha256": "c" * 64,
+                            "bytes": 41,
+                        }
+                    ],
+                },
+            },
+        )
+
+
+class ExtraLocatorEvidenceProvider(LocalPathEvidenceProvider):
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        result = super().execute(request)
+        web_evidence = copy.deepcopy(result.web_evidence)
+        web_evidence["prototype"]["fulltext_files"][0]["absolute_path"] = (
+            "/private/custody/escape.pdf"
+        )
+        return replace(result, web_evidence=web_evidence)
+
+
 class FailOnceDeepFetchProvider(DeterministicDeepFetchProvider):
     def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
         self.requests.append(request)
@@ -308,15 +379,230 @@ class AlwaysPendingDeepFetchProvider(DeterministicDeepFetchProvider):
         raise DeepFetchUnavailable("deepfetch_provider_reconciliation_pending")
 
 
-class SnapshotAwareProposalDrafter:
+class LegacyWorkspaceCodexDeepFetchAdapter(CodexDeepFetchAdapter):
+    """The exact pre-permission-upgrade binding persisted by deployed Runs."""
+
+    _sandbox_mode = "workspace-write"
+
+    def runtime_binding(self) -> DeepFetchRuntimeBinding:
+        current = super().runtime_binding()
+        return replace(
+            current,
+            capability_bindings=tuple(
+                capability
+                for capability in current.capability_bindings
+                if capability
+                not in {
+                    "filesystem-danger-full-access",
+                    "sandbox-policy:danger-full-access",
+                }
+            ),
+        )
+
+
+class AckLossLegacyCodexDeepFetchAdapter(LegacyWorkspaceCodexDeepFetchAdapter):
+    """Expose a sealed predecessor outcome while simulating an AR ACK loss."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._lose_next_owner_ack = True
+
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        try:
+            result = super().execute(request)
+        except DeepFetchUnavailable as error:
+            if self._lose_next_owner_ack and error.durable_outcome == "terminal":
+                self._lose_next_owner_ack = False
+                raise DeepFetchUnavailable(
+                    "deepfetch_provider_reconciliation_pending",
+                    durable_outcome="pending",
+                    native_session_ref=error.native_session_ref,
+                ) from error
+            raise
+        if self._lose_next_owner_ack:
+            self._lose_next_owner_ack = False
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_reconciliation_pending",
+                durable_outcome="pending",
+                native_session_ref=result.native_session_ref,
+            )
+        return result
+
+
+class UnpartitionedAckLossCodexDeepFetchAdapter(
+    AckLossLegacyCodexDeepFetchAdapter
+):
+    """The deployed pre-0038 filesystem shape, produced without renaming."""
+
+    def runtime_binding(self) -> DeepFetchRuntimeBinding:
+        current = super().runtime_binding()
+        return replace(
+            current,
+            capability_bindings=tuple(
+                capability
+                for capability in current.capability_bindings
+                if capability
+                != "agent-workspace-policy:dedicated-research-workspace-v1"
+                and not capability.startswith("provider-output-limits:")
+            ),
+        )
+
+    def _protocol_run_root(self, run_key: str, runtime_binding_hash: str) -> Path:
+        del runtime_binding_hash
+        return self._workspace / "runs" / run_key
+
+    def _provider_operation_root(
+        self, job_ref: str, runtime_binding_hash: str
+    ) -> Path:
+        del runtime_binding_hash
+        return self._workspace / "provider-operations" / canonical_hash(
+            {"job_ref": job_ref}
+        )
+
+    def _durable_argv(
+        self,
+        *,
+        schema_path: Path,
+        result_path: Path,
+        native_session_ref: str | None,
+    ) -> list[str]:
+        arguments = super()._durable_argv(
+            schema_path=schema_path,
+            result_path=result_path,
+            native_session_ref=native_session_ref,
+        )
+        arguments[arguments.index("--cd") + 1] = str(self._workspace)
+        return arguments
+
+
+class PreDispatchPendingCodexDeepFetchAdapter(
+    UnpartitionedAckLossCodexDeepFetchAdapter
+):
+    """Crash after protocol checkpoint publication but before provider dispatch."""
+
+    def _execute_protocol(self, *_args, **_kwargs) -> DeepFetchResult:
+        raise DeepFetchUnavailable(
+            "deepfetch_provider_reconciliation_pending",
+            durable_outcome="pending",
+        )
+
+
+class BoundDeepFetchProvider(DeterministicDeepFetchProvider):
+    def __init__(
+        self,
+        binding: DeepFetchRuntimeBinding,
+        *,
+        outcome: str = "executed",
+    ) -> None:
+        super().__init__()
+        self._binding = binding
+        self._outcome = outcome
+
+    @property
+    def requires_verified_terminal_retry(self) -> bool:
+        return self._outcome == "unverified_failure"
+
+    def runtime_binding(self) -> DeepFetchRuntimeBinding:
+        return self._binding
+
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        self.requests.append(request)
+        if self._outcome == "waiting_user":
+            raise DeepFetchUnavailable(
+                "deepfetch_acquisition_waiting_user",
+                durable_outcome="pending",
+                native_session_ref="native-old-binding",
+            )
+        if self._outcome == "unverified_failure":
+            raise DeepFetchUnavailable("codex_deepfetch_failed")
+        return self.result(native_session_ref="native-old-binding")
+
+
+class BlockingBoundDeepFetchProvider(BoundDeepFetchProvider):
+    def __init__(self, binding: DeepFetchRuntimeBinding) -> None:
+        super().__init__(binding)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        self.requests.append(request)
+        self.started.set()
+        assert self.release.wait(timeout=10)
+        return self.result(native_session_ref="native-old-binding")
+
+
+class PendingBoundDeepFetchProvider(BoundDeepFetchProvider):
+    """Leave one old-binding durable operation awaiting Owner reconciliation."""
+
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        self.requests.append(request)
+        raise DeepFetchUnavailable(
+            "deepfetch_provider_reconciliation_pending",
+            durable_outcome="pending",
+            native_session_ref="native-old-binding",
+        )
+
+
+class UpgradedReconciliationProvider(BoundDeepFetchProvider):
+    """A new adapter able to read the predecessor's sealed durable outcome."""
+
+    def __init__(
+        self,
+        old_binding: DeepFetchRuntimeBinding,
+        new_binding: DeepFetchRuntimeBinding,
+        *,
+        old_outcome: str,
+    ) -> None:
+        super().__init__(new_binding)
+        self._old_binding = old_binding
+        self._new_binding = new_binding
+        self._old_outcome = old_outcome
+
+    @property
+    def requires_verified_terminal_retry(self) -> bool:
+        return True
+
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        self.requests.append(request)
+        if request.runtime_binding == self._old_binding:
+            if self._old_outcome == "success":
+                return self.result(native_session_ref="native-old-binding")
+            if self._old_outcome == "terminal_failure":
+                raise DeepFetchUnavailable(
+                    "codex_deepfetch_failed",
+                    durable_outcome="terminal",
+                    native_session_ref="native-old-binding",
+                )
+        if request.runtime_binding == self._new_binding:
+            return self.result(native_session_ref="native-new-binding")
+        raise AssertionError("unexpected DeepFetch reconciliation binding")
+
+
+class PendingDurableRunner:
     def __init__(self) -> None:
+        self.calls = 0
+
+    def run_durable_job(self, *_args, **_kwargs) -> None:
+        self.calls += 1
+        raise subprocess.TimeoutExpired("fake-codex", 10)
+
+
+class SnapshotAwareProposalDrafter:
+    def __init__(self, expected_completion: str = "limited") -> None:
         self.requests: list[ProposalDraftRequest] = []
+        self.expected_completion = expected_completion
 
     def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
         self.requests.append(request)
         assert request.literature_snapshot is not None
-        assert request.literature_snapshot["completion"] == "limited"
-        assert request.literature_snapshot["summary"].startswith("两篇可核查论文")
+        assert request.literature_snapshot["schema_ref"] == (
+            "meta-research/proposal-literature-evidence/v1"
+        )
+        assert request.literature_snapshot["completion"] == self.expected_completion
+        if self.expected_completion == "limited":
+            assert request.literature_snapshot["summary"].startswith(
+                "两篇可核查论文"
+            )
         content = dict(QUESTION)
         if len(self.requests) > 1:
             content["background_context"] += f"（第 {len(self.requests)} 次生成）"
@@ -504,6 +790,12 @@ def test_deepfetch_prepares_one_exact_snapshot_then_returns_to_the_same_proposal
             after_research["deepfetch"]["run"]["execution_receipt"]["status"]
             == "accepted"
         )
+        assert (
+            after_research["deepfetch"]["run"][
+                "provider_operation_retry_permitted"
+            ]
+            is False
+        )
         snapshot = after_research["deepfetch"]["literature_snapshot"]
         assert snapshot["completion"] == "limited"
         assert snapshot["paper_count"] == 2
@@ -530,6 +822,47 @@ def test_deepfetch_prepares_one_exact_snapshot_then_returns_to_the_same_proposal
         }
 
         assert runtime.owners.human_collaboration.process_drafting_once()
+        proposal_evidence = proposal_drafter.requests[0].literature_snapshot
+        assert proposal_evidence is not None
+        assert proposal_evidence["schema_ref"] == (
+            "meta-research/proposal-literature-evidence/v1"
+        )
+        projection_payload = dict(proposal_evidence)
+        projection_hash = projection_payload.pop("projection_hash")
+        assert projection_hash == canonical_hash(projection_payload)
+        source = proposal_evidence["source_snapshot"]
+        assert source["snapshot_ref"] == snapshot["snapshot_ref"]
+        assert source["snapshot_hash"] == snapshot["snapshot_hash"]
+        assert source["receipt"] == snapshot["receipt"]
+        assert canonical_hash(source["binding"]) == source["snapshot_hash"]
+        assert source["binding"]["initialization_id"] == opened[
+            "initialization_id"
+        ]
+        assert source["binding"]["draft_revision"] == saved["quest_draft"][
+            "revision"
+        ]
+        assert source["binding"]["draft_hash"] == saved["quest_draft"]["hash"]
+        assert proposal_evidence["papers_ledger"]["papers"][
+            "doi:10.1000/example.one"
+        ]["reading"]["key_claims"][0]["evidence_locators"] == ["loc-1"]
+        assert proposal_evidence["limitations"] == [
+            "第二篇论文没有可合法获取的开放全文。"
+        ]
+        assert proposal_evidence["fulltexts"] == [
+            {
+                "paper_url": "https://example.org/papers/one",
+                "media_type": "text/plain",
+                "content_hash": snapshot_response.json()["fulltexts"][0][
+                    "content_hash"
+                ],
+            }
+        ]
+        serialized_evidence = json.dumps(
+            proposal_evidence, ensure_ascii=False, sort_keys=True
+        )
+        assert "Verified open full text for paper one." not in serialized_evidence
+        assert "fulltext_path" not in serialized_evidence
+        assert len(serialized_evidence.encode("utf-8")) <= 192 * 1024
         ready = client.get(
             f"/api/v1/quest-initializations/{opened['initialization_id']}"
         ).json()
@@ -679,6 +1012,7 @@ def test_failed_deepfetch_retries_the_same_run_with_a_new_fenced_attempt(
         assert failed["deepfetch"]["failure"] == {
             "code": "web_search_temporarily_unavailable"
         }
+        assert first_run["provider_operation_retry_permitted"] is True
         assert failed["deepfetch"]["literature_snapshot"] is None
         assert failed["proposal"] is None
 
@@ -701,8 +1035,161 @@ def test_failed_deepfetch_retries_the_same_run_with_a_new_fenced_attempt(
         assert second_run["run_ref"] == first_run["run_ref"]
         assert second_run["root_session_ref"] == first_run["root_session_ref"]
         assert second_run["attempt_generation"] == 2
+        assert second_run["provider_operation_retry_permitted"] is False
         assert succeeded["deepfetch"]["status"] == "succeeded"
         assert len(provider.requests) == 2
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_oversized_proposal_evidence_fails_closed_without_calling_the_drafter(
+    tmp_path: Path,
+) -> None:
+    proposal_drafter = SnapshotAwareProposalDrafter()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "data"),
+        proposal_drafter=proposal_drafter,
+        deepfetch_provider=OversizedProposalEvidenceProvider(),
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    try:
+        initialization_id, _queued = _open_and_queue_deepfetch(
+            client, write_headers, key_prefix="oversized-proposal-evidence"
+        )
+        assert runtime.deepfetch.process_once()
+
+        snapshot = runtime.owners.human_collaboration.query_quest_creation(
+            initialization_id
+        )["deepfetch"]["literature_snapshot"]
+        assert snapshot is not None
+        with pytest.raises(
+            OwnerConflict, match="codex_proposal_evidence_too_large"
+        ):
+            runtime.owners.research_memory.read_literature_proposal_evidence(
+                snapshot["snapshot_ref"]
+            )
+
+        assert runtime.owners.human_collaboration.process_drafting_once()
+        failed = runtime.owners.human_collaboration.query_quest_creation(
+            initialization_id
+        )
+        assert failed["proposal_generation"]["status"] == "failed"
+        assert failed["proposal_generation"]["failure"] == {
+            "code": "codex_proposal_evidence_too_large"
+        }
+        assert proposal_drafter.requests == []
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_honest_empty_proposal_evidence_preserves_the_empty_result_and_limit(
+    tmp_path: Path,
+) -> None:
+    proposal_drafter = SnapshotAwareProposalDrafter(
+        expected_completion="honest_empty"
+    )
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "data"),
+        proposal_drafter=proposal_drafter,
+        deepfetch_provider=HonestEmptyDeepFetchProvider(),
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    try:
+        initialization_id, _queued = _open_and_queue_deepfetch(
+            client, write_headers, key_prefix="honest-empty-proposal-evidence"
+        )
+        assert runtime.deepfetch.process_once()
+        assert runtime.owners.human_collaboration.process_drafting_once()
+
+        evidence = proposal_drafter.requests[0].literature_snapshot
+        assert evidence is not None
+        assert evidence["completion"] == "honest_empty"
+        assert evidence["source_snapshot"]["binding"]["completion"] == (
+            "honest_empty"
+        )
+        assert evidence["papers"] == []
+        assert evidence["fulltexts"] == []
+        assert evidence["limitations"] == ["检索未形成可纳入的精确论文。"]
+        current = runtime.owners.human_collaboration.query_quest_creation(
+            initialization_id
+        )
+        assert current["proposal_generation"]["status"] == "succeeded"
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_proposal_evidence_keeps_fulltext_proofs_but_removes_local_paths(
+    tmp_path: Path,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "data"),
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=LocalPathEvidenceProvider(),
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    try:
+        initialization_id, _queued = _open_and_queue_deepfetch(
+            client, write_headers, key_prefix="local-path-proposal-evidence"
+        )
+        assert runtime.deepfetch.process_once()
+        snapshot = runtime.owners.human_collaboration.query_quest_creation(
+            initialization_id
+        )["deepfetch"]["literature_snapshot"]
+        assert snapshot is not None
+
+        evidence = runtime.owners.research_memory.read_literature_proposal_evidence(
+            snapshot["snapshot_ref"]
+        )
+        fulltext_proofs = evidence["web_evidence"]["prototype"][
+            "fulltext_files"
+        ]
+        assert fulltext_proofs == [{"sha256": "c" * 64, "bytes": 41}]
+        assert "fulltext/paper-one.pdf" not in json.dumps(
+            evidence, ensure_ascii=False, sort_keys=True
+        )
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_deepfetch_rejects_a_fulltext_proof_with_an_extra_locator_before_snapshot(
+    tmp_path: Path,
+) -> None:
+    proposal_drafter = SnapshotAwareProposalDrafter()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "data"),
+        proposal_drafter=proposal_drafter,
+        deepfetch_provider=ExtraLocatorEvidenceProvider(),
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    try:
+        initialization_id, _queued = _open_and_queue_deepfetch(
+            client, write_headers, key_prefix="extra-locator-proposal-evidence"
+        )
+        assert runtime.deepfetch.process_once()
+        failed = runtime.owners.human_collaboration.query_quest_creation(
+            initialization_id
+        )
+        assert failed["deepfetch"]["status"] == "failed"
+        assert failed["deepfetch"]["failure"] == {
+            "code": "deepfetch_prototype_evidence_invalid"
+        }
+        assert failed["deepfetch"]["literature_snapshot"] is None
+        assert failed["proposal"] is None
+        assert proposal_drafter.requests == []
+        assert (
+            runtime.owners.research_memory.query_snapshot().facts[
+                "literature_snapshot_count"
+            ]
+            == 0
+        )
     finally:
         client.close()
         runtime.close()
@@ -844,6 +1331,1170 @@ result_path.write_text(json.dumps(payload), encoding='utf-8')
     finally:
         client.close()
         runtime.close()
+
+
+def test_terminal_legacy_binding_retry_readmits_with_new_permissions_and_session(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "fake-codex-binding-transition"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+counter_path = pathlib.Path(__file__).with_suffix('.count')
+arguments_path = pathlib.Path(__file__).with_suffix('.arguments')
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count), encoding='utf-8')
+with arguments_path.open('a', encoding='utf-8') as stream:
+    stream.write(json.dumps(arguments) + '\\n')
+prompt = sys.stdin.read()
+thread_ref = 'native-legacy-binding' if count == 1 else 'native-new-binding'
+print(json.dumps({'type': 'thread.started', 'thread_id': thread_ref}), flush=True)
+if count > 1:
+    if 'resume' in arguments:
+        raise SystemExit(8)
+    print(json.dumps({'type': 'item.completed', 'item': {
+        'id': 'search-transition', 'type': 'web_search', 'query': 'paper',
+        'action': {'type': 'search'}}}), flush=True)
+    print(json.dumps({'type': 'item.completed', 'item': {
+        'id': 'open-transition', 'type': 'web_search', 'query': '',
+        'action': {'type': 'other'}}}), flush=True)
+result_path = pathlib.Path(arguments[arguments.index('--output-last-message') + 1])
+output_root = pathlib.Path(next(
+    line.split('=', 1)[1] for line in prompt.splitlines()
+    if line.startswith('public_output_root=')
+))
+(output_root / 'fulltext').mkdir(parents=True, exist_ok=True)
+(output_root / 'papers.json').write_text(
+    json.dumps(__LEDGER__, ensure_ascii=False), encoding='utf-8')
+(output_root / 'summary.md').write_text(
+    '# 范围\\n\\n本轮检索未形成可纳入的精确论文。\\n', encoding='utf-8')
+result_path.write_text(json.dumps(__FINAL__), encoding='utf-8')
+""".replace("__LEDGER__", repr(PROTOTYPE_EMPTY_LEDGER)).replace(
+            "__FINAL__", repr(PROTOTYPE_EMPTY_FINAL)
+        ),
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    data_root = prepare_data_root(tmp_path / "data")
+    workspace = data_root.run / "deepfetch-provider"
+    legacy_adapter = LegacyWorkspaceCodexDeepFetchAdapter(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    old_binding = legacy_adapter.runtime_binding()
+    old_binding_hash = canonical_hash(old_binding.as_dict())
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=legacy_adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, _queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix="binding-transition"
+    )
+    try:
+        assert runtime.deepfetch.process_once()
+        failed = client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        first_run = failed["deepfetch"]["run"]
+        assert failed["deepfetch"]["failure"] == {
+            "code": "deepfetch_web_evidence_invalid"
+        }
+        assert first_run["native_session_ref"] == "native-legacy-binding"
+        assert first_run["runtime_binding_hash"] == old_binding_hash
+        with runtime._database.read() as connection:
+            first_attempt = connection.execute(
+                text(
+                    "SELECT attempt_ref, runtime_binding_json, "
+                    "runtime_binding_hash, native_session_ref FROM "
+                    "ar_deepfetch_attempts WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": first_run["run_ref"]},
+            ).one()
+        assert first_attempt.runtime_binding_hash == old_binding_hash
+        assert json.loads(first_attempt.runtime_binding_json) == old_binding.as_dict()
+        assert first_attempt.native_session_ref == "native-legacy-binding"
+        old_protocol_roots = set((workspace / "runs").iterdir())
+        old_spool_roots = set((workspace / "provider-operations").iterdir())
+        assert old_protocol_roots
+        assert old_spool_roots
+    finally:
+        client.close()
+        runtime.close()
+
+    # Recreate the exact deployed pre-0038 layout. The old adapter keyed the
+    # durable roots only by logical request/job identity, without a binding
+    # partition in the directory name.
+    for old_root in tuple(old_protocol_roots | old_spool_roots):
+        if not old_root.is_dir() or not old_root.name.startswith(
+            f"{old_binding_hash}-"
+        ):
+            continue
+        legacy_root = old_root.with_name(
+            old_root.name.removeprefix(f"{old_binding_hash}-")
+        )
+        old_root.rename(legacy_root)
+    old_protocol_roots = set((workspace / "runs").iterdir())
+    old_spool_roots = set((workspace / "provider-operations").iterdir())
+    assert all(
+        not path.name.startswith(f"{old_binding_hash}-")
+        for path in old_protocol_roots | old_spool_roots
+    )
+
+    new_adapter = CodexDeepFetchAdapter(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    new_binding = new_adapter.runtime_binding()
+    new_binding_hash = canonical_hash(new_binding.as_dict())
+    assert new_binding_hash != old_binding_hash
+    restarted = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=new_adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted_client, restarted_headers = _authenticate(restarted)
+    try:
+        failed = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        retry = restarted_client.post(
+            f"/api/v1/quest-initializations/{initialization_id}"
+            "/proposal-generations",
+            headers=_write_headers(restarted_headers, "binding-transition-retry"),
+            json={
+                "expected_draft_revision": failed["quest_draft"]["revision"],
+                "expected_draft_hash": failed["quest_draft"]["hash"],
+            },
+        )
+        retry.raise_for_status()
+        assert restarted.deepfetch.process_once()
+        succeeded = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        second_run = succeeded["deepfetch"]["run"]
+        assert succeeded["deepfetch"]["status"] == "succeeded"
+        assert second_run["run_ref"] == first_run["run_ref"]
+        assert second_run["root_session_ref"] == first_run["root_session_ref"]
+        assert second_run["attempt_generation"] == 2
+        assert second_run["runtime_binding_hash"] == new_binding_hash
+        assert second_run["native_session_ref"] == "native-new-binding"
+        with restarted._database.read() as connection:
+            attempts = connection.execute(
+                text(
+                    "SELECT generation, runtime_binding_json, "
+                    "runtime_binding_hash, native_session_ref FROM "
+                    "ar_deepfetch_attempts WHERE run_ref = :run_ref "
+                    "ORDER BY generation"
+                ),
+                {"run_ref": first_run["run_ref"]},
+            ).all()
+        assert [row.runtime_binding_hash for row in attempts] == [
+            old_binding_hash,
+            new_binding_hash,
+        ]
+        assert [row.native_session_ref for row in attempts] == [
+            "native-legacy-binding",
+            "native-new-binding",
+        ]
+        assert json.loads(attempts[0].runtime_binding_json) == old_binding.as_dict()
+        assert json.loads(attempts[1].runtime_binding_json) == new_binding.as_dict()
+        transition = next(
+            event
+            for event in restarted.feed.read_after(0).events
+            if event.event_type
+            == "agent_runtime.deepfetch_runtime_binding_transitioned"
+        )
+        assert transition.payload["old_runtime_binding_hash"] == old_binding_hash
+        assert transition.payload["new_runtime_binding_hash"] == new_binding_hash
+        assert old_protocol_roots < set((workspace / "runs").iterdir())
+        assert old_spool_roots < set((workspace / "provider-operations").iterdir())
+        assert all(path.exists() for path in old_protocol_roots | old_spool_roots)
+        assert any(
+            path.name.startswith(f"{new_binding_hash}-")
+            for path in (workspace / "runs").iterdir()
+        )
+        assert any(
+            path.name.startswith(f"{new_binding_hash}-")
+            for path in (workspace / "provider-operations").iterdir()
+        )
+        arguments = [
+            json.loads(line)
+            for line in executable.with_suffix(".arguments")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert "resume" not in arguments[0]
+        assert "resume" not in arguments[1]
+    finally:
+        restarted_client.close()
+        restarted.close()
+
+
+@pytest.mark.parametrize("terminal_state", ["executed", "cancelled", "failed"])
+def test_runtime_binding_transition_fails_closed_outside_verified_failed_retry(
+    tmp_path: Path,
+    terminal_state: str,
+) -> None:
+    old_binding = DeepFetchRuntimeBinding(
+        provider_ref="test/deepfetch-binding",
+        provider_version="legacy",
+        model_ref="test-model",
+        harness_ref="test-harness",
+        capability_bindings=("web-search-live", "web-fetch-live"),
+    )
+    new_binding = replace(
+        old_binding,
+        capability_bindings=(
+            "filesystem-danger-full-access",
+            "sandbox-policy:danger-full-access",
+            "web-search-live",
+            "web-fetch-live",
+        ),
+    )
+    old_provider = BoundDeepFetchProvider(
+        old_binding,
+        outcome=(
+            "executed"
+            if terminal_state == "executed"
+            else "waiting_user"
+            if terminal_state == "cancelled"
+            else "unverified_failure"
+        ),
+    )
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / terminal_state),
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_provider,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    try:
+        initialization_id, queued = _open_and_queue_deepfetch(
+            client, write_headers, key_prefix=f"unsafe-{terminal_state}"
+        )
+        request_ref = str(queued["deepfetch"]["request_ref"])
+        request = runtime.owners.human_collaboration.query_deepfetch_request(
+            request_ref
+        )
+        assert request is not None
+        if terminal_state == "executed":
+            runtime.owners.agent_runtime.execute_deepfetch(request, old_provider)
+        else:
+            with pytest.raises(DeepFetchUnavailable):
+                runtime.owners.agent_runtime.execute_deepfetch(request, old_provider)
+            if terminal_state == "cancelled":
+                runtime.owners.agent_runtime.cancel_deepfetch(request_ref)
+
+        new_provider = BoundDeepFetchProvider(new_binding)
+        with pytest.raises(
+            OwnerConflict, match="^deepfetch_run_identity_conflict$"
+        ):
+            runtime.owners.agent_runtime.execute_deepfetch(request, new_provider)
+
+        assert new_provider.requests == []
+        persisted = runtime.owners.agent_runtime.query_deepfetch_run(request_ref)
+        assert persisted is not None
+        assert persisted.runtime_binding_hash == canonical_hash(old_binding.as_dict())
+        projected = client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()["deepfetch"]["run"]
+        assert projected["provider_operation_retry_permitted"] is False
+        if terminal_state == "failed":
+            assert projected["status"] == "failed"
+        with runtime._database.read() as connection:
+            attempt_bindings = connection.execute(
+                text(
+                    "SELECT runtime_binding_hash FROM ar_deepfetch_attempts "
+                    "WHERE run_ref = :run_ref ORDER BY generation"
+                ),
+                {"run_ref": persisted.run_ref},
+            ).scalars().all()
+        assert attempt_bindings == [canonical_hash(old_binding.as_dict())]
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_active_runtime_binding_transition_is_an_identity_conflict(
+    tmp_path: Path,
+) -> None:
+    old_binding = DeepFetchRuntimeBinding(
+        provider_ref="test/deepfetch-active-binding",
+        provider_version="legacy",
+        model_ref="test-model",
+        harness_ref="test-harness",
+        capability_bindings=("web-search-live", "web-fetch-live"),
+    )
+    new_binding = replace(
+        old_binding,
+        capability_bindings=(
+            "filesystem-danger-full-access",
+            "sandbox-policy:danger-full-access",
+            "web-search-live",
+            "web-fetch-live",
+        ),
+    )
+    old_provider = BlockingBoundDeepFetchProvider(old_binding)
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "active"),
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_provider,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    errors: list[BaseException] = []
+    try:
+        _initialization_id, queued = _open_and_queue_deepfetch(
+            client, write_headers, key_prefix="unsafe-active"
+        )
+        request = runtime.owners.human_collaboration.query_deepfetch_request(
+            str(queued["deepfetch"]["request_ref"])
+        )
+        assert request is not None
+
+        def execute_old_binding() -> None:
+            try:
+                runtime.owners.agent_runtime.execute_deepfetch(request, old_provider)
+            except BaseException as error:  # pragma: no branch - asserted below
+                errors.append(error)
+
+        worker = threading.Thread(target=execute_old_binding, daemon=True)
+        worker.start()
+        assert old_provider.started.wait(timeout=5)
+        new_provider = BoundDeepFetchProvider(new_binding)
+        with pytest.raises(
+            OwnerConflict, match="^deepfetch_run_identity_conflict$"
+        ):
+            runtime.owners.agent_runtime.execute_deepfetch(request, new_provider)
+        assert new_provider.requests == []
+    finally:
+        old_provider.release.set()
+        if "worker" in locals():
+            worker.join(timeout=5)
+        client.close()
+        runtime.close()
+    assert errors == []
+
+
+def test_binding_upgrade_reconciles_ack_lost_success_under_persisted_binding(
+    tmp_path: Path,
+) -> None:
+    old_binding = DeepFetchRuntimeBinding(
+        provider_ref="test/deepfetch-ack-loss-binding",
+        provider_version="legacy",
+        model_ref="test-model",
+        harness_ref="test-harness",
+        capability_bindings=("web-search-live", "web-fetch-live"),
+    )
+    new_binding = replace(
+        old_binding,
+        capability_bindings=(
+            "filesystem-danger-full-access",
+            "sandbox-policy:danger-full-access",
+            "web-search-live",
+            "web-fetch-live",
+        ),
+    )
+    data_root = prepare_data_root(tmp_path / "ack-loss-success")
+    old_provider = PendingBoundDeepFetchProvider(old_binding)
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_provider,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix="binding-ack-loss-success"
+    )
+    request_ref = str(queued["deepfetch"]["request_ref"])
+    try:
+        assert not runtime.deepfetch.process_once()
+        admitted = runtime.owners.agent_runtime.query_deepfetch_run(request_ref)
+        assert admitted is not None
+        assert admitted.status == "admitted"
+        assert admitted.attempt_ref is None
+        assert admitted.runtime_binding_hash == canonical_hash(old_binding.as_dict())
+    finally:
+        client.close()
+        runtime.close()
+
+    upgraded_provider = UpgradedReconciliationProvider(
+        old_binding,
+        new_binding,
+        old_outcome="success",
+    )
+    restarted = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=upgraded_provider,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted_client, _restarted_headers = _authenticate(restarted)
+    try:
+        time.sleep(0.6)
+        assert restarted.deepfetch.process_once()
+        succeeded = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        run = succeeded["deepfetch"]["run"]
+        assert succeeded["deepfetch"]["status"] == "succeeded"
+        assert run["runtime_binding_hash"] == canonical_hash(old_binding.as_dict())
+        assert run["native_session_ref"] == "native-old-binding"
+        assert [request.runtime_binding for request in upgraded_provider.requests] == [
+            old_binding
+        ]
+        with restarted._database.read() as connection:
+            attempts = connection.execute(
+                text(
+                    "SELECT status, runtime_binding_hash FROM "
+                    "ar_deepfetch_attempts WHERE run_ref = :run_ref "
+                    "ORDER BY generation"
+                ),
+                {"run_ref": run["run_ref"]},
+            ).all()
+        assert [(row.status, row.runtime_binding_hash) for row in attempts] == [
+            ("superseded", canonical_hash(old_binding.as_dict())),
+            ("executed", canonical_hash(old_binding.as_dict())),
+        ]
+        assert not any(
+            event.event_type
+            == "agent_runtime.deepfetch_runtime_binding_transitioned"
+            for event in restarted.feed.read_after(0).events
+        )
+    finally:
+        restarted_client.close()
+        restarted.close()
+
+
+def test_binding_upgrade_waits_for_verified_old_failure_before_transition(
+    tmp_path: Path,
+) -> None:
+    old_binding = DeepFetchRuntimeBinding(
+        provider_ref="test/deepfetch-terminal-upgrade-binding",
+        provider_version="legacy",
+        model_ref="test-model",
+        harness_ref="test-harness",
+        capability_bindings=("web-search-live", "web-fetch-live"),
+    )
+    new_binding = replace(
+        old_binding,
+        capability_bindings=(
+            "filesystem-danger-full-access",
+            "sandbox-policy:danger-full-access",
+            "web-search-live",
+            "web-fetch-live",
+        ),
+    )
+    data_root = prepare_data_root(tmp_path / "terminal-upgrade")
+    old_provider = PendingBoundDeepFetchProvider(old_binding)
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_provider,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix="binding-terminal-upgrade"
+    )
+    request_ref = str(queued["deepfetch"]["request_ref"])
+    try:
+        assert not runtime.deepfetch.process_once()
+    finally:
+        client.close()
+        runtime.close()
+
+    upgraded_provider = UpgradedReconciliationProvider(
+        old_binding,
+        new_binding,
+        old_outcome="terminal_failure",
+    )
+    restarted = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=upgraded_provider,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted_client, restarted_headers = _authenticate(restarted)
+    try:
+        time.sleep(0.6)
+        assert restarted.deepfetch.process_once()
+        failed = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        assert failed["deepfetch"]["status"] == "failed"
+        assert failed["deepfetch"]["failure"] == {
+            "code": "codex_deepfetch_failed"
+        }
+        failed_run = failed["deepfetch"]["run"]
+        assert failed_run["runtime_binding_hash"] == canonical_hash(
+            old_binding.as_dict()
+        )
+        assert [request.runtime_binding for request in upgraded_provider.requests] == [
+            old_binding
+        ]
+
+        retried = restarted_client.post(
+            f"/api/v1/quest-initializations/{initialization_id}"
+            "/proposal-generations",
+            headers=_write_headers(
+                restarted_headers, "binding-terminal-upgrade-retry"
+            ),
+            json={
+                "expected_draft_revision": failed["quest_draft"]["revision"],
+                "expected_draft_hash": failed["quest_draft"]["hash"],
+            },
+        )
+        retried.raise_for_status()
+        assert restarted.deepfetch.process_once()
+        succeeded = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        run = succeeded["deepfetch"]["run"]
+        assert succeeded["deepfetch"]["status"] == "succeeded"
+        assert run["run_ref"] == failed_run["run_ref"]
+        assert run["runtime_binding_hash"] == canonical_hash(new_binding.as_dict())
+        assert run["native_session_ref"] == "native-new-binding"
+        assert [request.runtime_binding for request in upgraded_provider.requests] == [
+            old_binding,
+            new_binding,
+        ]
+        with restarted._database.read() as connection:
+            attempts = connection.execute(
+                text(
+                    "SELECT status, runtime_binding_hash FROM "
+                    "ar_deepfetch_attempts WHERE run_ref = :run_ref "
+                    "ORDER BY generation"
+                ),
+                {"run_ref": run["run_ref"]},
+            ).all()
+        assert [(row.status, row.runtime_binding_hash) for row in attempts] == [
+            ("superseded", canonical_hash(old_binding.as_dict())),
+            ("failed", canonical_hash(old_binding.as_dict())),
+            ("executed", canonical_hash(new_binding.as_dict())),
+        ]
+        transition = next(
+            event
+            for event in restarted.feed.read_after(0).events
+            if event.event_type
+            == "agent_runtime.deepfetch_runtime_binding_transitioned"
+        )
+        assert transition.payload["previous_attempt_ref"]
+        assert transition.payload["old_runtime_binding_hash"] == canonical_hash(
+            old_binding.as_dict()
+        )
+        assert transition.payload["new_runtime_binding_hash"] == canonical_hash(
+            new_binding.as_dict()
+        )
+    finally:
+        restarted_client.close()
+        restarted.close()
+
+
+@pytest.mark.parametrize(
+    ("root_shape", "tamper_mode"),
+    [
+        ("unpartitioned", None),
+        ("old-binding-prefixed", None),
+        ("unpartitioned", "conflicting-run-root"),
+        ("unpartitioned", "forged-invocation"),
+    ],
+)
+def test_codex_binding_upgrade_reconciles_signed_ack_loss_without_new_effect(
+    tmp_path: Path,
+    root_shape: str,
+    tamper_mode: str | None,
+) -> None:
+    executable = tmp_path / f"fake-codex-reconcile-{root_shape}-{tamper_mode}"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+counter_path = pathlib.Path(__file__).with_suffix('.count')
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count), encoding='utf-8')
+prompt = sys.stdin.read()
+thread_ref = 'native-signed-old-binding'
+print(json.dumps({'type': 'thread.started', 'thread_id': thread_ref}), flush=True)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'search-old-binding', 'type': 'web_search', 'query': 'paper',
+    'action': {'type': 'search'}}}), flush=True)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'open-old-binding', 'type': 'web_search', 'query': '',
+    'action': {'type': 'other'}}}), flush=True)
+result_path = pathlib.Path(arguments[arguments.index('--output-last-message') + 1])
+output_root = pathlib.Path(next(
+    line.split('=', 1)[1] for line in prompt.splitlines()
+    if line.startswith('public_output_root=')
+))
+(output_root / 'fulltext').mkdir(parents=True, exist_ok=True)
+(output_root / 'papers.json').write_text(
+    json.dumps(__LEDGER__, ensure_ascii=False), encoding='utf-8')
+(output_root / 'summary.md').write_text(
+    '# 范围\\n\\n本轮检索未形成可纳入的精确论文。\\n', encoding='utf-8')
+result_path.write_text(json.dumps(__FINAL__), encoding='utf-8')
+""".replace("__LEDGER__", repr(PROTOTYPE_EMPTY_LEDGER)).replace(
+            "__FINAL__", repr(PROTOTYPE_EMPTY_FINAL)
+        ),
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    data_root = prepare_data_root(tmp_path / f"data-{root_shape}")
+    workspace = data_root.run / "deepfetch-provider"
+    adapter_type = (
+        UnpartitionedAckLossCodexDeepFetchAdapter
+        if root_shape == "unpartitioned"
+        else AckLossLegacyCodexDeepFetchAdapter
+    )
+    old_adapter = adapter_type(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    old_binding = old_adapter.runtime_binding()
+    old_binding_hash = canonical_hash(old_binding.as_dict())
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix=f"signed-ack-loss-{root_shape}"
+    )
+    request_ref = str(queued["deepfetch"]["request_ref"])
+    try:
+        assert not runtime.deepfetch.process_once()
+        admitted = runtime.owners.agent_runtime.query_deepfetch_run(request_ref)
+        assert admitted is not None
+        assert admitted.status == "admitted"
+        assert admitted.attempt_ref is None
+        assert admitted.runtime_binding_hash == old_binding_hash
+        assert executable.with_suffix(".count").read_text(encoding="utf-8") == "1"
+    finally:
+        client.close()
+        runtime.close()
+
+    if tamper_mode == "conflicting-run-root":
+        legacy_run_root = next(
+            path for path in (workspace / "runs").iterdir() if path.is_dir()
+        )
+        (workspace / "runs" / f"{old_binding_hash}-{legacy_run_root.name}").mkdir()
+    elif tamper_mode == "forged-invocation":
+        invocation_path = next(
+            (workspace / "provider-operations").rglob("invocation.json")
+        )
+        invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+        invocation["seal"] = "0" * 64
+        invocation_path.write_text(
+            json.dumps(
+                invocation,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+    upgraded = CodexDeepFetchAdapter(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    assert canonical_hash(upgraded.runtime_binding().as_dict()) != old_binding_hash
+    restarted = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=upgraded,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted_client, _restarted_headers = _authenticate(restarted)
+    try:
+        time.sleep(0.6)
+        if tamper_mode is not None:
+            assert not restarted.deepfetch.process_once()
+            held = restarted_client.get(
+                f"/api/v1/quest-initializations/{initialization_id}"
+            ).json()
+            assert held["deepfetch"]["status"] == "queued"
+            assert held["deepfetch"]["failure"] is None
+            assert held["deepfetch"]["run"]["runtime_binding_hash"] == (
+                old_binding_hash
+            )
+            assert executable.with_suffix(".count").read_text(
+                encoding="utf-8"
+            ) == "1"
+            return
+        assert restarted.deepfetch.process_once()
+        succeeded = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        run = succeeded["deepfetch"]["run"]
+        assert succeeded["deepfetch"]["status"] == "succeeded"
+        assert run["runtime_binding_hash"] == old_binding_hash
+        assert run["native_session_ref"] == "native-signed-old-binding"
+        assert run["attempt_generation"] == 2
+        # Reconciliation read the sealed predecessor spool; the upgraded
+        # adapter never launched a second Codex argv under the old binding.
+        assert executable.with_suffix(".count").read_text(encoding="utf-8") == "1"
+        with restarted._database.read() as connection:
+            attempts = connection.execute(
+                text(
+                    "SELECT status, runtime_binding_hash FROM "
+                    "ar_deepfetch_attempts WHERE run_ref = :run_ref "
+                    "ORDER BY generation"
+                ),
+                {"run_ref": run["run_ref"]},
+            ).all()
+        assert [(row.status, row.runtime_binding_hash) for row in attempts] == [
+            ("superseded", old_binding_hash),
+            ("executed", old_binding_hash),
+        ]
+    finally:
+        restarted_client.close()
+        restarted.close()
+
+
+def test_codex_binding_upgrade_requires_signed_old_failure_before_new_effect(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "fake-codex-terminal-reconciliation"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+counter_path = pathlib.Path(__file__).with_suffix('.count')
+arguments_path = pathlib.Path(__file__).with_suffix('.arguments')
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count), encoding='utf-8')
+with arguments_path.open('a', encoding='utf-8') as stream:
+    stream.write(json.dumps(arguments) + '\\n')
+prompt = sys.stdin.read()
+thread_ref = 'native-signed-old-failure' if count == 1 else 'native-new-effect'
+print(json.dumps({'type': 'thread.started', 'thread_id': thread_ref}), flush=True)
+if count == 1:
+    raise SystemExit(7)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'search-new-binding', 'type': 'web_search', 'query': 'paper',
+    'action': {'type': 'search'}}}), flush=True)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'open-new-binding', 'type': 'web_search', 'query': '',
+    'action': {'type': 'other'}}}), flush=True)
+result_path = pathlib.Path(arguments[arguments.index('--output-last-message') + 1])
+output_root = pathlib.Path(next(
+    line.split('=', 1)[1] for line in prompt.splitlines()
+    if line.startswith('public_output_root=')
+))
+(output_root / 'fulltext').mkdir(parents=True, exist_ok=True)
+(output_root / 'papers.json').write_text(
+    json.dumps(__LEDGER__, ensure_ascii=False), encoding='utf-8')
+(output_root / 'summary.md').write_text(
+    '# 范围\\n\\n本轮检索未形成可纳入的精确论文。\\n', encoding='utf-8')
+result_path.write_text(json.dumps(__FINAL__), encoding='utf-8')
+""".replace("__LEDGER__", repr(PROTOTYPE_EMPTY_LEDGER)).replace(
+            "__FINAL__", repr(PROTOTYPE_EMPTY_FINAL)
+        ),
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    data_root = prepare_data_root(tmp_path / "terminal-reconciliation")
+    workspace = data_root.run / "deepfetch-provider"
+    old_adapter = UnpartitionedAckLossCodexDeepFetchAdapter(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    old_binding_hash = canonical_hash(old_adapter.runtime_binding().as_dict())
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix="signed-terminal-upgrade"
+    )
+    request_ref = str(queued["deepfetch"]["request_ref"])
+    try:
+        assert not runtime.deepfetch.process_once()
+        admitted = runtime.owners.agent_runtime.query_deepfetch_run(request_ref)
+        assert admitted is not None
+        assert admitted.status == "admitted"
+        assert admitted.runtime_binding_hash == old_binding_hash
+    finally:
+        client.close()
+        runtime.close()
+
+    upgraded = CodexDeepFetchAdapter(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    new_binding_hash = canonical_hash(upgraded.runtime_binding().as_dict())
+    restarted = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=upgraded,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted_client, restarted_headers = _authenticate(restarted)
+    try:
+        time.sleep(0.6)
+        assert restarted.deepfetch.process_once()
+        failed = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        assert failed["deepfetch"]["status"] == "failed"
+        assert failed["deepfetch"]["failure"] == {
+            "code": "codex_deepfetch_failed"
+        }
+        assert failed["deepfetch"]["run"]["runtime_binding_hash"] == (
+            old_binding_hash
+        )
+        assert executable.with_suffix(".count").read_text(encoding="utf-8") == "1"
+
+        retried = restarted_client.post(
+            f"/api/v1/quest-initializations/{initialization_id}"
+            "/proposal-generations",
+            headers=_write_headers(
+                restarted_headers, "signed-terminal-upgrade-retry"
+            ),
+            json={
+                "expected_draft_revision": failed["quest_draft"]["revision"],
+                "expected_draft_hash": failed["quest_draft"]["hash"],
+            },
+        )
+        retried.raise_for_status()
+        assert restarted.deepfetch.process_once()
+        succeeded = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        run = succeeded["deepfetch"]["run"]
+        assert succeeded["deepfetch"]["status"] == "succeeded"
+        assert run["runtime_binding_hash"] == new_binding_hash
+        assert run["native_session_ref"] == "native-new-effect"
+        assert executable.with_suffix(".count").read_text(encoding="utf-8") == "2"
+        arguments = [
+            json.loads(line)
+            for line in executable.with_suffix(".arguments")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert "resume" not in arguments[0]
+        assert "resume" not in arguments[1]
+        with restarted._database.read() as connection:
+            attempts = connection.execute(
+                text(
+                    "SELECT status, runtime_binding_hash FROM "
+                    "ar_deepfetch_attempts WHERE run_ref = :run_ref "
+                    "ORDER BY generation"
+                ),
+                {"run_ref": run["run_ref"]},
+            ).all()
+        assert [(row.status, row.runtime_binding_hash) for row in attempts] == [
+            ("superseded", old_binding_hash),
+            ("failed", old_binding_hash),
+            ("executed", new_binding_hash),
+        ]
+    finally:
+        restarted_client.close()
+        restarted.close()
+
+
+def test_codex_binding_upgrade_keeps_unfinished_old_operation_pending(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "unfinished-old-operation")
+    workspace = data_root.run / "deepfetch-provider"
+    old_runner = PendingDurableRunner()
+    old_adapter = UnpartitionedAckLossCodexDeepFetchAdapter(
+        workspace,
+        executable="/does/not/run",
+        model_ref="gpt-test",
+        timeout_seconds=10,
+        process_runner=old_runner,
+    )
+    old_binding_hash = canonical_hash(old_adapter.runtime_binding().as_dict())
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix="unfinished-old-operation"
+    )
+    request_ref = str(queued["deepfetch"]["request_ref"])
+    try:
+        assert not runtime.deepfetch.process_once()
+        assert old_runner.calls == 1
+    finally:
+        client.close()
+        runtime.close()
+
+    # Keep the exact sealed request inside its startup uncertainty window.  No
+    # signed exit or verified never-started proof exists yet.
+    supervisor_request = next(
+        (workspace / "provider-operations").rglob("supervisor-request.json")
+    )
+    supervisor_request.touch()
+    upgraded_runner = PendingDurableRunner()
+    upgraded = CodexDeepFetchAdapter(
+        workspace,
+        executable="/does/not/run",
+        model_ref="gpt-test",
+        timeout_seconds=10,
+        process_runner=upgraded_runner,
+    )
+    restarted = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=upgraded,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted_client, _restarted_headers = _authenticate(restarted)
+    try:
+        time.sleep(0.6)
+        supervisor_request.touch()
+        assert not restarted.deepfetch.process_once()
+        held = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        assert held["deepfetch"]["status"] == "queued"
+        assert held["deepfetch"]["failure"] is None
+        assert held["deepfetch"]["run"]["runtime_binding_hash"] == (
+            old_binding_hash
+        )
+        assert held["deepfetch"]["run"]["attempt_generation"] == 2
+        assert upgraded_runner.calls == 0
+        persisted = restarted.owners.agent_runtime.query_deepfetch_run(
+            request_ref
+        )
+        assert persisted is not None
+        assert persisted.status == "admitted"
+        assert persisted.attempt_ref is None
+    finally:
+        restarted_client.close()
+        restarted.close()
+
+
+def test_codex_binding_upgrade_retires_verified_predispatch_boundary(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "predispatch-boundary")
+    workspace = data_root.run / "deepfetch-provider"
+    old_adapter = PreDispatchPendingCodexDeepFetchAdapter(
+        workspace,
+        executable="/must-not-run",
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    old_binding_hash = canonical_hash(old_adapter.runtime_binding().as_dict())
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix="predispatch-boundary"
+    )
+    request_ref = str(queued["deepfetch"]["request_ref"])
+    try:
+        assert not runtime.deepfetch.process_once()
+        assert not (workspace / "provider-operations").exists()
+    finally:
+        client.close()
+        runtime.close()
+
+    upgraded = CodexDeepFetchAdapter(
+        workspace,
+        executable="/must-not-run",
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    restarted = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=upgraded,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted_client, _restarted_headers = _authenticate(restarted)
+    try:
+        time.sleep(0.6)
+        assert restarted.deepfetch.process_once()
+        failed = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        assert failed["deepfetch"]["status"] == "failed"
+        assert failed["deepfetch"]["failure"] == {
+            "code": "deepfetch_provider_never_started"
+        }
+        assert failed["deepfetch"]["run"]["runtime_binding_hash"] == (
+            old_binding_hash
+        )
+        with restarted._database.read() as connection:
+            retry_permitted = connection.execute(
+                text(
+                    "SELECT provider_operation_retry_permitted FROM "
+                    "ar_deepfetch_runs WHERE request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).scalar_one()
+        assert bool(retry_permitted)
+        assert not (workspace / "provider-operations").exists()
+    finally:
+        restarted_client.close()
+        restarted.close()
+
+
+def test_codex_binding_upgrade_retires_signed_acquisition_turn_boundary(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "fake-codex-acquisition-boundary"
+    acquisition_reply = {
+        "action": "acquire",
+        "acquisition_request": {
+            "request_id": "binding-upgrade-acquisition-1",
+            "route_policy": "oa_first_then_institution",
+            "papers": [
+                {
+                    "paper_id": "doi:10.1000/binding-upgrade",
+                    "title": "Binding upgrade boundary",
+                    "doi": "10.1000/binding-upgrade",
+                    "arxiv_id": None,
+                    "source_urls": ["https://example.org/binding-upgrade"],
+                }
+            ],
+        },
+        "completion": None,
+        "limitations": [],
+        "workflow": {
+            "prototype_commit": PROTOTYPE_COMMIT,
+            "main_agent_status": "running",
+            "reader_assignments": [],
+            "finalize_status": "pending",
+            "finalized_at": None,
+        },
+    }
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+counter_path = pathlib.Path(__file__).with_suffix('.count')
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count), encoding='utf-8')
+sys.stdin.read()
+print(json.dumps({'type': 'thread.started', 'thread_id':
+                  'native-acquisition-boundary'}), flush=True)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'search-boundary', 'type': 'web_search', 'query': 'paper',
+    'action': {'type': 'search'}}}), flush=True)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'open-boundary', 'type': 'web_search', 'query': '',
+    'action': {'type': 'other'}}}), flush=True)
+result_path = pathlib.Path(arguments[arguments.index('--output-last-message') + 1])
+result_path.write_text(json.dumps(__ACQUIRE__), encoding='utf-8')
+""".replace("__ACQUIRE__", repr(acquisition_reply)),
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    data_root = prepare_data_root(tmp_path / "acquisition-boundary")
+    workspace = data_root.run / "deepfetch-provider"
+    old_adapter = UnpartitionedAckLossCodexDeepFetchAdapter(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    old_binding_hash = canonical_hash(old_adapter.runtime_binding().as_dict())
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=old_adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix="acquisition-turn-boundary"
+    )
+    request_ref = str(queued["deepfetch"]["request_ref"])
+    try:
+        assert not runtime.deepfetch.process_once()
+        assert executable.with_suffix(".count").read_text(encoding="utf-8") == "1"
+    finally:
+        client.close()
+        runtime.close()
+
+    upgraded = CodexDeepFetchAdapter(
+        workspace,
+        executable=str(executable),
+        model_ref="gpt-test",
+        timeout_seconds=10,
+    )
+    restarted = build_production_runtime(
+        data_root,
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=upgraded,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted_client, _restarted_headers = _authenticate(restarted)
+    try:
+        time.sleep(0.6)
+        assert restarted.deepfetch.process_once()
+        failed = restarted_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        ).json()
+        assert failed["deepfetch"]["status"] == "failed"
+        assert failed["deepfetch"]["failure"] == {
+            "code": "deepfetch_runtime_binding_transition_required"
+        }
+        assert failed["deepfetch"]["run"]["runtime_binding_hash"] == (
+            old_binding_hash
+        )
+        assert executable.with_suffix(".count").read_text(encoding="utf-8") == "1"
+        with restarted._database.read() as connection:
+            retry_permitted = connection.execute(
+                text(
+                    "SELECT provider_operation_retry_permitted FROM "
+                    "ar_deepfetch_runs WHERE request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).scalar_one()
+        assert bool(retry_permitted)
+    finally:
+        restarted_client.close()
+        restarted.close()
 
 
 def test_reconciliation_pending_uses_persisted_backoff_without_attempt_churn(
@@ -1472,6 +3123,7 @@ def test_restart_reuses_one_root_session_and_rejects_the_old_fence_result(
         first_run = running["deepfetch"]["run"]
         assert first_run["status"] == "running"
         assert first_run["attempt_generation"] == 1
+        assert first_run["provider_operation_retry_permitted"] is False
 
         restarted_provider = BlockingDeepFetchProvider()
         restarted_runtime = build_production_runtime(
@@ -1507,6 +3159,12 @@ def test_restart_reuses_one_root_session_and_rejects_the_old_fence_result(
         assert during_successor["deepfetch"]["failure"] is None
         assert during_successor["deepfetch"]["run"]["status"] == "running"
         assert during_successor["deepfetch"]["run"]["attempt_generation"] == 2
+        assert (
+            during_successor["deepfetch"]["run"][
+                "provider_operation_retry_permitted"
+            ]
+            is False
+        )
 
         restarted_provider.release.set()
         successor.join(timeout=5)
@@ -1521,6 +3179,7 @@ def test_restart_reuses_one_root_session_and_rejects_the_old_fence_result(
         assert recovered_run["root_session_ref"] == first_run["root_session_ref"]
         assert recovered_run["attempt_generation"] == 2
         assert recovered_run["native_session_ref"] == "native-late-result"
+        assert recovered_run["provider_operation_retry_permitted"] is False
         after_late_result = (
             restarted_runtime.owners.human_collaboration.query_quest_creation(
                 initialization_id

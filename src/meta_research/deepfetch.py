@@ -26,6 +26,7 @@ from meta_research.provider_supervisor import (
     SUPERVISOR_REQUEST_SCHEMA,
     ProviderSupervisorError,
     ensure_transport_key,
+    read_transport_key_for_operation,
     read_transport_envelope,
     read_verified_exit_receipt,
     request_supervisor_stop,
@@ -34,8 +35,8 @@ from meta_research.provider_supervisor import (
     write_transport_envelope,
 )
 from meta_research.quest_drafting import (
+    DraftingUnavailable,
     PROVIDER_RESULT_MAX_BYTES,
-    PROVIDER_STREAM_MAX_BYTES,
     _CancellableProcessRunner,
     _ProcessStopped,
     _text_exceeds_limit,
@@ -67,6 +68,7 @@ MAX_DEEPFETCH_FULLTEXT_LENGTH = 280_000_000
 MAX_DEEPFETCH_LIMITATIONS = 100
 MAX_DEEPFETCH_FULLTEXT_FILE_BYTES = 32 * 1024 * 1024
 MAX_DEEPFETCH_FULLTEXT_TOTAL_BYTES = 96 * 1024 * 1024
+DEEPFETCH_PROVIDER_STREAM_MAX_BYTES = 64 * 1024 * 1024
 
 
 def canonical_json(value: object) -> str:
@@ -230,6 +232,10 @@ class DeepFetchProviderRequest:
     fence_ref: str
     native_session_ref: str | None = None
     job_ref: str | None = None
+    # Reconciliation is a read-only compatibility path for a durable operation
+    # admitted under a persisted predecessor binding.  Providers must not start
+    # or resume an external effect while this flag is set.
+    reconcile_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -423,6 +429,13 @@ def validate_deepfetch_result(
 class CodexDeepFetchAdapter:
     """Production Adapter for the bound DeepFetch v4 Harness workflow."""
 
+    # DeepFetch already runs inside its own dedicated provider workspace and
+    # publishes only artifacts that pass the Owner-side import validators.
+    # Supported deployment hosts do not reliably permit the user namespaces
+    # required by Codex's workspace-write sandbox, so use the same explicit
+    # local-execution boundary as the production Idea adapter.
+    _sandbox_mode = "danger-full-access"
+
     def __init__(
         self,
         workspace: Path,
@@ -437,11 +450,15 @@ class CodexDeepFetchAdapter:
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
+        self._agent_workspace = self._workspace / "research-workspace"
+        self._agent_workspace.mkdir(parents=True, exist_ok=True)
         self._executable = executable
         self._model_ref = model_ref
         self._timeout_seconds = timeout_seconds
         self._acquisition_client = acquisition_client
-        self._runner = process_runner or _CancellableProcessRunner()
+        self._runner = process_runner or _CancellableProcessRunner(
+            stream_max_bytes=DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
+        )
         self._skill_root = _deepfetch_skill_root()
         self._skill_bundle_hash = _deepfetch_skill_bundle_hash(self._skill_root)
 
@@ -469,74 +486,91 @@ class CodexDeepFetchAdapter:
         try:
             _key_path, key = ensure_transport_key(self._workspace)
             for provider_job_ref in self._registered_provider_jobs(job_ref):
-                operation_root = self._provider_operation_root(provider_job_ref)
-                if not operation_root.exists():
-                    continue
-                directories = sorted(
-                    path
-                    for path in operation_root.iterdir()
-                    if path.is_dir() and path.name.startswith("deepfetch-")
-                )
-                for directory in directories:
-                    invocation_path = directory / "invocation.json"
-                    if not invocation_path.is_file():
-                        if any(directory.iterdir()):
+                for operation_root in self._provider_operation_roots(
+                    provider_job_ref
+                ):
+                    directories = sorted(
+                        path
+                        for path in operation_root.iterdir()
+                        if path.is_dir() and path.name.startswith("deepfetch-")
+                    )
+                    for directory in directories:
+                        invocation_path = directory / "invocation.json"
+                        if not invocation_path.is_file():
+                            if any(directory.iterdir()):
+                                raise ProviderSupervisorError(
+                                    "provider_supervisor_spool_invalid"
+                                )
+                            continue
+                        invocation = read_transport_envelope(invocation_path, key)
+                        segment_name = directory.name.removeprefix("deepfetch-")
+                        if (
+                            invocation.get("schema_ref")
+                            != "meta-research/deepfetch-provider-operation/v1"
+                            or invocation.get("job_ref") != provider_job_ref
+                            or invocation.get("segment_name") != segment_name
+                        ):
                             raise ProviderSupervisorError(
                                 "provider_supervisor_spool_invalid"
                             )
-                        continue
-                    invocation = read_transport_envelope(invocation_path, key)
-                    segment_name = directory.name.removeprefix("deepfetch-")
-                    if (
-                        invocation.get("schema_ref")
-                        != "meta-research/deepfetch-provider-operation/v1"
-                        or invocation.get("job_ref") != provider_job_ref
-                        or invocation.get("segment_name") != segment_name
-                    ):
-                        raise ProviderSupervisorError(
-                            "provider_supervisor_spool_invalid"
-                        )
-                    invocation_hash = canonical_hash(invocation)
-                    receipt_path = directory / "supervisor-exit.json"
-                    if not receipt_path.is_file():
-                        if not (directory / "supervisor-ready.json").is_file():
-                            if not supervisor_request_never_started(
+                        invocation_hash = canonical_hash(invocation)
+                        receipt_path = directory / "supervisor-exit.json"
+                        if not receipt_path.is_file():
+                            if not (directory / "supervisor-ready.json").is_file():
+                                if not supervisor_request_never_started(
+                                    directory,
+                                    key=key,
+                                    invocation_hash=invocation_hash,
+                                    request_schema=SUPERVISOR_REQUEST_SCHEMA,
+                                ):
+                                    return False
+                                continue
+                            if not request_supervisor_stop(
                                 directory,
                                 key=key,
                                 invocation_hash=invocation_hash,
-                                request_schema=SUPERVISOR_REQUEST_SCHEMA,
+                                ready_schema=(
+                                    "meta-research/codex-provider-supervisor-ready/v1"
+                                ),
                             ):
                                 return False
-                            continue
-                        if not request_supervisor_stop(
-                            directory,
+                            if not receipt_path.is_file():
+                                continue
+                        read_verified_exit_receipt(
+                            receipt_path,
                             key=key,
                             invocation_hash=invocation_hash,
-                            ready_schema=(
-                                "meta-research/codex-provider-supervisor-ready/v1"
-                            ),
-                        ):
-                            return False
-                        if not receipt_path.is_file():
-                            continue
-                    read_verified_exit_receipt(
-                        receipt_path,
-                        key=key,
-                        invocation_hash=invocation_hash,
-                        prompt_path=directory / "prompt.txt",
-                        schema_path=directory / "output-schema.json",
-                        stdout_path=directory / "stdout.jsonl",
-                        result_path=directory / "last-message.json",
-                    )
+                            prompt_path=directory / "prompt.txt",
+                            schema_path=directory / "output-schema.json",
+                            stdout_path=directory / "stdout.jsonl",
+                            result_path=directory / "last-message.json",
+                        )
         except (OSError, ProviderSupervisorError, DeepFetchUnavailable):
             return False
         return True
 
-    def _provider_operation_root(self, job_ref: str) -> Path:
+    def _provider_operation_root(
+        self, job_ref: str, runtime_binding_hash: str
+    ) -> Path:
         return (
             self._workspace
             / "provider-operations"
-            / canonical_hash({"job_ref": job_ref})
+            / f"{runtime_binding_hash}-{canonical_hash({'job_ref': job_ref})}"
+        )
+
+    def _protocol_run_root(
+        self, run_key: str, runtime_binding_hash: str
+    ) -> Path:
+        return self._workspace / "runs" / f"{runtime_binding_hash}-{run_key}"
+
+    def _provider_operation_roots(self, job_ref: str) -> tuple[Path, ...]:
+        provider_root = self._workspace / "provider-operations"
+        job_hash = canonical_hash({"job_ref": job_ref})
+        candidates = [provider_root / job_hash]
+        if provider_root.exists():
+            candidates.extend(sorted(provider_root.glob(f"*-{job_hash}")))
+        return tuple(
+            dict.fromkeys(path for path in candidates if path.is_dir())
         )
 
     def _register_provider_turn(
@@ -545,8 +579,11 @@ class CodexDeepFetchAdapter:
         root_job_ref: str,
         turn_number: int,
         provider_job_ref: str,
+        runtime_binding_hash: str,
     ) -> None:
-        operation_root = self._provider_operation_root(root_job_ref)
+        operation_root = self._provider_operation_root(
+            root_job_ref, runtime_binding_hash
+        )
         registry_root = operation_root / "registered-turns"
         registry_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -574,31 +611,30 @@ class CodexDeepFetchAdapter:
             root_job_ref,
             *(f"{root_job_ref}:v4-turn:{turn}" for turn in range(12)),
         ]
-        registry_root = (
-            self._provider_operation_root(root_job_ref) / "registered-turns"
-        )
-        if not registry_root.exists():
-            return tuple(job_refs)
         try:
             _key_path, key = ensure_transport_key(self._workspace)
-            markers = sorted(
-                registry_root.glob("turn-*.json"),
-                key=_provider_turn_marker_number,
-            )
-            for marker in markers:
-                turn_number = _provider_turn_marker_number(marker)
-                payload = read_transport_envelope(marker, key)
-                provider_job_ref = f"{root_job_ref}:v4-turn:{turn_number}"
-                if payload != {
-                    "schema_ref": DEEPFETCH_PROVIDER_OPERATION_REGISTRY_SCHEMA,
-                    "root_job_ref": root_job_ref,
-                    "turn_number": turn_number,
-                    "provider_job_ref": provider_job_ref,
-                }:
-                    raise ProviderSupervisorError(
-                        "provider_supervisor_spool_invalid"
-                    )
-                job_refs.append(provider_job_ref)
+            for operation_root in self._provider_operation_roots(root_job_ref):
+                registry_root = operation_root / "registered-turns"
+                if not registry_root.exists():
+                    continue
+                markers = sorted(
+                    registry_root.glob("turn-*.json"),
+                    key=_provider_turn_marker_number,
+                )
+                for marker in markers:
+                    turn_number = _provider_turn_marker_number(marker)
+                    payload = read_transport_envelope(marker, key)
+                    provider_job_ref = f"{root_job_ref}:v4-turn:{turn_number}"
+                    if payload != {
+                        "schema_ref": DEEPFETCH_PROVIDER_OPERATION_REGISTRY_SCHEMA,
+                        "root_job_ref": root_job_ref,
+                        "turn_number": turn_number,
+                        "provider_job_ref": provider_job_ref,
+                    }:
+                        raise ProviderSupervisorError(
+                            "provider_supervisor_spool_invalid"
+                        )
+                    job_refs.append(provider_job_ref)
         except (OSError, ProviderSupervisorError, ValueError) as error:
             raise DeepFetchUnavailable(
                 "deepfetch_provider_spool_invalid"
@@ -618,12 +654,18 @@ class CodexDeepFetchAdapter:
             model_ref=self._model_ref,
             harness_ref="codex-cli",
             capability_bindings=(
+                "agent-workspace-policy:dedicated-research-workspace-v1",
                 "approval-policy-never",
                 "deepfetch-v4-main-agent",
                 f"deepfetch-v4-skill-bundle-sha256:{self._skill_bundle_hash}",
+                "filesystem-danger-full-access",
                 "hosted-acquisition-session",
                 "native-child-readers",
                 "papers-v4-finalize",
+                "provider-output-limits:"
+                f"stream={DEEPFETCH_PROVIDER_STREAM_MAX_BYTES};"
+                f"result={PROVIDER_RESULT_MAX_BYTES}",
+                "sandbox-policy:danger-full-access",
                 "structured-output-json-schema",
                 "workspace-write-public-artifacts",
                 "web-fetch-live",
@@ -632,6 +674,7 @@ class CodexDeepFetchAdapter:
         )
 
     def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        runtime_binding_hash = canonical_hash(request.runtime_binding.as_dict())
         run_key = canonical_hash(
             {
                 "request_ref": request.request_ref,
@@ -640,7 +683,16 @@ class CodexDeepFetchAdapter:
                 "scope_hash": request.scope_hash,
             }
         )[:32]
-        run_root = self._workspace / "runs" / run_key
+        if request.reconcile_only:
+            return self._reconcile_existing_protocol(
+                request,
+                run_key=run_key,
+                runtime_binding_hash=runtime_binding_hash,
+            )
+        run_root = self._protocol_run_root(
+            run_key,
+            runtime_binding_hash,
+        )
         public_root = run_root / "public"
         private_root = run_root / "private"
         public_root.mkdir(parents=True, exist_ok=True)
@@ -688,6 +740,568 @@ class CodexDeepFetchAdapter:
             if self.requires_verified_terminal_retry and native_session_ref is not None:
                 invalid = invalid.as_verified_terminal(native_session_ref)
             raise invalid from error
+
+    def _reconcile_existing_protocol(
+        self,
+        request: DeepFetchProviderRequest,
+        *,
+        run_key: str,
+        runtime_binding_hash: str,
+    ) -> DeepFetchResult:
+        """Read one predecessor operation without starting a provider effect."""
+
+        if request.job_ref is None or not callable(
+            getattr(self._runner, "run_durable_job", None)
+        ):
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_reconciliation_pending",
+                durable_outcome="pending",
+                native_session_ref=request.native_session_ref,
+            )
+        try:
+            run_root = self._select_reconciliation_root(
+                self._workspace / "runs",
+                identity_leaf=run_key,
+                runtime_binding_hash=runtime_binding_hash,
+            )
+            public_root = run_root / "public"
+            private_root = run_root / "private"
+            checkpoint_path = private_root / "protocol.json"
+            if (
+                run_root.is_symlink()
+                or public_root.is_symlink()
+                or private_root.is_symlink()
+                or checkpoint_path.is_symlink()
+                or not public_root.is_dir()
+                or not private_root.is_dir()
+                or not checkpoint_path.is_file()
+            ):
+                raise ValueError("deepfetch reconciliation run root")
+            checkpoint = _read_protocol_checkpoint(
+                checkpoint_path,
+                _deepfetch_protocol_identity(request),
+            )
+            checkpoint = self._verify_existing_protocol_turns(
+                request,
+                public_root=public_root,
+                checkpoint=checkpoint,
+                runtime_binding_hash=runtime_binding_hash,
+            )
+        except DeepFetchUnavailable as error:
+            if error.durable_outcome != "unknown":
+                raise
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_reconciliation_pending",
+                durable_outcome="pending",
+                native_session_ref=request.native_session_ref,
+            ) from error
+        except (
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            ProviderSupervisorError,
+        ) as error:
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_reconciliation_pending",
+                durable_outcome="pending",
+                native_session_ref=request.native_session_ref,
+            ) from error
+
+        if checkpoint.phase != "finalized":
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_reconciliation_pending",
+                durable_outcome="pending",
+                native_session_ref=checkpoint.native_session_ref,
+            )
+        try:
+            return self._execute_protocol(
+                request,
+                public_root=public_root,
+                checkpoint_path=checkpoint_path,
+                checkpoint=checkpoint,
+            )
+        except DeepFetchUnavailable as error:
+            if error.durable_outcome != "unknown":
+                raise
+            assert checkpoint.native_session_ref is not None
+            raise error.as_verified_terminal(
+                checkpoint.native_session_ref
+            ) from error
+        except (KeyError, TypeError, ValueError) as error:
+            assert checkpoint.native_session_ref is not None
+            raise DeepFetchUnavailable(
+                "codex_deepfetch_output_invalid",
+                durable_outcome="terminal",
+                native_session_ref=checkpoint.native_session_ref,
+            ) from error
+
+    def _select_reconciliation_root(
+        self,
+        parent: Path,
+        *,
+        identity_leaf: str,
+        runtime_binding_hash: str,
+        allow_missing: bool = False,
+    ) -> Path | None:
+        """Select exactly one deployed legacy or binding-partitioned root."""
+
+        if not parent.exists() and allow_missing:
+            return None
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError("deepfetch reconciliation root missing")
+        legacy_name = identity_leaf
+        partitioned_name = f"{runtime_binding_hash}-{identity_leaf}"
+        matches: list[Path] = []
+        for path in parent.iterdir():
+            if path.name != legacy_name and not path.name.endswith(
+                f"-{identity_leaf}"
+            ):
+                continue
+            if path.is_symlink() or not path.is_dir():
+                raise ValueError("deepfetch reconciliation root invalid")
+            matches.append(path)
+        if not matches and allow_missing:
+            return None
+        if len(matches) != 1 or matches[0].name not in {
+            legacy_name,
+            partitioned_name,
+        }:
+            raise ValueError("deepfetch reconciliation root conflict")
+        return matches[0]
+
+    def _verify_existing_protocol_turns(
+        self,
+        request: DeepFetchProviderRequest,
+        *,
+        public_root: Path,
+        checkpoint: _DeepFetchProtocolCheckpoint,
+        runtime_binding_hash: str,
+    ) -> _DeepFetchProtocolCheckpoint:
+        """Rebuild protocol facts from signed predecessor supervisor receipts."""
+
+        assert request.job_ref is not None
+        acquisition_requests: list[dict[str, object]] = []
+        observed_evidence: list[dict[str, object]] = []
+        previous_native_session_ref: str | None = None
+        enforce_previous_native = False
+        for turn_number in range(checkpoint.next_turn_number):
+            raw, native_session_ref, evidence = self._read_existing_turn(
+                request,
+                public_root=public_root,
+                provider_job_ref=f"{request.job_ref}:v4-turn:{turn_number}",
+                runtime_binding_hash=runtime_binding_hash,
+                expected_native_session_ref=previous_native_session_ref,
+                enforce_native_session_ref=enforce_previous_native,
+            )
+            observed_evidence.append(evidence)
+            previous_native_session_ref = native_session_ref
+            enforce_previous_native = True
+            if raw.get("action") == "acquire":
+                acquisition_requests.append(
+                    _validated_v4_acquisition_request(raw).identity_payload()
+                )
+            elif raw.get("action") == "finalize":
+                _validate_final_envelope_shape(raw)
+                if turn_number != checkpoint.next_turn_number - 1:
+                    raise ValueError("deepfetch reconciliation finalized early")
+            else:
+                raise ValueError("deepfetch reconciliation action invalid")
+
+        if tuple(observed_evidence) != checkpoint.evidence_parts:
+            raise ValueError("deepfetch reconciliation evidence mismatch")
+        if checkpoint.phase == "finalized":
+            if (
+                not acquisition_requests
+                and checkpoint.acquisition_request_ids
+                or tuple(
+                    str(item["request_id"])
+                    for item in acquisition_requests
+                )
+                != checkpoint.acquisition_request_ids
+                or checkpoint.final_envelope is None
+                or checkpoint.next_turn_number < 1
+            ):
+                raise ValueError("deepfetch reconciliation checkpoint mismatch")
+            final_raw, final_native, _final_evidence = self._read_existing_turn(
+                request,
+                public_root=public_root,
+                provider_job_ref=(
+                    f"{request.job_ref}:v4-turn:"
+                    f"{checkpoint.next_turn_number - 1}"
+                ),
+                runtime_binding_hash=runtime_binding_hash,
+                expected_native_session_ref=None,
+                enforce_native_session_ref=False,
+            )
+            if (
+                final_raw != checkpoint.final_envelope
+                or final_native != checkpoint.native_session_ref
+                or request.native_session_ref is not None
+                and final_native != request.native_session_ref
+            ):
+                raise ValueError("deepfetch reconciliation final mismatch")
+            return checkpoint
+
+        if checkpoint.phase == "pending_acquisition":
+            if (
+                not acquisition_requests
+                or checkpoint.pending_acquisition != acquisition_requests[-1]
+                or tuple(
+                    str(item["request_id"])
+                    for item in acquisition_requests[:-1]
+                )
+                != checkpoint.acquisition_request_ids
+            ):
+                raise ValueError("deepfetch reconciliation acquisition mismatch")
+            assert checkpoint.native_session_ref is not None
+            raise DeepFetchUnavailable(
+                "deepfetch_runtime_binding_transition_required",
+                durable_outcome="terminal",
+                native_session_ref=checkpoint.native_session_ref,
+            )
+
+        if tuple(
+            str(item["request_id"]) for item in acquisition_requests
+        ) != checkpoint.acquisition_request_ids:
+            raise ValueError("deepfetch reconciliation acquisition mismatch")
+        raw, native_session_ref, evidence = self._read_existing_turn(
+            request,
+            public_root=public_root,
+            provider_job_ref=(
+                f"{request.job_ref}:v4-turn:{checkpoint.next_turn_number}"
+            ),
+            runtime_binding_hash=runtime_binding_hash,
+            expected_native_session_ref=previous_native_session_ref,
+            enforce_native_session_ref=enforce_previous_native,
+            allow_missing_operation=True,
+        )
+        if raw.get("action") != "finalize":
+            # The predecessor provider effect is signed-terminal at this turn
+            # boundary, but continuing would start a new old-binding effect.
+            # Retire the old Attempt so a later command can transition binding.
+            _validated_v4_acquisition_request(raw)
+            raise DeepFetchUnavailable(
+                "deepfetch_runtime_binding_transition_required",
+                durable_outcome="terminal",
+                native_session_ref=native_session_ref,
+            )
+        _validate_final_envelope_shape(raw)
+        if request.native_session_ref is not None and (
+            native_session_ref != request.native_session_ref
+        ):
+            raise ValueError("deepfetch reconciliation native session mismatch")
+        return replace(
+            checkpoint,
+            phase="finalized",
+            native_session_ref=native_session_ref,
+            next_turn_number=checkpoint.next_turn_number + 1,
+            evidence_parts=(*checkpoint.evidence_parts, evidence),
+            next_prompt=None,
+            final_envelope=raw,
+        )
+
+    def _read_existing_turn(
+        self,
+        request: DeepFetchProviderRequest,
+        *,
+        public_root: Path,
+        provider_job_ref: str,
+        runtime_binding_hash: str,
+        expected_native_session_ref: str | None,
+        enforce_native_session_ref: bool,
+        allow_missing_operation: bool = False,
+    ) -> tuple[dict[str, object], str, dict[str, object]]:
+        """Verify one old durable turn without publishing any new files."""
+
+        operation_root = self._select_reconciliation_root(
+            self._workspace / "provider-operations",
+            identity_leaf=canonical_hash({"job_ref": provider_job_ref}),
+            runtime_binding_hash=runtime_binding_hash,
+            allow_missing=allow_missing_operation,
+        )
+        if operation_root is None:
+            # The durable protocol checkpoint precedes operation-root creation.
+            # With neither supported root present, the provider dispatch could
+            # not have been published and no old-binding effect may be resumed.
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_never_started",
+                durable_outcome="terminal",
+                native_session_ref=expected_native_session_ref,
+            )
+        try:
+            entries = tuple(operation_root.iterdir())
+            if any(
+                entry.is_symlink()
+                or not entry.is_dir()
+                or not entry.name.startswith("deepfetch-")
+                for entry in entries
+            ):
+                raise ValueError("deepfetch reconciliation segment invalid")
+            names = {entry.name for entry in entries}
+            if "deepfetch-initial" not in names:
+                raise ValueError("deepfetch reconciliation initial missing")
+            resume_numbers = sorted(
+                int(name.removeprefix("deepfetch-resume-"))
+                for name in names
+                if name.startswith("deepfetch-resume-")
+                and name.removeprefix("deepfetch-resume-").isdigit()
+            )
+            expected_names = {
+                "deepfetch-initial",
+                *(f"deepfetch-resume-{number}" for number in resume_numbers),
+            }
+            if (
+                names != expected_names
+                or resume_numbers
+                and resume_numbers != list(range(1, resume_numbers[-1] + 1))
+            ):
+                raise ValueError("deepfetch reconciliation segment conflict")
+            directories = [
+                operation_root / "deepfetch-initial",
+                *(
+                    operation_root / f"deepfetch-resume-{number}"
+                    for number in resume_numbers
+                ),
+            ]
+            _key_path, transport_key = read_transport_key_for_operation(
+                directories[0]
+            )
+            traces: list[str] = []
+            native_session_ref = expected_native_session_ref
+            enforce_native = enforce_native_session_ref
+            for index, directory in enumerate(directories):
+                segment_name = "initial" if index == 0 else f"resume-{index}"
+                invocation_path = directory / "invocation.json"
+                prompt_path = directory / "prompt.txt"
+                schema_path = directory / "output-schema.json"
+                if any(
+                    path.is_symlink() or not path.is_file()
+                    for path in (invocation_path, prompt_path, schema_path)
+                ):
+                    raise ValueError("deepfetch reconciliation input invalid")
+                invocation = read_transport_envelope(
+                    invocation_path, transport_key
+                )
+                prompt = prompt_path.read_text(encoding="utf-8")
+                schema_text = schema_path.read_text(encoding="utf-8")
+                invocation_native = invocation.get("native_session_ref")
+                if enforce_native and invocation_native != native_session_ref:
+                    raise ValueError("deepfetch reconciliation session mismatch")
+                if (
+                    set(invocation)
+                    != {
+                        "schema_ref",
+                        "job_ref",
+                        "segment_name",
+                        "request_ref",
+                        "correlation_ref",
+                        "draft_hash",
+                        "scope_hash",
+                        "runtime_binding_hash",
+                        "native_session_ref",
+                        "prompt_hash",
+                        "output_schema_hash",
+                        "model_ref",
+                    }
+                    or invocation.get("schema_ref")
+                    != "meta-research/deepfetch-provider-operation/v1"
+                    or invocation.get("job_ref") != provider_job_ref
+                    or invocation.get("segment_name") != segment_name
+                    or invocation.get("request_ref") != request.request_ref
+                    or invocation.get("correlation_ref") != request.correlation_ref
+                    or invocation.get("draft_hash") != request.draft_hash
+                    or invocation.get("scope_hash") != request.scope_hash
+                    or invocation.get("runtime_binding_hash")
+                    != runtime_binding_hash
+                    or invocation.get("prompt_hash") != canonical_hash(prompt)
+                    or invocation.get("output_schema_hash")
+                    != canonical_hash(_deepfetch_output_schema())
+                    or invocation.get("model_ref")
+                    != request.runtime_binding.model_ref
+                    or f"public_output_root={public_root}" not in prompt.splitlines()
+                    or schema_text
+                    != canonical_json(_deepfetch_output_schema())
+                ):
+                    raise ValueError("deepfetch reconciliation identity mismatch")
+                invocation_hash = canonical_hash(invocation)
+                self._verify_existing_supervisor_request(
+                    directory,
+                    invocation_hash=invocation_hash,
+                    invocation_native_session_ref=cast(
+                        str | None, invocation_native
+                    ),
+                    runtime_binding=request.runtime_binding,
+                    transport_key=transport_key,
+                )
+                if not (directory / "supervisor-exit.json").is_file():
+                    if supervisor_request_never_started(
+                        directory,
+                        key=transport_key,
+                        invocation_hash=invocation_hash,
+                        request_schema=SUPERVISOR_REQUEST_SCHEMA,
+                    ):
+                        raise DeepFetchUnavailable(
+                            "deepfetch_provider_never_started",
+                            durable_outcome="terminal",
+                            native_session_ref=native_session_ref,
+                        )
+                    raise DeepFetchUnavailable(
+                        "deepfetch_provider_reconciliation_pending",
+                        durable_outcome="pending",
+                        native_session_ref=native_session_ref,
+                    )
+                outcome = self._read_durable_segment(
+                    directory=directory,
+                    invocation_hash=invocation_hash,
+                    native_session_ref=cast(str | None, invocation_native),
+                    transport_key=transport_key,
+                )
+                traces.append(outcome[2])
+                observed_native = outcome[3]
+                if outcome[0] == "completed":
+                    if index != len(directories) - 1:
+                        raise ValueError(
+                            "deepfetch reconciliation trailing segment"
+                        )
+                    if not isinstance(outcome[1], dict) or not isinstance(
+                        observed_native, str
+                    ):
+                        raise ValueError("deepfetch reconciliation result invalid")
+                    try:
+                        evidence = _verified_turn_evidence("\n".join(traces))
+                    except DeepFetchUnavailable as error:
+                        raise error.as_verified_terminal(
+                            observed_native
+                        ) from error
+                    return outcome[1], observed_native, evidence
+                if not isinstance(observed_native, str) or not observed_native:
+                    raise DeepFetchUnavailable(
+                        "deepfetch_provider_stopped_before_session",
+                        durable_outcome="terminal",
+                    )
+                native_session_ref = observed_native
+                enforce_native = True
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_reconciliation_pending",
+                durable_outcome="pending",
+                native_session_ref=native_session_ref,
+            )
+        except DeepFetchUnavailable:
+            raise
+        except (
+            OSError,
+            UnicodeDecodeError,
+            ProviderSupervisorError,
+            ValueError,
+        ) as error:
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_reconciliation_pending",
+                durable_outcome="pending",
+                native_session_ref=request.native_session_ref,
+            ) from error
+
+    def _verify_existing_supervisor_request(
+        self,
+        directory: Path,
+        *,
+        invocation_hash: str,
+        invocation_native_session_ref: str | None,
+        runtime_binding: DeepFetchRuntimeBinding,
+        transport_key: bytes,
+    ) -> None:
+        request_path = directory / "supervisor-request.json"
+        if request_path.is_symlink() or not request_path.is_file():
+            raise ValueError("deepfetch reconciliation supervisor request missing")
+        supervisor = read_transport_envelope(request_path, transport_key)
+        expected_paths = {
+            "prompt_path": directory / "prompt.txt",
+            "schema_path": directory / "output-schema.json",
+            "stdout_path": directory / "stdout.jsonl",
+            "result_path": directory / "last-message.json",
+            "lock_path": directory / "supervisor.lock",
+            "ready_path": directory / "supervisor-ready.json",
+            "started_path": directory / "provider-started.json",
+            "receipt_path": directory / "supervisor-exit.json",
+            "stop_path": directory / "supervisor-stop.json",
+        }
+        if (
+            set(supervisor)
+            != {
+                "schema_ref",
+                "invocation_hash",
+                "argv",
+                "timeout_seconds",
+                "stream_max_bytes",
+                "result_max_bytes",
+                *expected_paths,
+            }
+            or supervisor.get("schema_ref") != SUPERVISOR_REQUEST_SCHEMA
+            or supervisor.get("invocation_hash") != invocation_hash
+            or any(
+                supervisor.get(key) != str(path)
+                for key, path in expected_paths.items()
+            )
+            or not isinstance(supervisor.get("timeout_seconds"), (int, float))
+            or isinstance(supervisor.get("timeout_seconds"), bool)
+            or cast(float, supervisor["timeout_seconds"]) <= 0
+            or not isinstance(supervisor.get("stream_max_bytes"), int)
+            or isinstance(supervisor.get("stream_max_bytes"), bool)
+            or not 0 < cast(int, supervisor["stream_max_bytes"]) <= (
+                DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
+            )
+            or supervisor.get("result_max_bytes") != PROVIDER_RESULT_MAX_BYTES
+        ):
+            raise ValueError("deepfetch reconciliation supervisor request invalid")
+        argv = supervisor.get("argv")
+        if not isinstance(argv, list) or any(
+            not isinstance(item, str) for item in argv
+        ):
+            raise ValueError("deepfetch reconciliation argv invalid")
+        arguments = cast(list[str], argv)
+
+        def option(name: str) -> str:
+            positions = [
+                index for index, value in enumerate(arguments) if value == name
+            ]
+            if len(positions) != 1 or positions[0] + 1 >= len(arguments):
+                raise ValueError("deepfetch reconciliation argv invalid")
+            return arguments[positions[0] + 1]
+
+        expected_sandbox = (
+            "danger-full-access"
+            if "sandbox-policy:danger-full-access"
+            in runtime_binding.capability_bindings
+            else "workspace-write"
+        )
+        expected_workspace = (
+            self._agent_workspace
+            if "agent-workspace-policy:dedicated-research-workspace-v1"
+            in runtime_binding.capability_bindings
+            else self._workspace
+        )
+        if (
+            len(arguments) < 2
+            or arguments[1] != "exec"
+            or option("--sandbox") != expected_sandbox
+            or option("--model") != runtime_binding.model_ref
+            or option("--cd") != str(expected_workspace)
+            or option("--output-schema")
+            != str(directory / "output-schema.json")
+            or option("--output-last-message")
+            != str(directory / "last-message.json")
+            or arguments[-1] != "-"
+            or (
+                invocation_native_session_ref is None
+                and "resume" in arguments
+            )
+            or (
+                invocation_native_session_ref is not None
+                and arguments[-3:]
+                != ["resume", invocation_native_session_ref, "-"]
+            )
+        ):
+            raise ValueError("deepfetch reconciliation argv identity invalid")
 
     def _execute_protocol(
         self,
@@ -746,6 +1360,9 @@ class CodexDeepFetchAdapter:
                     root_job_ref=request.job_ref,
                     turn_number=turn_number,
                     provider_job_ref=provider_job_ref,
+                    runtime_binding_hash=canonical_hash(
+                        request.runtime_binding.as_dict()
+                    ),
                 )
             turn_request = replace(
                 request,
@@ -921,11 +1538,11 @@ class CodexDeepFetchAdapter:
                 "--config",
                 "features.multi_agent=true",
                 "--sandbox",
-                "workspace-write",
+                self._sandbox_mode,
                 "--model",
                 self._model_ref,
                 "--cd",
-                str(self._workspace),
+                str(self._agent_workspace),
                 "--json",
                 "--output-schema",
                 str(schema_path),
@@ -950,13 +1567,21 @@ class CodexDeepFetchAdapter:
                 raise DeepFetchUnavailable("codex_cli_unavailable") from error
             except subprocess.TimeoutExpired as error:
                 raise DeepFetchUnavailable("codex_deepfetch_timeout") from error
+            except DraftingUnavailable as error:
+                if error.code == "codex_output_too_large":
+                    raise DeepFetchUnavailable(
+                        "codex_deepfetch_output_too_large"
+                    ) from error
+                raise
             except OSError as error:
                 raise DeepFetchUnavailable("codex_deepfetch_io_unavailable") from error
             if completed.returncode != 0:
                 raise DeepFetchUnavailable("codex_deepfetch_failed")
             if _text_exceeds_limit(
-                completed.stdout, PROVIDER_STREAM_MAX_BYTES
-            ) or _text_exceeds_limit(completed.stderr, PROVIDER_STREAM_MAX_BYTES):
+                completed.stdout, DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
+            ) or _text_exceeds_limit(
+                completed.stderr, DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
+            ):
                 raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
             try:
                 if result_path.stat().st_size > PROVIDER_RESULT_MAX_BYTES:
@@ -984,10 +1609,9 @@ class CodexDeepFetchAdapter:
         """Reconcile one logical provider operation across daemon Attempts."""
 
         assert request.job_ref is not None
-        operation_root = (
-            self._workspace
-            / "provider-operations"
-            / canonical_hash({"job_ref": request.job_ref})
+        operation_root = self._provider_operation_root(
+            request.job_ref,
+            canonical_hash(request.runtime_binding.as_dict()),
         )
         try:
             _key_path, transport_key = ensure_transport_key(self._workspace)
@@ -1118,7 +1742,7 @@ class CodexDeepFetchAdapter:
                         "invocation_hash": invocation_hash,
                         "argv": argv,
                         "timeout_seconds": self._timeout_seconds,
-                        "stream_max_bytes": PROVIDER_STREAM_MAX_BYTES,
+                        "stream_max_bytes": DEEPFETCH_PROVIDER_STREAM_MAX_BYTES,
                         "result_max_bytes": PROVIDER_RESULT_MAX_BYTES,
                         "prompt_path": str(prompt_path),
                         "schema_path": str(schema_path),
@@ -1133,7 +1757,7 @@ class CodexDeepFetchAdapter:
                     transport_key,
                 )
                 durable_job = self._runner.run_durable_job
-                durable_job(
+                durable_arguments = (
                     job_ref,
                     argv,
                     prompt,
@@ -1142,6 +1766,13 @@ class CodexDeepFetchAdapter:
                     directory / "pid.json",
                     supervisor_request_path,
                 )
+                if isinstance(self._runner, _CancellableProcessRunner):
+                    durable_job(
+                        *durable_arguments,
+                        stdout_max_bytes=DEEPFETCH_PROVIDER_STREAM_MAX_BYTES,
+                    )
+                else:
+                    durable_job(*durable_arguments)
             except _ProcessStopped as error:
                 raise DeepFetchUnavailable(
                     "deepfetch_provider_stopped", durable_outcome="pending"
@@ -1193,11 +1824,11 @@ class CodexDeepFetchAdapter:
             "--config",
             "features.multi_agent=true",
             "--sandbox",
-            "workspace-write",
+            self._sandbox_mode,
             "--model",
             self._model_ref,
             "--cd",
-            str(self._workspace),
+            str(self._agent_workspace),
             "--json",
             "--output-schema",
             str(schema_path),
@@ -1238,7 +1869,7 @@ class CodexDeepFetchAdapter:
                 stdout_path=stdout_path,
                 result_path=result_path,
             )
-            if stdout_path.stat().st_size > PROVIDER_STREAM_MAX_BYTES:
+            if stdout_path.stat().st_size > DEEPFETCH_PROVIDER_STREAM_MAX_BYTES:
                 raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
             stdout = stdout_path.read_text(encoding="utf-8")
         except DeepFetchUnavailable:
@@ -1246,6 +1877,12 @@ class CodexDeepFetchAdapter:
         except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
             raise DeepFetchUnavailable("deepfetch_provider_spool_invalid") from error
         observed_session_ref = _thread_id(stdout)
+        if receipt["termination_reason"] == "output_limit":
+            raise DeepFetchUnavailable(
+                "codex_deepfetch_output_too_large",
+                durable_outcome="terminal",
+                native_session_ref=observed_session_ref,
+            )
         if receipt["termination_reason"] == "stopped":
             return "stopped", None, stdout, observed_session_ref
         if receipt["termination_reason"] == "timeout":
@@ -2476,6 +3113,30 @@ def _validated_prototype_evidence(value: object) -> dict[str, object]:
         or not isinstance(files, list)
     ):
         raise DeepFetchUnavailable("deepfetch_prototype_evidence_invalid")
+    for file_proof in files:
+        if not isinstance(file_proof, dict) or set(file_proof) != {
+            "path",
+            "sha256",
+            "bytes",
+        }:
+            raise DeepFetchUnavailable("deepfetch_prototype_evidence_invalid")
+        path = file_proof.get("path")
+        sha256 = file_proof.get("sha256")
+        byte_count = file_proof.get("bytes")
+        if (
+            not isinstance(path, str)
+            or not path.startswith("fulltext/")
+            or Path(path).suffix.lower() not in {".pdf", ".html", ".xml"}
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+        ):
+            raise DeepFetchUnavailable("deepfetch_prototype_evidence_invalid")
     return cast(dict[str, object], value)
 
 
@@ -2564,7 +3225,10 @@ def _collect_reader_trace(
     if item.get("status") != "completed":
         return
     tool = item.get("tool")
-    if tool not in {"spawn_agent", "wait"}:
+    # Current Codex emits a completed ``close_agent`` item when the root
+    # collects an already-completed child without a preceding wait item.  Its
+    # signed agents_states payload is the same terminal evidence boundary.
+    if tool not in {"spawn_agent", "wait", "close_agent"}:
         return
     receivers = item.get("receiver_thread_ids")
     states = item.get("agents_states")
@@ -2592,7 +3256,7 @@ def _collect_reader_trace(
         state = states.get(receiver)
         if not isinstance(state, dict):
             raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
-        if state.get("status") == "completed":
+        if state.get("status") == "completed" and receiver not in terminal:
             terminal.append(receiver)
 
 

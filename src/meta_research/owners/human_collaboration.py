@@ -48,6 +48,7 @@ from meta_research.owners.common import (
 from meta_research.owners.research_graph import ResearchGraphInterface
 from meta_research.owners.research_memory import (
     AcceptedLiteratureSnapshot,
+    PROPOSAL_LITERATURE_EVIDENCE_SCHEMA,
     ResearchMemoryInterface,
 )
 from meta_research.owners.secret_detection import contains_secret
@@ -5700,8 +5701,10 @@ class SQLiteHumanCollaboration:
                 )
                 return True
             try:
-                literature_snapshot = self._research_memory.read_literature_snapshot(
-                    str(job.literature_snapshot_ref)
+                literature_snapshot = (
+                    self._research_memory.read_literature_proposal_evidence(
+                        str(job.literature_snapshot_ref)
+                    )
                 )
             except OwnerConflict as error:
                 self._fail_proposal_job(
@@ -5710,10 +5713,35 @@ class SQLiteHumanCollaboration:
                     error.code,
                 )
                 return True
+            source_snapshot = literature_snapshot.get("source_snapshot")
+            source_binding = (
+                source_snapshot.get("binding")
+                if isinstance(source_snapshot, dict)
+                else None
+            )
+            projection_hash = literature_snapshot.get("projection_hash")
+            projection_payload = dict(literature_snapshot)
+            projection_payload.pop("projection_hash", None)
             if (
-                literature_snapshot.get("initialization_id") != job.initialization_id
-                or literature_snapshot.get("draft_revision") != int(job.basis_revision)
-                or literature_snapshot.get("draft_hash") != job.basis_hash
+                literature_snapshot.get("schema_ref")
+                != PROPOSAL_LITERATURE_EVIDENCE_SCHEMA
+                or not isinstance(projection_hash, str)
+                or len(projection_hash) != 64
+                or canonical_hash(projection_payload) != projection_hash
+                or not isinstance(source_snapshot, dict)
+                or not isinstance(source_binding, dict)
+                or source_snapshot.get("snapshot_ref")
+                != job.literature_snapshot_ref
+                or source_binding.get("snapshot_ref")
+                != job.literature_snapshot_ref
+                or not isinstance(source_snapshot.get("snapshot_hash"), str)
+                or canonical_hash(source_binding)
+                != source_snapshot.get("snapshot_hash")
+                or source_binding.get("initialization_id")
+                != job.initialization_id
+                or source_binding.get("draft_revision")
+                != int(job.basis_revision)
+                or source_binding.get("draft_hash") != job.basis_hash
             ):
                 self._fail_proposal_job(
                     job.generation_ref,
@@ -5844,7 +5872,11 @@ class SQLiteHumanCollaboration:
                     literature_snapshot_hash=(
                         None
                         if literature_snapshot is None
-                        else str(literature_snapshot["snapshot_hash"])
+                        else str(
+                            cast(dict[str, object], literature_snapshot[
+                                "source_snapshot"
+                            ])["snapshot_hash"]
+                        )
                     ),
                 )
                 connection.execute(

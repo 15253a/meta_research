@@ -131,7 +131,7 @@ def test_0033_reasoning_successor_context_round_trips_from_0032(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0037_question_stage_identity",)
+        ).fetchone() == ("0038_deepfetch_binding_audit",)
         assert connection.execute(
             "PRAGMA foreign_key_list(rg_question_selection_facts)"
         ).fetchall() == []

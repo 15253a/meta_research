@@ -18,12 +18,29 @@ the user for another decision. A deployment may deliberately narrow its
 default policy, and a capability that is absent in reality must remain an
 explicit blocker rather than being simulated or silently waived.
 
-The Idea Harness gives Codex non-interactive full local execution because the
-supported hosts cannot reliably provide the narrower workspace sandbox. Codex
-starts in a dedicated research workspace, separate from the durable provider
-spool, and the packaged Skill forbids treating filesystem access as Owner
-authority. Authoritative state is still changed only through Owner Interfaces;
-new Web findings remain observations until an Owner accepts them as Evidence.
+The Idea and DeepFetch Harnesses give Codex non-interactive full local execution
+because the supported hosts cannot reliably provide the narrower workspace
+sandbox. Codex starts in a dedicated research workspace, separate from the
+durable provider spool, and the packaged Skill forbids treating filesystem
+access as Owner authority. DeepFetch imports only its size-bounded public
+artifacts after exact schema, Search/Fetch provenance, Reader, and result
+validation. The pre-confirmation Proposal Drafter uses the same explicit
+`danger-full-access` host boundary only to avoid that user-namespace dependency,
+but admits only Codex CLI `0.147.0` and runs in its own research workspace. A
+packaged, hash-verified single-model catalog disables shell and `apply_patch`;
+user configuration, rules, MCP, Web search, every built-in local tool, agent
+spawning, apps, plugins, memories, bundled Skill instructions, and environment
+inheritance are also disabled. Quest and literature inputs are enclosed as
+explicit untrusted research data, never instructions, and the UTF-8 prompt is
+capped before an effect starts. Its durable v2 execution identity binds the
+exact model, model-catalog bytes and path, provider version, sandbox, working
+directory, arguments, timeout, and byte limits; signed terminal recovery also
+checks the recorded prompt and input byte counts. A terminal v1 or superseded
+v2 spool can be observed and failed as outdated, but is never adopted as a
+current result; an unsigned or still-running old effect remains pending until
+termination is proven. Authoritative state is still changed only through Owner
+Interfaces; new Web findings remain observations until an Owner accepts them as
+Evidence.
 
 Broad execution does not remove the boundaries that make progress real. Owner
 receipts, currentness checks, Execution Fences, and concrete time, process, and
@@ -170,14 +187,24 @@ transfer content or custody ownership out of Research Memory. Existing formal
 Question and Idea content is migrated into the unified inventory without
 changing its stable ref, hash, object path, or historical receipt.
 
-Quest creation may select exact accepted AssetVersion bindings for its material
-basis, including `provided_only`; raw browser files and paths still cannot enter
-that basis directly. First-question DeepFetch is available as the explicit
-`deepfetch` route: HC freezes and authorizes one request, AR executes a fenced
-live Web Search/Fetch Run, and RM accepts an exact LiteratureSnapshot before the
-same six-field Proposal and final confirmation continue. The `direct` path does
-not create a snapshot, use a CreationSeed, or treat DeepFetch failure,
-cancellation, timeout, or unavailability as a waiver.
+Quest creation presents the human brief as three primary parts: Background,
+Goal, and Boundary. Its material tray accepts browser file/folder selection in
+the same modal, starts Research Memory intake as independent background work,
+and adds only the resulting exact accepted AssetVersion binding to the current
+DraftRevision. Pending intake recovery is keyed by creation context and job, so
+another modal cannot overwrite its identity. Optional pending or failed
+material never blocks the `direct` route; `provided_only` still requires at
+least one accepted binding. Raw browser files and paths therefore never enter
+the basis directly, and the separate Research Asset workbench is not a
+prerequisite for formal creation. A
+Quest-wide HumanRequest remains visible in the Companion queue while another
+formal creation modal is active and is presented after that modal closes,
+without discarding its draft. First-question DeepFetch is available as the
+explicit `deepfetch` route: HC freezes and authorizes one request, AR executes
+a fenced live Web Search/Fetch Run, and RM accepts an exact LiteratureSnapshot
+before the same six-field Proposal and final confirmation continue. The
+`direct` path does not create a snapshot, use a CreationSeed, or treat DeepFetch
+failure, cancellation, timeout, or unavailability as a waiver.
 
 Follow-up questions use a separate `manual_question_creation` context entered
 from an accepted Question in the Web question tree. Human Collaboration first
