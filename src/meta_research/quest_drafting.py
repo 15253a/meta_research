@@ -20,6 +20,7 @@ from meta_research.provider_supervisor import (
     ensure_transport_key,
     read_transport_key_for_operation,
     read_verified_exit_receipt,
+    protected_subprocess_environment,
     request_supervisor_stop,
     supervisor_request_never_started,
     write_supervisor_request,
@@ -229,8 +230,14 @@ def _read_bounded_provider_stream(
 
 
 class _CancellableProcessRunner:
-    def __init__(self, termination_grace_seconds: float = 0.25) -> None:
+    def __init__(
+        self,
+        termination_grace_seconds: float = 0.25,
+        *,
+        protected_environment: dict[str, str] | None = None,
+    ) -> None:
         self._termination_grace_seconds = termination_grace_seconds
+        self._protected_environment = dict(protected_environment or {})
         self._lock = threading.Lock()
         self._processes: dict[subprocess.Popen[bytes], int | None] = {}
         self._jobs: dict[str, tuple[subprocess.Popen[bytes], int | None]] = {}
@@ -295,11 +302,7 @@ class _CancellableProcessRunner:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=os.name == "posix",
-                env=(
-                    None
-                    if environment is None
-                    else {**os.environ, **environment}
-                ),
+                env=self._subprocess_environment(environment),
             )
             process_group = os.getpgid(process.pid) if os.name == "posix" else None
             ready_path = supervisor_request_path.parent / "supervisor-ready.json"
@@ -394,11 +397,7 @@ class _CancellableProcessRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 start_new_session=os.name == "posix",
-                env=(
-                    None
-                    if environment is None
-                    else {**os.environ, **environment}
-                ),
+                env=self._subprocess_environment(environment),
             )
             process_group = os.getpgid(process.pid) if os.name == "posix" else None
             self._processes[process] = process_group
@@ -481,6 +480,16 @@ class _CancellableProcessRunner:
                     if active is not None and active[0] is process:
                         self._jobs.pop(job_ref, None)
                 self._cancelled.discard(process)
+
+    def _subprocess_environment(
+        self, environment: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        if environment is None and not self._protected_environment:
+            return None
+        return protected_subprocess_environment(
+            protected=self._protected_environment,
+            requested=environment,
+        )
 
     def _join_drainer(
         self,

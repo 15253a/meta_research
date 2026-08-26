@@ -247,10 +247,12 @@ class _NativeCliHarnessAdapter:
         self,
         workspace: Path,
         *,
+        executable: str | None = None,
         runner: HarnessProcessRunner | None = None,
         timeout_seconds: float = 300.0,
         target_root_timeout_seconds: float = TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS,
         codex_child_ledger_reader: CodexChildLedgerReader | None = None,
+        codex_home: Path | None = None,
     ) -> None:
         if (
             not 0 < timeout_seconds <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
@@ -261,6 +263,8 @@ class _NativeCliHarnessAdapter:
             raise ValueError("harness_timeout_invalid")
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if executable is not None:
+            self.executable = executable
         self._runner = runner or HarnessSupervisorTransport(
             workspace / "shared-provider-supervisor"
         )
@@ -270,10 +274,12 @@ class _NativeCliHarnessAdapter:
         self._diagnostic_incarnation_ref: str | None = None
         self._codex_child_ledger_reader = codex_child_ledger_reader
         if self.family == "codex" and codex_child_ledger_reader is None:
-            codex_home = os.environ.get("CODEX_HOME")
-            if codex_home:
+            configured_codex_home = codex_home or (
+                Path(value) if (value := os.environ.get("CODEX_HOME")) else None
+            )
+            if configured_codex_home is not None:
                 self._codex_child_ledger_reader = _CodexHomeChildLedgerReader(
-                    Path(codex_home)
+                    configured_codex_home
                 )
 
     def provider_operation_timeout_seconds(self, *, target_root: bool) -> float:
@@ -797,24 +803,6 @@ class ClaudeHarnessAdapter(_NativeCliHarnessAdapter):
             argv.extend(["--resume", invocation.native_session_ref])
         return argv
 
-
-def _run_process(
-    argv: list[str],
-    prompt: str,
-    timeout: float,
-    environment: dict[str, str],
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        argv,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-        env={**os.environ, **environment},
-    )
-
-
 class _HarnessStdoutEventTail:
     """Replay the private JSONL spool from byte zero while it is growing."""
 
@@ -928,7 +916,7 @@ class _HarnessStdoutEventTail:
 
 
 class HarnessSupervisorTransport:
-    """Thin Harness adapter over the existing shared provider runner."""
+    """Thin Harness adapter over its provider-specific process runner."""
 
     def __init__(
         self,
@@ -951,7 +939,7 @@ class HarnessSupervisorTransport:
         environment: dict[str, str],
     ) -> subprocess.CompletedProcess[str]:
         if "--version" in argv and not prompt:
-            return _run_process(argv, prompt, timeout, environment)
+            return self._process_runner(argv, prompt, timeout, environment)
         family = environment.get(_HARNESS_FAMILY_ENV)
         if family not in {"codex", "claude"}:
             raise OSError("harness family unavailable")

@@ -488,6 +488,40 @@ def minimal_subprocess_environment(
     return environment
 
 
+def protected_subprocess_environment(
+    *,
+    protected: Mapping[str, str],
+    requested: Mapping[str, str] | None = None,
+    source_environment: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+) -> dict[str, str]:
+    """Merge an invocation environment without allowing protected overrides.
+
+    Windows treats environment keys case-insensitively.  Remove every spelling
+    of a protected key before installing the owner-controlled spelling so a
+    caller cannot escape a storage boundary with (for example) ``codex_home``.
+    """
+
+    selected_platform = platform_name or os.name
+    source = os.environ if source_environment is None else source_environment
+    environment = dict(source)
+    if requested is not None:
+        environment.update(requested)
+    if selected_platform == "nt":
+        protected_by_name = {
+            name.upper(): (name, value) for name, value in protected.items()
+        }
+        environment = {
+            name: value
+            for name, value in environment.items()
+            if name.upper() not in protected_by_name
+        }
+        environment.update(dict(protected_by_name.values()))
+    else:
+        environment.update(protected)
+    return environment
+
+
 def current_process_group() -> int:
     return ProviderProcessPlatform().current_process_group()
 

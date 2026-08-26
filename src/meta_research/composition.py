@@ -506,11 +506,16 @@ def build_production_runtime(
                 )
             ).scalar_one()
         )
-    shared_provider_runner = _CancellableProcessRunner()
+    codex_executable = str(data_root.codex_cli_executable.absolute())
+    codex_provider_runner = _CancellableProcessRunner(
+        protected_environment=data_root.codex_environment
+    )
+    claude_provider_runner = _CancellableProcessRunner()
     codex_adapter = (
         CodexDraftingAdapter(
             data_root.root / "drafting-provider",
-            process_runner=shared_provider_runner,
+            executable=codex_executable,
+            process_runner=codex_provider_runner,
         )
         if proposal_drafter is None or intent_drafting_provider is None
         else None
@@ -522,21 +527,25 @@ def build_production_runtime(
     host_compute_probe = host_compute_probe or NvidiaSmiProbe()
     idea_skill_provider = idea_skill_provider or CodexIdeaSkillAdapter(
         data_root.root / "idea-skill-provider",
-        process_runner=shared_provider_runner,
+        executable=codex_executable,
+        process_runner=codex_provider_runner,
     )
     plan_skill_provider = plan_skill_provider or CodexPlanSkillAdapter(
         data_root.root / "plan-skill-provider",
-        process_runner=shared_provider_runner,
+        executable=codex_executable,
+        process_runner=codex_provider_runner,
     )
     bundle_skill_provider = bundle_skill_provider or CodexBundleSkillAdapter(
         data_root.root / "bundle-skill-provider",
-        process_runner=shared_provider_runner,
+        executable=codex_executable,
+        process_runner=codex_provider_runner,
     )
     reasoning_skill_provider = (
         reasoning_skill_provider
         or CodexReasoningSkillAdapter(
             data_root.root / "reasoning-skill-provider",
-            process_runner=shared_provider_runner,
+            executable=codex_executable,
+            process_runner=codex_provider_runner,
         )
     )
     acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
@@ -545,7 +554,8 @@ def build_production_runtime(
     )
     writing_skill_provider = writing_skill_provider or CodexWritingSkillAdapter(
         data_root.root / "writing-skill-provider",
-        process_runner=shared_provider_runner,
+        executable=codex_executable,
+        process_runner=codex_provider_runner,
     )
 
     host_compute_reader = create_host_compute_observation_reader(database)
@@ -609,11 +619,12 @@ def build_production_runtime(
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
+        executable=codex_executable,
         acquisition_client=_AgentRuntimeAcquisitionClient(
             agent_runtime,
             acquisition_provider,
         ),
-        process_runner=shared_provider_runner,
+        process_runner=codex_provider_runner,
     )
     agent_runtime.bind_provider_quiescence_driver(
         idea_skill_provider,
@@ -833,20 +844,27 @@ def build_production_runtime(
     )
     harness_operation_canceller = None
     if harness_adapters is None:
-        shared_harness_transport = HarnessSupervisorTransport(
+        codex_harness_transport = HarnessSupervisorTransport(
             data_root.run / "harness-supervisor",
-            process_runner=shared_provider_runner,
+            process_runner=codex_provider_runner,
+            event_sink=owners.agent_runtime.harness_runs.append_target_root_events,
+        )
+        claude_harness_transport = HarnessSupervisorTransport(
+            data_root.run / "harness-supervisor",
+            process_runner=claude_provider_runner,
             event_sink=owners.agent_runtime.harness_runs.append_target_root_events,
         )
         harness_adapters = (
             CodexHarnessAdapter(
                 data_root.run / "harness",
-                runner=shared_harness_transport,
+                executable=codex_executable,
+                runner=codex_harness_transport,
+                codex_home=data_root.codex_home.absolute(),
                 target_root_timeout_seconds=target_root_timeout_seconds,
             ),
             ClaudeHarnessAdapter(
                 data_root.run / "harness",
-                runner=shared_harness_transport,
+                runner=claude_harness_transport,
                 target_root_timeout_seconds=target_root_timeout_seconds,
             ),
         )
@@ -986,7 +1004,8 @@ def build_production_runtime(
     )
     provider_lifecycles: list[object] = []
     for provider in (
-        shared_provider_runner,
+        codex_provider_runner,
+        claude_provider_runner,
         proposal_drafter,
         intent_drafting_provider,
         idea_skill_provider,

@@ -22,11 +22,11 @@ from meta_research.paths import (
     DataRoot,
     DataRootError,
     RuntimeState,
-    default_data_root,
     prepare_data_root,
     read_control_key,
     read_runtime_state,
 )
+from meta_research.provider_supervisor import protected_subprocess_environment
 
 
 _DOCTOR_OWNER_SCOPES = frozenset({"agent_runtime", "human_collaboration"})
@@ -126,7 +126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 human=__version__,
             )
 
-        data_root = prepare_data_root(args.data_root)
+        data_root = prepare_data_root(_explicit_data_root(args.data_root))
         if args.command == "init":
             return _emit(
                 {"status": "initialized", "data_root": str(data_root.root)},
@@ -239,7 +239,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _add_data_root(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--data-root", type=Path, default=default_data_root())
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        help="absolute deployment data root (or set META_RESEARCH_DATA_ROOT)",
+    )
+
+
+def _explicit_data_root(argument: Path | None) -> Path:
+    selected = argument
+    if selected is None:
+        configured = os.environ.get("META_RESEARCH_DATA_ROOT")
+        if configured:
+            selected = Path(configured)
+    if selected is None:
+        raise CliError(
+            "an explicit data root is required; pass --data-root or set "
+            "META_RESEARCH_DATA_ROOT"
+        )
+    expanded = selected.expanduser()
+    if not expanded.is_absolute():
+        raise CliError("the data root must be an absolute deployment path")
+    return expanded
 
 
 def _add_listener(parser: argparse.ArgumentParser) -> None:
@@ -270,6 +291,7 @@ def _ensure_daemon(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=_daemon_environment(data_root),
         **daemon_spawn_options(),
     )
     deadline = time.monotonic() + 15
@@ -298,6 +320,12 @@ def _ensure_daemon(
             "another daemon acquired the data-root lock but did not become ready"
         )
     raise CliError("daemon did not become ready within 15 seconds")
+
+
+def _daemon_environment(data_root: DataRoot) -> dict[str, str]:
+    return protected_subprocess_environment(
+        protected=data_root.codex_environment,
+    )
 
 
 def daemon_spawn_options(

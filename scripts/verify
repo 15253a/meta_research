@@ -10,6 +10,7 @@ INSTALL_ROOT="$VERIFY_ROOT/install"
 DATA_ROOT="$VERIFY_ROOT/data"
 DIST_ROOT="$VERIFY_ROOT/dist"
 PROVIDER_PATH="$VERIFY_ROOT/provider-path"
+CODEX_EXECUTABLE="$DATA_ROOT/provider-tools/codex-cli/node_modules/.bin/codex"
 CODEX_CALLS="$PROVIDER_PATH/codex-calls.jsonl"
 LOCKED_REQUIREMENTS="$VERIFY_ROOT/locked-requirements.txt"
 START_RESULT="$VERIFY_ROOT/start.json"
@@ -133,8 +134,8 @@ finally:
 )
 path.chmod(0o755)
 PY
-if PATH="$PROVIDER_PATH" command -v codex >/dev/null 2>&1; then
-  echo "providerless verification PATH unexpectedly resolves codex" >&2
+if [[ -e "$CODEX_EXECUTABLE" ]]; then
+  echo "providerless verification unexpectedly has a managed Codex CLI" >&2
   exit 1
 fi
 
@@ -475,21 +476,28 @@ PY
 import json, sys
 assert json.load(sys.stdin)["status"] == "stopped"
 '
+mkdir -p "$(dirname "$CODEX_EXECUTABLE")"
 "$INSTALL_ROOT/bin/python" - \
-  "$PROVIDER_PATH/codex" "$CODEX_CALLS" <<'PY'
+  "$CODEX_EXECUTABLE" "$CODEX_CALLS" \
+  "$DATA_ROOT/provider-homes/codex" <<'PY'
 import pathlib
 import sys
 
 
 path = pathlib.Path(sys.argv[1])
 calls_path = pathlib.Path(sys.argv[2])
+expected_codex_home = pathlib.Path(sys.argv[3])
 source = f'''#!{sys.executable}
 import json
+import os
 import pathlib
 import re
 import sys
 
 
+expected_codex_home = {str(expected_codex_home)!r}
+assert os.environ.get("CODEX_HOME") == expected_codex_home
+assert os.environ.get("CODEX_SQLITE_HOME") == expected_codex_home
 args = sys.argv[1:]
 if args == ["--version"]:
     print("codex-cli installed-fake 1")
@@ -1229,9 +1237,9 @@ import json, sys
 assert json.load(sys.stdin)["status"] == "stopped"
 '
 
-mv "$PROVIDER_PATH/codex" "$PROVIDER_PATH/codex.disabled"
-if PATH="$PROVIDER_PATH" command -v codex >/dev/null 2>&1; then
-  echo "recovery verification PATH unexpectedly resolves codex" >&2
+mv "$CODEX_EXECUTABLE" "$CODEX_EXECUTABLE.disabled"
+if [[ -e "$CODEX_EXECUTABLE" ]]; then
+  echo "recovery verification managed Codex CLI is still present" >&2
   exit 1
 fi
 PATH="$PROVIDER_PATH" "$CLI" start \

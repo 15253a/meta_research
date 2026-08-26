@@ -1,6 +1,0 @@
-interface:
-  display_name: "Implement Ticket"
-  short_description: "Implement and verify one frozen ticket candidate"
-  default_prompt: "Use $implement-ticket to implement the frozen ticket, maintain its public verification seam, and commit a verified candidate for automatic publication."
-policy:
-  allow_implicit_invocation: false

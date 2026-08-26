@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -61,6 +62,43 @@ class DataRoot:
     def daemon_log(self) -> Path:
         return self.logs / "daemon.jsonl"
 
+    @property
+    def provider_homes(self) -> Path:
+        return self.root / "provider-homes"
+
+    @property
+    def codex_home(self) -> Path:
+        return self.provider_homes / "codex"
+
+    @property
+    def codex_sessions(self) -> Path:
+        return self.codex_home / "sessions"
+
+    @property
+    def codex_archived_sessions(self) -> Path:
+        return self.codex_home / "archived_sessions"
+
+    @property
+    def provider_tools(self) -> Path:
+        return self.root / "provider-tools"
+
+    @property
+    def codex_cli_install_root(self) -> Path:
+        return self.provider_tools / "codex-cli"
+
+    @property
+    def codex_cli_executable(self) -> Path:
+        executable = "codex.cmd" if os.name == "nt" else "codex"
+        return self.codex_cli_install_root / "node_modules" / ".bin" / executable
+
+    @property
+    def codex_environment(self) -> dict[str, str]:
+        managed_home = str(self.codex_home.absolute())
+        return {
+            "CODEX_HOME": managed_home,
+            "CODEX_SQLITE_HOME": managed_home,
+        }
+
 
 @dataclass(frozen=True)
 class RuntimeState:
@@ -112,15 +150,6 @@ class RuntimeState:
         return value
 
 
-def default_data_root() -> Path:
-    explicit = os.environ.get("META_RESEARCH_DATA_ROOT")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    data_home = os.environ.get("XDG_DATA_HOME")
-    base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
-    return (base / "meta-research-vnext").resolve()
-
-
 def prepare_data_root(path: Path) -> DataRoot:
     root = DataRoot(path.expanduser().resolve())
     root.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -155,6 +184,16 @@ def prepare_data_root(path: Path) -> DataRoot:
     for directory in (root.run, root.logs, root.objects):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
+    for directory in (
+        root.provider_homes,
+        root.codex_home,
+        root.codex_sessions,
+        root.codex_archived_sessions,
+        root.provider_tools,
+        root.codex_cli_install_root,
+    ):
+        _prepare_private_directory(directory)
+
     if not root.object_store_marker.exists():
         _write_json_exclusive(
             root.object_store_marker,
@@ -169,6 +208,28 @@ def prepare_data_root(path: Path) -> DataRoot:
     if not root.control_key.exists():
         _write_exclusive(root.control_key, secrets.token_urlsafe(48), mode=0o600)
     return root
+
+
+def _prepare_private_directory(path: Path) -> None:
+    """Create a managed private directory without accepting link indirection."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        try:
+            path.mkdir(mode=0o700)
+            metadata = path.lstat()
+        except OSError as error:
+            raise DataRootError(f"cannot create managed directory: {path}") from error
+    except OSError as error:
+        raise DataRootError(f"cannot inspect managed directory: {path}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise DataRootError(f"managed directory is not a real directory: {path}")
+    try:
+        path.chmod(0o700)
+    except OSError as error:
+        if os.name == "posix":
+            raise DataRootError(f"cannot protect managed directory: {path}") from error
 
 
 def read_control_key(root: DataRoot) -> str:
