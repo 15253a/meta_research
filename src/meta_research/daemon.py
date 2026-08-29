@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import errno
 import os
+import signal
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 from meta_research import __version__
 from meta_research.paths import (
@@ -20,6 +22,63 @@ from meta_research.paths import (
 
 
 LockOperation = Callable[[int, bool], None]
+
+# ``meta-research stop`` owns this end-to-end deadline.  A long-lived HTTP/SSE
+# request may consume only the connection-drain share: the remaining ten
+# seconds preserve the existing Web lifespan worker drain (up to two seconds),
+# RuntimeProtection/telemetry close (up to five seconds), and three seconds for
+# request_stop, Owner/database cleanup, durable log/state writes, and scheduler
+# variance.  Keep the Uvicorn share strictly below the CLI deadline so a stuck
+# client cannot prevent those durable shutdown boundaries from running.
+DAEMON_STOP_DEADLINE_SECONDS = 15.0
+DAEMON_LIFESPAN_RESERVE_SECONDS = 2.0
+DAEMON_RUNTIME_CLOSE_RESERVE_SECONDS = 5.0
+DAEMON_FINALIZATION_RESERVE_SECONDS = 3.0
+DAEMON_CONNECTION_DRAIN_SECONDS = DAEMON_STOP_DEADLINE_SECONDS - (
+    DAEMON_LIFESPAN_RESERVE_SECONDS
+    + DAEMON_RUNTIME_CLOSE_RESERVE_SECONDS
+    + DAEMON_FINALIZATION_RESERVE_SECONDS
+)
+
+
+def _install_uvicorn_signal_replay_guard(
+    server: Any,
+    handled_signals: Sequence[int],
+) -> tuple[tuple[int, Any], ...]:
+    """Preserve daemon cleanup across Uvicorn's captured-signal replay.
+
+    Uvicorn restores the handler that preceded ``Server.run`` and then replays
+    every captured shutdown signal.  A replay into the process default would
+    terminate before the daemon can publish its stopped state and close the
+    runtime.  A real first signal in the small pre-capture window is delegated
+    to Uvicorn; only a replay after ``should_exit`` is already set is consumed.
+    Uvicorn itself does not install signal handlers outside the main thread, so
+    the guard follows the same boundary.
+    """
+
+    if threading.current_thread() is not threading.main_thread():
+        return ()
+
+    def guard(signal_number: int, frame: object) -> None:
+        if not server.should_exit:
+            server.handle_exit(signal_number, frame)
+
+    installed: list[tuple[int, Any]] = []
+    try:
+        for signal_number in handled_signals:
+            previous = signal.signal(signal_number, guard)
+            installed.append((signal_number, previous))
+    except BaseException:
+        _restore_shutdown_signal_handlers(tuple(installed))
+        raise
+    return tuple(installed)
+
+
+def _restore_shutdown_signal_handlers(
+    handlers: tuple[tuple[int, Any], ...],
+) -> None:
+    for signal_number, handler in reversed(handlers):
+        signal.signal(signal_number, handler)
 
 
 class DaemonFileLock:
@@ -158,11 +217,31 @@ def _serve(args: argparse.Namespace, data_root: DataRoot) -> int:
     )
     runtime = build_production_runtime(data_root)
     published_running_state = False
+    original_shutdown_signal_handlers: tuple[tuple[int, Any], ...] = ()
     try:
         app = create_app(
             runtime,
             base_url=base_url,
             control_key=read_control_key(data_root),
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host=args.host,
+                port=args.port,
+                workers=1,
+                access_log=False,
+                log_level="warning",
+                server_header=False,
+                date_header=False,
+                timeout_graceful_shutdown=DAEMON_CONNECTION_DRAIN_SECONDS,
+            )
+        )
+        original_shutdown_signal_handlers = (
+            _install_uvicorn_signal_replay_guard(
+                server,
+                uvicorn.server.HANDLED_SIGNALS,
+            )
         )
         write_runtime_state(
             data_root,
@@ -187,44 +266,36 @@ def _serve(args: argparse.Namespace, data_root: DataRoot) -> int:
                 "recorded_at": time.time(),
             },
         )
-
-        server = uvicorn.Server(
-            uvicorn.Config(
-                app,
-                host=args.host,
-                port=args.port,
-                workers=1,
-                access_log=False,
-                log_level="warning",
-                server_header=False,
-                date_header=False,
-            )
-        )
         server.run()
     finally:
-        if published_running_state:
-            append_daemon_event(
-                data_root,
-                {
-                    "event": "daemon.stopped",
-                    "pid": os.getpid(),
-                    "recorded_at": time.time(),
-                },
-            )
-            write_runtime_state(
-                data_root,
-                RuntimeState(
-                    status="stopped",
-                    pid=os.getpid(),
-                    host=args.host,
-                    port=args.port,
-                    base_url=base_url,
-                    version=__version__,
-                    started_at=started_at,
-                    stopped_at=time.time(),
-                ),
-            )
-        runtime.close()
+        try:
+            try:
+                if published_running_state:
+                    append_daemon_event(
+                        data_root,
+                        {
+                            "event": "daemon.stopped",
+                            "pid": os.getpid(),
+                            "recorded_at": time.time(),
+                        },
+                    )
+                    write_runtime_state(
+                        data_root,
+                        RuntimeState(
+                            status="stopped",
+                            pid=os.getpid(),
+                            host=args.host,
+                            port=args.port,
+                            base_url=base_url,
+                            version=__version__,
+                            started_at=started_at,
+                            stopped_at=time.time(),
+                        ),
+                    )
+            finally:
+                runtime.close()
+        finally:
+            _restore_shutdown_signal_handlers(original_shutdown_signal_handlers)
     return 0
 
 

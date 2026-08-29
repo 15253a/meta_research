@@ -30,6 +30,7 @@ PROTOCOL_EVALUATION_ADAPTER = "protocol_evaluation"
 PROTOCOL_EVALUATION_SCHEMA_REF = (
     "meta-research/target-execution/protocol-evaluation/v2"
 )
+PROTOCOL_EVALUATION_REQUEST_MAX_BYTES = 8 * 1024 * 1024
 LEGACY_MICRO_EXPERIMENT_ADAPTER = "legacy_micro_experiment"
 EXPERIMENT_PROVIDER_CAPABILITY_CATALOG_SCHEMA = (
     "meta-research/experiment-provider-capability-catalog/v1"
@@ -243,7 +244,10 @@ class _ProtocolEvaluationAdapter:
         )
         if any(not isinstance(value, dict) or not value for value in documents):
             raise TargetExecutionContractError("target_execution_request_invalid")
-        if len(canonical_json(request).encode("utf-8")) > 512_000:
+        if (
+            len(canonical_json(request).encode("utf-8"))
+            > PROTOCOL_EVALUATION_REQUEST_MAX_BYTES
+        ):
             raise TargetExecutionContractError("target_execution_request_too_large")
         source = request.get("variant_source")
         policy = request.get("checkpoint_policy")

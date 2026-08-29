@@ -311,6 +311,27 @@ def test_valid_plan_accounts_for_every_obligation_and_idea() -> None:
     assert plan_hash == canonical_hash(_plan_document())
 
 
+def test_plan_domain_validator_rejects_duplicate_question_trace_after_decode() -> None:
+    document = _plan_document()
+    obligation = document["answer_contract"]["obligations"][0]
+    obligation["question_trace"] = ["answer_shape", "answer_shape"]
+    contract = document["answer_contract"]
+    contract.pop("answer_contract_hash")
+    contract["answer_contract_hash"] = canonical_hash(contract)
+
+    with pytest.raises(PlanContractError, match="answer_contract_trace_invalid"):
+        validate_plan_document(
+            document,
+            question_ref="question_1",
+            idea_set_ref="idea_set_1",
+            context_pack_ref="plan_context_1",
+            context_pack_hash="6" * 64,
+            accepted_idea_set=_IDEA_SET,
+            evidence_by_ref={"evidence_1": _EVIDENCE_REF},
+            evidence_reference_revision=1,
+        )
+
+
 def test_plan_rejects_an_incomplete_obligation_by_idea_matrix() -> None:
     document = _plan_document()
     document["answer_contract"]["obligations"][0]["idea_relevance"].pop()

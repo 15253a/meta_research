@@ -499,6 +499,7 @@ class RuntimeProtection:
         self._incarnation_ref = new_ref("runtime_incarnation")
         self._released_during_startup: set[str] = set()
         self._register_incarnation()
+        self._supersede_existing_epoch_backends()
         # An exact Owner receipt means the effect was already durably settled.
         # Replay those lost finish ACKs before deciding whether any genuinely
         # unresolved interrupted work needs a new physical hold.
@@ -2494,6 +2495,86 @@ class RuntimeProtection:
                 is not None
             )
 
+    def _supersede_existing_epoch_backends(self) -> None:
+        """Replace an old backend identity when the current adapter proves it.
+
+        An explicit deployment-mode change can legitimately supersede a native
+        hold while preserving the durable holder identity.  Only an adapter
+        that can confirm that exact holder may perform this transition.
+        """
+
+        if (
+            getattr(self._inhibitor, "allows_backend_supersession", False)
+            is not True
+        ):
+            return
+        query_exact_hold = getattr(self._inhibitor, "query_exact_hold", None)
+        if not callable(query_exact_hold):
+            return
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_power_inhibitor_epochs WHERE status IN "
+                    "('active', 'releasing', 'release_pending') ORDER BY "
+                    "updated_at, holder_ref"
+                )
+            ).mappings().all()
+        for row in rows:
+            previous_backend = str(row["backend"])
+            if previous_backend == self._inhibitor.kind:
+                continue
+            holder_ref = str(row["holder_ref"])
+            try:
+                status, lease = query_exact_hold(holder_ref=holder_ref)
+                if status != "confirmed" or lease is None:
+                    continue
+                _validate_lease(lease, holder_ref=holder_ref)
+                if lease.backend != self._inhibitor.kind:
+                    continue
+            except Exception:
+                continue
+            now = self._clock()
+            with self._database.write() as connection:
+                adopted = connection.execute(
+                    text(
+                        "UPDATE ar_power_inhibitor_epochs SET backend = "
+                        ":backend, scope = :scope, native_holder_ref = "
+                        ":native_holder_ref, acquired_at = "
+                        ":acquired_at, updated_at = :now WHERE holder_ref = "
+                        ":holder_ref AND backend = :previous_backend AND status = "
+                        ":status"
+                    ),
+                    {
+                        "backend": lease.backend,
+                        "scope": lease.scope,
+                        "native_holder_ref": lease.native_holder_ref,
+                        "acquired_at": lease.acquired_at,
+                        "now": now,
+                        "holder_ref": holder_ref,
+                        "previous_backend": previous_backend,
+                        "status": row["status"],
+                    },
+                )
+                if adopted.rowcount != 1:
+                    continue
+                self._feed.record(
+                    connection,
+                    "agent_runtime.power_inhibitor_backend_superseded",
+                    {
+                        "holder_ref": holder_ref,
+                        "previous_backend": previous_backend,
+                        "previous_status": str(row["status"]),
+                        "native_release_disposition": "not_attempted",
+                        "backend": lease.backend,
+                        "scope": lease.scope,
+                    },
+                )
+            self._emit(
+                event_code="runtime.inhibitor.backend_superseded",
+                status=str(row["status"]),
+                correlation={"holder_ref": holder_ref},
+            )
+
     def _retry_pending_releases(self) -> None:
         with self._database.write() as connection:
             rows = connection.execute(
@@ -2863,6 +2944,8 @@ class RuntimeProtection:
                 else "agent_runtime.power_inhibitor_release_failed",
                 {
                     "holder_ref": lease.holder_ref,
+                    "backend": lease.backend,
+                    "scope": lease.scope,
                     "status": status,
                     "reason_code": reason_code,
                 },

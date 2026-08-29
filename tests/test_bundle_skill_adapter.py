@@ -27,7 +27,11 @@ from meta_research.bundle_skill import (
     validate_bundle_exhaustion_skill_result,
     validate_bundle_skill_result,
 )
-from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
+from meta_research.idea_skill import (
+    CodexIdeaSkillAdapter,
+    IdeaSkillUnavailable,
+    ProviderTransportLimits,
+)
 from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA,
     bundle_exhaustion_route_fingerprint,
@@ -55,6 +59,8 @@ from meta_research.bundle_target_contract import (
     MEASUREMENT_CONTRACT_CANDIDATE_SCHEMA_REF,
     PROTOCOL_VERSION_CANDIDATE_SCHEMA_REF,
     build_normalized_completion_contract,
+    formal_target_candidate_from_dict,
+    normalized_completion_contract_from_dict,
     normalized_completion_contract_to_dict,
 )
 from meta_research.plan_contract import PLAN_DOCUMENT_SCHEMA_REF
@@ -323,15 +329,96 @@ def _receipt(receipt_ref: str, subject_ref: str) -> dict[str, object]:
     }
 
 
+def _provider_wire_value(
+    value: object,
+    schema: dict[str, object],
+    *,
+    encode_domain_documents: bool = True,
+) -> object:
+    """Encode deterministic fake output through the frozen provider schema."""
+
+    union = schema.get("anyOf")
+    if isinstance(union, list):
+        matching = [
+            branch
+            for branch in union
+            if isinstance(branch, dict)
+            and (
+                "const" not in branch
+                or branch["const"] == value
+            )
+            and (
+                not isinstance(value, dict)
+                or not isinstance(branch.get("required"), list)
+                or set(branch["required"]) <= set(value)
+            )
+        ]
+        if matching:
+            return _provider_wire_value(
+                value,
+                matching[0],
+                encode_domain_documents=encode_domain_documents,
+            )
+    if (
+        encode_domain_documents
+        and isinstance(value, dict)
+        and schema.get("type") == "string"
+        and "canonical JSON object string"
+        in str(schema.get("description", ""))
+    ):
+        return canonical_json(value)
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            if set(properties) == {"provider_output"} and set(value) != {
+                "provider_output"
+            }:
+                child = properties["provider_output"]
+                assert isinstance(child, dict)
+                return {
+                    "provider_output": _provider_wire_value(
+                        value,
+                        child,
+                        encode_domain_documents=encode_domain_documents,
+                    )
+                }
+            return {
+                key: (
+                    _provider_wire_value(
+                        nested,
+                        properties[key],
+                        encode_domain_documents=encode_domain_documents,
+                    )
+                    if key in properties and isinstance(properties[key], dict)
+                    else nested
+                )
+                for key, nested in value.items()
+            }
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        return [
+            _provider_wire_value(
+                nested,
+                schema["items"],
+                encode_domain_documents=encode_domain_documents,
+            )
+            for nested in value
+        ]
+    return value
+
+
 class _SequenceRunner:
     def __init__(
         self,
         outputs: list[dict[str, object]],
         *,
         emit_review_trace: bool = True,
+        emit_primary_review_trace: bool = False,
+        provider_wire_mode: str = "strict",
     ) -> None:
         self._outputs = iter(outputs)
         self._emit_review_trace = emit_review_trace
+        self._emit_primary_review_trace = emit_primary_review_trace
+        self._provider_wire_mode = provider_wire_mode
         self.calls: list[tuple[list[str], str, dict[str, object]]] = []
         self.environments: list[dict[str, str] | None] = []
 
@@ -347,6 +434,12 @@ class _SequenceRunner:
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         output_path = Path(argv[argv.index("--output-last-message") + 1])
         output = next(self._outputs)
+        if self._provider_wire_mode != "raw":
+            output = _provider_wire_value(
+                output,
+                schema,
+                encode_domain_documents=self._provider_wire_mode == "strict",
+            )
         output_path.write_text(json.dumps(output, ensure_ascii=False), encoding="utf-8")
         self.calls.append((argv, prompt, schema))
         self.environments.append(environment)
@@ -354,6 +447,29 @@ class _SequenceRunner:
         events: list[dict[str, object]] = [
             {"type": "thread.started", "thread_id": thread_id}
         ]
+        if self._emit_primary_review_trace and (
+            "target_plan" in schema.get("properties", {})
+            or "exhaustion_assessment" in schema.get("properties", {})
+        ):
+            reviewer = "codex-bundle-primary-reviewer:1"
+            for tool, status in (
+                ("spawn_agent", "pending_init"),
+                ("wait", "completed"),
+            ):
+                events.append(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": f"collab-primary-{tool}:1",
+                            "type": "collab_tool_call",
+                            "tool": tool,
+                            "sender_thread_id": thread_id,
+                            "receiver_thread_ids": [reviewer],
+                            "agents_states": {reviewer: {"status": status}},
+                            "status": "completed",
+                        },
+                    }
+                )
         if (
             self._emit_review_trace
             and "reviewer_agent_ref" in schema.get("properties", {})
@@ -669,7 +785,6 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     adapter = CodexBundleSkillAdapter(
         tmp_path / "provider",
         executable=str(_fake_codex(tmp_path / "codex")),
-        model_ref="test-model",
         process_runner=runner,
     )
     authority = _FullConformanceAuthority()
@@ -780,8 +895,19 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
 
     assert result.primary_session_ref == "codex-bundle-primary:1"
     assert result.reviewer_agent_ref == "codex-bundle-reviewer:1"
+    assert binding.model_ref == "gpt-5.6-sol"
+    assert (
+        "codex-config:model_reasoning_effort=max"
+        in binding.resource_bindings
+    )
     assert any(
         "meta_research.skills.bundle_stage/SKILL.md" in item
+        for item in binding.resource_bindings
+    )
+    assert any(
+        item.startswith(
+            "adapter-source:meta_research.idea_skill@sha256:"
+        )
         for item in binding.resource_bindings
     )
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
@@ -790,21 +916,33 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     batch_argv, batch_prompt, batch_schema = runner.calls[3]
     serialized_checkpoint = canonical_json(request.inbox_checkpoint)
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
+    assert 'model_reasoning_effort="max"' in primary_argv
     assert f"inbox_checkpoint={serialized_checkpoint}" in primary_prompt
     assert f"inbox_checkpoint={serialized_checkpoint}" in review_prompt
     assert "Agent Session 绝不是 Target 或 TargetRun" in primary_prompt
+    assert "本回合仅执行 Primary draft phase" in primary_prompt
+    assert "禁止调用 spawn_agent 或 wait" in primary_prompt
     assert "TargetPlan 不选择 provider、adapter" in primary_prompt
     assert "installed_experiment_provider_catalog=" not in primary_prompt
-    assert set(primary_schema) == {"oneOf"}
-    assert len(primary_schema["oneOf"]) == 2
+    assert "Provider transport envelope" in primary_prompt
+    assert "Provider transport encoding" in primary_prompt
+    assert set(primary_schema) == {
+        "type",
+        "additionalProperties",
+        "properties",
+        "required",
+    }
+    assert primary_schema["required"] == ["provider_output"]
+    provider_output_schema = primary_schema["properties"]["provider_output"]
+    assert len(provider_output_schema["anyOf"]) == 2
     target_plan_branch = next(
         branch
-        for branch in primary_schema["oneOf"]
+        for branch in provider_output_schema["anyOf"]
         if "target_plan" in branch["properties"]
     )
     exhaustion_branch = next(
         branch
-        for branch in primary_schema["oneOf"]
+        for branch in provider_output_schema["anyOf"]
         if "exhaustion_assessment" in branch["properties"]
     )
     assert target_plan_branch["additionalProperties"] is False
@@ -855,6 +993,8 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     assert "完整 measurement contract" in review_prompt
     assert review_argv[-3:] == ["resume", "codex-bundle-primary:1", "-"]
     assert 'fork_turns="none"' in review_prompt
+    assert "当前 frozen reviewed_draft" in review_prompt
+    assert "不得复用 Primary phase" in review_prompt
     assert "DAG" in review_prompt
     assert "final_target_plan" in review_schema["properties"]
     assert dispatch.selected_target_ref == "target:accepted-structure"
@@ -862,8 +1002,12 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     assert dispatch_argv[-3:] == ["resume", "codex-bundle-primary:1", "-"]
     assert f"inbox_checkpoint={serialized_checkpoint}" in dispatch_prompt
     assert "durable frontier" in dispatch_prompt
-    assert dispatch_schema["properties"]["selected_target_ref"]["anyOf"][0]["enum"] == [
-        "target:accepted-structure"
+    selected_target_schema = dispatch_schema["properties"][
+        "selected_target_ref"
+    ]["anyOf"]
+    assert selected_target_schema == [
+        {"type": "string", "minLength": 1},
+        {"type": "null"},
     ]
     assert batch.strategy_update["strategy_complete"] is True
     assert len(batch.strategy_update["candidates"]) == 1
@@ -1165,12 +1309,34 @@ def test_production_exhaustion_review_requires_exact_fresh_child_trace(
         missing_trace_runner, "missing-exhaustion-trace"
     )
     missing_binding = missing_trace_adapter.runtime_binding()
+    missing_request = replace(
+        request,
+        runtime_binding=missing_binding,
+        job_ref="bundle-exhaustion-missing-trace-job",
+    )
+    with pytest.raises(
+        BundleSkillUnavailable, match="codex_child_review_spawn_invalid"
+    ) as caught:
+        missing_trace_adapter.execute(missing_request)
+    assert caught.value.recovery_checkpoint is not None
+    assert caught.value.recovery_checkpoint["contract_failure_code"] == (
+        "codex_child_review_spawn_invalid"
+    )
+    assert caught.value.recovery_checkpoint["contract_failure_detail_code"] == (
+        "codex_child_review_spawn_invalid"
+    )
+    assert "当前 frozen reviewed_assessment" in missing_trace_runner.calls[1][1]
+    assert "不得复用 Primary phase" in missing_trace_runner.calls[1][1]
+
+    no_replay = _SequenceRunner([])
+    restarted = configured_adapter(no_replay, "missing-exhaustion-trace")
     with pytest.raises(
         BundleSkillUnavailable, match="codex_child_review_spawn_invalid"
     ):
-        missing_trace_adapter.execute(
-            replace(request, runtime_binding=missing_binding)
+        restarted.execute(
+            replace(missing_request, runtime_binding=restarted.runtime_binding())
         )
+    assert no_replay.calls == []
 
 
 def test_production_adapter_does_not_bind_an_experiment_provider_catalog(
@@ -1232,6 +1398,128 @@ def test_complete_measurement_contract_is_not_limited_to_the_old_192k_slice() ->
         context_pack_hash=context_hash,
         plan_document=plan,
     ) == material_target_plan_hash(target_plan)
+
+
+def test_domain_validator_preserves_legal_nested_empty_object() -> None:
+    plan = _plan_document()
+    target_plan = _target_plan(plan, "a" * 64)
+    candidate = deepcopy(
+        target_plan["initial_strategy_update"]["candidates"][0]
+    )
+    candidate["measurement_contract"]["protocol_version"][
+        "evaluation_data"
+    ]["optional_metadata"] = {}
+    completion = normalized_completion_contract_from_dict(
+        target_plan["completion_contract"],
+        plan_document=plan,
+    )
+
+    formal_target_candidate_from_dict(
+        candidate,
+        completion_contract=completion,
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_wire_mode", "encoded_document"),
+    [
+        ("strict", '{"alpha":1e999}'),
+        ("strict", '{"alpha":-1e999}'),
+        ("envelope_only", None),
+        ("raw", None),
+    ],
+)
+def test_invalid_provider_transport_is_terminal_and_never_replayed(
+    tmp_path: Path,
+    provider_wire_mode: str,
+    encoded_document: str | None,
+) -> None:
+    plan = _plan_document()
+    context = {
+        "schema_ref": "meta-research/bundle-context-pack/v1",
+        "cycle_ref": "cycle:bundle-transport",
+        "accepted_question_binding": {"question_ref": "question:bundle-1"},
+        "accepted_formal_plan_binding": {
+            "formal_plan_ref": "formal-plan:bundle-1",
+            "plan_document": plan,
+            "plan_document_hash": canonical_hash(plan),
+            "answer_contract_hash": "a" * 64,
+        },
+    }
+    context_hash = canonical_hash(context)
+    target_plan = _target_plan(plan, context_hash)
+    if encoded_document is not None:
+        target_plan["initial_strategy_update"]["candidates"][0][
+            "measurement_contract"
+        ]["baseline_forward_contract"] = encoded_document
+    workspace = tmp_path / (
+        "bundle-transport-"
+        + provider_wire_mode
+        + ("-negative" if encoded_document and "-1e999" in encoded_document else "")
+    )
+    executable = str(_fake_codex(tmp_path / "codex-bundle-transport"))
+    runner = _SequenceRunner(
+        [{"target_plan": target_plan}],
+        provider_wire_mode=provider_wire_mode,
+    )
+    adapter = CodexBundleSkillAdapter(
+        workspace,
+        executable=executable,
+        model_ref="test-model",
+        process_runner=runner,
+    )
+    adapter.bind_full_conformance_authority(_FullConformanceAuthority())
+    adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
+    request = BundleSkillRequest(
+        stage_request_ref="stage-request:bundle-transport",
+        run_ref="bundle-run:transport",
+        attempt_ref="bundle-attempt:transport",
+        fence_ref="bundle-fence:transport",
+        cycle_ref="cycle:bundle-transport",
+        question_ref="question:bundle-1",
+        formal_plan_ref="formal-plan:bundle-1",
+        context_pack_ref="context-pack:bundle-1",
+        context_pack_hash=context_hash,
+        context_pack=context,
+        plan_document=plan,
+        root_session_ref="ar-session:bundle-transport",
+        runtime_binding=adapter.runtime_binding(),
+        inbox_checkpoint=_inbox_checkpoint(
+            run_ref="bundle-run:transport",
+            attempt_ref="bundle-attempt:transport",
+            fence_ref="bundle-fence:transport",
+        ),
+        job_ref="bundle-provider-transport-job",
+    )
+
+    with pytest.raises(
+        BundleSkillUnavailable,
+        match="bundle_primary_result_contract_invalid",
+    ) as caught:
+        adapter.generate_draft(request)
+    assert caught.value.recovery_checkpoint is not None
+    assert caught.value.recovery_checkpoint["contract_failure_detail_code"] == (
+        "codex_bundle_primary_invalid"
+    )
+    assert len(runner.calls) == 1
+
+    no_replay = _SequenceRunner([])
+    restarted = CodexBundleSkillAdapter(
+        workspace,
+        executable=executable,
+        model_ref="test-model",
+        process_runner=no_replay,
+    )
+    restarted.bind_full_conformance_authority(_FullConformanceAuthority())
+    restarted.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
+    with pytest.raises(
+        BundleSkillUnavailable,
+        match="bundle_primary_result_contract_invalid",
+    ):
+        restarted.generate_draft(
+            replace(request, runtime_binding=restarted.runtime_binding())
+        )
+    assert no_replay.calls == []
 
 
 def test_bundle_adapter_transports_a_legal_target_plan_larger_than_one_mib(
@@ -1323,6 +1611,7 @@ def test_bundle_durable_runner_uses_the_sealed_stream_limit(tmp_path: Path) -> N
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {},
+                "required": [],
             },
             native_session_ref=None,
             job_ref="bundle-provider-operation:limit-probe",
@@ -1580,11 +1869,22 @@ def test_idea_and_plan_keep_the_existing_transport_limits(
         "stream_max_bytes": PROVIDER_STREAM_MAX_BYTES,
         "result_max_bytes": PROVIDER_RESULT_MAX_BYTES,
     }
+    local_limit = 64 * 1024
+    adapter._provider_transport_limits = ProviderTransportLimits(
+        prompt_max_bytes=local_limit,
+        stream_max_bytes=local_limit,
+        result_max_bytes=local_limit,
+    )
     with pytest.raises(IdeaSkillUnavailable, match="codex_prompt_too_large"):
         adapter._invoke(
             operation_name="primary",
-            prompt="x" * (PROVIDER_STREAM_MAX_BYTES + 1),
-            schema={"type": "object"},
+            prompt="x" * (local_limit + 1),
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+                "required": [],
+            },
             native_session_ref=None,
             job_ref="unchanged-default-limit",
         )
@@ -1603,9 +1903,40 @@ def test_bundle_oversized_prompt_fails_before_provider_or_spool(
         adapter._invoke(
             operation_name="target-batch-2",
             prompt="x" * (BUNDLE_PROVIDER_TRANSPORT_LIMITS.prompt_max_bytes + 1),
-            schema={"type": "object"},
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+                "required": [],
+            },
             native_session_ref=None,
             job_ref="bundle-provider-operation:oversized",
+        )
+    assert runner.calls == []
+    assert not (workspace / "provider-operations").exists()
+
+
+def test_provider_dialect_gate_fails_before_runner_or_durable_spool(
+    tmp_path: Path,
+) -> None:
+    runner = _SequenceRunner([])
+    workspace = tmp_path / "invalid-provider-schema"
+    adapter = CodexBundleSkillAdapter(workspace, process_runner=runner)
+
+    with pytest.raises(
+        BundleSkillUnavailable, match="codex_output_schema_invalid"
+    ):
+        adapter._invoke(
+            operation_name="primary",
+            prompt="valid prompt",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"value": {"type": "string"}},
+                "required": [],
+            },
+            native_session_ref=None,
+            job_ref="bundle-provider-operation:invalid-schema",
         )
     assert runner.calls == []
     assert not (workspace / "provider-operations").exists()

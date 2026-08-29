@@ -58,7 +58,11 @@ curl --noproxy '*' --max-time 10 http://127.0.0.1:3456/targets
 
 The bridge attaches to the running browser and exposes only page-control operations. Keep credentials, cookies, local storage, and browser-profile files outside agent context.
 
-If the authenticated route fails, ask the user to re-login in that browser, continue OA-only, or cancel. OA-only mode passes `--no-institutional-access`. Waiting for user login or upload is outside the DeepFetch active-search clock. Cancellation ends the provider and its parent run immediately.
+If the session is already OA-only, treat it as the user's selected primary route, skip every
+institutional/browser preflight, and pass `--no-institutional-access`; never describe this as forced,
+as a downgrade, or as a fallback. Otherwise, if the authenticated route fails, ask the user to
+re-login in that browser, continue OA-only, or cancel. Waiting for user login or upload is outside
+the DeepFetch active-search clock. Cancellation ends the provider and its parent run immediately.
 
 Completion criterion: authenticated entitlement is visibly verified or OA-only continuation is explicit.
 
@@ -127,8 +131,10 @@ Routing remains mechanical:
 
 Return `missing` only when the item is route-exhausted: every supplied hint and applicable OA
 resolver is terminal, and, when institutional fallback is enabled, the unresolved item has also
-reached a typed terminal institutional outcome. A confirmed OA location whose bytes timed out is `transfer_failed`, not
-`oa_fulltext_not_found`.
+reached a typed terminal institutional outcome. Under a user-selected OA-only session, exhausted
+items return `oa_not_found` (or the host-level `acquisition_route_exhausted`), never an
+institutional-authorization failure. A confirmed OA location whose bytes timed out is
+`transfer_failed`, not `oa_fulltext_not_found`.
 
 ## Verify and return
 

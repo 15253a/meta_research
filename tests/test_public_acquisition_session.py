@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,7 @@ from meta_research.acquisition import (
     AcquisitionPaper,
     AcquisitionPreflightResult,
     AcquisitionRuntimeBinding,
+    AcquisitionUnavailable,
     canonical_hash as acquisition_hash,
     canonical_json as acquisition_json,
     validate_batch_request,
@@ -115,6 +117,48 @@ class RecordingAcquisitionProvider:
         )
 
 
+class ObtainingAcquisitionProvider(RecordingAcquisitionProvider):
+    content = b"owner-frozen-acquisition-artifact"
+
+    def acquire(self, request: AcquisitionBatchRequest):
+        self.batches.append(request)
+        target = Path(request.target_dir) / "owner-frozen.html"
+        target.write_bytes(self.content)
+        return tuple(
+            AcquisitionItemResult(
+                paper_id=item.paper_id,
+                status="obtained",
+                path=str(target.resolve()),
+                format="html",
+                failure=None,
+            )
+            for item in request.papers
+        )
+
+
+@pytest.mark.parametrize("request_id", ["/tmp/x", "../x", "a/b"])
+def test_acquisition_request_id_must_be_a_path_safe_token(request_id: str) -> None:
+    request = AcquisitionBatchRequest(
+        request_id=request_id,
+        route_policy="oa_first_then_institution",
+        papers=(
+            AcquisitionPaper(
+                paper_id="paper:path-safe-request-id",
+                title="Path-safe acquisition identity",
+                doi=None,
+                arxiv_id=None,
+                source_urls=(),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        AcquisitionUnavailable,
+        match="acquisition_batch_request_invalid",
+    ):
+        validate_batch_request(request)
+
+
 class RejectingPowerInhibitor:
     kind = "test_rejecting_inhibitor"
 
@@ -160,12 +204,26 @@ class SwitchablePowerInhibitor:
 class PartialAcquisitionProvider(RecordingAcquisitionProvider):
     def acquire(self, request: AcquisitionBatchRequest):
         self.batches.append(request)
+        target_root = Path(request.target_dir)
+        target_root.mkdir(parents=True, exist_ok=True)
+        paths = {
+            item.paper_id: target_root / (
+                item.paper_id.replace(":", "-") + ".pdf"
+            )
+            for item in request.papers
+        }
+        for path in paths.values():
+            path.write_bytes(b"%PDF-1.4\nfixture acquisition artifact\n")
         if len(self.batches) == 1:
             return tuple(
                 AcquisitionItemResult(
                     paper_id=item.paper_id,
                     status="obtained" if item.paper_id == "paper:obtained" else "waiting_user",
-                    path=("/private/already-obtained.pdf" if item.paper_id == "paper:obtained" else None),
+                    path=(
+                        str(paths[item.paper_id].resolve())
+                        if item.paper_id == "paper:obtained"
+                        else None
+                    ),
                     format=("pdf" if item.paper_id == "paper:obtained" else None),
                     failure=(
                         None
@@ -182,7 +240,7 @@ class PartialAcquisitionProvider(RecordingAcquisitionProvider):
             AcquisitionItemResult(
                 paper_id=item.paper_id,
                 status="obtained",
-                path="/private/resumed.pdf",
+                path=str(paths[item.paper_id].resolve()),
                 format="pdf",
                 failure=None,
             )
@@ -300,6 +358,41 @@ class RepeatedPendingAcquisitionProvider(RecordingAcquisitionProvider):
                     "code": "route_exhausted",
                     "detail": "The exact operation now has a terminal manifest.",
                 },
+            )
+            for item in request.papers
+        )
+
+
+class InvalidArtifactAfterReconcileProvider(RecordingAcquisitionProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reconcile_calls: list[AcquisitionBatchRequest] = []
+
+    def acquire(self, request: AcquisitionBatchRequest):
+        self.batches.append(request)
+        return tuple(
+            AcquisitionItemResult(
+                paper_id=item.paper_id,
+                status="waiting_user",
+                path=None,
+                format=None,
+                failure={
+                    "code": "acquisition_reconciliation_required",
+                    "detail": "The provider operation requires exact reconciliation.",
+                },
+            )
+            for item in request.papers
+        )
+
+    def reconcile(self, request: AcquisitionBatchRequest):
+        self.reconcile_calls.append(request)
+        return tuple(
+            AcquisitionItemResult(
+                paper_id=item.paper_id,
+                status="obtained",
+                path=str((Path(request.target_dir) / "missing.pdf").resolve()),
+                format="pdf",
+                failure=None,
             )
             for item in request.papers
         )
@@ -592,6 +685,125 @@ def _respond_with_accepted_material(
     )
 
 
+def test_owner_rejects_path_unsafe_request_ids_before_target_or_provider(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "path-unsafe-acquisition-request"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="path-unsafe-acquisition-request",
+        )
+        paper = AcquisitionPaper(
+            paper_id="paper:path-unsafe-request",
+            title="Reject an unsafe acquisition identity",
+            doi=None,
+            arxiv_id=None,
+            source_urls=(),
+        )
+
+        for request_id in ("/tmp/x", "../x", "a/b"):
+            with pytest.raises(
+                OwnerConflict,
+                match="acquisition_batch_request_invalid",
+            ):
+                runtime.owners.agent_runtime.acquire_literature(
+                    session_ref,
+                    AcquisitionBatchRequest(
+                        request_id=request_id,
+                        route_policy="oa_first_then_institution",
+                        papers=(paper,),
+                    ),
+                    provider,
+                )
+
+        assert provider.batches == []
+        assert not (
+            runtime.owners.agent_runtime._acquisition_private_root
+            / session_ref
+            / "requests"
+        ).exists()
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_owner_rejects_precreated_acquisition_target_symlink_before_provider(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "symlink-acquisition-target"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="symlink-acquisition-target",
+        )
+        request = AcquisitionBatchRequest(
+            request_id="precreated-target-symlink",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:symlink-target",
+                    title="Reject a symlinked acquisition target",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        requests_root = (
+            runtime.owners.agent_runtime._acquisition_private_root
+            / session_ref
+            / "requests"
+        )
+        requests_root.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / "outside-owner-target"
+        outside.mkdir()
+        (requests_root / request.request_id).symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+
+        with pytest.raises(
+            OwnerConflict,
+            match="acquisition_artifact_target_invalid",
+        ):
+            runtime.owners.agent_runtime.acquire_literature(
+                session_ref,
+                request,
+                provider,
+            )
+
+        assert provider.batches == []
+        assert runtime.owners.agent_runtime.query_acquisition_execution(
+            session_ref,
+            request.request_id,
+        ) is None
+        session = runtime.owners.agent_runtime.query_acquisition_session(
+            session_ref=session_ref
+        )
+        assert session is not None
+        assert session.status == "ready"
+        assert session.slot_held is False
+        assert session.current_request_id is None
+    finally:
+        client.close()
+        runtime.close()
+
+
 def test_acquisition_preflight_never_starts_without_confirmed_power_hold(
     tmp_path: Path,
 ) -> None:
@@ -684,6 +896,224 @@ def test_acquisition_batch_retries_with_a_new_attempt_after_power_wait(
                 {"request_id": request.request_id},
             ).scalar_one() == 2
     finally:
+        runtime.close()
+
+
+def test_completed_acquisition_execution_is_queryable_without_provider_replay(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "query-completed-acquisition"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="query-completed-acquisition",
+        )
+        request = AcquisitionBatchRequest(
+            request_id="query-completed-acquisition-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:query-completed",
+                    title="Query completed acquisition",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        assert runtime.owners.agent_runtime.query_acquisition_execution(
+            session_ref,
+            request.request_id,
+        ) is None
+
+        completed = runtime.owners.agent_runtime.acquire_literature(
+            session_ref,
+            request,
+            provider,
+        )
+        queried = runtime.owners.agent_runtime.query_acquisition_execution(
+            session_ref,
+            request.request_id,
+        )
+
+        assert queried == completed
+        assert [batch.request_id for batch in provider.batches] == [
+            request.request_id
+        ]
+    finally:
+        client.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "corrupted_column",
+    ("request_json", "request_hash", "route_policy"),
+)
+def test_completed_acquisition_query_rejects_corrupted_owner_request_identity(
+    tmp_path: Path,
+    corrupted_column: str,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / f"corrupt-{corrupted_column}"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix=f"corrupt-{corrupted_column}",
+        )
+        request = AcquisitionBatchRequest(
+            request_id=f"corrupt-{corrupted_column}-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:corrupted-owner-identity",
+                    title="Corrupted Owner request identity",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        runtime.owners.agent_runtime.acquire_literature(
+            session_ref,
+            request,
+            provider,
+        )
+
+        with runtime._database.write() as connection:
+            if corrupted_column == "request_json":
+                stored_json = connection.execute(
+                    text(
+                        "SELECT request_json FROM ar_acquisition_requests WHERE "
+                        "request_id = :request_id"
+                    ),
+                    {"request_id": request.request_id},
+                ).scalar_one()
+                connection.execute(
+                    text(
+                        "UPDATE ar_acquisition_requests SET request_json = "
+                        ":request_json WHERE request_id = :request_id"
+                    ),
+                    {
+                        "request_id": request.request_id,
+                        "request_json": " " + stored_json,
+                    },
+                )
+            elif corrupted_column == "request_hash":
+                connection.execute(
+                    text(
+                        "UPDATE ar_acquisition_requests SET request_hash = "
+                        ":request_hash WHERE request_id = :request_id"
+                    ),
+                    {
+                        "request_id": request.request_id,
+                        "request_hash": "f" * 64,
+                    },
+                )
+            else:
+                connection.execute(text("PRAGMA ignore_check_constraints = ON"))
+                connection.execute(
+                    text(
+                        "UPDATE ar_acquisition_requests SET route_policy = "
+                        ":route_policy WHERE request_id = :request_id"
+                    ),
+                    {
+                        "request_id": request.request_id,
+                        "route_policy": "corrupted_route_policy",
+                    },
+                )
+
+        with pytest.raises(
+            OwnerConflict,
+            match="^acquisition_request_identity_conflict$",
+        ):
+            runtime.owners.agent_runtime.query_acquisition_execution(
+                session_ref,
+                request.request_id,
+            )
+        assert [batch.request_id for batch in provider.batches] == [
+            request.request_id
+        ]
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_terminal_acquisition_commit_freezes_artifact_digest_and_size(
+    tmp_path: Path,
+) -> None:
+    provider = ObtainingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "frozen-acquisition-proof"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="frozen-acquisition-proof",
+        )
+        request = AcquisitionBatchRequest(
+            request_id="frozen-acquisition-proof-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:frozen-acquisition-proof",
+                    title="Frozen acquisition proof",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        completed = runtime.owners.agent_runtime.acquire_literature(
+            session_ref,
+            request,
+            provider,
+        )
+        item = completed.results[0]
+
+        assert item.content_sha256 == hashlib.sha256(provider.content).hexdigest()
+        assert item.content_bytes == len(provider.content)
+        with runtime._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT results_json, results_hash FROM "
+                    "ar_acquisition_requests WHERE request_id = :request_id"
+                ),
+                {"request_id": request.request_id},
+            ).one()
+        persisted = acquisition_json([item.as_dict()])
+        assert row.results_json == persisted
+        assert row.results_hash == acquisition_hash([item.as_dict()])
+
+        assert item.path is not None
+        Path(item.path).write_bytes(b"mutated-after-terminal-owner-commit")
+        queried = runtime.owners.agent_runtime.query_acquisition_execution(
+            session_ref,
+            request.request_id,
+        )
+        assert queried is not None
+        assert queried.results[0].content_sha256 == item.content_sha256
+        assert queried.results[0].content_bytes == item.content_bytes
+        assert len(provider.batches) == 1
+    finally:
+        client.close()
         runtime.close()
 
 
@@ -939,6 +1369,476 @@ def test_waiting_batch_retries_only_the_affected_item(
     finally:
         client.close()
         runtime.close()
+
+
+def test_mixed_legacy_wait_resume_freezes_proof_for_previous_obtained_item(
+    tmp_path: Path,
+) -> None:
+    provider = PartialAcquisitionProvider()
+    data_root = prepare_data_root(tmp_path / "mixed-legacy-obtained-proof")
+    runtime = build_production_runtime(
+        data_root,
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    initialization_id, saved, session_ref = _open_ready_acquisition(
+        client, write_headers, prefix="mixed-legacy-obtained-proof"
+    )
+    request = AcquisitionBatchRequest(
+        request_id="mixed-legacy-obtained-proof-batch",
+        route_policy="oa_first_then_institution",
+        papers=(
+            AcquisitionPaper(
+                paper_id="paper:obtained",
+                title="Legacy obtained item",
+                doi="10.1000/legacy-obtained-proof",
+                arxiv_id=None,
+                source_urls=(),
+            ),
+            AcquisitionPaper(
+                paper_id="paper:waiting",
+                title="Waiting item",
+                doi="10.1000/legacy-waiting-proof",
+                arxiv_id=None,
+                source_urls=(),
+            ),
+        ),
+    )
+    try:
+        first = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert first.status == "waiting_user"
+        human_request = _current_acquisition_human_request(
+            runtime, session_ref, request.request_id
+        )
+        legacy_results = [
+            {
+                "paper_id": "paper:obtained",
+                "status": "obtained",
+                "path": first.results[0].path,
+                "format": "pdf",
+                "failure": None,
+            },
+            {
+                "paper_id": "paper:waiting",
+                "status": "waiting_user",
+                "path": None,
+                "format": None,
+                "failure": {
+                    "code": "institutional_login_required",
+                    "detail": "请恢复机构登录。",
+                },
+            },
+        ]
+        with runtime.owners.agent_runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ar_acquisition_requests SET results_json = :results_json, "
+                    "results_hash = :results_hash WHERE request_id = :request_id"
+                ),
+                {
+                    "results_json": acquisition_json(legacy_results),
+                    "results_hash": acquisition_hash(legacy_results),
+                    "request_id": request.request_id,
+                },
+            )
+    finally:
+        client.close()
+        runtime.close()
+
+    restarted = build_production_runtime(
+        data_root,
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    restarted_client, restarted_headers = _authenticated_client(restarted)
+    try:
+        response = restarted_client.post(
+            f"/api/v1/human-requests/{human_request['request_ref']}/responses",
+            headers=_write_headers(
+                restarted_headers, "mixed-legacy-obtained-proof-response"
+            ),
+            json={
+                "decision": "provided",
+                "facts": {"route": "institutional_browser_reconnected"},
+                "note": "The existing controlled browser login was restored.",
+            },
+        )
+        assert response.status_code == 201
+        restored = restarted_client.post(
+            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
+            headers=_write_headers(
+                restarted_headers, "mixed-legacy-obtained-proof-preflight"
+            ),
+            json={
+                "expected_draft_revision": saved["quest_draft"]["revision"],
+                "expected_draft_hash": saved["quest_draft"]["hash"],
+            },
+        )
+        restored.raise_for_status()
+
+        resumed = restarted.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+
+        assert resumed.status == "obtained"
+        assert resumed.results[0].content_sha256 == hashlib.sha256(
+            b"%PDF-1.4\nfixture acquisition artifact\n"
+        ).hexdigest()
+        assert resumed.results[0].content_bytes == 38
+        queried = restarted.owners.agent_runtime.query_acquisition_execution(
+            session_ref, request.request_id
+        )
+        assert queried == resumed
+        consumed = restarted.owners.agent_runtime.query_human_request(
+            human_request["request_ref"]
+        )
+        assert consumed is not None
+        assert consumed["revision"] == human_request["revision"]
+        assert consumed["direct_waiters"][0]["status"] == "consumed"
+        assert [paper.paper_id for paper in provider.batches[1].papers] == [
+            "paper:waiting"
+        ]
+    finally:
+        restarted_client.close()
+        restarted.close()
+
+
+def test_mixed_wait_resume_terminalizes_previous_obtained_artifact_drift(
+    tmp_path: Path,
+) -> None:
+    provider = PartialAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "mixed-obtained-artifact-drift"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        initialization_id, saved, session_ref = _open_ready_acquisition(
+            client, write_headers, prefix="mixed-obtained-artifact-drift"
+        )
+        request = AcquisitionBatchRequest(
+            request_id="mixed-obtained-artifact-drift-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:obtained",
+                    title="Frozen obtained item",
+                    doi="10.1000/frozen-obtained-drift",
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+                AcquisitionPaper(
+                    paper_id="paper:waiting",
+                    title="Waiting item",
+                    doi="10.1000/waiting-drift",
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        first = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert first.status == "waiting_user"
+        assert first.results[0].content_sha256 == hashlib.sha256(
+            b"%PDF-1.4\nfixture acquisition artifact\n"
+        ).hexdigest()
+        assert first.results[0].path is not None
+        Path(first.results[0].path).write_bytes(b"mutated after Owner proof")
+
+        _respond_to_acquisition_human_request(
+            runtime,
+            session_ref=session_ref,
+            request_id=request.request_id,
+            key="mixed-obtained-artifact-drift",
+        )
+        restored = client.post(
+            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
+            headers=_write_headers(
+                write_headers, "mixed-obtained-artifact-drift-preflight"
+            ),
+            json={
+                "expected_draft_revision": saved["quest_draft"]["revision"],
+                "expected_draft_hash": saved["quest_draft"]["hash"],
+            },
+        )
+        restored.raise_for_status()
+
+        resumed = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+
+        assert resumed.status == "partial"
+        assert resumed.results[0] == AcquisitionItemResult(
+            paper_id="paper:obtained",
+            status="missing",
+            path=None,
+            format=None,
+            failure={
+                "code": "acquisition_artifact_drift",
+                "detail": (
+                    "Acquisition artifact bytes 与 Owner 已冻结 proof 不一致；"
+                    "拒绝重新签名且不会自动重放 Provider。"
+                ),
+            },
+        )
+        assert resumed.results[1].status == "obtained"
+        assert resumed.results[1].content_sha256 is not None
+        assert runtime.owners.agent_runtime.query_acquisition_execution(
+            session_ref, request.request_id
+        ) == resumed
+        replay = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert replay == resumed
+        assert len(provider.batches) == 2
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_reconciled_invalid_artifact_is_terminal_and_never_replayed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = InvalidArtifactAfterReconcileProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "reconciled-invalid-artifact"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _, _, session_ref = _open_ready_acquisition(
+            client, write_headers, prefix="reconciled-invalid-artifact"
+        )
+        request = AcquisitionBatchRequest(
+            request_id="reconciled-invalid-artifact-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:invalid-artifact",
+                    title="Invalid reconciled artifact",
+                    doi="10.1000/reconciled-invalid-artifact",
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        first = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert first.status == "waiting_user"
+
+        recorded_boundaries: list[tuple[str, str]] = []
+        original_record_runtime_boundary = (
+            agent_runtime_module.record_runtime_boundary
+        )
+
+        def record_terminal_boundary(connection, **values) -> None:
+            recorded_boundaries.append(
+                (values["identity"].responsibility_ref, values["boundary"])
+            )
+            original_record_runtime_boundary(connection, **values)
+
+        monkeypatch.setattr(
+            agent_runtime_module,
+            "record_runtime_boundary",
+            record_terminal_boundary,
+        )
+        terminal = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+
+        assert terminal.status == "missing"
+        assert terminal.results == (
+            AcquisitionItemResult(
+                paper_id="paper:invalid-artifact",
+                status="missing",
+                path=None,
+                format=None,
+                failure={
+                    "code": "acquisition_artifact_invalid",
+                    "detail": (
+                        "Owner 无法验证 Acquisition artifact bytes；"
+                        "该 item 已终止且不会自动重放 Provider。"
+                    ),
+                },
+            ),
+        )
+        assert {boundary for _ref, boundary in recorded_boundaries} == {
+            "checkpoint",
+            "permanent_fence",
+        }
+        assert runtime.owners.agent_runtime.query_acquisition_execution(
+            session_ref, request.request_id
+        ) == terminal
+
+        replay = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert replay == terminal
+        assert len(provider.batches) == 1
+        assert len(provider.reconcile_calls) == 1
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_upgrade_preserves_legacy_waiting_item_hash_for_public_reconnect(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    data_root = prepare_data_root(tmp_path / "legacy-waiting-item-hash")
+    runtime = build_production_runtime(
+        data_root,
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    initialization_id, saved, session_ref = _open_ready_acquisition(
+        client, write_headers, prefix="legacy-waiting-item-hash"
+    )
+    request = AcquisitionBatchRequest(
+        request_id="legacy-waiting-item-hash-batch",
+        route_policy="oa_first_then_institution",
+        papers=(
+            AcquisitionPaper(
+                paper_id="paper:waiting",
+                title="Resume an upgrade-era library wait",
+                doi="10.1000/legacy-waiting-item-hash",
+                arxiv_id=None,
+                source_urls=(),
+            ),
+        ),
+    )
+    try:
+        first = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert first.status == "waiting_user"
+        human_request = _current_acquisition_human_request(
+            runtime, session_ref, request.request_id
+        )
+
+        # Freeze the exact persisted shape emitted before artifact proofs were
+        # introduced: five item fields in results_json, and the HumanRequest
+        # target bound to that five-field canonical item hash.
+        legacy_result = {
+            "paper_id": "paper:waiting",
+            "status": "waiting_user",
+            "path": None,
+            "format": None,
+            "failure": {
+                "code": "institutional_login_required",
+                "detail": "请在既有受控浏览器中恢复图书馆登录。",
+            },
+        }
+        legacy_results = [legacy_result]
+        legacy_target = {
+            **human_request["target_assertion"],
+            "acquisition_item_hash": acquisition_hash(legacy_result),
+        }
+        legacy_contract = {
+            "quest_ref": human_request["quest_ref"],
+            "kind": human_request["kind"],
+            "obligation": human_request["obligation"],
+            "business_purpose": human_request["business_purpose"],
+            "target_assertion": legacy_target,
+            "acceptance_conditions": human_request["acceptance_conditions"],
+            "required_authorization": human_request["required_authorization"],
+            "expires_at": human_request["expires_at"],
+        }
+        with runtime.owners.agent_runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ar_acquisition_requests SET results_json = :results_json, "
+                    "results_hash = :results_hash WHERE request_id = :request_id"
+                ),
+                {
+                    "results_json": acquisition_json(legacy_results),
+                    "results_hash": acquisition_hash(legacy_results),
+                    "request_id": request.request_id,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE owner_human_requests SET target_assertion_json = "
+                    ":target_json, target_assertion_hash = :target_hash, "
+                    "identity_hash = :identity_hash WHERE request_ref = :request_ref"
+                ),
+                {
+                    "target_json": acquisition_json(legacy_target),
+                    "target_hash": acquisition_hash(legacy_target),
+                    "identity_hash": acquisition_hash(legacy_contract),
+                    "request_ref": human_request["request_ref"],
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE owner_human_request_waiters SET target_assertion_json = "
+                    ":target_json, target_assertion_hash = :target_hash WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {
+                    "target_json": acquisition_json(legacy_target),
+                    "target_hash": acquisition_hash(legacy_target),
+                    "request_ref": human_request["request_ref"],
+                },
+            )
+    finally:
+        client.close()
+        runtime.close()
+
+    restarted = build_production_runtime(
+        data_root,
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    restarted_client, restarted_headers = _authenticated_client(restarted)
+    try:
+        response = restarted_client.post(
+            f"/api/v1/human-requests/{human_request['request_ref']}/responses",
+            headers=_write_headers(
+                restarted_headers, "legacy-waiting-item-hash-response"
+            ),
+            json={
+                "decision": "provided",
+                "facts": {"route": "institutional_browser_reconnected"},
+                "note": "The existing controlled browser login was restored.",
+            },
+        )
+        assert response.status_code == 201
+
+        restored = restarted_client.post(
+            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
+            headers=_write_headers(
+                restarted_headers, "legacy-waiting-item-hash-preflight"
+            ),
+            json={
+                "expected_draft_revision": saved["quest_draft"]["revision"],
+                "expected_draft_hash": saved["quest_draft"]["hash"],
+            },
+        )
+        restored.raise_for_status()
+        resumed = restarted.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert resumed.status == "missing"
+        assert len(provider.batches) == 2
+        current = restarted.owners.agent_runtime.query_human_request(
+            human_request["request_ref"]
+        )
+        assert current is not None
+        assert current["revision"] == human_request["revision"]
+        assert current["direct_waiters"][0]["status"] == "consumed"
+    finally:
+        restarted_client.close()
+        restarted.close()
 
 
 def test_acquisition_session_claim_is_single_slot_cas(

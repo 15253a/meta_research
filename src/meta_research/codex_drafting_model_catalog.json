@@ -1,10 +1,16 @@
 {
   "models": [
     {
-      "slug": "gpt-5.4",
-      "display_name": "GPT-5.4 Proposal Drafter",
+      "slug": "gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol Proposal Drafter",
       "description": "Schema-only pre-confirmation drafting model metadata.",
-      "supported_reasoning_levels": [],
+      "default_reasoning_level": "max",
+      "supported_reasoning_levels": [
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        }
+      ],
       "shell_type": "disabled",
       "visibility": "list",
       "supported_in_api": true,
@@ -33,7 +39,7 @@
       "supports_parallel_tool_calls": false,
       "supports_image_detail_original": false,
       "context_window": 272000,
-      "max_context_window": 872000,
+      "max_context_window": 272000,
       "auto_compact_token_limit": null,
       "effective_context_window_percent": 95,
       "experimental_supported_tools": [],

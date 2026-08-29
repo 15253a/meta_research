@@ -8,6 +8,10 @@ import subprocess
 from typing import Callable, Protocol, cast
 from urllib.parse import urlsplit
 
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF,
+    CODEX_REASONING_EFFORT_BINDING,
+)
 from meta_research.harness import (
     FullConformanceBinding,
     HarnessAdmissionError,
@@ -17,9 +21,12 @@ from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     ProviderTransportLimits,
     _DISABLED_CODEX_FEATURES,
+    _compile_codex_output_schema,
     _codex_harness_manifest,
     _file_sha256,
+    _shared_codex_adapter_source_hash,
     _verify_child_review_trace,
+    _verify_primary_phase_trace,
 )
 from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -737,12 +744,24 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
 
     _provider_transport_limits = REASONING_PROVIDER_TRANSPORT_LIMITS
 
+    def _is_reconciliation_operation_name(self, operation_name: str) -> bool:
+        return operation_name == "autonomous-resume" or (
+            super()._is_reconciliation_operation_name(operation_name)
+        )
+
+    def _transport_contract_failure_code(self, operation_name: str) -> str:
+        if operation_name == "primary":
+            return "reasoning_primary_result_contract_invalid"
+        if operation_name in {"review", "autonomous-resume"}:
+            return "reasoning_review_result_contract_invalid"
+        raise ReasoningSkillUnavailable("codex_operation_spool_invalid")
+
     def __init__(
         self,
         workspace: Path,
         *,
         executable: str = "codex",
-        model_ref: str = "gpt-5.4",
+        model_ref: str = CODEX_MODEL_REF,
         timeout_seconds: float = 15 * 60,
         process_runner: Callable[
             [list[str], str, float], subprocess.CompletedProcess[str]
@@ -902,7 +921,26 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 mcp_token=channel.connection.token,
                 mcp_scope_binding_hash=scope_binding_hash,
             )
-            _verify_reasoning_semantic_trace(result[2], operation_ids)
+            try:
+                _verify_reasoning_semantic_trace(result[2], operation_ids)
+            except (
+                ReasoningSkillContractError,
+                ReasoningSkillUnavailable,
+            ) as error:
+                detail_code = (
+                    error.code
+                    if isinstance(error, ReasoningSkillUnavailable)
+                    else str(error)
+                )
+                raise self._sealed_result_failure(
+                    job_ref=request.job_ref,
+                    operation_name=operation_name,
+                    native_session_ref=cast(str, result[1]),
+                    failure_code=self._transport_contract_failure_code(
+                        operation_name
+                    ),
+                    detail_code=detail_code,
+                ) from error
         except ReasoningSkillUnavailable as error:
             if error.code != "codex_operation_reconciliation_pending":
                 self._release_resident_channel(channel_key)
@@ -940,6 +978,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         resources = _reasoning_skill_resources()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_source_hash = _file_sha256(Path(__file__).resolve())
+        shared_adapter_source_hash = _shared_codex_adapter_source_hash()
         supervisor_source_hash = _file_sha256(
             Path(__file__).with_name("provider_supervisor.py").resolve()
         )
@@ -954,12 +993,17 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 template, _reasoning_autonomous_checkpoint_schema(template)
             ),
         }
+        schemas = {
+            name: _compile_codex_output_schema(schema)
+            for name, schema in schemas.items()
+        }
         binding = ReasoningRuntimeBinding(
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
                     "skill_instructions": _reasoning_skill_instructions(),
                     "adapter_source_hash": adapter_source_hash,
+                    "shared_adapter_source_hash": shared_adapter_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
                 }
             ),
@@ -991,12 +1035,15 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             + (
                 "adapter-source:meta_research.reasoning_skill@sha256:"
                 f"{adapter_source_hash}",
+                "adapter-source:meta_research.idea_skill@sha256:"
+                f"{shared_adapter_source_hash}",
                 "adapter-source:meta_research.provider_supervisor@sha256:"
                 f"{supervisor_source_hash}",
                 "disabled-codex-features:"
                 + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
                 "codex-config:features.multi_agent=true",
+                CODEX_REASONING_EFFORT_BINDING,
                 "codex-config:web_search=live",
                 "output-route:codex-output-last-message/json-schema/v1",
                 "provider-output-limits:"
@@ -1033,6 +1080,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable("reasoning_runtime_binding_drift")
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
+            "本回合仅执行 Primary draft phase。禁止调用 spawn_agent 或 wait，禁止委派 "
+            "child、独立评审或预先处理 review；必须先返回 frozen draft。独立评审只能在 "
+            "Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是当前 Reasoning 根 Agent，而不是 State Owner。先通过 resident "
             "Semantic MCP 严格按顺序调用 advancement_engine.reasoning_stage_run.observe、"
             "research_memory.reasoning_evidence.read、research_graph.reasoning_context.read，"
@@ -1069,7 +1119,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "frozen_evidence_closure="
             f"{canonical_json(list(request.frozen_evidence_closure))}"
         )
-        output, session_ref, _stdout = self._invoke_with_resident_mcp(
+        output, session_ref, primary_stdout = self._invoke_with_resident_mcp(
             request=request,
             operation_name="primary",
             prompt=prompt,
@@ -1078,6 +1128,15 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         )
         if session_ref is None or not isinstance(output, dict):
             raise ReasoningSkillUnavailable("codex_reasoning_primary_invalid")
+        try:
+            _verify_primary_phase_trace(primary_stdout)
+        except ReasoningSkillUnavailable as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="primary",
+                native_session_ref=session_ref,
+                failure_code=error.code,
+            ) from error
         draft = ReasoningSkillDraft(
             draft=output,
             primary_session_ref=session_ref,
@@ -1086,7 +1145,13 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         try:
             validate_reasoning_skill_draft(request, draft)
         except ReasoningContractError as error:
-            raise ReasoningSkillUnavailable(error.args[0]) from error
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="primary",
+                native_session_ref=session_ref,
+                failure_code="reasoning_primary_result_contract_invalid",
+                detail_code=str(error.args[0]),
+            ) from error
         return draft
 
     def review_draft(
@@ -1106,6 +1171,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable(error.args[0]) from error
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
+            "本回合是 Review phase。必须针对下方当前 frozen reviewed_draft 现在新建一个 "
+            "child reviewer；不得复用 Primary phase、任何先前 child 或先前评审结论。"
             "你仍是同一个 Reasoning 根 Agent。先再次通过三项 resident Semantic MCP "
             "操作核对 current request/fence/epoch 与冻结 evidence/context。然后必须在当前 "
             "managed native Session 内使用 Harness 原生 spawn_agent，以 "
@@ -1152,13 +1219,27 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             or not isinstance(reviewed.get("final_output"), dict)
             or not isinstance(reviewed.get("dispositions"), list)
         ):
-            raise ReasoningSkillUnavailable("codex_reasoning_review_invalid")
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code="reasoning_review_result_contract_invalid",
+                detail_code="codex_reasoning_review_invalid",
+            )
         reviewer_agent_ref = cast(str, reviewed["reviewer_agent_ref"])
-        _verify_child_review_trace(
-            stdout,
-            root_session_ref=draft.primary_session_ref,
-            reviewer_agent_ref=reviewer_agent_ref,
-        )
+        try:
+            _verify_child_review_trace(
+                stdout,
+                root_session_ref=draft.primary_session_ref,
+                reviewer_agent_ref=reviewer_agent_ref,
+            )
+        except ReasoningSkillUnavailable as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code=error.code,
+            ) from error
         final_output = cast(dict[str, object], reviewed["final_output"])
         if (
             draft.draft.get("schema_ref")
@@ -1185,7 +1266,13 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                     request, draft, checkpoint_result
                 )
             except ReasoningContractError as error:
-                raise ReasoningSkillUnavailable(error.args[0]) from error
+                raise self._sealed_result_failure(
+                    job_ref=request.job_ref,
+                    operation_name="review",
+                    native_session_ref=draft.primary_session_ref,
+                    failure_code="reasoning_review_result_contract_invalid",
+                    detail_code=str(error.args[0]),
+                ) from error
             return checkpoint_result
         scientific_outcome = final_output.get("scientific_outcome")
         next_cycle = final_output.get("next_cycle_proposal")
@@ -1197,7 +1284,13 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             or completion is not None
             and not isinstance(completion, dict)
         ):
-            raise ReasoningSkillUnavailable("codex_reasoning_review_invalid")
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code="reasoning_review_result_contract_invalid",
+                detail_code="codex_reasoning_review_invalid",
+            )
         result = ReasoningSkillResult(
             reviewed_draft=draft.draft,
             scientific_outcome=scientific_outcome,
@@ -1219,7 +1312,13 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         try:
             validate_reasoning_skill_result(request, result)
         except ReasoningContractError as error:
-            raise ReasoningSkillUnavailable(error.args[0]) from error
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code="reasoning_review_result_contract_invalid",
+                detail_code=str(error.args[0]),
+            ) from error
         return result
 
     def resume_after_autonomous_creation(
@@ -1247,6 +1346,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable("reasoning_native_session_missing")
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
+            "本回合是 Review phase。必须针对下方当前 frozen checkpoint 与当前 creation "
+            "result 现在新建一个 child reviewer；不得复用 Primary phase、任何先前 child "
+            "或先前评审结论。"
             "继续同一 Reasoning root/native Session。create_question 已通过五 Owner 公共 "
             "seam 返回 RG accepted QuestionAnchor、同一 graph revision 的 present/open facts "
             "以及真实 QuestionLiteratureRevision。先按既定顺序重查三项 resident Semantic "
@@ -1282,18 +1384,38 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             or not isinstance(reviewed.get("final_output"), dict)
             or not isinstance(reviewed.get("dispositions"), list)
         ):
-            raise ReasoningSkillUnavailable("codex_reasoning_review_invalid")
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="autonomous-resume",
+                native_session_ref=request.native_session_ref,
+                failure_code="reasoning_review_result_contract_invalid",
+                detail_code="codex_reasoning_review_invalid",
+            )
         reviewer_agent_ref = cast(str, reviewed["reviewer_agent_ref"])
-        _verify_child_review_trace(
-            stdout,
-            root_session_ref=request.native_session_ref,
-            reviewer_agent_ref=reviewer_agent_ref,
-        )
+        try:
+            _verify_child_review_trace(
+                stdout,
+                root_session_ref=request.native_session_ref,
+                reviewer_agent_ref=reviewer_agent_ref,
+            )
+        except ReasoningSkillUnavailable as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="autonomous-resume",
+                native_session_ref=request.native_session_ref,
+                failure_code=error.code,
+            ) from error
         final_output = cast(dict[str, object], reviewed["final_output"])
         outcome = final_output.get("scientific_outcome")
         next_cycle = final_output.get("next_cycle_proposal")
         if not isinstance(outcome, dict) or not isinstance(next_cycle, dict):
-            raise ReasoningSkillUnavailable("codex_reasoning_review_invalid")
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="autonomous-resume",
+                native_session_ref=request.native_session_ref,
+                failure_code="reasoning_review_result_contract_invalid",
+                detail_code="codex_reasoning_review_invalid",
+            )
         result = ReasoningSkillResult(
             reviewed_draft=checkpoint,
             scientific_outcome=outcome,
@@ -1317,7 +1439,13 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 request, checkpoint, creation_result, result
             )
         except ReasoningContractError as error:
-            raise ReasoningSkillUnavailable(error.args[0]) from error
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="autonomous-resume",
+                native_session_ref=request.native_session_ref,
+                failure_code="reasoning_review_result_contract_invalid",
+                detail_code=str(error.args[0]),
+            ) from error
         return result
 
     def execute(self, request: ReasoningSkillRequest) -> ReasoningSkillResult:
@@ -1565,47 +1693,41 @@ def _reasoning_stage_output_schema(
 ) -> dict[str, object]:
     next_cycle = _next_cycle_proposal_schema(request)
     completion = _candidate_completion_schema(request)
+    base_properties = {
+        "schema_ref": {"const": REASONING_STAGE_OUTPUT_SCHEMA_REF},
+        "scientific_outcome": _scientific_outcome_schema(request),
+    }
     return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "schema_ref": {"const": REASONING_STAGE_OUTPUT_SCHEMA_REF},
-            "scientific_outcome": _scientific_outcome_schema(request),
-            "next_cycle_proposal": {
-                "anyOf": [next_cycle, {"type": "null"}]
-            },
-            "candidate_completion": {
-                "anyOf": [completion, {"type": "null"}]
-            },
-        },
-        "required": [
-            "schema_ref",
-            "scientific_outcome",
-            "next_cycle_proposal",
-            "candidate_completion",
-        ],
-        "oneOf": [
+        "anyOf": [
             {
+                "type": "object",
+                "additionalProperties": False,
                 "properties": {
+                    **base_properties,
                     "next_cycle_proposal": next_cycle,
                     "candidate_completion": {"type": "null"},
                 },
                 "required": [
+                    *base_properties,
                     "next_cycle_proposal",
                     "candidate_completion",
                 ],
             },
             {
+                "type": "object",
+                "additionalProperties": False,
                 "properties": {
+                    **base_properties,
                     "next_cycle_proposal": {"type": "null"},
                     "candidate_completion": completion,
                 },
                 "required": [
+                    *base_properties,
                     "next_cycle_proposal",
                     "candidate_completion",
                 ],
             },
-        ],
+        ]
     }
 
 
@@ -1614,15 +1736,10 @@ def _reasoning_primary_output_schema(
 ) -> dict[str, object]:
     closed = _reasoning_stage_output_schema(request)
     autonomous = _reasoning_autonomous_checkpoint_schema(request)
-    closed_properties = cast(dict[str, object], closed["properties"])
-    autonomous_properties = cast(dict[str, object], autonomous["properties"])
+    closed_variants = cast(list[dict[str, object]], closed["anyOf"])
     return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {**closed_properties, **autonomous_properties},
-        "required": ["schema_ref", "scientific_outcome"],
         "oneOf": [
-            closed,
+            *closed_variants,
             autonomous,
         ]
     }
@@ -1644,20 +1761,7 @@ def _reasoning_autonomous_checkpoint_schema(
         )
     }
     source = _reasoning_source_properties(request)
-    skip_basis = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            stage: {
-                "type": "array",
-                "minItems": 1,
-                "uniqueItems": True,
-                "items": text,
-            }
-            for stage in ("idea", "plan", "bundle")
-        },
-    }
-    scope_properties = {
+    scope_base_properties = {
         "schema_ref": {"const": AUTONOMOUS_QUESTION_SCOPE_SCHEMA_REF},
         "kind": {"const": "AutonomousQuestionScope"},
         "creation_mode": {"const": "AutonomousCreation"},
@@ -1675,13 +1779,27 @@ def _reasoning_autonomous_checkpoint_schema(
             "uniqueItems": True,
             "items": text,
         },
-        "entry_stage": {
-            "type": "string",
-            "enum": ["idea", "plan", "bundle", "reasoning"],
-        },
-        "typed_skip_basis_refs_by_stage": skip_basis,
         "is_authoritative": {"const": False},
     }
+    scope_variants = [
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                **scope_base_properties,
+                "entry_stage": {"const": entry_stage},
+                "typed_skip_basis_refs_by_stage": _typed_skip_basis_schema(
+                    entry_stage, text
+                ),
+            },
+            "required": [
+                *scope_base_properties,
+                "entry_stage",
+                "typed_skip_basis_refs_by_stage",
+            ],
+        }
+        for entry_stage in ("idea", "plan", "bundle", "reasoning")
+    ]
     return {
         "type": "object",
         "additionalProperties": False,
@@ -1690,12 +1808,7 @@ def _reasoning_autonomous_checkpoint_schema(
                 "const": REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF
             },
             "scientific_outcome": _scientific_outcome_schema(request),
-            "autonomous_scope": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": scope_properties,
-                "required": list(scope_properties),
-            },
+            "autonomous_scope": {"anyOf": scope_variants},
         },
         "required": ["schema_ref", "scientific_outcome", "autonomous_scope"],
     }
@@ -1704,58 +1817,35 @@ def _reasoning_autonomous_checkpoint_schema(
 def _scientific_outcome_schema(
     request: ReasoningSkillRequest,
 ) -> dict[str, object]:
-    frozen_evidence = tuple(
-        value
-        for value in request.frozen_evidence_closure
-        if value.get("kind")
-        in _SCIENTIFIC_EVIDENCE_KINDS | _DIAGNOSTIC_EVIDENCE_KINDS
-    )
-    evidence_refs = [
-        value.get("ref")
-        for value in frozen_evidence
-        if isinstance(value.get("ref"), str)
-    ]
-    citation_variants = [
-        {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "kind": {"const": value["kind"]},
-                "ref": {"const": value["ref"]},
-                "finding": (
-                    {"const": "context"}
-                    if value.get("kind") in _DIAGNOSTIC_EVIDENCE_KINDS
-                    else {
-                        "type": "string",
-                        "enum": [
-                            "supporting",
-                            "negative",
-                            "partial",
-                            "context",
-                        ],
-                    }
+    text = {"type": "string", "minLength": 1}
+    # Frozen-closure membership, kind/ref pairing, and the diagnostic-only
+    # ``context`` finding are all checked by ``validate_scientific_outcome``.
+    # Keep the provider projection fixed-size so a valid large closure cannot
+    # overflow Structured Outputs' aggregate enum/property limits.
+    citation = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": sorted(
+                    _SCIENTIFIC_EVIDENCE_KINDS
+                    | _DIAGNOSTIC_EVIDENCE_KINDS
                 ),
             },
-            "required": ["kind", "ref", "finding"],
-        }
-        for value in frozen_evidence
-        if isinstance(value.get("kind"), str)
-        and isinstance(value.get("ref"), str)
-    ]
-    if not citation_variants:
-        citation_variants = [
-            {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "kind": {"const": "__no_frozen_evidence_available__"},
-                    "ref": {"const": "__no_frozen_evidence_available__"},
-                    "finding": {"const": "context"},
-                },
-                "required": ["kind", "ref", "finding"],
-            }
-        ]
-    text = {"type": "string", "minLength": 1}
+            "ref": text,
+            "finding": {
+                "type": "string",
+                "enum": [
+                    "supporting",
+                    "negative",
+                    "partial",
+                    "context",
+                ],
+            },
+        },
+        "required": ["kind", "ref", "finding"],
+    }
     research_context = cast(
         dict[str, object], request.context_pack["research_context"]
     )
@@ -1770,6 +1860,20 @@ def _scientific_outcome_schema(
     prior_refs = [cast(str, value["outcome_ref"]) for value in prior_outcomes]
     frozen_causal = cast(dict[str, object], research_context["causal_context"])
     text_array = {"type": "array", "items": text, "uniqueItems": True}
+    causal_ref_arrays = {
+        field: {
+            "type": "array",
+            "minItems": len(cast(list[object], frozen_causal[field])),
+            "maxItems": len(cast(list[object], frozen_causal[field])),
+            "items": text,
+        }
+        for field in (
+            "target_commit_refs",
+            "changed_axis_fact_refs",
+            "held_fixed_fact_refs",
+            "provenance_refs",
+        )
+    }
     return {
         "type": "object",
         "additionalProperties": False,
@@ -1798,7 +1902,7 @@ def _scientific_outcome_schema(
             "evidence": {
                 "type": "array",
                 "uniqueItems": True,
-                "items": {"anyOf": citation_variants},
+                "items": citation,
             },
             "missing_evidence": {"type": "array", "items": text},
             "uncertainty_basis": {"type": "array", "items": text},
@@ -1810,13 +1914,10 @@ def _scientific_outcome_schema(
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "target_commit_refs": {"const": frozen_causal["target_commit_refs"]},
-                    "changed_axis_fact_refs": {"const": frozen_causal["changed_axis_fact_refs"]},
-                    "held_fixed_fact_refs": {"const": frozen_causal["held_fixed_fact_refs"]},
-                    "provenance_refs": {"const": frozen_causal["provenance_refs"]},
+                    **causal_ref_arrays,
                     "attribution_basis_refs": {
                         "type": "array",
-                        "items": {"type": "string", "enum": evidence_refs or ["__no_frozen_evidence_available__"]},
+                        "items": text,
                         "uniqueItems": True,
                     },
                     "claim_scope": text,
@@ -1844,8 +1945,11 @@ def _scientific_outcome_schema(
                         "properties": {
                             "question_ref": {"const": request.question_ref},
                             "prior_accepted_outcome_refs": {
-                                "type": "array", "items": {"type": "string", "enum": prior_refs or ["__no_prior_outcome__"]},
-                                "minItems": len(prior_refs), "maxItems": len(prior_refs), "uniqueItems": True,
+                                "type": "array",
+                                "items": text,
+                                "minItems": len(prior_refs),
+                                "maxItems": len(prior_refs),
+                                "uniqueItems": True,
                             },
                             "progress": text,
                         },
@@ -1856,7 +1960,7 @@ def _scientific_outcome_schema(
                         "items": {
                             "type": "object", "additionalProperties": False,
                             "properties": {
-                                "question_ref": {"type": "string", "enum": parent_refs or ["__no_parent_question__"]},
+                                "question_ref": text,
                                 "impact": {"type": "string", "enum": ["material", "no_material", "unknown"]},
                                 "statement": text,
                             },
@@ -1922,70 +2026,64 @@ def _next_cycle_proposal_schema(
     request: ReasoningSkillRequest,
 ) -> dict[str, object]:
     text = {"type": "string", "minLength": 1}
-    skip_properties = {
-        stage: {
-            "type": "array",
-            "minItems": 1,
-            "uniqueItems": True,
-            "items": text,
-        }
-        for stage in ("idea", "plan", "bundle")
-    }
-    properties = {
+    base_properties = {
         "schema_ref": {"const": NEXT_CYCLE_PROPOSAL_SCHEMA_REF},
         "kind": {"const": "NextCycleProposal"},
         **_reasoning_source_properties(request),
         "target_question_ref": {"type": "string", "minLength": 1},
         "target_question_anchor_ref": {"type": "string", "minLength": 1},
-        "entry_stage": {
-            "type": "string",
-            "enum": ["idea", "plan", "bundle", "reasoning"],
-        },
-        "typed_skip_basis_refs_by_stage": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": skip_properties,
-        },
         "is_authoritative": {"const": False},
     }
+    return {
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    **base_properties,
+                    "entry_stage": {"const": entry_stage},
+                    "typed_skip_basis_refs_by_stage": _typed_skip_basis_schema(
+                        entry_stage, text
+                    ),
+                },
+                "required": [
+                    *base_properties,
+                    "entry_stage",
+                    "typed_skip_basis_refs_by_stage",
+                ],
+            }
+            for entry_stage in ("idea", "plan", "bundle", "reasoning")
+        ],
+    }
+
+
+def _typed_skip_basis_schema(
+    entry_stage: str,
+    text_schema: dict[str, object],
+) -> dict[str, object]:
     stage_order = ("idea", "plan", "bundle", "reasoning")
+    skipped_stages = stage_order[: stage_order.index(entry_stage)]
+    properties = {
+        stage: {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": True,
+            "items": text_schema,
+        }
+        for stage in skipped_stages
+    }
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": properties,
         "required": list(properties),
-        "allOf": [
-            {
-                "if": {
-                    "properties": {"entry_stage": {"const": entry_stage}},
-                    "required": ["entry_stage"],
-                },
-                "then": {
-                    "properties": {
-                        "typed_skip_basis_refs_by_stage": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                stage: skip_properties[stage]
-                                for stage in stage_order[
-                                    : stage_order.index(entry_stage)
-                                ]
-                            },
-                            "required": list(
-                                stage_order[: stage_order.index(entry_stage)]
-                            ),
-                        }
-                    }
-                },
-            }
-            for entry_stage in stage_order
-        ],
     }
 
 
 def _candidate_completion_schema(
     request: ReasoningSkillRequest,
 ) -> dict[str, object]:
+    milestone_basis_refs = completion_milestone_basis_refs(request.context_pack)
     properties = {
         "schema_ref": {"const": CANDIDATE_COMPLETION_SCHEMA_REF},
         "kind": {"const": "CandidateCompletion"},
@@ -1993,7 +2091,10 @@ def _candidate_completion_schema(
         "current_quest_ref": {"const": request.quest_ref},
         "current_goal_revision_ref": {"const": request.goal_revision_ref},
         "completion_milestone_basis_refs": {
-            "const": list(completion_milestone_basis_refs(request.context_pack)),
+            "type": "array",
+            "minItems": len(milestone_basis_refs),
+            "maxItems": len(milestone_basis_refs),
+            "items": {"type": "string", "minLength": 1},
         },
         "rationale": {"type": "string", "minLength": 1},
         "is_authoritative": {"const": False},

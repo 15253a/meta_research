@@ -13,7 +13,6 @@ import {
   createQuest,
   fetchAssetIntake,
   fetchQuestCreation,
-  fetchResearchAssets,
   generateQuestionProposal,
   hydrateScopedAssetIntakeRecovery,
   observeHostCompute,
@@ -24,6 +23,7 @@ import {
   sendIntentMessage,
   submitScopedAssetIntake,
   type IntentSessionTurn,
+  type DeepFetchActivityEvent,
   type LegacyQuestDraft,
   type QuestionContent,
   type QuestReceiptState,
@@ -148,6 +148,15 @@ type MaterialUpload = {
 type QuestAcceptedMaterialBinding =
   QuestDraft["literature"]["accepted_material_bindings"][number];
 
+export type QuestCompletionHandoff = Readonly<{
+  initializationId: string;
+  questRef: string;
+  memoryRef: string;
+  questionRef: string;
+  cycleRef: string;
+  questionTitle: string;
+}>;
+
 type ApplyViewOptions = {
   syncDraft?: boolean;
   syncProposal?: boolean;
@@ -190,16 +199,14 @@ const idleOperations: InFlightOperations = {
 export function QuestCreationWorkbench({
   current,
   researchAssets,
-  researchAssetInventoryRevision,
-  researchAssetTotal,
   onClose,
+  onCompleted,
   onChanged,
 }: {
   current: QuestCreationView | null;
   researchAssets: ResearchAssetItem[];
-  researchAssetInventoryRevision: number;
-  researchAssetTotal: number;
   onClose: () => void;
+  onCompleted: (handoff: QuestCompletionHandoff) => void;
   onChanged: () => void;
 }) {
   const normalizedCurrent = current ? normalizeQuestCreationView(current) : null;
@@ -243,6 +250,7 @@ export function QuestCreationWorkbench({
     initializationId: string;
     promise: Promise<QuestCreationView>;
   } | null>(null);
+  const completedHandoffRef = useRef<string | null>(null);
 
   const [creation, setCreation] = useState<NormalizedQuestCreationView | null>(
     normalizedCurrent,
@@ -274,16 +282,8 @@ export function QuestCreationWorkbench({
   const [error, setError] = useState<ProductFailure | null>(null);
   const [intentText, setIntentText] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [materialPickerOpen, setMaterialPickerOpen] = useState(false);
   const [materialAssets, setMaterialAssets] = useState(researchAssets);
-  const [materialInventoryRevision, setMaterialInventoryRevision] = useState(
-    researchAssetInventoryRevision,
-  );
-  const materialInventoryRevisionRef = useRef(
-    researchAssetInventoryRevision,
-  );
-  const [materialTotal, setMaterialTotal] = useState(researchAssetTotal);
-  const [materialsLoading, setMaterialsLoading] = useState(false);
+  const [materialDirectory, setMaterialDirectory] = useState("");
   const [materialUploads, setMaterialUploads] = useState<MaterialUpload[]>([]);
 
   const replaceMaterialUploads = (
@@ -300,59 +300,12 @@ export function QuestCreationWorkbench({
   }, []);
 
   useEffect(() => {
-    materialInventoryRevisionRef.current = researchAssetInventoryRevision;
     setMaterialAssets((current) => {
-      if (materialInventoryRevision !== researchAssetInventoryRevision) {
-        return researchAssets;
-      }
-      const byRef = new Map(
-        current.map((item) => [item.memory_ref, item]),
-      );
+      const byRef = new Map(current.map((item) => [item.memory_ref, item]));
       for (const item of researchAssets) byRef.set(item.memory_ref, item);
       return [...byRef.values()];
     });
-    setMaterialInventoryRevision(researchAssetInventoryRevision);
-    setMaterialTotal(researchAssetTotal);
-  }, [researchAssetInventoryRevision, researchAssetTotal, researchAssets]);
-
-  const loadMoreMaterials = useCallback(async () => {
-    if (materialsLoading || materialAssets.length >= materialTotal) return;
-    setMaterialsLoading(true);
-    try {
-      const next = await fetchResearchAssets(
-        undefined,
-        materialAssets.length,
-        50,
-      );
-      if (
-        next.inventory_revision !== materialInventoryRevisionRef.current
-      ) {
-        const currentPage = await fetchResearchAssets();
-        setMaterialAssets(currentPage.items);
-        materialInventoryRevisionRef.current = currentPage.inventory_revision;
-        setMaterialInventoryRevision(currentPage.inventory_revision);
-        setMaterialTotal(currentPage.total_count);
-        return;
-      }
-      setMaterialAssets((current) => {
-        const byRef = new Map(current.map((item) => [item.memory_ref, item]));
-        for (const item of next.items) byRef.set(item.memory_ref, item);
-        return [...byRef.values()];
-      });
-      setMaterialTotal(next.total_count);
-    } catch (caught) {
-      const code = caught instanceof ProductError ? caught.code : "unknown_error";
-      errorFocusRef.current = "alert";
-      setError({ code, message: messageFor(code) });
-    } finally {
-      setMaterialsLoading(false);
-    }
-  }, [
-    materialAssets.length,
-    materialInventoryRevision,
-    materialTotal,
-    materialsLoading,
-  ]);
+  }, [researchAssets]);
 
   const applyView = useCallback((
     received: QuestCreationView,
@@ -570,10 +523,13 @@ export function QuestCreationWorkbench({
   const pollCreation = useCallback(async (
     initializationId: string,
     complete: (view: QuestCreationView) => boolean,
-    timeoutMs = 190_000,
+    timeoutMs: number | null = 190_000,
   ): Promise<QuestCreationView> => {
-    const deadline = Date.now() + timeoutMs;
-    while (mountedRef.current && Date.now() < deadline) {
+    const deadline = timeoutMs === null ? null : Date.now() + timeoutMs;
+    while (
+      mountedRef.current &&
+      (deadline === null || Date.now() < deadline)
+    ) {
       const latest = normalizeQuestCreationView(
         await fetchQuestCreation(initializationId),
       );
@@ -582,15 +538,22 @@ export function QuestCreationWorkbench({
       if (complete(latest)) return latest;
       await delay(300);
     }
+    if (!mountedRef.current) {
+      throw new ProductError("quest_initialization_poll_cancelled");
+    }
     throw new ProductError("quest_initialization_poll_timeout");
   }, [applyView]);
 
   const resumeExecution = useCallback((basis: QuestCreationView) => {
-    if (!executionIsPending(basis)) return;
+    const proposalIsPending = basis.status === "proposal_generating";
+    if (!executionIsPending(basis) && !proposalIsPending) return;
     if (recoveryPollRef.current?.initializationId === basis.initialization_id) return;
     const promise = pollCreation(
       basis.initialization_id,
-      (view) => ["completed", "cancelled"].includes(view.status),
+      proposalIsPending
+        ? proposalGenerationSettled
+        : (view) => ["completed", "cancelled"].includes(view.status),
+      proposalIsPending ? null : 190_000,
     ).then((settled) => {
       if (mountedRef.current) {
         applyView(settled, {
@@ -625,6 +588,13 @@ export function QuestCreationWorkbench({
   useEffect(() => {
     if (creation) resumeExecution(creation);
   }, [creation, resumeExecution]);
+
+  useEffect(() => {
+    const handoff = questCompletionHandoff(creation);
+    if (!handoff || completedHandoffRef.current === handoff.initializationId) return;
+    completedHandoffRef.current = handoff.initializationId;
+    onCompleted(handoff);
+  }, [creation, onCompleted]);
 
   useEffect(() => {
     const basis = creation;
@@ -726,14 +696,30 @@ export function QuestCreationWorkbench({
         }
         if (!mountedRef.current) return next;
         const unchanged = sameDraft(draftRef.current, captured);
-        applyView(next, {
+        const accepted = applyView(next, {
           syncDraft: unchanged,
           syncProposal: !proposalDirtyRef.current,
           adoptDirtyDraftBasis: true,
         });
         draftDirtyRef.current = !unchanged;
+        if (!accepted && unchanged) {
+          // A newer same-initialization Projection can arrive after this PUT
+          // becomes durable but before its response continuation runs. The
+          // dirty guard correctly preserves the captured local edit while the
+          // write is in flight; once that exact edit is settled, replay the
+          // already accepted newer view so the form cannot remain stranded on
+          // the superseded response.
+          const latest = creationRef.current;
+          if (latest) {
+            applyView(latest, {
+              syncDraft: true,
+              syncProposal: !proposalDirtyRef.current,
+              notify: false,
+            });
+          }
+        }
         setDraftSaveState(unchanged ? "saved" : "unsaved");
-        return next;
+        return !accepted && unchanged ? creationRef.current ?? next : next;
       } catch (caught) {
         if (mountedRef.current) {
           if (caught instanceof ProductError && caught.code === "quest_draft_stale") {
@@ -889,25 +875,11 @@ export function QuestCreationWorkbench({
     updateDraft(boundaryDraft(draftRef.current, value));
   };
 
-  const toggleAcceptedMaterial = (asset: ResearchAssetItem) => {
+  const removeAcceptedMaterial = (versionRef: string) => {
     const bindings = draftRef.current.literature.accepted_material_bindings;
-    const selected = bindings.some(
-      (binding) => binding.version_ref === asset.version_ref,
+    const nextBindings = bindings.filter(
+      (binding) => binding.version_ref !== versionRef,
     );
-    if (!selected) {
-      const remaining = remainingQuestMaterialSlots(
-        draftRef.current,
-        materialUploadsRef.current,
-      );
-      if (remaining < 1) {
-        errorFocusRef.current = "alert";
-        setError(questMaterialLimitFailure(remaining));
-        return;
-      }
-    }
-    const nextBindings = selected
-      ? bindings.filter((binding) => binding.version_ref !== asset.version_ref)
-      : [...bindings, researchAssetBinding(asset)];
     updateDraft({
       ...draftRef.current,
       literature: {
@@ -955,7 +927,6 @@ export function QuestCreationWorkbench({
           byRef.set(asset.memory_ref, asset);
           return [...byRef.values()];
         });
-        setMaterialTotal((currentTotal) => Math.max(currentTotal, materialAssets.length + 1));
         // Save the user's current text before the independent material CAS.
         // Later edits never wait for this optional bind: whichever CAS loses
         // retries from the newer basis, and Draft stale recovery only merges
@@ -1062,6 +1033,73 @@ export function QuestCreationWorkbench({
         reason: materialUploadFailureCopy(code),
       });
     }
+  };
+
+  const runMaterialDirectory = async (
+    key: string,
+    directory: string,
+    initializationId: string,
+  ) => {
+    try {
+      updateMaterialUpload(key, { status: "accepting" });
+      const result = await submitScopedAssetIntake(
+        questMaterialIntakeContext(initializationId),
+        {
+          source_kind: "directory",
+          custody_mode: "linked_local",
+          display_name: materialDirectoryName(directory),
+          media_type: "application/x-directory",
+          source_locator: directory,
+          asynchronous: true,
+          provenance: {
+            submitted_via: "quest_creation",
+            initialization_id: initializationId,
+            selection_mode: "directory_path",
+          },
+        },
+      );
+      void settleMaterialUpload(key, initializationId, result);
+    } catch (caught) {
+      const code = caught instanceof ProductError ? caught.code : "unknown_error";
+      updateMaterialUpload(key, {
+        status: "failed",
+        reason: materialUploadFailureCopy(code),
+      });
+    }
+  };
+
+  const useMaterialDirectory = () => {
+    const initializationId = creationRef.current?.initialization_id;
+    const directory = materialDirectory.trim();
+    if (!initializationId || !directory) return;
+    if (materialUploadsRef.current.some(
+      (upload) => upload.name === directory && upload.status !== "failed",
+    )) {
+      setMaterialDirectory("");
+      return;
+    }
+    const remaining = remainingQuestMaterialSlots(
+      draftRef.current,
+      materialUploadsRef.current,
+    );
+    if (remaining < 1) {
+      errorFocusRef.current = "alert";
+      setError(questMaterialLimitFailure(remaining));
+      return;
+    }
+    const key = `directory-${Date.now()}-${crypto.randomUUID()}`;
+    replaceMaterialUploads((currentUploads) => [
+      ...currentUploads,
+      {
+        key,
+        name: directory,
+        status: "accepting",
+      },
+    ]);
+    setMaterialDirectory("");
+    materialUploadQueueRef.current = materialUploadQueueRef.current.then(
+      () => runMaterialDirectory(key, directory, initializationId),
+    );
   };
 
   const selectMaterialFiles = (
@@ -1294,11 +1332,23 @@ export function QuestCreationWorkbench({
       const queued = await generateQuestionProposal(basis);
       if (!operationIsCurrent("generating", token)) return;
       applyView(queued);
-      const next = await pollCreation(
+      const generationPoll = pollCreation(
         queued.initialization_id,
         proposalGenerationSettled,
-        draftRef.current.route === "deepfetch" ? 1_810_000 : 190_000,
+        draftRef.current.route === "deepfetch" ? null : 190_000,
       );
+      recoveryPollRef.current = {
+        initializationId: queued.initialization_id,
+        promise: generationPoll,
+      };
+      let next: QuestCreationView;
+      try {
+        next = await generationPoll;
+      } finally {
+        if (recoveryPollRef.current?.promise === generationPoll) {
+          recoveryPollRef.current = null;
+        }
+      }
       if (!operationIsCurrent("generating", token)) return;
       applyView(next, { syncProposal: Boolean(next.proposal) });
       if (
@@ -1753,65 +1803,92 @@ export function QuestCreationWorkbench({
                     >
                       <option value="oa_then_institution">全面搜索（包括图书馆）</option>
                       <option value="oa_only">只搜索开放获取资源</option>
-                      <option value="provided_only" disabled={materialTotal === 0}>
+                      <option
+                        value="provided_only"
+                        disabled={draft.literature.accepted_material_bindings.length === 0}
+                      >
                         只使用我提供的材料
                       </option>
                     </select>
                   </label>
-                  <div className="quest-library-prep">
-                    <i aria-hidden="true">↗</i>
-                    <div>
-                      <b>全面搜索前准备 Google Chrome</b>
-                      <small>检测真实 provider、浏览器控制与获准资源；凭据和 provider manifest 始终留在私有会话。</small>
+                  {draft.literature.mode === "oa_then_institution" ? (
+                    <>
+                      <div className="quest-library-prep">
+                        <i aria-hidden="true">↗</i>
+                        <div>
+                          <b>全面搜索前准备 Google Chrome</b>
+                          <small>检测真实 provider、浏览器控制与获准资源；凭据和 provider manifest 始终留在私有会话。</small>
+                        </div>
+                        <button
+                          ref={acquisitionButtonRef}
+                          className="quest-library-test"
+                          type="button"
+                          disabled={
+                            !creation ||
+                            acquisitionActionLocked ||
+                            draftSaveState === "saving"
+                          }
+                          onClick={() => void detectAcquisition()}
+                        >
+                          {inFlight.acquisition
+                            ? "正在检测…"
+                            : acquisitionSession?.status === "waiting_user"
+                              ? "重新检测登录"
+                              : acquisitionSession
+                                ? "重新检测"
+                                : "检测搜索环境"}
+                        </button>
+                        <span
+                          className={`quest-unavailable-tag ${acquisitionSession?.status ?? "not-checked"}`}
+                          data-testid="acquisition-session-status"
+                          aria-live="polite"
+                        >
+                          {inFlight.acquisition
+                            ? "probing · current"
+                            : acquisitionSessionCopy(acquisitionSession, draft)}
+                        </span>
+                      </div>
+                      <label className="quest-field">
+                        <span>图书馆／数据库入口链接 <em>可选</em></span>
+                        <input
+                          type="url"
+                          inputMode="url"
+                          autoComplete="url"
+                          value={draft.literature.library_entry_url}
+                          disabled={!creation || draftInteractionLocked}
+                          placeholder="例如 https://library.example.edu/resource"
+                          onChange={(event) => updateDraft({
+                            ...draft,
+                            literature: { ...draft.literature, library_entry_url: event.target.value },
+                          })}
+                          onBlur={() => void persistDraft()}
+                        />
+                      </label>
+                      <small className="quest-library-boundary">
+                        不收集密码、Cookie、token、OTP 或浏览器 profile；入口 URL 只是 Quest 配置。
+                      </small>
+                    </>
+                  ) : draft.literature.mode === "oa_only" ? (
+                    <div
+                      className="quest-library-prep"
+                      data-testid="oa-only-primary-route"
+                    >
+                      <i aria-hidden="true">✓</i>
+                      <div>
+                        <b>OA-only 是已选择的主路线</b>
+                        <small>跳过机构浏览器、图书馆入口和登录检测；未命中只报告 OA 路线穷尽，不会写成被迫降级。</small>
+                      </div>
+                      <span
+                        className={`quest-unavailable-tag ${acquisitionSession?.status ?? "not-checked"}`}
+                        data-testid="acquisition-session-status"
+                        aria-live="polite"
+                      >
+                        {inFlight.acquisition
+                          ? "preparing · current · browser not_required"
+                          : acquisitionSessionCopy(acquisitionSession, draft)}
+                      </span>
                     </div>
-                    <button
-                      ref={acquisitionButtonRef}
-                      className="quest-library-test"
-                      type="button"
-                      disabled={
-                        !creation ||
-                        acquisitionActionLocked ||
-                        draftSaveState === "saving"
-                      }
-                      onClick={() => void detectAcquisition()}
-                    >
-                      {inFlight.acquisition
-                        ? "正在检测…"
-                        : acquisitionSession?.status === "waiting_user"
-                          ? "重新检测登录"
-                          : acquisitionSession
-                            ? "重新检测"
-                            : "检测搜索环境"}
-                    </button>
-                    <span
-                      className={`quest-unavailable-tag ${acquisitionSession?.status ?? "not-checked"}`}
-                      data-testid="acquisition-session-status"
-                      aria-live="polite"
-                    >
-                      {inFlight.acquisition
-                        ? "probing · current"
-                        : acquisitionSessionCopy(acquisitionSession, draft)}
-                    </span>
-                  </div>
-                  <label className="quest-field">
-                    <span>图书馆／数据库入口链接 <em>可选</em></span>
-                    <input
-                      type="url"
-                      inputMode="url"
-                      autoComplete="url"
-                      value={draft.literature.library_entry_url}
-                      disabled={!creation || draftInteractionLocked}
-                      placeholder="例如 https://library.example.edu/resource"
-                      onChange={(event) => updateDraft({
-                        ...draft,
-                        literature: { ...draft.literature, library_entry_url: event.target.value },
-                      })}
-                      onBlur={() => void persistDraft()}
-                    />
-                  </label>
-                  <small className="quest-library-boundary">
-                    不收集密码、Cookie、token、OTP 或浏览器 profile；入口 URL 只是 Quest 配置。
-                  </small>
+                  ) : null}
                   {draft.literature.mode === "provided_only" ? (
                     <small className="quest-library-boundary">
                       {draft.literature.accepted_material_bindings.length
@@ -1825,31 +1902,48 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="materials" aria-labelledby="quest-materials-title">
                 <div className="quest-section-heading">
                   <b id="quest-materials-title">研究材料 <em>可选</em></b>
-                  <small>选取后后台接纳，成功即同步到当前草案</small>
+                  <small>输入目录路径，材料留在原处</small>
                 </div>
                 <div className="quest-material-card">
-                  <div className="quest-material-actions">
+                  <div className="quest-material-directory">
+                    <label className="quest-field">
+                      <span>运行 Meta Research 的主机目录</span>
+                      <input
+                        type="text"
+                        inputMode="text"
+                        autoComplete="off"
+                        spellCheck={false}
+                        aria-label="研究材料目录"
+                        value={materialDirectory}
+                        disabled={!creation || draftInteractionLocked}
+                        placeholder="/absolute/path/to/research-materials"
+                        onChange={(event) => setMaterialDirectory(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key !== "Enter") return;
+                          event.preventDefault();
+                          useMaterialDirectory();
+                        }}
+                      />
+                    </label>
                     <button
                       className="quest-material-button"
                       type="button"
-                      disabled={!creation || draftInteractionLocked}
-                      onClick={() => materialFolderInputRef.current?.click()}
+                      disabled={
+                        !creation ||
+                        draftInteractionLocked ||
+                        !materialDirectory.trim()
+                      }
+                      onClick={useMaterialDirectory}
                     >
-                      选择文件夹
+                      使用此目录
                     </button>
-                    <button
-                      className="quest-material-button"
-                      type="button"
-                      disabled={!creation || draftInteractionLocked}
-                      onClick={() => materialFilesInputRef.current?.click()}
-                    >
-                      选择文件
-                    </button>
-                    <span>无需先去材料工作台；名称、类型与保管方式会自动处理。</span>
                   </div>
+                  <p className="quest-material-footnote">
+                    请输入运行 Meta Research 服务的机器可访问的绝对目录。系统只建立本地关联，不上传或复制文件。
+                  </p>
                   <input
                     ref={materialFolderInputRef}
-                    className="quest-visually-hidden"
+                    hidden
                     type="file"
                     multiple
                     tabIndex={-1}
@@ -1861,7 +1955,7 @@ export function QuestCreationWorkbench({
                   />
                   <input
                     ref={materialFilesInputRef}
-                    className="quest-visually-hidden"
+                    hidden
                     type="file"
                     multiple
                     tabIndex={-1}
@@ -1881,8 +1975,8 @@ export function QuestCreationWorkbench({
                             <span aria-hidden="true">✓</span>
                             <b>{asset?.display_name ?? versionRef}</b>
                             <small>已加入本次 Quest</small>
-                            {asset && !draftInteractionLocked ? (
-                              <button type="button" onClick={() => toggleAcceptedMaterial(asset)}>
+                            {!draftInteractionLocked ? (
+                              <button type="button" onClick={() => removeAcceptedMaterial(versionRef)}>
                                 移除
                               </button>
                             ) : null}
@@ -1898,51 +1992,13 @@ export function QuestCreationWorkbench({
                       ))}
                     </div>
                   ) : (
-                    <p className="quest-material-empty">尚未选择材料。这里为空不会阻塞 Direct 创建。</p>
+                    <p className="quest-material-empty">尚未设置材料目录。这里为空不会阻塞 Direct 创建。</p>
                   )}
-                  <details
-                    className="quest-material-library"
-                    open={materialPickerOpen}
-                    onToggle={(event) => setMaterialPickerOpen(event.currentTarget.open)}
-                  >
-                    <summary>从已有材料中选择</summary>
-                    <div className="quest-material-picker" role="group" aria-label="选择已接纳 Research Asset">
-                      {materialAssets.length ? materialAssets.map((asset) => {
-                        const selected = draft.literature.accepted_material_bindings.some(
-                          (binding) => binding.version_ref === asset.version_ref,
-                        );
-                        return (
-                          <button
-                            key={asset.version_ref}
-                            type="button"
-                            aria-pressed={selected}
-                            disabled={draftInteractionLocked}
-                            onClick={() => toggleAcceptedMaterial(asset)}
-                          >
-                            <span>{selected ? "✓" : "+"}</span>
-                            <b>{asset.display_name}</b>
-                            <small>{asset.version_ref} · integrity {asset.integrity} · availability {asset.availability}</small>
-                          </button>
-                        );
-                      }) : (
-                        <small>还没有已接纳材料；可直接使用上方按钮添加。</small>
-                      )}
-                      {materialAssets.length < materialTotal ? (
-                        <button
-                          type="button"
-                          disabled={materialsLoading}
-                          onClick={() => void loadMoreMaterials()}
-                        >
-                          <span>+</span>
-                          <b>{materialsLoading ? "正在读取…" : "加载更多已接纳版本"}</b>
-                          <small>已显示 {materialAssets.length} / {materialTotal}</small>
-                        </button>
-                      ) : null}
-                    </div>
-                  </details>
-                  <p className="quest-material-footnote">
-                    上传失败只影响该材料；若选择“只使用我提供的材料”，至少一个材料正式加入后才能继续。
-                  </p>
+                  {draft.literature.mode === "provided_only" ? (
+                    <p className="quest-material-footnote">
+                      目录正式加入后，“只使用我提供的材料”才会继续生成第一问。
+                    </p>
+                  ) : null}
                 </div>
               </section>
 
@@ -1987,38 +2043,19 @@ export function QuestCreationWorkbench({
                       className={`quest-deepfetch-runway ${deepfetch?.status ?? "not-started"}`}
                       data-testid="deepfetch-runway"
                       data-status={deepfetch?.status ?? "not-started"}
-                      role="status"
-                      aria-live="polite"
                     >
                       <div className="quest-deepfetch-head">
                         <div>
                           <small>FIRST-QUESTION PREPARATION</small>
                           <b>DeepFetch Web Research</b>
                         </div>
-                        <span>{deepfetch ? deepfetchStatusLabel(deepfetch) : "等待启动"}</span>
+                        <span role="status" aria-live="polite">
+                          {deepfetch ? deepfetchStatusLabel(deepfetch) : "等待启动"}
+                        </span>
                       </div>
                       {deepfetch ? (
                         <>
-                          <div className="quest-deepfetch-progress">
-                            <progress
-                              aria-label="DeepFetch 真实进度"
-                              value={deepfetch.progress.completed}
-                              max={deepfetch.progress.total}
-                            />
-                            <code>
-                              {deepfetch.progress.completed}/{deepfetch.progress.total}
-                            </code>
-                          </div>
-                          <div className="quest-deepfetch-stages" aria-label="DeepFetch 活动阶段">
-                            {["授权", "排队", "Web Research", "RM 接纳", "Proposal"].map((label, index) => (
-                              <span
-                                key={label}
-                                className={index < deepfetch.progress.completed ? "done" : undefined}
-                              >
-                                {label}
-                              </span>
-                            ))}
-                          </div>
+                          <DeepFetchProgress deepfetch={deepfetch} />
                           <div className="quest-deepfetch-facts">
                             <span>
                               <small>ACTIVITY</small>
@@ -2060,7 +2097,7 @@ export function QuestCreationWorkbench({
                         </>
                       ) : (
                         <p className="quest-deepfetch-awaiting">
-                          保存当前 DraftRevision 和 Resource Envelope 后，点击下方唯一生成按钮启动；进度只读取 durable Projection。
+                          保存当前 DraftRevision 和 Resource Envelope 后，点击下方唯一生成按钮启动；阶段读取 durable Projection，运行中会持续闪动并显示真实已用时间。
                         </p>
                       )}
                     </div>
@@ -2804,6 +2841,190 @@ function previewStatusRank(
   return ["current", "stale", "consumed"].indexOf(status);
 }
 
+const DEEPFETCH_STAGE_LABELS = [
+  "授权",
+  "排队",
+  "Web Research",
+  "RM 接纳",
+  "Proposal",
+] as const;
+
+function DeepFetchProgress({
+  deepfetch,
+}: {
+  deepfetch: NonNullable<QuestCreationView["deepfetch"]>;
+}) {
+  const attempt = deepfetch.run;
+  const attemptStartedAt = attempt?.attempt_started_at ?? null;
+  const attemptCompletedAt = attempt?.attempt_completed_at ?? null;
+  const total = DEEPFETCH_STAGE_LABELS.length;
+  const completed = Math.max(0, Math.min(deepfetch.progress.completed, total));
+  const proposalIsActive =
+    deepfetch.status === "succeeded" &&
+    deepfetch.activity === "proposal_drafting" &&
+    completed < total;
+  const progressIsActive =
+    ["queued", "running", "accepting"].includes(deepfetch.status) ||
+    proposalIsActive;
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    setNow(Date.now());
+    if (!progressIsActive) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [
+    attempt?.attempt_ref,
+    attemptCompletedAt,
+    attemptStartedAt,
+    progressIsActive,
+  ]);
+
+  const stage = Math.min(completed + 1, total);
+  const elapsedEndAt = progressIsActive
+    ? now / 1_000
+    : attemptCompletedAt ?? now / 1_000;
+  const elapsedSeconds = attemptStartedAt === null
+    ? null
+    : Math.max(
+      0,
+      elapsedEndAt - attemptStartedAt,
+    );
+  const elapsed = elapsedSeconds === null
+    ? null
+    : formatElapsedSeconds(Math.floor(elapsedSeconds));
+  const progressCopy = deepfetch.status === "failed"
+    ? `失败于阶段 ${stage}/${total}${elapsed === null ? "" : ` · 耗时 ${elapsed}`}`
+    : `阶段 ${stage}/${total}${elapsed === null ? "" : ` · 已经过 ${elapsed}`}`;
+  const progressValueText = `阶段 ${stage}/${total} · ${DEEPFETCH_STAGE_LABELS[stage - 1]}${elapsed === null ? "" : ` · 已运行 ${elapsed}`}`;
+  const durableProgress = Math.round((completed / total) * 100);
+
+  return (
+    <>
+      <div className="quest-deepfetch-progress">
+        <div
+          className={`quest-deepfetch-meter${progressIsActive ? " is-active" : ""}${completed >= total ? " is-complete" : ""}`}
+          role="progressbar"
+          aria-label="DeepFetch 运行进度"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={durableProgress}
+          aria-valuetext={progressValueText}
+        >
+          <span
+            className="quest-deepfetch-meter-fill"
+            style={{ width: `${durableProgress}%` }}
+          >
+            <span aria-hidden="true" />
+          </span>
+        </div>
+        <code data-testid="deepfetch-elapsed" aria-live="off">
+          {progressCopy}
+        </code>
+      </div>
+      <div className="quest-deepfetch-stages" aria-label="DeepFetch 活动阶段">
+        {DEEPFETCH_STAGE_LABELS.map((label, index) => (
+          <span
+            key={label}
+            className={index < completed ? "done" : undefined}
+            aria-current={progressIsActive && index === stage - 1 ? "step" : undefined}
+          >
+            {label}
+          </span>
+        ))}
+      </div>
+      {progressIsActive ? (
+        <DeepFetchLiveEvents
+          attemptRef={attempt?.attempt_ref ?? null}
+          events={deepfetch.recent_events ?? []}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function DeepFetchLiveEvents({
+  attemptRef,
+  events,
+}: {
+  attemptRef: string | null;
+  events: DeepFetchActivityEvent[];
+}) {
+  const logRef = useRef<HTMLDivElement>(null);
+  const lastSequence = events.at(-1)?.sequence ?? null;
+
+  useEffect(() => {
+    const log = logRef.current;
+    if (!log || lastSequence === null) return;
+    log.scrollTo({
+      top: log.scrollHeight,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+    });
+  }, [attemptRef, lastSequence]);
+
+  return (
+    <section
+      className="quest-deepfetch-live"
+      data-testid="deepfetch-live-events"
+      aria-label="DeepFetch 实时运行轨迹"
+    >
+      <header>
+        <span>
+          <i aria-hidden="true" />
+          LIVE PROVIDER TRACE
+        </span>
+        <code>{events.length ? `最近 ${events.length} 条` : "等待事件"}</code>
+      </header>
+      <div
+        ref={logRef}
+        className="quest-deepfetch-live-log"
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-atomic="false"
+      >
+        {events.length ? events.map((event) => (
+          <div
+            key={`${attemptRef ?? "attempt"}:${event.sequence}`}
+            className={`quest-deepfetch-live-event ${event.status}`}
+            data-sequence={event.sequence}
+          >
+            <i aria-hidden="true" />
+            <span>{event.label}</span>
+            <code>{deepfetchEventCategory(event.category)}</code>
+          </div>
+        )) : (
+          <p>Provider 已启动，等待下一条结构化运行事件…</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function deepfetchEventCategory(
+  category: DeepFetchActivityEvent["category"],
+): string {
+  return {
+    session: "SESSION",
+    web_search: "WEB SEARCH",
+    web_fetch: "WEB FETCH",
+    analysis: "RESEARCH",
+  }[category];
+}
+
+function formatElapsedSeconds(totalSeconds: number): string {
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  if (hours === 0) {
+    return `${String(totalMinutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
 function intentStatusRank(status: IntentSessionTurn["assistant_status"]): number {
   return ["queued", "running", "completed", "unavailable", "failed"].indexOf(status);
 }
@@ -2839,7 +3060,7 @@ function deepfetchStatusRank(
   return ["queued", "running", "accepting", "succeeded", "failed", "cancelled"].indexOf(status);
 }
 
-function deepfetchRequiresNewInitialization(
+function deepfetchRequiresSuccessorBasis(
   deepfetch: NonNullable<QuestCreationView["deepfetch"]>,
 ): boolean {
   return deepfetch.failure?.code === "deepfetch_run_identity_conflict" ||
@@ -2851,11 +3072,14 @@ function deepfetchFailureCopy(
 ): string {
   const failure = deepfetch.failure;
   if (!failure) return "";
-  if (deepfetchRequiresNewInitialization(deepfetch)) {
+  if (deepfetchRequiresSuccessorBasis(deepfetch)) {
     const hardFailure = failure.code === "deepfetch_run_identity_conflict"
       ? messageFor(failure.code)
       : `DeepFetch 运行未完成（${failure.code}）；当前 durable 草案与已接纳事实不会回滚。`;
-    return `${hardFailure} 需要新建 initialization 或交由人工检查；当前记录不会自动重试。`;
+    return `${hardFailure} 当前记录不会自动重试。` +
+      "请修改并保存当前 Draft，形成新的 DraftRevision；重新准备 acquisition session 后，" +
+      "再次点击“生成第一个问题”创建 successor DeepFetch。" +
+      "只有无法形成有效 successor basis 时，才取消当前 initialization 后新建。";
   }
   return `${messageFor(failure.code)} ` +
     "重新点击“生成第一个问题”会沿同一 correlation 创建新 Attempt。";
@@ -2869,7 +3093,9 @@ function deepfetchStatusLabel(
     running: "真实检索中",
     accepting: "RM 接纳中",
     succeeded: "快照已接纳",
-    failed: deepfetchRequiresNewInitialization(deepfetch) ? "需人工检查" : "需要重试",
+    failed: deepfetchRequiresSuccessorBasis(deepfetch)
+      ? "Attempt 已失败 · 需更新 Draft"
+      : "Attempt 已失败 · 可重试",
     cancelled: "已取消",
   }[deepfetch.status];
 }
@@ -2883,9 +3109,33 @@ function deepfetchActivityLabel(
     accepting_assets: "接纳 summary / papers / fulltexts",
     proposal_drafting: "使用精确快照起草",
     complete: "首问题已原位展开",
-    needs_retry: "运行未完成",
+    needs_retry: "等待新 Attempt",
     cancelled: "运行已取消",
   }[activity];
+}
+
+function questCompletionHandoff(
+  creation: NormalizedQuestCreationView | null,
+): QuestCompletionHandoff | null {
+  const questionTitle = creation?.proposal?.content.title.trim();
+  if (
+    creation?.status !== "completed"
+    || !creation.quest_ref
+    || !creation.memory_ref
+    || !creation.question_ref
+    || !creation.cycle_ref
+    || !questionTitle
+  ) {
+    return null;
+  }
+  return {
+    initializationId: creation.initialization_id,
+    questRef: creation.quest_ref,
+    memoryRef: creation.memory_ref,
+    questionRef: creation.question_ref,
+    cycleRef: creation.cycle_ref,
+    questionTitle,
+  };
 }
 
 function creationIsLocked(creation: QuestCreationView): boolean {
@@ -2939,8 +3189,8 @@ function footerCopy(
   if (!creation.resource_envelope) return "请检测本机计算卡，并为 Quest 形成 Resource Envelope";
   if (!proposal) {
     if (creation.deepfetch?.status === "failed") {
-      return deepfetchRequiresNewInitialization(creation.deepfetch)
-        ? "DeepFetch 未完成；需要新建 initialization 或交由人工检查，当前记录不会自动重试"
+      return deepfetchRequiresSuccessorBasis(creation.deepfetch)
+        ? "DeepFetch 未完成；修改并保存当前 Draft 形成新 DraftRevision，再准备 acquisition successor"
         : "DeepFetch 未完成；可沿同一 correlation 重试";
     }
     if (creation.status === "proposal_generating") {
@@ -3010,16 +3260,6 @@ function formatMemory(memoryTotalMib: number): string {
   return `${Number.isInteger(gib) ? gib.toFixed(0) : gib.toFixed(1)} GiB`;
 }
 
-function researchAssetBinding(asset: ResearchAssetItem): Record<string, unknown> {
-  return {
-    asset_ref: asset.asset_ref,
-    version_ref: asset.version_ref,
-    content_hash: asset.content_hash,
-    manifest_hash: asset.manifest_hash,
-    receipt: { ...asset.receipt },
-  };
-}
-
 function questMaterialIntakeContext(
   initializationId: string,
 ): ScopedAssetIntakeContext {
@@ -3072,6 +3312,22 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
     binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
   }
   return btoa(binary);
+}
+
+function materialDirectoryName(directory: string): string {
+  const normalized = directory.trim().replace(/[\\/]+$/, "");
+  const leaf = normalized.split(/[\\/]/).at(-1)?.trim();
+  return leaf || "research-materials";
+}
+
+function researchAssetBinding(asset: ResearchAssetItem): Record<string, unknown> {
+  return {
+    asset_ref: asset.asset_ref,
+    version_ref: asset.version_ref,
+    content_hash: asset.content_hash,
+    manifest_hash: asset.manifest_hash,
+    receipt: { ...asset.receipt },
+  };
 }
 
 function awaitQuestMaterialIntake(
@@ -3216,6 +3472,12 @@ function questMaterialLimitFailure(remaining: number): ProductFailure {
 function materialUploadFailureCopy(code: string): string {
   return {
     asset_content_too_large: "文件超过 64 MiB；未上传",
+    asset_source_locator_absolute_required: "请输入运行服务的机器上的绝对目录",
+    asset_source_unavailable: "目录不存在、不可访问，或不是目录",
+    asset_source_symlink_unsupported: "目录中包含不支持的符号链接",
+    asset_source_entry_unsupported: "目录中包含不支持的文件或路径名称",
+    asset_source_too_large: "目录超过 10,000 项或 64 MiB，未加入",
+    asset_source_changed_during_intake: "读取期间目录发生变化，请重试",
     quest_material_binding_closed: "材料已接纳，但 Quest 已确认，未加入本次依据",
     quest_material_binding_pending: "材料已接纳；自动加入待重试",
   }[code] ?? `材料处理未完成（${code}）；其他步骤不受影响`;
@@ -3245,8 +3507,8 @@ function messageFor(code: string): string {
     literature_snapshot_required: "当前 DeepFetch basis 尚无已接纳 LiteratureSnapshot；请先运行或重试检索。",
     literature_snapshot_stale: "LiteratureSnapshot 与当前 DraftRevision 不一致；旧快照已保留但不会静默套用。",
     web_search_temporarily_unavailable: "真实 Web Search 暂不可用；可沿同一 correlation 重试，不会转成 direct waiver。",
-    deepfetch_web_evidence_invalid: "DeepFetch 未形成可验证的 Web Search / Fetch 证据；这不是成功结果。请在运行环境恢复后沿同一记录重试。",
-    codex_deepfetch_timeout: "DeepFetch 本次 Attempt 超时；当前草案未丢失，可从同一运行检查点重试。",
+    deepfetch_web_evidence_invalid: "DeepFetch 本次 Attempt 缺少可验证的 Web Search / Fetch 证据，已失败且未接纳结果。重试时会先执行短 Web Evidence Gate。",
+    codex_deepfetch_timeout: "DeepFetch 本次 Attempt 超时；当前草案未丢失，可沿同一 correlation 创建新 Attempt 重试。",
     deepfetch_provider_stopped: "DeepFetch Provider 已停止；系统会按原 correlation 恢复，不会接纳晚到结果。",
     deepfetch_run_identity_conflict: "DeepFetch 的 durable Run 身份与当前执行记录冲突。",
     initialization_cancelled: "初始化已取消；DeepFetch 结果不会转成 Proposal 或任何 domain object。",

@@ -3198,6 +3198,115 @@ def test_cycle_cancel_is_recoverable_without_reopening_terminal_run(
         runtime.close()
 
 
+def test_worker_restarts_idea_after_public_cycle_cancel_resume(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(
+        prepare_data_root(tmp_path / "worker-cycle-cancel-resume"),
+        _IdeaProvider(),
+    )
+    try:
+        completed = _confirm_question_with_prefix(
+            runtime,
+            "worker-cycle-cancel-resume",
+        )
+        initial = runtime.owners.advancement_engine.query_foreground(
+            completed["quest_ref"]
+        )
+        assert initial is not None
+
+        assert runtime.idea_stage.process_once()
+        old_request = runtime.owners.advancement_engine.query_idea_stage_request(
+            completed["cycle_ref"]
+        )
+        assert old_request is not None
+        assert old_request.epoch == initial["epoch"]
+        assert runtime.idea_stage.process_once()
+        old_run = runtime.owners.agent_runtime.query_idea_stage_run(
+            old_request.request_ref
+        )
+        assert old_run is not None
+
+        cancel = _confirmed_control(
+            runtime.owners.human_collaboration,
+            scope_ref=f"quest:{completed['quest_ref']}",
+            payload={
+                "action": "cancel",
+                "target": {
+                    "quest_ref": completed["quest_ref"],
+                    "cycle_ref": completed["cycle_ref"],
+                    "question_ref": initial["question_ref"],
+                    "epoch": initial["epoch"],
+                },
+                "reason": "operator_requested",
+            },
+            key="worker-cycle-cancel",
+        )
+        _execute_control(
+            runtime.owners.human_collaboration,
+            cancel,
+            "worker-cycle-cancel",
+        )
+        cancelled = runtime.owners.advancement_engine.query_foreground(
+            completed["quest_ref"]
+        )
+        assert cancelled is not None
+        assert cancelled["status"] == "suspended"
+        assert runtime.owners.agent_runtime.query_managed_run(old_run.run_ref)[
+            "status"
+        ] == "terminated"
+
+        resume = _confirmed_control(
+            runtime.owners.human_collaboration,
+            scope_ref=f"quest:{completed['quest_ref']}",
+            payload={
+                "action": "resume",
+                "target": {
+                    "quest_ref": completed["quest_ref"],
+                    "cycle_ref": completed["cycle_ref"],
+                    "question_ref": cancelled["question_ref"],
+                    "epoch": cancelled["epoch"],
+                },
+                "reason": "operator_requested",
+            },
+            key="worker-cycle-resume",
+        )
+        _execute_control(
+            runtime.owners.human_collaboration,
+            resume,
+            "worker-cycle-resume",
+        )
+        active = runtime.owners.advancement_engine.query_foreground(
+            completed["quest_ref"]
+        )
+        assert active is not None
+        assert active["status"] == "active"
+        assert active["epoch"] == initial["epoch"] + 1
+        assert active["cycle_ref"] == completed["cycle_ref"]
+        assert active["question_ref"] == completed["question_ref"]
+
+        assert runtime.idea_stage.process_once()
+        new_request = runtime.owners.advancement_engine.query_idea_stage_request(
+            completed["cycle_ref"]
+        )
+        assert new_request is not None
+        assert new_request.request_ref != old_request.request_ref
+        assert new_request.epoch == active["epoch"]
+        assert new_request.accepted_question == old_request.accepted_question
+
+        assert runtime.idea_stage.process_once()
+        new_run = runtime.owners.agent_runtime.query_idea_stage_run(
+            new_request.request_ref
+        )
+        assert new_run is not None
+        assert new_run.run_ref != old_run.run_ref
+        assert runtime.owners.agent_runtime.query_managed_run(old_run.run_ref)[
+            "status"
+        ] == "terminated"
+    finally:
+        runtime.close()
+
+
 def test_run_scoped_cancel_rejects_formal_stage_run_without_partial_effect(
     tmp_path: Path,
 ) -> None:

@@ -68,11 +68,12 @@ with zipfile.ZipFile(sys.argv[1]) as wheel:
     assert names == [expected_name]
     payload = wheel.read(expected_name)
 assert hashlib.sha256(payload).hexdigest() == (
-    "088421d9b8a33c1a4f86ec9f955974dcc1bb91cad3b4385cb6bb15cfbb307776"
+    "f340eee121d525ab9e05782ca2eb5e7648a7db2694b2473e473da529ef2eba9b"
 )
 catalog = json.loads(payload)
-assert [model["slug"] for model in catalog["models"]] == ["gpt-5.4"]
+assert [model["slug"] for model in catalog["models"]] == ["gpt-5.6-sol"]
 model = catalog["models"][0]
+assert model["default_reasoning_level"] == "max"
 assert model["shell_type"] == "disabled"
 assert model["apply_patch_tool_type"] is None
 assert model["supports_search_tool"] is False
@@ -547,7 +548,7 @@ def assert_schema_only_drafting_contract():
     assert "--ignore-rules" in args
     assert "--strict-config" in args
     assert args[args.index("--sandbox") + 1] == "danger-full-access"
-    assert args[args.index("--model") + 1] == "gpt-5.4"
+    assert args[args.index("--model") + 1] == "gpt-5.6-sol"
     expected_workspace = (
         pathlib.Path(expected_codex_home).parents[1]
         / "drafting-provider"
@@ -566,6 +567,7 @@ def assert_schema_only_drafting_contract():
     assert set(config_values) == {{
         "mcp_servers={{}}",
         'approval_policy="never"',
+        'model_reasoning_effort="max"',
         'web_search="disabled"',
         'shell_environment_policy.inherit="none"',
         "tools.update_plan.enabled=false",
@@ -575,19 +577,20 @@ def assert_schema_only_drafting_contract():
         "skills.bundled.enabled=false",
         model_catalog_config,
     }}
-    assert len(config_values) == 10
+    assert len(config_values) == 11
     catalog_path = pathlib.Path(
         json.loads(model_catalog_config.removeprefix("model_catalog_json="))
     )
     assert catalog_path.is_absolute()
     catalog_payload = catalog_path.read_bytes()
     assert hashlib.sha256(catalog_payload).hexdigest() == (
-        "088421d9b8a33c1a4f86ec9f955974dcc1bb91cad3b4385cb6bb15cfbb307776"
+        "f340eee121d525ab9e05782ca2eb5e7648a7db2694b2473e473da529ef2eba9b"
     )
     catalog = json.loads(catalog_payload)
     assert len(catalog["models"]) == 1
     model = catalog["models"][0]
-    assert model["slug"] == "gpt-5.4"
+    assert model["slug"] == "gpt-5.6-sol"
+    assert model["default_reasoning_level"] == "max"
     assert model["shell_type"] == "disabled"
     assert model["apply_patch_tool_type"] is None
     assert model["include_skills_usage_instructions"] is False
@@ -694,9 +697,10 @@ elif properties == {{"outcome"}}:
         if value == "--config"
     }}
     assert 'approval_policy="never"' in config_values
+    assert 'model_reasoning_effort="max"' in config_values
     assert 'web_search="live"' in config_values
     assert args[args.index("--sandbox") + 1] == "danger-full-access"
-    assert args[args.index("--model") + 1] == "gpt-5.4"
+    assert args[args.index("--model") + 1] == "gpt-5.6-sol"
     enabled = {{
         args[index + 1]
         for index, value in enumerate(args[:-1])
@@ -781,6 +785,7 @@ elif properties == {{
         if value == "--config"
     }}
     assert 'approval_policy="never"' in config_values
+    assert 'model_reasoning_effort="max"' in config_values
     assert 'web_search="live"' in config_values
     assert args[args.index("--sandbox") + 1] == "danger-full-access"
     enabled = {{

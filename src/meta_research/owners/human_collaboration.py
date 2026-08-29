@@ -4580,6 +4580,14 @@ class SQLiteHumanCollaboration:
         ).first()
         if existing is not None:
             if existing.status == "failed":
+                failed_run = self._agent_runtime.query_deepfetch_run(
+                    str(existing.request_ref)
+                )
+                if (
+                    failed_run is not None
+                    and not failed_run.provider_operation_retry_permitted
+                ):
+                    raise OwnerConflict("deepfetch_successor_required")
                 connection.execute(
                     text(
                         "UPDATE hc_deepfetch_requests SET status = 'queued', "
@@ -8139,17 +8147,18 @@ class SQLiteHumanCollaboration:
 
     def query_current_quest_creation(self) -> dict[str, object] | None:
         with self._database.read() as connection:
-            initialization_id = connection.execute(
+            row = connection.execute(
                 text(
-                    "SELECT initialization_id FROM hc_quest_initializations "
+                    "SELECT initialization_id, status FROM "
+                    "hc_quest_initializations "
                     "WHERE status != 'cancelled' ORDER BY CASE WHEN status IN "
                     "('draft', 'proposal_ready', 'confirmed') THEN 0 ELSE 1 END, "
                     "created_at DESC LIMIT 1"
                 )
-            ).scalar_one_or_none()
-        if initialization_id is None:
+            ).first()
+        if row is None or row.status in {"completed", "cancelled"}:
             return None
-        view = self.query_quest_creation(str(initialization_id))
+        view = self.query_quest_creation(str(row.initialization_id))
         return (
             view
             if view["status"] not in {"completed", "cancelled", "unavailable"}
@@ -10668,6 +10677,9 @@ def _public_deepfetch(
         "status": status,
         "activity": activity,
         "progress": {"completed": completed, "total": 5},
+        "recent_events": (
+            [] if run is None else list(run.recent_activity_events)
+        ),
         "freshness": "current" if basis_current else "stale",
         "authorization_receipt": AcceptanceReceipt(
             issuer=HC_OWNER,

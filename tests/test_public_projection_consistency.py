@@ -259,6 +259,59 @@ class _HumanCollaboration(_StaticOwner):
         }
 
 
+class _StageProjection:
+    def __init__(self, projection: dict[str, object]) -> None:
+        self.projection = projection
+        self.queries = 0
+
+    def query_current(self) -> dict[str, object]:
+        self.queries += 1
+        return self.projection
+
+
+class _IdeaStageProjection(_StageProjection):
+    def query_current_question(self) -> None:
+        return None
+
+
+def test_idea_foreground_does_not_query_ineligible_downstream_stages(
+    tmp_path: Path,
+) -> None:
+    idea = _IdeaStageProjection({"eligibility": {"status": "requested"}})
+    plan = _StageProjection({"eligibility": {"status": "not_eligible"}})
+    bundle = _StageProjection({"eligibility": {"status": "not_eligible"}})
+    reasoning = _StageProjection({"eligibility": {"status": "not_eligible"}})
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_projection"
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=_StaticResearchGraph(
+            "research_graph", {"quest_count": 1, "question_count": 1}
+        ),  # type: ignore[arg-type]
+        advancement_engine=_QuestionForegroundOwner(
+            "advancement_engine", {"foreground_cycle_count": 1}
+        ),  # type: ignore[arg-type]
+        research_memory=_StaticResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+        idea_stage=idea,  # type: ignore[arg-type]
+        plan_stage=plan,  # type: ignore[arg-type]
+        bundle_stage=bundle,  # type: ignore[arg-type]
+        reasoning_stage=reasoning,  # type: ignore[arg-type]
+    )
+
+    snapshot = projection.query_snapshot()
+
+    assert snapshot["idea_stage"] == idea.projection
+    assert "plan_stage" not in snapshot
+    assert "bundle_stage" not in snapshot
+    assert "reasoning_stage" not in snapshot
+    assert (plan.queries, bundle.queries, reasoning.queries) == (0, 0, 0)
+
+
 def test_snapshot_retries_when_feed_advances_during_owner_reads(
     tmp_path: Path,
 ) -> None:

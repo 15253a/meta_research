@@ -10,7 +10,15 @@ Own topic interpretation, multidimensional discovery, OpenAlex and Web Search ca
 
 DeepFetch accepts an injected Quest-level Acquisition session when the host has one. A standalone run creates one download-only session for that run. The session reads `providers/nature-downloader/SKILL.md` completely and follows it as the retrieval authority.
 
-Before the active-search clock starts:
+When the host injects that session, the main agent must not execute Nature Downloader or its
+download scripts directly. It requests each finite batch through the host's `action=acquire`
+envelope and may register or assign a Reader only for the same `paper_id` returned as `obtained` by
+that hosted request. A first-turn `finalize` may contain discovery-only placeholders, but it cannot
+claim a full text or Reader without this hosted proof.
+
+Before the active-search clock starts, first inspect the injected Acquisition session mode. When
+it is already `oa_only`, treat that as the user's selected primary route, skip institutional/browser
+probing, and do not ask the user to select OA again or narrate OA as a forced fallback. Otherwise:
 
 1. run Nature Downloader configuration and connectivity health checks;
 2. verify that browser control reaches the configured institutional resource in the user's authenticated browser context, rather than merely reaching a login page;
@@ -40,8 +48,11 @@ Send a finite batch:
 
 Set `route_policy` on every turn, including turns sent to a persistent Quest-level Acquisition
 session. Do not rely on that session remembering the desired route from an earlier batch. Under
-this policy, attempt lawful open access for every English paper first and send only unresolved
-items to publisher-API or institutional fallback. Chinese papers remain CNKI-only.
+this policy, attempt lawful open access for every English paper first. The injected session mode is
+the authoritative route ceiling: when it is `oa_only`, stop after the OA pass and return
+`oa_not_found` for an exhausted item; the `route_policy` name does not authorize publisher-API or
+institutional fallback. Otherwise, send only unresolved items to publisher-API or institutional
+fallback. Chinese papers remain CNKI-only.
 Pass every arXiv identifier and source URL already present in Radar metadata. They are retrieval
 hints, not trusted full-text evidence; Acquisition verifies identity, access, and content.
 

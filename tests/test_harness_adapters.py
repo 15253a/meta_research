@@ -19,6 +19,7 @@ from meta_research.harness import HarnessAdmissionError, HarnessProbeRequest
 from meta_research.harness_adapters import (
     ClaudeHarnessAdapter,
     CodexHarnessAdapter,
+    HARNESS_PROVIDER_STREAM_MAX_BYTES,
     HarnessAdapterUnavailable,
     HarnessInvocation,
     HarnessSupervisorTransport,
@@ -58,6 +59,53 @@ class _RecordedRunner:
             "\n".join(json.dumps(item) for item in self.stream) + "\n",
             "",
         )
+
+
+def test_harness_probe_accepts_prompt_above_legacy_256k_limit(
+    tmp_path: Path,
+) -> None:
+    runner = _RecordedRunner(
+        "codex",
+        (
+            {"type": "thread.started", "thread_id": "large-prompt-root"},
+            {"type": "turn.completed"},
+        ),
+    )
+    data_root = prepare_data_root(tmp_path / "large-harness-prompt")
+    runtime = build_production_runtime(
+        data_root,
+        harness_adapters=(
+            CodexHarnessAdapter(data_root.run / "harness", runner=runner),
+            ClaudeHarnessAdapter(
+                data_root.run / "harness",
+                runner=_RecordedRunner("claude", ()),
+            ),
+        ),
+    )
+    try:
+        admission = runtime.harnesses.admit_probe(
+            HarnessProbeRequest(
+                request_ref="large-harness-prompt",
+                harness_family="codex",
+                model_ref="gpt-test",
+                auth_profile_ref="harness-profile:codex-default",
+                required_operation_ids=("research_graph.snapshot.read",),
+                required_capabilities=("native_session", "stream"),
+            ),
+            idempotency_key="large-harness-prompt",
+        )
+        prompt = "p" * (256_000 + 1)
+        completed = runtime.harnesses.execute_probe(
+            admission.run.request_ref,
+            prompt=prompt,
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+
+        assert completed.status == "executed"
+        assert runner.calls[-1][1] == prompt
+        assert len(prompt.encode("utf-8")) < HARNESS_PROVIDER_STREAM_MAX_BYTES
+    finally:
+        runtime.close()
 
 
 class _ConfirmedPowerInhibitor:
@@ -704,6 +752,12 @@ def test_codex_adapter_derives_native_identity_and_capabilities_from_jsonl(
     _assert_profile_is_event_derived(result.profile)
     argv, _prompt, environment = runner.calls[-1]
     assert argv[:2] == ["codex", "exec"]
+    config_values = [
+        argv[index + 1]
+        for index, value in enumerate(argv)
+        if value == "--config"
+    ]
+    assert 'model_reasoning_effort="max"' in config_values
     assert "opaque-channel-token" not in " ".join(argv)
     assert environment["META_RESEARCH_MCP_TOKEN"] == "opaque-channel-token"
 

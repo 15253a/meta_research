@@ -4,9 +4,11 @@ import asyncio
 import base64
 import binascii
 import hmac
+import ipaddress
 import json
 import logging
 import math
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -22,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sqlalchemy.exc import SQLAlchemyError
 
 from meta_research.auth import AuthSession
+from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.composition import ProductionRuntime
 from meta_research.experiment import ExperimentIntent
 from meta_research.harness import (
@@ -64,7 +67,6 @@ PLAN_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 REASONING_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS = 30.0
-DEEPFETCH_WORKER_WATCHDOG_SECONDS = 1810.0
 EXPERIMENT_WORKER_WATCHDOG_SECONDS = 30.0
 WRITING_WORKER_WATCHDOG_SECONDS = 910.0
 HARNESS_CONFORMANCE_WORKER_WATCHDOG_SECONDS = 310.0
@@ -155,7 +157,7 @@ class BootstrapExchange(BaseModel):
 class StartHarnessConformanceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    codex_model_ref: str = Field(min_length=1, max_length=160)
+    codex_model_ref: Literal["gpt-5.6-sol"] = CODEX_MODEL_REF
     codex_auth_profile_ref: str = Field(min_length=1, max_length=160)
     claude_model_ref: str = Field(min_length=1, max_length=160)
     claude_auth_profile_ref: str = Field(min_length=1, max_length=160)
@@ -890,6 +892,17 @@ def create_app(
     )
     web_root = Path(str(files("meta_research") / "web_dist")).resolve()
     expected_host = urlsplit(base_url).netloc
+    base_url_host = urlsplit(base_url).hostname
+    try:
+        base_url_is_loopback = bool(
+            base_url_host and ipaddress.ip_address(base_url_host).is_loopback
+        )
+    except ValueError:
+        base_url_is_loopback = False
+    trust_ssh_loopback = (
+        os.environ.get("META_RESEARCH_TRUST_SSH_LOOPBACK") == "1"
+        and base_url_is_loopback
+    )
 
     def worker_check(
         name: str,
@@ -1000,6 +1013,8 @@ def create_app(
         }
         internal_route = path.startswith("/internal/")
         mcp_route = path == "/mcp"
+        issued_session: AuthSession | None = None
+        session_was_valid = False
 
         if mcp_route:
             content_type = (
@@ -1026,10 +1041,17 @@ def create_app(
                 return _error(401, "control_authentication_required")
         elif not public_auth_route and not mcp_route:
             session_token = request.cookies.get(SESSION_COOKIE)
-            if not await asyncio.to_thread(
+            session_was_valid = await asyncio.to_thread(
                 runtime.authentication.session_is_valid, session_token
-            ):
-                return _error(401, "authentication_required")
+            )
+            if not session_was_valid:
+                if not trust_ssh_loopback:
+                    return _error(401, "authentication_required")
+                if path != "/auth/logout":
+                    issued_session = await asyncio.to_thread(
+                        runtime.authentication.issue_session
+                    )
+                    session_token = issued_session.token
             request.state.session_token = session_token
 
         json_auth_route = request.method == "POST" and path in {
@@ -1053,7 +1075,16 @@ def create_app(
                 return _error(415, "json_required")
             if request.headers.get("origin") != base_url:
                 return _error(403, "origin_invalid")
-        if unsafe_api_route or path == "/auth/logout":
+        csrf_protected_route = unsafe_api_route or path == "/auth/logout"
+        trusted_session_was_issued = trust_ssh_loopback and issued_session is not None
+        trusted_logout_without_session = (
+            trust_ssh_loopback
+            and path == "/auth/logout"
+            and not session_was_valid
+        )
+        if csrf_protected_route and not (
+            trusted_session_was_issued or trusted_logout_without_session
+        ):
             csrf_header = request.headers.get("x-csrf-token")
             csrf_cookie = request.cookies.get(CSRF_COOKIE)
             if (
@@ -1105,6 +1136,8 @@ def create_app(
             response.headers["Referrer-Policy"] = "no-referrer"
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
+            if issued_session is not None:
+                _set_session_cookie(response, issued_session)
             return response
 
         if not is_asset_intake:
@@ -1410,8 +1443,11 @@ def create_app(
     def logout(request: Request) -> JSONResponse:
         csrf_token = request.headers.get("x-csrf-token", "")
         session_token = request.state.session_token
-        if not runtime.authentication.revoke_session(session_token, csrf_token):
-            raise HTTPException(status_code=403, detail={"code": "csrf_invalid"})
+        if session_token is not None and not runtime.authentication.revoke_session(
+            session_token, csrf_token
+        ):
+            if not trust_ssh_loopback:
+                raise HTTPException(status_code=403, detail={"code": "csrf_invalid"})
         response = JSONResponse({"status": "logged_out"})
         response.delete_cookie(SESSION_COOKIE, path="/", samesite="strict")
         response.delete_cookie(CSRF_COOKIE, path="/", samesite="strict")
@@ -2904,13 +2940,7 @@ async def _process_first_question_deepfetch(
 
     while True:
         try:
-            advanced = await _await_monitored_worker_call(
-                runtime.deepfetch.process_once,
-                health=health,
-                timeout_code="deepfetch_operation_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=DEEPFETCH_WORKER_WATCHDOG_SECONDS,
-            )
+            advanced = await _daemon_thread_call(runtime.deepfetch.process_once)
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("first-question DeepFetch attempt failed unexpectedly")

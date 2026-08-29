@@ -292,6 +292,8 @@ export type DeepFetchRun = {
   status: "admitted" | "running" | "executed" | "failed" | "cancelled";
   attempt_ref: string | null;
   attempt_generation: number;
+  attempt_started_at: number | null;
+  attempt_completed_at: number | null;
   provider_operation_retry_permitted: boolean;
   root_session_ref: string;
   native_session_ref: string | null;
@@ -299,6 +301,13 @@ export type DeepFetchRun = {
   runtime_binding_hash: string;
   execution_receipt: Extract<ReceiptState, { status: "accepted" }> | null;
   failure: null | { code: string };
+};
+
+export type DeepFetchActivityEvent = {
+  sequence: number;
+  category: "session" | "web_search" | "web_fetch" | "analysis";
+  status: "running" | "completed" | "failed";
+  label: string;
 };
 
 export type AcquisitionSessionProjection = {
@@ -361,6 +370,7 @@ export type DeepFetchProjection = {
     | "needs_retry"
     | "cancelled";
   progress: { completed: number; total: number };
+  recent_events: DeepFetchActivityEvent[];
   freshness: "current" | "stale";
   authorization_receipt: Extract<ReceiptState, { status: "accepted" }>;
   run: DeepFetchRun | null;

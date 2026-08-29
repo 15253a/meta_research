@@ -1561,7 +1561,7 @@ async def serve(
     if stage_pipeline == "bundle-exhaustion":
         runtime.harnesses.start_full_conformance(
             FullConformanceRequest(
-                codex_model_ref="gpt-conformance",
+                codex_model_ref="gpt-5.6-sol",
                 codex_auth_profile_ref="harness-profile:codex-default",
                 claude_model_ref="claude-conformance",
                 claude_auth_profile_ref="harness-profile:claude-default",

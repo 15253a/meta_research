@@ -925,6 +925,55 @@ def test_unexpected_worker_failure_retries_and_is_publicly_unavailable(
         runtime.close()
 
 
+def test_long_running_deepfetch_has_no_web_operation_watchdog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    released = threading.Event()
+    calls = 0
+
+    def process_once() -> bool:
+        nonlocal calls
+        calls += 1
+        started.set()
+        released.wait(timeout=2)
+        return False
+
+    provider = SimpleNamespace()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "deepfetch-without-web-watchdog"),
+        proposal_drafter=provider,
+        intent_drafting_provider=provider,
+    )
+    monkeypatch.setattr(runtime.deepfetch, "process_once", process_once)
+    monkeypatch.setattr(
+        "meta_research.web.DEEPFETCH_WORKER_WATCHDOG_SECONDS",
+        0.03,
+        raising=False,
+    )
+    base_url = "http://127.0.0.1:8766"
+    app = create_app(runtime, base_url=base_url, control_key="test-control-key")
+    try:
+        with TestClient(app, base_url=base_url) as client:
+            assert started.wait(timeout=0.5)
+            time.sleep(0.08)
+
+            readiness = client.get(
+                "/internal/readiness",
+                headers={"X-Meta-Research-Control": "test-control-key"},
+            )
+            assert readiness.status_code == 200
+            assert readiness.json()["deepfetch"] == {
+                "status": "ready",
+                "last_error": None,
+            }
+            assert calls == 1
+            released.set()
+    finally:
+        released.set()
+        runtime.close()
+
+
 def test_connected_sse_observes_worker_failure_and_recovery() -> None:
     failure_gate = threading.Event()
     attempts = 0

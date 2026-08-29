@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 _MAX_SNAPSHOT_ATTEMPTS = 3
 _COLLABORATION_SCOPE_PAGE_SIZE = 101
+_STAGE_ORDER = {"idea": 0, "plan": 1, "bundle": 2, "reasoning": 3}
 
 
 class SnapshotConsistencyUnavailable(RuntimeError):
@@ -467,20 +468,32 @@ class PublicProjection:
                 self._research_graph,
                 control_quest_ref,
             )
+            current_foreground = (
+                foregrounds_by_quest.get(control_quest_ref)
+                if control_quest_ref is not None
+                else None
+            )
             idea_stage = (
                 None if self._idea_stage is None else self._idea_stage.query_current()
             )
             plan_stage = (
-                None if self._plan_stage is None else self._plan_stage.query_current()
+                None
+                if self._plan_stage is None
+                or not _stage_projection_query_allowed(current_foreground, "plan")
+                else self._plan_stage.query_current()
             )
             bundle_stage = (
                 None
                 if self._bundle_stage is None
+                or not _stage_projection_query_allowed(current_foreground, "bundle")
                 else self._bundle_stage.query_current()
             )
             reasoning_stage = (
                 None
                 if self._reasoning_stage is None
+                or not _stage_projection_query_allowed(
+                    current_foreground, "reasoning"
+                )
                 else self._reasoning_stage.query_current()
             )
             autonomous_creation = (
@@ -882,6 +895,20 @@ def _query_current_quest_goal(
         "projection_digest": canonical_hash(binding),
         "reason": None,
     }
+
+
+def _stage_projection_query_allowed(
+    foreground: dict[str, object] | None,
+    stage: str,
+) -> bool:
+    """Avoid querying stages that the exact foreground cannot have reached."""
+
+    if not isinstance(foreground, dict):
+        return True
+    foreground_stage = foreground.get("stage")
+    if foreground_stage not in _STAGE_ORDER:
+        return True
+    return _STAGE_ORDER[stage] <= _STAGE_ORDER[foreground_stage]
 
 
 def _query_question_cycle_binding(

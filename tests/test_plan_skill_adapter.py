@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from importlib.resources import files
 import json
@@ -8,6 +9,7 @@ import subprocess
 
 import pytest
 
+from meta_research.idea_skill import _compile_codex_output_schema
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash
 from meta_research.plan_contract import material_plan_hash
@@ -16,6 +18,10 @@ from meta_research.plan_skill import (
     PlanSkillContractError,
     PlanSkillRequest,
     PlanSkillResult,
+    PlanSkillUnavailable,
+    _plan_envelope_schema,
+    _review_finalization_schema,
+    _validate_request,
     validate_plan_skill_result,
 )
 
@@ -310,9 +316,48 @@ def test_validator_accepts_exact_plan_and_owner_feedback_requires_material_chang
     )
 
 
+def test_large_legal_idea_set_keeps_actual_provider_schemas_within_budget() -> None:
+    idea_set = deepcopy(_IDEA_SET)
+    template = deepcopy(_IDEA_SET["candidates"][0])
+    idea_set["candidates"] = [
+        {
+            **deepcopy(template),
+            "candidate_key": f"candidate-{index:03d}",
+            "direction": f"比较机制候选 {index:03d}。",
+        }
+        for index in range(200)
+    ]
+    idea_binding = {
+        **deepcopy(_IDEA_BINDING),
+        "outcome_hash": canonical_hash(idea_set),
+        "idea_set": idea_set,
+    }
+    context_pack = {
+        **_context_pack(),
+        "accepted_idea_set_binding": idea_binding,
+    }
+    request = _request(
+        accepted_idea_set=idea_set,
+        context_pack=context_pack,
+        context_pack_hash=canonical_hash(context_pack),
+    )
+
+    _validate_request(request)
+    _compile_codex_output_schema(_plan_envelope_schema(request))
+    _compile_codex_output_schema(_review_finalization_schema(request))
+
+
 class _SequenceRunner:
-    def __init__(self, outputs: list[dict[str, object]]) -> None:
+    def __init__(
+        self,
+        outputs: list[dict[str, object]],
+        *,
+        emit_review_trace: bool = True,
+        emit_primary_review_trace: bool = False,
+    ) -> None:
         self._outputs = iter(outputs)
+        self._emit_review_trace = emit_review_trace
+        self._emit_primary_review_trace = emit_primary_review_trace
         self.calls: list[tuple[list[str], str, dict[str, object]]] = []
 
     def __call__(
@@ -329,7 +374,25 @@ class _SequenceRunner:
         events: list[dict[str, object]] = [
             {"type": "thread.started", "thread_id": thread_id}
         ]
-        if "reviewer_agent_ref" in schema.get("properties", {}):
+        properties = schema.get("properties", {})
+        if self._emit_primary_review_trace and "plan" in properties:
+            reviewer = "codex-plan-primary-reviewer:1"
+            for tool, status in (("spawn_agent", "pending_init"), ("wait", "completed")):
+                events.append(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": f"collab-primary-{tool}:1",
+                            "type": "collab_tool_call",
+                            "tool": tool,
+                            "sender_thread_id": thread_id,
+                            "receiver_thread_ids": [reviewer],
+                            "agents_states": {reviewer: {"status": status}},
+                            "status": "completed",
+                        },
+                    }
+                )
+        if self._emit_review_trace and "reviewer_agent_ref" in properties:
             reviewer = output["reviewer_agent_ref"]
             for tool, status in (("spawn_agent", "pending_init"), ("wait", "completed")):
                 events.append(
@@ -352,6 +415,12 @@ class _SequenceRunner:
             stdout="\n".join(json.dumps(event) for event in events),
             stderr="",
         )
+
+    def run_job(
+        self, job_ref: str, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        del job_ref
+        return self(argv, prompt, timeout)
 
 
 def _fake_codex(path: Path) -> Path:
@@ -378,29 +447,226 @@ def test_production_adapter_uses_one_native_root_and_a_fresh_child_reviewer(
     adapter = CodexPlanSkillAdapter(
         tmp_path / "provider",
         executable=str(_fake_codex(tmp_path / "codex")),
-        model_ref="test-model",
         process_runner=runner,
     )
-    request = _request(runtime_binding=adapter.runtime_binding())
+    binding = adapter.runtime_binding()
+    request = _request(runtime_binding=binding)
 
     result = adapter.execute(request)
     validate_plan_skill_result(request, result)
 
     assert result.primary_session_ref == "codex-plan-primary:1"
     assert result.reviewer_agent_ref == "codex-plan-reviewer:1"
+    assert binding.model_ref == "gpt-5.6-sol"
+    assert (
+        "codex-config:model_reasoning_effort=max"
+        in binding.resource_bindings
+    )
+    assert any(
+        item.startswith(
+            "adapter-source:meta_research.idea_skill@sha256:"
+        )
+        for item in binding.resource_bindings
+    )
     assert len(runner.calls) == 2
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
     review_argv, review_prompt, review_schema = runner.calls[1]
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert "--json" in primary_argv
+    assert 'model_reasoning_effort="max"' in primary_argv
     assert "AcceptedQuestionBinding" in primary_prompt
     assert "完整 IdeaSet" in primary_prompt
     assert "EvidenceRef" in primary_prompt
+    assert "本回合仅执行 Primary draft phase" in primary_prompt
+    assert "禁止调用 spawn_agent 或 wait" in primary_prompt
+    assert "下一次 resumed review turn" in primary_prompt
     assert primary_schema["properties"]["plan"]["properties"]["answer_contract"]
     assert review_argv[-3:] == ["resume", "codex-plan-primary:1", "-"]
     assert 'fork_turns="none"' in review_prompt
+    assert "当前 frozen reviewed_draft" in review_prompt
+    assert "不得复用 Primary phase" in review_prompt
     assert "ExperimentBrief" in review_prompt
     assert "final_plan" in review_schema["properties"]
+
+
+def test_production_adapter_derives_answer_contract_hash_after_each_turn(
+    tmp_path: Path,
+) -> None:
+    primary = _plan()
+    primary_answer = primary["answer_contract"]
+    assert isinstance(primary_answer, dict)
+    primary_answer.pop("answer_contract_hash")
+
+    final = deepcopy(primary)
+    final_answer = final["answer_contract"]
+    assert isinstance(final_answer, dict)
+    final_answer["answer_contract_hash"] = "0" * 64
+
+    runner = _SequenceRunner(
+        [
+            {"plan": primary},
+            {
+                "reviewer_agent_ref": "codex-plan-reviewer:derived-hash",
+                "findings": [],
+                "final_plan": final,
+                "dispositions": [],
+            },
+        ]
+    )
+    adapter = CodexPlanSkillAdapter(
+        tmp_path / "provider-derived-hash",
+        executable=str(_fake_codex(tmp_path / "codex-derived-hash")),
+        process_runner=runner,
+    )
+    request = _request(runtime_binding=adapter.runtime_binding())
+
+    result = adapter.execute(request)
+
+    validate_plan_skill_result(request, result)
+    for plan in (result.reviewed_draft, result.final_plan):
+        answer_contract = plan["answer_contract"]
+        assert isinstance(answer_contract, dict)
+        derived_hash = answer_contract["answer_contract_hash"]
+        contract_without_hash = {
+            key: value
+            for key, value in answer_contract.items()
+            if key != "answer_contract_hash"
+        }
+        assert derived_hash == canonical_hash(contract_without_hash)
+
+    for _argv, _prompt, schema in runner.calls:
+        plan_schema = schema["properties"].get(
+            "plan", schema["properties"].get("final_plan")
+        )
+        assert isinstance(plan_schema, dict)
+        answer_schema = plan_schema["properties"]["answer_contract"]
+        assert "answer_contract_hash" not in answer_schema["properties"]
+        assert "answer_contract_hash" not in answer_schema["required"]
+
+
+def test_production_adapter_accepts_root_review_without_child_trace(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    runner = _SequenceRunner(
+        [
+            {"plan": plan},
+            {
+                "reviewer_agent_ref": "plan-root-review:1",
+                "findings": [],
+                "final_plan": plan,
+                "dispositions": [],
+            },
+        ],
+        emit_review_trace=False,
+    )
+    adapter = CodexPlanSkillAdapter(
+        tmp_path / "provider-root-review",
+        executable=str(_fake_codex(tmp_path / "codex-root-review")),
+        process_runner=runner,
+    )
+    request = _request(runtime_binding=adapter.runtime_binding())
+
+    result = adapter.execute(request)
+
+    validate_plan_skill_result(request, result)
+    assert len(runner.calls) == 2
+
+
+def test_durable_plan_review_shape_failure_is_terminal_and_not_replayed(
+    tmp_path: Path,
+) -> None:
+    draft = _plan()
+    workspace = tmp_path / "durable-plan-shape"
+    runner = _SequenceRunner(
+        [
+            {"plan": draft},
+            {
+                "reviewer_agent_ref": "codex-plan-reviewer:shape",
+                "findings": "invalid",
+                "final_plan": draft,
+                "dispositions": [],
+            },
+        ]
+    )
+    adapter = CodexPlanSkillAdapter(
+        workspace,
+        executable=str(_fake_codex(tmp_path / "codex-plan-shape")),
+        model_ref="test-model",
+        process_runner=runner,
+    )
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        job_ref="plan-shape-job",
+    )
+
+    with pytest.raises(
+        PlanSkillUnavailable, match="plan_review_result_contract_invalid"
+    ) as caught:
+        adapter.execute(request)
+    assert caught.value.recovery_checkpoint is not None
+    assert caught.value.recovery_checkpoint["contract_failure_code"] == (
+        "plan_review_result_contract_invalid"
+    )
+    assert caught.value.recovery_checkpoint["contract_failure_detail_code"] == (
+        "codex_review_invalid"
+    )
+    assert len(runner.calls) == 2
+
+    no_replay = _SequenceRunner([])
+    restarted = CodexPlanSkillAdapter(
+        workspace,
+        executable=str(tmp_path / "codex-plan-shape"),
+        model_ref="test-model",
+        process_runner=no_replay,
+    )
+    with pytest.raises(
+        PlanSkillUnavailable, match="plan_review_result_contract_invalid"
+    ):
+        restarted.execute(
+            replace(request, runtime_binding=restarted.runtime_binding())
+        )
+    assert no_replay.calls == []
+
+
+def test_durable_plan_primary_rejects_early_review_without_replay(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "durable-plan-primary-phase"
+    runner = _SequenceRunner(
+        [{"plan": _plan()}],
+        emit_primary_review_trace=True,
+    )
+    adapter = CodexPlanSkillAdapter(
+        workspace,
+        executable=str(_fake_codex(tmp_path / "codex-plan-primary-phase")),
+        process_runner=runner,
+    )
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        job_ref="plan-primary-phase-job",
+    )
+
+    with pytest.raises(
+        PlanSkillUnavailable, match="codex_primary_review_phase_invalid"
+    ) as caught:
+        adapter.generate_draft(request)
+    assert caught.value.recovery_checkpoint is not None
+    assert len(runner.calls) == 1
+
+    no_replay = _SequenceRunner([])
+    restarted = CodexPlanSkillAdapter(
+        workspace,
+        executable=str(tmp_path / "codex-plan-primary-phase"),
+        process_runner=no_replay,
+    )
+    with pytest.raises(
+        PlanSkillUnavailable, match="codex_primary_review_phase_invalid"
+    ):
+        restarted.generate_draft(
+            replace(request, runtime_binding=restarted.runtime_binding())
+        )
+    assert no_replay.calls == []
 
 
 def test_owner_feedback_is_present_in_the_successor_prompt(tmp_path: Path) -> None:

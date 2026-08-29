@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import os
 import sys
 import threading
@@ -17,6 +19,12 @@ from meta_research.experiment_contract import (
     AcceptedExperimentInputBinding,
     ExperimentIdentitySet,
     ExperimentProviderRequest,
+)
+from meta_research.experiment_provider_supervisor import (
+    OBSERVATION_MAX_COUNT,
+    STDOUT_MAX_RECORDS,
+    _ObservationLedger,
+    _bounded_drain,
 )
 from meta_research.owners.common import (
     AcceptanceReceipt,
@@ -351,6 +359,10 @@ def _write_runner(
         "elif mode == 'many_lines':\n"
         "    for index in range(300):\n"
         "        print(f'line-{index:03d}', flush=True)\n"
+        "    print('META_RESEARCH_RESULT\\t' + result, flush=True)\n"
+        "elif mode == 'structural_capacity':\n"
+        "    print('y' * (40 * 1024), flush=True)\n"
+        "    print('x' * 8000, flush=True)\n"
         "    print('META_RESEARCH_RESULT\\t' + result, flush=True)\n"
         "elif mode in {'active_stop', 'streaming'}:\n"
         "    if event_time_path is not None:\n"
@@ -1199,10 +1211,10 @@ def test_runtime_bundle_is_rm_owned_and_covers_provider_orchestration_and_parser
             assert member_hash.encode("ascii") in materialized.content
         resources = set(provider.runtime_binding().resource_bindings)
         assert "limit:wall-time-seconds:300" in resources
-        assert "limit:stdout-bytes:1048576" in resources
-        assert "limit:result-bytes:1048576" in resources
-        assert "limit:stdout-records:4096" in resources
-        assert "limit:observation-count:8192" in resources
+        assert "limit:stdout-bytes:16777216" in resources
+        assert "limit:result-bytes:16777216" in resources
+        assert "limit:stdout-records:65536" in resources
+        assert "limit:observation-count:524288" in resources
         assert "limit:observation-record-bytes:32768" in resources
         assert "telemetry:cadence-seconds:0.25" in resources
         assert all("nvidia" not in resource for resource in resources)
@@ -1254,6 +1266,122 @@ def test_public_tail_is_bounded_but_log_asset_contains_all_durable_stdout(
         }
     finally:
         runtime.close()
+
+
+def test_structural_stdout_limits_do_not_preempt_the_byte_budget(
+    tmp_path: Path,
+) -> None:
+    runner = _write_runner(
+        tmp_path / "structural-capacity-runner",
+        mode="structural_capacity",
+    )
+    provider = BuiltinMicroExperimentProvider(
+        tmp_path / "structural-capacity-provider",
+        runner_path=runner,
+        wall_timeout_seconds=10.0,
+    )
+    runtime = _runtime(tmp_path / "structural-capacity-data", provider)
+    try:
+        quest = _confirm_quest(runtime)
+        admitted = runtime.experiment.start(
+            _intent(quest["quest_ref"], "structural-capacity"),
+            "provider-start-structural-capacity",
+        )
+        attempt_ref = admitted["identities"]["evaluation_attempt_ref"]
+        deadline = time.monotonic() + 15.0
+        while True:
+            runtime.experiment.process_once()
+            completed = runtime.experiment.query(attempt_ref)
+            if completed["formal_measurement"]["status"] == "accepted":
+                break
+            assert time.monotonic() < deadline, (
+                completed["execution"],
+                completed["assets"],
+                completed["formal_measurement"],
+            )
+            time.sleep(0.02)
+
+        assert completed["execution"]["status"] == "executed"
+        log_role = completed["assets"]["log_assets"][0]
+        log = runtime.owners.research_memory.materialize_asset(
+            log_role["version_ref"]
+        )
+        document = json.loads(log.content.decode("utf-8"))
+        assert len(document["stdout"]) == 1
+        assert document["stdout"][0]["line"] == "x" * 8000
+        stdout_path = next(
+            (provider.workspace / "provider-operations").glob("*/stdout.bin")
+        )
+        raw_stdout = stdout_path.read_bytes()
+        assert b"y" * (40 * 1024) in raw_stdout
+        assert b"x" * 8000 in raw_stdout
+        assert b"META_RESEARCH_RESULT\t" in raw_stdout
+    finally:
+        runtime.close()
+
+
+def test_short_stdout_records_do_not_hit_legacy_structure_counts() -> None:
+    class InMemoryLedger:
+        def __init__(self) -> None:
+            self.exceeded = threading.Event()
+            self.count = 0
+
+        def append(self, _kind: str, _payload: object, _observed_at: float) -> None:
+            if self.count >= OBSERVATION_MAX_COUNT:
+                self.exceeded.set()
+                return
+            self.count += 1
+
+    payload = (b"line\n" * 9000)
+    assert len(payload) < 16 * 1024 * 1024
+    exceeded = threading.Event()
+    errors: list[BaseException] = []
+    ledger = InMemoryLedger()
+
+    _bounded_drain(
+        io.BytesIO(payload),
+        io.BytesIO(),
+        32 * 1024 * 1024 + 1024,
+        16 * 1024 * 1024,
+        STDOUT_MAX_RECORDS,
+        16 * 1024 * 1024,
+        exceeded,
+        errors,
+        ledger,  # type: ignore[arg-type]
+    )
+
+    assert not exceeded.is_set()
+    assert not ledger.exceeded.is_set()
+    assert errors == []
+    assert ledger.count == 9000
+
+
+def test_observation_record_guard_skips_only_oversized_stdout() -> None:
+    stream = io.BytesIO()
+    ledger = _ObservationLedger(
+        stream,
+        key=b"k" * 32,
+        invocation_hash="a" * 64,
+        maximum_count=8,
+    )
+
+    ledger.append(
+        "stdout",
+        {"line": "x" * (40 * 1024), "stream": "stdout"},
+        1_720_000_000.0,
+    )
+    assert ledger.count == 0
+    assert not ledger.exceeded.is_set()
+    assert stream.getvalue() == b""
+
+    ledger.append(
+        "telemetry",
+        {"oversized": "x" * (40 * 1024)},
+        1_720_000_001.0,
+    )
+    assert ledger.count == 0
+    assert ledger.exceeded.is_set()
+    assert stream.getvalue() == b""
 
 
 @pytest.mark.parametrize(

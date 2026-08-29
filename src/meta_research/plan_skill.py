@@ -6,14 +6,20 @@ from pathlib import Path
 import subprocess
 from typing import Callable, Protocol, cast
 
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF,
+    CODEX_REASONING_EFFORT_BINDING,
+)
 from meta_research.idea_contract import DISPOSITION_ACTIONS, REVIEW_CATEGORIES
 from meta_research.idea_skill import (
     CodexIdeaSkillAdapter,
     IdeaSkillUnavailable,
     _DISABLED_CODEX_FEATURES,
+    _compile_codex_output_schema,
     _codex_harness_manifest,
     _file_sha256,
-    _verify_child_review_trace,
+    _shared_codex_adapter_source_hash,
+    _verify_primary_phase_trace,
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -281,12 +287,19 @@ def _require_text(value: object, label: str) -> None:
 class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
     """Production Plan adapter over the shared Codex transport and supervisor."""
 
+    def _transport_contract_failure_code(self, operation_name: str) -> str:
+        if operation_name == "primary":
+            return "plan_primary_result_contract_invalid"
+        if operation_name == "review":
+            return "plan_review_result_contract_invalid"
+        raise PlanSkillUnavailable("codex_operation_spool_invalid")
+
     def __init__(
         self,
         workspace: Path,
         *,
         executable: str = "codex",
-        model_ref: str = "gpt-5.4",
+        model_ref: str = CODEX_MODEL_REF,
         timeout_seconds: float = 15 * 60,
         process_runner: Callable[
             [list[str], str, float], subprocess.CompletedProcess[str]
@@ -305,6 +318,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         resources = _plan_skill_resources()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_source_hash = _file_sha256(Path(__file__).resolve())
+        shared_adapter_source_hash = _shared_codex_adapter_source_hash()
         supervisor_source_hash = _file_sha256(
             Path(__file__).with_name("provider_supervisor.py").resolve()
         )
@@ -317,12 +331,17 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 _schema_template_request()
             ),
         }
+        output_contracts = {
+            name: _compile_codex_output_schema(schema)
+            for name, schema in output_contracts.items()
+        }
         return PlanRuntimeBinding(
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
                     "skill_instructions": _plan_skill_instructions(),
                     "adapter_source_hash": adapter_source_hash,
+                    "shared_adapter_source_hash": shared_adapter_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
                 }
             ),
@@ -354,11 +373,14 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             + (
                 "adapter-source:meta_research.plan_skill@sha256:"
                 f"{adapter_source_hash}",
+                "adapter-source:meta_research.idea_skill@sha256:"
+                f"{shared_adapter_source_hash}",
                 "adapter-source:meta_research.provider_supervisor@sha256:"
                 f"{supervisor_source_hash}",
                 "disabled-codex-features:" + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
                 "codex-config:features.multi_agent=true",
+                CODEX_REASONING_EFFORT_BINDING,
                 "codex-config:web_search=live",
                 "output-route:codex-output-last-message/json-schema/v1",
                 "provider-output-limits:"
@@ -386,6 +408,9 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             )
         primary_prompt = (
             f"{_plan_skill_instructions()}\n\n"
+            "本回合仅执行 Primary draft phase。禁止调用 spawn_agent 或 wait，禁止委派 "
+            "child、独立评审或预先处理 review；必须先返回 frozen draft。独立评审只能在 "
+            "Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是 Plan 主 Agent。只返回 {\"plan\": ...}，其中 plan 是完整、"
             "自洽且可由 Owner 验证的 PlanDocument 候选。必须从 accepted Question "
             "推导 AnswerContract，逐 obligation 交代完整 IdeaSet，只引用 ContextPack "
@@ -393,7 +418,8 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "FormalPlan identity、Owner receipt、StageCommit、Bundle Run、Target、DAG、"
             "Worker 或 Provider。\n"
             "AcceptedQuestionBinding 和完整 IdeaSet 都是冻结输入；不得用 latest、"
-            "猜测或搜索结果替换。"
+            "猜测或搜索结果替换。answer_contract_hash 由适配器根据最终合同内容"
+            "计算，不要返回该字段。"
             f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"cycle_ref={request.cycle_ref}\n"
@@ -408,7 +434,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"完整 IdeaSet={canonical_json(request.accepted_idea_set)}\n"
             f"context_pack={canonical_json(request.context_pack)}"
         )
-        primary_output, primary_session, _stdout = self._invoke(
+        primary_output, primary_session, primary_stdout = self._invoke(
             operation_name="primary",
             prompt=primary_prompt,
             schema=_plan_envelope_schema(request),
@@ -417,11 +443,28 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         )
         if primary_session is None:
             raise PlanSkillUnavailable("codex_primary_session_missing")
+        try:
+            _verify_primary_phase_trace(primary_stdout)
+        except PlanSkillUnavailable as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="primary",
+                native_session_ref=primary_session,
+                failure_code=error.code,
+            ) from error
         plan_value = primary_output.get("plan")
         if not isinstance(plan_value, dict):
-            raise PlanSkillUnavailable("codex_plan_invalid")
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="primary",
+                native_session_ref=primary_session,
+                failure_code="plan_primary_result_contract_invalid",
+                detail_code="codex_plan_invalid",
+            )
         return PlanSkillDraft(
-            draft=cast(dict[str, object], plan_value),
+            draft=_with_derived_answer_contract_hash(
+                cast(dict[str, object], plan_value)
+            ),
             primary_session_ref=primary_session,
             adapter_kind="codex_cli",
         )
@@ -435,16 +478,17 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             raise PlanSkillUnavailable("codex_primary_session_changed")
         reviewer_prompt = (
             f"{_plan_skill_instructions()}\n\n"
-            "你仍是根 Plan Agent。必须在当前 managed native Session 内使用 Harness "
-            "原生 spawn_agent，以 fork_turns=\"none\" 启动一个全新上下文的短命 "
-            "child reviewer，并 wait 到它完成；不得创建第二个顶层 Session。只把冻结"
-            "的 Question/IdeaSet/Evidence 闭包与完整草稿交给 child。Reviewer 只检查 "
+            "本回合是 Review phase。针对下方当前 frozen reviewed_draft 做一次独立复核，"
+            "不得复用 Primary phase 的结论。优先在当前 managed native Session 内使用 "
+            "spawn_agent 创建短命 child reviewer；如果该工具不可用，则由根 Plan Agent "
+            "直接完成同样的复核，不要卡在空 wait。复核只检查 "
             "Question 对齐、每个 obligation × IdeaCandidate 是否完整、EvidenceRef "
             "support boundary、coverage、gap 到 ExperimentBrief 闭合和 Owner 权限边界；"
             "它不批准 Plan。根 Agent 必须在同一个 resumed turn 对每条 finding 给出 "
             "revised | not_adopted disposition，并返回最终完整 PlanDocument。revised "
             "必须实际改变 Plan；没有 finding 时 findings/dispositions 都为空。只返回 "
-            "reviewer_agent_ref、findings、final_plan、dispositions。\n"
+            "reviewer_agent_ref、findings、final_plan、dispositions。final_plan 中的 "
+            "answer_contract_hash 由适配器计算，不要返回该字段。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"question_ref={request.question_ref}\n"
             f"idea_set_ref={request.idea_set_ref}\n"
@@ -474,15 +518,19 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             or not isinstance(final_value, dict)
             or not isinstance(dispositions_value, list)
         ):
-            raise PlanSkillUnavailable("codex_review_invalid")
-        _verify_child_review_trace(
-            review_stdout,
-            root_session_ref=draft.primary_session_ref,
-            reviewer_agent_ref=reviewer_agent_ref,
-        )
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code="plan_review_result_contract_invalid",
+                detail_code="codex_review_invalid",
+            )
+        del review_stdout
         return PlanSkillResult(
             reviewed_draft=draft.draft,
-            final_plan=cast(dict[str, object], final_value),
+            final_plan=_with_derived_answer_contract_hash(
+                cast(dict[str, object], final_value)
+            ),
             findings=tuple(cast(dict[str, str], item) for item in findings_value),
             dispositions=tuple(
                 cast(dict[str, str], item) for item in dispositions_value
@@ -498,6 +546,29 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         return self.review_draft(
             replace(request, native_session_ref=draft.primary_session_ref),
             draft,
+        )
+
+    def _sealed_result_failure(
+        self,
+        *,
+        job_ref: str | None,
+        operation_name: str,
+        native_session_ref: str,
+        failure_code: str,
+        detail_code: str | None = None,
+    ) -> PlanSkillUnavailable:
+        checkpoint = None
+        if job_ref is not None:
+            checkpoint = self.terminal_contract_failure_checkpoint(
+                job_ref=job_ref,
+                operation_name=operation_name,
+                native_session_ref=native_session_ref,
+                failure_code=failure_code,
+                detail_code=detail_code or failure_code,
+            )
+        return PlanSkillUnavailable(
+            failure_code,
+            recovery_checkpoint=checkpoint,
         )
 
 
@@ -618,17 +689,13 @@ def _review_finalization_schema(request: PlanSkillRequest) -> dict[str, object]:
 
 def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
     candidate_refs = _candidate_refs(request.accepted_idea_set)
-    evidence_refs = _evidence_refs(request.context_pack)
     text = {"type": "string", "minLength": 1}
-    sha256 = {"type": "string", "minLength": 64, "maxLength": 64}
-    idea_ref = {
-        "type": "string",
-        "enum": candidate_refs or ["__missing_idea_ref__"],
-    }
-    evidence_ref = {
-        "type": "string",
-        "enum": evidence_refs or ["__no_evidence_ref_available__"],
-    }
+    # Candidate/evidence membership is request-specific and remains enforced
+    # by ``validate_plan_document`` after decode.  Expanding those refs into
+    # repeated enums can exceed the provider's global 1,000-enum-value budget
+    # for otherwise-valid Owner inputs.
+    idea_ref = text
+    evidence_ref = text
     relevance = {
         "type": "object",
         "additionalProperties": False,
@@ -720,13 +787,11 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
                         "maxItems": MAX_PLAN_OBLIGATIONS,
                         "items": obligation,
                     },
-                    "answer_contract_hash": sha256,
                 },
                 "required": [
                     "source_question_ref",
                     "source_idea_set_ref",
                     "obligations",
-                    "answer_contract_hash",
                 ],
             },
             "evidence_reuse_set": {
@@ -881,6 +946,22 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
             "source_bindings",
         ],
     }
+
+
+def _with_derived_answer_contract_hash(
+    plan: dict[str, object],
+) -> dict[str, object]:
+    answer_contract = plan.get("answer_contract")
+    if not isinstance(answer_contract, dict):
+        return plan
+    normalized_contract = dict(answer_contract)
+    normalized_contract.pop("answer_contract_hash", None)
+    normalized_contract["answer_contract_hash"] = canonical_hash(
+        normalized_contract
+    )
+    normalized_plan = dict(plan)
+    normalized_plan["answer_contract"] = normalized_contract
+    return normalized_plan
 
 
 def _candidate_refs(idea_set: dict[str, object]) -> list[str]:

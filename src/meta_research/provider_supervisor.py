@@ -1278,7 +1278,7 @@ def _fsync_directory(path: Path) -> None:
 
 def _validated_request_paths(
     request_path: Path, payload: dict[str, object]
-) -> tuple[list[str], dict[str, Path], float, int, int]:
+) -> tuple[list[str], dict[str, Path], float | None, int, int]:
     directory = request_path.parent.resolve()
     values = {
         "prompt_path": directory / "prompt.txt",
@@ -1308,16 +1308,21 @@ def _validated_request_paths(
     }
     if schema_ref == CODEX_SUPERVISOR_REQUEST_SCHEMA_V2:
         expected_fields.add("prompt_max_bytes")
+    timeout_valid = timeout_seconds is None and schema_ref == (
+        SUPERVISOR_REQUEST_SCHEMA
+    )
+    if isinstance(timeout_seconds, (int, float)) and not isinstance(
+        timeout_seconds, bool
+    ):
+        timeout_valid = 0 < float(timeout_seconds) <= (
+            PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+        )
     if (
         set(payload) != expected_fields
         or not isinstance(argv, list)
         or not argv
         or not all(isinstance(value, str) and value for value in argv)
-        or not isinstance(timeout_seconds, (int, float))
-        or isinstance(timeout_seconds, bool)
-        or not 0
-        < float(timeout_seconds)
-        <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+        or not timeout_valid
         or not isinstance(stream_max_bytes, int)
         or isinstance(stream_max_bytes, bool)
         or not 0 < stream_max_bytes <= PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES
@@ -1352,7 +1357,7 @@ def _validated_request_paths(
     return (
         typed_argv,
         values,
-        float(timeout_seconds),
+        None if timeout_seconds is None else float(timeout_seconds),
         stream_max_bytes,
         result_max_bytes,
     )
@@ -1622,7 +1627,7 @@ def _supervise_locked(
     paths: dict[str, Path],
     invocation_hash: str,
     key: bytes,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
     stream_max_bytes: int,
     result_max_bytes: int,
     stop_requested: Callable[[], bool],
@@ -1749,7 +1754,11 @@ def _supervise_locked(
                 stdout_drainer.start()
                 if result_drainer is not None:
                     result_drainer.start()
-                deadline = time.monotonic() + timeout_seconds
+                deadline = (
+                    None
+                    if timeout_seconds is None
+                    else time.monotonic() + timeout_seconds
+                )
                 while process.poll() is None or (
                     provider_job is not None
                     and provider_job.active_process_count() > 0
@@ -1762,7 +1771,7 @@ def _supervise_locked(
                             provider_job=provider_job,
                         )
                         break
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         termination_reason = "timeout"
                         returncode = _terminate_provider(
                             process,

@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,8 +20,21 @@ from urllib.parse import parse_qsl, urlsplit
 from meta_research.acquisition import (
     AcquisitionBatchExecution,
     AcquisitionBatchRequest,
+    AcquisitionUnavailable,
     AcquisitionPaper,
     DEEPFETCH_PROTOTYPE_COMMIT,
+    aggregate_batch_status,
+    validate_batch_request,
+    validate_item_results,
+)
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF,
+    CODEX_REASONING_EFFORT_BINDING,
+    CODEX_REASONING_EFFORT_CONFIG,
+)
+from meta_research.codex_ledger import (
+    CodexHomeLedgerReader,
+    CodexSessionLedgerReader,
 )
 
 from meta_research.provider_supervisor import (
@@ -55,8 +70,11 @@ DEEPFETCH_RESULT_SCHEMA = "meta-research/first-question-deepfetch-result/v2"
 DEEPFETCH_RUNTIME_BINDING_SCHEMA = "meta-research/deepfetch-runtime-binding/v1"
 DEEPFETCH_WEB_EVIDENCE_SCHEMA = "meta-research/deepfetch-web-evidence/v1"
 DEEPFETCH_PROTOTYPE_EVIDENCE_SCHEMA = "meta-research/deepfetch-prototype-evidence/v4"
-DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA = (
+LEGACY_DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA = (
     "meta-research/deepfetch-v4-protocol-checkpoint/v1"
+)
+DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA = (
+    "meta-research/deepfetch-v4-protocol-checkpoint/v2"
 )
 DEEPFETCH_PROVIDER_OPERATION_REGISTRY_SCHEMA = (
     "meta-research/deepfetch-provider-operation-registry/v1"
@@ -69,6 +87,17 @@ MAX_DEEPFETCH_LIMITATIONS = 100
 MAX_DEEPFETCH_FULLTEXT_FILE_BYTES = 32 * 1024 * 1024
 MAX_DEEPFETCH_FULLTEXT_TOTAL_BYTES = 96 * 1024 * 1024
 DEEPFETCH_PROVIDER_STREAM_MAX_BYTES = 64 * 1024 * 1024
+DEEPFETCH_ACTIVITY_TAIL_MAX_BYTES = 512 * 1024
+DEEPFETCH_ACTIVITY_MAX_EVENTS = 12
+_DEEPFETCH_COMPLETION_RULES = (
+    "最终 action=finalize 时，completion 描述证据完备性，不是流程是否执行完："
+    "complete：papers 非空、每篇均取得全文且 Reader 成功，并且 limitations 为空；"
+    "limited：papers 非空且 limitations 非空，用于存在 missing_fulltexts、Reader 失败"
+    "或其他证据局限；"
+    "honest_empty：papers 为空且 limitations 非空。"
+    "workflow.main_agent_status=complete 只表示研究流程已执行完，不能据此选择 "
+    "completion=complete。action=acquire 时 completion 必须为 null。"
+)
 
 
 def canonical_json(value: object) -> str:
@@ -83,6 +112,169 @@ def canonical_json(value: object) -> str:
 
 def canonical_hash(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _public_deepfetch_activity_event(
+    value: object,
+    *,
+    sequence: int,
+) -> dict[str, object] | None:
+    """Reduce one untrusted Provider event to a fixed, content-free label."""
+
+    if not isinstance(value, dict):
+        return None
+    event_type = value.get("type")
+    if event_type == "thread.started":
+        return {
+            "sequence": sequence,
+            "category": "session",
+            "status": "completed",
+            "label": "DeepFetch 会话已启动",
+        }
+    if event_type == "turn.started":
+        return {
+            "sequence": sequence,
+            "category": "analysis",
+            "status": "running",
+            "label": "正在规划研究步骤",
+        }
+    if event_type == "turn.completed":
+        return {
+            "sequence": sequence,
+            "category": "session",
+            "status": "completed",
+            "label": "DeepFetch 当前检索轮次已完成",
+        }
+    if event_type not in {"item.started", "item.completed"}:
+        return None
+    item = value.get("item")
+    if not isinstance(item, dict):
+        return None
+    started = event_type == "item.started"
+    failed = not started and item.get("status") == "failed"
+    status = "running" if started else "failed" if failed else "completed"
+    item_type = item.get("type")
+    if item_type == "web_search":
+        action = item.get("action")
+        action_type = action.get("type") if isinstance(action, dict) else None
+        if action_type == "search":
+            return {
+                "sequence": sequence,
+                "category": "web_search",
+                "status": status,
+                "label": (
+                    "正在执行 Web Search"
+                    if started
+                    else "Web Search 遇到问题"
+                    if failed
+                    else "Web Search 已完成"
+                ),
+            }
+        return {
+            "sequence": sequence,
+            "category": "web_fetch",
+            "status": status,
+            "label": (
+                "正在读取 Web 资料"
+                if started
+                else "Web 资料读取遇到问题"
+                if failed
+                else "Web 资料读取完成"
+            ),
+        }
+    labels = {
+        "command_execution": (
+            "正在处理研究资料",
+            "研究资料处理遇到问题" if failed else "研究资料处理完成",
+        ),
+        "file_change": (
+            "正在整理研究记录",
+            "研究记录整理遇到问题" if failed else "研究记录已更新",
+        ),
+        "collab_tool_call": (
+            "研究子任务正在执行",
+            "研究子任务遇到问题" if failed else "研究子任务已返回",
+        ),
+        "agent_message": (
+            "正在更新研究判断",
+            "研究判断已更新",
+        ),
+    }
+    label_pair = labels.get(item_type)
+    if label_pair is None:
+        return None
+    return {
+        "sequence": sequence,
+        "category": "analysis",
+        "status": status,
+        "label": label_pair[0] if started else label_pair[1],
+    }
+
+
+_DEEPFETCH_PUBLIC_ACTIVITY_LABELS = frozenset(
+    {
+        ("session", "completed", "DeepFetch 会话已启动"),
+        ("session", "completed", "DeepFetch 当前检索轮次已完成"),
+        ("analysis", "running", "正在规划研究步骤"),
+        ("web_search", "running", "正在执行 Web Search"),
+        ("web_search", "completed", "Web Search 已完成"),
+        ("web_search", "failed", "Web Search 遇到问题"),
+        ("web_fetch", "running", "正在读取 Web 资料"),
+        ("web_fetch", "completed", "Web 资料读取完成"),
+        ("web_fetch", "failed", "Web 资料读取遇到问题"),
+        ("analysis", "running", "正在处理研究资料"),
+        ("analysis", "completed", "研究资料处理完成"),
+        ("analysis", "failed", "研究资料处理遇到问题"),
+        ("analysis", "running", "正在整理研究记录"),
+        ("analysis", "completed", "研究记录已更新"),
+        ("analysis", "failed", "研究记录整理遇到问题"),
+        ("analysis", "running", "研究子任务正在执行"),
+        ("analysis", "completed", "研究子任务已返回"),
+        ("analysis", "failed", "研究子任务遇到问题"),
+        ("analysis", "running", "正在更新研究判断"),
+        ("analysis", "completed", "研究判断已更新"),
+    }
+)
+
+
+def validate_deepfetch_activity_events(
+    values: object,
+) -> tuple[dict[str, object], ...]:
+    """Validate the narrow public liveness projection from any Provider."""
+
+    if not isinstance(values, (list, tuple)):
+        raise DeepFetchUnavailable("deepfetch_activity_projection_invalid")
+    projected: list[dict[str, object]] = []
+    previous_sequence = 0
+    for value in values:
+        if not isinstance(value, dict) or set(value) != {
+            "sequence",
+            "category",
+            "status",
+            "label",
+        }:
+            raise DeepFetchUnavailable("deepfetch_activity_projection_invalid")
+        sequence = value.get("sequence")
+        category = value.get("category")
+        status = value.get("status")
+        label = value.get("label")
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence <= previous_sequence
+            or sequence > 9_007_199_254_740_991
+            or not isinstance(category, str)
+            or not isinstance(status, str)
+            or not isinstance(label, str)
+            or (category, status, label)
+            not in _DEEPFETCH_PUBLIC_ACTIVITY_LABELS
+        ):
+            raise DeepFetchUnavailable("deepfetch_activity_projection_invalid")
+        projected.append(dict(value))
+        previous_sequence = sequence
+    if len(projected) > DEEPFETCH_ACTIVITY_MAX_EVENTS:
+        raise DeepFetchUnavailable("deepfetch_activity_projection_invalid")
+    return tuple(projected)
 
 
 def _provider_turn_marker_number(path: Path) -> int:
@@ -259,9 +451,11 @@ class _DeepFetchProtocolCheckpoint:
     next_turn_number: int
     evidence_parts: tuple[dict[str, object], ...]
     acquisition_request_ids: tuple[str, ...]
+    acquisition_item_proofs: tuple[dict[str, object], ...]
     pending_acquisition: dict[str, object] | None
     next_prompt: str | None
     final_envelope: dict[str, object] | None
+    legacy_checkpoint: bool
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -272,10 +466,18 @@ class _DeepFetchProtocolCheckpoint:
             "next_turn_number": self.next_turn_number,
             "evidence_parts": list(self.evidence_parts),
             "acquisition_request_ids": list(self.acquisition_request_ids),
+            "acquisition_item_proofs": list(self.acquisition_item_proofs),
             "pending_acquisition": self.pending_acquisition,
             "next_prompt": self.next_prompt,
             "final_envelope": self.final_envelope,
         }
+
+
+@dataclass(frozen=True)
+class _VerifiedReaderAgentTrace:
+    refs: tuple[str, ...]
+    identity_kind: Literal["native_thread", "task_name"]
+    native_thread_refs: tuple[str, ...] = ()
 
 
 class DeepFetchProvider(Protocol):
@@ -294,6 +496,14 @@ class DeepFetchAcquisitionClient(Protocol):
         session_ref: str,
         request: AcquisitionBatchRequest,
     ) -> AcquisitionBatchExecution: ...
+
+    def query_completed_batch(
+        self,
+        session_ref: str,
+        request_id: str,
+    ) -> AcquisitionBatchExecution | None:
+        """Read one Owner-recorded terminal batch without replaying acquisition."""
+        ...
 
 
 def validate_runtime_binding(binding: DeepFetchRuntimeBinding) -> str:
@@ -369,6 +579,13 @@ def validate_deepfetch_result(
     )
     if len(set(limitations)) != len(limitations):
         raise DeepFetchUnavailable("deepfetch_limitations_duplicate")
+    if request.scope.get("literature_mode") == "oa_only" and (
+        _misstates_selected_oa_as_fallback(summary)
+        or any(
+            _misstates_selected_oa_as_fallback(value) for value in limitations
+        )
+    ):
+        raise DeepFetchUnavailable("deepfetch_oa_only_limitation_invalid")
     if result.completion == "honest_empty" and (papers or fulltexts):
         raise DeepFetchUnavailable("deepfetch_empty_result_not_empty")
     if result.completion == "honest_empty" and not limitations:
@@ -426,6 +643,71 @@ def validate_deepfetch_result(
     return payload, canonical_hash(payload)
 
 
+def _misstates_selected_oa_as_fallback(value: str) -> bool:
+    normalized = value.casefold()
+    names_oa = any(
+        marker in normalized
+        for marker in ("oa_only", "oa-only", "open access", "open-access", "开放获取")
+    ) or re.search(r"(?<![a-z0-9])oa(?![a-z0-9])", normalized) is not None
+    institution = any(
+        marker in normalized
+        for marker in ("institutional", "institution", "browser", "机构", "图书馆", "浏览器")
+    )
+    unavailable = any(
+        marker in normalized
+        for marker in ("不可用", "失败", "disabled", "unavailable", "not authorized")
+    )
+    causal = any(
+        marker in normalized
+        for marker in ("因此", "所以", "导致", "由于", "because", "therefore", "due to")
+    )
+    coercion_context = normalized
+    for correction in (
+        "并非被迫使用",
+        "并非被迫采用",
+        "并非被迫转向",
+        "不是被迫使用",
+        "不是被迫采用",
+        "不是被迫转向",
+        "没有被迫使用",
+        "没有被迫采用",
+        "没有被迫转向",
+        "没有降级到",
+        "没有降级至",
+        "并未降级到",
+        "并未降级至",
+        "not forced to use",
+        "not forced to fall back",
+        "not degraded to",
+        "never forced to use",
+        "never forced to fall back",
+        "never degraded to",
+    ):
+        coercion_context = coercion_context.replace(correction, "")
+    forced_or_degraded = any(
+        marker in coercion_context
+        for marker in (
+            "被迫使用",
+            "被迫采用",
+            "被迫转向",
+            "不得不使用",
+            "不得不采用",
+            "不得不转向",
+            "只好使用",
+            "只好采用",
+            "只好转向",
+            "降级到",
+            "降级至",
+            "forced to use",
+            "forced to fall back",
+            "degraded to",
+        )
+    )
+    return names_oa and (
+        forced_or_degraded or institution and unavailable and causal
+    )
+
+
 class CodexDeepFetchAdapter:
     """Production Adapter for the bound DeepFetch v4 Harness workflow."""
 
@@ -441,26 +723,33 @@ class CodexDeepFetchAdapter:
         workspace: Path,
         *,
         executable: str = "codex",
-        model_ref: str = "gpt-5.4",
-        timeout_seconds: float = 30 * 60,
+        model_ref: str = CODEX_MODEL_REF,
         acquisition_client: DeepFetchAcquisitionClient | None = None,
         process_runner: (
-            Callable[[list[str], str, float], subprocess.CompletedProcess[str]] | None
+            Callable[
+                [list[str], str, float | None],
+                subprocess.CompletedProcess[str],
+            ]
+            | None
         ) = None,
+        codex_ledger_reader: CodexSessionLedgerReader | None = None,
+        codex_home: Path | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
-        self._agent_workspace = self._workspace / "research-workspace"
-        self._agent_workspace.mkdir(parents=True, exist_ok=True)
+        self._agent_workspace_root = self._workspace / "research-workspaces"
+        self._agent_workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._executable = executable
         self._model_ref = model_ref
-        self._timeout_seconds = timeout_seconds
         self._acquisition_client = acquisition_client
         self._runner = process_runner or _CancellableProcessRunner(
             stream_max_bytes=DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
         )
         self._skill_root = _deepfetch_skill_root()
         self._skill_bundle_hash = _deepfetch_skill_bundle_hash(self._skill_root)
+        self._codex_ledger_reader = codex_ledger_reader
+        if self._codex_ledger_reader is None and codex_home is not None:
+            self._codex_ledger_reader = CodexHomeLedgerReader(codex_home)
 
     def request_stop(self) -> None:
         request_stop = getattr(self._runner, "request_stop", None)
@@ -468,6 +757,12 @@ class CodexDeepFetchAdapter:
             request_stop()
 
     def cancel_job(self, job_ref: str) -> None:
+        if callable(getattr(self._runner, "run_durable_job", None)):
+            # A ready durable supervisor owns its provider process and signed
+            # terminal receipt. Ask it to stop through that sealed channel;
+            # generic process-tree cancellation can destroy the receipt.
+            self.reconcile_cancelled_job(job_ref)
+            return
         cancel_job = getattr(self._runner, "cancel_job", None)
         if callable(cancel_job):
             for provider_job_ref in self._registered_provider_jobs(job_ref):
@@ -479,10 +774,136 @@ class CodexDeepFetchAdapter:
             for provider_job_ref in self._registered_provider_jobs(job_ref):
                 finish_job(provider_job_ref)
 
+    def recent_activity_events(
+        self,
+        job_ref: str,
+        runtime_binding_hash: str,
+        *,
+        limit: int = DEEPFETCH_ACTIVITY_MAX_EVENTS,
+    ) -> tuple[dict[str, object], ...]:
+        """Read a bounded tail and expose only fixed operational labels.
+
+        Provider payloads can contain queries, URLs, commands, paths, and prose.
+        None of those values cross this observer seam.
+        """
+
+        if limit < 1:
+            return ()
+        try:
+            root_operation = self._provider_operation_root(
+                job_ref, runtime_binding_hash
+            )
+            if root_operation.is_symlink() or not root_operation.is_dir():
+                return ()
+            provider_jobs = self._registered_provider_jobs(
+                job_ref,
+                operation_roots=(root_operation,),
+            )
+            sources: list[tuple[int, int, Path]] = []
+            for provider_job_ref in provider_jobs:
+                root_ref, separator, turn = provider_job_ref.rpartition(
+                    ":v4-turn:"
+                )
+                turn_sequence = (
+                    int(turn) + 1
+                    if separator and root_ref == job_ref and turn.isdigit()
+                    else 0
+                )
+                operation_root = self._provider_operation_root(
+                    provider_job_ref, runtime_binding_hash
+                )
+                if operation_root.is_symlink() or not operation_root.is_dir():
+                    continue
+                directories = [operation_root / "deepfetch-initial"]
+                directories.extend(
+                    sorted(
+                        (
+                            path
+                            for path in operation_root.glob(
+                                "deepfetch-resume-*"
+                            )
+                            if path.name.removeprefix(
+                                "deepfetch-resume-"
+                            ).isdigit()
+                        ),
+                        key=lambda path: int(
+                            path.name.removeprefix("deepfetch-resume-")
+                        ),
+                    )
+                )
+                for segment, directory in enumerate(directories):
+                    sources.append(
+                        (turn_sequence, segment, directory / "stdout.jsonl")
+                    )
+
+            public_limit = min(limit, DEEPFETCH_ACTIVITY_MAX_EVENTS)
+            remaining = public_limit
+            reverse_batches: list[list[dict[str, object]]] = []
+            for turn_sequence, segment, stdout_path in reversed(sources):
+                directory = stdout_path.parent
+                if (
+                    directory.is_symlink()
+                    or not directory.is_dir()
+                    or stdout_path.is_symlink()
+                    or not stdout_path.is_file()
+                ):
+                    continue
+                size = stdout_path.stat().st_size
+                start = max(0, size - DEEPFETCH_ACTIVITY_TAIL_MAX_BYTES)
+                with stdout_path.open("rb") as stream:
+                    stream.seek(start)
+                    data = stream.read(DEEPFETCH_ACTIVITY_TAIL_MAX_BYTES)
+                base_offset = start
+                if start:
+                    boundary = data.find(b"\n")
+                    if boundary < 0:
+                        continue
+                    base_offset += boundary + 1
+                    data = data[boundary + 1 :]
+                if data and not data.endswith(b"\n"):
+                    boundary = data.rfind(b"\n")
+                    if boundary < 0:
+                        continue
+                    data = data[: boundary + 1]
+                offset = base_offset
+                segment_events: list[dict[str, object]] = []
+                for raw_line in data.splitlines(keepends=True):
+                    line_offset = offset
+                    offset += len(raw_line)
+                    try:
+                        event = json.loads(raw_line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    public = _public_deepfetch_activity_event(
+                        event,
+                        sequence=(
+                            turn_sequence
+                            * DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
+                            * 1024
+                            + segment * DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
+                            + line_offset
+                            + 1
+                        ),
+                    )
+                    if public is not None:
+                        segment_events.append(public)
+                if segment_events:
+                    batch = segment_events[-remaining:]
+                    reverse_batches.append(batch)
+                    remaining -= len(batch)
+                    if remaining == 0:
+                        break
+            return tuple(
+                event
+                for batch in reversed(reverse_batches)
+                for event in batch
+            )
+        except OSError:
+            return ()
+
     def reconcile_cancelled_job(self, job_ref: str) -> bool:
         """Stop and verify all durable DeepFetch segments for a terminal Run."""
 
-        self.cancel_job(job_ref)
         try:
             _key_path, key = ensure_transport_key(self._workspace)
             for provider_job_ref in self._registered_provider_jobs(job_ref):
@@ -535,7 +956,7 @@ class CodexDeepFetchAdapter:
                             ):
                                 return False
                             if not receipt_path.is_file():
-                                continue
+                                return False
                         read_verified_exit_receipt(
                             receipt_path,
                             key=key,
@@ -563,6 +984,64 @@ class CodexDeepFetchAdapter:
     ) -> Path:
         return self._workspace / "runs" / f"{runtime_binding_hash}-{run_key}"
 
+    @staticmethod
+    def _logical_run_key(
+        request: DeepFetchRunRequest | DeepFetchProviderRequest,
+    ) -> str:
+        return canonical_hash(
+            {
+                "request_ref": request.request_ref,
+                "correlation_ref": request.correlation_ref,
+                "draft_hash": request.draft_hash,
+                "scope_hash": request.scope_hash,
+            }
+        )[:32]
+
+    @staticmethod
+    def _root_provider_job_ref(job_ref: str) -> str:
+        root_job_ref, separator, turn = job_ref.rpartition(":v4-turn:")
+        if separator and root_job_ref and turn.isdigit():
+            return root_job_ref
+        return job_ref
+
+    @classmethod
+    def _provider_execution_key(cls, job_ref: str) -> str:
+        return canonical_hash({"job_ref": cls._root_provider_job_ref(job_ref)})
+
+    def _agent_workspace_path(
+        self, job_ref: str, runtime_binding_hash: str
+    ) -> Path:
+        workspace = self._agent_workspace_root / (
+            f"{runtime_binding_hash}-{self._provider_execution_key(job_ref)}"
+        )
+        if workspace.parent != self._agent_workspace_root:
+            raise DeepFetchUnavailable("deepfetch_provider_workspace_invalid")
+        return workspace
+
+    def _agent_workspace_for(
+        self, job_ref: str, runtime_binding_hash: str
+    ) -> Path:
+        workspace = self._agent_workspace_path(job_ref, runtime_binding_hash)
+        try:
+            if (
+                self._agent_workspace_root.is_symlink()
+                or not self._agent_workspace_root.is_dir()
+            ):
+                raise OSError("unsafe provider workspace root")
+            workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if (
+                workspace.is_symlink()
+                or not workspace.is_dir()
+                or workspace.resolve(strict=True).parent
+                != self._agent_workspace_root.resolve(strict=True)
+            ):
+                raise OSError("unsafe provider execution workspace")
+        except OSError as error:
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_workspace_invalid"
+            ) from error
+        return workspace
+
     def _provider_operation_roots(self, job_ref: str) -> tuple[Path, ...]:
         provider_root = self._workspace / "provider-operations"
         job_hash = canonical_hash({"job_ref": job_ref})
@@ -572,6 +1051,29 @@ class CodexDeepFetchAdapter:
         return tuple(
             dict.fromkeys(path for path in candidates if path.is_dir())
         )
+
+    def _retry_operation_roots(
+        self, job_ref: str, runtime_binding_hash: str
+    ) -> tuple[Path, ...]:
+        provider_root = self._workspace / "provider-operations"
+        candidates = tuple(
+            dict.fromkeys(
+                (
+                    provider_root / canonical_hash({"job_ref": job_ref}),
+                    self._provider_operation_root(
+                        job_ref, runtime_binding_hash
+                    ),
+                )
+            )
+        )
+        existing = tuple(
+            path for path in candidates if path.exists() or path.is_symlink()
+        )
+        if len(existing) > 1:
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_retry_cleanup_invalid"
+            )
+        return existing
 
     def _register_provider_turn(
         self,
@@ -603,7 +1105,12 @@ class CodexDeepFetchAdapter:
                 "deepfetch_provider_spool_invalid"
             ) from error
 
-    def _registered_provider_jobs(self, root_job_ref: str) -> tuple[str, ...]:
+    def _registered_provider_jobs(
+        self,
+        root_job_ref: str,
+        *,
+        operation_roots: tuple[Path, ...] | None = None,
+    ) -> tuple[str, ...]:
         # The fixed legacy entries are migration coverage for provider turns
         # created by builds that predate the durable registry. New turns have
         # no generation ceiling and are discovered only through signed facts.
@@ -613,7 +1120,12 @@ class CodexDeepFetchAdapter:
         ]
         try:
             _key_path, key = ensure_transport_key(self._workspace)
-            for operation_root in self._provider_operation_roots(root_job_ref):
+            roots = (
+                self._provider_operation_roots(root_job_ref)
+                if operation_roots is None
+                else operation_roots
+            )
+            for operation_root in roots:
                 registry_root = operation_root / "registered-turns"
                 if not registry_root.exists():
                     continue
@@ -641,6 +1153,117 @@ class CodexDeepFetchAdapter:
             ) from error
         return tuple(dict.fromkeys(job_refs))
 
+    @staticmethod
+    def _remove_owned_execution_tree(path: Path, *, parent: Path) -> None:
+        """Delete one exact provider-owned child without following symlinks."""
+
+        if path.parent != parent:
+            raise DeepFetchUnavailable("deepfetch_provider_retry_cleanup_invalid")
+        try:
+            if not path.exists() and not path.is_symlink():
+                return
+            if (
+                parent.is_symlink()
+                or not parent.is_dir()
+                or path.is_symlink()
+                or not path.is_dir()
+                or path.resolve(strict=True).parent
+                != parent.resolve(strict=True)
+            ):
+                raise OSError("unsafe provider retry cleanup target")
+            shutil.rmtree(path)
+        except OSError as error:
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_retry_cleanup_invalid"
+            ) from error
+
+    def prepare_retry_execution(
+        self,
+        request: DeepFetchRunRequest,
+        *,
+        previous_job_ref: str,
+        previous_run_ref: str,
+        previous_runtime_binding: DeepFetchRuntimeBinding,
+    ) -> None:
+        """Remove one verified-terminal predecessor's exact physical state."""
+
+        expected_prefix = f"{previous_run_ref}:deepfetch:"
+        generation = previous_job_ref.removeprefix(expected_prefix)
+        if (
+            not previous_job_ref.startswith(expected_prefix)
+            or not generation.isdigit()
+            or int(generation) < 1
+        ):
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_retry_cleanup_invalid"
+            )
+        previous_binding_hash = validate_runtime_binding(
+            previous_runtime_binding
+        )
+        logical_run_key = self._logical_run_key(request)
+        execution_key = self._provider_execution_key(previous_job_ref)
+        run_parent = self._workspace / "runs"
+        protocol_candidates = tuple(
+            dict.fromkeys(
+                (
+                    run_parent / execution_key,
+                    self._protocol_run_root(
+                        execution_key, previous_binding_hash
+                    ),
+                    # Compatibility roots written before provider-operation
+                    # identity became the physical protocol partition.
+                    run_parent / logical_run_key,
+                    self._protocol_run_root(
+                        logical_run_key, previous_binding_hash
+                    ),
+                )
+            )
+        )
+        existing_protocol_roots = tuple(
+            path
+            for path in protocol_candidates
+            if path.exists() or path.is_symlink()
+        )
+        if len(existing_protocol_roots) > 1:
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_retry_cleanup_invalid"
+            )
+
+        root_operation_roots = self._retry_operation_roots(
+            previous_job_ref, previous_binding_hash
+        )
+        provider_jobs = self._registered_provider_jobs(
+            previous_job_ref,
+            operation_roots=root_operation_roots,
+        )
+        operation_roots = tuple(
+            dict.fromkeys(
+                operation_root
+                for provider_job_ref in provider_jobs
+                for operation_root in self._retry_operation_roots(
+                    provider_job_ref, previous_binding_hash
+                )
+            )
+        )
+        operation_workspace = self._agent_workspace_root / (
+            f"{previous_binding_hash}-{execution_key}"
+        )
+
+        for protocol_root in existing_protocol_roots:
+            self._remove_owned_execution_tree(
+                protocol_root,
+                parent=run_parent,
+            )
+        for operation_root in operation_roots:
+            self._remove_owned_execution_tree(
+                operation_root,
+                parent=self._workspace / "provider-operations",
+            )
+        self._remove_owned_execution_tree(
+            operation_workspace,
+            parent=self._agent_workspace_root,
+        )
+
     @property
     def requires_verified_terminal_retry(self) -> bool:
         """Whether a new durable effect requires a signed terminal predecessor."""
@@ -654,19 +1277,23 @@ class CodexDeepFetchAdapter:
             model_ref=self._model_ref,
             harness_ref="codex-cli",
             capability_bindings=(
-                "agent-workspace-policy:dedicated-research-workspace-v1",
+                "agent-workspace-policy:provider-operation-scoped-v2",
                 "approval-policy-never",
+                "codex-default-capabilities:v1",
                 "deepfetch-v4-main-agent",
                 f"deepfetch-v4-skill-bundle-sha256:{self._skill_bundle_hash}",
                 "filesystem-danger-full-access",
                 "hosted-acquisition-session",
                 "native-child-readers",
                 "papers-v4-finalize",
+                "codex-reader-ledger:v1",
                 "provider-output-limits:"
                 f"stream={DEEPFETCH_PROVIDER_STREAM_MAX_BYTES};"
                 f"result={PROVIDER_RESULT_MAX_BYTES}",
+                CODEX_REASONING_EFFORT_BINDING,
                 "sandbox-policy:danger-full-access",
                 "structured-output-json-schema",
+                "web-evidence-gate:v1",
                 "workspace-write-public-artifacts",
                 "web-fetch-live",
                 "web-search-live",
@@ -675,22 +1302,32 @@ class CodexDeepFetchAdapter:
 
     def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
         runtime_binding_hash = canonical_hash(request.runtime_binding.as_dict())
-        run_key = canonical_hash(
-            {
-                "request_ref": request.request_ref,
-                "correlation_ref": request.correlation_ref,
-                "draft_hash": request.draft_hash,
-                "scope_hash": request.scope_hash,
-            }
-        )[:32]
+        logical_run_key = self._logical_run_key(request)
+        root_job_ref = request.job_ref or f"{request.run_ref}:direct"
+        execution_key = self._provider_execution_key(root_job_ref)
+        if (
+            not request.reconcile_only
+            and request.runtime_binding.as_dict()
+            != self.runtime_binding().as_dict()
+        ):
+            # An operation admitted before these protocol boundaries existed
+            # may only be inspected through the predecessor-binding
+            # reconciliation path.  It must never start a new provider effect.
+            raise DeepFetchUnavailable(
+                "deepfetch_runtime_binding_transition_required",
+                durable_outcome="pending",
+                native_session_ref=request.native_session_ref,
+            )
         if request.reconcile_only:
             return self._reconcile_existing_protocol(
                 request,
-                run_key=run_key,
+                execution_key=execution_key,
+                legacy_run_key=logical_run_key,
                 runtime_binding_hash=runtime_binding_hash,
             )
+        self._agent_workspace_for(root_job_ref, runtime_binding_hash)
         run_root = self._protocol_run_root(
-            run_key,
+            execution_key,
             runtime_binding_hash,
         )
         public_root = run_root / "public"
@@ -704,11 +1341,7 @@ class CodexDeepFetchAdapter:
                 checkpoint_path,
                 identity_hash=identity_hash,
                 native_session_ref=request.native_session_ref,
-                initial_prompt=self._initial_prompt(
-                    request,
-                    public_root=public_root,
-                    private_root=private_root,
-                ),
+                initial_prompt=self._web_evidence_gate_prompt(request),
             )
             return self._execute_protocol(
                 request,
@@ -745,7 +1378,8 @@ class CodexDeepFetchAdapter:
         self,
         request: DeepFetchProviderRequest,
         *,
-        run_key: str,
+        execution_key: str,
+        legacy_run_key: str,
         runtime_binding_hash: str,
     ) -> DeepFetchResult:
         """Read one predecessor operation without starting a provider effect."""
@@ -759,11 +1393,28 @@ class CodexDeepFetchAdapter:
                 native_session_ref=request.native_session_ref,
             )
         try:
-            run_root = self._select_reconciliation_root(
+            execution_root = self._select_reconciliation_root(
                 self._workspace / "runs",
-                identity_leaf=run_key,
+                identity_leaf=execution_key,
                 runtime_binding_hash=runtime_binding_hash,
+                allow_missing=True,
             )
+            legacy_root = self._select_reconciliation_root(
+                self._workspace / "runs",
+                identity_leaf=legacy_run_key,
+                runtime_binding_hash=runtime_binding_hash,
+                allow_missing=True,
+            )
+            roots = tuple(
+                dict.fromkeys(
+                    root
+                    for root in (execution_root, legacy_root)
+                    if root is not None
+                )
+            )
+            if len(roots) != 1:
+                raise ValueError("deepfetch reconciliation run root conflict")
+            run_root = roots[0]
             public_root = run_root / "public"
             private_root = run_root / "private"
             checkpoint_path = private_root / "protocol.json"
@@ -893,11 +1544,21 @@ class CodexDeepFetchAdapter:
                 runtime_binding_hash=runtime_binding_hash,
                 expected_native_session_ref=previous_native_session_ref,
                 enforce_native_session_ref=enforce_previous_native,
+                expected_web_gate=(
+                    "web-evidence-gate:v1"
+                    in request.runtime_binding.capability_bindings
+                    and turn_number == 0
+                ),
             )
             observed_evidence.append(evidence)
             previous_native_session_ref = native_session_ref
             enforce_previous_native = True
-            if raw.get("action") == "acquire":
+            if raw.get("status") == "web_evidence_ready":
+                if turn_number != 0:
+                    raise ValueError("deepfetch reconciliation gate position invalid")
+                _validate_web_evidence_gate_result(raw)
+                _merge_web_evidence([evidence])
+            elif raw.get("action") == "acquire":
                 acquisition_requests.append(
                     _validated_v4_acquisition_request(raw).identity_payload()
                 )
@@ -933,6 +1594,11 @@ class CodexDeepFetchAdapter:
                 runtime_binding_hash=runtime_binding_hash,
                 expected_native_session_ref=None,
                 enforce_native_session_ref=False,
+                expected_web_gate=(
+                    "web-evidence-gate:v1"
+                    in request.runtime_binding.capability_bindings
+                    and checkpoint.next_turn_number - 1 == 0
+                ),
             )
             if (
                 final_raw != checkpoint.final_envelope
@@ -975,7 +1641,20 @@ class CodexDeepFetchAdapter:
             expected_native_session_ref=previous_native_session_ref,
             enforce_native_session_ref=enforce_previous_native,
             allow_missing_operation=True,
+            expected_web_gate=(
+                "web-evidence-gate:v1"
+                in request.runtime_binding.capability_bindings
+                and checkpoint.next_turn_number == 0
+            ),
         )
+        if raw.get("status") == "web_evidence_ready":
+            _validate_web_evidence_gate_result(raw)
+            _merge_web_evidence([evidence])
+            raise DeepFetchUnavailable(
+                "deepfetch_runtime_binding_transition_required",
+                durable_outcome="terminal",
+                native_session_ref=native_session_ref,
+            )
         if raw.get("action") != "finalize":
             # The predecessor provider effect is signed-terminal at this turn
             # boundary, but continuing would start a new old-binding effect.
@@ -1010,6 +1689,7 @@ class CodexDeepFetchAdapter:
         runtime_binding_hash: str,
         expected_native_session_ref: str | None,
         enforce_native_session_ref: bool,
+        expected_web_gate: bool,
         allow_missing_operation: bool = False,
     ) -> tuple[dict[str, object], str, dict[str, object]]:
         """Verify one old durable turn without publishing any new files."""
@@ -1085,6 +1765,11 @@ class CodexDeepFetchAdapter:
                 )
                 prompt = prompt_path.read_text(encoding="utf-8")
                 schema_text = schema_path.read_text(encoding="utf-8")
+                full_schema_text = canonical_json(_deepfetch_output_schema())
+                gate_schema_text = canonical_json(
+                    _deepfetch_web_evidence_gate_output_schema()
+                )
+                gate_turn = schema_text == gate_schema_text
                 invocation_native = invocation.get("native_session_ref")
                 if enforce_native and invocation_native != native_session_ref:
                     raise ValueError("deepfetch reconciliation session mismatch")
@@ -1116,17 +1801,30 @@ class CodexDeepFetchAdapter:
                     != runtime_binding_hash
                     or invocation.get("prompt_hash") != canonical_hash(prompt)
                     or invocation.get("output_schema_hash")
-                    != canonical_hash(_deepfetch_output_schema())
+                    != canonical_hash(
+                        _deepfetch_web_evidence_gate_output_schema()
+                        if gate_turn
+                        else _deepfetch_output_schema()
+                    )
                     or invocation.get("model_ref")
                     != request.runtime_binding.model_ref
-                    or f"public_output_root={public_root}" not in prompt.splitlines()
-                    or schema_text
-                    != canonical_json(_deepfetch_output_schema())
+                    or schema_text not in {full_schema_text, gate_schema_text}
+                    or gate_turn != expected_web_gate
+                    or (
+                        gate_turn
+                        and not prompt.startswith("web_evidence_gate=v1\n")
+                    )
+                    or (
+                        not gate_turn
+                        and f"public_output_root={public_root}"
+                        not in prompt.splitlines()
+                    )
                 ):
                     raise ValueError("deepfetch reconciliation identity mismatch")
                 invocation_hash = canonical_hash(invocation)
                 self._verify_existing_supervisor_request(
                     directory,
+                    provider_job_ref=provider_job_ref,
                     invocation_hash=invocation_hash,
                     invocation_native_session_ref=cast(
                         str | None, invocation_native
@@ -1205,6 +1903,7 @@ class CodexDeepFetchAdapter:
         self,
         directory: Path,
         *,
+        provider_job_ref: str,
         invocation_hash: str,
         invocation_native_session_ref: str | None,
         runtime_binding: DeepFetchRuntimeBinding,
@@ -1225,6 +1924,12 @@ class CodexDeepFetchAdapter:
             "receipt_path": directory / "supervisor-exit.json",
             "stop_path": directory / "supervisor-stop.json",
         }
+        timeout_seconds = supervisor.get("timeout_seconds")
+        timeout_valid = timeout_seconds is None or (
+            isinstance(timeout_seconds, (int, float))
+            and not isinstance(timeout_seconds, bool)
+            and float(timeout_seconds) > 0
+        )
         if (
             set(supervisor)
             != {
@@ -1242,9 +1947,7 @@ class CodexDeepFetchAdapter:
                 supervisor.get(key) != str(path)
                 for key, path in expected_paths.items()
             )
-            or not isinstance(supervisor.get("timeout_seconds"), (int, float))
-            or isinstance(supervisor.get("timeout_seconds"), bool)
-            or cast(float, supervisor["timeout_seconds"]) <= 0
+            or not timeout_valid
             or not isinstance(supervisor.get("stream_max_bytes"), int)
             or isinstance(supervisor.get("stream_max_bytes"), bool)
             or not 0 < cast(int, supervisor["stream_max_bytes"]) <= (
@@ -1274,12 +1977,21 @@ class CodexDeepFetchAdapter:
             in runtime_binding.capability_bindings
             else "workspace-write"
         )
-        expected_workspace = (
-            self._agent_workspace
-            if "agent-workspace-policy:dedicated-research-workspace-v1"
+        if (
+            "agent-workspace-policy:provider-operation-scoped-v2"
             in runtime_binding.capability_bindings
-            else self._workspace
-        )
+        ):
+            expected_workspace = self._agent_workspace_path(
+                provider_job_ref,
+                canonical_hash(runtime_binding.as_dict()),
+            )
+        elif (
+            "agent-workspace-policy:dedicated-research-workspace-v1"
+            in runtime_binding.capability_bindings
+        ):
+            expected_workspace = self._workspace / "research-workspace"
+        else:
+            expected_workspace = self._workspace
         if (
             len(arguments) < 2
             or arguments[1] != "exec"
@@ -1311,6 +2023,16 @@ class CodexDeepFetchAdapter:
         checkpoint_path: Path,
         checkpoint: _DeepFetchProtocolCheckpoint,
     ) -> DeepFetchResult:
+        if checkpoint.legacy_checkpoint:
+            checkpoint = self._reattest_legacy_acquisition_proofs(
+                request,
+                checkpoint,
+            )
+            # Seal the query-only Owner re-attestation before any provider or
+            # hosted Acquisition effect can continue under the upgraded schema.
+            if checkpoint.phase != "finalized":
+                checkpoint = replace(checkpoint, legacy_checkpoint=False)
+                _write_protocol_checkpoint(checkpoint_path, checkpoint)
         while checkpoint.phase != "finalized":
             if checkpoint.phase == "pending_acquisition":
                 if self._acquisition_client is None:
@@ -1331,6 +2053,21 @@ class CodexDeepFetchAdapter:
                         durable_outcome="pending",
                         native_session_ref=checkpoint.native_session_ref,
                     )
+                try:
+                    item_proofs = _hosted_acquisition_item_proofs(
+                        request.acquisition_session_ref,
+                        batch,
+                        execution,
+                    )
+                except DeepFetchUnavailable as error:
+                    # Acquisition already committed this immutable request.  A
+                    # proof failure cannot be repaired by reopening the same
+                    # DeepFetch attempt or replaying the Acquisition Provider.
+                    raise DeepFetchUnavailable(
+                        error.code,
+                        durable_outcome="pending",
+                        native_session_ref=checkpoint.native_session_ref,
+                    ) from error
                 acquisition_ids = (
                     *checkpoint.acquisition_request_ids,
                     batch.request_id,
@@ -1339,10 +2076,15 @@ class CodexDeepFetchAdapter:
                     checkpoint,
                     phase="ready_for_turn",
                     acquisition_request_ids=acquisition_ids,
+                    acquisition_item_proofs=(
+                        *checkpoint.acquisition_item_proofs,
+                        *item_proofs,
+                    ),
                     pending_acquisition=None,
                     next_prompt=self._acquisition_result_prompt(
                         public_root,
                         execution,
+                        item_proofs,
                     ),
                 )
                 _write_protocol_checkpoint(checkpoint_path, checkpoint)
@@ -1369,9 +2111,18 @@ class CodexDeepFetchAdapter:
                 native_session_ref=checkpoint.native_session_ref,
                 job_ref=provider_job_ref,
             )
+            web_gate = checkpoint.next_prompt.startswith(
+                "web_evidence_gate=v1\n"
+            )
             raw, native_session_ref, turn_evidence = self._invoke(
                 turn_request,
                 checkpoint.next_prompt,
+                output_schema=(
+                    _deepfetch_web_evidence_gate_output_schema()
+                    if web_gate
+                    else _deepfetch_output_schema()
+                ),
+                timeout_seconds=None,
             )
             if checkpoint.native_session_ref is None:
                 # A terminal provider call can establish the native session even
@@ -1385,6 +2136,30 @@ class CodexDeepFetchAdapter:
             elif checkpoint.native_session_ref != native_session_ref:
                 raise DeepFetchUnavailable("deepfetch_native_session_changed")
             evidence_parts = (*checkpoint.evidence_parts, turn_evidence)
+            if web_gate:
+                _validate_web_evidence_gate_result(raw)
+                if (
+                    turn_evidence["spawned_reader_agent_refs"]
+                    or turn_evidence["terminal_reader_agent_refs"]
+                ):
+                    raise DeepFetchUnavailable(
+                        "deepfetch_reader_agent_trace_invalid"
+                    )
+                _merge_web_evidence([turn_evidence])
+                checkpoint = replace(
+                    checkpoint,
+                    phase="ready_for_turn",
+                    native_session_ref=native_session_ref,
+                    next_turn_number=turn_number + 1,
+                    evidence_parts=evidence_parts,
+                    next_prompt=self._initial_prompt(
+                        request,
+                        public_root=public_root,
+                        private_root=checkpoint_path.parent,
+                    ),
+                )
+                _write_protocol_checkpoint(checkpoint_path, checkpoint)
+                continue
             if raw.get("action") == "finalize":
                 _validate_final_envelope_shape(raw)
                 checkpoint = replace(
@@ -1419,9 +2194,31 @@ class CodexDeepFetchAdapter:
         assert checkpoint.final_envelope is not None
         assert checkpoint.native_session_ref is not None
         web_evidence = _merge_web_evidence(list(checkpoint.evidence_parts))
-        reader_agent_refs = _verified_reader_agent_refs(
-            checkpoint.evidence_parts
+        reader_agent_trace = _verified_reader_agent_refs(
+            checkpoint.evidence_parts,
+            ledger_reader=self._codex_ledger_reader,
+            root_session_ref=checkpoint.native_session_ref,
+            expected_working_directory=str(
+                self._agent_workspace_path(
+                    request.job_ref or f"{request.run_ref}:direct",
+                    canonical_hash(request.runtime_binding.as_dict()),
+                )
+            ),
         )
+        authoritative_acquisition_proofs = (
+            self._query_authoritative_acquisition_proofs(
+                request,
+                checkpoint.acquisition_request_ids,
+                native_session_ref=checkpoint.native_session_ref,
+            )
+        )
+        if (
+            authoritative_acquisition_proofs
+            != checkpoint.acquisition_item_proofs
+        ):
+            raise DeepFetchUnavailable(
+                "deepfetch_hosted_acquisition_proof_mismatch"
+            )
         _precheck_public_artifact_resource_limits(public_root)
         _run_exact_papers_validator(self._skill_root, public_root)
         imported = _import_v4_public_artifacts(
@@ -1429,7 +2226,8 @@ class CodexDeepFetchAdapter:
             checkpoint.final_envelope,
             acquisition_session_ref=request.acquisition_session_ref,
             acquisition_request_ids=checkpoint.acquisition_request_ids,
-            reader_agent_refs=reader_agent_refs,
+            acquisition_item_proofs=authoritative_acquisition_proofs,
+            reader_agent_trace=reader_agent_trace,
         )
         web_evidence = {**web_evidence, "prototype": imported[6]}
         result = DeepFetchResult(
@@ -1448,10 +2246,96 @@ class CodexDeepFetchAdapter:
         )
         validate_deepfetch_result(request, result)
         # "finalized" is durable only after the exact v4 validator, artifact
-        # import, web/Reader provenance checks, and public-result validation all
-        # pass. A malformed terminal turn remains safely retryable in-session.
-        _write_protocol_checkpoint(checkpoint_path, checkpoint)
+        # import, hosted artifact/Reader-output checks, native child-tool
+        # provenance, and public-result validation all pass.
+        _write_protocol_checkpoint(
+            checkpoint_path,
+            replace(checkpoint, legacy_checkpoint=False),
+        )
         return result
+
+    def _reattest_legacy_acquisition_proofs(
+        self,
+        request: DeepFetchProviderRequest,
+        checkpoint: _DeepFetchProtocolCheckpoint,
+    ) -> _DeepFetchProtocolCheckpoint:
+        if not checkpoint.acquisition_request_ids:
+            return checkpoint
+        proofs = self._query_authoritative_acquisition_proofs(
+            request,
+            checkpoint.acquisition_request_ids,
+            native_session_ref=checkpoint.native_session_ref,
+        )
+        return replace(
+            checkpoint,
+            acquisition_item_proofs=proofs,
+        )
+
+    def _query_authoritative_acquisition_proofs(
+        self,
+        request: DeepFetchProviderRequest,
+        request_ids: tuple[str, ...],
+        *,
+        native_session_ref: str | None,
+    ) -> tuple[dict[str, object], ...]:
+        if not request_ids:
+            return ()
+        query_completed = getattr(
+            self._acquisition_client,
+            "query_completed_batch",
+            None,
+        )
+        if not callable(query_completed):
+            raise DeepFetchUnavailable(
+                "deepfetch_acquisition_reattestation_required",
+                durable_outcome="pending",
+                native_session_ref=native_session_ref,
+            )
+        proofs: list[dict[str, object]] = []
+        try:
+            for request_id in request_ids:
+                execution = query_completed(
+                    request.acquisition_session_ref,
+                    request_id,
+                )
+                if execution is None or execution.request_id != request_id:
+                    raise DeepFetchUnavailable(
+                        "deepfetch_acquisition_reattestation_required"
+                    )
+                proofs.extend(
+                    _hosted_acquisition_item_proofs(
+                        request.acquisition_session_ref,
+                        execution.request,
+                        execution,
+                    )
+                )
+        except DeepFetchUnavailable as error:
+            raise DeepFetchUnavailable(
+                error.code,
+                durable_outcome=(
+                    "terminal"
+                    if error.code
+                    == "deepfetch_acquisition_owner_proof_legacy_missing"
+                    else "pending"
+                ),
+                native_session_ref=native_session_ref,
+            ) from error
+        except RuntimeError as error:
+            code = (
+                "deepfetch_acquisition_owner_proof_legacy_missing"
+                if str(error) == "acquisition_artifact_proof_legacy_missing"
+                else "deepfetch_acquisition_reattestation_required"
+            )
+            raise DeepFetchUnavailable(
+                code,
+                durable_outcome=(
+                    "terminal"
+                    if code == "deepfetch_acquisition_owner_proof_legacy_missing"
+                    else "pending"
+                ),
+                native_session_ref=native_session_ref,
+            ) from error
+        return tuple(proofs)
 
     def _initial_prompt(
         self,
@@ -1461,6 +2345,13 @@ class CodexDeepFetchAdapter:
         private_root: Path,
     ) -> str:
         skill_entrypoint = self._skill_root / "SKILL.md"
+        route_contract = ""
+        if request.scope.get("literature_mode") == "oa_only":
+            route_contract = (
+                "本请求的 oa_only 是用户明确选择的主路线；跳过 "
+                "institution/browser preflight，不得探测或评价机构访问可用性，"
+                "不得描述为被迫、只能或降级到 OA。\n"
+            )
         return (
             "你是绑定 fixed commit "
             f"{DEEPFETCH_PROTOTYPE_COMMIT} 的 DeepFetch v4 main agent。"
@@ -1469,12 +2360,15 @@ class CodexDeepFetchAdapter:
             "hosted Acquisition、independent Readers、Synthesis 与 "
             "scripts/papers.py finalize 闭环；不得把它扁平化成单体 Web Search/Fetch "
             "回答。主 Agent 负责发现、选择、ledger 和 summary，Acquisition 只负责"
-            "合法获取；每份已注册全文必须用原生 spawn_agent 启动一个独立 Reader，"
+            "合法获取；不得直接运行 Nature Downloader 或其下载脚本，需要全文时必须先返回 "
+            "action=acquire，并且只把 hosted Acquisition 返回为 obtained 的同一 paper_id "
+            "交给 Reader。每份已注册全文必须用原生 spawn_agent 启动一个独立 Reader，"
             "并 wait 到终态。最终 workflow.reader_assignments 的 reader_agent_ref "
-            "必须填写 spawn_agent 返回的 child id，不能填写 assignment_id。"
+            "填写 spawn_agent 返回的 task_name。"
             "不得声称创建 Quest/Question/Cycle、接纳 Evidence 或签发 receipt；"
             "不得把 Cookie、凭据、浏览器 profile、私有 manifest 或恢复状态写入"
             "公开目录。最终公开目录必须且只能包含 papers.json、summary.md、fulltext/。\n"
+            f"{_DEEPFETCH_COMPLETION_RULES}\n"
             f"deepfetch_skill_root={self._skill_root}\n"
             f"public_output_root={public_root}\n"
             f"private_work_root={private_root}\n"
@@ -1483,24 +2377,51 @@ class CodexDeepFetchAdapter:
             f"draft_revision={request.draft_revision}\n"
             f"draft_hash={request.draft_hash}\n"
             f"scope={canonical_json(request.scope)}\n"
+            f"{route_contract}"
             "accepted_material_bindings="
             f"{canonical_json(list(request.accepted_material_bindings))}"
+        )
+
+    def _web_evidence_gate_prompt(
+        self,
+        request: DeepFetchProviderRequest,
+    ) -> str:
+        """Open one live result before any expensive DeepFetch side effect."""
+
+        return (
+            "web_evidence_gate=v1\n"
+            "这是 DeepFetch 的短 Web Evidence Gate，不是研究成果。首先完成以下动作："
+            "根据 scope 做至少一次真实 Web Search，并立即 Open/Fetch 至少一个检索结果。"
+            "Codex 默认工具能力保持可用，但本 Gate 只验收上述 Search 与 Open/Fetch；"
+            "通过前不要展开 Acquisition、Reader 或正式成果生成。"
+            "完成 Search 与 Open/Fetch 后，只返回 schema 要求的 web_evidence_ready。\n"
+            f"request_ref={request.request_ref}\n"
+            f"draft_revision={request.draft_revision}\n"
+            f"draft_hash={request.draft_hash}\n"
+            f"scope={canonical_json(request.scope)}"
         )
 
     def _acquisition_result_prompt(
         self,
         public_root: Path,
         execution: AcquisitionBatchExecution,
+        item_proofs: tuple[dict[str, object], ...],
     ) -> str:
         return (
             "继续同一 DeepFetch v4 main agent Session。以下是 hosted Acquisition "
             "对上一精确批次返回的紧凑结果；不得改变 request_id 或把私有 manifest "
             "带入公开资产。继续 Radar/Ledger/Readers，必要时提出一个新的有限批次，"
             "最终运行固定 bundle 的 scripts/papers.py finalize。每个 Reader 的 "
-            "reader_agent_ref 必须使用原生 spawn_agent 返回的 child id。\n"
+            "reader_agent_ref 使用原生 spawn_agent 返回的 task_name。"
+            "Reader 和 "
+            "public fulltext/ 必须读取 obtained path 并逐字节复制同一 hosted artifact；"
+            "不得按同一 paper_id 自造或替换正文 bytes。\n"
+            f"{_DEEPFETCH_COMPLETION_RULES}\n"
             f"deepfetch_skill_root={self._skill_root}\n"
             f"public_output_root={public_root}\n"
             f"acquisition_request_id={execution.request_id}\n"
+            "acquisition_artifact_proofs="
+            f"{canonical_json(list(item_proofs))}\n"
             "acquisition_result="
             f"{canonical_json([item.as_dict() for item in execution.results])}"
         )
@@ -1509,11 +2430,25 @@ class CodexDeepFetchAdapter:
         self,
         request: DeepFetchProviderRequest,
         prompt: str,
+        *,
+        output_schema: dict[str, object] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[dict[str, object], str, dict[str, object]]:
+        schema = output_schema or _deepfetch_output_schema()
         if request.job_ref is not None and callable(
             getattr(self._runner, "run_durable_job", None)
         ):
-            return self._invoke_durable(request, prompt)
+            return self._invoke_durable(
+                request,
+                prompt,
+                output_schema=schema,
+                timeout_seconds=timeout_seconds,
+            )
+        root_job_ref = request.job_ref or f"{request.run_ref}:direct"
+        agent_workspace = self._agent_workspace_for(
+            root_job_ref,
+            canonical_hash(request.runtime_binding.as_dict()),
+        )
         with tempfile.TemporaryDirectory(
             prefix="deepfetch-", dir=self._workspace
         ) as raw_directory:
@@ -1521,18 +2456,17 @@ class CodexDeepFetchAdapter:
             schema_path = directory / "output-schema.json"
             result_path = directory / "last-message.json"
             schema_path.write_text(
-                canonical_json(_deepfetch_output_schema()), encoding="utf-8"
+                canonical_json(schema), encoding="utf-8"
             )
             argv = [
                 self._executable,
                 "exec",
                 "--skip-git-repo-check",
-                "--ignore-user-config",
                 "--strict-config",
                 "--config",
-                "mcp_servers={}",
-                "--config",
                 'approval_policy="never"',
+                "--config",
+                CODEX_REASONING_EFFORT_CONFIG,
                 "--config",
                 'web_search="live"',
                 "--config",
@@ -1542,7 +2476,7 @@ class CodexDeepFetchAdapter:
                 "--model",
                 self._model_ref,
                 "--cd",
-                str(self._agent_workspace),
+                str(agent_workspace),
                 "--json",
                 "--output-schema",
                 str(schema_path),
@@ -1557,10 +2491,10 @@ class CodexDeepFetchAdapter:
                 run_job = getattr(self._runner, "run_job", None)
                 if request.job_ref is not None and callable(run_job):
                     completed = run_job(
-                        request.job_ref, argv, prompt, self._timeout_seconds
+                        request.job_ref, argv, prompt, timeout_seconds
                     )
                 else:
-                    completed = self._runner(argv, prompt, self._timeout_seconds)
+                    completed = self._runner(argv, prompt, timeout_seconds)
             except _ProcessStopped as error:
                 raise DeepFetchUnavailable("deepfetch_provider_stopped") from error
             except FileNotFoundError as error:
@@ -1593,18 +2527,28 @@ class CodexDeepFetchAdapter:
                 raise DeepFetchUnavailable("codex_deepfetch_output_invalid") from error
             if not isinstance(decoded, dict):
                 raise DeepFetchUnavailable("codex_deepfetch_output_invalid")
-            native_session_ref = request.native_session_ref or _thread_id(
-                completed.stdout
-            )
-            if native_session_ref is None:
+            observed_native_session_ref = _thread_id(completed.stdout)
+            if observed_native_session_ref is None:
                 raise DeepFetchUnavailable("codex_deepfetch_session_ref_missing")
+            if (
+                request.native_session_ref is not None
+                and request.native_session_ref != observed_native_session_ref
+            ):
+                raise DeepFetchUnavailable("deepfetch_native_session_changed")
             web_evidence = _verified_turn_evidence(completed.stdout)
-            return cast(dict[str, object], decoded), native_session_ref, web_evidence
+            return (
+                cast(dict[str, object], decoded),
+                observed_native_session_ref,
+                web_evidence,
+            )
 
     def _invoke_durable(
         self,
         request: DeepFetchProviderRequest,
         prompt: str,
+        *,
+        output_schema: dict[str, object],
+        timeout_seconds: float | None,
     ) -> tuple[dict[str, object], str, dict[str, object]]:
         """Reconcile one logical provider operation across daemon Attempts."""
 
@@ -1631,6 +2575,8 @@ class CodexDeepFetchAdapter:
                 job_ref=request.job_ref,
                 request=request,
                 prompt=prompt,
+                output_schema=output_schema,
+                timeout_seconds=timeout_seconds,
                 native_session_ref=native_session_ref,
                 transport_key=transport_key,
             )
@@ -1668,11 +2614,13 @@ class CodexDeepFetchAdapter:
         job_ref: str,
         request: DeepFetchProviderRequest,
         prompt: str,
+        output_schema: dict[str, object],
+        timeout_seconds: float | None,
         native_session_ref: str | None,
         transport_key: bytes,
     ) -> tuple[str, dict[str, object] | None, str, str | None]:
         directory.mkdir(parents=True, exist_ok=True)
-        schema = _deepfetch_output_schema()
+        schema = output_schema
         invocation = {
             "schema_ref": "meta-research/deepfetch-provider-operation/v1",
             "job_ref": job_ref,
@@ -1729,6 +2677,10 @@ class CodexDeepFetchAdapter:
                     durable_outcome="pending",
                 )
             argv = self._durable_argv(
+                job_ref=job_ref,
+                runtime_binding_hash=canonical_hash(
+                    request.runtime_binding.as_dict()
+                ),
                 schema_path=schema_path,
                 result_path=result_path,
                 native_session_ref=native_session_ref,
@@ -1741,7 +2693,7 @@ class CodexDeepFetchAdapter:
                         "schema_ref": SUPERVISOR_REQUEST_SCHEMA,
                         "invocation_hash": invocation_hash,
                         "argv": argv,
-                        "timeout_seconds": self._timeout_seconds,
+                        "timeout_seconds": timeout_seconds,
                         "stream_max_bytes": DEEPFETCH_PROVIDER_STREAM_MAX_BYTES,
                         "result_max_bytes": PROVIDER_RESULT_MAX_BYTES,
                         "prompt_path": str(prompt_path),
@@ -1761,7 +2713,7 @@ class CodexDeepFetchAdapter:
                     job_ref,
                     argv,
                     prompt,
-                    self._timeout_seconds,
+                    timeout_seconds,
                     stdout_path,
                     directory / "pid.json",
                     supervisor_request_path,
@@ -1805,20 +2757,24 @@ class CodexDeepFetchAdapter:
     def _durable_argv(
         self,
         *,
+        job_ref: str,
+        runtime_binding_hash: str,
         schema_path: Path,
         result_path: Path,
         native_session_ref: str | None,
     ) -> list[str]:
+        agent_workspace = self._agent_workspace_for(
+            job_ref, runtime_binding_hash
+        )
         argv = [
             self._executable,
             "exec",
             "--skip-git-repo-check",
-            "--ignore-user-config",
             "--strict-config",
             "--config",
-            "mcp_servers={}",
-            "--config",
             'approval_policy="never"',
+            "--config",
+            CODEX_REASONING_EFFORT_CONFIG,
             "--config",
             'web_search="live"',
             "--config",
@@ -1828,7 +2784,7 @@ class CodexDeepFetchAdapter:
             "--model",
             self._model_ref,
             "--cd",
-            str(self._agent_workspace),
+            str(agent_workspace),
             "--json",
             "--output-schema",
             str(schema_path),
@@ -2026,7 +2982,8 @@ def _load_or_create_protocol_checkpoint(
                 checkpoint,
                 native_session_ref=native_session_ref,
             )
-            _write_protocol_checkpoint(path, checkpoint)
+            if not checkpoint.legacy_checkpoint:
+                _write_protocol_checkpoint(path, checkpoint)
         return checkpoint
     checkpoint = _DeepFetchProtocolCheckpoint(
         identity_hash=identity_hash,
@@ -2035,9 +2992,11 @@ def _load_or_create_protocol_checkpoint(
         next_turn_number=0,
         evidence_parts=(),
         acquisition_request_ids=(),
+        acquisition_item_proofs=(),
         pending_acquisition=None,
         next_prompt=initial_prompt,
         final_envelope=None,
+        legacy_checkpoint=False,
     )
     _write_protocol_checkpoint(path, checkpoint)
     return checkpoint
@@ -2061,16 +3020,28 @@ def _read_protocol_checkpoint(
         "next_turn_number",
         "evidence_parts",
         "acquisition_request_ids",
+        "acquisition_item_proofs",
         "pending_acquisition",
         "next_prompt",
         "final_envelope",
     }
+    if not isinstance(value, dict):
+        raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+    schema_ref = value.get("schema_ref")
+    legacy_required = required - {"acquisition_item_proofs"}
     if (
-        not isinstance(value, dict)
-        or set(value) != required
-        or value.get("schema_ref") != DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
-        or value.get("identity_hash") != identity_hash
+        schema_ref == DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
+        and set(value) == required
     ):
+        acquisition_item_proofs = value.get("acquisition_item_proofs")
+    elif (
+        schema_ref == LEGACY_DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
+        and set(value) == legacy_required
+    ):
+        acquisition_item_proofs = []
+    else:
+        raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+    if value.get("identity_hash") != identity_hash:
         raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
     phase = value.get("phase")
     native_session_ref = value.get("native_session_ref")
@@ -2092,8 +3063,16 @@ def _read_protocol_checkpoint(
             for item in acquisition_request_ids
         )
         or len(set(acquisition_request_ids)) != len(acquisition_request_ids)
+        or not isinstance(acquisition_item_proofs, list)
     ):
         raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+    validated_item_proofs = _validated_hosted_acquisition_item_proofs(
+        acquisition_item_proofs,
+        acquisition_request_ids=cast(list[str], acquisition_request_ids),
+        require_every_request=(
+            schema_ref == DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
+        ),
+    )
     validated_evidence = tuple(
         _validated_turn_evidence_part(item) for item in evidence_parts
     )
@@ -2138,9 +3117,13 @@ def _read_protocol_checkpoint(
         next_turn_number=next_turn_number,
         evidence_parts=validated_evidence,
         acquisition_request_ids=tuple(cast(list[str], acquisition_request_ids)),
+        acquisition_item_proofs=validated_item_proofs,
         pending_acquisition=cast(dict[str, object] | None, pending),
         next_prompt=cast(str | None, prompt),
         final_envelope=cast(dict[str, object] | None, final),
+        legacy_checkpoint=(
+            schema_ref == LEGACY_DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
+        ),
     )
 
 
@@ -2214,6 +3197,193 @@ def _acquisition_batch_from_checkpoint(
         raise DeepFetchUnavailable(
             "deepfetch_protocol_checkpoint_invalid"
         ) from error
+
+
+def _hosted_acquisition_item_proofs(
+    session_ref: str,
+    batch: AcquisitionBatchRequest,
+    execution: AcquisitionBatchExecution,
+) -> tuple[dict[str, object], ...]:
+    expected_paper_ids = {paper.paper_id for paper in batch.papers}
+    result_paper_ids = [result.paper_id for result in execution.results]
+    if (
+        execution.session_ref != session_ref
+        or execution.request_id != batch.request_id
+        or execution.request.identity_payload() != batch.identity_payload()
+        or execution.request.session_ref != session_ref
+        or not execution.request.target_dir
+        or not Path(execution.request.target_dir).is_absolute()
+        or len(result_paper_ids) != len(set(result_paper_ids))
+        or set(result_paper_ids) != expected_paper_ids
+        or any(result.status not in {"obtained", "missing"} for result in execution.results)
+    ):
+        raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
+    try:
+        validate_item_results(batch, execution.results)
+    except AcquisitionUnavailable as error:
+        raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid") from error
+    if execution.status != aggregate_batch_status(execution.results):
+        raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
+    proofs: list[dict[str, object]] = []
+    for result in execution.results:
+        proof: dict[str, object] = {
+            "request_id": batch.request_id,
+            "paper_id": result.paper_id,
+            "status": result.status,
+            "path": None,
+            "format": None,
+            "sha256": None,
+            "bytes": None,
+        }
+        if result.status == "obtained":
+            if (
+                result.content_sha256 is None
+                or result.content_bytes is None
+            ):
+                raise DeepFetchUnavailable(
+                    "deepfetch_acquisition_owner_proof_legacy_missing"
+                )
+            path, artifact_format, observed_digest, observed_bytes = (
+                _read_hosted_acquisition_artifact(
+                    result.path,
+                    result.format,
+                    required_root=Path(execution.request.target_dir),
+                )
+            )
+            if (
+                observed_digest != result.content_sha256
+                or observed_bytes != result.content_bytes
+            ):
+                raise DeepFetchUnavailable(
+                    "deepfetch_acquisition_artifact_drift"
+                )
+            proof.update(
+                {
+                    "path": path,
+                    "format": artifact_format,
+                    "sha256": result.content_sha256,
+                    "bytes": result.content_bytes,
+                }
+            )
+        proofs.append(proof)
+    return tuple(proofs)
+
+
+def _read_hosted_acquisition_artifact(
+    path_value: object,
+    format_value: object,
+    *,
+    required_root: Path | None = None,
+) -> tuple[str, str, str, int]:
+    if (
+        not isinstance(path_value, str)
+        or not path_value
+        or not Path(path_value).is_absolute()
+        or format_value not in {"pdf", "html", "xml"}
+    ):
+        raise DeepFetchUnavailable("deepfetch_acquisition_artifact_invalid")
+    path = Path(path_value)
+    try:
+        resolved = path.resolve(strict=True)
+        required_root_resolved = (
+            None if required_root is None else required_root.resolve(strict=True)
+        )
+        if (
+            str(resolved) != path_value
+            or path.is_symlink()
+            or not path.is_file()
+            or required_root is not None
+            and (
+                required_root.is_symlink()
+                or not required_root.is_dir()
+                or required_root_resolved != required_root
+                or not resolved.is_relative_to(required_root_resolved)
+            )
+        ):
+            raise OSError("unsafe hosted artifact")
+        byte_count = path.stat().st_size
+        if byte_count < 1 or byte_count > MAX_DEEPFETCH_FULLTEXT_FILE_BYTES:
+            raise DeepFetchUnavailable("deepfetch_acquisition_artifact_invalid")
+        with path.open("rb") as source:
+            content = source.read(MAX_DEEPFETCH_FULLTEXT_FILE_BYTES + 1)
+        if len(content) != byte_count:
+            raise DeepFetchUnavailable("deepfetch_acquisition_artifact_invalid")
+    except (OSError, ValueError) as error:
+        raise DeepFetchUnavailable("deepfetch_acquisition_artifact_invalid") from error
+    return (
+        path_value,
+        cast(str, format_value),
+        hashlib.sha256(content).hexdigest(),
+        byte_count,
+    )
+
+
+def _validated_hosted_acquisition_item_proofs(
+    value: object,
+    *,
+    acquisition_request_ids: list[str],
+    require_every_request: bool,
+) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, list):
+        raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+    proofs: list[dict[str, object]] = []
+    identities: set[tuple[str, str]] = set()
+    request_ids = set(acquisition_request_ids)
+    for proof in value:
+        if not isinstance(proof, dict) or set(proof) != {
+            "request_id",
+            "paper_id",
+            "status",
+            "path",
+            "format",
+            "sha256",
+            "bytes",
+        }:
+            raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+        request_id = proof.get("request_id")
+        paper_id = proof.get("paper_id")
+        status = proof.get("status")
+        identity = (str(request_id), str(paper_id))
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or request_id not in request_ids
+            or not isinstance(paper_id, str)
+            or not paper_id
+            or status not in {"obtained", "missing"}
+            or identity in identities
+        ):
+            raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+        path = proof.get("path")
+        artifact_format = proof.get("format")
+        sha256 = proof.get("sha256")
+        byte_count = proof.get("bytes")
+        if status == "obtained":
+            observed = _read_hosted_acquisition_artifact(path, artifact_format)
+            if observed != (path, artifact_format, sha256, byte_count):
+                raise DeepFetchUnavailable(
+                    "deepfetch_protocol_checkpoint_invalid"
+                )
+        elif any(
+            value is not None
+            for value in (path, artifact_format, sha256, byte_count)
+        ):
+            raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+        identities.add(identity)
+        proofs.append(
+            {
+                "request_id": request_id,
+                "paper_id": paper_id,
+                "status": status,
+                "path": path,
+                "format": artifact_format,
+                "sha256": sha256,
+                "bytes": byte_count,
+            }
+        )
+    if require_every_request and {proof["request_id"] for proof in proofs} != request_ids:
+        raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+    return tuple(proofs)
 
 
 def _validate_final_envelope_shape(value: dict[str, object]) -> None:
@@ -2410,11 +3580,18 @@ def _validated_v4_acquisition_request(
                 ),
             )
         )
-    return AcquisitionBatchRequest(
+    batch = AcquisitionBatchRequest(
         request_id=request_id,
         route_policy="oa_first_then_institution",
         papers=tuple(papers),
     )
+    try:
+        validate_batch_request(batch)
+    except AcquisitionUnavailable as error:
+        raise DeepFetchUnavailable(
+            "deepfetch_acquisition_request_invalid"
+        ) from error
+    return batch
 
 
 def _merge_web_evidence(
@@ -2445,7 +3622,8 @@ def _import_v4_public_artifacts(
     *,
     acquisition_session_ref: str,
     acquisition_request_ids: tuple[str, ...],
-    reader_agent_refs: tuple[str, ...],
+    acquisition_item_proofs: tuple[dict[str, object], ...],
+    reader_agent_trace: _VerifiedReaderAgentTrace,
 ) -> tuple[
     Literal["complete", "limited", "honest_empty"],
     str,
@@ -2603,9 +3781,30 @@ def _import_v4_public_artifacts(
     ]
     if (
         len(set(assignment_agent_refs)) != len(assignment_agent_refs)
-        or set(assignment_agent_refs) != set(reader_agent_refs)
+        or len(assignment_agent_refs) != len(reader_agent_trace.refs)
+        or reader_agent_trace.identity_kind == "task_name"
+        and set(assignment_agent_refs) != set(reader_agent_trace.refs)
     ):
         raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+    if assignments and not acquisition_request_ids:
+        raise DeepFetchUnavailable("deepfetch_hosted_acquisition_proof_missing")
+    obtained_artifacts: dict[str, dict[str, object]] = {}
+    for proof in acquisition_item_proofs:
+        if proof["status"] != "obtained":
+            continue
+        paper_id = cast(str, proof["paper_id"])
+        previous = obtained_artifacts.get(paper_id)
+        artifact = {
+            key: proof[key]
+            for key in ("path", "format", "sha256", "bytes")
+        }
+        if previous is not None and previous != artifact:
+            raise DeepFetchUnavailable(
+                "deepfetch_hosted_acquisition_artifact_mismatch"
+            )
+        obtained_artifacts[paper_id] = artifact
+    if set(assignment_by_paper) - set(obtained_artifacts):
+        raise DeepFetchUnavailable("deepfetch_hosted_acquisition_proof_mismatch")
 
     papers: list[dict[str, object]] = []
     fulltexts: list[dict[str, object]] = []
@@ -2743,6 +3942,24 @@ def _import_v4_public_artifacts(
             if not content_bytes:
                 raise DeepFetchUnavailable("deepfetch_fulltext_invalid")
             suffix = candidate.suffix.lower()
+            hosted_artifact = obtained_artifacts.get(paper_id)
+            expected_suffix = {
+                "pdf": ".pdf",
+                "html": ".html",
+                "xml": ".xml",
+            }.get(
+                None if hosted_artifact is None else hosted_artifact["format"]
+            )
+            if (
+                hosted_artifact is None
+                or suffix != expected_suffix
+                or len(content_bytes) != hosted_artifact["bytes"]
+                or hashlib.sha256(content_bytes).hexdigest()
+                != hosted_artifact["sha256"]
+            ):
+                raise DeepFetchUnavailable(
+                    "deepfetch_hosted_acquisition_artifact_mismatch"
+                )
             if suffix == ".html":
                 media_type = "text/html"
                 try:
@@ -2809,6 +4026,11 @@ def _import_v4_public_artifacts(
     completion = envelope.get("completion")
     if completion not in {"complete", "limited", "honest_empty"}:
         raise DeepFetchUnavailable("codex_deepfetch_output_invalid")
+    if completion == "complete" and paper_order and limitations:
+        # Preserve a structurally valid, non-empty research result when the
+        # model reports its finished workflow as evidence-complete.  The
+        # imported artifacts remain authoritative about evidence gaps.
+        completion = "limited"
     if completion == "honest_empty" and paper_order:
         raise DeepFetchUnavailable("deepfetch_empty_result_not_empty")
     if completion == "complete" and (
@@ -3022,6 +4244,7 @@ def _required_text(value: object, *, maximum: int, code: str) -> str:
 
 
 def _thread_id(stdout: str) -> str | None:
+    observed: set[str] = set()
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -3030,8 +4253,10 @@ def _thread_id(stdout: str) -> str | None:
         if isinstance(event, dict) and event.get("type") == "thread.started":
             value = event.get("thread_id")
             if isinstance(value, str) and value:
-                return value
-    return None
+                observed.add(value)
+    if len(observed) > 1:
+        raise DeepFetchUnavailable("deepfetch_native_session_changed")
+    return next(iter(observed), None)
 
 
 def _validated_web_evidence(
@@ -3299,7 +4524,11 @@ def _validated_turn_evidence_part(value: object) -> dict[str, object]:
 
 def _verified_reader_agent_refs(
     evidence_parts: tuple[dict[str, object], ...],
-) -> tuple[str, ...]:
+    *,
+    ledger_reader: CodexSessionLedgerReader | None = None,
+    root_session_ref: str | None = None,
+    expected_working_directory: str | None = None,
+) -> _VerifiedReaderAgentTrace:
     spawned = [
         cast(str, reader_ref)
         for part in evidence_parts
@@ -3316,7 +4545,302 @@ def _verified_reader_agent_refs(
         or set(spawned) != set(terminal)
     ):
         raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
-    return tuple(spawned)
+    ledger_trace: _VerifiedReaderAgentTrace | None = None
+    if (
+        ledger_reader is not None
+        and root_session_ref is not None
+        and expected_working_directory is not None
+    ):
+        ledger_trace = _verified_codex_reader_ledger_refs(
+            ledger_reader,
+            root_session_ref=root_session_ref,
+            expected_working_directory=expected_working_directory,
+        )
+        if spawned and set(spawned) not in (
+            set(ledger_trace.refs),
+            set(ledger_trace.native_thread_refs),
+        ):
+            raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+    if ledger_trace is not None:
+        return ledger_trace
+    return _VerifiedReaderAgentTrace(tuple(spawned), "native_thread")
+
+
+def _verified_codex_reader_ledger_refs(
+    reader: CodexSessionLedgerReader,
+    *,
+    root_session_ref: str,
+    expected_working_directory: str,
+) -> _VerifiedReaderAgentTrace:
+    """Bind root spawn calls to child lineage, terminal output, and delivery."""
+
+    try:
+        records = reader.read(root_session_ref)
+    except (OSError, ValueError) as error:
+        raise DeepFetchUnavailable(
+            "deepfetch_reader_agent_trace_invalid"
+        ) from error
+    metadata = [
+        record.get("payload")
+        for record in records
+        if record.get("type") == "session_meta"
+        and isinstance(record.get("payload"), dict)
+    ]
+    if len(metadata) != 1:
+        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+    root = metadata[0]
+    contexts = [
+        record.get("payload")
+        for record in records
+        if record.get("type") == "turn_context"
+        and isinstance(record.get("payload"), dict)
+    ]
+    if (
+        root.get("id") != root_session_ref
+        or root.get("session_id") != root_session_ref
+        or root.get("cwd") != expected_working_directory
+        or root.get("thread_source") != "user"
+        or root.get("originator") != "codex_exec"
+        or root.get("source") != "exec"
+        or not contexts
+        or any(
+            context.get("cwd") != expected_working_directory
+            or not isinstance(context.get("sandbox_policy"), dict)
+            or cast(dict[str, object], context["sandbox_policy"]).get("type")
+            != "danger-full-access"
+            for context in contexts
+        )
+    ):
+        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+
+    spawn_calls: dict[str, str] = {}
+    spawn_outputs: dict[str, str] = {}
+    activities: dict[str, tuple[str, str]] = {}
+    delivered: dict[str, str] = {}
+    for record in records:
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if record.get("type") == "response_item" and (
+            payload.get("type") == "function_call"
+            and payload.get("name") == "spawn_agent"
+        ):
+            call_id = payload.get("call_id")
+            arguments = payload.get("arguments")
+            try:
+                decoded_arguments = json.loads(cast(str, arguments))
+            except (TypeError, json.JSONDecodeError) as error:
+                raise DeepFetchUnavailable(
+                    "deepfetch_reader_agent_trace_invalid"
+                ) from error
+            task_name = (
+                decoded_arguments.get("task_name")
+                if isinstance(decoded_arguments, dict)
+                else None
+            )
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or call_id in spawn_calls
+                or not isinstance(task_name, str)
+                or re.fullmatch(r"reader_[a-z0-9_]{1,96}", task_name) is None
+            ):
+                raise DeepFetchUnavailable(
+                    "deepfetch_reader_agent_trace_invalid"
+                )
+            spawn_calls[call_id] = task_name
+        elif record.get("type") == "response_item" and (
+            payload.get("type") == "function_call_output"
+        ):
+            call_id = payload.get("call_id")
+            if not isinstance(call_id, str) or call_id not in spawn_calls:
+                continue
+            try:
+                decoded_output = json.loads(cast(str, payload.get("output")))
+            except (TypeError, json.JSONDecodeError) as error:
+                raise DeepFetchUnavailable(
+                    "deepfetch_reader_agent_trace_invalid"
+                ) from error
+            canonical_task_name = (
+                decoded_output.get("task_name")
+                if isinstance(decoded_output, dict)
+                else None
+            )
+            if (
+                not isinstance(decoded_output, dict)
+                or set(decoded_output) != {"task_name"}
+                or canonical_task_name != f"/root/{spawn_calls[call_id]}"
+                or call_id in spawn_outputs
+            ):
+                raise DeepFetchUnavailable(
+                    "deepfetch_reader_agent_trace_invalid"
+                )
+            spawn_outputs[call_id] = canonical_task_name
+        elif record.get("type") == "event_msg" and (
+            payload.get("type") == "sub_agent_activity"
+            and payload.get("kind") == "started"
+        ):
+            call_id = payload.get("event_id")
+            task_name = payload.get("agent_path")
+            child_ref = payload.get("agent_thread_id")
+            if (
+                not isinstance(call_id, str)
+                or call_id in activities
+                or not isinstance(task_name, str)
+                or not isinstance(child_ref, str)
+                or not child_ref
+            ):
+                raise DeepFetchUnavailable(
+                    "deepfetch_reader_agent_trace_invalid"
+                )
+            activities[call_id] = (task_name, child_ref)
+        elif record.get("type") == "response_item" and (
+            payload.get("type") == "agent_message"
+        ):
+            author = payload.get("author")
+            content = payload.get("content")
+            text = _codex_ledger_message_text(content)
+            if (
+                not isinstance(author, str)
+                or not author.startswith("/root/reader_")
+                or payload.get("recipient") != "/root"
+                or text is None
+            ):
+                continue
+            delivered[author] = text
+
+    if (
+        not spawn_calls
+        or set(spawn_calls) != set(spawn_outputs)
+        or set(spawn_calls) != set(activities)
+        or len(set(spawn_outputs.values())) != len(spawn_outputs)
+        or len({child_ref for _task, child_ref in activities.values()})
+        != len(activities)
+    ):
+        if not spawn_calls and not activities and not delivered:
+            return _VerifiedReaderAgentTrace((), "task_name", ())
+        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+
+    verified_task_names: list[str] = []
+    verified_child_refs: list[str] = []
+    for call_id, task_name in spawn_outputs.items():
+        activity_task, child_ref = activities[call_id]
+        if activity_task != task_name:
+            raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+        try:
+            child_records = reader.read(child_ref)
+        except (OSError, ValueError) as error:
+            raise DeepFetchUnavailable(
+                "deepfetch_reader_agent_trace_invalid"
+            ) from error
+        terminal = _verified_codex_reader_child(
+            child_records,
+            child_ref=child_ref,
+            task_name=task_name,
+            root_session_ref=root_session_ref,
+            expected_working_directory=expected_working_directory,
+        )
+        if task_name not in delivered or not delivered[task_name].endswith(terminal):
+            raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+        verified_task_names.append(task_name)
+        verified_child_refs.append(child_ref)
+    if set(delivered) != set(verified_task_names):
+        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+    return _VerifiedReaderAgentTrace(
+        tuple(verified_task_names),
+        "task_name",
+        tuple(verified_child_refs),
+    )
+
+
+def _codex_ledger_message_text(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return None
+    parts = [
+        item.get("text")
+        for item in value
+        if isinstance(item, dict)
+        and item.get("type") in {"input_text", "text", "output_text"}
+        and isinstance(item.get("text"), str)
+    ]
+    return "".join(cast(list[str], parts)) if parts else None
+
+
+def _verified_codex_reader_child(
+    records: tuple[dict[str, object], ...],
+    *,
+    child_ref: str,
+    task_name: str,
+    root_session_ref: str,
+    expected_working_directory: str,
+) -> str:
+    metadata = [
+        record.get("payload")
+        for record in records
+        if record.get("type") == "session_meta"
+        and isinstance(record.get("payload"), dict)
+    ]
+    terminals = [
+        payload.get("last_agent_message")
+        for record in records
+        if record.get("type") == "event_msg"
+        and isinstance((payload := record.get("payload")), dict)
+        and payload.get("type") == "task_complete"
+        and isinstance(payload.get("last_agent_message"), str)
+        and payload.get("last_agent_message")
+    ]
+    if len(metadata) != 1 or len(terminals) != 1:
+        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+    value = metadata[0]
+    source = value.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    contexts = [
+        record.get("payload")
+        for record in records
+        if record.get("type") == "turn_context"
+        and isinstance(record.get("payload"), dict)
+    ]
+    if (
+        value.get("id") != child_ref
+        or value.get("session_id") != root_session_ref
+        or value.get("parent_thread_id") != root_session_ref
+        or value.get("cwd") != expected_working_directory
+        or value.get("thread_source") != "subagent"
+        or value.get("originator") != "codex_exec"
+        or not isinstance(spawn, dict)
+        or spawn.get("parent_thread_id") != root_session_ref
+        or spawn.get("depth") != 1
+        or spawn.get("agent_path") != task_name
+        or not contexts
+        or any(
+            context.get("cwd") != expected_working_directory
+            or not isinstance(context.get("sandbox_policy"), dict)
+            or cast(dict[str, object], context["sandbox_policy"]).get("type")
+            != "danger-full-access"
+            for context in contexts
+        )
+    ):
+        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+    return cast(str, terminals[0])
+
+
+def _validate_web_evidence_gate_result(value: object) -> None:
+    if value != {"status": "web_evidence_ready"}:
+        raise DeepFetchUnavailable("codex_deepfetch_output_invalid")
+
+
+def _deepfetch_web_evidence_gate_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "status": {"type": "string", "const": "web_evidence_ready"},
+        },
+        "required": ["status"],
+    }
 
 
 def _deepfetch_output_schema() -> dict[str, object]:
@@ -3433,6 +4957,7 @@ def _deepfetch_output_schema() -> dict[str, object]:
                 "anyOf": [acquisition_request, {"type": "null"}]
             },
             "completion": {
+                "description": _DEEPFETCH_COMPLETION_RULES,
                 "anyOf": [
                     {
                         "type": "string",

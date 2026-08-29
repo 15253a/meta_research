@@ -192,10 +192,11 @@ test("create Quest is one continuous production window with fixed responsibiliti
   await expect(form.getByLabel("这个 Quest 最终要完成什么？")).toHaveCount(0);
   await expect(form.getByLabel("什么情况算完成？")).toHaveCount(0);
   const materials = form.locator("[data-journey-section='materials']");
-  await expect(materials.getByRole("button", { name: "选择文件", exact: true })).toBeVisible();
-  await expect(materials.getByRole("button", { name: "选择文件夹", exact: true })).toBeVisible();
-  await expect(materials.getByLabel("上传研究材料文件", { exact: true })).toBeAttached();
-  await expect(materials.getByLabel("上传研究材料文件夹", { exact: true })).toBeAttached();
+  await expect(materials.getByLabel("研究材料目录", { exact: true })).toBeVisible();
+  await expect(materials.getByRole("button", { name: "使用此目录", exact: true })).toBeVisible();
+  await expect(materials.getByRole("button", { name: "选择文件", exact: true })).toHaveCount(0);
+  await expect(materials.getByRole("button", { name: "选择文件夹", exact: true })).toHaveCount(0);
+  await expect(materials.getByText("从已有材料中选择", { exact: true })).toHaveCount(0);
   await expect(form.getByText("先从左侧 Research Asset 工作台完成 Intake。")).toHaveCount(0);
   await expect(form.getByLabel("时间预算")).toBeVisible();
   await expect(form.getByRole("button", { name: "检测本机计算卡" })).toBeVisible();

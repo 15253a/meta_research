@@ -33,9 +33,11 @@ from meta_research.experiment_contract import (
 from meta_research.experiment_provider_supervisor import (
     EXIT_SCHEMA,
     MARKER_SCHEMA,
+    OBSERVATION_MAX_COUNT,
     OBSERVATION_MAX_RECORD_BYTES,
     OBSERVATION_SCHEMA,
     REQUEST_SCHEMA,
+    STDOUT_MAX_RECORDS,
     ExperimentSupervisorError,
     decode_observation_line,
     ensure_transport_key,
@@ -94,8 +96,8 @@ class ExperimentProvider(Protocol):
 class BuiltinMicroExperimentProvider:
     """Packaged real subprocess adapter for the installable micro experiment."""
 
-    _MAX_STDOUT_RECORDS = 4096
-    _MAX_OBSERVATIONS = 8192
+    _MAX_STDOUT_RECORDS = STDOUT_MAX_RECORDS
+    _MAX_OBSERVATIONS = OBSERVATION_MAX_COUNT
     _TELEMETRY_CADENCE_SECONDS = 0.25
 
     def __init__(
@@ -104,8 +106,8 @@ class BuiltinMicroExperimentProvider:
         *,
         runner_path: Path | None = None,
         wall_timeout_seconds: float = 300.0,
-        stdout_max_bytes: int = 1024 * 1024,
-        result_max_bytes: int = 1024 * 1024,
+        stdout_max_bytes: int = 16 * 1024 * 1024,
+        result_max_bytes: int = 16 * 1024 * 1024,
     ) -> None:
         package_root = Path(__file__).resolve().parent
         self._workspace = workspace.expanduser().resolve()
@@ -269,14 +271,12 @@ class BuiltinMicroExperimentProvider:
         if (
             raw_size > self._stdout_max_bytes
             or len(raw_lines) > self._MAX_STDOUT_RECORDS
-            or any(len(line) > 4000 for line in raw_lines)
             or len(result_lines) != 1
         ):
             code = (
                 "experiment_provider_output_limit"
                 if raw_size > self._stdout_max_bytes
                 or len(raw_lines) > self._MAX_STDOUT_RECORDS
-                or any(len(line) > 4000 for line in raw_lines)
                 else "experiment_result_missing"
             )
             raise ExperimentProviderUnavailable(code, durable_outcome="terminal")
@@ -762,7 +762,6 @@ class BuiltinMicroExperimentProvider:
                         set(observation_payload) != {"line", "stream"}
                         or observation_payload.get("stream") != "stdout"
                         or not isinstance(observation_payload.get("line"), str)
-                        or len(str(observation_payload["line"])) > 4000
                         or "\n" in str(observation_payload["line"])
                         or "\r" in str(observation_payload["line"])
                         or "\x00" in str(observation_payload["line"])

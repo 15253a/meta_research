@@ -16,6 +16,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
+from meta_research.codex_runtime import CODEX_REASONING_EFFORT_CONFIG
+from meta_research.codex_ledger import CodexHomeLedgerReader
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.owners.secret_detection import contains_secret
 from meta_research.provider_supervisor import (
@@ -71,8 +73,11 @@ _HARNESS_WORKSPACE_ENV = "META_RESEARCH_HARNESS_WORKSPACE"
 _PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION_REF"
 _HARNESS_EVIDENCE_SCOPE_ENV = "META_RESEARCH_HARNESS_EVIDENCE_SCOPE_REF"
 _HARNESS_OBSERVATION_SCOPE_ENV = "META_RESEARCH_HARNESS_OBSERVATION_SCOPE"
-_STREAM_LIMIT = 16 * 1024 * 1024
-_RESULT_LIMIT = 1024 * 1024
+HARNESS_PROVIDER_STREAM_MAX_BYTES = 64 * 1024 * 1024
+HARNESS_PROVIDER_RESULT_MAX_BYTES = 16 * 1024 * 1024
+_STREAM_LIMIT = HARNESS_PROVIDER_STREAM_MAX_BYTES
+_RESULT_LIMIT = HARNESS_PROVIDER_RESULT_MAX_BYTES
+_CHILD_PROMPT_LIMIT = HARNESS_PROVIDER_STREAM_MAX_BYTES
 _TARGET_ROOT_OUTPUT_CHUNK_LIMIT = 8 * 1024
 _TARGET_ROOT_OUTPUT_TOTAL_LIMIT = 1024 * 1024
 _TARGET_ROOT_OUTPUT_PENDING_LIMIT = _TARGET_ROOT_OUTPUT_CHUNK_LIMIT
@@ -86,7 +91,7 @@ _TARGET_ROOT_OUTPUT_SAMPLE_BYTES = 256 * 1024
 _TARGET_ROOT_OUTPUT_SAMPLE_EVENTS = 64
 _TARGET_ROOT_EVENT_BATCH_LIMIT = 64
 TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
-# The private spool is capped at 16 MiB, so no raw JSONL stream can reach this
+# The private spool is capped at 64 MiB, so no raw JSONL stream can reach this
 # sequence range. Observation-only rows can share the Harness ledger without
 # colliding with formal evidence stored at raw sequences.
 _TARGET_ROOT_OBSERVATION_SEQUENCE_BASE = 1_000_000_000
@@ -278,7 +283,7 @@ class _NativeCliHarnessAdapter:
                 Path(value) if (value := os.environ.get("CODEX_HOME")) else None
             )
             if configured_codex_home is not None:
-                self._codex_child_ledger_reader = _CodexHomeChildLedgerReader(
+                self._codex_child_ledger_reader = CodexHomeLedgerReader(
                     configured_codex_home
                 )
 
@@ -714,6 +719,8 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             invocation.model_ref,
             "--config",
             'approval_policy="never"',
+            "--config",
+            CODEX_REASONING_EFFORT_CONFIG,
             "--config",
             'web_search="live"',
             "--config",
@@ -2995,7 +3002,7 @@ def _verified_codex_child_code_review_evidence(
     )
     if (
         not isinstance(prompt, str)
-        or len(prompt.encode("utf-8")) > 256_000
+        or len(prompt.encode("utf-8")) > _CHILD_PROMPT_LIMIT
         or len(spawn_skill_paths) != 1
         or root_code_review_skill_calls
         or codex_child_ledger_reader is None
@@ -3092,7 +3099,7 @@ def _verified_codex_child_result_review_evidence(
         or codex_child_ledger_reader is None
         or expected_working_directory is None
         or not isinstance(prompt, str)
-        or len(prompt.encode("utf-8")) > 256_000
+        or len(prompt.encode("utf-8")) > _CHILD_PROMPT_LIMIT
     ):
         return None
     wait_message = terminal_child_state.get("message") if terminal_child_state else None

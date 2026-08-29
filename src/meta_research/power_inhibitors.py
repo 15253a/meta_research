@@ -1,8 +1,9 @@
-"""Fail-closed production power-inhibitor adapters.
+"""Power-inhibitor adapters for production and attested development hosts.
 
-The runtime coordinator owns durable responsibility.  This module owns only the
-host-specific hold and never treats a Linux process inside WSL as a Windows
-power request.
+The runtime coordinator owns durable responsibility.  Production adapters own
+only their host-specific hold and never treat a Linux process inside WSL as a
+Windows power request.  The development adapter records an explicit operator
+attestation instead of claiming a native hold.
 """
 
 from __future__ import annotations
@@ -32,6 +33,72 @@ PlatformKind = Literal["ubuntu", "wsl", "unsupported"]
 _PLATFORMS = frozenset({"ubuntu", "wsl", "unsupported"})
 _SCOPE = "sleep"
 _LINUX_READY_PREFIX = "META_RESEARCH_INHIBITOR_READY:"
+
+
+class OperatorAttestedPowerInhibitor:
+    """Trust an operator's assertion that this development host stays online.
+
+    This adapter deliberately creates no native power-management hold.  Its
+    distinct backend name keeps that operational choice visible in runtime
+    evidence instead of pretending that logind or a Windows guardian exists.
+    """
+
+    allows_backend_supersession = True
+
+    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
+
+    @property
+    def kind(self) -> str:
+        return "operator_attested_always_on"
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        return self._lease(holder_ref)
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return self.query_hold(lease) == "confirmed"
+
+    def query_hold(
+        self, lease: InhibitorLease
+    ) -> Literal["confirmed", "absent", "unknown"]:
+        expected = self._lease(lease.holder_ref)
+        if (
+            lease.backend != expected.backend
+            or lease.scope != expected.scope
+            or lease.native_holder_ref != expected.native_holder_ref
+        ):
+            return "unknown"
+        return "confirmed"
+
+    def query_exact_hold(
+        self,
+        *,
+        holder_ref: str,
+    ) -> tuple[
+        Literal["confirmed", "absent", "unknown"],
+        InhibitorLease | None,
+    ]:
+        return "confirmed", self._lease(holder_ref)
+
+    def release(self, lease: InhibitorLease) -> None:
+        # The attestation is deployment-wide, so there is no native resource
+        # or holder-local state to release.
+        if self.query_hold(lease) != "confirmed":
+            raise RuntimeProtectionUnavailable(
+                "power_inhibitor_operator_attestation_invalid"
+            )
+
+    def _lease(self, holder_ref: str) -> InhibitorLease:
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope=_SCOPE,
+            acquired_at=self._clock(),
+            native_holder_ref=(
+                f"operator-attestation:{_holder_digest(holder_ref)}"
+            ),
+        )
 
 
 class ProductionPowerInhibitor:

@@ -1,4 +1,6 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   DeterministicProduct,
@@ -7,6 +9,11 @@ import {
 
 type JsonRecord = Record<string, unknown>;
 
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const linkedMaterialDirectory = resolve(
+  repositoryRoot,
+  "src/meta_research/skills/deepfetch_v4/references",
+);
 
 let product: DeterministicProduct | undefined;
 
@@ -92,6 +99,73 @@ test("Research Asset is a real responsive intake, inventory, and receipt surface
   await expect(opener).toBeFocused();
 });
 
+test("Quest materials use one server directory path without browser upload", async ({
+  page,
+}) => {
+  if (!product) throw new Error("deterministic product missing");
+  await openAuthenticatedProduct(page, product);
+
+  let intakeBody: JsonRecord | null = null;
+  let intakePosts = 0;
+  let releaseIntake!: () => void;
+  const intakeGate = new Promise<void>((resolveGate) => {
+    releaseIntake = resolveGate;
+  });
+  const holdFirstIntake = async (route: Route) => {
+    if (route.request().method() === "POST") {
+      intakePosts += 1;
+      if (intakePosts === 1) await intakeGate;
+    }
+    await route.fallback();
+  };
+  await page.route("**/api/v1/research-assets/intakes", holdFirstIntake);
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST"
+      && request.url().endsWith("/api/v1/research-assets/intakes")
+    ) {
+      intakeBody = request.postDataJSON() as JsonRecord;
+    }
+  });
+
+  try {
+    await page.getByRole("button", { name: "创建 Quest" }).click();
+    const quest = page.getByRole("dialog", {
+      name: "创建 Quest，并决定第一个研究问题",
+    });
+    const materials = quest.locator("[data-journey-section='materials']");
+    await materials.getByLabel("研究材料目录", { exact: true }).fill(
+      linkedMaterialDirectory,
+    );
+    await materials.getByRole("button", { name: "使用此目录", exact: true }).click();
+
+    await expect.poll(() => intakePosts).toBe(1);
+    await materials.getByLabel("研究材料目录", { exact: true }).fill(
+      linkedMaterialDirectory,
+    );
+    await materials.getByRole("button", { name: "使用此目录", exact: true }).click();
+    await expect(materials.locator(".quest-material-status")).toHaveCount(1);
+    await expect(materials.getByLabel("研究材料目录", { exact: true })).toHaveValue("");
+    expect(intakePosts).toBe(1);
+    releaseIntake();
+
+    await expect.poll(() => intakeBody).toMatchObject({
+      source_kind: "directory",
+      custody_mode: "linked_local",
+      source_locator: linkedMaterialDirectory,
+      asynchronous: true,
+    });
+    expect(intakeBody).not.toHaveProperty("content_base64");
+    await expect(materials.locator(".quest-material-status.accepted")).toContainText(
+      "references",
+      { timeout: 15_000 },
+    );
+  } finally {
+    releaseIntake();
+    await page.unroute("**/api/v1/research-assets/intakes", holdFirstIntake);
+  }
+});
+
 test("an over-capacity Quest material selection is rejected as one batch before intake", async ({
   page,
 }) => {
@@ -128,7 +202,7 @@ test("an over-capacity Quest material selection is rejected as one batch before 
   await expect(quest.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
 });
 
-test("pending uploads reserve all Quest material slots across repeat selection and picker append", async ({
+test("pending uploads reserve all Quest material slots across repeat selection", async ({
   page,
 }) => {
   if (!product) throw new Error("deterministic product missing");
@@ -177,15 +251,6 @@ test("pending uploads reserve all Quest material slots across repeat selection a
     expect(intakePosts).toBe(1);
     await expect(materials.locator(".quest-material-status")).toHaveCount(100);
 
-    await materials.getByText("从已有材料中选择", { exact: true }).click();
-    const pickerAsset = materials.getByRole("group", {
-      name: "选择已接纳 Research Asset",
-    }).getByRole("button").filter({ hasText: "slot-picker.md" });
-    await expect(pickerAsset).toHaveAttribute("aria-pressed", "false");
-    await pickerAsset.click();
-    await expect(pickerAsset).toHaveAttribute("aria-pressed", "false");
-    await expect(alert).toContainText("剩余 0 个");
-    expect(intakePosts).toBe(1);
     await expect(quest.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
   } finally {
     await page.goto("about:blank");
@@ -734,12 +799,13 @@ test("a slow optional material bind never gates the formal Direct Quest flow", a
     { width: 390, height: 844 },
   ]) {
     await page.setViewportSize(viewport);
+    await expect(materials.getByLabel("研究材料目录", { exact: true })).toBeVisible();
+    await expect(materials.getByRole("button", { name: "使用此目录", exact: true }))
+      .toBeDisabled();
     await expect(materials.getByRole("button", { name: "选择文件", exact: true }))
-      .toBeEnabled();
+      .toHaveCount(0);
     await expect(materials.getByRole("button", { name: "选择文件夹", exact: true }))
-      .toBeEnabled();
-    await expect(materials.getByLabel("上传研究材料文件", { exact: true }))
-      .toBeAttached();
+      .toHaveCount(0);
     expect(await page.evaluate(() => (
       document.documentElement.scrollWidth <= document.documentElement.clientWidth
     ))).toBe(true);
@@ -943,7 +1009,7 @@ test("a committed scoped Quest intake replays the exact POST after its ACK is lo
   ).length)).toBe(0);
 });
 
-test("paged inventory and Quest materials keep an exact off-page version reachable", async ({
+test("paged inventory keeps an exact off-page version reachable", async ({
   page,
 }) => {
   if (!product) throw new Error("deterministic product missing");
@@ -992,21 +1058,6 @@ test("paged inventory and Quest materials keep an exact off-page version reachab
   await dialog.getByRole("button", { name: /加载更多（已显示 51 \/ 52）/ }).click();
   await expect(dialog.getByText("52 / 52 versions", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("listitem")).toHaveCount(52);
-
-  await dialog.getByRole("button", { name: "关闭 Research Asset 工作台" }).click();
-  await page.getByRole("button", { name: "创建 Quest", exact: true }).click();
-  const quest = page.getByRole("dialog", {
-    name: "创建 Quest，并决定第一个研究问题",
-  });
-  await quest.getByText("从已有材料中选择", { exact: true }).click();
-  const picker = quest.getByRole("group", { name: "选择已接纳 Research Asset" });
-  await expect(
-    picker.getByRole("button").filter({ hasText: "paged-00.txt" }),
-  ).toHaveCount(0);
-  await picker.getByRole("button", { name: /加载更多已接纳版本/ }).click();
-  await expect(
-    picker.getByRole("button").filter({ hasText: "paged-00.txt" }),
-  ).toBeVisible();
 });
 
 test("an authorization interruption retains the durable intake pointer and resumes", async ({

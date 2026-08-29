@@ -272,6 +272,87 @@ def test_nature_downloader_preflight_rejects_a_library_home_page(
     assert result.evidence["authorized_resource"] == "not_verified"
 
 
+def test_oa_only_preflight_skips_institutional_browser_checks(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingNatureRunner()
+    adapter = NatureDownloaderAdapter(
+        _provider_root(tmp_path), command_runner=runner
+    )
+
+    result = adapter.preflight(
+        AcquisitionPreflightRequest(
+            session_ref="acquisition-session-oa",
+            initialization_id="initialization-oa",
+            draft_revision=1,
+            config_hash="d" * 64,
+            mode="oa_only",
+            library_entry_url=None,
+            private_state_dir=str(tmp_path / "private"),
+        )
+    )
+
+    assert result.status == "ready"
+    assert result.browser_context_ref is None
+    assert result.reason_code is None
+    assert result.evidence == {
+        "configuration_health": "not_required",
+        "browser_control": "not_required",
+        "authorized_resource": "oa_only",
+    }
+    commands = [" ".join(call[0]) for call in runner.calls]
+    assert any("node --check" in command for command in commands)
+    assert not any("configure_school.py" in command for command in commands)
+    assert not any("functional_cdp_probe.mjs" in command for command in commands)
+    assert not any("authorized_resource_probe.py" in command for command in commands)
+
+
+def test_oa_only_manifest_records_the_selected_route_without_institutional_language(
+    tmp_path: Path,
+) -> None:
+    provider_root = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "meta_research"
+        / "skills"
+        / "deepfetch_v4"
+        / "providers"
+        / "nature-downloader"
+    )
+    batch_script = provider_root / "scripts" / "batch_download.mjs"
+    manifest_module = provider_root / "scripts" / "lib" / "manifest.mjs"
+    output_root = tmp_path / "oa-only-manifest"
+    script = f"""
+import fs from "node:fs";
+import {{ selectedOaOnlyRoute }} from {json.dumps(batch_script.as_uri())};
+import {{ writeManifest }} from {json.dumps(manifest_module.as_uri())};
+const route = selectedOaOnlyRoute();
+const manifestPath = writeManifest({json.dumps(str(output_root))}, {{
+  request: {{ mode: "oa_only" }},
+  summary: {{ total: 1, downloaded: 1, seconds: 0 }},
+  results: [{{
+    status: "open_access_downloaded",
+    route: route.provider,
+    route_reason: route.reason,
+  }}],
+}});
+process.stdout.write(fs.readFileSync(manifestPath, "utf8"));
+"""
+
+    completed = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    manifest = json.loads(completed.stdout)
+
+    assert manifest["results"][0]["route_reason"] == "selected_oa_only_route"
+    serialized = json.dumps(manifest, ensure_ascii=False).casefold()
+    assert "institutional" not in serialized
+    assert "browser" not in serialized
+
+
 def test_nature_downloader_executes_each_exact_oa_batch_without_public_manifest(
     tmp_path: Path,
 ) -> None:
@@ -317,6 +398,50 @@ def test_nature_downloader_executes_each_exact_oa_batch_without_public_manifest(
     assert "--no-si" in command
     assert command[command.index("--cnki-format") + 1] == "pdf"
     assert "manifest.json" not in json.dumps([result.as_dict() for result in results])
+
+
+def test_oa_only_route_exhaustion_is_not_an_institutional_authorization_failure(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingNatureRunner(oa_missing=True)
+    adapter = NatureDownloaderAdapter(
+        _provider_root(tmp_path), command_runner=runner
+    )
+    target = tmp_path / "private" / "session-oa" / "requests" / "acq-oa"
+
+    results = adapter.acquire(
+        AcquisitionBatchRequest(
+            request_id="acq-oa",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="doi:10.1000/oa-missing",
+                    title="Exact OA-only paper",
+                    doi="10.1000/oa-missing",
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+            session_ref="acquisition-session-oa",
+            session_mode="oa_only",
+            provider_state_dir=str(tmp_path / "private" / "session-oa"),
+            target_dir=str(target),
+        )
+    )
+
+    assert results[0].status == "missing"
+    assert results[0].failure == {
+        "code": "oa_not_found",
+        "detail": "用户选择的 OA-only 路线已穷尽，未找到可验证全文。",
+    }
+    commands = [
+        call[0]
+        for call in runner.calls
+        if "run_batch_download.py" in " ".join(call[0])
+    ]
+    assert commands
+    assert all("--no-institutional-access" in command for command in commands)
+    assert all("--api-fallback-web" not in command for command in commands)
 
 
 def test_nature_downloader_has_no_hidden_logical_retry_generation_ceiling(

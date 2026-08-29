@@ -132,7 +132,19 @@ LITERATURE_SNAPSHOT_RECEIPT_KIND = "literature_snapshot_acceptance"
 PROPOSAL_LITERATURE_EVIDENCE_SCHEMA = (
     "meta-research/proposal-literature-evidence/v1"
 )
-PROPOSAL_LITERATURE_EVIDENCE_MAX_BYTES = 192 * 1024
+PROPOSAL_LEDGER_EVIDENCE_SCHEMA = (
+    "meta-research/proposal-ledger-evidence/v1"
+)
+PROPOSAL_LITERATURE_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024
+PROPOSAL_LEDGER_READING_FIELDS = (
+    "status",
+    "understanding_summary",
+    "methods",
+    "key_claims",
+    "limitations",
+    "credibility",
+)
+PROPOSAL_LEDGER_LOCATOR_FIELDS = ("id", "section", "page")
 ASSET_RECEIPT_KIND = "asset_acceptance"
 ASSET_CUSTODY_ESTABLISHED_RECEIPT_KIND = "asset_custody_established"
 ASSET_CUSTODY_LOCATOR_MIGRATED_RECEIPT_KIND = (
@@ -9172,18 +9184,11 @@ def _proposal_literature_evidence(
     ):
         raise OwnerConflict("literature_snapshot_invalid")
 
-    projected_ledger: dict[str, object] | None = None
-    if raw_ledger is not None:
-        projected_ledger = cast(
-            dict[str, object], json.loads(canonical_json(raw_ledger))
-        )
-        ledger_papers = projected_ledger.get("papers")
-        if not isinstance(ledger_papers, dict):
-            raise OwnerConflict("literature_snapshot_invalid")
-        for record in ledger_papers.values():
-            if not isinstance(record, dict) or "fulltext_path" not in record:
-                raise OwnerConflict("literature_snapshot_invalid")
-            record.pop("fulltext_path")
+    projected_ledger = (
+        None
+        if raw_ledger is None
+        else _proposal_ledger_evidence(raw_ledger)
+    )
 
     fulltexts: list[dict[str, object]] = []
     for raw_fulltext in raw_fulltexts:
@@ -9285,19 +9290,166 @@ def _proposal_literature_evidence(
             "schema_ref": "meta-research/proposal-evidence-input-policy/v1",
             "fulltext_bodies": "omitted",
             "local_custody_locators": "omitted",
+            "papers_ledger": "semantic_core_or_hash_only",
             "truncation": "forbidden",
         },
     }
-    projection = {
-        **payload,
-        "projection_hash": canonical_hash(payload),
-    }
+    projection = _hashed_proposal_evidence(payload)
+    if (
+        len(canonical_json(projection).encode("utf-8"))
+        > PROPOSAL_LITERATURE_EVIDENCE_MAX_BYTES
+        and projected_ledger is not None
+    ):
+        payload["papers_ledger"] = _hash_only_proposal_ledger_evidence(
+            projected_ledger
+        )
+        projection = _hashed_proposal_evidence(payload)
     if (
         len(canonical_json(projection).encode("utf-8"))
         > PROPOSAL_LITERATURE_EVIDENCE_MAX_BYTES
     ):
-        raise OwnerConflict("codex_proposal_evidence_too_large")
+        payload = _binding_only_proposal_evidence(payload)
+        projection = _hashed_proposal_evidence(payload)
+    if (
+        len(canonical_json(projection).encode("utf-8"))
+        > PROPOSAL_LITERATURE_EVIDENCE_MAX_BYTES
+    ):
+        raise OwnerConflict("literature_snapshot_invalid")
     return projection
+
+
+def _proposal_ledger_evidence(
+    raw_ledger: dict[str, object],
+) -> dict[str, object]:
+    """Keep the evidence needed for drafting without copying the full ledger."""
+
+    ledger = cast(
+        dict[str, object], json.loads(canonical_json(raw_ledger))
+    )
+    papers = ledger.get("papers")
+    if not isinstance(papers, dict):
+        raise OwnerConflict("literature_snapshot_invalid")
+    projected_papers: dict[str, object] = {}
+    for paper_ref, record in papers.items():
+        if (
+            not isinstance(paper_ref, str)
+            or not isinstance(record, dict)
+            or "fulltext_path" not in record
+            or not isinstance(record.get("identity"), dict)
+            or not isinstance(record.get("pre_understanding"), dict)
+            or not isinstance(record.get("reading"), dict)
+        ):
+            raise OwnerConflict("literature_snapshot_invalid")
+        reading = cast(dict[str, object], record["reading"])
+        projected_reading = {
+            field: reading[field]
+            for field in PROPOSAL_LEDGER_READING_FIELDS
+            if field in reading
+        }
+        evidence_locators = reading.get("evidence_locators")
+        if evidence_locators is not None:
+            if not isinstance(evidence_locators, list) or any(
+                not isinstance(locator, dict)
+                for locator in evidence_locators
+            ):
+                raise OwnerConflict("literature_snapshot_invalid")
+            projected_reading["evidence_locators"] = [
+                {
+                    field: locator[field]
+                    for field in PROPOSAL_LEDGER_LOCATOR_FIELDS
+                    if field in locator
+                }
+                for locator in evidence_locators
+            ]
+        projected_papers[paper_ref] = {
+            "identity": record["identity"],
+            "pre_understanding": record["pre_understanding"],
+            "reading": projected_reading,
+        }
+    return {
+        "schema_ref": PROPOSAL_LEDGER_EVIDENCE_SCHEMA,
+        "projection": "semantic_core",
+        "source_schema_version": ledger.get("schema_version"),
+        "source_hash": canonical_hash(ledger),
+        "topic": ledger.get("topic"),
+        "run": ledger.get("run"),
+        "paper_order": ledger.get("paper_order"),
+        "papers": projected_papers,
+        "missing_fulltexts": ledger.get("missing_fulltexts"),
+        "limitations": ledger.get("limitations"),
+    }
+
+
+def _hash_only_proposal_ledger_evidence(
+    projected_ledger: dict[str, object],
+) -> dict[str, object]:
+    paper_order = projected_ledger.get("paper_order")
+    if not isinstance(paper_order, list):
+        raise OwnerConflict("literature_snapshot_invalid")
+    return {
+        "schema_ref": PROPOSAL_LEDGER_EVIDENCE_SCHEMA,
+        "projection": "hash_only_due_to_size",
+        "source_schema_version": projected_ledger.get(
+            "source_schema_version"
+        ),
+        "source_hash": projected_ledger.get("source_hash"),
+        "paper_count": len(paper_order),
+    }
+
+
+def _hashed_proposal_evidence(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    return {
+        **payload,
+        "projection_hash": canonical_hash(payload),
+    }
+
+
+def _binding_only_proposal_evidence(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Keep exact custody bindings when accepted content cannot fit the model."""
+
+    papers = payload.get("papers")
+    fulltexts = payload.get("fulltexts")
+    limitations = payload.get("limitations")
+    web_evidence = payload.get("web_evidence")
+    policy = payload.get("provider_input_policy")
+    if (
+        not isinstance(papers, list)
+        or not isinstance(fulltexts, list)
+        or not isinstance(limitations, list)
+        or not isinstance(policy, dict)
+    ):
+        raise OwnerConflict("literature_snapshot_invalid")
+    return {
+        "schema_ref": payload["schema_ref"],
+        "content_trust": payload["content_trust"],
+        "source_snapshot": payload["source_snapshot"],
+        "completion": payload["completion"],
+        "summary": (
+            "完整 DeepFetch 证据已由 Research Memory 接纳；因模型输入上限，"
+            "本次 Proposal 只携带精确 Snapshot binding 与组件计数。"
+        ),
+        "papers": [],
+        "papers_ledger": payload.get("papers_ledger"),
+        "fulltexts": [],
+        "limitations": [
+            "完整证据未进入 Proposal 模型输入；durable LiteratureSnapshot 未修改。"
+        ],
+        "web_evidence": None,
+        "provider_input_policy": {
+            **policy,
+            "projection": "binding_only_due_to_size",
+            "omitted_component_counts": {
+                "papers": len(papers),
+                "fulltexts": len(fulltexts),
+                "limitations": len(limitations),
+                "web_evidence": 0 if web_evidence is None else 1,
+            },
+        },
+    }
 
 
 def _validated_v4_ledger(value: object, *, expected_count: int) -> int:

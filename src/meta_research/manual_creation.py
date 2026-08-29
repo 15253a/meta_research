@@ -1096,6 +1096,14 @@ class ManualQuestionCreation:
                             or failed.acquisition_session_ref != session.session_ref
                         ):
                             raise OwnerConflict("manual_deepfetch_retry_basis_stale")
+                        failed_run = self._agent_runtime.query_deepfetch_run(
+                            str(failed.request_ref)
+                        )
+                        if (
+                            failed_run is not None
+                            and not failed_run.provider_operation_retry_permitted
+                        ):
+                            raise OwnerConflict("deepfetch_successor_required")
                         request_ref = str(failed.request_ref)
                         now = time.time()
                         connection.execute(

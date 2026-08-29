@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import platform
 import re
@@ -16,6 +17,11 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Callable, Protocol, cast
 
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF,
+    CODEX_REASONING_EFFORT_BINDING,
+    CODEX_REASONING_EFFORT_CONFIG,
+)
 from meta_research.idea_contract import (
     DISPOSITION_ACTIONS,
     IDEA_OUTCOME_SCHEMA_REF,
@@ -69,6 +75,66 @@ _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA = (
     "meta-research/codex-provider-operation/v1"
 )
 _COMPLETION_ENVELOPE_MAX_BYTES = 64 * 1024
+_CODEX_ROOT_OUTPUT_KEY = "provider_output"
+_CODEX_JSON_OBJECT_STRING_MARKER = (
+    "x-meta-research-canonical-json-object-string"
+)
+_CODEX_TRANSPORT_DECODE_FAILURE_KEY = "provider_transport_decode_failure"
+_CODEX_FORBIDDEN_OUTPUT_SCHEMA_KEYWORDS = frozenset(
+    {
+        "allOf",
+        "contains",
+        "dependentRequired",
+        "dependentSchemas",
+        "else",
+        "if",
+        "maxContains",
+        "maxProperties",
+        "minContains",
+        "minProperties",
+        "not",
+        "oneOf",
+        "patternProperties",
+        "prefixItems",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "uniqueItems",
+    }
+)
+_CODEX_MAX_OBJECT_PROPERTIES = 5_000
+_CODEX_MAX_OBJECT_NESTING = 10
+_CODEX_MAX_ENUM_VALUES = 1_000
+_CODEX_LARGE_ENUM_THRESHOLD = 250
+_CODEX_MAX_LARGE_ENUM_STRING_LENGTH = 15_000
+_CODEX_MAX_IDENTITY_STRING_LENGTH = 120_000
+_JSON_OBJECT_LIMIT_FIELDS = frozenset(
+    {
+        "max_collection_items",
+        "max_depth",
+        "max_integer_abs",
+        "max_nodes",
+        "max_serialized_bytes",
+        "max_string_bytes",
+    }
+)
+_CHILD_REVIEW_TRACE_FAILURES = frozenset(
+    {
+        "codex_child_review_spawn_invalid",
+        "codex_child_review_ref_mismatch",
+        "codex_child_review_task_mismatch",
+        "codex_child_review_wait_invalid",
+        "codex_child_review_result_missing",
+    }
+)
+_SEALED_TRANSPORT_CONTRACT_FAILURES = frozenset(
+    {
+        "codex_output_invalid",
+        "codex_native_session_missing",
+        "codex_native_session_mismatch",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +187,506 @@ class IdeaSkillUnavailable(RuntimeError):
         self.recovery_checkpoint = (
             None if recovery_checkpoint is None else dict(recovery_checkpoint)
         )
+
+
+def _validate_codex_output_schema_dialect(
+    schema: dict[str, object],
+) -> None:
+    """Fail closed on schemas outside the provider's strict JSON subset."""
+
+    if schema.get("type") != "object" or "anyOf" in schema:
+        raise IdeaSkillUnavailable("codex_output_schema_invalid")
+
+    budget = {
+        "enum_values": 0,
+        "identity_string_length": 0,
+        "object_properties": 0,
+    }
+
+    def literal_string_length(value: object) -> int:
+        if isinstance(value, str):
+            return len(value)
+        if isinstance(value, list):
+            return sum(literal_string_length(item) for item in value)
+        if isinstance(value, dict):
+            return sum(
+                len(key) + literal_string_length(item)
+                for key, item in value.items()
+            )
+        return 0
+
+    def walk(node: dict[str, object], object_depth: int) -> None:
+        if _CODEX_FORBIDDEN_OUTPUT_SCHEMA_KEYWORDS.intersection(node):
+            raise IdeaSkillUnavailable("codex_output_schema_invalid")
+        if "const" in node:
+            if "type" not in node:
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+            budget["identity_string_length"] += literal_string_length(
+                node["const"]
+            )
+        enum = node.get("enum")
+        if enum is not None:
+            if not isinstance(enum, list) or not enum:
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+            budget["enum_values"] += len(enum)
+            enum_string_length = sum(
+                literal_string_length(value) for value in enum
+            )
+            budget["identity_string_length"] += enum_string_length
+            if (
+                len(enum) > _CODEX_LARGE_ENUM_THRESHOLD
+                and enum_string_length > _CODEX_MAX_LARGE_ENUM_STRING_LENGTH
+            ):
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+
+        next_object_depth = object_depth
+        if node.get("type") == "object":
+            next_object_depth += 1
+            if next_object_depth > _CODEX_MAX_OBJECT_NESTING:
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+            properties = node.get("properties")
+            required = node.get("required")
+            if (
+                not isinstance(properties, dict)
+                or node.get("additionalProperties") is not False
+                or not isinstance(required, list)
+                or len(required) != len(properties)
+                or len(set(required)) != len(required)
+                or set(required) != set(properties)
+                or any(not isinstance(key, str) for key in properties)
+                or any(not isinstance(child, dict) for child in properties.values())
+            ):
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+            budget["object_properties"] += len(properties)
+            budget["identity_string_length"] += sum(
+                len(key) for key in properties
+            )
+            for child in properties.values():
+                walk(cast(dict[str, object], child), next_object_depth)
+        elif "properties" in node or "required" in node:
+            raise IdeaSkillUnavailable("codex_output_schema_invalid")
+
+        if node.get("type") == "array" and not isinstance(
+            node.get("items"), dict
+        ):
+            raise IdeaSkillUnavailable("codex_output_schema_invalid")
+        items = node.get("items")
+        if isinstance(items, dict):
+            walk(items, next_object_depth)
+
+        for key in ("$defs", "definitions"):
+            definitions = node.get(key)
+            if definitions is None:
+                continue
+            if not isinstance(definitions, dict) or any(
+                not isinstance(name, str) or not isinstance(child, dict)
+                for name, child in definitions.items()
+            ):
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+            budget["identity_string_length"] += sum(
+                len(name) for name in definitions
+            )
+            for child in definitions.values():
+                walk(cast(dict[str, object], child), next_object_depth)
+
+        union = node.get("anyOf")
+        if union is not None:
+            if not isinstance(union, list) or not union or any(
+                not isinstance(child, dict) for child in union
+            ):
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+            for child in union:
+                walk(cast(dict[str, object], child), next_object_depth)
+
+        if (
+            budget["object_properties"] > _CODEX_MAX_OBJECT_PROPERTIES
+            or budget["enum_values"] > _CODEX_MAX_ENUM_VALUES
+            or budget["identity_string_length"]
+            > _CODEX_MAX_IDENTITY_STRING_LENGTH
+        ):
+            raise IdeaSkillUnavailable("codex_output_schema_invalid")
+
+    walk(schema, 0)
+
+
+def _compile_codex_output_schema(
+    schema: dict[str, object],
+) -> dict[str, object]:
+    """Compile JSON Schema constants to the provider's strict schema subset.
+
+    JSON Schema permits ``const`` to stand alone, but the Codex response-format
+    endpoint requires an explicit JSON ``type`` on those schema nodes.  Keep
+    the compilation deterministic so the exact provider schema can be frozen
+    into RuntimeBinding and durable operation identity hashes.
+    """
+
+    def inferred_type(value: object) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        raise IdeaSkillUnavailable("codex_output_schema_invalid")
+
+    def compile_node(node: dict[str, object]) -> dict[str, object]:
+        marker = node.get(_CODEX_JSON_OBJECT_STRING_MARKER)
+        if marker is not None:
+            limits = _codex_json_object_limits(node)
+            return {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": limits["max_serialized_bytes"],
+                "description": (
+                    "A canonical JSON object string (sorted keys, compact "
+                    "separators, no duplicate keys). It is decoded and "
+                    "validated against the frozen domain contract after the "
+                    "provider returns."
+                ),
+            }
+        compiled = dict(node)
+        # ``uniqueItems`` is valid JSON Schema but is rejected by the strict
+        # Structured Outputs dialect.  Uniqueness remains a domain-validator
+        # concern after the provider result is decoded.
+        compiled.pop("uniqueItems", None)
+        one_of = compiled.pop("oneOf", None)
+        if one_of is not None:
+            if not isinstance(one_of, list) or "anyOf" in compiled:
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+            compiled["anyOf"] = one_of
+        if "const" in compiled and "type" not in compiled:
+            compiled["type"] = inferred_type(compiled["const"])
+        if compiled.get("type") == "array" and "items" not in compiled:
+            const_items = compiled.get("const")
+            if not isinstance(const_items, list) or any(
+                not isinstance(item, str) for item in const_items
+            ):
+                raise IdeaSkillUnavailable("codex_output_schema_invalid")
+            # All current frozen array constants are reference lists.  An
+            # explicit item schema is still required by the strict dialect,
+            # including when the exact constant is the empty list.
+            compiled["items"] = {"type": "string"}
+        for key in ("properties", "patternProperties", "$defs", "definitions"):
+            children = compiled.get(key)
+            if isinstance(children, dict):
+                compiled[key] = {
+                    name: compile_node(child)
+                    if isinstance(child, dict)
+                    else child
+                    for name, child in children.items()
+                }
+        for key in (
+            "additionalProperties",
+            "contains",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+        ):
+            child = compiled.get(key)
+            if isinstance(child, dict):
+                compiled[key] = compile_node(child)
+        for key in ("allOf", "anyOf", "prefixItems"):
+            children = compiled.get(key)
+            if isinstance(children, list):
+                compiled[key] = [
+                    compile_node(child) if isinstance(child, dict) else child
+                    for child in children
+                ]
+        return compiled
+
+    root_union = schema.get("oneOf")
+    if isinstance(root_union, list):
+        compiled_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                _CODEX_ROOT_OUTPUT_KEY: {
+                    "description": (
+                        "Provider transport envelope containing exactly one "
+                        "domain output variant."
+                    ),
+                    "anyOf": [
+                        compile_node(branch)
+                        if isinstance(branch, dict)
+                        else branch
+                        for branch in root_union
+                    ],
+                }
+            },
+            "required": [_CODEX_ROOT_OUTPUT_KEY],
+        }
+    else:
+        compiled_schema = compile_node(schema)
+    _validate_codex_output_schema_dialect(compiled_schema)
+    return compiled_schema
+
+
+def _codex_json_object_limits(
+    schema: dict[str, object],
+) -> dict[str, int]:
+    marker = schema.get(_CODEX_JSON_OBJECT_STRING_MARKER)
+    if (
+        set(schema) != {_CODEX_JSON_OBJECT_STRING_MARKER}
+        or not isinstance(marker, dict)
+        or set(marker) != _JSON_OBJECT_LIMIT_FIELDS
+    ):
+        raise IdeaSkillUnavailable("codex_output_schema_invalid")
+    limits: dict[str, int] = {}
+    for name in _JSON_OBJECT_LIMIT_FIELDS:
+        value = marker.get(name)
+        if type(value) is not int or cast(int, value) < 1:
+            raise IdeaSkillUnavailable("codex_output_schema_invalid")
+        limits[name] = cast(int, value)
+    return limits
+
+
+def _schema_contains_json_object_transport(node: object) -> bool:
+    if isinstance(node, dict):
+        if _CODEX_JSON_OBJECT_STRING_MARKER in node:
+            return True
+        return any(
+            _schema_contains_json_object_transport(value)
+            for value in node.values()
+        )
+    if isinstance(node, list):
+        return any(_schema_contains_json_object_transport(value) for value in node)
+    return False
+
+
+def _decode_canonical_json_object(
+    value: object,
+    schema: dict[str, object],
+) -> dict[str, object]:
+    limits = _codex_json_object_limits(schema)
+
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        decoded: dict[str, object] = {}
+        for key, nested in pairs:
+            if key in decoded:
+                raise ValueError("duplicate key")
+            decoded[key] = nested
+        return decoded
+
+    if isinstance(value, str):
+
+        def parse_finite_float(encoded: str) -> float:
+            decoded_float = float(encoded)
+            if not math.isfinite(decoded_float):
+                raise ValueError("non-finite JSON number")
+            return decoded_float
+
+        try:
+            if len(value.encode("utf-8")) > limits["max_serialized_bytes"]:
+                raise ValueError("oversized JSON object string")
+            decoded = json.loads(
+                value,
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=lambda _constant: (_ for _ in ()).throw(
+                    ValueError("non-finite JSON number")
+                ),
+                parse_float=parse_finite_float,
+            )
+            if not isinstance(decoded, dict) or canonical_json(decoded) != value:
+                raise ValueError("non-canonical JSON object string")
+        except (
+            RecursionError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
+            raise IdeaSkillUnavailable(
+                "codex_json_object_transport_invalid"
+            ) from error
+    else:
+        raise IdeaSkillUnavailable("codex_json_object_transport_invalid")
+
+    state = {"nodes": 0}
+
+    def visit(item: object, depth: int) -> None:
+        if depth > limits["max_depth"]:
+            raise IdeaSkillUnavailable("codex_json_object_transport_invalid")
+        state["nodes"] += 1
+        if state["nodes"] > limits["max_nodes"]:
+            raise IdeaSkillUnavailable("codex_json_object_transport_invalid")
+        if isinstance(item, dict):
+            if (depth == 0 and not item) or len(item) > limits[
+                "max_collection_items"
+            ]:
+                raise IdeaSkillUnavailable(
+                    "codex_json_object_transport_invalid"
+                )
+            for key, nested in item.items():
+                if (
+                    not isinstance(key, str)
+                    or len(key.encode("utf-8")) > limits["max_string_bytes"]
+                ):
+                    raise IdeaSkillUnavailable(
+                        "codex_json_object_transport_invalid"
+                    )
+                visit(nested, depth + 1)
+            return
+        if isinstance(item, list):
+            if len(item) > limits["max_collection_items"]:
+                raise IdeaSkillUnavailable(
+                    "codex_json_object_transport_invalid"
+                )
+            for nested in item:
+                visit(nested, depth + 1)
+            return
+        if isinstance(item, str):
+            if len(item.encode("utf-8")) > limits["max_string_bytes"]:
+                raise IdeaSkillUnavailable(
+                    "codex_json_object_transport_invalid"
+                )
+            return
+        if type(item) is int:
+            if abs(item) > limits["max_integer_abs"]:
+                raise IdeaSkillUnavailable(
+                    "codex_json_object_transport_invalid"
+                )
+            return
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise IdeaSkillUnavailable(
+                    "codex_json_object_transport_invalid"
+                )
+            return
+        if item is None or isinstance(item, bool):
+            return
+        raise IdeaSkillUnavailable("codex_json_object_transport_invalid")
+
+    try:
+        visit(decoded, 0)
+        if (
+            len(canonical_json(decoded).encode("utf-8"))
+            > limits["max_serialized_bytes"]
+        ):
+            raise IdeaSkillUnavailable(
+                "codex_json_object_transport_invalid"
+            )
+    except (RecursionError, UnicodeError) as error:
+        raise IdeaSkillUnavailable(
+            "codex_json_object_transport_invalid"
+        ) from error
+    return decoded
+
+
+def _schema_may_match(value: object, schema: dict[str, object]) -> bool:
+    if _CODEX_JSON_OBJECT_STRING_MARKER in schema:
+        return isinstance(value, str)
+    if "const" in schema and value != schema["const"]:
+        return False
+    schema_type = schema.get("type")
+    if schema_type == "object" and not isinstance(value, dict):
+        return False
+    if schema_type == "array" and not isinstance(value, list):
+        return False
+    if schema_type == "string" and not isinstance(value, str):
+        return False
+    if schema_type == "integer" and type(value) is not int:
+        return False
+    if schema_type == "number" and (
+        isinstance(value, bool) or not isinstance(value, (int, float))
+    ):
+        return False
+    if schema_type == "boolean" and not isinstance(value, bool):
+        return False
+    if schema_type == "null" and value is not None:
+        return False
+    if isinstance(value, dict):
+        required = schema.get("required")
+        if isinstance(required, list) and not set(required) <= set(value):
+            return False
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for key, child in properties.items():
+                if (
+                    key in value
+                    and isinstance(child, dict)
+                    and not _schema_may_match(value[key], child)
+                ):
+                    return False
+    for union_key in ("anyOf", "oneOf"):
+        union = schema.get(union_key)
+        if isinstance(union, list):
+            return any(
+                isinstance(child, dict) and _schema_may_match(value, child)
+                for child in union
+            )
+    return True
+
+
+def _decode_codex_schema_value(value: object, schema: dict[str, object]) -> object:
+    if _CODEX_JSON_OBJECT_STRING_MARKER in schema:
+        return _decode_canonical_json_object(value, schema)
+    for union_key in ("oneOf", "anyOf"):
+        union = schema.get(union_key)
+        if isinstance(union, list):
+            matching = [
+                child
+                for child in union
+                if isinstance(child, dict) and _schema_may_match(value, child)
+            ]
+            if not matching:
+                raise IdeaSkillUnavailable(
+                    "codex_json_object_transport_invalid"
+                )
+            return _decode_codex_schema_value(value, matching[0])
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return {
+                key: (
+                    _decode_codex_schema_value(nested, properties[key])
+                    if key in properties and isinstance(properties[key], dict)
+                    else nested
+                )
+                for key, nested in value.items()
+            }
+    if isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            return [
+                _decode_codex_schema_value(nested, items) for nested in value
+            ]
+    return value
+
+
+def _decode_codex_provider_output(
+    output: dict[str, object],
+    raw_schema: dict[str, object],
+) -> dict[str, object]:
+    decoded = _decode_codex_schema_value(output, raw_schema)
+    if not isinstance(decoded, dict):
+        raise IdeaSkillUnavailable("codex_json_object_transport_invalid")
+    return decoded
+
+
+def _unwrap_codex_root_output(
+    output: dict[str, object],
+    raw_schema: dict[str, object],
+) -> dict[str, object]:
+    """Remove only the fixed transport wrapper added for a root union."""
+
+    if not isinstance(raw_schema.get("oneOf"), list):
+        return output
+    wrapped = output.get(_CODEX_ROOT_OUTPUT_KEY)
+    if set(output) == {_CODEX_ROOT_OUTPUT_KEY} and isinstance(wrapped, dict):
+        return cast(dict[str, object], wrapped)
+    raise IdeaSkillUnavailable("codex_json_object_transport_invalid")
 
 
 @dataclass(frozen=True)
@@ -330,12 +896,19 @@ class CodexIdeaSkillAdapter:
     def _is_reconciliation_operation_name(self, operation_name: str) -> bool:
         return operation_name in self._reconciliation_operation_names
 
+    def _transport_contract_failure_code(self, operation_name: str) -> str:
+        if operation_name == "primary":
+            return "idea_primary_result_contract_invalid"
+        if operation_name == "review":
+            return "idea_review_result_contract_invalid"
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+
     def __init__(
         self,
         workspace: Path,
         *,
         executable: str = "codex",
-        model_ref: str = "gpt-5.4",
+        model_ref: str = CODEX_MODEL_REF,
         timeout_seconds: float = 15 * 60,
         process_runner: Callable[
             [list[str], str, float], subprocess.CompletedProcess[str]
@@ -529,6 +1102,10 @@ class CodexIdeaSkillAdapter:
                 "__context_pack_ref__",
             ),
         }
+        output_contracts = {
+            name: _compile_codex_output_schema(schema)
+            for name, schema in output_contracts.items()
+        }
         return IdeaRuntimeBinding(
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
@@ -572,6 +1149,7 @@ class CodexIdeaSkillAdapter:
                 + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
                 "codex-config:features.multi_agent=true",
+                CODEX_REASONING_EFFORT_BINDING,
                 "codex-config:web_search=live",
                 "output-route:codex-output-last-message/json-schema/v1",
                 "provider-output-limits:"
@@ -594,6 +1172,204 @@ class CodexIdeaSkillAdapter:
                 "codex_transport_seal_unavailable"
             ) from error
 
+    def terminal_contract_failure_checkpoint(
+        self,
+        *,
+        job_ref: str,
+        operation_name: str,
+        native_session_ref: str,
+        failure_code: str,
+        detail_code: str,
+    ) -> dict[str, object]:
+        """Bind a terminal contract failure to the already-sealed operation."""
+
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", failure_code) is None:
+            raise IdeaSkillUnavailable("codex_contract_failure_code_invalid")
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", detail_code) is None:
+            raise IdeaSkillUnavailable("codex_contract_failure_detail_code_invalid")
+        directory = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": job_ref})
+            / operation_name
+        )
+        try:
+            completion = json.loads(
+                _read_spool_text(
+                    directory / "completed.json",
+                    self._provider_transport_limits.result_max_bytes
+                    + _COMPLETION_ENVELOPE_MAX_BYTES,
+                )
+            )
+            if not isinstance(completion, dict):
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            invocation_hash = completion.get("invocation_hash")
+            if not isinstance(invocation_hash, str) or len(invocation_hash) != 64:
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            envelope = json.loads(
+                _read_spool_text(
+                    directory / "invocation.json",
+                    _COMPLETION_ENVELOPE_MAX_BYTES,
+                )
+            )
+            invocation = (
+                envelope.get("payload") if isinstance(envelope, dict) else None
+            )
+            if (
+                not isinstance(invocation, dict)
+                or canonical_hash(invocation) != invocation_hash
+            ):
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            transport_limits = _operation_transport_limits(
+                cast(dict[str, object], invocation)
+            )
+            _decoded, recovered_session, _recovered_stdout = (
+                _read_completed_operation(
+                    directory,
+                    invocation_hash=invocation_hash,
+                    native_session_ref=native_session_ref,
+                    transport_limits=transport_limits,
+                )
+            )
+            marker = _verified_success_exit(
+                directory,
+                invocation_hash=invocation_hash,
+            )
+        except IdeaSkillUnavailable:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+        if (
+            recovered_session != native_session_ref
+            or marker.get("returncode") != 0
+            or marker.get("termination_reason") != "completed"
+        ):
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+        return _provider_terminal_contract_checkpoint(
+            marker,
+            failure_code,
+            detail_code,
+        )
+
+    def _sealed_transport_contract_failure(
+        self,
+        *,
+        directory: Path,
+        job_ref: str,
+        operation_name: str,
+        native_session_ref: str | None,
+    ) -> IdeaSkillUnavailable:
+        """Re-prove a transport-level contract failure from sealed raw files."""
+
+        try:
+            _key_path, transport_key = self._transport_key()
+            invocation = read_transport_envelope(
+                directory / "invocation.json",
+                transport_key,
+            )
+            if not isinstance(invocation, dict):
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            schema_ref = invocation.get("schema_ref")
+            transport_limits = _operation_transport_limits(invocation)
+            expected_fields = {
+                "schema_ref",
+                "job_ref",
+                "operation_name",
+                "prompt_hash",
+                "output_schema_hash",
+                "native_session_ref",
+                "model_ref",
+                "mcp_url",
+                "mcp_scope_binding_hash",
+                "transport_mode",
+                *transport_limits.as_dict(),
+            }
+            if schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA:
+                expected_fields.difference_update(
+                    {"mcp_url", "mcp_scope_binding_hash"}
+                )
+                expected_fields.difference_update(transport_limits.as_dict())
+            if (
+                set(invocation) != expected_fields
+                or invocation.get("job_ref") != job_ref
+                or invocation.get("operation_name") != operation_name
+                or invocation.get("native_session_ref") != native_session_ref
+                or invocation.get("transport_mode")
+                not in {"durable_supervisor", "unreconciled_runner"}
+            ):
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            invocation_hash = canonical_hash(invocation)
+            _verified_operation_inputs(
+                directory,
+                invocation_hash=invocation_hash,
+            )
+            marker = _verified_success_exit(
+                directory,
+                invocation_hash=invocation_hash,
+            )
+            if marker.get("termination_reason") != "completed":
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            hash_fields = (
+                "invocation_hash",
+                "prompt_hash",
+                "output_schema_hash",
+                "stdout_hash",
+                "result_file_hash",
+                "supervisor_receipt_hash",
+            )
+            if any(
+                not isinstance(marker.get(field), str)
+                or re.fullmatch(r"[0-9a-f]{64}", cast(str, marker[field])) is None
+                for field in hash_fields
+            ):
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            try:
+                decoded = json.loads(
+                    _read_idea_result(
+                        directory / "last-message.json",
+                        result_max_bytes=transport_limits.result_max_bytes,
+                    )
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                detail_code = "codex_output_invalid"
+            else:
+                if not isinstance(decoded, dict):
+                    detail_code = "codex_output_invalid"
+                else:
+                    stdout = _read_spool_text(
+                        directory / "stdout.jsonl",
+                        transport_limits.stream_max_bytes,
+                    )
+                    try:
+                        _verified_native_session(
+                            stdout,
+                            expected=native_session_ref,
+                        )
+                    except IdeaSkillUnavailable as error:
+                        if error.code not in {
+                            "codex_native_session_missing",
+                            "codex_native_session_mismatch",
+                        }:
+                            raise
+                        detail_code = error.code
+                    else:
+                        raise IdeaSkillUnavailable(
+                            "codex_operation_spool_invalid"
+                        )
+        except IdeaSkillUnavailable:
+            raise
+        except (OSError, ProviderSupervisorError) as error:
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+        failure_code = self._transport_contract_failure_code(operation_name)
+        return IdeaSkillUnavailable(
+            failure_code,
+            recovery_checkpoint=_provider_terminal_contract_checkpoint(
+                marker,
+                failure_code,
+                detail_code,
+            ),
+        )
+
     def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
         if request.runtime_binding != self.runtime_binding():
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
@@ -609,6 +1385,9 @@ class CodexIdeaSkillAdapter:
             )
         primary_prompt = (
             f"{skill}\n\n"
+            "本回合仅执行 Primary draft phase。禁止调用 spawn_agent 或 wait，禁止委派 "
+            "child、独立评审或预先处理 review；必须先返回 frozen draft。独立评审只能在 "
+            "Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是 Idea 主 Agent。只返回 {\"outcome\": ...}，其中 outcome 是一个完整 "
             "IdeaSet 或 NoViableCandidate。"
             "不得创建 Question、Plan、Run、receipt、selected Idea 或 StageCommit。"
@@ -632,9 +1411,30 @@ class CodexIdeaSkillAdapter:
         )
         if primary_session is None:
             raise IdeaSkillUnavailable("codex_primary_session_missing")
+        try:
+            _verify_primary_phase_trace(_primary_stdout)
+        except IdeaSkillUnavailable as error:
+            if request.job_ref is None:
+                raise
+            raise IdeaSkillUnavailable(
+                error.code,
+                recovery_checkpoint=self.terminal_contract_failure_checkpoint(
+                    job_ref=request.job_ref,
+                    operation_name="primary",
+                    native_session_ref=primary_session,
+                    failure_code=error.code,
+                    detail_code=error.code,
+                ),
+            ) from error
         draft_value = primary_output.get("outcome")
         if not isinstance(draft_value, dict):
-            raise IdeaSkillUnavailable("codex_outcome_invalid")
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="primary",
+                native_session_ref=primary_session,
+                failure_code="idea_primary_result_contract_invalid",
+                detail_code="codex_outcome_invalid",
+            )
         return IdeaSkillDraft(
             draft=cast(dict[str, object], draft_value),
             primary_session_ref=primary_session,
@@ -652,6 +1452,8 @@ class CodexIdeaSkillAdapter:
 
         reviewer_prompt = (
             f"{skill}\n\n"
+            "本回合是 Review phase。必须针对下方当前 frozen reviewed_draft 现在新建一个 "
+            "child reviewer；不得复用 Primary phase、任何先前 child 或先前评审结论。"
             "你仍是根 Idea Agent。必须把独立 advisory reviewer 委派给 Harness：在当前 "
             "managed native Session 内使用 Harness "
             "原生 spawn_agent 能力以 fork_turns=\"none\" 启动一个全新上下文的短命 child "
@@ -692,12 +1494,34 @@ class CodexIdeaSkillAdapter:
             or not isinstance(final_value, dict)
             or not isinstance(disposition_value, list)
         ):
-            raise IdeaSkillUnavailable("codex_review_invalid")
-        _verify_child_review_trace(
-            review_stdout,
-            root_session_ref=draft.primary_session_ref,
-            reviewer_agent_ref=reviewer_agent_ref,
-        )
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code="idea_review_result_contract_invalid",
+                detail_code="codex_review_invalid",
+            )
+        try:
+            _verify_child_review_trace(
+                review_stdout,
+                root_session_ref=draft.primary_session_ref,
+                reviewer_agent_ref=reviewer_agent_ref,
+            )
+        except IdeaSkillUnavailable as error:
+            if request.job_ref is None or error.code not in (
+                _CHILD_REVIEW_TRACE_FAILURES
+            ):
+                raise
+            raise IdeaSkillUnavailable(
+                error.code,
+                recovery_checkpoint=self.terminal_contract_failure_checkpoint(
+                    job_ref=request.job_ref,
+                    operation_name="review",
+                    native_session_ref=draft.primary_session_ref,
+                    failure_code=error.code,
+                    detail_code=error.code,
+                ),
+            ) from error
         findings = tuple(cast(dict[str, str], item) for item in findings_value)
         dispositions = tuple(
             cast(dict[str, str], item) for item in disposition_value
@@ -722,6 +1546,29 @@ class CodexIdeaSkillAdapter:
             draft,
         )
 
+    def _sealed_result_failure(
+        self,
+        *,
+        job_ref: str | None,
+        operation_name: str,
+        native_session_ref: str,
+        failure_code: str,
+        detail_code: str | None = None,
+    ) -> IdeaSkillUnavailable:
+        checkpoint = None
+        if job_ref is not None:
+            checkpoint = self.terminal_contract_failure_checkpoint(
+                job_ref=job_ref,
+                operation_name=operation_name,
+                native_session_ref=native_session_ref,
+                failure_code=failure_code,
+                detail_code=detail_code or failure_code,
+            )
+        return IdeaSkillUnavailable(
+            failure_code,
+            recovery_checkpoint=checkpoint,
+        )
+
     def _invoke(
         self,
         *,
@@ -735,6 +1582,23 @@ class CodexIdeaSkillAdapter:
         mcp_scope_binding_hash: str | None = None,
         sandbox_read_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
+        raw_schema = schema
+        if isinstance(raw_schema.get("oneOf"), list):
+            prompt = (
+                f"{prompt}\n\nProvider transport envelope: return exactly "
+                f'{{"{_CODEX_ROOT_OUTPUT_KEY}": <domain output>}}. '
+                "The nested value is the requested domain output; do not add "
+                "any other root key."
+            )
+        if _schema_contains_json_object_transport(raw_schema):
+            prompt = (
+                f"{prompt}\n\nProvider transport encoding: every schema field "
+                "described as a canonical JSON object string must contain a "
+                "compact JSON object with sorted keys, no duplicate keys, and "
+                "no surrounding prose. The adapter decodes it before the "
+                "frozen domain validator runs."
+            )
+        schema = _compile_codex_output_schema(raw_schema)
         transport_limits = self._provider_transport_limits
         _validate_provider_inputs(
             prompt,
@@ -748,7 +1612,7 @@ class CodexIdeaSkillAdapter:
                 / canonical_hash({"job_ref": job_ref})
                 / operation_name
             )
-            return self._invoke_durable(
+            result = self._invoke_durable(
                 directory=directory,
                 operation_name=operation_name,
                 job_ref=job_ref,
@@ -761,24 +1625,35 @@ class CodexIdeaSkillAdapter:
                 sandbox_read_root=sandbox_read_root,
                 transport_limits=transport_limits,
             )
-        with tempfile.TemporaryDirectory(
-            prefix="idea-provider-", dir=self._workspace
-        ) as raw_directory:
-            return self._invoke_once(
-                directory=Path(raw_directory),
-                prompt=prompt,
-                schema=schema,
-                native_session_ref=native_session_ref,
-                job_ref=None,
-                stdout_path=None,
-                invocation_hash=None,
-                supervisor_request_schema=CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
-                mcp_url=mcp_url,
-                mcp_token=mcp_token,
-                mcp_scope_binding_hash=mcp_scope_binding_hash,
-                sandbox_read_root=sandbox_read_root,
-                transport_limits=transport_limits,
-            )
+        else:
+            with tempfile.TemporaryDirectory(
+                prefix="idea-provider-", dir=self._workspace
+            ) as raw_directory:
+                result = self._invoke_once(
+                    directory=Path(raw_directory),
+                    prompt=prompt,
+                    schema=schema,
+                    native_session_ref=native_session_ref,
+                    job_ref=None,
+                    stdout_path=None,
+                    invocation_hash=None,
+                    supervisor_request_schema=CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
+                    mcp_url=mcp_url,
+                    mcp_token=mcp_token,
+                    mcp_scope_binding_hash=mcp_scope_binding_hash,
+                    sandbox_read_root=sandbox_read_root,
+                    transport_limits=transport_limits,
+                )
+        try:
+            unwrapped = _unwrap_codex_root_output(result[0], raw_schema)
+            decoded = _decode_codex_provider_output(unwrapped, raw_schema)
+        except IdeaSkillUnavailable as error:
+            if error.code != "codex_json_object_transport_invalid":
+                raise
+            # Make the stage's existing top-level shape check fail so its
+            # stage-specific sealed terminal contract remains authoritative.
+            decoded = {_CODEX_TRANSPORT_DECODE_FAILURE_KEY: error.code}
+        return decoded, result[1], result[2]
 
     def _invoke_durable(
         self,
@@ -860,12 +1735,22 @@ class CodexIdeaSkillAdapter:
             if provider_started.exists() or any(
                 path.exists() for path in effect_files
             ):
-                return _read_completed_operation(
-                    directory,
-                    invocation_hash=invocation_hash,
-                    native_session_ref=native_session_ref,
-                    transport_limits=transport_limits,
-                )
+                try:
+                    return _read_completed_operation(
+                        directory,
+                        invocation_hash=invocation_hash,
+                        native_session_ref=native_session_ref,
+                        transport_limits=transport_limits,
+                    )
+                except IdeaSkillUnavailable as error:
+                    if error.code in _SEALED_TRANSPORT_CONTRACT_FAILURES:
+                        raise self._sealed_transport_contract_failure(
+                            directory=directory,
+                            job_ref=job_ref,
+                            operation_name=operation_name,
+                            native_session_ref=native_session_ref,
+                        ) from error
+                    raise
             if persisted_transport_mode != "durable_supervisor":
                 raise IdeaSkillUnavailable(
                     "codex_operation_reconciliation_pending"
@@ -889,6 +1774,13 @@ class CodexIdeaSkillAdapter:
                 transport_limits=transport_limits,
             )
         except IdeaSkillUnavailable as error:
+            if error.code in _SEALED_TRANSPORT_CONTRACT_FAILURES:
+                raise self._sealed_transport_contract_failure(
+                    directory=directory,
+                    job_ref=job_ref,
+                    operation_name=operation_name,
+                    native_session_ref=native_session_ref,
+                ) from error
             if error.code == "codex_cli_unavailable":
                 # Popen never occurred, so retrying this prepared operation is safe.
                 _remove_operation_spool(directory)
@@ -961,6 +1853,8 @@ class CodexIdeaSkillAdapter:
             ),
             "--config",
             'approval_policy="never"',
+            "--config",
+            CODEX_REASONING_EFFORT_CONFIG,
             "--config",
             f'web_search="{self._web_search_mode}"',
             *(
@@ -1218,6 +2112,7 @@ def _validate_provider_inputs(
     *,
     transport_limits: ProviderTransportLimits,
 ) -> None:
+    _validate_codex_output_schema_dialect(schema)
     if len(prompt.encode("utf-8")) > transport_limits.prompt_max_bytes:
         raise IdeaSkillUnavailable("codex_prompt_too_large")
     if (
@@ -1443,12 +2338,34 @@ def _provider_hard_ceiling_error(
     marker: dict[str, object],
 ) -> IdeaSkillUnavailable | None:
     termination_reason = marker.get("termination_reason")
+    returncode = marker.get("returncode")
+    if not isinstance(returncode, int) or isinstance(returncode, bool):
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid")
     failure_code = {
         "timeout": "codex_operation_timeout",
         "output_limit": "codex_operation_output_limit",
     }.get(termination_reason)
+    if (
+        failure_code is None
+        and returncode != 0
+        and termination_reason != "stopped"
+    ):
+        # Every signed terminal non-zero exit is a hard ceiling for this exact
+        # provider operation, except a cooperative stop requested by runtime
+        # control.  The more specific supervisor reason remains in the
+        # checkpoint; the public failure code stays backward-compatible.
+        failure_code = "codex_operation_failed"
     if failure_code is None:
         return None
+    return IdeaSkillUnavailable(
+        failure_code,
+        recovery_checkpoint=_provider_hard_ceiling_checkpoint(marker),
+    )
+
+
+def _provider_hard_ceiling_checkpoint(
+    marker: dict[str, object],
+) -> dict[str, object]:
     evidence_fields = (
         "invocation_hash",
         "prompt_hash",
@@ -1463,14 +2380,25 @@ def _provider_hard_ceiling_error(
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
     checkpoint = {
         "schema_ref": "meta-research/provider-hard-ceiling/v1",
-        "termination_reason": termination_reason,
+        "termination_reason": marker.get("termination_reason"),
         **{field: marker[field] for field in evidence_fields},
         "result_file_hash": marker.get("result_file_hash"),
     }
-    return IdeaSkillUnavailable(
-        failure_code,
-        recovery_checkpoint=checkpoint,
-    )
+    return checkpoint
+
+
+def _provider_terminal_contract_checkpoint(
+    marker: dict[str, object], failure_code: str, detail_code: str
+) -> dict[str, object]:
+    checkpoint = _provider_hard_ceiling_checkpoint(marker)
+    if checkpoint.get("termination_reason") != "completed":
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+    return {
+        **checkpoint,
+        "schema_ref": "meta-research/provider-terminal-contract-failure/v1",
+        "contract_failure_code": failure_code,
+        "contract_failure_detail_code": detail_code,
+    }
 
 
 def _verified_operation_inputs(
@@ -1549,6 +2477,25 @@ def _verified_native_session(stdout: str, *, expected: str | None) -> str:
     if expected is not None and observed != expected:
         raise IdeaSkillUnavailable("codex_native_session_mismatch")
     return observed
+
+
+def _verify_primary_phase_trace(stdout: str) -> None:
+    """Reject review collaboration that ran before the draft was frozen."""
+
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "collab_tool_call"
+            and item.get("tool") in {"spawn_agent", "wait"}
+        ):
+            raise IdeaSkillUnavailable("codex_primary_review_phase_invalid")
 
 
 def _verify_child_review_trace(
@@ -1716,11 +2663,9 @@ def _read_completed_operation(
                 )
             )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise IdeaSkillUnavailable(
-                "codex_operation_reconciliation_pending"
-            ) from error
+            raise IdeaSkillUnavailable("codex_output_invalid") from error
         if not isinstance(decoded, dict):
-            raise IdeaSkillUnavailable("codex_operation_reconciliation_pending")
+            raise IdeaSkillUnavailable("codex_output_invalid")
         recovered_session = _verified_native_session(
             stdout,
             expected=native_session_ref,
@@ -1922,6 +2867,12 @@ def _file_sha256(path: Path) -> str:
     except OSError as error:
         raise IdeaSkillUnavailable("codex_cli_identity_unavailable") from error
     return digest.hexdigest()
+
+
+def _shared_codex_adapter_source_hash() -> str:
+    """Hash the shared compiler/transport seam inherited by stage adapters."""
+
+    return _file_sha256(Path(__file__).resolve())
 
 
 def _idea_skill_resources() -> dict[str, str]:

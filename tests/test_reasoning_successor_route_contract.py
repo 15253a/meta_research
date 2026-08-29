@@ -61,3 +61,23 @@ def test_next_cycle_rejects_missing_or_partial_typed_route() -> None:
             next_cycle=partial,
             candidate_completion=None,
         )
+
+
+def test_next_cycle_domain_validator_rejects_duplicate_skip_basis_after_decode() -> None:
+    outcome = _scientific_outcome()
+    proposal = _routed_next_cycle("plan")
+    basis_ref = proposal["source_scientific_outcome_ref"]
+    proposal["typed_skip_basis_refs_by_stage"]["idea"] = [
+        basis_ref,
+        basis_ref,
+    ]
+
+    with pytest.raises(
+        ReasoningContractError,
+        match="next_cycle_proposal_skip_basis_invalid",
+    ):
+        validate_reasoning_transition(
+            outcome,
+            next_cycle=proposal,
+            candidate_completion=None,
+        )

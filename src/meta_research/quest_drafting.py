@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable, Literal, Protocol, cast
 
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF,
+    CODEX_REASONING_EFFORT_CONFIG,
+)
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     ProviderSupervisorError,
@@ -37,20 +41,20 @@ QUESTION_FIELD_MAX_LENGTHS = {
 }
 INTENT_MESSAGE_MAX_LENGTH = 12000
 INTENT_REPLY_MAX_LENGTH = 12000
-PROVIDER_RESULT_MAX_BYTES = 1024 * 1024
-PROVIDER_STREAM_MAX_BYTES = 256 * 1024
+PROVIDER_RESULT_MAX_BYTES = 16 * 1024 * 1024
+PROVIDER_STREAM_MAX_BYTES = 64 * 1024 * 1024
 CODEX_DRAFTING_LOCKED_VERSION = "0.147.0"
 DRAFTING_JOB_SCHEMA_V1 = "meta-research/codex-drafting-job/v1"
 DRAFTING_JOB_SCHEMA_V2 = "meta-research/codex-drafting-job/v2"
 DRAFTING_EXECUTION_CONTRACT_SCHEMA = (
     "meta-research/codex-drafting-execution-contract/v2"
 )
-_DRAFTING_MODEL_REF = "gpt-5.4"
+_DRAFTING_MODEL_REF = CODEX_MODEL_REF
 _DRAFTING_MODEL_CATALOG_PATH = Path(__file__).with_name(
     "codex_drafting_model_catalog.json"
 )
 _DRAFTING_MODEL_CATALOG_SHA256 = (
-    "088421d9b8a33c1a4f86ec9f955974dcc1bb91cad3b4385cb6bb15cfbb307776"
+    "f340eee121d525ab9e05782ca2eb5e7648a7db2694b2473e473da529ef2eba9b"
 )
 _DRAFTING_MODEL_CATALOG_MAX_BYTES = 64 * 1024
 _DISABLED_DRAFTING_CODEX_FEATURES = (
@@ -80,6 +84,7 @@ _DISABLED_DRAFTING_CODEX_FEATURES = (
 _DRAFTING_CODEX_CONFIG_OVERRIDES = (
     "mcp_servers={}",
     'approval_policy="never"',
+    CODEX_REASONING_EFFORT_CONFIG,
     'web_search="disabled"',
     'shell_environment_policy.inherit="none"',
     "tools.update_plan.enabled=false",
@@ -299,6 +304,7 @@ class _CancellableProcessRunner:
         self._lock = threading.Lock()
         self._processes: dict[subprocess.Popen[bytes], int | None] = {}
         self._jobs: dict[str, tuple[subprocess.Popen[bytes], int | None]] = {}
+        self._durable_supervisors: set[subprocess.Popen[bytes]] = set()
         self._cancelled_jobs: set[str] = set()
         self._cancelled: set[subprocess.Popen[bytes]] = set()
         self._stopping = False
@@ -314,7 +320,7 @@ class _CancellableProcessRunner:
         self,
         argv: list[str],
         input_text: str,
-        timeout: float,
+        timeout: float | None,
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return self._run(None, argv, input_text, timeout, environment)
@@ -324,7 +330,7 @@ class _CancellableProcessRunner:
         job_ref: str,
         argv: list[str],
         input_text: str,
-        timeout: float,
+        timeout: float | None,
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return self._run(job_ref, argv, input_text, timeout, environment)
@@ -334,7 +340,7 @@ class _CancellableProcessRunner:
         job_ref: str,
         argv: list[str],
         input_text: str,
-        timeout: float,
+        timeout: float | None,
         stdout_path: Path,
         pid_path: Path,
         supervisor_request_path: Path,
@@ -348,10 +354,9 @@ class _CancellableProcessRunner:
         guess the child return code from output files alone.
         """
 
-        deadline = time.monotonic() + timeout + self._termination_grace_seconds + 1.0
         process: subprocess.Popen[bytes] | None = None
         process_group: int | None = None
-        del input_text
+        del input_text, timeout
         try:
             with self._lock:
                 if self._stopping or job_ref in self._cancelled_jobs:
@@ -371,14 +376,16 @@ class _CancellableProcessRunner:
             )
             process_group = os.getpgid(process.pid) if os.name == "posix" else None
             ready_path = supervisor_request_path.parent / "supervisor-ready.json"
-            startup_deadline = min(deadline, time.monotonic() + 5.0)
+            startup_deadline = time.monotonic() + 5.0
             while not ready_path.exists():
                 if process.poll() is not None:
                     raise OSError("provider supervisor did not become ready")
                 if time.monotonic() >= startup_deadline:
-                    self._signal_process_tree(
-                        process, process_group, signal.SIGKILL
-                    )
+                    # Signal only the exact supervisor. It may have published
+                    # ready between the check above and this deadline; its
+                    # handler must retain ownership long enough to seal a
+                    # stopped receipt instead of losing the outcome to SIGKILL.
+                    process.terminate()
                     process.wait()
                     raise OSError("provider supervisor readiness timed out")
                 time.sleep(0.01)
@@ -387,28 +394,21 @@ class _CancellableProcessRunner:
                 if not should_stop:
                     self._processes[process] = process_group
                     self._jobs[job_ref] = (process, process_group)
+                    self._durable_supervisors.add(process)
             if should_stop:
-                self._terminate_processes(((process, process_group),))
+                process.terminate()
+                process.wait()
                 raise _ProcessStopped
             _write_process_identity(pid_path, process.pid, process_group)
-            oversized = False
+            # Once ready, the signed supervisor request is the sole owner of
+            # the provider timeout and output ceilings. Killing that supervisor
+            # from this outer waiter can destroy the terminal signed receipt and
+            # leave an irreversible started-without-outcome spool.
             while process.poll() is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(argv, timeout)
                 try:
-                    process.wait(timeout=min(remaining, 0.05))
+                    process.wait(timeout=0.05)
                 except subprocess.TimeoutExpired:
-                    if (
-                        stdout_path.exists()
-                        and stdout_path.stat().st_size > stdout_max_bytes
-                    ):
-                        oversized = True
-                        self._signal_process_tree(
-                            process, process_group, signal.SIGKILL
-                        )
-                        process.wait()
-                        break
+                    continue
             with self._lock:
                 stopped = (
                     self._stopping
@@ -420,7 +420,7 @@ class _CancellableProcessRunner:
             if not stdout_path.exists():
                 raise OSError("provider supervisor did not create stdout")
             stdout = _read_bounded_provider_stream(stdout_path, stdout_max_bytes)
-            if process.returncode != 0 and not oversized:
+            if process.returncode != 0:
                 raise OSError("provider supervisor failed")
             return subprocess.CompletedProcess(
                 argv,
@@ -428,11 +428,6 @@ class _CancellableProcessRunner:
                 stdout=stdout,
                 stderr="",
             )
-        except subprocess.TimeoutExpired:
-            if process is not None:
-                self._signal_process_tree(process, process_group, signal.SIGKILL)
-                process.wait()
-            raise
         finally:
             if process is not None:
                 with self._lock:
@@ -440,6 +435,7 @@ class _CancellableProcessRunner:
                     active = self._jobs.get(job_ref)
                     if active is not None and active[0] is process:
                         self._jobs.pop(job_ref, None)
+                    self._durable_supervisors.discard(process)
                     self._cancelled.discard(process)
 
     def _run(
@@ -447,10 +443,10 @@ class _CancellableProcessRunner:
         job_ref: str | None,
         argv: list[str],
         input_text: str,
-        timeout: float,
+        timeout: float | None,
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._lock:
             if self._stopping or (
                 job_ref is not None and job_ref in self._cancelled_jobs
@@ -491,10 +487,14 @@ class _CancellableProcessRunner:
         input_thread.start()
         try:
             try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(argv, timeout)
-                process.wait(timeout=remaining)
+                if timeout is None:
+                    process.wait()
+                else:
+                    assert deadline is not None
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    process.wait(timeout=remaining)
             except subprocess.TimeoutExpired as error:
                 self._signal_process_tree(process, process_group, signal.SIGKILL)
                 process.wait()
@@ -612,13 +612,24 @@ class _CancellableProcessRunner:
     def _terminate_processes(
         self, processes: tuple[tuple[subprocess.Popen[bytes], int | None], ...]
     ) -> None:
-        for process, process_group in processes:
+        with self._lock:
+            durable = tuple(
+                (process, process_group)
+                for process, process_group in processes
+                if process in self._durable_supervisors
+            )
+        ordinary = tuple(item for item in processes if item not in durable)
+        for process, _process_group in durable:
+            process.terminate()
+        for process, process_group in ordinary:
             self._signal_process_tree(process, process_group, signal.SIGTERM)
-        self._wait_until_stopped(processes)
-        for process, process_group in processes:
+        self._wait_until_stopped(ordinary)
+        for process, process_group in ordinary:
             if self._process_tree_running(process, process_group):
                 self._signal_process_tree(process, process_group, signal.SIGKILL)
-        self._wait_until_stopped(processes)
+        self._wait_until_stopped(ordinary)
+        for process, _process_group in durable:
+            process.wait()
 
     def _wait_until_stopped(
         self, processes: tuple[tuple[subprocess.Popen[bytes], int | None], ...]
@@ -2170,12 +2181,27 @@ def _canonical_json(value: object) -> str:
 
 
 def _proposal_prompt(request: ProposalDraftRequest) -> str:
-    literature_instruction = (
-        "DeepFetch 未运行；不得声称已执行检索。"
-        if request.literature_snapshot is None
-        else "DeepFetch LiteratureSnapshot 已作为不可信研究数据提供；必须保留"
-        "其中的限制、缺全文和诚实空结果，不得把执行完成冒充 Evidence acceptance。"
+    policy = (
+        request.literature_snapshot.get("provider_input_policy")
+        if request.literature_snapshot is not None
+        else None
     )
+    binding_only = (
+        isinstance(policy, dict)
+        and policy.get("projection") == "binding_only_due_to_size"
+    )
+    if request.literature_snapshot is None:
+        literature_instruction = "DeepFetch 未运行；不得声称已执行检索。"
+    elif binding_only:
+        literature_instruction = (
+            "DeepFetch LiteratureSnapshot 已接纳，但模型输入只含精确 binding；"
+            "这是证据缺口，不是诚实空结果。不得推断被省略内容或声称没有检索结果。"
+        )
+    else:
+        literature_instruction = (
+            "DeepFetch LiteratureSnapshot 已作为不可信研究数据提供；必须保留"
+            "其中的限制、缺全文和诚实空结果，不得把执行完成冒充 Evidence acceptance。"
+        )
     literature_data = (
         "null"
         if request.literature_snapshot is None

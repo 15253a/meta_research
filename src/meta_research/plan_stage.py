@@ -459,6 +459,7 @@ class PlanStageWorker:
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
             provider_safe = True
+            draft = None
             try:
                 try:
                     draft = self._provider.generate_draft(skill_request)
@@ -479,7 +480,31 @@ class PlanStageWorker:
                     self._transient_error = error.code
                     return _CycleStep(False, provider_boundary_attempted=True)
                 except PlanSkillContractError as error:
-                    self._transient_error = str(error)
+                    if draft is None:
+                        self._transient_error = str(error)
+                        return _CycleStep(
+                            False, provider_boundary_attempted=True
+                        )
+                    failure_code = "plan_primary_result_contract_invalid"
+                    try:
+                        terminal = self._record_terminal_contract_failure(
+                            unit_ref=unit_ref,
+                            run=run,
+                            job_ref=job_ref,
+                            operation_name="primary",
+                            native_session_ref=draft.primary_session_ref,
+                            failure_code=failure_code,
+                            detail_code=str(error),
+                        )
+                    except PlanSkillUnavailable as checkpoint_error:
+                        provider_safe = False
+                        self._transient_error = checkpoint_error.code
+                        return _CycleStep(
+                            False, provider_boundary_attempted=True
+                        )
+                    if terminal:
+                        provider_safe = False
+                    self._transient_error = failure_code
                     return _CycleStep(False, provider_boundary_attempted=True)
                 checkpoint = self._agent_runtime.record_plan_primary_draft(
                     run_ref=run.run_ref,
@@ -525,6 +550,7 @@ class PlanStageWorker:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
         provider_safe = True
+        result = None
         try:
             try:
                 result = self._provider.review_draft(skill_request, draft)
@@ -549,7 +575,27 @@ class PlanStageWorker:
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
             except PlanSkillContractError as error:
-                self._transient_error = str(error)
+                if result is None:
+                    self._transient_error = str(error)
+                    return _CycleStep(False, provider_boundary_attempted=True)
+                failure_code = "plan_review_result_contract_invalid"
+                try:
+                    terminal = self._record_terminal_contract_failure(
+                        unit_ref=unit_ref,
+                        run=run,
+                        job_ref=job_ref,
+                        operation_name="review",
+                        native_session_ref=result.primary_session_ref,
+                        failure_code=failure_code,
+                        detail_code=str(error),
+                    )
+                except PlanSkillUnavailable as checkpoint_error:
+                    provider_safe = False
+                    self._transient_error = checkpoint_error.code
+                    return _CycleStep(False, provider_boundary_attempted=True)
+                if terminal:
+                    provider_safe = False
+                self._transient_error = failure_code
                 return _CycleStep(False, provider_boundary_attempted=True)
             review = review_record(
                 result,
@@ -592,6 +638,45 @@ class PlanStageWorker:
                     attempt_ref=run.attempt_ref,
                     fence_ref=run.fence_ref,
                 )
+
+    def _record_terminal_contract_failure(
+        self,
+        *,
+        unit_ref: str,
+        run: PlanStageRun,
+        job_ref: str,
+        operation_name: str,
+        native_session_ref: str,
+        failure_code: str,
+        detail_code: str,
+    ) -> bool:
+        checkpoint_factory = getattr(
+            self._provider,
+            "terminal_contract_failure_checkpoint",
+            None,
+        )
+        if not callable(checkpoint_factory):
+            return False
+        checkpoint = checkpoint_factory(
+            job_ref=job_ref,
+            operation_name=operation_name,
+            native_session_ref=native_session_ref,
+            failure_code=failure_code,
+            detail_code=detail_code,
+        )
+        if not isinstance(checkpoint, dict):
+            raise PlanSkillUnavailable(
+                "codex_contract_failure_checkpoint_invalid"
+            )
+        self._agent_runtime.record_stage_provider_hard_ceiling(
+            unit_ref=unit_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            failure_code=failure_code,
+            provider_exit=checkpoint,
+        )
+        return True
 
     def _qualify(self, current: _CurrentCycle) -> _Qualification:
         successor = self._advancement_engine.query_reasoning_successor_context(

@@ -50,6 +50,19 @@ Meta Research 是一个本地优先、人机协作的科研执行系统。它把
 
 当前 `test-all` 基线锁定 Codex CLI `0.147.0` 和 Claude Code `2.1.220`。分支更新后以新安装的 `doctor` 输出为准。
 
+### 非 systemd 开发机
+
+生产默认会在原生电源抑制能力无法确认时 fail closed。对于由操作者保证持续在线、
+并明确接受进程不会阻止休眠或关机的本地开发环境，可以在启动 daemon 前设置：
+
+```bash
+export META_RESEARCH_ASSUME_ALWAYS_ON=1
+```
+
+此时运行态证据中的电源后端会明确显示为
+`operator_attested_always_on`，不会伪装成 logind 或 Windows guardian。该开关只绕过
+宿主电源管理要求；未设置时仍使用原有生产保护路径。
+
 ## 隔离部署与启动
 
 目前 `test-all` 通过源码安装，还没有 PyPI 稳定发行版。
@@ -241,10 +254,12 @@ Writing 是独立的用户触发工作流，不是第五个研究 Stage。它基
 ```bash
 ./.venv/bin/meta-research conformance start \
   --data-root "$META_RESEARCH_DATA_ROOT" \
-  --codex-model '<your-account-codex-model-id>' \
+  --codex-model 'gpt-5.6-sol' \
   --claude-model '<your-account-model-id>' \
   --json
 ```
+
+Codex production 路径固定使用 `gpt-5.6-sol`，reasoning effort 固定为 `max`；CLI 省略 `--codex-model` 时也会采用这一不可降级的默认值。
 
 然后反复查看公开状态，直到完成或出现明确 blocker：
 

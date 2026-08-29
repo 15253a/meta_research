@@ -382,7 +382,6 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     adapter = CodexWritingSkillAdapter(
         tmp_path / "provider",
         executable=str(_fake_codex(tmp_path / "codex")),
-        model_ref="test-model",
         process_runner=runner,
     )
     request = _request(adapter)
@@ -391,10 +390,16 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
 
     assert result.primary_session_ref == "codex-writing-primary:1"
     assert result.reviewer_agent_ref == "codex-writing-reviewer:1"
+    assert request.runtime_binding.model_ref == "gpt-5.6-sol"
+    assert (
+        "codex-config:model_reasoning_effort=max"
+        in request.runtime_binding.resource_bindings
+    )
     assert len(runner.calls) == 2
     primary_argv, primary_prompt, _primary_schema = runner.calls[0]
     review_argv, review_prompt, _review_schema = runner.calls[1]
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
+    assert 'model_reasoning_effort="max"' in primary_argv
     assert review_argv[-3:] == ["resume", "codex-writing-primary:1", "-"]
     assert 'web_search="disabled"' in primary_argv
     assert 'web_search="disabled"' in review_argv
@@ -621,6 +626,10 @@ def test_writing_runtime_binding_seals_the_complete_provider_contract(
     assert "filesystem-workspace-write" not in binding.capability_bindings
     assert any(
         item.startswith("adapter-source:meta_research.provider_supervisor@sha256:")
+        for item in binding.resource_bindings
+    )
+    assert any(
+        item.startswith("adapter-source:meta_research.idea_skill@sha256:")
         for item in binding.resource_bindings
     )
     assert any(

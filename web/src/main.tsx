@@ -68,7 +68,10 @@ import {
   useExecutionObserver,
 } from "./ExecutionObserver";
 import { ExperimentLauncher } from "./ExperimentLauncher";
-import { QuestCreationWorkbench } from "./QuestCreation";
+import {
+  QuestCreationWorkbench,
+  type QuestCompletionHandoff,
+} from "./QuestCreation";
 import { QuestionTree } from "./QuestionTree";
 import { ResearchAssetsWorkbench } from "./ResearchAssets";
 import { WritingReportWorkbench } from "./WritingReport";
@@ -516,6 +519,15 @@ function questCreationReady(snapshot: PublicSnapshot | null): boolean {
   return requiredChecks.length > 0
     ? requiredChecks.every((check) => check.status === "ready")
     : snapshot.readiness.status === "ready";
+}
+
+function restorableQuestCreation(
+  current: PublicSnapshot["quest_creation"]["current"],
+  completedInitializationId: string | null,
+): PublicSnapshot["quest_creation"]["current"] {
+  if (!current) return null;
+  if (["completed", "cancelled"].includes(current.status)) return null;
+  return current.initialization_id === completedInitializationId ? null : current;
 }
 
 function RailButton({
@@ -3434,6 +3446,9 @@ function App() {
   const [questionRouteNodeRef, setQuestionRouteNodeRef] = useState<string | null>(
     () => initialParameters.get("node"),
   );
+  const [questCompletionLanding, setQuestCompletionLanding] = useState<
+    QuestCompletionHandoff | null
+  >(null);
   const [questionInspectorMode, setQuestionInspectorMode] = useState<
     QuestionInspectorMode
   >(() => {
@@ -3477,6 +3492,7 @@ function App() {
   const questionTreeButtonRef = useRef<HTMLButtonElement>(null);
   const historyButtonRef = useRef<HTMLButtonElement>(null);
   const questionTreeReturnFocusRef = useRef<HTMLButtonElement | null>(null);
+  const completedHandoffInitializationRef = useRef<string | null>(null);
   const writingButtonRef = useRef<HTMLButtonElement>(null);
   const humanRequestReturnFocusRef = useRef<HTMLElement | null>(null);
   const humanRequestReturnUrlRef = useRef<string | null>(null);
@@ -3739,20 +3755,53 @@ function App() {
   )?.status === "ready";
   const openCreation = () => {
     if (!canCreate) return;
+    const currentCreation = restorableQuestCreation(
+      snapshot?.quest_creation.current ?? null,
+      completedHandoffInitializationRef.current,
+    );
+    setQuestCompletionLanding(null);
     setQuestionTreeOpen(false);
     setAssetsOpen(false);
     setWritingOpen(false);
     setManualPanel(null);
     setPendingDirectManualParentRef(null);
     window.history.replaceState(null, "", "/?panel=create-quest");
-    setCreationMode("current");
+    setCreationMode(currentCreation ? "current" : "new");
   };
   const closeCreation = () => {
     window.history.replaceState(null, "", "/");
     setCreationMode(null);
   };
+  const completeCreation = useCallback((handoff: QuestCompletionHandoff) => {
+    if (completedHandoffInitializationRef.current === handoff.initializationId) return;
+    completedHandoffInitializationRef.current = handoff.initializationId;
+    setSnapshot((current) => {
+      if (
+        !current
+        || current.quest_creation.current?.initialization_id !== handoff.initializationId
+      ) return current;
+      return {
+        ...current,
+        quest_creation: { ...current.quest_creation, current: null },
+      };
+    });
+    setAssetsOpen(false);
+    setWritingOpen(false);
+    setManualPanel(null);
+    setManualOpenError(null);
+    setQuestionInspectorMode(null);
+    setQuestionRouteNodeRef(handoff.questionRef);
+    setSelectedQuestionContext(null);
+    setPendingDirectManualParentRef(null);
+    setQuestCompletionLanding(handoff);
+    window.history.replaceState(null, "", questionTreeUrl(handoff.questionRef));
+    setCreationMode(null);
+    setQuestionTreeOpen(true);
+    void reload();
+  }, [reload]);
   const openAssets = () => {
     if (!canBrowseAssets) return;
+    setQuestCompletionLanding(null);
     setCreationMode(null);
     setQuestionTreeOpen(false);
     setWritingOpen(false);
@@ -3767,6 +3816,7 @@ function App() {
   };
   const openQuestionTree = () => {
     if (!canBrowseQuestions) return;
+    setQuestCompletionLanding(null);
     questionTreeReturnFocusRef.current = questionTreeButtonRef.current;
     setCreationMode(null);
     setAssetsOpen(false);
@@ -3781,6 +3831,7 @@ function App() {
     setQuestionTreeOpen(true);
   };
   const closeQuestionTree = () => {
+    setQuestCompletionLanding(null);
     setManualPanel(null);
     setQuestionTreeOpen(false);
     setQuestionInspectorMode(null);
@@ -3798,6 +3849,7 @@ function App() {
 
   const openQuestionHistory = () => {
     if (!canBrowseHistory || !historyQuestionRef) return;
+    setQuestCompletionLanding(null);
     questionTreeReturnFocusRef.current = historyButtonRef.current;
     setCreationMode(null);
     setAssetsOpen(false);
@@ -3816,7 +3868,25 @@ function App() {
     setQuestionTreeOpen(true);
   };
 
+  const completionLandingProjected = Boolean(
+    questCompletionLanding
+    && snapshot?.question_tree.items.some(
+      (item) => item.question_ref === questCompletionLanding.questionRef,
+    ),
+  );
   const selectQuestionTreeContext = useCallback((question: QuestionTreeItem | null) => {
+    // Completion may lead the next full Snapshot. Keep the exact handoff route
+    // while the mounted old tree reports its automatic fallback selection.
+    if (
+      questCompletionLanding
+      && !completionLandingProjected
+      && question?.question_ref !== questCompletionLanding.questionRef
+    ) return;
+    setQuestCompletionLanding((current) => (
+      current && question && current.questionRef !== question.question_ref
+        ? null
+        : current
+    ));
     setSelectedQuestionContext((current) => (
       current?.question_ref === question?.question_ref
         ? current
@@ -3833,7 +3903,12 @@ function App() {
         questionTreeUrl(question.question_ref, questionInspectorMode),
       );
     }
-  }, [manualPanel, questionInspectorMode]);
+  }, [
+    completionLandingProjected,
+    manualPanel,
+    questCompletionLanding,
+    questionInspectorMode,
+  ]);
 
   const discussQuestionWithCompanion = useCallback((
     question: QuestionTreeItem,
@@ -3866,6 +3941,7 @@ function App() {
 
   const openWriting = () => {
     if (!canBrowseWriting || !snapshot) return;
+    setQuestCompletionLanding(null);
     setCreationMode(null);
     setAssetsOpen(false);
     setQuestionTreeOpen(false);
@@ -4146,6 +4222,7 @@ function App() {
             projectionStatus={snapshot.question_tree.status}
             projectionReason={snapshot.question_tree.reason?.code ?? null}
             initialQuestionRef={questionRouteNodeRef}
+            completionLanding={questCompletionLanding}
             initialInspectorMode={questionInspectorMode}
             onInspectorModeChange={changeQuestionInspectorMode}
             manualCreationReady={Boolean(
@@ -4196,13 +4273,13 @@ function App() {
       />
       {creationMode && snapshot ? (
         <QuestCreationWorkbench
-          current={creationMode === "new" ? null : snapshot.quest_creation.current}
+          current={restorableQuestCreation(
+            snapshot.quest_creation.current,
+            completedHandoffInitializationRef.current,
+          )}
           researchAssets={snapshot.research_assets.items}
-          researchAssetInventoryRevision={
-            snapshot.research_assets.inventory_revision
-          }
-          researchAssetTotal={snapshot.research_assets.total_count}
           onClose={closeCreation}
+          onCompleted={completeCreation}
           onChanged={() => void reload()}
         />
       ) : null}

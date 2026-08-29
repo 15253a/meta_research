@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from meta_research.database import Database
 from meta_research.feed import DurableFeed
 from meta_research.migration import upgrade_database
 from meta_research.paths import prepare_data_root
+from meta_research.power_inhibitors import OperatorAttestedPowerInhibitor
 from meta_research.runtime_protection import (
     InhibitorLease,
     RuntimeEffectIdentity,
@@ -1007,6 +1009,201 @@ def test_restart_records_interruption_and_rejects_the_old_incarnation(
             checkpoint_ref="checkpoint:recovered-owner-commit",
         )
         assert adapter.release_calls == adapter.acquire_calls
+    finally:
+        first_database.close()
+        second_database.close()
+
+
+def test_restart_adopts_active_epoch_into_operator_attested_backend(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "restart-adopts-attested-backend")
+    upgrade_database(data_root.database)
+    native_adapter = RecordingInhibitor()
+    first_database = Database(data_root.database)
+    first = RuntimeProtection(
+        database=first_database,
+        feed=DurableFeed(first_database),
+        inhibitor=native_adapter,
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    effect = _effect("restart-adopts-attested-backend")
+    original = first.acquire(effect)
+
+    second_database = Database(data_root.database)
+    second = RuntimeProtection(
+        database=second_database,
+        feed=DurableFeed(second_database),
+        inhibitor=OperatorAttestedPowerInhibitor(clock=lambda: 1_720_000_100.0),
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    try:
+        evidence = second.query_evidence()
+
+        assert evidence["reason"] == {"code": "runtime_responsibility_waiting"}
+        assert evidence["inhibitor"]["backend"] == (
+            "operator_attested_always_on"
+        )
+        assert evidence["inhibitor"]["capability"]["status"] == "ready"
+        assert evidence["inhibitor"]["holder_ref"] == original.holder_ref
+        assert evidence["interruptions"][0]["reconciliation_status"] == (
+            "protected"
+        )
+        with second_database.read() as connection:
+            epoch = connection.execute(
+                text(
+                    "SELECT backend, native_holder_ref FROM "
+                    "ar_power_inhibitor_epochs WHERE holder_ref = :holder_ref"
+                ),
+                {"holder_ref": original.holder_ref},
+            ).mappings().one()
+        assert epoch["backend"] == "operator_attested_always_on"
+        assert str(epoch["native_holder_ref"]).startswith(
+            "operator-attestation:"
+        )
+        with second_database.read() as connection:
+            payload = json.loads(
+                connection.execute(
+                    text(
+                        "SELECT payload_json FROM durable_feed WHERE event_type = "
+                        "'agent_runtime.power_inhibitor_backend_superseded' "
+                        "ORDER BY revision DESC LIMIT 1"
+                    )
+                ).scalar_one()
+            )
+        assert payload == {
+            "backend": "operator_attested_always_on",
+            "holder_ref": original.holder_ref,
+            "native_release_disposition": "not_attempted",
+            "previous_backend": "test_inhibitor",
+            "previous_status": "active",
+            "scope": "sleep",
+        }
+    finally:
+        first_database.close()
+        second_database.close()
+
+
+def test_restart_adopts_release_pending_epoch_before_attested_release(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "release-pending-attested-backend")
+    upgrade_database(data_root.database)
+    native_adapter = RecordingInhibitor(
+        release_fail_code="power_inhibitor_release_failed"
+    )
+    first_database = Database(data_root.database)
+    first = RuntimeProtection(
+        database=first_database,
+        feed=DurableFeed(first_database),
+        inhibitor=native_adapter,
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    effect = _effect("release-pending-attested-backend")
+    original = first.acquire(effect)
+    _record_boundary(first_database, effect, boundary="terminal")
+    first.finish(effect.responsibility_ref, boundary="terminal")
+
+    second_database = Database(data_root.database)
+    second = RuntimeProtection(
+        database=second_database,
+        feed=DurableFeed(second_database),
+        inhibitor=OperatorAttestedPowerInhibitor(clock=lambda: 1_720_000_100.0),
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    try:
+        evidence = second.query_evidence()
+
+        assert evidence["status"] == "ready"
+        assert evidence["inhibitor"]["status"] == "idle"
+        with second_database.read() as connection:
+            epoch = connection.execute(
+                text(
+                    "SELECT backend, native_holder_ref, status FROM "
+                    "ar_power_inhibitor_epochs WHERE holder_ref = :holder_ref"
+                ),
+                {"holder_ref": original.holder_ref},
+            ).mappings().one()
+        assert epoch == {
+            "backend": "operator_attested_always_on",
+            "native_holder_ref": (
+                "operator-attestation:"
+                + hashlib.sha256(
+                    original.holder_ref.encode("utf-8")
+                ).hexdigest()[:24]
+            ),
+            "status": "released",
+        }
+        with second_database.read() as connection:
+            events = connection.execute(
+                text(
+                    "SELECT event_type, payload_json FROM durable_feed WHERE "
+                    "event_type IN ("
+                    "'agent_runtime.power_inhibitor_backend_superseded', "
+                    "'agent_runtime.power_inhibitor_released') ORDER BY revision"
+                )
+            ).mappings().all()
+        assert [event["event_type"] for event in events] == [
+            "agent_runtime.power_inhibitor_backend_superseded",
+            "agent_runtime.power_inhibitor_released",
+        ]
+        released_payload = json.loads(str(events[-1]["payload_json"]))
+        assert released_payload["backend"] == "operator_attested_always_on"
+        assert released_payload["scope"] == "sleep"
+    finally:
+        first_database.close()
+        second_database.close()
+
+
+def test_release_pending_foreign_epoch_stays_pending_without_supersession(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "release-pending-no-supersession")
+    upgrade_database(data_root.database)
+    native_adapter = RecordingInhibitor(
+        release_fail_code="power_inhibitor_release_failed"
+    )
+    first_database = Database(data_root.database)
+    first = RuntimeProtection(
+        database=first_database,
+        feed=DurableFeed(first_database),
+        inhibitor=native_adapter,
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    effect = _effect("release-pending-no-supersession")
+    original = first.acquire(effect)
+    _record_boundary(first_database, effect, boundary="terminal")
+    first.finish(effect.responsibility_ref, boundary="terminal")
+
+    untrusted_replacement = OperatorAttestedPowerInhibitor()
+    untrusted_replacement.allows_backend_supersession = False
+    second_database = Database(data_root.database)
+    second = RuntimeProtection(
+        database=second_database,
+        feed=DurableFeed(second_database),
+        inhibitor=untrusted_replacement,
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    try:
+        evidence = second.query_evidence()
+
+        assert evidence["inhibitor"]["status"] == "release_pending"
+        with second_database.read() as connection:
+            epoch = connection.execute(
+                text(
+                    "SELECT backend, status FROM ar_power_inhibitor_epochs "
+                    "WHERE holder_ref = :holder_ref"
+                ),
+                {"holder_ref": original.holder_ref},
+            ).mappings().one()
+            superseded_count = connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM durable_feed WHERE event_type = "
+                    "'agent_runtime.power_inhibitor_backend_superseded'"
+                )
+            ).scalar_one()
+        assert epoch == {"backend": "test_inhibitor", "status": "release_pending"}
+        assert superseded_count == 0
     finally:
         first_database.close()
         second_database.close()

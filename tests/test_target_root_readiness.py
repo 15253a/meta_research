@@ -56,6 +56,32 @@ def test_target_root_is_ready_without_a_second_execution_service(
         runtime.close()
 
 
+def test_operator_attested_development_host_reports_runtime_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("META_RESEARCH_ASSUME_ALWAYS_ON", "1")
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "operator-attested-development-host"),
+        startup_harness_diagnostics=False,
+    )
+    try:
+        evidence = runtime.query_runtime_observability()
+
+        assert evidence["status"] == "ready"
+        assert evidence["durable_waiting_count"] == 0
+        assert evidence["inhibitor"]["backend"] == "operator_attested_always_on"
+        assert evidence["inhibitor"]["capability"] == {
+            "status": "ready",
+            "backend": "operator_attested_always_on",
+            "scope": "sleep",
+            "reason": None,
+            "probed_at": evidence["inhibitor"]["capability"]["probed_at"],
+        }
+    finally:
+        runtime.close()
+
+
 def test_internal_readiness_and_doctor_report_the_light_root_driver(
     tmp_path: Path,
 ) -> None:

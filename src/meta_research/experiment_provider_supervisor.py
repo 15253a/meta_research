@@ -41,6 +41,10 @@ EXIT_SCHEMA = "meta-research/experiment-provider-supervisor-exit/v2"
 MARKER_SCHEMA = "meta-research/experiment-provider-phase/v1"
 OBSERVATION_SCHEMA = "meta-research/experiment-provider-observation/v1"
 OBSERVATION_MAX_RECORD_BYTES = 32 * 1024
+STDOUT_MAX_RECORDS = 64 * 1024
+# Covers every stdout observation plus a full 24-hour run at the production
+# 0.25-second telemetry cadence, while remaining a finite disk guard.
+OBSERVATION_MAX_COUNT = 512 * 1024
 RESULT_PREFIX = b"META_RESEARCH_RESULT\t"
 
 
@@ -146,6 +150,11 @@ class _ObservationLedger:
             envelope = sealed_transport_envelope(observation, self._key)
             encoded = transport_canonical_json(envelope).encode("utf-8") + b"\n"
             if len(encoded) > OBSERVATION_MAX_RECORD_BYTES:
+                if kind == "stdout":
+                    # Raw stdout remains durably bounded by stdout_max_bytes.
+                    # A line too large for the public sealed projection is
+                    # omitted instead of failing the provider operation.
+                    return
                 self.exceeded.set()
                 return
             self._stream.write(encoded)
@@ -236,13 +245,13 @@ def _validate_request(
         or not 0 < stdout_max <= 16 * 1024 * 1024
         or not isinstance(stdout_max_records, int)
         or isinstance(stdout_max_records, bool)
-        or not 1 <= stdout_max_records <= 65536
+        or not 1 <= stdout_max_records <= STDOUT_MAX_RECORDS
         or not isinstance(result_max, int)
         or isinstance(result_max, bool)
         or not 0 < result_max <= 16 * 1024 * 1024
         or not isinstance(observation_max, int)
         or isinstance(observation_max, bool)
-        or not 1 <= observation_max <= 65536
+        or not 1 <= observation_max <= OBSERVATION_MAX_COUNT
         or not isinstance(telemetry_cadence, (int, float))
         or isinstance(telemetry_cadence, bool)
         or not 0.05 <= float(telemetry_cadence) <= 60.0
@@ -564,14 +573,9 @@ def _bounded_drain(
         record_bytes = len(record) + (1 if terminated else 0)
         raw_bytes += record_bytes
         raw_records += 1
-        try:
-            decoded = record.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            decoded = None
         if (
             raw_bytes > stdout_max_bytes
             or raw_records > stdout_max_records
-            or (decoded is not None and len(decoded) > 4000)
         ):
             exceeded.set()
             return
@@ -619,8 +623,6 @@ def _publish_stdout_record(record: bytes, ledger: _ObservationLedger) -> None:
     try:
         line = record.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
-        return
-    if len(line) > 4000:
         return
     ledger.append(
         "stdout",

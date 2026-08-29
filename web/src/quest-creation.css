@@ -649,29 +649,19 @@
     #fff;
 }
 
-.quest-material-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
+.quest-material-directory {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
 }
 
-.quest-material-actions > span {
-  color: var(--quest-muted);
-  font-size: 9px;
-  line-height: 1.5;
+.quest-material-directory input {
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
 }
 
-.quest-visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
+.quest-material-directory .quest-material-button {
+  min-width: 108px;
 }
 
 .quest-material-statuses {
@@ -813,13 +803,14 @@
   display: grid;
   gap: 10px;
   margin-top: 10px;
-  padding: 12px;
+  padding: 14px;
   color: #42466a;
   background:
     radial-gradient(circle at 90% 0, rgba(98, 95, 231, 0.12), transparent 38%),
     #f7f7ff;
   border: 1px solid #d9d8f5;
-  border-radius: 12px;
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(69, 67, 150, 0.07);
 }
 
 .quest-deepfetch-runway.failed,
@@ -858,13 +849,13 @@
 .quest-deepfetch-head small,
 .quest-deepfetch-facts small {
   color: #79799b;
-  font: 800 7px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 800 8px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
   letter-spacing: 0.08em;
 }
 
 .quest-deepfetch-head b {
   margin-top: 3px;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .quest-deepfetch-head > span {
@@ -873,23 +864,82 @@
   background: rgba(255, 255, 255, 0.78);
   border: 1px solid currentColor;
   border-radius: 999px;
-  font: 800 8px/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 800 9px/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
 }
 
-.quest-deepfetch-progress progress {
-  width: 100%;
-  height: 7px;
+.quest-deepfetch-meter {
+  position: relative;
+  width: auto;
+  min-width: 0;
+  height: 10px;
+  flex: 1;
   overflow: hidden;
-  accent-color: var(--quest-violet);
-  border: 0;
+  background: #e4e5f2;
+  border: 1px solid rgba(82, 80, 167, 0.12);
   border-radius: 999px;
+  box-shadow: inset 0 1px 3px rgba(47, 49, 91, 0.12);
+}
+
+.quest-deepfetch-meter::after {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0,
+    transparent calc(20% - 1px),
+    rgba(255, 255, 255, 0.62) calc(20% - 1px),
+    rgba(255, 255, 255, 0.62) 20%
+  );
+  content: "";
+  pointer-events: none;
+}
+
+.quest-deepfetch-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  min-width: 2px;
+  overflow: hidden;
+  background: linear-gradient(90deg, #514ec5 0%, #7470ed 58%, #35a99c 100%);
+  border-radius: inherit;
+  box-shadow: 0 0 12px rgba(98, 95, 231, 0.3);
+  transition: width 1s linear;
+}
+
+.quest-deepfetch-meter-fill > span {
+  position: absolute;
+  inset: -1px auto -1px -32%;
+  width: 26%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.72),
+    transparent
+  );
+  transform: skewX(-18deg);
+}
+
+.quest-deepfetch-meter.is-active .quest-deepfetch-meter-fill > span {
+  animation: quest-deepfetch-scan 2.4s ease-in-out infinite;
+}
+
+.quest-deepfetch-runway.failed .quest-deepfetch-meter-fill,
+.quest-deepfetch-runway.cancelled .quest-deepfetch-meter-fill {
+  background: linear-gradient(90deg, #d26952, #ef947b);
+  box-shadow: none;
+}
+
+.quest-deepfetch-meter.is-complete .quest-deepfetch-meter-fill {
+  background: linear-gradient(90deg, #168d80, #4ab9a9);
+  box-shadow: 0 0 12px rgba(21, 153, 135, 0.24);
 }
 
 .quest-deepfetch-progress code {
-  min-width: 28px;
   color: #6968a0;
-  font-size: 8px;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
   text-align: right;
+  white-space: nowrap;
 }
 
 .quest-deepfetch-stages {
@@ -902,13 +952,36 @@
   padding-top: 5px;
   color: #9598aa;
   border-top: 2px solid #d9dce7;
-  font: 700 7px/1.25 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font: 700 8px/1.3 ui-monospace, "SFMono-Regular", Consolas, monospace;
   text-align: center;
 }
 
 .quest-deepfetch-stages span.done {
   color: #4f4cb4;
   border-color: var(--quest-violet);
+}
+
+.quest-deepfetch-stages span[aria-current="step"] {
+  color: #4f4cb4;
+  border-color: #aaa8ec;
+}
+
+@keyframes quest-deepfetch-scan {
+  0%,
+  18% {
+    left: -32%;
+    opacity: 0;
+  }
+
+  38% {
+    opacity: 0.9;
+  }
+
+  72%,
+  100% {
+    left: 112%;
+    opacity: 0;
+  }
 }
 
 .quest-deepfetch-facts {
@@ -929,6 +1002,116 @@
   font: 750 8px/1.3 ui-monospace, "SFMono-Regular", Consolas, monospace;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.quest-deepfetch-live {
+  min-width: 0;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.8);
+  border: 1px solid rgba(82, 80, 167, 0.16);
+  border-radius: 9px;
+}
+
+.quest-deepfetch-live > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  color: #66658e;
+  border-bottom: 1px solid rgba(82, 80, 167, 0.1);
+  font: 800 8px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  letter-spacing: 0.07em;
+}
+
+.quest-deepfetch-live > header span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.quest-deepfetch-live > header i {
+  width: 6px;
+  height: 6px;
+  background: #35a99c;
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px rgba(53, 169, 156, 0.13);
+  animation: quest-deepfetch-live-pulse 1.8s ease-in-out infinite;
+}
+
+.quest-deepfetch-live > header code {
+  color: #8584a5;
+  font-size: 8px;
+  letter-spacing: 0;
+}
+
+.quest-deepfetch-live-log {
+  max-height: 116px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.quest-deepfetch-live-event {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 27px;
+  padding: 5px 9px;
+  border-top: 1px solid rgba(82, 80, 167, 0.07);
+}
+
+.quest-deepfetch-live-event:first-child {
+  border-top: 0;
+}
+
+.quest-deepfetch-live-event > i {
+  width: 5px;
+  height: 5px;
+  background: #7774d9;
+  border-radius: 50%;
+}
+
+.quest-deepfetch-live-event.running > i {
+  background: #35a99c;
+  box-shadow: 0 0 0 3px rgba(53, 169, 156, 0.11);
+}
+
+.quest-deepfetch-live-event.failed > i {
+  background: #d26952;
+}
+
+.quest-deepfetch-live-event > span {
+  min-width: 0;
+  color: #4f526d;
+  font-size: 9px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.quest-deepfetch-live-event > code {
+  color: #9392ad;
+  font-size: 7px;
+  white-space: nowrap;
+}
+
+.quest-deepfetch-live-log > p {
+  margin: 0;
+  padding: 11px 9px;
+  color: #85879c;
+  font: 500 8px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
+}
+
+@keyframes quest-deepfetch-live-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+
+  50% {
+    opacity: 1;
+  }
 }
 
 .quest-deepfetch-snapshot {
@@ -1581,6 +1764,14 @@
 
   .quest-material-picker {
     grid-template-columns: 1fr;
+  }
+
+  .quest-material-directory {
+    grid-template-columns: 1fr;
+  }
+
+  .quest-material-directory .quest-material-button {
+    width: 100%;
   }
 
   .quest-library-prep {

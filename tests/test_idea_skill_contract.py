@@ -19,6 +19,7 @@ from meta_research.idea_skill import (
     IdeaSkillRequest,
     IdeaSkillResult,
     IdeaSkillUnavailable,
+    _provider_hard_ceiling_error,
     validate_idea_skill_result,
 )
 from meta_research.idea_contract import (
@@ -446,6 +447,7 @@ class _SequenceRunner:
         emit_review_timeout_wait: bool = False,
         emit_review_wait: bool = True,
         observed_reviewer_agent_ref: str | None = None,
+        emit_primary_review_trace: bool = False,
     ) -> None:
         self._outputs = iter(outputs)
         self._thread_ids = None if thread_ids is None else iter(thread_ids)
@@ -453,6 +455,7 @@ class _SequenceRunner:
         self._emit_review_timeout_wait = emit_review_timeout_wait
         self._emit_review_wait = emit_review_wait
         self._observed_reviewer_agent_ref = observed_reviewer_agent_ref
+        self._emit_primary_review_trace = emit_primary_review_trace
         self.calls: list[tuple[list[str], str, dict[str, object]]] = []
 
     def __call__(
@@ -473,6 +476,26 @@ class _SequenceRunner:
         events: list[dict[str, object]] = [
             {"type": "thread.started", "thread_id": thread_id}
         ]
+        if self._emit_primary_review_trace and "outcome" in schema.get(
+            "properties", {}
+        ):
+            reviewer_agent_ref = "codex-primary-phase-reviewer:1"
+            events.extend(
+                (
+                    _collab_event(
+                        tool="spawn_agent",
+                        sender_thread_id=thread_id,
+                        reviewer_agent_ref=reviewer_agent_ref,
+                        agent_status="pending_init",
+                    ),
+                    _collab_event(
+                        tool="wait",
+                        sender_thread_id=thread_id,
+                        reviewer_agent_ref=reviewer_agent_ref,
+                        agent_status="completed",
+                    ),
+                )
+            )
         if "reviewer_agent_ref" in schema.get("properties", {}):
             reviewer_agent_ref = self._observed_reviewer_agent_ref or output.get(
                 "reviewer_agent_ref"
@@ -526,6 +549,21 @@ class _SequenceRunner:
     ) -> subprocess.CompletedProcess[str]:
         del job_ref
         return self(argv, prompt, timeout)
+
+
+def _assert_codex_schema_types(value: object, path: str = "$") -> None:
+    """Match the provider's strict requirement for every const schema node."""
+
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _assert_codex_schema_types(item, f"{path}[{index}]")
+        return
+    if not isinstance(value, dict):
+        return
+    if "const" in value:
+        assert "type" in value, f"missing type at {path}"
+    for key, item in value.items():
+        _assert_codex_schema_types(item, f"{path}.{key}")
 
 
 def _collab_event(
@@ -783,13 +821,18 @@ def test_production_adapter_runs_the_packaged_skill_and_independent_review(
         if value == "--config"
     }
     assert 'approval_policy="never"' in config_values
+    assert 'model_reasoning_effort="max"' in config_values
     assert 'web_search="live"' in config_values
     assert primary_argv[primary_argv.index("--sandbox") + 1] == "danger-full-access"
     agent_workspace = Path(primary_argv[primary_argv.index("--cd") + 1])
     schema_path = Path(primary_argv[primary_argv.index("--output-schema") + 1])
     assert agent_workspace.name == "research-workspace"
     assert not schema_path.is_relative_to(agent_workspace)
-    assert primary_argv[primary_argv.index("--model") + 1] == "gpt-5.4"
+    assert primary_argv[primary_argv.index("--model") + 1] == "gpt-5.6-sol"
+    assert (
+        "codex-config:model_reasoning_effort=max"
+        in request.runtime_binding.resource_bindings
+    )
     disabled = {
         primary_argv[index + 1]
         for index, value in enumerate(primary_argv[:-1])
@@ -802,10 +845,14 @@ def test_production_adapter_runs_the_packaged_skill_and_independent_review(
     assert "execution completed != content accepted" in primary_prompt
     assert "## IdeaStageInvocation" in primary_prompt
     assert "## Accepted handoff" in primary_prompt
+    assert "本回合仅执行 Primary draft phase" in primary_prompt
+    assert "禁止调用 spawn_agent 或 wait" in primary_prompt
+    assert "下一次 resumed review turn" in primary_prompt
     assert "一个 submission identity" in primary_prompt
     assert "不得创建 Question、Plan、Run、receipt" in primary_prompt
     assert set(primary_schema["properties"]) == {"outcome"}
     assert "anyOf" in primary_schema["properties"]["outcome"]
+    _assert_codex_schema_types(primary_schema)
     assert "独立 advisory reviewer" in review_prompt
     assert "spawn" in review_prompt
     assert "wait" in review_prompt
@@ -815,12 +862,15 @@ def test_production_adapter_runs_the_packaged_skill_and_independent_review(
     assert "## Accepted handoff" in review_prompt
     assert "reviewed_draft=" in review_prompt
     assert review_argv[-3:] == ["resume", "codex-primary:1", "-"]
+    assert "当前 frozen reviewed_draft" in review_prompt
+    assert "不得复用 Primary phase" in review_prompt
     assert set(review_schema["properties"]) == {
         "reviewer_agent_ref",
         "findings",
         "final_outcome",
         "dispositions",
     }
+    _assert_codex_schema_types(review_schema)
 
 
 def test_production_adapter_rejects_review_without_a_successful_spawn(
@@ -929,6 +979,87 @@ def test_production_adapter_rechecks_child_trace_on_durable_recovery(
         match="codex_child_review_wait_invalid",
     ):
         restarted.review_draft(review_request, draft)
+    assert no_replay.calls == []
+
+
+def test_durable_primary_rejects_an_early_review_trace_without_replay(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "durable-primary-early-review"
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}],
+        emit_primary_review_trace=True,
+    )
+    first = CodexIdeaSkillAdapter(workspace, process_runner=runner)
+    request = _request(
+        runtime_binding=first.runtime_binding(),
+        job_ref="idea-primary-operation:early-review",
+    )
+
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_primary_review_phase_invalid",
+    ) as failed:
+        first.generate_draft(request)
+    checkpoint = failed.value.recovery_checkpoint
+    assert checkpoint is not None
+    assert checkpoint["schema_ref"] == (
+        "meta-research/provider-terminal-contract-failure/v1"
+    )
+    assert checkpoint["termination_reason"] == "completed"
+    assert checkpoint["contract_failure_code"] == (
+        "codex_primary_review_phase_invalid"
+    )
+    assert checkpoint["contract_failure_detail_code"] == (
+        "codex_primary_review_phase_invalid"
+    )
+
+    no_replay = _SequenceRunner([])
+    restarted = CodexIdeaSkillAdapter(workspace, process_runner=no_replay)
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_primary_review_phase_invalid",
+    ) as recovered:
+        restarted.generate_draft(request)
+    assert recovered.value.recovery_checkpoint == failed.value.recovery_checkpoint
+    assert no_replay.calls == []
+
+
+def test_durable_review_trace_failure_seals_a_non_replayable_checkpoint(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "durable-review-invalid-trace"
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, _review_turn_output()],
+        emit_review_spawn=False,
+    )
+    first = CodexIdeaSkillAdapter(workspace, process_runner=runner)
+    request = _request(
+        runtime_binding=first.runtime_binding(),
+        job_ref="idea-review-operation:invalid-sealed-trace",
+    )
+    draft = first.generate_draft(request)
+    review_request = replace(
+        request,
+        native_session_ref=draft.primary_session_ref,
+    )
+
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_child_review_spawn_invalid",
+    ) as failed:
+        first.review_draft(review_request, draft)
+    assert failed.value.recovery_checkpoint is not None
+    assert failed.value.recovery_checkpoint["termination_reason"] == "completed"
+
+    no_replay = _SequenceRunner([])
+    restarted = CodexIdeaSkillAdapter(workspace, process_runner=no_replay)
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_child_review_spawn_invalid",
+    ) as recovered:
+        restarted.review_draft(review_request, draft)
+    assert recovered.value.recovery_checkpoint == failed.value.recovery_checkpoint
     assert no_replay.calls == []
 
 
@@ -1162,8 +1293,12 @@ def test_durable_provider_operation_never_promotes_a_failed_exit(
         job_ref="idea-primary-operation:failed-exit",
     )
 
-    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_failed"):
+    with pytest.raises(
+        IdeaSkillUnavailable, match="codex_operation_failed"
+    ) as failed:
         first.generate_draft(request)
+    assert failed.value.recovery_checkpoint is not None
+    assert failed.value.recovery_checkpoint["termination_reason"] == "completed"
     assert failed_runner.calls == 1
     assert next(workspace.glob("provider-operations/*/primary/exit.json")).is_file()
     assert not list(workspace.glob("provider-operations/*/primary/completed.json"))
@@ -1173,8 +1308,11 @@ def test_durable_provider_operation_never_promotes_a_failed_exit(
         workspace,
         process_runner=forbidden_replay,
     )
-    with pytest.raises(IdeaSkillUnavailable, match="codex_operation_failed"):
+    with pytest.raises(
+        IdeaSkillUnavailable, match="codex_operation_failed"
+    ) as replayed:
         restarted.generate_draft(request)
+    assert replayed.value.recovery_checkpoint == failed.value.recovery_checkpoint
     assert forbidden_replay.calls == []
 
     exit_path = next(workspace.glob("provider-operations/*/primary/exit.json"))
@@ -1190,6 +1328,51 @@ def test_durable_provider_operation_never_promotes_a_failed_exit(
     ):
         restarted.generate_draft(request)
     assert forbidden_replay.calls == []
+
+
+@pytest.mark.parametrize(
+    "termination_reason,returncode",
+    [
+        ("descendant_process", 126),
+        ("launch_failed", 127),
+    ],
+)
+def test_every_signed_terminal_provider_exit_has_a_non_replayable_checkpoint(
+    termination_reason: str,
+    returncode: int,
+) -> None:
+    marker: dict[str, object] = {
+        "termination_reason": termination_reason,
+        "returncode": returncode,
+        "invocation_hash": "1" * 64,
+        "prompt_hash": "2" * 64,
+        "output_schema_hash": "3" * 64,
+        "stdout_hash": "4" * 64,
+        "result_file_hash": None,
+        "supervisor_receipt_hash": "5" * 64,
+    }
+
+    error = _provider_hard_ceiling_error(marker)
+
+    assert error is not None
+    assert error.code == "codex_operation_failed"
+    assert error.recovery_checkpoint is not None
+    assert error.recovery_checkpoint["termination_reason"] == termination_reason
+
+
+def test_cooperative_stop_is_not_misclassified_as_a_provider_hard_ceiling() -> None:
+    marker: dict[str, object] = {
+        "termination_reason": "stopped",
+        "returncode": 143,
+        "invocation_hash": "1" * 64,
+        "prompt_hash": "2" * 64,
+        "output_schema_hash": "3" * 64,
+        "stdout_hash": "4" * 64,
+        "result_file_hash": None,
+        "supervisor_receipt_hash": "5" * 64,
+    }
+
+    assert _provider_hard_ceiling_error(marker) is None
 
 
 def test_durable_provider_seal_rejects_unsealed_result_tampering(
@@ -1691,8 +1874,15 @@ def test_supervisor_terminates_provider_descendants_before_sealing(
         job_ref="idea-primary-operation:descendant",
     )
 
-    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_failed"):
+    with pytest.raises(
+        IdeaSkillUnavailable, match="codex_operation_failed"
+    ) as failed:
         adapter.generate_draft(request)
+    assert failed.value.recovery_checkpoint is not None
+    assert (
+        failed.value.recovery_checkpoint["termination_reason"]
+        == "descendant_process"
+    )
 
     operation = next(workspace.glob("provider-operations/*/primary"))
     receipt = json.loads(

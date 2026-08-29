@@ -26,6 +26,11 @@ export type QuestionTreeProps = {
   projectionStatus: "ready" | "unavailable" | "capability_unavailable";
   projectionReason?: string | null;
   initialQuestionRef?: string | null;
+  completionLanding?: {
+    initializationId: string;
+    questionRef: string;
+    questionTitle: string;
+  } | null;
   manualCreationReady: boolean;
   controlsInert?: boolean;
   openingParentRef?: string | null;
@@ -466,6 +471,7 @@ export function QuestionTree({
   projectionStatus,
   projectionReason = null,
   initialQuestionRef = null,
+  completionLanding = null,
   manualCreationReady,
   controlsInert = false,
   openingParentRef = null,
@@ -486,6 +492,7 @@ export function QuestionTree({
   const historyButtonRef = useRef<HTMLButtonElement>(null);
   const reportedSelectionKeyRef = useRef<string | null | undefined>(undefined);
   const appliedInitialQuestionRef = useRef<string | null>(initialQuestionRef);
+  const focusedCompletionLandingRef = useRef<string | null>(null);
   const dragRef = useRef<null | {
     pointerId: number;
     clientX: number;
@@ -784,6 +791,15 @@ export function QuestionTree({
     });
   }, [layout, outlineMode]);
 
+  useEffect(() => {
+    if (!completionLanding || !layout.byRef.has(completionLanding.questionRef)) return;
+    const landingKey = `${completionLanding.initializationId}:${completionLanding.questionRef}`;
+    if (focusedCompletionLandingRef.current === landingKey) return;
+    focusedCompletionLandingRef.current = landingKey;
+    setSelectedRef(completionLanding.questionRef);
+    focusNode(completionLanding.questionRef);
+  }, [completionLanding, focusNode, layout]);
+
   const zoomCanvas = (multiplier: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -963,6 +979,34 @@ export function QuestionTree({
           className="question-tree-card"
           aria-label={outlineMode ? "当前问题树缩进大纲" : "当前问题树画布"}
         >
+          {completionLanding ? (
+            <div
+              className={`question-tree-handoff${
+                layout.byRef.has(completionLanding.questionRef) ? " located" : " syncing"
+              }`}
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              aria-label={`Quest 创建完成。第一个正式 Question：${
+                completionLanding.questionTitle
+              }。${completionLanding.questionRef} · ${
+                layout.byRef.has(completionLanding.questionRef)
+                  ? "已定位到问题树当前节点"
+                  : "问题树 Projection 正在同步"
+              }`}
+            >
+              <span aria-hidden="true">✓</span>
+              <div>
+                <small>FIRST FORMAL QUESTION · CURRENT NODE</small>
+                <b>第一个正式 Question：{completionLanding.questionTitle}</b>
+                <code>
+                  {completionLanding.questionRef} · {layout.byRef.has(completionLanding.questionRef)
+                    ? "已定位到问题树当前节点"
+                    : "问题树 Projection 正在同步"}
+                </code>
+              </div>
+            </div>
+          ) : null}
           <div className="question-tree-topline">
             <b>{outlineMode ? "问题树大纲" : "问题树画布"}</b>
             <small>{outlineMode

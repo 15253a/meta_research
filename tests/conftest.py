@@ -43,6 +43,7 @@ class _DeterministicPowerInhibitor:
 def _isolate_platform_power_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep ordinary tests deterministic while preserving explicit adapters."""
 
+    monkeypatch.delenv("META_RESEARCH_ASSUME_ALWAYS_ON", raising=False)
     adapters: dict[Path, _DeterministicPowerInhibitor] = {}
 
     def build_adapter(state_directory: Path) -> _DeterministicPowerInhibitor:

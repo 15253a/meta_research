@@ -166,6 +166,10 @@ export function shouldPreserveBrowserTarget(status) {
   return isUserHandoff(status);
 }
 
+export function selectedOaOnlyRoute() {
+  return { provider: "open_access", reason: "selected_oa_only_route" };
+}
+
 export function publisherPdfHandoff(doi, url) {
   return {
     doi,
@@ -627,16 +631,13 @@ async function routeDoiDownload(doi, args, context) {
     if (args.noInstitutionalAccess) {
       const oa = await downloadOpenAccessArticle(article, { email: context.contactEmail, outDir: args.out });
       if (isSuccess(oa.status)) {
-        return decorateResult(oa, article, {
-          provider: "open_access",
-          reason: "institutional_access_disabled_oa_only",
-        }, args.si);
+        return decorateResult(oa, article, selectedOaOnlyRoute(), args.si);
       }
       return decorateResult({
-        status: STATUS.INSTITUTIONAL_ACCESS_NOT_AUTHORIZED,
-        reason: "CNKI requires institutional browser authorization for this request",
+        status: STATUS.OA_NOT_FOUND,
+        reason: "No lawful OA full text was found under the selected OA-only route",
         oa_attempt: { status: oa.status, assessment: oa.oaAssessment || "unknown" },
-      }, article, { provider: "cnki", reason: "institutional_access_disabled" }, args.si);
+      }, article, { provider: "open_access", reason: "oa_only_route_exhausted" }, args.si);
     }
     await context.ensureBrowser();
     const route = { provider: "cnki", reason: args.route ? "explicit_override" : "chinese_literature" };
@@ -657,7 +658,7 @@ async function routeDoiDownload(doi, args, context) {
     routeOverride: args.route,
     hasPublisherCredentials: hasUsablePublisherCredentials(publisherProvider, publisherCredentials),
   });
-  const useApiFirst = !args.route && initialRoute.reason === "publisher_api_credentials_available";
+  const useApiFirst = !args.noInstitutionalAccess && !args.route && initialRoute.reason === "publisher_api_credentials_available";
   let apiResult = null;
   let oaResult = null;
 
@@ -691,6 +692,14 @@ async function routeDoiDownload(doi, args, context) {
     if (args.route === "open_access") return decorateResult(oa, article, { provider: "open_access", reason: "explicit_override" }, args.si);
   }
 
+  if (args.noInstitutionalAccess) {
+    return decorateResult({
+      status: STATUS.OA_NOT_FOUND,
+      reason: "No lawful OA full text was found under the selected OA-only route",
+      ...(oaResult ? { oa_attempt: { status: oaResult.status, assessment: oaResult.oaAssessment || "unknown" } } : {}),
+    }, article, { provider: "open_access", reason: "oa_only_route_exhausted" }, args.si);
+  }
+
   const route = chooseRoute({
     ...article,
     isOa: false,
@@ -700,9 +709,9 @@ async function routeDoiDownload(doi, args, context) {
   if (route.provider === "web_access") {
     if (args.noInstitutionalAccess) {
       return decorateResult({
-        status: STATUS.INSTITUTIONAL_ACCESS_NOT_AUTHORIZED,
-        reason: "No lawful OA or configured publisher-API full text was found; institutional browser access is disabled",
-      }, article, { provider: "web_access", reason: "institutional_access_disabled" }, args.si);
+        status: STATUS.OA_NOT_FOUND,
+        reason: "No lawful OA full text was found under the selected OA-only route",
+      }, article, { provider: "open_access", reason: "oa_only_route_exhausted" }, args.si);
     }
     const result = await runWebAccess(doi, article, args, context);
     return decorateResult({
@@ -733,12 +742,10 @@ async function routeDoiDownload(doi, args, context) {
   }
   if (args.noInstitutionalAccess) {
     return decorateResult({
-      ...apiResult,
-      api_status: apiResult.status,
       ...(oaAttempt ? { oa_attempt: oaAttempt } : {}),
-      status: STATUS.INSTITUTIONAL_ACCESS_NOT_AUTHORIZED,
-      reason: "Publisher API and OA routes did not yield full text; institutional browser access is disabled",
-    }, article, route, args.si);
+      status: STATUS.OA_NOT_FOUND,
+      reason: "No lawful OA full text was found under the selected OA-only route",
+    }, article, { provider: "open_access", reason: "oa_only_route_exhausted" }, args.si);
   }
   const providerFallback = args.apiFallbackWebFor?.includes(route.provider)
     ? true
@@ -839,10 +846,10 @@ async function main() {
     if (args.noInstitutionalAccess && (directRoute.mode === "title_search" || directRoute.provider === "cnki")) {
       results.push({
         title: args.title || "",
-        status: STATUS.INSTITUTIONAL_ACCESS_NOT_AUTHORIZED,
-        reason: "CNKI direct access requires institutional browser authorization",
-        route: "cnki",
-        route_reason: "institutional_access_disabled",
+        status: STATUS.OA_NOT_FOUND,
+        reason: "No lawful OA full text was found under the selected OA-only route",
+        route: "open_access",
+        route_reason: "oa_only_route_exhausted",
         si_requested: args.si,
       });
       outputAndManifest(args, results, t0);

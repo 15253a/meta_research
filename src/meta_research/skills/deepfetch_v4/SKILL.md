@@ -40,7 +40,12 @@ Run Radar, Ledger, and Fan-out as an overlapping pipeline. The numbered sections
 
 ## 1. Preflight
 
-Read the Preflight section of [references/agents.md](references/agents.md). Verify the configured institutional route through the Acquisition session before starting the clock. Start only after access works or the user explicitly selects open-access-only continuation.
+Read the Preflight section of [references/agents.md](references/agents.md). Treat an injected
+`oa_only` session as the user's already explicit primary route: its preflight is satisfied without
+probing institutional/browser access. Otherwise verify the configured institutional route through
+the Acquisition session before starting the clock. Start only after access works or the user
+explicitly selects open-access-only continuation. Never describe an already selected `oa_only`
+route as forced, as a downgrade, or as a fallback caused by unavailable institutional access.
 
 If the user cancels, end without starting a run.
 

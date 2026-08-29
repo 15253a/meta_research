@@ -5,9 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from meta_research.experiment_contract import ProtocolExperimentIntent
-from meta_research.owners.common import OwnerConflict
+from meta_research.owners.common import OwnerConflict, canonical_json
 from meta_research.target_execution import (
     PROTOCOL_EVALUATION_ADAPTER,
+    PROTOCOL_EVALUATION_REQUEST_MAX_BYTES,
     PROTOCOL_EVALUATION_SCHEMA_REF,
     TargetExecutionContractError,
     TargetExecutionCoordinator,
@@ -79,6 +80,19 @@ def test_protocol_adapter_builds_only_an_isolated_experiment_projection() -> Non
         for item in target_execution_json_schema()["oneOf"]
     }
     assert PROTOCOL_EVALUATION_ADAPTER in adapter_kinds
+
+
+def test_protocol_request_accepts_context_above_legacy_512k_limit() -> None:
+    execution = _execution()
+    request = execution["request"]
+    assert isinstance(request, dict)
+    forward_contract = request["baseline_forward_contract"]
+    assert isinstance(forward_contract, dict)
+    forward_contract["context"] = "x" * 600_000
+
+    assert validate_target_execution(execution) == PROTOCOL_EVALUATION_ADAPTER
+    request_bytes = len(canonical_json(request).encode("utf-8"))
+    assert 512_000 < request_bytes < PROTOCOL_EVALUATION_REQUEST_MAX_BYTES
 
 
 def test_compatibility_projection_uses_canonical_candidate_label() -> None:

@@ -98,6 +98,7 @@ from meta_research.acquisition import (
     AcquisitionUnavailable,
     aggregate_batch_status,
     canonical_hash as acquisition_hash,
+    freeze_acquisition_item_artifacts,
     validate_batch_request,
     validate_item_results,
     validate_preflight_result,
@@ -110,6 +111,7 @@ from meta_research.deepfetch import (
     DeepFetchRuntimeBinding,
     DeepFetchUnavailable,
     validate_deepfetch_result,
+    validate_deepfetch_activity_events,
     validate_runtime_binding,
 )
 from meta_research.feed import DurableFeed
@@ -758,6 +760,9 @@ class DeepFetchRun:
     result_hash: str | None
     execution_receipt: AcceptanceReceipt | None
     failure_code: str | None
+    attempt_started_at: float | None = None
+    attempt_completed_at: float | None = None
+    recent_activity_events: tuple[dict[str, object], ...] = ()
 
     def as_public_dict(self) -> dict[str, object]:
         return {
@@ -765,6 +770,8 @@ class DeepFetchRun:
             "status": self.status,
             "attempt_ref": self.attempt_ref,
             "attempt_generation": self.attempt_generation,
+            "attempt_started_at": self.attempt_started_at,
+            "attempt_completed_at": self.attempt_completed_at,
             "provider_operation_retry_permitted": (
                 self.provider_operation_retry_permitted
             ),
@@ -1102,6 +1109,12 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         session_ref: str | None = None,
         quest_ref: str | None = None,
     ) -> AcquisitionSession | None: ...
+
+    def query_acquisition_execution(
+        self,
+        session_ref: str,
+        request_id: str,
+    ) -> AcquisitionBatchExecution | None: ...
 
     def verify_acquisition_session_binding(
         self,
@@ -2106,6 +2119,52 @@ _PROVIDER_UNIT_RUN_KINDS = {
     "experiment": "experiment",
     "writing_primary": "writing",
     "writing_review": "writing",
+}
+_STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES = frozenset(
+    {
+        "codex_child_review_spawn_invalid",
+        "codex_child_review_ref_mismatch",
+        "codex_child_review_task_mismatch",
+        "codex_child_review_wait_invalid",
+        "codex_child_review_result_missing",
+    }
+)
+_STAGE_PROVIDER_TERMINAL_CONTRACT_FAILURES = {
+    "idea_primary": frozenset(
+        {
+            "codex_primary_review_phase_invalid",
+            "idea_primary_result_contract_invalid",
+        }
+    ),
+    "idea_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
+    | {"idea_review_result_contract_invalid"},
+    "plan_primary": frozenset(
+        {
+            "codex_primary_review_phase_invalid",
+            "plan_primary_result_contract_invalid",
+        }
+    ),
+    "plan_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
+    | {"plan_review_result_contract_invalid"},
+    "bundle_primary": frozenset(
+        {
+            "codex_primary_review_phase_invalid",
+            "bundle_primary_result_contract_invalid",
+        }
+    ),
+    "bundle_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
+    | {
+        "bundle_review_result_contract_invalid",
+        "codex_child_review_trace_invalid",
+    },
+    "reasoning_primary": frozenset(
+        {
+            "codex_primary_review_phase_invalid",
+            "reasoning_primary_result_contract_invalid",
+        }
+    ),
+    "reasoning_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
+    | {"reasoning_review_result_contract_invalid"},
 }
 
 
@@ -8320,10 +8379,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     ) -> None:
         """Permanently fence one sealed Stage operation, not its logical Run."""
 
-        provider_exit = _validated_stage_provider_hard_ceiling(
-            failure_code=failure_code,
-            provider_exit=provider_exit,
-        )
         if not unit_ref or len(unit_ref) > 96:
             raise OwnerConflict("stage_provider_hard_ceiling_invalid")
         now = time.time()
@@ -8360,6 +8415,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 or _PROVIDER_UNIT_RUN_KINDS.get(unit.unit_kind) != control.run_kind
             ):
                 raise OwnerConflict("stage_provider_hard_ceiling_stale")
+            provider_exit = _validated_stage_provider_hard_ceiling(
+                unit_kind=str(unit.unit_kind),
+                failure_code=failure_code,
+                provider_exit=provider_exit,
+            )
             effect = _provider_runtime_effect(
                 unit_ref=str(unit.unit_ref),
                 operation_ref=str(unit.operation_ref),
@@ -11111,6 +11171,58 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ).first()
         return None if row is None else _acquisition_session_from_row(row)
 
+    def query_acquisition_execution(
+        self,
+        session_ref: str,
+        request_id: str,
+    ) -> AcquisitionBatchExecution | None:
+        """Return only an Owner-recorded terminal batch; never invoke a Provider."""
+
+        if not session_ref or not request_id:
+            raise OwnerConflict("acquisition_execution_query_invalid")
+        with self._database.read() as connection:
+            request_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_acquisition_requests WHERE "
+                    "request_id = :request_id"
+                ),
+                {"request_id": request_id},
+            ).first()
+            session_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_acquisition_sessions WHERE "
+                    "session_ref = :session_ref"
+                ),
+                {"session_ref": session_ref},
+            ).first()
+        if request_row is None:
+            return None
+        if request_row.session_ref != session_ref:
+            raise OwnerConflict("acquisition_request_identity_conflict")
+        if session_row is None:
+            raise OwnerConflict("acquisition_session_not_found")
+        if request_row.status not in {"obtained", "partial", "missing"}:
+            return None
+        execution = _acquisition_execution_from_row(
+            request_row,
+            session_row,
+            self._acquisition_private_root,
+        )
+        try:
+            validate_item_results(execution.request, execution.results)
+        except AcquisitionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+        if any(
+            result.status == "obtained"
+            and (
+                result.content_sha256 is None
+                or result.content_bytes is None
+            )
+            for result in execution.results
+        ):
+            raise OwnerConflict("acquisition_artifact_proof_legacy_missing")
+        return execution
+
     def verify_acquisition_session_binding(
         self,
         *,
@@ -11526,9 +11638,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
 
     def _prepare_accepted_material_route(
         self,
-        session_ref: str,
-        request_id: str,
         route: dict[str, object],
+        target_dir: Path,
     ) -> tuple[object, Path]:
         resolver = self._research_material_resolver
         if resolver is None:
@@ -11540,10 +11651,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             or hashlib.sha256(content).hexdigest() != route["content_hash"]
         ):
             raise OwnerConflict("acquisition_material_binding_invalid")
-        target_dir = (
-            self._acquisition_private_root / session_ref / "requests" / request_id
-        )
-        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         return materialized, _store_provided_material(target_dir, route, materialized)
 
     def reconcile_human_request(self, request_ref: str) -> dict[str, object] | None:
@@ -12011,6 +12118,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             runtime_binding_hash = validate_acquisition_runtime_binding(runtime_binding)
         except AcquisitionUnavailable as error:
             raise OwnerConflict(error.code) from error
+        if self.query_acquisition_session(session_ref=session_ref) is None:
+            raise OwnerConflict("acquisition_session_not_found")
+        target_dir = _acquisition_request_target_dir(
+            self._acquisition_private_root,
+            session_ref,
+            request.request_id,
+            create=True,
+        )
         resume_binding: tuple[str, str, int] | None = None
         resume_target: dict[str, object] | None = None
         resume_route: dict[str, object] | None = None
@@ -12070,7 +12185,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ):
                 materialized_asset, material_path = (
                     self._prepare_accepted_material_route(
-                        session_ref, request.request_id, resume_route
+                        resume_route,
+                        target_dir,
                     )
                 )
         if (
@@ -12121,7 +12237,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if resume_route["route"] == "accepted_material":
                 materialized_asset, material_path = (
                     self._prepare_accepted_material_route(
-                        session_ref, request.request_id, resume_route
+                        resume_route,
+                        target_dir,
                     )
                 )
         now = time.time()
@@ -12362,13 +12479,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 else str(session_row.browser_context_ref)
             )
 
-        target_dir = (
-            self._acquisition_private_root
-            / session_ref
-            / "requests"
-            / request.request_id
-        )
-        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         effective_session_mode = str(session_row.mode)
         if resume_route is not None and resume_route["route"] == "oa_only":
             effective_session_mode = "oa_only"
@@ -12482,6 +12592,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 for paper in provider_request.papers
             )
             results = validate_item_results(provider_request, results)
+            results = _freeze_terminal_acquisition_artifacts(
+                provider_request, results
+            )
             operation_terminal = not any(
                 result.status == "waiting_user"
                 and result.failure is not None
@@ -13043,6 +13156,37 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 runtime_binding_json = canonical_json(runtime_binding.as_dict())
                 reconcile_only = True
 
+        verified_terminal_retry = (
+            existing is not None
+            and existing.status == "failed"
+            and existing.provider_operation_retry_permitted
+            and bool(
+                getattr(provider, "requires_verified_terminal_retry", False)
+            )
+        )
+        if verified_terminal_retry:
+            assert existing is not None
+            expected_previous_job_ref = typed_provider_operation_ref(
+                existing.run_ref,
+                "deepfetch",
+                existing.provider_operation_generation,
+            )
+            if existing.provider_operation_ref != expected_previous_job_ref:
+                raise OwnerConflict("deepfetch_provider_operation_invalid")
+            prepare_retry_execution = getattr(
+                provider, "prepare_retry_execution", None
+            )
+            if not callable(prepare_retry_execution):
+                raise OwnerConflict(
+                    "deepfetch_provider_retry_cleanup_unavailable"
+                )
+            prepare_retry_execution(
+                request,
+                previous_job_ref=existing.provider_operation_ref,
+                previous_run_ref=existing.run_ref,
+                previous_runtime_binding=existing.runtime_binding,
+            )
+
         (
             run_ref,
             root_session_ref,
@@ -13160,8 +13304,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     fence_ref=fence_ref,
                     failure_code=error.code,
                     provider_operation_retry_permitted=(
-                        not requires_verified_terminal
-                        or error.durable_outcome == "terminal"
+                        error.code
+                        != "deepfetch_acquisition_owner_proof_legacy_missing"
+                        and (
+                            not requires_verified_terminal
+                            or error.durable_outcome == "terminal"
+                        )
                     ),
                     native_session_ref=error.native_session_ref,
                 )
@@ -13612,6 +13760,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ).first()
             is_new = run is None
             was_failed = run is not None and run.status == "failed"
+            new_provider_execution = (
+                was_failed
+                and run is not None
+                and bool(run.provider_operation_retry_permitted)
+            )
             binding_transition: dict[str, object] | None = None
             if run is not None:
                 if (
@@ -13718,7 +13871,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 provider_operation_generation = int(run.provider_operation_generation)
                 provider_operation_ref = str(run.provider_operation_ref)
                 reconciliation_attempt_count = int(run.reconciliation_attempt_count)
-                if was_failed and bool(run.provider_operation_retry_permitted):
+                if new_provider_execution:
                     provider_operation_generation += 1
                     provider_operation_ref = typed_provider_operation_ref(
                         run_ref,
@@ -13733,16 +13886,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     {"run_ref": run_ref},
                 ).one()
                 root_session_ref = str(session.root_session_ref)
-                if binding_transition is None:
+                if not new_provider_execution:
                     native_session_ref = (
                         None
                         if session.native_session_ref is None
                         else str(session.native_session_ref)
                     )
                 else:
+                    if session.status != "open":
+                        raise OwnerConflict("deepfetch_run_identity_conflict")
                     if (
-                        session.status != "open"
-                        or terminal_attempt.native_session_ref
+                        binding_transition is not None
+                        and terminal_attempt.native_session_ref
                         != session.native_session_ref
                     ):
                         raise OwnerConflict("deepfetch_run_identity_conflict")
@@ -13755,19 +13910,20 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         ),
                         {"run_ref": run_ref, "now": now},
                     )
-                    connection.execute(
-                        text(
-                            "UPDATE ar_deepfetch_runs SET "
-                            "runtime_binding_json = :runtime_binding_json, "
-                            "runtime_binding_hash = :runtime_binding_hash "
-                            "WHERE run_ref = :run_ref"
-                        ),
-                        {
-                            "run_ref": run_ref,
-                            "runtime_binding_json": runtime_binding_json,
-                            "runtime_binding_hash": runtime_binding_hash,
-                        },
-                    )
+                    if binding_transition is not None:
+                        connection.execute(
+                            text(
+                                "UPDATE ar_deepfetch_runs SET "
+                                "runtime_binding_json = :runtime_binding_json, "
+                                "runtime_binding_hash = :runtime_binding_hash "
+                                "WHERE run_ref = :run_ref"
+                            ),
+                            {
+                                "run_ref": run_ref,
+                                "runtime_binding_json": runtime_binding_json,
+                                "runtime_binding_hash": runtime_binding_hash,
+                            },
+                        )
             else:
                 run_ref = new_ref("deepfetch_run")
                 provider_operation_generation = 1
@@ -14274,14 +14430,37 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "a.status AS attempt_status, a.runtime_binding_json AS "
                     "attempt_runtime_binding_json, a.runtime_binding_hash AS "
                     "attempt_runtime_binding_hash, a.native_session_ref AS "
-                    "attempt_native_session_ref FROM ar_deepfetch_runs r "
+                    "attempt_native_session_ref, a.started_at AS "
+                    "attempt_started_at, a.completed_at AS "
+                    "attempt_completed_at FROM ar_deepfetch_runs r "
                     "JOIN ar_deepfetch_sessions s ON s.run_ref = r.run_ref "
                     "LEFT JOIN ar_deepfetch_attempts a ON a.attempt_ref = "
                     "r.current_attempt_ref WHERE r.request_ref = :request_ref"
                 ),
                 {"request_ref": request_ref},
             ).first()
-        return None if row is None else _deepfetch_run_from_row(row)
+        if row is None:
+            return None
+        run = _deepfetch_run_from_row(row)
+        if run.status not in {"admitted", "running"}:
+            return run
+        with self._deepfetch_provider_lock:
+            provider = self._deepfetch_providers.get(request_ref)
+        if provider is None:
+            with self._provider_quiescence_lock:
+                provider = self._provider_quiescence_drivers.get("deepfetch")
+        observe = getattr(provider, "recent_activity_events", None)
+        if not callable(observe):
+            return run
+        try:
+            events = validate_deepfetch_activity_events(
+                observe(
+                    run.provider_operation_ref, run.runtime_binding_hash
+                )
+            )
+        except Exception:
+            return run
+        return replace(run, recent_activity_events=events)
 
     def cancel_deepfetch(self, request_ref: str) -> DeepFetchRun | None:
         provider_operation_ref: str | None = None
@@ -16342,12 +16521,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "running",
                     "current",
                 )
-            elif status_pair == ("submitted", "submitted"):
+            elif stage == "bundle" and status_pair == ("executed", "submitted"):
                 _require_current_fence(
                     run,
                     attempt,
                     fence,
-                    "submitted",
+                    "executed",
                     "submitted",
                 )
             else:
@@ -19963,7 +20142,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 not isinstance(line, str)
                 or "\n" in line
                 or "\r" in line
-                or len(line) > 4000
             ):
                 raise OwnerConflict("experiment_stdout_invalid")
         with self._database.write() as connection:
@@ -22033,7 +22211,9 @@ class SQLiteAgentRuntimeReceiptVerifier:
                     "attempt_result_hash, a.runtime_binding_json AS "
                     "attempt_runtime_binding_json, a.runtime_binding_hash AS "
                     "attempt_runtime_binding_hash, a.native_session_ref AS "
-                    "attempt_native_session_ref FROM ar_deepfetch_runs r JOIN "
+                    "attempt_native_session_ref, a.started_at AS "
+                    "attempt_started_at, a.completed_at AS "
+                    "attempt_completed_at FROM ar_deepfetch_runs r JOIN "
                     "ar_deepfetch_sessions s ON s.run_ref = r.run_ref JOIN "
                     "ar_deepfetch_attempts a ON a.attempt_ref = "
                     "r.current_attempt_ref WHERE r.execution_receipt_ref = "
@@ -22299,10 +22479,12 @@ def _acquisition_results_from_json(
                 path=item["path"],
                 format=item["format"],
                 failure=item["failure"],
+                content_sha256=item.get("content_sha256"),
+                content_bytes=item.get("content_bytes"),
             )
             for item in raw_results
         )
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
+    except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise OwnerConflict("acquisition_result_invalid") from error
 
 
@@ -22392,12 +22574,74 @@ def _store_provided_material(
     return target
 
 
+def _acquisition_request_target_dir(
+    acquisition_private_root: Path,
+    session_ref: str,
+    request_id: str,
+    *,
+    create: bool,
+) -> Path:
+    """Resolve one exact Owner target without following child symlinks."""
+
+    try:
+        private_root = acquisition_private_root.resolve(strict=True)
+        session_root = acquisition_private_root / session_ref
+        if session_root.is_symlink() or not session_root.is_dir():
+            raise OSError("unsafe acquisition session root")
+        resolved_session_root = session_root.resolve(strict=True)
+        if resolved_session_root != private_root / session_ref:
+            raise OSError("acquisition session root escaped private custody")
+
+        requests_root = session_root / "requests"
+        if requests_root.is_symlink():
+            raise OSError("unsafe acquisition requests root")
+        if not requests_root.exists():
+            if not create:
+                raise OSError("acquisition requests root missing")
+            requests_root.mkdir(mode=0o700)
+        if not requests_root.is_dir():
+            raise OSError("acquisition requests root is not a directory")
+        resolved_requests_root = requests_root.resolve(strict=True)
+        if resolved_requests_root != resolved_session_root / "requests":
+            raise OSError("acquisition requests root escaped session custody")
+
+        target_dir = requests_root / request_id
+        if target_dir.is_symlink():
+            raise OSError("unsafe acquisition target symlink")
+        if not target_dir.exists():
+            if not create:
+                raise OSError("acquisition target missing")
+            target_dir.mkdir(mode=0o700)
+        if not target_dir.is_dir():
+            raise OSError("acquisition target is not a directory")
+        if target_dir.resolve(strict=True) != resolved_requests_root / request_id:
+            raise OSError("acquisition target escaped request custody")
+        return target_dir
+    except (OSError, ValueError) as error:
+        raise OwnerConflict("acquisition_artifact_target_invalid") from error
+
+
 def _acquisition_execution_from_row(
     row,
     session_row,
     acquisition_private_root: Path,
 ) -> AcquisitionBatchExecution:
-    request = _acquisition_request_from_json(row.request_json).bind_to_session(
+    unbound_request = _acquisition_request_from_json(row.request_json)
+    identity_payload = unbound_request.identity_payload()
+    if (
+        unbound_request.request_id != row.request_id
+        or canonical_json(identity_payload) != row.request_json
+        or acquisition_hash(identity_payload) != row.request_hash
+        or unbound_request.route_policy != row.route_policy
+    ):
+        raise OwnerConflict("acquisition_request_identity_conflict")
+    target_dir = _acquisition_request_target_dir(
+        acquisition_private_root,
+        str(row.session_ref),
+        str(row.request_id),
+        create=False,
+    )
+    request = unbound_request.bind_to_session(
         session_ref=str(row.session_ref),
         session_mode=str(session_row.mode),
         browser_context_ref=(
@@ -22406,12 +22650,7 @@ def _acquisition_execution_from_row(
             else str(session_row.browser_context_ref)
         ),
         provider_state_dir=acquisition_private_root / str(row.session_ref),
-        target_dir=(
-            acquisition_private_root
-            / str(row.session_ref)
-            / "requests"
-            / str(row.request_id)
-        ),
+        target_dir=target_dir,
     )
     results = _acquisition_results_from_json(row.results_json, row.results_hash)
     return AcquisitionBatchExecution(
@@ -22431,6 +22670,53 @@ def _failed_acquisition_item(paper_id: str, code: str) -> AcquisitionItemResult:
         format=None,
         failure={"code": code, "detail": "Nature Downloader 未形成可接纳正文。"},
     )
+
+
+def _freeze_terminal_acquisition_artifacts(
+    request: AcquisitionBatchRequest,
+    results: tuple[AcquisitionItemResult, ...],
+) -> tuple[AcquisitionItemResult, ...]:
+    """Freeze every obtained item, terminalizing proof failures without replay."""
+
+    papers = {paper.paper_id: paper for paper in request.papers}
+    frozen: list[AcquisitionItemResult] = []
+    for result in results:
+        if result.status != "obtained":
+            frozen.append(result)
+            continue
+        try:
+            frozen.extend(
+                freeze_acquisition_item_artifacts(
+                    replace(request, papers=(papers[result.paper_id],)),
+                    (result,),
+                )
+            )
+        except AcquisitionUnavailable as error:
+            if error.code not in {
+                "acquisition_artifact_invalid",
+                "acquisition_artifact_drift",
+            }:
+                raise
+            detail = (
+                "Acquisition artifact bytes 与 Owner 已冻结 proof 不一致；"
+                "拒绝重新签名且不会自动重放 Provider。"
+                if error.code == "acquisition_artifact_drift"
+                else (
+                    "Owner 无法验证 Acquisition artifact bytes；"
+                    "该 item 已终止且不会自动重放 Provider。"
+                )
+            )
+            frozen.append(
+                AcquisitionItemResult(
+                    paper_id=result.paper_id,
+                    status="missing",
+                    path=None,
+                    format=None,
+                    failure={"code": error.code, "detail": detail},
+                )
+            )
+    frozen_results = tuple(frozen)
+    return validate_item_results(request, frozen_results)
 
 
 def _acquisition_reconciliation_pending(
@@ -22641,6 +22927,16 @@ def _deepfetch_run_from_row(row) -> DeepFetchRun:
         result_hash=row.result_hash,
         execution_receipt=receipt,
         failure_code=row.failure_code,
+        attempt_started_at=(
+            None
+            if getattr(row, "attempt_started_at", None) is None
+            else float(row.attempt_started_at)
+        ),
+        attempt_completed_at=(
+            None
+            if getattr(row, "attempt_completed_at", None) is None
+            else float(row.attempt_completed_at)
+        ),
     )
 
 
@@ -28011,12 +28307,17 @@ def _managed_run_document(
 
 
 def _validated_stage_provider_hard_ceiling(
-    *, failure_code: str, provider_exit: dict[str, object]
+    *,
+    unit_kind: str,
+    failure_code: str,
+    provider_exit: dict[str, object],
 ) -> dict[str, object]:
-    expected_reason = {
-        "codex_operation_timeout": "timeout",
-        "codex_operation_output_limit": "output_limit",
-    }.get(failure_code)
+    if not isinstance(provider_exit, dict):
+        raise OwnerConflict("stage_provider_hard_ceiling_invalid")
+    schema_ref = provider_exit.get("schema_ref")
+    terminal_contract_schema = (
+        schema_ref == "meta-research/provider-terminal-contract-failure/v1"
+    )
     expected_fields = {
         "schema_ref",
         "termination_reason",
@@ -28027,26 +28328,75 @@ def _validated_stage_provider_hard_ceiling(
         "result_file_hash",
         "supervisor_receipt_hash",
     }
+    schema_valid = False
+    expected_reasons: frozenset[str] = frozenset()
+    if schema_ref == "meta-research/provider-hard-ceiling/v1":
+        legacy_reasons = {
+            "codex_operation_failed": frozenset(
+                {"completed", "descendant_process", "launch_failed"}
+            ),
+            "codex_operation_timeout": frozenset({"timeout"}),
+            "codex_operation_output_limit": frozenset({"output_limit"}),
+        }.get(failure_code)
+        if legacy_reasons is not None:
+            schema_valid = True
+            expected_reasons = legacy_reasons
+    elif terminal_contract_schema:
+        expected_fields.update(
+            {"contract_failure_code", "contract_failure_detail_code"}
+        )
+        contract_failure_code = provider_exit.get("contract_failure_code")
+        contract_failure_detail_code = provider_exit.get(
+            "contract_failure_detail_code"
+        )
+        if (
+            isinstance(contract_failure_code, str)
+            and contract_failure_code == failure_code
+            and contract_failure_code
+            in _STAGE_PROVIDER_TERMINAL_CONTRACT_FAILURES.get(
+                unit_kind, frozenset()
+            )
+            and isinstance(contract_failure_detail_code, str)
+            and 1 <= len(contract_failure_detail_code) <= 96
+            and "a" <= contract_failure_detail_code[0] <= "z"
+            and all(
+                "a" <= character <= "z"
+                or "0" <= character <= "9"
+                or character == "_"
+                for character in contract_failure_detail_code
+            )
+        ):
+            schema_valid = True
+            expected_reasons = frozenset({"completed"})
     hash_fields = expected_fields - {
         "schema_ref",
         "termination_reason",
         "result_file_hash",
+        "contract_failure_code",
+        "contract_failure_detail_code",
     }
     result_hash = provider_exit.get("result_file_hash")
     if (
-        expected_reason is None
+        not schema_valid
         or not isinstance(provider_exit, dict)
         or set(provider_exit) != expected_fields
-        or provider_exit.get("schema_ref")
-        != "meta-research/provider-hard-ceiling/v1"
-        or provider_exit.get("termination_reason") != expected_reason
+        or provider_exit.get("termination_reason") not in expected_reasons
         or any(
-            not isinstance(provider_exit.get(field), str)
-            or len(cast(str, provider_exit[field])) != 64
+            (
+                not _is_sha256(provider_exit.get(field))
+                if terminal_contract_schema
+                else not isinstance(provider_exit.get(field), str)
+                or len(cast(str, provider_exit[field])) != 64
+            )
             for field in hash_fields
         )
         or (
-            result_hash is not None
+            terminal_contract_schema
+            and not _is_sha256(result_hash)
+        )
+        or (
+            not terminal_contract_schema
+            and result_hash is not None
             and (not isinstance(result_hash, str) or len(result_hash) != 64)
         )
     ):

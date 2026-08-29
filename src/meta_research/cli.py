@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from meta_research import __version__
+from meta_research.codex_runtime import CODEX_MODEL_REF
+from meta_research.daemon import DAEMON_STOP_DEADLINE_SECONDS
 from meta_research.paths import (
     DataRoot,
     DataRootError,
@@ -40,6 +42,7 @@ _DOCTOR_EFFECT_KINDS = frozenset(
         "runtime_reconciliation",
     }
 )
+_DAEMON_START_DEADLINE_SECONDS = 30.0
 
 
 class CliError(RuntimeError):
@@ -82,7 +85,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "start", help="Start the full durable Harness conformance matrix"
     )
     _add_data_root(conformance_start_parser)
-    conformance_start_parser.add_argument("--codex-model", required=True)
+    conformance_start_parser.add_argument(
+        "--codex-model",
+        choices=(CODEX_MODEL_REF,),
+        default=CODEX_MODEL_REF,
+    )
     conformance_start_parser.add_argument(
         "--codex-auth-profile",
         default="harness-profile:codex-default",
@@ -294,7 +301,7 @@ def _ensure_daemon(
         env=_daemon_environment(data_root),
         **daemon_spawn_options(),
     )
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + _DAEMON_START_DEADLINE_SECONDS
     while time.monotonic() < deadline:
         exit_code = process.poll()
         if exit_code not in {None, 2}:
@@ -307,19 +314,31 @@ def _ensure_daemon(
             and state.status == "running"
             and (owns_state or can_adopt_winner)
         ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                _internal_request(data_root, state, "/internal/readiness", method="GET")
+                _internal_request(
+                    data_root,
+                    state,
+                    "/internal/readiness",
+                    method="GET",
+                    timeout_seconds=remaining,
+                )
                 return state, owns_state
             except CliError:
                 pass
-        time.sleep(0.05)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
     if process.poll() is None:
         process.terminate()
     if process.poll() == 2:
         raise CliError(
             "another daemon acquired the data-root lock but did not become ready"
         )
-    raise CliError("daemon did not become ready within 15 seconds")
+    raise CliError("daemon did not become ready within 30 seconds")
 
 
 def _daemon_environment(data_root: DataRoot) -> dict[str, str]:
@@ -533,12 +552,15 @@ def _stop_daemon(data_root: DataRoot) -> dict[str, object]:
     ):
         raise CliError("refusing to signal a process that is not this data root's daemon")
     os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + DAEMON_STOP_DEADLINE_SECONDS
     while time.monotonic() < deadline:
         if not pid_is_alive(pid):
             return {"status": "stopped", "data_root": str(data_root.root)}
         time.sleep(0.05)
-    raise CliError("daemon did not stop within 15 seconds")
+    raise CliError(
+        "daemon did not stop within "
+        f"{DAEMON_STOP_DEADLINE_SECONDS:g} seconds"
+    )
 
 
 def _internal_request(
@@ -548,6 +570,7 @@ def _internal_request(
     *,
     method: str = "POST",
     payload: dict[str, object] | None = None,
+    timeout_seconds: float = 2.0,
 ) -> dict[str, Any]:
     request_body = None
     if method != "GET":
@@ -565,7 +588,7 @@ def _internal_request(
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(request, timeout=2) as response:
+        with opener.open(request, timeout=timeout_seconds) as response:
             body = response.read()
     except (urllib.error.URLError, TimeoutError) as error:
         raise CliError(f"daemon control request failed: {path}") from error

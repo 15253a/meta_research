@@ -11,8 +11,13 @@ from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
 from meta_research.bundle_protocol import TargetWorkHandle
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF,
+    CODEX_REASONING_EFFORT,
+)
 from meta_research.harness_adapters import (
     HARNESS_CAPABILITIES,
+    HARNESS_PROVIDER_STREAM_MAX_BYTES,
     HarnessAdapter,
     HarnessAdapterUnavailable,
     HarnessInvocation,
@@ -768,6 +773,8 @@ class HarnessRuntime:
     ) -> FullConformanceRunSet:
         """Admit one fixed full-contract Run for each production Adapter."""
 
+        if request.codex_model_ref != CODEX_MODEL_REF:
+            raise HarnessAdmissionError("codex_model_not_allowed")
         token = secrets.token_hex(8)
         conformance_ref = f"hfc_{token}"
         probe_requests: list[HarnessProbeRequest] = []
@@ -1613,7 +1620,8 @@ class HarnessRuntime:
     ) -> HarnessProbeRun:
         if (
             not prompt
-            or len(prompt.encode("utf-8")) > 256_000
+            or len(prompt.encode("utf-8"))
+            > HARNESS_PROVIDER_STREAM_MAX_BYTES
             or not _loopback_http_url(mcp_base_url)
         ):
             raise HarnessAdmissionError("harness_probe_execution_invalid")
@@ -1710,7 +1718,8 @@ class HarnessRuntime:
     ) -> HarnessProbeRun:
         if (
             not prompt
-            or len(prompt.encode("utf-8")) > 256_000
+            or len(prompt.encode("utf-8"))
+            > HARNESS_PROVIDER_STREAM_MAX_BYTES
             or not _loopback_http_url(mcp_base_url)
         ):
             raise HarnessAdmissionError("harness_probe_execution_invalid")
@@ -2483,6 +2492,8 @@ class HarnessRuntime:
                 ),
                 "required_capabilities": list(request.required_capabilities),
         }
+        if request.harness_family == "codex":
+            material["model_reasoning_effort"] = CODEX_REASONING_EFFORT
         if isinstance(request, TargetHarnessRequest):
             material.update(
                 {

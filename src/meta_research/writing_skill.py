@@ -13,13 +13,16 @@ import threading
 from types import ModuleType
 from typing import Protocol, cast
 
+from meta_research.codex_runtime import CODEX_REASONING_EFFORT_BINDING
 from meta_research.idea_skill import (
     CodexIdeaSkillAdapter,
     PROVIDER_RESULT_MAX_BYTES,
     PROVIDER_STREAM_MAX_BYTES,
     _DISABLED_CODEX_FEATURES,
+    _compile_codex_output_schema,
     _codex_harness_manifest,
     _file_sha256,
+    _shared_codex_adapter_source_hash,
     _verify_child_review_trace,
 )
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
@@ -284,6 +287,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         resources = _writing_skill_resources(document_type)
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_hash = _file_sha256(Path(__file__).resolve())
+        shared_adapter_source_hash = _shared_codex_adapter_source_hash()
         supervisor_hash = _file_sha256(
             Path(__file__).with_name("provider_supervisor.py").resolve()
         )
@@ -292,12 +296,17 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             "writing-draft": _draft_schema(),
             "writing-child-review-finalization": _review_schema(),
         }
+        output_contracts = {
+            name: _compile_codex_output_schema(schema)
+            for name, schema in output_contracts.items()
+        }
         return WritingRuntimeBinding(
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
                     "skill_instructions": _writing_skill_instructions(document_type),
                     "adapter_source_hash": adapter_hash,
+                    "shared_adapter_source_hash": shared_adapter_source_hash,
                     "supervisor_source_hash": supervisor_hash,
                 }
             ),
@@ -330,12 +339,15 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             + tuple(harness_artifacts)
             + (
                 f"adapter-source:meta_research.writing_skill@sha256:{adapter_hash}",
+                "adapter-source:meta_research.idea_skill@sha256:"
+                f"{shared_adapter_source_hash}",
                 "adapter-source:meta_research.provider_supervisor@sha256:"
                 f"{supervisor_hash}",
                 "disabled-codex-features:" + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
                 "codex-config:default_permissions=writing_snapshot",
                 "codex-config:features.multi_agent=true",
+                CODEX_REASONING_EFFORT_BINDING,
                 "codex-config:permissions.writing_snapshot=exact-frozen-read-root",
                 "codex-config:shell_environment_policy.inherit=none",
                 "codex-config:web_search=disabled",

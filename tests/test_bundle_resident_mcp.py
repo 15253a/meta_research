@@ -86,3 +86,56 @@ def test_bundle_resident_mcp_channel_is_bound_to_current_ar_scope(
             )
     finally:
         runtime.close()
+
+
+def test_bundle_resident_mcp_channel_allows_exact_executed_submission_scope(
+    tmp_path: Path,
+) -> None:
+    runtime = _bundle_runtime(tmp_path / "resident-mcp-awaiting-acceptance")
+    try:
+        _prepare_bundle_request(runtime)
+        for _step in range(8):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            run_view = current["run"]
+            if (
+                run_view is not None
+                and run_view["attempt_execution_receipt"] is not None
+            ):
+                break
+        else:
+            raise AssertionError("Bundle did not reach durable execution")
+
+        request_ref = current["stage_run_request"]["request_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        assert run is not None
+        with runtime._database.read() as connection:
+            statuses = connection.execute(
+                text(
+                    "SELECT runs.status AS run_status, "
+                    "attempts.status AS attempt_status, "
+                    "fences.status AS fence_status FROM ar_stage_runs runs "
+                    "JOIN ar_stage_attempts attempts ON attempts.attempt_ref = "
+                    "runs.current_attempt_ref JOIN ar_execution_fences fences ON "
+                    "fences.fence_ref = runs.current_fence_ref WHERE runs.run_ref = "
+                    ":run_ref"
+                ),
+                {"run_ref": run.run_ref},
+            ).one()
+        assert tuple(statuses) == (
+            "awaiting_acceptance",
+            "executed",
+            "submitted",
+        )
+
+        channel = runtime.harnesses.issue_resident_mcp_channel(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            root_session_ref=run.root_session_ref,
+            fence_ref=run.fence_ref,
+            capability_binding_hash=run.runtime_binding_hash,
+            operation_ids=("research_graph.snapshot.read",),
+        )
+        runtime.harnesses.revoke_resident_mcp_channel(channel)
+    finally:
+        runtime.close()

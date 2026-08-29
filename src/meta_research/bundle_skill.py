@@ -42,16 +42,28 @@ from meta_research.bundle_target_contract import (
     strategy_update_from_dict,
 )
 from meta_research.bundle_protocol import (
+    BUNDLE_CANONICAL_INTEGER_MAX_ABS,
     BUNDLE_PROJECTION_MAX_TUPLE_ITEMS,
+    BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES,
+    BUNDLE_ROOT_MAX_NODES,
+    BUNDLE_ROOT_MAX_SERIALIZED_BYTES,
     TERMINAL_EXTERNAL_OUTCOMES,
+)
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF,
+    CODEX_REASONING_EFFORT_BINDING,
 )
 from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     ProviderTransportLimits,
+    _CODEX_JSON_OBJECT_STRING_MARKER,
     _DISABLED_CODEX_FEATURES,
+    _compile_codex_output_schema,
     _codex_harness_manifest,
     _file_sha256,
+    _shared_codex_adapter_source_hash,
     _verify_child_review_trace,
+    _verify_primary_phase_trace,
 )
 from meta_research.harness import (
     FullConformanceBinding,
@@ -65,6 +77,7 @@ from meta_research.owners.agent_runtime import (
     validate_bundle_inbox_checkpoint_projection,
 )
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
+from meta_research.plan_contract import MAX_PLAN_EXPERIMENT_BRIEFS
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
 BundleSkillContractError = BundleContractError
@@ -789,7 +802,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         workspace: Path,
         *,
         executable: str = "codex",
-        model_ref: str = "gpt-5.4",
+        model_ref: str = CODEX_MODEL_REF,
         timeout_seconds: float = 15 * 60,
         process_runner: Callable[
             [list[str], str, float], subprocess.CompletedProcess[str]
@@ -989,10 +1002,18 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             and dynamic_generation[0] != "0"
         )
 
+    def _transport_contract_failure_code(self, operation_name: str) -> str:
+        if operation_name == "primary":
+            return "bundle_primary_result_contract_invalid"
+        if self._is_reconciliation_operation_name(operation_name):
+            return "bundle_review_result_contract_invalid"
+        raise BundleSkillUnavailable("codex_operation_spool_invalid")
+
     def runtime_binding(self) -> BundleRuntimeBinding:
         resources = _bundle_skill_resources()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_source_hash = _file_sha256(Path(__file__).resolve())
+        shared_adapter_source_hash = _shared_codex_adapter_source_hash()
         supervisor_source_hash = _file_sha256(
             Path(__file__).with_name("provider_supervisor.py").resolve()
         )
@@ -1005,12 +1026,17 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "target-dispatch": _dispatch_schema(("__target__",)),
             "target-batch": _target_batch_schema(_schema_template_request()),
         }
+        schemas = {
+            name: _compile_codex_output_schema(schema)
+            for name, schema in schemas.items()
+        }
         binding = BundleRuntimeBinding(
             packaged_skill_bundle_hash=canonical_hash(resources),
             instruction_set_hash=canonical_hash(
                 {
                     "skill_instructions": _bundle_skill_instructions(),
                     "adapter_source_hash": adapter_source_hash,
+                    "shared_adapter_source_hash": shared_adapter_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
                 }
             ),
@@ -1042,11 +1068,14 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             + (
                 "adapter-source:meta_research.bundle_skill@sha256:"
                 f"{adapter_source_hash}",
+                "adapter-source:meta_research.idea_skill@sha256:"
+                f"{shared_adapter_source_hash}",
                 "adapter-source:meta_research.provider_supervisor@sha256:"
                 f"{supervisor_source_hash}",
                 "disabled-codex-features:" + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
                 "codex-config:features.multi_agent=true",
+                CODEX_REASONING_EFFORT_BINDING,
                 "codex-config:web_search=live",
                 "output-route:codex-output-last-message/json-schema/v1",
                 "provider-output-limits:"
@@ -1072,6 +1101,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
+            "本回合仅执行 Primary draft phase。禁止调用 spawn_agent 或 wait，禁止委派 "
+            "child、独立评审或预先处理 review；必须先返回 frozen draft。独立评审只能在 "
+            "Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             '你是 Bundle 根 Agent。返回且只返回下列两个闭合分支之一：'
             '{"target_plan": ...} 的 formal v3，或固定合同中的 '
             '{"exhaustion_assessment": ...}。不得同时返回、混合或扩展两分支。'
@@ -1135,7 +1167,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{canonical_json(list(request.predecessor_rejections))}\n"
             f"plan_document={canonical_json(request.plan_document)}"
         )
-        output, session_ref, _stdout = self._invoke_with_resident_mcp(
+        output, session_ref, primary_stdout = self._invoke_with_resident_mcp(
             run_ref=request.run_ref,
             attempt_ref=request.attempt_ref,
             root_session_ref=request.root_session_ref,
@@ -1149,6 +1181,15 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if session_ref is None or type(output) is not dict:
             raise BundleSkillUnavailable("codex_bundle_primary_invalid")
+        try:
+            _verify_primary_phase_trace(primary_stdout)
+        except BundleSkillUnavailable as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="primary",
+                native_session_ref=session_ref,
+                failure_code=error.code,
+            ) from error
         if set(output) == {"target_plan"} and isinstance(
             output.get("target_plan"), dict
         ):
@@ -1167,7 +1208,13 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 adapter_kind="codex_cli",
                 output_kind="exhaustion_assessment",
             )
-        raise BundleSkillUnavailable("codex_bundle_primary_invalid")
+        raise self._sealed_result_failure(
+            job_ref=request.job_ref,
+            operation_name="primary",
+            native_session_ref=session_ref,
+            failure_code="bundle_primary_result_contract_invalid",
+            detail_code="codex_bundle_primary_invalid",
+        )
 
     def review_draft(
         self, request: BundleSkillRequest, draft: BundleSkillDraft
@@ -1184,6 +1231,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             raise BundleSkillUnavailable("bundle_skill_output_kind_invalid")
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
+            "本回合是 Review phase。必须针对下方当前 frozen reviewed_draft 现在新建一个 "
+            "child reviewer；不得复用 Primary phase、任何先前 child 或先前评审结论。"
             "在当前 Bundle 根 Session 内使用 Harness 原生 spawn_agent，以 "
             'fork_turns="none" 启动一个短命、全新上下文 child reviewer，并 wait '
             "到完成。它只审查 FormalPlan lineage、"
@@ -1229,12 +1278,26 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             or not isinstance(final, dict)
             or not isinstance(dispositions, list)
         ):
-            raise BundleSkillUnavailable("codex_bundle_review_invalid")
-        _verify_child_review_trace(
-            stdout,
-            root_session_ref=draft.primary_session_ref,
-            reviewer_agent_ref=reviewer,
-        )
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code="bundle_review_result_contract_invalid",
+                detail_code="codex_bundle_review_invalid",
+            )
+        try:
+            _verify_child_review_trace(
+                stdout,
+                root_session_ref=draft.primary_session_ref,
+                reviewer_agent_ref=reviewer,
+            )
+        except BundleSkillUnavailable as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code=error.code,
+            ) from error
         return BundleSkillResult(
             reviewed_draft=draft.draft,
             final_target_plan=cast(dict[str, object], final),
@@ -1281,6 +1344,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
+            "本回合是 Review phase。必须针对下方当前 frozen reviewed_assessment 现在新建 "
+            "一个 child reviewer；不得复用 Primary phase、任何先前 child 或先前评审结论。"
             "在当前 Bundle 根 Session 内使用 Harness 原生 spawn_agent，"
             'fork_turns="none"，且将下面 child_task 原样作为 prompt。'
             "wait 直到该独立 child terminal completed。根 Agent 不得自审，"
@@ -1314,51 +1379,85 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 reviewed_assessment_hash=assessment_hash,
             )
         ):
-            raise BundleSkillUnavailable("codex_bundle_exhaustion_review_invalid")
-        _verify_child_review_trace(
-            stdout,
-            root_session_ref=draft.primary_session_ref,
-            reviewer_agent_ref=reviewer,
-            expected_spawn_prompt=child_task,
-        )
-        spawn_hash, completion_hash = _child_review_event_hashes(
-            stdout,
-            root_session_ref=draft.primary_session_ref,
-            reviewer_agent_ref=reviewer,
-        )
-        unsigned_trace = BundleExhaustionReviewTrace(
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            fence_ref=request.fence_ref,
-            primary_session_ref=draft.primary_session_ref,
-            reviewer_agent_ref=reviewer,
-            reviewed_assessment_hash=assessment_hash,
-            review_task_hash=task_hash,
-            review_response_hash=canonical_hash(output),
-            spawn_event_hash=spawn_hash,
-            completion_event_hash=completion_hash,
-            transport_seal="0" * 64,
-        )
-        trace = replace(
-            unsigned_trace,
-            transport_seal=self._bundle_exhaustion_trace_seal(
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code="bundle_review_result_contract_invalid",
+                detail_code="codex_bundle_exhaustion_review_invalid",
+            )
+        try:
+            _verify_child_review_trace(
+                stdout,
+                root_session_ref=draft.primary_session_ref,
+                reviewer_agent_ref=reviewer,
+                expected_spawn_prompt=child_task,
+            )
+        except BundleSkillUnavailable as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code=error.code,
+            ) from error
+        try:
+            spawn_hash, completion_hash = _child_review_event_hashes(
+                stdout,
+                root_session_ref=draft.primary_session_ref,
+                reviewer_agent_ref=reviewer,
+            )
+        except BundleSkillUnavailable as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code=error.code,
+            ) from error
+        try:
+            unsigned_trace = BundleExhaustionReviewTrace(
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                fence_ref=request.fence_ref,
+                primary_session_ref=draft.primary_session_ref,
+                reviewer_agent_ref=reviewer,
+                reviewed_assessment_hash=assessment_hash,
+                review_task_hash=task_hash,
+                review_response_hash=canonical_hash(output),
+                spawn_event_hash=spawn_hash,
+                completion_event_hash=completion_hash,
+                transport_seal="0" * 64,
+            )
+            trace = replace(
                 unsigned_trace,
-                runtime_binding_hash=canonical_hash(
-                    request.runtime_binding.as_dict()
+                transport_seal=self._bundle_exhaustion_trace_seal(
+                    unsigned_trace,
+                    runtime_binding_hash=canonical_hash(
+                        request.runtime_binding.as_dict()
+                    ),
                 ),
-            ),
-        )
-        result = BundleExhaustionSkillResult(
-            reviewed_assessment=draft.draft,
-            reviewed_assessment_hash=assessment_hash,
-            findings=(),
-            primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=reviewer,
-            adapter_kind=draft.adapter_kind,
-            review_trace=trace,
-        )
-        validate_bundle_exhaustion_skill_result(request, result)
+            )
+            result = BundleExhaustionSkillResult(
+                reviewed_assessment=draft.draft,
+                reviewed_assessment_hash=assessment_hash,
+                findings=(),
+                primary_session_ref=draft.primary_session_ref,
+                review_mode="harness_child_agent",
+                reviewer_agent_ref=reviewer,
+                adapter_kind=draft.adapter_kind,
+                review_trace=trace,
+            )
+            validate_bundle_exhaustion_skill_result(request, result)
+        except (OwnerConflict, BundleSkillContractError) as error:
+            detail_code = (
+                error.code if isinstance(error, OwnerConflict) else str(error)
+            )
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name="review",
+                native_session_ref=draft.primary_session_ref,
+                failure_code="bundle_review_result_contract_invalid",
+                detail_code=detail_code,
+            ) from error
         return result
 
     def _bundle_exhaustion_trace_seal(
@@ -1431,13 +1530,14 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"frontier={canonical_json(list(request.frontier))}\n"
             f"state={canonical_json(request.state)}"
         )
+        operation_name = f"dispatch-{request.generation}"
         output, session_ref, _stdout = self._invoke_with_resident_mcp(
             run_ref=request.run_ref,
             attempt_ref=request.attempt_ref,
             root_session_ref=request.root_session_ref,
             fence_ref=request.fence_ref,
             runtime_binding=request.runtime_binding,
-            operation_name=f"dispatch-{request.generation}",
+            operation_name=operation_name,
             prompt=prompt,
             schema=_dispatch_schema(target_refs),
             native_session_ref=request.native_session_ref,
@@ -1455,7 +1555,16 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             )
             or not isinstance(rationale, str)
         ):
-            raise BundleSkillUnavailable("codex_bundle_dispatch_invalid")
+            checkpoint_session = session_ref or request.native_session_ref
+            if checkpoint_session is None:
+                raise BundleSkillUnavailable("codex_bundle_dispatch_invalid")
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name=operation_name,
+                native_session_ref=checkpoint_session,
+                failure_code="bundle_review_result_contract_invalid",
+                detail_code="codex_bundle_dispatch_invalid",
+            )
         result = BundleDispatchResult(
             action=action,
             selected_target_ref=selected_target_ref,
@@ -1463,7 +1572,16 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             native_session_ref=session_ref,
             adapter_kind="codex_cli",
         )
-        validate_bundle_dispatch_result(request, result)
+        try:
+            validate_bundle_dispatch_result(request, result)
+        except BundleSkillContractError as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name=operation_name,
+                native_session_ref=session_ref,
+                failure_code="bundle_review_result_contract_invalid",
+                detail_code=str(error),
+            ) from error
         return result
 
     def propose_target_batch(
@@ -1521,13 +1639,14 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             raise BundleSkillUnavailable("bundle_target_batch_prompt_too_large")
         if request.runtime_binding != self.runtime_binding():
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
+        operation_name = f"target-batch-{request.base_generation + 1}"
         output, session_ref, _stdout = self._invoke_with_resident_mcp(
             run_ref=request.run_ref,
             attempt_ref=request.attempt_ref,
             root_session_ref=request.root_session_ref,
             fence_ref=request.fence_ref,
             runtime_binding=request.runtime_binding,
-            operation_name=f"target-batch-{request.base_generation + 1}",
+            operation_name=operation_name,
             prompt=prompt,
             schema=_target_batch_schema(request),
             native_session_ref=request.native_session_ref,
@@ -1540,14 +1659,32 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             or not isinstance(strategy_update, dict)
             or not isinstance(rationale, str)
         ):
-            raise BundleSkillUnavailable("codex_bundle_target_batch_invalid")
+            checkpoint_session = session_ref or request.native_session_ref
+            if checkpoint_session is None:
+                raise BundleSkillUnavailable("codex_bundle_target_batch_invalid")
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name=operation_name,
+                native_session_ref=checkpoint_session,
+                failure_code="bundle_review_result_contract_invalid",
+                detail_code="codex_bundle_target_batch_invalid",
+            )
         result = BundleTargetBatchResult(
             strategy_update=cast(dict[str, object], strategy_update),
             rationale=rationale,
             native_session_ref=session_ref,
             adapter_kind="codex_cli",
         )
-        validate_bundle_target_batch_result(request, result)
+        try:
+            validate_bundle_target_batch_result(request, result)
+        except BundleSkillContractError as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name=operation_name,
+                native_session_ref=session_ref,
+                failure_code="bundle_review_result_contract_invalid",
+                detail_code=str(error),
+            ) from error
         return result
 
 
@@ -1817,7 +1954,11 @@ def _exhaustion_review_schema(
             "reviewer_agent_ref": _ref_schema(),
             "reviewed_assessment_hash": reviewed_hash_schema,
             "accepted": {"const": True},
-            "findings": {"type": "array", "maxItems": 0},
+            "findings": {
+                "type": "array",
+                "maxItems": 0,
+                "items": {"type": "string"},
+            },
         },
         "required": [
             "schema_ref",
@@ -1865,20 +2006,13 @@ def _exhaustion_assessment_envelope_schema(
 def _exhaustion_exploration_record_schema(
     request: BundleSkillRequest,
 ) -> dict[str, object]:
-    experiment_keys = [
-        cast(str, brief["experiment_key"])
-        for brief in _plan_briefs(request)
-        if isinstance(brief.get("experiment_key"), str)
-    ]
+    del request
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "record_ref": _ref_schema(),
-            "experiment_key": {
-                "type": "string",
-                "enum": experiment_keys or ["__missing_experiment__"],
-            },
+            "experiment_key": _plan_semantic_text_schema(),
             "measurement_unit_key": _ref_schema(),
             "held_fixed_bindings": {
                 "type": "array",
@@ -1898,11 +2032,7 @@ def _exhaustion_exploration_record_schema(
                         "minItems": 1,
                         "maxItems": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS,
                         "uniqueItems": True,
-                        "items": {
-                            "type": "string",
-                            "enum": experiment_keys
-                            or ["__missing_experiment__"],
-                        },
+                        "items": _plan_semantic_text_schema(),
                     },
                     "outcome": {
                         "type": "string",
@@ -1912,7 +2042,11 @@ def _exhaustion_exploration_record_schema(
                             "attempted_rejected",
                         ],
                     },
-                    "required_changes": {"type": "array", "maxItems": 0},
+                    "required_changes": {
+                        "type": "array",
+                        "maxItems": 0,
+                        "items": {"type": "string"},
+                    },
                     "evidence_refs": _ref_array_schema(min_items=1),
                     "external_reconciliations": {
                         "type": "array",
@@ -1963,6 +2097,7 @@ def _exhaustion_exploration_record_schema(
 
 
 def _dispatch_schema(target_refs: tuple[str, ...]) -> dict[str, object]:
+    del target_refs
     text = {"type": "string", "minLength": 1}
     return {
         "type": "object",
@@ -1974,10 +2109,7 @@ def _dispatch_schema(target_refs: tuple[str, ...]) -> dict[str, object]:
             },
             "selected_target_ref": {
                 "anyOf": [
-                    {
-                        "type": "string",
-                        "enum": list(target_refs) or ["__no_dispatch_target__"],
-                    },
+                    text,
                     {"type": "null"},
                 ],
             },
@@ -2059,9 +2191,6 @@ def _normalized_completion_contract_schema(
     request: BundleSkillRequest | BundleTargetBatchRequest,
 ) -> dict[str, object]:
     briefs = _plan_briefs(request)
-    experiment_schemas = [
-        _normalized_experiment_schema(brief) for brief in briefs
-    ]
     return {
         "type": "object",
         "additionalProperties": False,
@@ -2072,30 +2201,25 @@ def _normalized_completion_contract_schema(
                 "type": "array",
                 "minItems": len(briefs),
                 "maxItems": len(briefs),
-                "items": {
-                    "oneOf": experiment_schemas
-                    or [{"type": "object", "maxProperties": 0}],
-                },
+                "items": _normalized_experiment_schema(),
             },
         },
         "required": ["schema_ref", "plan_document_hash", "experiments"],
     }
 
 
-def _normalized_experiment_schema(brief: dict[str, object]) -> dict[str, object]:
-    key = cast(str, brief["experiment_key"])
-    semantic_delta = cast(str, brief["semantic_delta"])
+def _normalized_experiment_schema() -> dict[str, object]:
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "semantic_inputs": _semantic_inputs_schema(brief),
+            "semantic_inputs": _semantic_inputs_schema(),
             "brief": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "experiment_key": {"const": key},
-                    "semantic_delta": {"const": semantic_delta},
+                    "experiment_key": _plan_semantic_text_schema(),
+                    "semantic_delta": _plan_semantic_text_schema(),
                     "held_fixed_slots": _ref_array_schema(min_items=0),
                     "required_measurement_unit_keys": _ref_array_schema(
                         min_items=1
@@ -2113,16 +2237,16 @@ def _normalized_experiment_schema(brief: dict[str, object]) -> dict[str, object]
     }
 
 
-def _semantic_inputs_schema(brief: dict[str, object]) -> dict[str, object]:
+def _semantic_inputs_schema() -> dict[str, object]:
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "experiment_key": {"const": brief["experiment_key"]},
-            "goal": {"const": brief["goal"]},
-            "characteristics": {"const": brief["characteristics"]},
-            "boundary_constraints": {"const": brief["boundary_constraints"]},
-            "semantic_delta": {"const": brief["semantic_delta"]},
+            "experiment_key": _plan_semantic_text_schema(),
+            "goal": _plan_semantic_text_schema(),
+            "characteristics": _plan_semantic_text_schema(),
+            "boundary_constraints": _plan_semantic_text_schema(),
+            "semantic_delta": _plan_semantic_text_schema(),
         },
         "required": [
             "experiment_key",
@@ -2177,8 +2301,6 @@ def _formal_target_candidate_schema(
     request: BundleSkillRequest | BundleTargetBatchRequest,
 ) -> dict[str, object]:
     briefs = _plan_briefs(request)
-    experiment_keys = [cast(str, brief["experiment_key"]) for brief in briefs]
-    semantic_variants = [_semantic_inputs_schema(brief) for brief in briefs]
     text = _ref_schema()
     return {
         "type": "object",
@@ -2194,11 +2316,7 @@ def _formal_target_candidate_schema(
                         "type": "array",
                         "minItems": 1,
                         "uniqueItems": True,
-                        "items": {
-                            "type": "string",
-                            "enum": experiment_keys
-                            or ["__missing_experiment__"],
-                        },
+                        "items": _plan_semantic_text_schema(),
                     },
                     "measurement_unit_keys": {
                         **_ref_array_schema(min_items=1),
@@ -2240,14 +2358,9 @@ def _formal_target_candidate_schema(
                 "type": "array",
                 "minItems": 1,
                 "maxItems": max(1, len(briefs)),
-                "items": {
-                    "oneOf": semantic_variants
-                    or [{"type": "object", "maxProperties": 0}],
-                },
+                "items": _semantic_inputs_schema(),
             },
-            "measurement_contract": _measurement_contract_schema(
-                experiment_keys
-            ),
+            "measurement_contract": _measurement_contract_schema(),
             "risk_class": {"type": "string", "enum": ["normal", "high"]},
         },
         "required": [
@@ -2260,9 +2373,7 @@ def _formal_target_candidate_schema(
     }
 
 
-def _measurement_contract_schema(
-    experiment_keys: list[str],
-) -> dict[str, object]:
+def _measurement_contract_schema() -> dict[str, object]:
     return {
         "type": "object",
         "additionalProperties": False,
@@ -2273,12 +2384,9 @@ def _measurement_contract_schema(
             "experiment_keys": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": max(1, len(experiment_keys)),
+                "maxItems": MAX_PLAN_EXPERIMENT_BRIEFS,
                 "uniqueItems": True,
-                "items": {
-                    "type": "string",
-                    "enum": experiment_keys or ["__missing_experiment__"],
-                },
+                "items": _plan_semantic_text_schema(),
             },
             "measurement_unit_key": _ref_schema(),
             "baseline_forward_contract": _domain_document_schema(),
@@ -2385,27 +2493,14 @@ def _frozen_rule_schema() -> dict[str, object]:
 
 def _domain_document_schema() -> dict[str, object]:
     return {
-        "type": "object",
-        "minProperties": 1,
-        "maxProperties": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS,
-        "propertyNames": {
-            "not": {
-                "enum": [
-                    "adapter",
-                    "adapter_kind",
-                    "argv",
-                    "command",
-                    "container_image",
-                    "entrypoint",
-                    "execution",
-                    "execution_payload",
-                    "image",
-                    "provider",
-                    "provider_registry",
-                    "runtime_binding",
-                ]
-            }
-        },
+        _CODEX_JSON_OBJECT_STRING_MARKER: {
+            "max_collection_items": BUNDLE_PROJECTION_MAX_TUPLE_ITEMS,
+            "max_depth": 64,
+            "max_integer_abs": BUNDLE_CANONICAL_INTEGER_MAX_ABS,
+            "max_nodes": BUNDLE_ROOT_MAX_NODES,
+            "max_serialized_bytes": BUNDLE_ROOT_MAX_SERIALIZED_BYTES,
+            "max_string_bytes": BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES,
+        }
     }
 
 
@@ -2574,6 +2669,12 @@ def _plan_briefs(
 
 def _ref_schema() -> dict[str, object]:
     return {"type": "string", "minLength": 1, "maxLength": 4096}
+
+
+def _plan_semantic_text_schema() -> dict[str, object]:
+    # Accepted Plan text is request-specific.  Exact equality to the frozen
+    # Plan remains enforced by the Bundle domain validators after decode.
+    return {"type": "string", "minLength": 1, "maxLength": 8192}
 
 
 def _sha256_schema() -> dict[str, object]:

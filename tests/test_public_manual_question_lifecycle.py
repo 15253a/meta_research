@@ -267,6 +267,24 @@ class FailOnceManualDeepFetchProvider(DeterministicManualDeepFetchProvider):
         return super().execute(request)
 
 
+class ArtifactDriftOnceManualDeepFetchProvider(
+    DeterministicManualDeepFetchProvider
+):
+    @property
+    def requires_verified_terminal_retry(self) -> bool:
+        return True
+
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        if not self.requests:
+            self.requests.append(request)
+            raise DeepFetchUnavailable(
+                "deepfetch_acquisition_artifact_drift",
+                durable_outcome="pending",
+                native_session_ref="native-manual-artifact-drift",
+            )
+        return super().execute(request)
+
+
 def _build_runtime(
     data_root: Path,
     *,
@@ -1622,6 +1640,132 @@ def test_failed_manual_deepfetch_is_not_a_waiver_and_retries_one_request(
         assert second_run.attempt_generation == 2
         assert len(provider.requests) == 2
     finally:
+        runtime.close()
+
+
+def test_nonretryable_manual_deepfetch_requires_cancelled_context_successor(
+    tmp_path: Path,
+) -> None:
+    provider = ArtifactDriftOnceManualDeepFetchProvider()
+    runtime = _build_runtime(
+        tmp_path / "manual-deepfetch-artifact-successor",
+        deepfetch_provider=provider,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        quest_ref, parent_question_ref = _accept_root_question(
+            runtime, "manual-deepfetch-artifact-successor"
+        )
+        human = runtime.owners.human_collaboration
+        seeded = _open_and_confirm_seed(
+            human,
+            quest_ref=quest_ref,
+            parent_question_ref=parent_question_ref,
+            key_prefix="manual-deepfetch-artifact-successor",
+            deepfetch_preference="use",
+        )
+        queued = human.start_manual_creation_deepfetch(
+            seeded["context_ref"],
+            expected_seed_ref=seeded["seed"]["ref"],
+            expected_seed_hash=seeded["seed"]["hash"],
+            idempotency_key="manual-deepfetch-artifact-start",
+        )
+        old_context_ref = seeded["context_ref"]
+        old_request_ref = queued["research_path"]["deepfetch"]["request_ref"]
+
+        assert runtime.deepfetch.process_once()
+        failed = human.query_manual_question_creation(old_context_ref)
+        assert failed["research_path"]["status"] == "failed"
+        assert failed["research_path"]["deepfetch"]["failure"] == {
+            "code": "deepfetch_acquisition_artifact_drift"
+        }
+        old_run = runtime.owners.agent_runtime.query_deepfetch_run(old_request_ref)
+        assert old_run is not None
+        assert old_run.provider_operation_retry_permitted is False
+
+        same_basis = client.post(
+            f"/api/v1/manual-question-creations/{old_context_ref}/deepfetch",
+            headers=_command_headers(
+                write_headers, "manual-deepfetch-artifact-same-basis"
+            ),
+            json={
+                "expected_seed_ref": seeded["seed"]["ref"],
+                "expected_seed_hash": seeded["seed"]["hash"],
+            },
+        )
+
+        assert same_basis.status_code == 409
+        assert same_basis.json()["detail"]["code"] == (
+            "deepfetch_successor_required"
+        )
+        assert human.query_manual_question_creation(old_context_ref) == failed
+        assert len(provider.requests) == 1
+
+        cancelled_response = client.post(
+            f"/api/v1/manual-question-creations/{old_context_ref}/cancel",
+            headers=_command_headers(
+                write_headers, "manual-deepfetch-artifact-cancel"
+            ),
+            json={},
+        )
+        assert cancelled_response.status_code == 200
+        assert cancelled_response.json()["status"] == "cancelled"
+
+        opened_response = client.post(
+            "/api/v1/manual-question-creations",
+            headers=_command_headers(
+                write_headers, "manual-deepfetch-artifact-successor-open"
+            ),
+            json={
+                "quest_ref": quest_ref,
+                "parent_question_ref": parent_question_ref,
+            },
+        )
+        assert opened_response.status_code == 201
+        opened = opened_response.json()
+        assert opened["context_ref"] != old_context_ref
+        assert opened["generation"] == seeded["generation"] + 1
+
+        seeded_response = client.post(
+            f"/api/v1/manual-question-creations/{opened['context_ref']}"
+            "/seed-confirmation",
+            headers=_command_headers(
+                write_headers, "manual-deepfetch-artifact-successor-seed"
+            ),
+            json={"seed": _seed_value(deepfetch_preference="use")},
+        )
+        assert seeded_response.status_code == 201
+        successor_seed = seeded_response.json()
+        started_response = client.post(
+            f"/api/v1/manual-question-creations/{opened['context_ref']}/deepfetch",
+            headers=_command_headers(
+                write_headers, "manual-deepfetch-artifact-successor-start"
+            ),
+            json={
+                "expected_seed_ref": successor_seed["seed"]["ref"],
+                "expected_seed_hash": successor_seed["seed"]["hash"],
+            },
+        )
+        assert started_response.status_code == 202
+        successor = started_response.json()
+        new_request_ref = successor["research_path"]["deepfetch"]["request_ref"]
+        assert new_request_ref != old_request_ref
+
+        assert runtime.deepfetch.process_once()
+        succeeded = client.get(
+            f"/api/v1/manual-question-creations/{opened['context_ref']}"
+        ).json()
+        assert succeeded["research_path"]["status"] == "ready"
+        new_run = runtime.owners.agent_runtime.query_deepfetch_run(new_request_ref)
+        assert new_run is not None
+        assert new_run.run_ref != old_run.run_ref
+        assert new_run.attempt_generation == 1
+        assert [request.request_ref for request in provider.requests] == [
+            old_request_ref,
+            new_request_ref,
+        ]
+    finally:
+        client.close()
         runtime.close()
 
 

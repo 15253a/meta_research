@@ -37,6 +37,13 @@ class Authentication:
     def issue_browser_grant(self) -> str:
         return self._issue_grant("browser", BROWSER_GRANT_TTL_SECONDS)
 
+    def issue_session(self) -> AuthSession:
+        """Create a session after the caller has verified a trusted boundary."""
+
+        now = time.time()
+        with self._database.write() as connection:
+            return self._create_session(connection, now)
+
     def exchange_bootstrap_token(self, token: str) -> AuthSession | None:
         return self._exchange_grant(token, "token")
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
@@ -90,7 +91,10 @@ from meta_research.owners.target_root_lifecycle import (
 from meta_research.paths import DataRoot
 from meta_research.plan_skill import CodexPlanSkillAdapter, PlanSkillProvider
 from meta_research.plan_stage import PlanStageWorker
-from meta_research.power_inhibitors import ProductionPowerInhibitor
+from meta_research.power_inhibitors import (
+    OperatorAttestedPowerInhibitor,
+    ProductionPowerInhibitor,
+)
 from meta_research.projection import PublicProjection
 from meta_research.quest_drafting import (
     CodexDraftingAdapter,
@@ -453,6 +457,22 @@ class _AgentRuntimeAcquisitionClient(DeepFetchAcquisitionClient):
             self._provider,
         )
 
+    def query_completed_batch(
+        self,
+        session_ref: str,
+        request_id: str,
+    ) -> AcquisitionBatchExecution | None:
+        return self._agent_runtime.query_acquisition_execution(
+            session_ref,
+            request_id,
+        )
+
+
+def _configured_power_inhibitor(data_root: DataRoot) -> PowerInhibitor:
+    if os.environ.get("META_RESEARCH_ASSUME_ALWAYS_ON") == "1":
+        return OperatorAttestedPowerInhibitor()
+    return ProductionPowerInhibitor(data_root.run / "power-inhibitor")
+
 
 def build_production_runtime(
     data_root: DataRoot,
@@ -488,7 +508,7 @@ def build_production_runtime(
         inhibitor=(
             power_inhibitor
             if power_inhibitor is not None
-            else ProductionPowerInhibitor(data_root.run / "power-inhibitor")
+            else _configured_power_inhibitor(data_root)
         ),
         event_logger=RuntimeEventLogger(data_root.daemon_log),
         startup_probe=(
@@ -625,6 +645,7 @@ def build_production_runtime(
             acquisition_provider,
         ),
         process_runner=codex_provider_runner,
+        codex_home=data_root.codex_home.absolute(),
     )
     agent_runtime.bind_provider_quiescence_driver(
         idea_skill_provider,

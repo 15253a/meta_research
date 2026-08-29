@@ -454,6 +454,7 @@ class BundleStageWorker:
                     self._transient_error = error.code
                     return False
                 provider_safe = True
+                result = None
                 try:
                     try:
                         result = self._provider.propose_target_batch(batch_request)
@@ -474,7 +475,29 @@ class BundleStageWorker:
                         self._transient_error = error.code
                         return False
                     except BundleSkillContractError as error:
-                        self._transient_error = str(error)
+                        if result is None:
+                            self._transient_error = str(error)
+                            return False
+                        failure_code = "bundle_review_result_contract_invalid"
+                        try:
+                            terminal = self._record_terminal_contract_failure(
+                                unit_ref=batch_unit_ref,
+                                run=run,
+                                job_ref=batch_operation_ref,
+                                operation_name=(
+                                    f"target-batch-{graph.head_generation + 1}"
+                                ),
+                                native_session_ref=result.native_session_ref,
+                                failure_code=failure_code,
+                                detail_code=str(error),
+                            )
+                        except BundleSkillUnavailable as checkpoint_error:
+                            provider_safe = False
+                            self._transient_error = checkpoint_error.code
+                            return False
+                        if terminal:
+                            provider_safe = False
+                        self._transient_error = failure_code
                         return False
                     self._agent_runtime.record_bundle_target_proposal(
                         run_ref=run.run_ref,
@@ -612,6 +635,7 @@ class BundleStageWorker:
                 self._transient_error = error.code
                 return False
             provider_safe = True
+            result = None
             try:
                 try:
                     result = self._provider.schedule_target(dispatch_request)
@@ -632,7 +656,27 @@ class BundleStageWorker:
                     self._transient_error = error.code
                     return False
                 except BundleSkillContractError as error:
-                    self._transient_error = str(error)
+                    if result is None:
+                        self._transient_error = str(error)
+                        return False
+                    failure_code = "bundle_review_result_contract_invalid"
+                    try:
+                        terminal = self._record_terminal_contract_failure(
+                            unit_ref=dispatch_unit_ref,
+                            run=run,
+                            job_ref=dispatch_operation_ref,
+                            operation_name=f"dispatch-{dispatch_generation}",
+                            native_session_ref=result.native_session_ref,
+                            failure_code=failure_code,
+                            detail_code=str(error),
+                        )
+                    except BundleSkillUnavailable as checkpoint_error:
+                        provider_safe = False
+                        self._transient_error = checkpoint_error.code
+                        return False
+                    if terminal:
+                        provider_safe = False
+                    self._transient_error = failure_code
                     return False
                 self._agent_runtime.record_bundle_dispatch_decision(
                     run_ref=run.run_ref,
@@ -2106,6 +2150,7 @@ class BundleStageWorker:
                 self._transient_error = error.code
                 return False
             provider_safe = True
+            draft = None
             try:
                 try:
                     draft = self._provider.generate_draft(skill_request)
@@ -2126,7 +2171,27 @@ class BundleStageWorker:
                     self._transient_error = error.code
                     return False
                 except BundleSkillContractError as error:
-                    self._transient_error = str(error)
+                    if draft is None:
+                        self._transient_error = str(error)
+                        return False
+                    failure_code = "bundle_primary_result_contract_invalid"
+                    try:
+                        terminal = self._record_terminal_contract_failure(
+                            unit_ref=unit_ref,
+                            run=run,
+                            job_ref=job_ref,
+                            operation_name="primary",
+                            native_session_ref=draft.primary_session_ref,
+                            failure_code=failure_code,
+                            detail_code=str(error),
+                        )
+                    except BundleSkillUnavailable as checkpoint_error:
+                        provider_safe = False
+                        self._transient_error = checkpoint_error.code
+                        return False
+                    if terminal:
+                        provider_safe = False
+                    self._transient_error = failure_code
                     return False
                 checkpoint = self._agent_runtime.record_bundle_primary_draft(
                     run_ref=run.run_ref,
@@ -2171,6 +2236,7 @@ class BundleStageWorker:
             self._transient_error = error.code
             return False
         provider_safe = True
+        result = None
         try:
             try:
                 result = self._provider.review_draft(skill_request, draft)
@@ -2203,7 +2269,27 @@ class BundleStageWorker:
                 self._transient_error = error.code
                 return False
             except BundleSkillContractError as error:
-                self._transient_error = str(error)
+                if result is None:
+                    self._transient_error = str(error)
+                    return False
+                failure_code = "bundle_review_result_contract_invalid"
+                try:
+                    terminal = self._record_terminal_contract_failure(
+                        unit_ref=unit_ref,
+                        run=run,
+                        job_ref=job_ref,
+                        operation_name="review",
+                        native_session_ref=result.primary_session_ref,
+                        failure_code=failure_code,
+                        detail_code=str(error),
+                    )
+                except BundleSkillUnavailable as checkpoint_error:
+                    provider_safe = False
+                    self._transient_error = checkpoint_error.code
+                    return False
+                if terminal:
+                    provider_safe = False
+                self._transient_error = failure_code
                 return False
             if isinstance(result, BundleExhaustionSkillResult):
                 self._accept_exhaustion_review(
@@ -2260,6 +2346,45 @@ class BundleStageWorker:
                     attempt_ref=run.attempt_ref,
                     fence_ref=run.fence_ref,
                 )
+
+    def _record_terminal_contract_failure(
+        self,
+        *,
+        unit_ref: str,
+        run: BundleStageRun,
+        job_ref: str,
+        operation_name: str,
+        native_session_ref: str,
+        failure_code: str,
+        detail_code: str,
+    ) -> bool:
+        checkpoint_factory = getattr(
+            self._provider,
+            "terminal_contract_failure_checkpoint",
+            None,
+        )
+        if not callable(checkpoint_factory):
+            return False
+        checkpoint = checkpoint_factory(
+            job_ref=job_ref,
+            operation_name=operation_name,
+            native_session_ref=native_session_ref,
+            failure_code=failure_code,
+            detail_code=detail_code,
+        )
+        if not isinstance(checkpoint, dict):
+            raise BundleSkillUnavailable(
+                "codex_contract_failure_checkpoint_invalid"
+            )
+        self._agent_runtime.record_stage_provider_hard_ceiling(
+            unit_ref=unit_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            failure_code=failure_code,
+            provider_exit=checkpoint,
+        )
+        return True
 
     def _accept_exhaustion_review(
         self,

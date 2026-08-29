@@ -121,11 +121,35 @@ def _runtime(tmp_path: Path, *, codex_missing: str | None = None):
 
 def _full_request() -> FullConformanceRequest:
     return FullConformanceRequest(
-        codex_model_ref="gpt-conformance",
+        codex_model_ref="gpt-5.6-sol",
         codex_auth_profile_ref="harness-profile:codex-default",
         claude_model_ref="claude-conformance",
         claude_auth_profile_ref="harness-profile:claude-default",
     )
+
+
+def test_full_conformance_rejects_a_non_sol_codex_model_before_admission(
+    tmp_path: Path,
+) -> None:
+    runtime, _codex, _claude = _runtime(tmp_path / "wrong-codex-model")
+    try:
+        with pytest.raises(
+            HarnessAdmissionError,
+            match="codex_model_not_allowed",
+        ):
+            runtime.harnesses.start_full_conformance(
+                FullConformanceRequest(
+                    codex_model_ref="gpt-conformance",
+                    codex_auth_profile_ref="harness-profile:codex-default",
+                    claude_model_ref="claude-conformance",
+                    claude_auth_profile_ref="harness-profile:claude-default",
+                )
+            )
+        assert runtime.harnesses.query_status()["conformance"][
+            "conformance_ref"
+        ] is None
+    finally:
+        runtime.close()
 
 
 def test_old_partial_probe_can_never_make_product_harness_ready(
@@ -316,8 +340,6 @@ def test_cli_conformance_start_posts_only_provider_configuration(
                 "start",
                 "--data-root",
                 str(data_root.root),
-                "--codex-model",
-                "gpt-conformance",
                 "--claude-model",
                 "claude-conformance",
                 "--json",
@@ -328,7 +350,7 @@ def test_cli_conformance_start_posts_only_provider_configuration(
     assert captured["path"] == "/internal/harness-conformance"
     assert captured["method"] == "POST"
     assert captured["payload"] == {
-        "codex_model_ref": "gpt-conformance",
+        "codex_model_ref": "gpt-5.6-sol",
         "codex_auth_profile_ref": "harness-profile:codex-default",
         "claude_model_ref": "claude-conformance",
         "claude_auth_profile_ref": "harness-profile:claude-default",
@@ -350,11 +372,22 @@ def test_internal_product_route_admits_the_fixed_two_family_set(
         base_url=base_url,
     )
     try:
-        response = client.post(
+        rejected = client.post(
             "/internal/harness-conformance",
             headers={"X-Meta-Research-Control": "control-secret"},
             json={
                 "codex_model_ref": "gpt-conformance",
+                "codex_auth_profile_ref": "harness-profile:codex-default",
+                "claude_model_ref": "claude-conformance",
+                "claude_auth_profile_ref": "harness-profile:claude-default",
+            },
+        )
+        assert rejected.status_code == 422
+        response = client.post(
+            "/internal/harness-conformance",
+            headers={"X-Meta-Research-Control": "control-secret"},
+            json={
+                "codex_model_ref": "gpt-5.6-sol",
                 "codex_auth_profile_ref": "harness-profile:codex-default",
                 "claude_model_ref": "claude-conformance",
                 "claude_auth_profile_ref": "harness-profile:claude-default",

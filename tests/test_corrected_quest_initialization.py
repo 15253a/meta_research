@@ -2979,3 +2979,56 @@ def test_corrected_v2_confirmation_preserves_the_owner_receipt_chain(
         assert second["status"] == "draft"
     finally:
         runtime.close()
+
+
+def test_current_creation_skips_terminal_reconstruction_without_hiding_new_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = DeterministicDraftingAdapter()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "current-terminal-query-budget"),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    hc = runtime.owners.human_collaboration
+    try:
+        ready = _ready_v2(runtime, "current-terminal-query-budget")
+        completed = hc.confirm_quest(
+            ready["initialization_id"],
+            quest_draft_revision=ready["quest_draft"]["revision"],
+            quest_draft_hash=ready["quest_draft"]["hash"],
+            proposal_ref=ready["proposal"]["ref"],
+            proposal_hash=ready["proposal"]["hash"],
+            preview_ref=ready["confirmation_preview"]["ref"],
+            preview_hash=ready["confirmation_preview"]["hash"],
+            idempotency_key="current-terminal-confirm",
+        )
+        while completed["status"] != "completed":
+            assert hc.reconcile_once()
+            completed = hc.query_quest_creation(ready["initialization_id"])
+
+        reconstructed: list[str] = []
+        query_quest_creation = hc.query_quest_creation
+
+        def record_reconstruction(initialization_id: str) -> dict[str, object]:
+            reconstructed.append(initialization_id)
+            return query_quest_creation(initialization_id)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(hc, "query_quest_creation", record_reconstruction)
+            assert hc.query_current_quest_creation() is None
+        assert reconstructed == []
+
+        active = hc.create_quest({}, "current-after-terminal")
+        reconstructed.clear()
+        with monkeypatch.context() as patch:
+            patch.setattr(hc, "query_quest_creation", record_reconstruction)
+            current = hc.query_current_quest_creation()
+        assert current is not None
+        assert current["initialization_id"] == active["initialization_id"]
+        assert current["status"] == "draft"
+        assert reconstructed == [active["initialization_id"]]
+    finally:
+        runtime.close()

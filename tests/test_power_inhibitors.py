@@ -9,7 +9,10 @@ import time
 
 import pytest
 
-from meta_research.power_inhibitors import ProductionPowerInhibitor
+from meta_research.power_inhibitors import (
+    OperatorAttestedPowerInhibitor,
+    ProductionPowerInhibitor,
+)
 from meta_research.runtime_protection import InhibitorLease, RuntimeProtectionUnavailable
 
 
@@ -27,6 +30,54 @@ def test_unsupported_host_fails_closed_with_typed_reason() -> None:
         inhibitor.acquire(holder_ref="holder:unsupported", reason="managed work")
 
     assert raised.value.code == "power_inhibitor_platform_unsupported"
+
+
+def test_operator_attested_host_confirms_exact_holder_across_restart() -> None:
+    holder_ref = "holder:operator-attested-development-host"
+    first = OperatorAttestedPowerInhibitor(clock=lambda: 1_720_000_000.0)
+
+    lease = first.acquire(holder_ref=holder_ref, reason="managed work")
+
+    assert first.kind == "operator_attested_always_on"
+    assert lease == InhibitorLease(
+        holder_ref=holder_ref,
+        backend="operator_attested_always_on",
+        scope="sleep",
+        acquired_at=1_720_000_000.0,
+        native_holder_ref=(
+            "operator-attestation:"
+            + hashlib.sha256(holder_ref.encode("utf-8")).hexdigest()[:24]
+        ),
+    )
+    assert first.is_confirmed(lease)
+    assert first.query_hold(lease) == "confirmed"
+
+    restarted = OperatorAttestedPowerInhibitor(clock=lambda: 1_720_000_100.0)
+    exact_status, exact_lease = restarted.query_exact_hold(holder_ref=holder_ref)
+
+    assert exact_status == "confirmed"
+    assert exact_lease == InhibitorLease(
+        holder_ref=holder_ref,
+        backend="operator_attested_always_on",
+        scope="sleep",
+        acquired_at=1_720_000_100.0,
+        native_holder_ref=lease.native_holder_ref,
+    )
+    restarted.release(exact_lease)
+
+    with pytest.raises(RuntimeProtectionUnavailable) as foreign_release:
+        restarted.release(
+            InhibitorLease(
+                holder_ref=holder_ref,
+                backend="ubuntu_logind",
+                scope="sleep",
+                acquired_at=1_720_000_000.0,
+                native_holder_ref="pid:123:holder:legacy",
+            )
+        )
+    assert foreign_release.value.code == (
+        "power_inhibitor_operator_attestation_invalid"
+    )
 
 
 def test_wsl_detection_takes_precedence_over_linux_distribution(

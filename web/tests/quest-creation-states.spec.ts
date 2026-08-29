@@ -94,6 +94,8 @@ type PublicQuestCreation = {
     run: null | {
       run_ref: string;
       attempt_generation: number;
+      attempt_started_at: number | null;
+      attempt_completed_at: number | null;
       root_session_ref: string;
       native_session_ref: string | null;
       execution_receipt: null | PublicReceipt;
@@ -318,6 +320,266 @@ test("the ready Proposal keeps the accepted violet source and six seed-field car
   await expectAcceptedProposalContract(dialog);
 });
 
+test("a completed Quest lands once on its accepted first Question", async ({
+  page,
+}) => {
+  test.setTimeout(45_000);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openAuthenticatedProduct(page, runningProduct());
+  const { dialog } = await openCreation(page);
+  await fillRequiredBasis(
+    dialog,
+    "验证完成后首问题立即可发现",
+    "完成后关闭创建窗口并定位到第一个正式 Question",
+  );
+  await dialog.getByRole("button", { name: "检测本机计算卡" }).click();
+  await expect(
+    dialog.getByText("capability_unavailable · deterministic_probe_unavailable", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await selectReadyCompute(dialog);
+  await generateReadyProposal(dialog);
+
+  const pending = await publicCurrent(page);
+  expect(pending).not.toBeNull();
+  const firstQuestionTitle = await dialog.getByLabel("首问题标题").inputValue();
+  await dialog.getByRole("button", {
+    name: "确认创建 Quest 与第一个问题",
+  }).click();
+
+  await expect(dialog).toBeHidden({ timeout: 15_000 });
+  const completed = await waitForPublicStatus(
+    page,
+    pending!.initialization_id,
+    "completed",
+  );
+  const questionRef = completed.question_ref;
+  expect(questionRef).toMatch(/^question_/);
+  if (!questionRef) throw new Error("completed Quest omitted its formal Question identity");
+
+  const route = new URL(page.url());
+  expect(route.searchParams.get("view")).toBe("questions");
+  expect(route.searchParams.get("panel")).toBe("question-tree");
+  expect(route.searchParams.get("node")).toBe(questionRef);
+
+  const tree = page.getByTestId("question-tree");
+  await expect(tree).toBeVisible();
+  const node = tree.locator(`[data-question-ref="${questionRef}"]`);
+  await expect(node).toBeVisible();
+  await expect(node).toHaveAttribute("aria-selected", "true");
+  await expect(node).toContainText(firstQuestionTitle);
+  await expect(node).toBeFocused();
+  const handoffStatus = tree.getByRole("status", {
+    name: `Quest 创建完成。第一个正式 Question：${firstQuestionTitle}。${questionRef} · 已定位到问题树当前节点`,
+  });
+  await expect(
+    handoffStatus,
+  ).toContainText(`第一个正式 Question：${firstQuestionTitle}`);
+  await expect(
+    handoffStatus,
+  ).toContainText(`${questionRef} · 已定位到问题树当前节点`);
+  const compactGeometry = await page.evaluate(() => ({
+    clientWidth: document.documentElement.clientWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+  }));
+  expect(compactGeometry.scrollWidth).toBeLessThanOrEqual(compactGeometry.clientWidth);
+
+  const stableFocus = tree.getByRole("button", { name: "聚焦当前支线" });
+  await stableFocus.focus();
+  const stableUrl = page.url();
+  await page.waitForTimeout(1_800);
+  await expect(stableFocus).toBeFocused();
+  expect(page.url()).toBe(stableUrl);
+});
+
+test("a second completed Quest keeps its handoff while the QuestionTree projection lags", async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await openAuthenticatedProduct(page, runningProduct());
+
+  let { dialog } = await openCreation(page);
+  await fillRequiredBasis(
+    dialog,
+    "建立旧 Quest 作为第二次创建的投影基线",
+    "第二次完成前问题树只包含这个旧节点",
+  );
+  await dialog.getByRole("button", { name: "检测本机计算卡" }).click();
+  await expect(
+    dialog.getByText("capability_unavailable · deterministic_probe_unavailable", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await selectReadyCompute(dialog);
+  await generateReadyProposal(dialog);
+  await dialog.getByRole("button", {
+    name: "确认创建 Quest 与第一个问题",
+  }).click();
+  await expect(dialog).toBeHidden({ timeout: 15_000 });
+
+  const firstCreation = await publicCurrent(page);
+  expect(firstCreation).toBeNull();
+  const tree = page.getByTestId("question-tree");
+  await expect(tree).toBeVisible();
+  const firstQuestion = tree.locator("[data-question-ref]").first();
+  await expect(firstQuestion).toBeVisible();
+  const firstQuestionRef = await firstQuestion.getAttribute("data-question-ref");
+  if (!firstQuestionRef) throw new Error("first completed Quest omitted its Question identity");
+  expect(firstQuestionRef).toMatch(/^question_/);
+  const oldQuestion = tree.locator(`[data-question-ref="${firstQuestionRef}"]`);
+
+  ({ dialog } = await openCreation(page));
+  await fillRequiredBasis(
+    dialog,
+    "第二个 Quest：完成后等待自己的首问题投影",
+    "旧节点不得劫持第二次 completion handoff",
+  );
+  await selectReadyCompute(dialog);
+  await generateReadyProposal(dialog);
+  const second = await publicCurrent(page);
+  expect(second).not.toBeNull();
+  const secondQuestionTitle = await dialog.getByLabel("首问题标题").inputValue();
+
+  const beforeSecondCompletion = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/snapshot", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`snapshot failed: ${response.status}`);
+    return response.json() as Promise<{
+      question_tree: { items: Array<{ question_ref: string }> };
+    }>;
+  });
+  expect(beforeSecondCompletion.question_tree.items.map((item) => item.question_ref))
+    .toEqual([firstQuestionRef]);
+
+  let releaseProjection!: () => void;
+  const projectionReleased = new Promise<void>((resolveRelease) => {
+    releaseProjection = resolveRelease;
+  });
+  let delayedSnapshotRequests = 0;
+  const delayProjection = async (route: Route) => {
+    delayedSnapshotRequests += 1;
+    await projectionReleased;
+    await route.continue();
+  };
+  await page.route("**/api/v1/snapshot", delayProjection);
+
+  await dialog.getByRole("button", {
+    name: "确认创建 Quest 与第一个问题",
+  }).click();
+  await expect(dialog).toBeHidden({ timeout: 15_000 });
+  const completedSecond = await waitForPublicStatus(
+    page,
+    second!.initialization_id,
+    "completed",
+  );
+  const secondQuestionRef = completedSecond.question_ref;
+  if (!secondQuestionRef) throw new Error("second completed Quest omitted its Question identity");
+  expect(secondQuestionRef).not.toBe(firstQuestionRef);
+  await expect.poll(() => delayedSnapshotRequests).toBeGreaterThan(0);
+
+  const syncingStatus = tree.getByRole("status", {
+    name: `Quest 创建完成。第一个正式 Question：${secondQuestionTitle}。${secondQuestionRef} · 问题树 Projection 正在同步`,
+  });
+  await expect(syncingStatus).toBeVisible();
+  expect(new URL(page.url()).searchParams.get("node")).toBe(secondQuestionRef);
+  await expect(tree.locator(`[data-question-ref="${secondQuestionRef}"]`)).toHaveCount(0);
+  await expect(oldQuestion).toHaveAttribute("aria-selected", "true");
+
+  releaseProjection();
+  const secondQuestion = tree.locator(`[data-question-ref="${secondQuestionRef}"]`);
+  await expect(secondQuestion).toBeVisible({ timeout: 15_000 });
+  await page.unroute("**/api/v1/snapshot", delayProjection);
+  await expect(secondQuestion).toHaveAttribute("aria-selected", "true");
+  await expect(oldQuestion).toHaveCount(0);
+  await expect(secondQuestion).toContainText(secondQuestionTitle);
+  await expect(secondQuestion).toBeFocused();
+  await expect(tree.getByRole("status", {
+    name: `Quest 创建完成。第一个正式 Question：${secondQuestionTitle}。${secondQuestionRef} · 已定位到问题树当前节点`,
+  })).toHaveCount(1);
+  expect(new URL(page.url()).searchParams.get("node")).toBe(secondQuestionRef);
+
+  const stableFocus = tree.getByRole("button", { name: "聚焦当前支线" });
+  await stableFocus.focus();
+  const stableUrl = page.url();
+  await page.waitForTimeout(1_800);
+  await expect(stableFocus).toBeFocused();
+  expect(page.url()).toBe(stableUrl);
+});
+
+test("a stale completed Snapshot starts a new Quest instead of reopening the accepted initialization", async ({
+  page,
+}) => {
+  test.setTimeout(45_000);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await openAuthenticatedProduct(page, runningProduct());
+  const { dialog } = await openCreation(page);
+  await fillRequiredBasis(
+    dialog,
+    "验证完成后立即开始下一项研究",
+    "慢 Snapshot 不能把已完成 initialization 重新装回创建窗口",
+  );
+  await dialog.getByRole("button", { name: "检测本机计算卡" }).click();
+  await expect(
+    dialog.getByText("capability_unavailable · deterministic_probe_unavailable", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await selectReadyCompute(dialog);
+  await generateReadyProposal(dialog);
+
+  const pending = await publicCurrent(page);
+  expect(pending).not.toBeNull();
+  const frozenSnapshot = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/snapshot", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`snapshot failed: ${response.status}`);
+    return response.json() as Promise<{
+      revision: number;
+      quest_creation: { current: PublicQuestCreation | null };
+      [key: string]: unknown;
+    }>;
+  });
+  expect(frozenSnapshot.quest_creation.current).toMatchObject({
+    initialization_id: pending!.initialization_id,
+    status: "proposal_ready",
+  });
+  const freezePreCompletionSnapshot = async (route: Route) => {
+    await route.fulfill({ json: frozenSnapshot });
+  };
+  await page.route("**/api/v1/snapshot", freezePreCompletionSnapshot);
+
+  await dialog.getByRole("button", {
+    name: "确认创建 Quest 与第一个问题",
+  }).click();
+  await expect(dialog).toBeHidden({ timeout: 15_000 });
+  await expect(page.locator(".lumen-connection code")).toHaveText(
+    `rev ${frozenSnapshot.revision}`,
+  );
+
+  const reopened = await openCreation(page);
+  await page.unroute("**/api/v1/snapshot", freezePreCompletionSnapshot);
+  await expect.poll(async () => {
+    const current = await publicCurrent(page);
+    return {
+      present: current !== null,
+      reusesCompletedInitialization:
+        current?.initialization_id === pending!.initialization_id,
+    };
+  }).toEqual({ present: true, reusesCompletedInitialization: false });
+  await expect(reopened.dialog.getByRole("textbox", {
+    name: "目标",
+    exact: true,
+  })).toHaveValue("");
+  await expect(reopened.dialog).toBeVisible();
+});
+
 test("DeepFetch unfolds real progress and its accepted snapshot inside the same Quest window", async ({
   page,
 }) => {
@@ -350,14 +612,14 @@ test("DeepFetch unfolds real progress and its accepted snapshot inside the same 
   );
   const runway = dialog.getByTestId("deepfetch-runway");
   await expect(runway).toHaveAttribute("data-status", "not-started");
-  await expect(runway).toContainText("进度只读取 durable Projection");
+  await expect(runway).toContainText("阶段读取 durable Projection");
   await expect(session).toBeVisible();
 
   await dialog.getByRole("button", { name: "生成第一个问题" }).click();
   await expect(runway).toHaveAttribute("data-status", /queued|running|succeeded/, {
     timeout: 8_000,
   });
-  await expect(runway.getByLabel("DeepFetch 真实进度")).toBeVisible();
+  await expect(runway.getByLabel("DeepFetch 运行进度")).toBeVisible();
   await expect(session).toBeVisible();
   await expect(runway).toContainText("2 papers · 1 fulltexts · RM accepted", {
     timeout: 12_000,
@@ -370,6 +632,10 @@ test("DeepFetch unfolds real progress and its accepted snapshot inside the same 
     "DeepFetch 已核查两篇论文；一篇没有可合法获取的开放全文。",
   );
   await expect(runway).toHaveAttribute("data-status", "succeeded");
+  await expect(runway.getByLabel("DeepFetch 运行进度")).toHaveAttribute(
+    "aria-valuenow",
+    "100",
+  );
   await expect(runway).toContainText("首问题已原位展开");
   await expectAcceptedProposalContract(dialog);
 
@@ -425,7 +691,264 @@ test("DeepFetch unfolds real progress and its accepted snapshot inside the same 
   }
 });
 
-test("non-retryable DeepFetch failures fail closed without promising another Attempt", async ({
+test("DeepFetch shows durable progress and live elapsed time across reload", async ({
+  page,
+}) => {
+  await openAuthenticatedProduct(page, runningProduct());
+  await openCreation(page);
+  const basis = await publicCurrent(page);
+  expect(basis).not.toBeNull();
+  const snapshotBasis = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/snapshot", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`snapshot failed: ${response.status}`);
+    return response.json() as Promise<{
+      quest_creation?: { current?: Record<string, unknown> | null };
+      [key: string]: unknown;
+    }>;
+  });
+
+  let attemptGeneration = 1;
+  let attemptStartedAt = Date.now() / 1_000 - 65;
+  let attemptCompletedAt: number | null = null;
+  let deepfetchStatus = "running";
+  let deepfetchActivity = "web_research";
+  let deepfetchCompleted = 2;
+  let liveEventCount = 1;
+  const applyRunningDeepFetch = (current: Record<string, unknown>) => {
+    const questDraft = current.quest_draft as {
+      revision: number;
+      hash: string;
+      value: Record<string, unknown>;
+    };
+    current.status = "proposal_generating";
+    questDraft.value = { ...questDraft.value, route: "deepfetch" };
+    current.deepfetch = {
+      request_ref: "deepfetch-request-elapsed",
+      correlation_ref: "deepfetch-correlation-elapsed",
+      basis_revision: questDraft.revision,
+      basis_hash: questDraft.hash,
+      scope_hash: "a".repeat(64),
+      status: deepfetchStatus,
+      activity: deepfetchActivity,
+      progress: { completed: deepfetchCompleted, total: 5 },
+      recent_events: [
+        {
+          sequence: 1,
+          category: "session",
+          status: "completed",
+          label: "DeepFetch 会话已启动",
+        },
+        {
+          sequence: 2,
+          category: "web_search",
+          status: "running",
+          label: "正在执行 Web Search",
+        },
+      ].slice(0, liveEventCount),
+      freshness: "current",
+      authorization_receipt: null,
+      run: {
+        run_ref: "deepfetch-run-elapsed",
+        status: deepfetchStatus === "failed" ? "failed" : "running",
+        attempt_ref: `deepfetch-attempt-elapsed-${attemptGeneration}`,
+        attempt_generation: attemptGeneration,
+        attempt_started_at: attemptStartedAt,
+        attempt_completed_at: attemptCompletedAt,
+        root_session_ref: "deepfetch-root-elapsed",
+        native_session_ref: null,
+        fence_ref: "deepfetch-fence-elapsed",
+        runtime_binding_hash: "b".repeat(64),
+        provider_operation_retry_permitted: true,
+        execution_receipt: null,
+        failure: deepfetchStatus === "failed"
+          ? { code: "deepfetch_web_evidence_invalid" }
+          : null,
+      },
+      literature_snapshot: null,
+      failure: deepfetchStatus === "failed"
+        ? { code: "deepfetch_web_evidence_invalid" }
+        : null,
+    };
+  };
+  const projectRunningDeepFetch = async (route: Route) => {
+    const snapshot = JSON.parse(JSON.stringify(snapshotBasis)) as {
+      quest_creation?: { current?: Record<string, unknown> | null };
+      [key: string]: unknown;
+    };
+    const current = snapshot.quest_creation?.current;
+    if (!current) {
+      await route.fulfill({ json: snapshot });
+      return;
+    }
+    applyRunningDeepFetch(current);
+    await route.fulfill({ json: snapshot });
+  };
+  const projectRunningDeepFetchView = async (route: Route) => {
+    const current = JSON.parse(JSON.stringify(basis)) as Record<string, unknown>;
+    applyRunningDeepFetch(current);
+    await route.fulfill({ json: current });
+  };
+  await page.route("**/api/v1/snapshot", projectRunningDeepFetch);
+  const exactViewPattern = `**/api/v1/quest-initializations/${basis!.initialization_id}`;
+  await page.route(exactViewPattern, projectRunningDeepFetchView);
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  let dialog = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  let runway = dialog.getByTestId("deepfetch-runway");
+  let progress = runway.getByLabel("DeepFetch 运行进度");
+  await expect(progress).toHaveAttribute("aria-valuemax", "100");
+  await expect(progress).toHaveAttribute("aria-valuenow", "40");
+  await expect(progress).toHaveClass(/is-active/);
+  await expect(progress).toHaveAttribute(
+    "aria-valuetext",
+    /阶段 3\/5 · Web Research · 已运行 01:\d{2}/,
+  );
+  await expect(runway.getByText("Web Research", { exact: true })).toHaveAttribute(
+    "aria-current",
+    "step",
+  );
+  const liveEvents = runway.getByTestId("deepfetch-live-events");
+  await expect(liveEvents).toBeVisible();
+  await expect(liveEvents).toContainText("DeepFetch 会话已启动");
+  liveEventCount = 2;
+  await expect(liveEvents).toContainText("正在执行 Web Search");
+  const elapsed = runway.getByTestId("deepfetch-elapsed");
+  await expect(elapsed).toHaveAttribute("aria-live", "off");
+  await expect(elapsed).toContainText(/阶段 3\/5 · 已经过 01:\d{2}/);
+
+  const beforeTick = await elapsed.textContent();
+  await page.waitForTimeout(1_100);
+  await expect.poll(() => elapsed.textContent()).not.toBe(beforeTick);
+  await expect(progress).toHaveAttribute("aria-valuenow", "40");
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  dialog = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  runway = dialog.getByTestId("deepfetch-runway");
+  progress = runway.getByLabel("DeepFetch 运行进度");
+  await expect(progress).toHaveAttribute("aria-valuenow", "40");
+  await expect(runway.getByTestId("deepfetch-elapsed")).toContainText(
+    /阶段 3\/5 · 已经过 01:\d{2}/,
+  );
+  await expect(runway.getByTestId("deepfetch-elapsed")).not.toContainText("00:00");
+
+  attemptGeneration = 2;
+  attemptStartedAt = Date.now() / 1_000;
+  await page.reload({ waitUntil: "domcontentloaded" });
+  dialog = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  runway = dialog.getByTestId("deepfetch-runway");
+  progress = runway.getByLabel("DeepFetch 运行进度");
+  await expect(progress).toHaveAttribute("aria-valuenow", "40");
+  await expect(runway.getByTestId("deepfetch-elapsed")).toContainText(
+    /阶段 3\/5 · 已经过 00:0\d/,
+  );
+  await expect(runway.locator(".quest-deepfetch-facts")).toContainText("2");
+
+  attemptStartedAt = Date.now() / 1_000 - 190;
+  attemptCompletedAt = Date.now() / 1_000 - 65;
+  deepfetchStatus = "accepting";
+  deepfetchActivity = "accepting_assets";
+  deepfetchCompleted = 3;
+  await page.reload({ waitUntil: "domcontentloaded" });
+  dialog = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  runway = dialog.getByTestId("deepfetch-runway");
+  progress = runway.getByLabel("DeepFetch 运行进度");
+  await expect(progress).toHaveAttribute("aria-valuenow", "60");
+  await expect(runway.getByText("RM 接纳", { exact: true })).toHaveAttribute(
+    "aria-current",
+    "step",
+  );
+  const acceptingElapsed = runway.getByTestId("deepfetch-elapsed");
+  const acceptingBeforeTick = await acceptingElapsed.textContent();
+  await page.waitForTimeout(1_100);
+  await expect.poll(() => acceptingElapsed.textContent()).not.toBe(
+    acceptingBeforeTick,
+  );
+  await expect(progress).toHaveAttribute("aria-valuenow", "60");
+
+  deepfetchStatus = "succeeded";
+  deepfetchActivity = "proposal_drafting";
+  deepfetchCompleted = 4;
+  await page.reload({ waitUntil: "domcontentloaded" });
+  dialog = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  runway = dialog.getByTestId("deepfetch-runway");
+  progress = runway.getByLabel("DeepFetch 运行进度");
+  await expect(progress).toHaveAttribute("aria-valuenow", "80");
+  await expect(runway.getByText("Proposal", { exact: true })).toHaveAttribute(
+    "aria-current",
+    "step",
+  );
+  const proposalElapsed = runway.getByTestId("deepfetch-elapsed");
+  const proposalBeforeTick = await proposalElapsed.textContent();
+  await page.waitForTimeout(1_100);
+  await expect.poll(() => proposalElapsed.textContent()).not.toBe(
+    proposalBeforeTick,
+  );
+  await expect(progress).toHaveAttribute("aria-valuenow", "80");
+
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(progress).toHaveAttribute("aria-valuenow", "80");
+  const reducedMotionBeforeTick = await proposalElapsed.textContent();
+  await page.waitForTimeout(1_100);
+  await expect(progress).toHaveAttribute("aria-valuenow", "80");
+  await expect.poll(() => proposalElapsed.textContent()).not.toBe(
+    reducedMotionBeforeTick,
+  );
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+
+  deepfetchCompleted = 5;
+  deepfetchActivity = "complete";
+  await page.reload({ waitUntil: "domcontentloaded" });
+  dialog = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  runway = dialog.getByTestId("deepfetch-runway");
+  progress = runway.getByLabel("DeepFetch 运行进度");
+  await expect(progress).toHaveAttribute("aria-valuenow", "100");
+  await expect(progress).not.toHaveClass(/is-active/);
+  await expect(runway.getByTestId("deepfetch-live-events")).toHaveCount(0);
+
+  attemptGeneration = 3;
+  attemptStartedAt = Date.now() / 1_000 - 3_177;
+  attemptCompletedAt = attemptStartedAt + 3_177;
+  deepfetchStatus = "failed";
+  deepfetchActivity = "needs_retry";
+  deepfetchCompleted = 1;
+  await page.reload({ waitUntil: "domcontentloaded" });
+  dialog = page.getByRole("dialog", {
+    name: "创建 Quest，并决定第一个研究问题",
+  });
+  runway = dialog.getByTestId("deepfetch-runway");
+  const frozenElapsed = runway.getByTestId("deepfetch-elapsed");
+  progress = runway.getByLabel("DeepFetch 运行进度");
+  await expect(progress).toHaveAttribute("aria-valuenow", "20");
+  await expect(progress).not.toHaveClass(/is-active/);
+  await expect(runway.getByTestId("deepfetch-live-events")).toHaveCount(0);
+  await expect(runway).toContainText("Attempt 已失败 · 可重试");
+  await expect(runway).toContainText("等待新 Attempt");
+  await expect(frozenElapsed).toHaveText("失败于阶段 2/5 · 耗时 52:57");
+  await expect(runway.locator('[aria-current="step"]')).toHaveCount(0);
+  await page.waitForTimeout(1_100);
+  await expect(frozenElapsed).toHaveText("失败于阶段 2/5 · 耗时 52:57");
+  await expect(progress).toHaveAttribute("aria-valuenow", "20");
+
+  await page.unroute("**/api/v1/snapshot", projectRunningDeepFetch);
+  await page.unroute(exactViewPattern, projectRunningDeepFetchView);
+});
+
+test("non-retryable DeepFetch failures guide a new DraftRevision successor without replaying the Attempt", async ({
   page,
 }) => {
   await openAuthenticatedProduct(page, runningProduct());
@@ -433,7 +956,7 @@ test("non-retryable DeepFetch failures fail closed without promising another Att
   await fillRequiredBasis(
     opened.dialog,
     "验证 DeepFetch hard failure 不会误导重试",
-    "身份冲突或 provider_operation_retry_permitted=false 必须要求新 initialization 或人工检查",
+    "身份冲突或 provider_operation_retry_permitted=false 必须要求新的 DraftRevision successor",
   );
 
   let failureCode = "deepfetch_run_identity_conflict";
@@ -515,9 +1038,16 @@ test("non-retryable DeepFetch failures fail closed without promising another Att
       name: "创建 Quest，并决定第一个研究问题",
     });
     const runway = dialog.getByTestId("deepfetch-runway");
-    await expect(runway).toContainText("需要新建 initialization 或交由人工检查");
     await expect(runway).toContainText("当前记录不会自动重试");
+    await expect(runway).toContainText("修改并保存当前 Draft，形成新的 DraftRevision");
+    await expect(runway).toContainText("重新准备 acquisition session");
+    await expect(runway).toContainText("再次点击“生成第一个问题”创建 successor DeepFetch");
+    await expect(runway).toContainText("只有无法形成有效 successor basis 时，才取消当前 initialization 后新建");
+    await expect(runway).not.toContainText("需要新建 initialization 或交由人工检查");
     await expect(runway).not.toContainText("重新点击“生成第一个问题”");
+    await expect(dialog.locator(".quest-footer")).toContainText(
+      "修改并保存当前 Draft 形成新 DraftRevision，再准备 acquisition successor",
+    );
     await expect(dialog.locator(".quest-footer")).not.toContainText("可沿同一 correlation 重试");
   };
 
@@ -711,7 +1241,7 @@ async function expectTargetAssertions(
 }
 
 async function expectAcceptedReceipts(
-  details: Locator,
+  details: Locator | null,
   view: PublicQuestCreation,
 ) {
   const accepted = Object.entries(view.receipts).filter(
@@ -733,6 +1263,7 @@ async function expectAcceptedReceipts(
       subject_ref: expect.any(String),
       payload_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
+    if (!details) continue;
     const record = details.getByRole("article").filter({
       hasText: `${name} · accepted`,
     });
@@ -1112,6 +1643,12 @@ test("a delayed conflict reload cannot replace a newer SSE view with stale form 
     (await page.locator(".lumen-connection code").textContent())?.replace("rev ", ""),
   )).toBeGreaterThanOrEqual(await publicSnapshotRevision(page));
   expect(revisionC).toBeGreaterThan(versionB.quest_draft.revision);
+  // The shell revision proves the parent accepted the public Snapshot; the
+  // workbench's visible bound-draft label proves its child effect observed C
+  // before the deliberately stale response B is released.
+  await expect(dialog.locator(".quest-intent-status")).toContainText(
+    `绑定 draft r${revisionC}`,
+  );
 
   releaseReload();
   await expect(dialog.getByRole("alert")).toContainText("quest_reload_stale");
@@ -1345,6 +1882,14 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   await expect(literature.locator("option")).toHaveCount(3);
   await literature.selectOption("oa_only");
   await expect(literature).toHaveValue("oa_only");
+  await expect(dialog.getByTestId("oa-only-primary-route")).toContainText(
+    "OA-only 是已选择的主路线",
+  );
+  await expect(dialog.getByTestId("oa-only-primary-route")).toContainText(
+    "跳过机构浏览器、图书馆入口和登录检测",
+  );
+  await expect(dialog.locator(".quest-library-test")).toHaveCount(0);
+  await expect(dialog.locator('input[type="url"]')).toHaveCount(0);
   await expect(literature.locator('option[value="provided_only"]')).toHaveAttribute(
     "disabled",
     "",
@@ -1355,6 +1900,9 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   );
   await literature.selectOption("oa_then_institution");
   await expect(literature).toHaveValue("oa_then_institution");
+  await expect(dialog.getByText("全面搜索前准备 Google Chrome", { exact: true })).toBeVisible();
+  await expect(dialog.locator(".quest-library-test")).toHaveCount(1);
+  await expect(dialog.locator('input[type="url"]')).toHaveCount(1);
   await expect(acquisitionStatus).toContainText(
     "waiting_user · current · institutional_entry_required",
   );
@@ -1593,13 +2141,13 @@ test("real Chrome traverses the corrected durable state machine and a second cre
     dialog.getByText("正在创建；重复确认已禁用，可安全关闭后恢复", { exact: true }),
   ).toBeVisible();
   await expect(dialog.getByText("正在从首个缺失 receipt 恢复", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("Quest 与第一个问题已就绪。", { exact: false })).toBeVisible({
-    timeout: 15_000,
-  });
-  const completedFirst = await publicStatus(page, first!.initialization_id);
-  expect(completedFirst.status).toBe("completed");
-  await expectAcceptedReceipts(firstDetails, completedFirst);
-  await expect(dialog.getByRole("button", { name: "取消" })).toBeDisabled();
+  await expect(dialog).toBeHidden({ timeout: 15_000 });
+  const completedFirst = await waitForPublicStatus(
+    page,
+    first!.initialization_id,
+    "completed",
+  );
+  await expectAcceptedReceipts(null, completedFirst);
   const rejectedCompletedCancellation = await publicPost(
     page,
     `/api/v1/quest-initializations/${first!.initialization_id}/cancel`,
@@ -1610,8 +2158,6 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   });
   expect((await publicStatus(page, first!.initialization_id)).status).toBe("completed");
 
-  await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
-  await expect(dialog).toBeHidden();
   ({ dialog } = await openCreation(page));
   const second = await publicCurrent(page);
   expect(second).not.toBeNull();
@@ -1673,12 +2219,9 @@ test("real Chrome traverses the corrected durable state machine and a second cre
       timeout: 15_000,
     })
     .toBe("completed");
-  await expect(dialog.getByText("Quest 与第一个问题已就绪。", { exact: false })).toBeVisible();
+  await expect(dialog).toBeHidden({ timeout: 8_000 });
 
   runningProduct().damageQuestionContentCustody();
-  await expect(
-    dialog.getByText("已完成事实的持久对象暂时无法验证。", { exact: true }),
-  ).toBeVisible({ timeout: 8_000 });
   const unavailable = await publicStatus(page, second!.initialization_id);
   expect(unavailable).toMatchObject({
     status: "unavailable",

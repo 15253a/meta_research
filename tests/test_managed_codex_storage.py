@@ -168,7 +168,9 @@ def test_cli_data_root_rejects_relative_paths(
 
 def test_default_codex_adapters_share_only_the_managed_codex_runner(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "wrong-codex-home"))
     data_root = prepare_data_root(tmp_path / "deployment")
     runtime = build_production_runtime(
         data_root,
@@ -201,6 +203,9 @@ def test_default_codex_adapters_share_only_the_managed_codex_runner(
 
         codex_harness = runtime.harnesses._adapters["codex"]
         claude_harness = runtime.harnesses._adapters["claude"]
+        assert runtime.deepfetch._provider._codex_ledger_reader._codex_home == (
+            data_root.codex_home.resolve()
+        )
         assert codex_harness.executable == expected_executable
         assert codex_harness._codex_child_ledger_reader._codex_home == (
             data_root.codex_home.resolve()

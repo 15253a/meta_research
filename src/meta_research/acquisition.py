@@ -20,6 +20,9 @@ DEEPFETCH_PROTOTYPE_COMMIT = "cb369c938da835bcd07202e03ccc770551984070"
 _CDP_PROXY = "http://127.0.0.1:3456"
 _NATURE_ROUTE_CURSOR_SCHEMA = "meta-research/nature-route-cursor/v1"
 _LEGACY_NATURE_ATTEMPT_GENERATIONS = 99
+_ACQUISITION_REQUEST_ID_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+)
 
 
 class AcquisitionUnavailable(RuntimeError):
@@ -128,15 +131,21 @@ class AcquisitionItemResult:
     path: str | None
     format: Literal["pdf", "html", "xml"] | None
     failure: dict[str, str] | None
+    content_sha256: str | None = None
+    content_bytes: int | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "paper_id": self.paper_id,
             "status": self.status,
             "path": self.path,
             "format": self.format,
             "failure": self.failure,
         }
+        if self.content_sha256 is not None or self.content_bytes is not None:
+            payload["content_sha256"] = self.content_sha256
+            payload["content_bytes"] = self.content_bytes
+        return payload
 
 
 @dataclass(frozen=True)
@@ -612,6 +621,23 @@ class NatureDownloaderAdapter:
             if result.status in {"obtained", "waiting_user"}:
                 return result
             last_missing = result
+        if (
+            request.session_mode == "oa_only"
+            and last_missing is not None
+            and last_missing.failure is not None
+            and last_missing.failure.get("code")
+            in {
+                "institutional_access_not_authorized",
+                "library_no_permission",
+                "no_authorized_pdf_found",
+                "oa_not_found",
+            }
+        ):
+            return _missing_item(
+                paper.paper_id,
+                "oa_not_found",
+                "用户选择的 OA-only 路线已穷尽，未找到可验证全文。",
+            )
         return last_missing or _missing_item(
             paper.paper_id,
             "acquisition_route_exhausted",
@@ -1075,6 +1101,8 @@ def _item_result_from_private_state(
             path=value["path"],  # type: ignore[arg-type]
             format=value["format"],  # type: ignore[arg-type]
             failure=value["failure"],  # type: ignore[arg-type]
+            content_sha256=value.get("content_sha256"),  # type: ignore[arg-type]
+            content_bytes=value.get("content_bytes"),  # type: ignore[arg-type]
         )
         validate_item_results(
             AcquisitionBatchRequest(
@@ -1296,8 +1324,8 @@ def validate_preflight_result(
 
 def validate_batch_request(request: AcquisitionBatchRequest) -> str:
     if (
-        not request.request_id
-        or len(request.request_id) > 128
+        not isinstance(request.request_id, str)
+        or _ACQUISITION_REQUEST_ID_PATTERN.fullmatch(request.request_id) is None
         or request.route_policy != ACQUISITION_ROUTE_POLICY
         or not request.papers
         or len(request.papers) > 10
@@ -1326,16 +1354,33 @@ def validate_item_results(
         raise AcquisitionUnavailable("acquisition_result_identity_mismatch")
     for result in results:
         if result.status == "obtained":
+            proof_absent = (
+                result.content_sha256 is None and result.content_bytes is None
+            )
+            proof_valid = (
+                isinstance(result.content_sha256, str)
+                and len(result.content_sha256) == 64
+                and all(
+                    character in "0123456789abcdef"
+                    for character in result.content_sha256
+                )
+                and isinstance(result.content_bytes, int)
+                and not isinstance(result.content_bytes, bool)
+                and result.content_bytes > 0
+            )
             if (
                 result.path is None
                 or result.format not in {"pdf", "html", "xml"}
                 or result.failure is not None
+                or not (proof_absent or proof_valid)
             ):
                 raise AcquisitionUnavailable("acquisition_result_invalid")
         elif result.status in {"waiting_user", "missing"}:
             if (
                 result.path is not None
                 or result.format is not None
+                or result.content_sha256 is not None
+                or result.content_bytes is not None
                 or not isinstance(result.failure, dict)
                 or set(result.failure) != {"code", "detail"}
                 or not all(
@@ -1347,6 +1392,73 @@ def validate_item_results(
         else:
             raise AcquisitionUnavailable("acquisition_result_invalid")
     return results
+
+
+def freeze_acquisition_item_artifacts(
+    request: AcquisitionBatchRequest,
+    results: tuple[AcquisitionItemResult, ...],
+) -> tuple[AcquisitionItemResult, ...]:
+    """Freeze Owner-observed artifact bytes before terminal result persistence."""
+
+    validate_item_results(request, results)
+    if not request.target_dir or not Path(request.target_dir).is_absolute():
+        raise AcquisitionUnavailable("acquisition_provider_binding_invalid")
+    target_path = Path(request.target_dir)
+    try:
+        target_root = target_path.resolve(strict=True)
+        if (
+            target_path.is_symlink()
+            or not target_path.is_dir()
+            or target_root != target_path
+        ):
+            raise OSError("unsafe acquisition target root")
+    except (OSError, ValueError) as error:
+        raise AcquisitionUnavailable("acquisition_artifact_invalid") from error
+    frozen: list[AcquisitionItemResult] = []
+    for result in results:
+        if result.status != "obtained":
+            frozen.append(result)
+            continue
+        assert result.path is not None
+        path = Path(result.path)
+        try:
+            resolved = path.resolve(strict=True)
+            if (
+                not path.is_absolute()
+                or str(resolved) != result.path
+                or path.is_symlink()
+                or not path.is_file()
+                or not resolved.is_relative_to(target_root)
+            ):
+                raise OSError("unsafe acquisition artifact")
+            byte_count = path.stat().st_size
+            if byte_count < 1 or byte_count > 32 * 1024 * 1024:
+                raise OSError("acquisition artifact size invalid")
+            with path.open("rb") as source:
+                content = source.read(32 * 1024 * 1024 + 1)
+            if len(content) != byte_count:
+                raise OSError("acquisition artifact changed while freezing")
+        except (OSError, ValueError) as error:
+            raise AcquisitionUnavailable("acquisition_artifact_invalid") from error
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        if result.content_sha256 is not None:
+            if (
+                result.content_sha256 != content_sha256
+                or result.content_bytes != byte_count
+            ):
+                raise AcquisitionUnavailable("acquisition_artifact_drift")
+            frozen.append(result)
+        else:
+            frozen.append(
+                replace(
+                    result,
+                    content_sha256=content_sha256,
+                    content_bytes=byte_count,
+                )
+            )
+    frozen_results = tuple(frozen)
+    validate_item_results(request, frozen_results)
+    return frozen_results
 
 
 def aggregate_batch_status(
