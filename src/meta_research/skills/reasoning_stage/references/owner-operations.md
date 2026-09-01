@@ -15,7 +15,7 @@ Reasoning root 只获得三项高层、closed、current AR-scope 的 Semantic MC
 - Research Memory：不可变 ScientificOutcome/transition content custody 与 content receipt。
 - Research Graph：scientific/domain acceptance、QuestionAnchor、Goal/completion semantics 与 domain receipt。
 - Human Collaboration：Web preview、明确用户 completion confirmation 与 HumanRequest；response 不自动等于 satisfied/resumed。
-- Reasoning Agent：证据受限的 scientific judgment、唯一 transition 候选与 child-review disposition；不是 State Owner。
+- Reasoning Agent：证据受限的 scientific judgment、唯一 transition 候选与 root advisory disposition；不是 State Owner。
 
 ## 写入与恢复
 

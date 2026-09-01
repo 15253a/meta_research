@@ -116,12 +116,15 @@ class ProposalDraftRequest:
     creation_context_kind: str = "quest_initialization"
     creation_context_ref: str | None = None
     context_generation: int | None = None
+    companion_native_session_ref: str | None = None
 
 
 @dataclass(frozen=True)
 class ProposalDraftResult:
     content: dict[str, str]
     adapter_kind: str
+    companion_native_session_ref: str | None = None
+    proposal_fork_native_session_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -193,7 +196,7 @@ class HostComputeProbe(Protocol):
 
 
 ProcessRunner = Callable[
-    [list[str], str, float], subprocess.CompletedProcess[str]
+    [list[str], str, float | None], subprocess.CompletedProcess[str]
 ]
 CommandRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 
@@ -699,7 +702,7 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         *,
         executable: str = "codex",
         model_ref: str = _DRAFTING_MODEL_REF,
-        timeout_seconds: float = 180.0,
+        timeout_seconds: float | None = None,
         process_runner: ProcessRunner | None = None,
         version_runner: CommandRunner | None = None,
     ) -> None:
@@ -1474,9 +1477,14 @@ def _read_drafting_invocation(
         or not _is_sha256(contract.get("argv_hash"))
         or contract.get("supervisor_request_schema_ref")
         != CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
-        or not isinstance(contract.get("timeout_seconds"), (int, float))
-        or isinstance(contract.get("timeout_seconds"), bool)
-        or cast(float, contract["timeout_seconds"]) <= 0
+        or (
+            contract.get("timeout_seconds") is not None
+            and (
+                not isinstance(contract.get("timeout_seconds"), (int, float))
+                or isinstance(contract.get("timeout_seconds"), bool)
+                or cast(float, contract["timeout_seconds"]) <= 0
+            )
+        )
         or contract.get("prompt_max_bytes") != PROVIDER_STREAM_MAX_BYTES
         or contract.get("stream_max_bytes") != PROVIDER_STREAM_MAX_BYTES
         or contract.get("result_max_bytes") != PROVIDER_RESULT_MAX_BYTES

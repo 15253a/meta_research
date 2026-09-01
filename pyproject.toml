@@ -6,7 +6,6 @@ build-backend = "hatchling.build"
 name = "meta-research-vnext"
 version = "0.1.0"
 description = "Local-first, human-governed research runtime"
-readme = "PRODUCT.md"
 requires-python = ">=3.11,<3.14"
 license = { text = "Proprietary" }
 authors = [{ name = "meta-research" }]
@@ -41,7 +40,6 @@ packages = ["src/meta_research"]
 include = [
   "/src",
   "/tests",
-  "/PRODUCT.md",
   "/pyproject.toml",
   "/uv.lock",
 ]

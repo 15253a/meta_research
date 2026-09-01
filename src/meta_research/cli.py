@@ -76,13 +76,13 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--json", action="store_true", dest="as_json")
 
     conformance_parser = commands.add_parser(
-        "conformance", help="Run the fixed Codex and Claude Harness contract"
+        "conformance", help="Run the selected Codex Harness diagnostic contract"
     )
     conformance_commands = conformance_parser.add_subparsers(
         dest="conformance_command", required=True
     )
     conformance_start_parser = conformance_commands.add_parser(
-        "start", help="Start the full durable Harness conformance matrix"
+        "start", help="Start the durable Codex Harness diagnostic"
     )
     _add_data_root(conformance_start_parser)
     conformance_start_parser.add_argument(
@@ -94,10 +94,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--codex-auth-profile",
         default="harness-profile:codex-default",
     )
-    conformance_start_parser.add_argument("--claude-model", required=True)
+    conformance_start_parser.add_argument(
+        "--claude-model",
+        help=argparse.SUPPRESS,
+    )
     conformance_start_parser.add_argument(
         "--claude-auth-profile",
-        default="harness-profile:claude-default",
+        help=argparse.SUPPRESS,
     )
     conformance_start_parser.add_argument(
         "--json", action="store_true", dest="as_json"
@@ -177,8 +180,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 payload={
                     "codex_model_ref": args.codex_model,
                     "codex_auth_profile_ref": args.codex_auth_profile,
-                    "claude_model_ref": args.claude_model,
-                    "claude_auth_profile_ref": args.claude_auth_profile,
                 },
             )
             return _emit(

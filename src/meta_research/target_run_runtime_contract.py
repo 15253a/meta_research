@@ -31,6 +31,7 @@ from meta_research.owners.common import AcceptanceReceipt, AcceptedAssetBinding
 
 
 TARGET_COMPLETION_HANDOFF_SCHEMA = "meta-research/target-completion-handoff/v1"
+TARGET_COMPLETION_BINDING_SCHEMA = "meta-research/target-completion-binding/v1"
 TARGET_COMPLETION_ARTIFACT_ROLES = frozenset(
     {"implementation", "checkpoint", "result", "log", "analysis"}
 )

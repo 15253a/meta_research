@@ -105,7 +105,7 @@ class BuiltinMicroExperimentProvider:
         workspace: Path,
         *,
         runner_path: Path | None = None,
-        wall_timeout_seconds: float = 300.0,
+        wall_timeout_seconds: float = 24 * 60 * 60,
         stdout_max_bytes: int = 16 * 1024 * 1024,
         result_max_bytes: int = 16 * 1024 * 1024,
     ) -> None:
@@ -178,7 +178,7 @@ class BuiltinMicroExperimentProvider:
         resources = [
             "host:cpu",
             "process-group:local",
-            f"limit:wall-time-seconds:{self._wall_timeout_seconds:g}",
+            f"limit:wall-time-budget-max-seconds:{self._wall_timeout_seconds:g}",
             f"limit:stdout-bytes:{self._stdout_max_bytes}",
             f"limit:result-bytes:{self._result_max_bytes}",
             f"limit:stdout-records:{self._MAX_STDOUT_RECORDS}",
@@ -477,6 +477,7 @@ class BuiltinMicroExperimentProvider:
                 request.evaluation_attempt_binding.inputs_hash
             ),
             "required_metrics": list(request.required_metrics),
+            "wall_time_budget_seconds": request.wall_time_budget_seconds,
             "runtime_bundle_hash": runtime_hash,
             "stdin_hash": hashlib.sha256(
                 canonical_json(payload).encode("utf-8")
@@ -500,7 +501,7 @@ class BuiltinMicroExperimentProvider:
                 "schema_ref": REQUEST_SCHEMA,
                 "invocation_hash": invocation_hash,
                 "argv": [sys.executable, "-I", str(self._runner)],
-                "wall_timeout_seconds": self._wall_timeout_seconds,
+                "wall_timeout_seconds": request.wall_time_budget_seconds,
                 "stdout_max_bytes": self._stdout_max_bytes,
                 "stdout_max_records": self._MAX_STDOUT_RECORDS,
                 "result_max_bytes": self._result_max_bytes,
@@ -535,9 +536,19 @@ class BuiltinMicroExperimentProvider:
         try:
             key = ensure_transport_key(self._workspace)
             invocation = read_signed(operation / "invocation.json", key)
+            supervisor_request = read_signed(
+                operation / "supervisor-request.json", key
+            )
         except (OSError, ExperimentSupervisorError) as error:
             raise OwnerConflict("experiment_provider_spool_invalid") from error
         invocation_hash = canonical_hash(invocation)
+        wall_time_budget = supervisor_request.get("wall_timeout_seconds")
+        if (
+            not isinstance(wall_time_budget, (int, float))
+            or isinstance(wall_time_budget, bool)
+            or not 0 < float(wall_time_budget) <= self._wall_timeout_seconds
+        ):
+            raise OwnerConflict("experiment_provider_spool_invalid")
         if not receipt_path.exists() and not (
             operation / "provider-started.json"
         ).exists():
@@ -562,7 +573,7 @@ class BuiltinMicroExperimentProvider:
                 ) from error
             with self._state_lock:
                 self._active_supervisors.add(supervisor)
-        deadline = time.monotonic() + self._wall_timeout_seconds + 5.0
+        deadline = time.monotonic() + float(wall_time_budget) + 5.0
         with self._state_lock:
             observation_cursor, next_observation_sequence = (
                 self._observation_progress.get(invocation_hash, (0, 1))
@@ -1347,6 +1358,9 @@ class ExperimentService:
             selected_checkpoints=tuple(selected),
             definition=domain.execution_request.definition,
             checkpoint_policy=experiment_checkpoint_policy(domain.intent),
+            wall_time_budget_seconds=float(
+                getattr(domain.intent, "wall_time_budget_seconds", 300.0)
+            ),
         )
         request.validate()
         return request

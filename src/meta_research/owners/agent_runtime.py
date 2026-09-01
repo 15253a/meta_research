@@ -18,6 +18,7 @@ from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_ASSESSMENT_RECEIPT_KIND,
     BUNDLE_EXHAUSTION_EVIDENCE_RECEIPT_KIND,
     BUNDLE_EXHAUSTION_RECORD_RECEIPT_KIND,
+    BUNDLE_EXHAUSTION_REVIEWER_UNOBSERVED,
     BundleExhaustionEvidence,
     BundleExhaustionProposal,
     BundleExhaustionRejectedSubmission,
@@ -86,6 +87,10 @@ from meta_research.control_contract import (
     validate_control_payload,
 )
 from meta_research.database import Database
+from meta_research.root_capabilities import (
+    RootAgentKind,
+    root_capability_profile,
+)
 from meta_research.acquisition import (
     AcquisitionBatchExecution,
     AcquisitionBatchRequest,
@@ -220,6 +225,7 @@ from meta_research.writing_contract import (
     normalize_writing_intent,
     validate_writing_document,
     validate_writing_execution_budget,
+    writing_advisory_review_task_hash,
     writing_child_review_task_hash,
 )
 from meta_research.writing_delivery import (
@@ -285,6 +291,16 @@ BUNDLE_DISPATCH_RECEIPT_KIND = "bundle_target_dispatch"
 BUNDLE_TARGET_PROPOSAL_RECEIPT_KIND = "bundle_target_proposal"
 BUNDLE_REPORT_RECEIPT_KIND = "bundle_report_accepted"
 BUNDLE_REPORT_DISPOSITION_RECEIPT_KIND = "bundle_report_disposition_recorded"
+_TARGET_AUTHORIZATION_OBLIGATION = (
+    "决定是否仅为这一精确高风险 Target 授予一次执行权限。"
+)
+_TARGET_AUTHORIZATION_PURPOSE = (
+    "只恢复对应 Target；同一 DAG 中其他普通 Target 继续推进。"
+)
+_TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS = (
+    "Human Collaboration 保存 exact granted authorization receipt。",
+    "Agent Runtime 重验 current Target/spec 与同一 waiter generation。",
+)
 TARGET_RUN_ADMISSION_RECEIPT_KIND = "target_run_admission"
 TARGET_LAUNCH_ADMISSION_RECEIPT_KIND = "target_launch_admission"
 RUN_COMPLETION_RECEIPT_KIND = "run_execution_completed"
@@ -299,7 +315,9 @@ _IDEA_SAFE_CAPABILITIES = {
     "approval-policy-never",
     "filesystem-danger-full-access",
     "global-config-ignored",
+    "user-config-loaded",
     "harness-full-conformance-v1",
+    "harness-operation-binding-v1",
     "harness-child-agent-review",
     "mcp-config-empty",
     "semantic-mcp-resident",
@@ -311,6 +329,7 @@ _IDEA_SAFE_CAPABILITIES = {
 }
 _IDEA_SAFE_RESOURCE_PREFIXES = (
     "adapter-source:",
+    "child-review-evidence-mode:",
     "codex-config:",
     "disabled-codex-config:",
     "disabled-codex-features:",
@@ -957,6 +976,16 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     def query_managed_run(self, run_ref: str) -> dict[str, object] | None: ...
 
     def query_managed_runs(self, quest_ref: str) -> tuple[dict[str, object], ...]: ...
+
+    def verify_root_agent_human_request_scope(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> dict[str, object]: ...
 
     def query_runtime_observability(self) -> dict[str, object]: ...
 
@@ -1974,6 +2003,7 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         attempt_ref: str,
         fence_ref: str,
         failure_code: str,
+        recoverable_contract: bool = False,
     ) -> WritingRun: ...
 
     def record_writing_checkpoint(
@@ -2122,9 +2152,23 @@ _PROVIDER_UNIT_RUN_KINDS = {
 }
 _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES = frozenset(
     {
+        "codex_child_review_causal_order_invalid",
+        "codex_child_review_child_ledger_invalid",
+        "codex_child_review_child_runtime_invalid",
+        "codex_child_review_delivery_invalid",
+        "codex_child_review_hash_mismatch",
+        "codex_child_review_lineage_invalid",
+        "codex_child_review_operation_invalid",
+        "codex_child_review_request_invalid",
+        "codex_child_review_root_ledger_invalid",
+        "codex_child_review_root_runtime_invalid",
         "codex_child_review_spawn_invalid",
         "codex_child_review_ref_mismatch",
+        "codex_child_review_stdout_identity_mismatch",
+        "codex_child_review_stdout_invalid",
         "codex_child_review_task_mismatch",
+        "codex_child_review_terminal_invalid",
+        "codex_child_review_turn_invalid",
         "codex_child_review_wait_invalid",
         "codex_child_review_result_missing",
     }
@@ -2166,6 +2210,34 @@ _STAGE_PROVIDER_TERMINAL_CONTRACT_FAILURES = {
     "reasoning_review": _STAGE_PROVIDER_CHILD_REVIEW_TRACE_FAILURES
     | {"reasoning_review_result_contract_invalid"},
 }
+_WRITING_PROVIDER_TERMINAL_CONTRACT_FAILURES = frozenset(
+    {
+        "writing_adapter_kind_invalid",
+        "writing_child_review_result_invalid",
+        "writing_child_review_result_missing",
+        "writing_child_review_trace_invalid",
+        "writing_citation_source_unaccepted",
+        "writing_citations_invalid",
+        "writing_markdown_invalid",
+        "writing_native_session_invalid",
+        "writing_paper_structure_invalid",
+        "writing_presentation_structure_invalid",
+        "writing_review_invalid",
+        "writing_review_mode_invalid",
+        "writing_review_not_independent",
+        "writing_review_revision_not_material",
+        "writing_review_task_invalid",
+        "writing_reviewed_checkpoint_mismatch",
+        "writing_reviewer_invalid",
+    }
+)
+
+
+def _is_writing_provider_terminal_contract_failure(value: object) -> bool:
+    return isinstance(value, str) and (
+        value in _WRITING_PROVIDER_TERMINAL_CONTRACT_FAILURES
+        or value.startswith("codex_child_review_")
+    )
 
 
 def _provider_runtime_effect(
@@ -2358,6 +2430,8 @@ class TargetRootCompletionReader(Protocol):
 
     def query_completion(self, target_ref: str) -> object | None: ...
 
+    def query_handle_history(self, target_ref: str) -> object | None: ...
+
 
 class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     """Agent Runtime owns durable host-capability observations and their integrity."""
@@ -2446,6 +2520,20 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if dispatch_row is None:
                 raise OwnerConflict("target_launch_dispatch_invalid")
             dispatch = _bundle_dispatch_decision(dispatch_row)
+            selected_items = tuple(
+                item
+                for item in dispatch.frontier
+                if item.get("target_ref") == request.target_ref
+            )
+            if len(selected_items) != 1:
+                raise OwnerConflict("target_launch_dispatch_invalid")
+            selected_item = selected_items[0]
+            selected_uses_coordination = "dispatch_allowed" in selected_item
+            if (
+                selected_uses_coordination
+                and selected_item.get("dispatch_allowed") is not True
+            ):
+                raise OwnerConflict("target_launch_dispatch_invalid")
             dispatch_checkpoint = _bundle_inbox_checkpoint_for_operation(
                 connection,
                 operation_kind="dispatch",
@@ -2480,12 +2568,38 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 or dispatch_checkpoint.fence_ref != dispatch.fence_ref
             ):
                 raise OwnerConflict("target_launch_dispatch_invalid")
+            bundle_run, bundle_attempt, bundle_session, bundle_fence = (
+                _load_stage_fence(
+                    connection,
+                    dispatch.run_ref,
+                    dispatch.attempt_ref,
+                    dispatch.fence_ref,
+                )
+            )
+            _require_current_fence(
+                bundle_run,
+                bundle_attempt,
+                bundle_fence,
+                "executed",
+                "submitted",
+            )
+            if (
+                bundle_run.run_ref != stage_run.run_ref
+                or bundle_run.request_ref != stage_run.request_ref
+                or bundle_run.current_attempt_ref != stage_run.current_attempt_ref
+                or bundle_run.current_fence_ref != stage_run.current_fence_ref
+                or bundle_run.root_session_ref != stage_run.root_session_ref
+                or bundle_session.session_ref != stage_run.root_session_ref
+                or bundle_session.native_session_ref != dispatch.native_session_ref
+            ):
+                raise OwnerConflict("target_launch_dispatch_invalid")
             _verify_target_launch_stage_current(self, stage_run)
             verifier.verify_bundle_dispatch_frontier(
                 request_ref=stage_run.request_ref,
                 run_ref=dispatch.run_ref,
                 graph_ref=dispatch.graph_ref,
                 frontier=dispatch.frontier,
+                allow_legacy_high_risk=True,
             )
             if (verification.risk_class == "high") != has_human_authorization:
                 raise OwnerConflict("target_launch_authorization_invalid")
@@ -2521,6 +2635,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     target_ref=request.target_ref,
                     target_spec_hash=request.target_spec_binding.content_hash_ref,
                 )
+                root_assertion = {
+                    "schema_ref": "meta-research/root-agent-human-request-target/v1",
+                    "root": {
+                        "run_kind": "bundle_stage",
+                        "run_ref": dispatch.run_ref,
+                        "attempt_ref": dispatch.attempt_ref,
+                        "root_session_ref": stage_run.root_session_ref,
+                        "fence_ref": dispatch.fence_ref,
+                        "waiter_generation": int(bundle_attempt.generation),
+                    },
+                    "condition": assertion,
+                }
                 human_request = connection.execute(
                     text(
                         "SELECT * FROM owner_human_requests WHERE issuer = "
@@ -2558,20 +2684,113 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     stored_requirement = decoded_object(
                         human_request.required_authorization_json
                     )
-                except (TypeError, ValueError) as error:
+                    stored_conditions = json.loads(
+                        human_request.acceptance_conditions_json
+                    )
+                    waiter_assertion = decoded_object(
+                        waiter.target_assertion_json
+                    )
+                    waiter_blockers = json.loads(waiter.other_blockers_json)
+                    validation_blockers = json.loads(
+                        validation.other_blockers_json
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError) as error:
                     raise OwnerConflict(
                         "target_launch_authorization_invalid"
                     ) from error
+                if stored_assertion == assertion:
+                    # Persisted pre-root-authority requests remain restartable.
+                    # Their target-scoped waiter is accepted only with the exact
+                    # historical assertion and generation-one identity.
+                    expected_assertion = assertion
+                    expected_waiter_ref = request.target_ref
+                    expected_waiter_generation = 1
+                elif stored_assertion == root_assertion:
+                    expected_assertion = root_assertion
+                    expected_waiter_ref = f"root_run:{dispatch.run_ref}"
+                    expected_waiter_generation = int(bundle_attempt.generation)
+                else:
+                    raise OwnerConflict("target_launch_authorization_invalid")
+                expected_contract = {
+                    "quest_ref": verification.quest_ref,
+                    "kind": "capability_authorization",
+                    "obligation": _TARGET_AUTHORIZATION_OBLIGATION,
+                    "business_purpose": _TARGET_AUTHORIZATION_PURPOSE,
+                    "target_assertion": expected_assertion,
+                    "acceptance_conditions": list(
+                        _TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS
+                    ),
+                    "required_authorization": requirement,
+                    "expires_at": None,
+                }
                 if (
                     human_request.kind != "capability_authorization"
                     or human_request.quest_ref != verification.quest_ref
-                    or stored_assertion != assertion
+                    or human_request.status != "satisfied"
+                    or not bool(human_request.is_current)
+                    or human_request.obligation != _TARGET_AUTHORIZATION_OBLIGATION
+                    or human_request.business_purpose
+                    != _TARGET_AUTHORIZATION_PURPOSE
+                    or human_request.expires_at is not None
+                    or canonical_json(stored_assertion)
+                    != human_request.target_assertion_json
+                    or human_request.target_assertion_hash
+                    != canonical_hash(expected_assertion)
+                    or stored_conditions
+                    != list(_TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS)
+                    or canonical_json(stored_conditions)
+                    != human_request.acceptance_conditions_json
+                    or human_request.acceptance_conditions_hash
+                    != canonical_hash(stored_conditions)
                     or stored_requirement != requirement
-                    or waiter.target_assertion_hash != canonical_hash(assertion)
+                    or canonical_json(stored_requirement)
+                    != human_request.required_authorization_json
+                    or human_request.required_authorization_hash
+                    != canonical_hash(requirement)
+                    or human_request.identity_hash
+                    != canonical_hash(expected_contract)
+                    or human_waiter_ref != expected_waiter_ref
+                    or cast(int, human_waiter_generation)
+                    != expected_waiter_generation
+                    or waiter.request_ref != human_request_ref
+                    or waiter.waiter_ref != expected_waiter_ref
                     or int(waiter.generation)
-                    != cast(int, human_waiter_generation)
+                    != expected_waiter_generation
+                    or waiter_assertion != expected_assertion
+                    or canonical_json(waiter_assertion)
+                    != waiter.target_assertion_json
+                    or waiter.target_assertion_hash
+                    != canonical_hash(expected_assertion)
+                    or waiter.wait_scope != "local"
+                    or waiter_blockers != []
+                    or canonical_json(waiter_blockers)
+                    != waiter.other_blockers_json
+                    or waiter.other_blockers_hash != canonical_hash([])
+                    or waiter.status != "released"
+                    or validation.request_ref != human_request_ref
+                    or validation.waiter_ref != expected_waiter_ref
+                    or int(validation.generation)
+                    != expected_waiter_generation
+                    or validation.target_assertion_hash
+                    != canonical_hash(expected_assertion)
                     or validation.authorization_receipt_ref
                     != human_authorization_receipt_ref
+                    or validation_blockers != []
+                    or canonical_json(validation_blockers)
+                    != validation.other_blockers_json
+                    or validation.other_blockers_hash != canonical_hash([])
+                    or validation.status != "released"
+                    or validation.reason_code is not None
+                    or (
+                        selected_uses_coordination
+                        and (
+                            selected_item.get("dispatch_allowed") is not True
+                            or selected_item.get("human_request_ref")
+                            != human_request_ref
+                            or selected_item.get("human_request_status")
+                            != "satisfied"
+                        )
+                    )
                 ):
                     raise OwnerConflict("target_launch_authorization_invalid")
                 authorization_verifier = self._authorization_verifier
@@ -4377,11 +4596,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             target_commit_ref=target_commit_ref,
         )
         handoff = TargetRunHandoff(
-            handle_history=(verified.handle,),
+            handle_history=verified.handle_history,
             code_review_preflights=(),
             stop_decisions=(),
-            recovered_blockers=(),
-            recovery_evidence_refs=(),
+            recovered_blockers=verified.recovered_blockers,
+            recovery_evidence_refs=verified.recovery_evidence_refs,
             terminal=verified.terminal,
         )
         idempotency_key = "target-root-publication:" + canonical_hash(
@@ -4423,11 +4642,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             return None
         handoff = self.read_target_run_handoff(notice.handoff_manifest_ref)
         expected = TargetRunHandoff(
-            handle_history=(verified.handle,),
+            handle_history=verified.handle_history,
             code_review_preflights=(),
             stop_decisions=(),
-            recovered_blockers=(),
-            recovery_evidence_refs=(),
+            recovered_blockers=verified.recovered_blockers,
+            recovery_evidence_refs=verified.recovery_evidence_refs,
             terminal=verified.terminal,
         )
         if handoff != expected or notice.terminal_fact_ref != target_commit_ref:
@@ -4550,15 +4769,26 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         monitor=SimpleNamespace(snapshot_required=0),
                         candidate=None,
                         formal_plan=None,
-                        handles=(verified_root.handle,),
+                        handles=verified_root.handle_history,
                         preflights=(),
                         review_scopes=(),
                         stop_decisions=(),
-                        recovered_blockers=(),
-                        recovery_evidence_refs=(),
+                        recovered_blockers=(
+                            verified_root.recovered_blockers
+                        ),
+                        recovery_evidence_refs=(
+                            verified_root.recovery_evidence_refs
+                        ),
                     )
                     if (
-                        handoff.handle_history != (verified_root.handle,)
+                        handoff.handle_history
+                        != verified_root.handle_history
+                        or handoff.code_review_preflights
+                        or handoff.stop_decisions
+                        or handoff.recovered_blockers
+                        != verified_root.recovered_blockers
+                        or handoff.recovery_evidence_refs
+                        != verified_root.recovery_evidence_refs
                         or handoff.terminal != verified_root.terminal
                     ):
                         raise OwnerConflict(
@@ -5468,11 +5698,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         """Re-read root completion, RG commit, terminal frontier, and inbox."""
 
         try:
-            if len(handoff.handle_history) != 1:
+            if not handoff.handle_history:
                 raise OwnerConflict(
                     "target_root_completion_publication_integrity_invalid"
                 )
-            handle = handoff.handle_history[0]
+            handle = handoff.handle_history[-1]
             target_ref = handle.target_ref
             terminal = handoff.terminal
             transition = self._target_graph_verifier
@@ -5530,6 +5760,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ).first()
             if (
                 verified.handle != handle
+                or verified.handle_history != handoff.handle_history
+                or handoff.code_review_preflights
+                or handoff.stop_decisions
+                or verified.recovered_blockers
+                != handoff.recovered_blockers
+                or verified.recovery_evidence_refs
+                != handoff.recovery_evidence_refs
                 or verified.terminal != terminal
                 or getattr(verified.lifecycle, "status", None) != "completed"
                 or row.target_ref != target_ref
@@ -5557,7 +5794,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 notice,
                 frontier,
                 frontier,
-                initial_handle=handle,
+                initial_handle=verified.handle_history[0],
                 target_spec_binding=request.target_spec_binding,
                 target_spec_acceptance_receipt=(
                     request.target_spec_acceptance_receipt
@@ -5577,6 +5814,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
             if (
                 reconfirmed.handle != verified.handle
+                or reconfirmed.handle_history != verified.handle_history
+                or reconfirmed.recovered_blockers
+                != verified.recovered_blockers
+                or reconfirmed.recovery_evidence_refs
+                != verified.recovery_evidence_refs
                 or reconfirmed.terminal != verified.terminal
                 or reconfirmed.transition != verified.transition
                 or reconfirmed.completion != verified.completion
@@ -6524,12 +6766,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         with self._database.read() as connection:
             refs = connection.execute(
                 text(
-                    "SELECT run_ref FROM ar_writing_runs WHERE status = 'active' "
+                    "SELECT run_ref FROM ar_writing_runs WHERE status IN "
+                    "('active', 'blocked') "
                     "ORDER BY updated_at, run_ref"
                 )
             ).scalars().all()
         runs = tuple(self.query_writing_report(str(run_ref)) for run_ref in refs)
-        return tuple(run for run in runs if run is not None)
+        return tuple(
+            run
+            for run in runs
+            if run is not None
+            and (
+                run.status == "active"
+                or _is_writing_provider_terminal_contract_failure(
+                    run.failure_code
+                )
+            )
+        )
 
     def query_writing_reports(self) -> tuple[WritingRun, ...]:
         with self._database.read() as connection:
@@ -6615,6 +6868,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         attempt_ref: str,
         fence_ref: str,
         failure_code: str,
+        recoverable_contract: bool = False,
     ) -> WritingRun:
         if (
             not isinstance(failure_code, str)
@@ -6622,6 +6876,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             or len(failure_code) > 128
         ):
             raise OwnerConflict("writing_failure_code_invalid")
+        if recoverable_contract and not (
+            _is_writing_provider_terminal_contract_failure(failure_code)
+        ):
+            raise OwnerConflict("writing_contract_correction_invalid")
         timeout_interruption = failure_code == "writing_operation_timeout"
         recover_timeout_without_provider = False
         with self._database.write() as connection:
@@ -6716,13 +6974,52 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                             "attempt_ref": attempt_ref,
                         },
                     )
-                _retire_writing_managed_attempt(
-                    connection,
-                    run=row,
-                    managed_status="reconciliation_required",
-                    reason_code=failure_code,
-                    now=now,
-                )
+                if recoverable_contract:
+                    active_unit = connection.execute(
+                        text(
+                            "SELECT unit_ref FROM ar_provider_units WHERE run_ref = "
+                            ":run_ref AND attempt_ref IS :attempt_ref AND fence_ref "
+                            "IS :fence_ref AND status IN ('active', "
+                            "'revocation_pending') LIMIT 1"
+                        ),
+                        {
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "fence_ref": fence_ref,
+                        },
+                    ).first()
+                    if active_unit is not None:
+                        raise OwnerConflict("writing_contract_correction_not_safe")
+                    connection.execute(
+                        text(
+                            "UPDATE ar_execution_fences SET status = 'rejected', "
+                            "closed_at = COALESCE(closed_at, :now) WHERE fence_ref = "
+                            ":fence_ref AND status IN ('current', 'submitted')"
+                        ),
+                        {"now": now, "fence_ref": fence_ref},
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE ar_run_controls SET status = "
+                            "'reconciliation_required', safe_point_ref = NULL, "
+                            "terminal_reason = :failure_code, cleanup_status = "
+                            "'none', control_revision = control_revision + 1, "
+                            "updated_at = :now WHERE run_ref = :run_ref"
+                        ),
+                        {
+                            "failure_code": failure_code,
+                            "now": now,
+                            "run_ref": run_ref,
+                        },
+                    )
+                else:
+                    _retire_writing_managed_attempt(
+                        connection,
+                        run=row,
+                        managed_status="reconciliation_required",
+                        reason_code=failure_code,
+                        now=now,
+                    )
                 if timeout_interruption:
                     recover_timeout_without_provider = (
                         connection.execute(
@@ -6748,7 +7045,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     (
                         "agent_runtime.writing_attempt_interrupted"
                         if timeout_interruption
-                        else "agent_runtime.writing_report_blocked"
+                        else (
+                            "agent_runtime.writing_contract_correction_retained"
+                            if recoverable_contract
+                            else "agent_runtime.writing_report_blocked"
+                        )
                     ),
                     {
                         "run_ref": run_ref,
@@ -6833,13 +7134,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     runtime_binding.as_dict()
                 ):
                     raise OwnerConflict("writing_runtime_binding_drift")
-                budget = validate_writing_execution_budget(
+                validate_writing_execution_budget(
                     decoded_object(run.execution_budget_json)
                 )
-                if int(run.output_bytes) + output_bytes > int(
-                    budget["max_output_bytes"]
-                ):
-                    raise OwnerConflict("writing_output_budget_exhausted")
                 if run.native_session_ref not in {None, native_session_ref}:
                     raise OwnerConflict("writing_native_session_changed")
                 session_owner = connection.execute(
@@ -6977,7 +7274,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             review.get("reviewed_markdown_hash") != reviewed_hash
             or review.get("final_markdown_hash") != final_hash
             or review.get("citations_hash") != citations_hash
-            or review.get("review_mode") != "harness_child_agent"
+            or review.get("review_mode") != "advisory_unobserved"
+            or review.get("reviewer_agent_ref") is not None
         ):
             raise OwnerConflict("writing_review_invalid")
         execution_payload = {
@@ -7014,13 +7312,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     runtime_binding.as_dict()
                 ):
                     raise OwnerConflict("writing_runtime_binding_drift")
-                budget = validate_writing_execution_budget(
+                validate_writing_execution_budget(
                     decoded_object(run.execution_budget_json)
                 )
-                if int(run.output_bytes) + output_bytes > int(
-                    budget["max_output_bytes"]
-                ):
-                    raise OwnerConflict("writing_output_budget_exhausted")
                 checkpoint = connection.execute(
                     text(
                         "SELECT * FROM ar_writing_checkpoints WHERE attempt_ref = "
@@ -7069,6 +7363,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     citations=citations,
                     final_hash=final_hash,
                     citations_hash=citations_hash,
+                    allow_legacy_child=False,
                 )
                 existing = connection.execute(
                     text(
@@ -7262,27 +7557,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 ).first()
                 if execution is None or run.native_session_ref is None:
                     raise OwnerConflict("writing_revision_predecessor_incomplete")
-                execution_budget = validate_writing_execution_budget(
+                validate_writing_execution_budget(
                     decoded_object(run.execution_budget_json)
                 )
-                # Recovery/pause replacements copy immutable lineage onto a
-                # new execution Attempt.  Count distinct predecessor versions,
-                # not Attempt rows, so Fence rotation never consumes a content
-                # revision from the frozen run budget.
-                content_revision = 2 + int(
-                    connection.execute(
-                        text(
-                            "SELECT COUNT(DISTINCT predecessor_version_ref) FROM "
-                            "ar_writing_attempts WHERE run_ref = :run_ref AND "
-                            "predecessor_version_ref IS NOT NULL"
-                        ),
-                        {"run_ref": run_ref},
-                    ).scalar_one()
-                )
-                if content_revision > int(
-                    execution_budget["max_content_revisions"]
-                ):
-                    raise OwnerConflict("writing_revision_budget_exhausted")
                 generation = int(run.attempt_generation) + 1
                 replacement_ref = new_ref("writing_attempt")
                 replacement_fence = new_ref("writing_fence")
@@ -7529,11 +7806,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     raise OwnerConflict("runtime_quiescence_pending")
                 now = time.time()
                 if run.status in {"blocked", "paused"} and target == "active":
-                    if run.status == "blocked" and run.failure_code in {
-                        "writing_revision_budget_exhausted",
-                        "writing_output_budget_exhausted",
-                    }:
-                        raise OwnerConflict(cast(str, run.failure_code))
                     attempt = connection.execute(
                         text(
                             "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
@@ -7868,8 +8140,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             canonical_json(execution_budget) != row.execution_budget_json
             or canonical_hash(execution_budget) != row.execution_budget_hash
             or int(row.output_bytes) < 0
-            or int(row.output_bytes)
-            > int(execution_budget["max_output_bytes"])
         ):
             raise OwnerConflict("writing_execution_budget_invalid")
         try:
@@ -7952,6 +8222,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 citations=execution.citations,
                 final_hash=execution.final_markdown_hash,
                 citations_hash=execution.citations_hash,
+                allow_legacy_child=True,
             )
         try:
             feedback_value = json.loads(attempt_row.feedback_json)
@@ -8049,6 +8320,146 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 for row in rows
             )
         return values
+
+    def verify_root_agent_human_request_scope(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> dict[str, object]:
+        """Derive one current root wait identity without trusting Agent-supplied refs."""
+
+        if not _is_sha256(runtime_binding_hash):
+            raise OwnerConflict("root_agent_human_request_scope_invalid")
+        managed = self.query_managed_run(run_ref)
+        if managed is None:
+            with self._database.read() as connection:
+                target = connection.execute(
+                    text(
+                        "SELECT runs.attempt_ref, runs.attempt_generation AS "
+                        "generation, runs.root_session_ref, runs.fence_ref, "
+                        "runs.capability_binding_hash AS runtime_binding_hash, "
+                        "runs.status AS run_status, admissions.target_ref, "
+                        "launches.quest_ref, launches.target_ref AS "
+                        "launch_target_ref, launches.target_run_ref AS "
+                        "launch_target_run_ref, launches.status AS launch_status "
+                        "FROM ar_harness_runs AS runs JOIN "
+                        "ar_target_harness_admissions AS admissions ON "
+                        "admissions.target_run_ref = runs.run_ref JOIN "
+                        "ar_target_launches AS launches ON launches.target_ref = "
+                        "admissions.target_ref WHERE runs.run_ref = :run_ref"
+                    ),
+                    {"run_ref": run_ref},
+                ).first()
+            if target is None:
+                # Generic Harness probes and validators are not product roots.
+                raise OwnerConflict(
+                    "root_agent_human_request_effect_unauthorized"
+                )
+            if (
+                target.run_status != "running"
+                or target.launch_status not in {"admitted", "active"}
+                or target.launch_target_run_ref != run_ref
+                or target.launch_target_ref != target.target_ref
+                or target.runtime_binding_hash != runtime_binding_hash
+                or target.attempt_ref != attempt_ref
+                or target.root_session_ref != root_session_ref
+                or target.fence_ref != fence_ref
+                or not isinstance(target.generation, int)
+                or isinstance(target.generation, bool)
+                or int(target.generation) < 1
+                or not isinstance(target.target_ref, str)
+                or not target.target_ref
+                or not isinstance(target.quest_ref, str)
+                or not target.quest_ref
+            ):
+                raise OwnerConflict("root_agent_human_request_scope_stale")
+            return {
+                "run_kind": "target",
+                "quest_ref": target.quest_ref,
+                "target_ref": target.target_ref,
+                "waiter_ref": f"root_run:{run_ref}",
+                "waiter_generation": int(target.generation),
+            }
+        if (
+            managed.get("status") != "running"
+            or managed.get("attempt_ref") != attempt_ref
+            or managed.get("root_session_ref") != root_session_ref
+            or managed.get("fence_ref") != fence_ref
+        ):
+            raise OwnerConflict("root_agent_human_request_scope_stale")
+        run_kind = managed.get("run_kind")
+        stage = (
+            run_kind.removesuffix("_stage")
+            if isinstance(run_kind, str) and run_kind.endswith("_stage")
+            else None
+        )
+        if stage in FORMAL_STAGES:
+            self._verify_formal_runtime_scope(
+                stage=cast(str, stage),
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                root_session_ref=root_session_ref,
+                fence_ref=fence_ref,
+                runtime_binding_hash=runtime_binding_hash,
+            )
+            source_query = (
+                "SELECT runs.runtime_binding_hash, runs.current_attempt_ref AS "
+                "attempt_ref, runs.root_session_ref, runs.current_fence_ref AS "
+                "fence_ref, attempts.generation FROM ar_stage_runs AS runs JOIN "
+                "ar_stage_attempts AS attempts ON attempts.attempt_ref = "
+                "runs.current_attempt_ref WHERE runs.run_ref = :run_ref"
+            )
+        elif run_kind == "deepfetch":
+            source_query = (
+                "SELECT runs.runtime_binding_hash, runs.current_attempt_ref AS "
+                "attempt_ref, sessions.root_session_ref, attempts.fence_ref, "
+                "attempts.generation FROM ar_deepfetch_runs AS runs JOIN "
+                "ar_deepfetch_sessions AS sessions ON sessions.run_ref = "
+                "runs.run_ref JOIN ar_deepfetch_attempts AS attempts ON "
+                "attempts.attempt_ref = runs.current_attempt_ref WHERE "
+                "runs.run_ref = :run_ref"
+            )
+        elif run_kind == "writing":
+            source_query = (
+                "SELECT runs.runtime_binding_hash, runs.attempt_ref, "
+                "runs.root_session_ref, runs.fence_ref, attempts.generation, "
+                "runs.quest_ref FROM ar_writing_runs AS runs JOIN "
+                "ar_writing_attempts AS attempts ON attempts.attempt_ref = "
+                "runs.attempt_ref WHERE runs.run_ref = :run_ref"
+            )
+        else:
+            # Experiment and generic Harness probes are not product root Agents.
+            raise OwnerConflict("root_agent_human_request_effect_unauthorized")
+        with self._database.read() as connection:
+            source = connection.execute(
+                text(source_query), {"run_ref": run_ref}
+            ).first()
+        if (
+            source is None
+            or source.runtime_binding_hash != runtime_binding_hash
+            or source.attempt_ref != attempt_ref
+            or source.root_session_ref != root_session_ref
+            or source.fence_ref != fence_ref
+            or not isinstance(source.generation, int)
+            or isinstance(source.generation, bool)
+            or int(source.generation) < 1
+        ):
+            raise OwnerConflict("root_agent_human_request_scope_stale")
+        quest_ref = (
+            source.quest_ref
+            if run_kind == "writing"
+            else managed.get("quest_ref")
+        )
+        return {
+            "run_kind": run_kind,
+            "quest_ref": quest_ref,
+            "waiter_ref": f"root_run:{run_ref}",
+            "waiter_generation": int(source.generation),
+        }
 
     def query_runtime_observability(self) -> dict[str, object]:
         if self._runtime_protection is None:
@@ -8377,7 +8788,29 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         failure_code: str,
         provider_exit: dict[str, object],
     ) -> None:
-        """Permanently fence one sealed Stage operation, not its logical Run."""
+        """Fence physical ceilings; route completed contract drift to correction."""
+
+        recoverable_terminal = isinstance(provider_exit, dict) and (
+            provider_exit.get("schema_ref")
+            == "meta-research/provider-terminal-contract-failure/v1"
+            or (
+                provider_exit.get("schema_ref")
+                == "meta-research/provider-hard-ceiling/v1"
+                and failure_code == "codex_operation_failed"
+                and provider_exit.get("termination_reason")
+                in {"completed", "launch_failed"}
+            )
+        )
+        if recoverable_terminal:
+            self._record_stage_provider_correction(
+                unit_ref=unit_ref,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                failure_code=failure_code,
+                provider_exit=provider_exit,
+            )
+            return
 
         if not unit_ref or len(unit_ref) > 96:
             raise OwnerConflict("stage_provider_hard_ceiling_invalid")
@@ -8574,6 +9007,203 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         except RuntimeProtectionUnavailable as error:
             raise OwnerConflict(error.code) from error
 
+    def _record_stage_provider_correction(
+        self,
+        *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+        provider_exit: dict[str, object],
+    ) -> None:
+        """Retain a completed malformed result and install a live successor."""
+
+        if not unit_ref or len(unit_ref) > 96:
+            raise OwnerConflict("stage_provider_correction_invalid")
+        now = time.time()
+        effect: RuntimeEffectIdentity | None = None
+        with self._database.write() as connection:
+            control = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            stage_run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            unit = connection.execute(
+                text("SELECT * FROM ar_provider_units WHERE unit_ref = :unit_ref"),
+                {"unit_ref": unit_ref},
+            ).first()
+            if (
+                control is None
+                or stage_run is None
+                or unit is None
+                or control.run_kind
+                not in {"idea_stage", "plan_stage", "reasoning_stage", "bundle_stage"}
+                or control.status != "running"
+                or control.attempt_ref != attempt_ref
+                or control.fence_ref != fence_ref
+                or stage_run.current_attempt_ref != attempt_ref
+                or stage_run.current_fence_ref != fence_ref
+                or stage_run.status not in {"running", "awaiting_acceptance"}
+                or unit.run_ref != run_ref
+                or unit.attempt_ref != attempt_ref
+                or unit.fence_ref != fence_ref
+                or unit.status != "active"
+                or _PROVIDER_UNIT_RUN_KINDS.get(unit.unit_kind) != control.run_kind
+            ):
+                raise OwnerConflict("stage_provider_correction_stale")
+            provider_exit = _validated_stage_provider_hard_ceiling(
+                unit_kind=str(unit.unit_kind),
+                failure_code=failure_code,
+                provider_exit=provider_exit,
+            )
+            effect = _provider_runtime_effect(
+                unit_ref=str(unit.unit_ref),
+                operation_ref=str(unit.operation_ref),
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                claim_started_at=float(unit.started_at),
+            )
+            safe_operation_ref = "stage_provider_correction_" + canonical_hash(
+                {
+                    "unit_ref": unit_ref,
+                    "operation_ref": unit.operation_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "failure_code": failure_code,
+                    "provider_exit": provider_exit,
+                }
+            )[:48]
+            checkpoint = {
+                "schema_ref": "meta-research/runtime-safe-point/v1",
+                "operation_ref": safe_operation_ref,
+                "action": "provider_result_correction",
+                "run_ref": run_ref,
+                "run_kind": control.run_kind,
+                "quest_ref": control.quest_ref,
+                "cycle_ref": control.cycle_ref,
+                "epoch": None if control.epoch is None else int(control.epoch),
+                "run_status": "running",
+                "attempt_ref": attempt_ref,
+                "root_session_ref": control.root_session_ref,
+                "fence_ref": fence_ref,
+                "control_revision": int(control.control_revision),
+                "provider_unit_ref": unit_ref,
+                "provider_operation_ref": unit.operation_ref,
+                "provider_operation_retry_permitted": True,
+                "failure": {"code": failure_code},
+                "provider_exit": provider_exit,
+            }
+            safe_point_ref = new_ref("safe_point")
+            connection.execute(
+                text(
+                    "INSERT INTO ar_safe_points (safe_point_ref, operation_ref, "
+                    "run_ref, attempt_ref, root_session_ref, fence_ref, "
+                    "checkpoint_json, checkpoint_hash, created_at) VALUES "
+                    "(:safe_point_ref, :operation_ref, :run_ref, :attempt_ref, "
+                    ":root_session_ref, :fence_ref, :checkpoint_json, "
+                    ":checkpoint_hash, :now)"
+                ),
+                {
+                    "safe_point_ref": safe_point_ref,
+                    "operation_ref": safe_operation_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "root_session_ref": control.root_session_ref,
+                    "fence_ref": fence_ref,
+                    "checkpoint_json": canonical_json(checkpoint),
+                    "checkpoint_hash": canonical_hash(checkpoint),
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_execution_fences SET status = 'rejected', "
+                    "closed_at = COALESCE(closed_at, :now) WHERE fence_ref = "
+                    ":fence_ref AND status IN ('current', 'submitted')"
+                ),
+                {"now": now, "fence_ref": fence_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_provider_units SET status = 'completed', "
+                    "completed_at = :now WHERE unit_ref = :unit_ref AND status = "
+                    "'active'"
+                ),
+                {"now": now, "unit_ref": unit_ref},
+            )
+            try:
+                record_runtime_boundary(
+                    connection,
+                    identity=effect,
+                    boundary="terminal",
+                    checkpoint_ref=None,
+                    owner_evidence_ref="stage_provider_correction_"
+                    + canonical_hash(checkpoint),
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
+            replacement = self._replace_fenced_managed_attempt(
+                connection,
+                control,
+                now,
+                reuse_checkpoint=str(unit.unit_kind).endswith("_review"),
+                reuse_operation_refs=False,
+                preserve_native_session=True,
+                replacement_reason_code="provider_result_correction",
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_run_controls SET status = 'running', attempt_ref = "
+                    ":attempt_ref, fence_ref = :fence_ref, control_revision = "
+                    "control_revision + 1, safe_point_ref = :safe_point_ref, "
+                    "terminal_reason = NULL, cleanup_status = 'none', updated_at = "
+                    ":now WHERE run_ref = :run_ref"
+                ),
+                {
+                    "attempt_ref": replacement.attempt_ref,
+                    "fence_ref": replacement.fence_ref,
+                    "safe_point_ref": safe_point_ref,
+                    "now": now,
+                    "run_ref": run_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "safe_point_count = safe_point_count + 1 WHERE singleton = "
+                    "'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.stage_provider_correction_scheduled",
+                {
+                    "run_ref": run_ref,
+                    "retired_attempt_ref": attempt_ref,
+                    "attempt_ref": replacement.attempt_ref,
+                    "fence_ref": replacement.fence_ref,
+                    "unit_ref": unit_ref,
+                    "safe_point_ref": safe_point_ref,
+                    "failure": {"code": failure_code},
+                },
+            )
+        assert effect is not None
+        if self._runtime_protection is None:
+            raise OwnerConflict("runtime_protection_unavailable")
+        try:
+            self._runtime_protection.finish(
+                effect.responsibility_ref,
+                boundary="terminal",
+            )
+        except RuntimeProtectionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+
     def bind_provider_quiescence_driver(
         self, provider: object, *, unit_kinds: tuple[str, ...]
     ) -> None:
@@ -8704,7 +9334,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     ),
                     {"status": status, "now": now, "unit_ref": unit_ref},
                 )
-                # Replacement Attempts reuse the external operation_ref.  A
+                # Reconciliation replacements may reuse the external
+                # operation_ref.  A
                 # verified terminal response is also the missing safe ACK for
                 # any pre-restart physical unit left revocation_pending.
                 connection.execute(
@@ -9964,7 +10595,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 )
 
     def _replace_fenced_managed_attempt(
-        self, connection, control, now, *, reuse_checkpoint: bool = True
+        self,
+        connection,
+        control,
+        now,
+        *,
+        reuse_checkpoint: bool = True,
+        reuse_operation_refs: bool | None = None,
+        preserve_native_session: bool | None = None,
+        replacement_reason_code: str = "runtime_fence_replaced",
     ):
         if control.run_kind == "deepfetch":
             run = connection.execute(
@@ -10054,6 +10693,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         if not _is_formal_stage_run_kind(control.run_kind):
             raise OwnerConflict("runtime_reconciliation_required")
+        if preserve_native_session is None:
+            preserve_native_session = reuse_checkpoint
+        if reuse_operation_refs is None:
+            reuse_operation_refs = reuse_checkpoint
+        if not replacement_reason_code or len(replacement_reason_code) > 96:
+            raise OwnerConflict("runtime_reconciliation_required")
         run = connection.execute(
             text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
             {"run_ref": control.run_ref},
@@ -10080,7 +10725,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             {"attempt_ref": old_attempt.attempt_ref},
         ).all()
         operation_refs = None
-        if reuse_checkpoint:
+        if reuse_operation_refs:
             operation_refs = {
                 row.phase: row.operation_ref for row in old_invocations
             }
@@ -10180,7 +10825,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "attempt_ref": attempt_ref,
                 },
             )
-        if not reuse_checkpoint:
+        if not preserve_native_session:
             # The logical root Session survives a foreground rebind, but a native
             # provider session is input-specific.  Clearing only that attachment
             # keeps the Run/root identity while allowing the replacement Attempt
@@ -10198,12 +10843,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 "INSERT INTO ar_stage_attempt_replacements "
                 "(replacement_attempt_ref, run_ref, retired_attempt_ref, "
                 "reason_code, created_at) VALUES (:replacement, :run_ref, :retired, "
-                "'runtime_fence_replaced', :now)"
+                ":reason_code, :now)"
             ),
             {
                 "replacement": attempt_ref,
                 "run_ref": run.run_ref,
                 "retired": old_attempt.attempt_ref,
+                "reason_code": replacement_reason_code,
                 "now": now,
             },
         )
@@ -11819,7 +12465,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         )
 
     def _reconcile_acquisition_human_requests(self, session_ref: str) -> None:
-        for request in self.query_human_requests(include_history=False):
+        with self._database.read() as connection:
+            request_refs = tuple(
+                row.request_ref
+                for row in connection.execute(
+                    text(
+                        "SELECT request_ref FROM owner_human_requests WHERE "
+                        "issuer = :issuer AND kind = 'library_reconnect' AND "
+                        "is_current = 1 AND status IN ('open', 'satisfied') "
+                        "ORDER BY created_at, request_ref"
+                    ),
+                    {"issuer": AR_OWNER},
+                ).all()
+            )
+        for request_ref in request_refs:
+            request = self.query_human_request(request_ref)
+            if request is None:
+                continue
             target = request.get("target_assertion")
             if (
                 isinstance(target, dict)
@@ -11829,158 +12491,53 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ):
                 self.reconcile_human_request(cast(str, request["request_ref"]))
 
-    def _ensure_acquisition_human_requests(
+    def _waiting_acquisition_execution(
         self,
         *,
         session_ref: str,
-        quest_ref: str | None,
-        config_hash: str,
-        preflight_generation: int,
         request_id: str,
         request_hash: str,
-        attempt_count: int,
-    ) -> tuple[dict[str, object], ...]:
+    ) -> AcquisitionBatchExecution:
+        """Read one typed wait without turning it into a system-authored request."""
+
         with self._database.read() as connection:
-            row = connection.execute(
+            request_row = connection.execute(
                 text(
-                    "SELECT request_json, request_hash, results_json, results_hash "
+                    "SELECT * "
                     "FROM ar_acquisition_requests WHERE request_id = :request_id "
                     "AND session_ref = :session_ref AND status = 'waiting_user'"
                 ),
                 {"request_id": request_id, "session_ref": session_ref},
             ).first()
-        if row is None or row.request_hash != request_hash:
-            raise OwnerConflict("acquisition_human_request_stale")
-        request = _acquisition_request_from_json(row.request_json)
-        papers = {paper.paper_id: paper for paper in request.papers}
-        waiting_items = _waiting_acquisition_item_bindings(
-            row.results_json, row.results_hash
-        )
-        if not waiting_items or any(
-            item["paper_id"] not in papers for item in waiting_items
+            session_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_acquisition_sessions WHERE "
+                    "session_ref = :session_ref"
+                ),
+                {"session_ref": session_ref},
+            ).first()
+        if (
+            request_row is None
+            or session_row is None
+            or request_row.request_hash != request_hash
         ):
-            raise OwnerConflict("acquisition_human_request_invalid")
-        current = self.query_human_requests(include_history=False)
-        ensured: list[dict[str, object]] = []
-        for item in waiting_items:
-            paper_id = cast(str, item["paper_id"])
-            target = {
-                "schema_ref": "meta-research/acquisition-human-request-target/v1",
-                "operation": "resume_acquisition_item",
-                "session_ref": session_ref,
-                "acquisition_request_id": request_id,
-                "acquisition_request_hash": request_hash,
-                "acquisition_paper_id": paper_id,
-                "acquisition_item_hash": item["item_hash"],
-                "config_hash": config_hash,
-                "blocked_preflight_generation": preflight_generation,
-                "attempt_count": attempt_count,
-            }
-            waiter = {
-                "waiter_ref": "acquisition_item:"
-                + canonical_hash({"request_id": request_id, "paper_id": paper_id})[:32],
-                "generation": attempt_count,
-                "target_assertion": target,
-                "wait_scope": "local",
-                "other_blockers": [],
-            }
-            obligation = (
-                "Restore access or provide an accepted lawful copy for the exact "
-                f"literature item {paper_id}."
-            )
-            conditions = (
-                "A newer preflight verifies the exact session and config, or the "
-                "Owner accepts an OA-only route for this exact item.",
-                "Any provided material is an accepted Research Asset bound to this "
-                "exact acquisition item.",
-            )
-            candidates = [
-                candidate
-                for candidate in current
-                if (
-                    candidate.get("status") == "open"
-                    or (
-                        candidate.get("status") == "satisfied"
-                        and candidate.get("target_assertion", {}).get("config_hash")
-                        == config_hash
-                        and candidate.get("target_assertion", {}).get(
-                            "acquisition_item_hash"
-                        )
-                        == item["item_hash"]
-                    )
-                )
-                and isinstance(candidate.get("target_assertion"), dict)
-                and candidate["target_assertion"].get("schema_ref")
-                == "meta-research/acquisition-human-request-target/v1"
-                and candidate["target_assertion"].get("session_ref") == session_ref
-                and candidate["target_assertion"].get("acquisition_request_id")
-                == request_id
-                and candidate["target_assertion"].get("acquisition_paper_id")
-                == paper_id
-                and any(
-                    waiter.get("status") != "consumed"
-                    for waiter in candidate.get("direct_waiters", [])
-                    if isinstance(waiter, dict)
-                )
-            ]
-            if len(candidates) > 1:
-                raise OwnerConflict("acquisition_human_request_invalid")
-            if candidates and (
-                candidates[0]["target_assertion"] == target
-                or (
-                    candidates[0].get("status") == "satisfied"
-                    and candidates[0]["target_assertion"].get("config_hash")
-                    == config_hash
-                    and candidates[0]["target_assertion"].get("acquisition_item_hash")
-                    == item["item_hash"]
-                )
-            ):
-                ensured.append(candidates[0])
-                continue
-            command_binding = {
-                "session_ref": session_ref,
-                "request_id": request_id,
-                "paper_id": paper_id,
-                "target": target,
-            }
-            if candidates:
-                result = self.revise_human_request(
-                    cast(str, candidates[0]["request_ref"]),
-                    expected_revision=cast(int, candidates[0]["revision"]),
-                    obligation=obligation,
-                    target_assertion=target,
-                    acceptance_conditions=conditions,
-                    direct_waiters=(waiter,),
-                    idempotency_key="ar-acq-hr-revise:"
-                    + canonical_hash(command_binding),
-                )
-            else:
-                result = self.open_human_request(
-                    request_kind="library_reconnect",
-                    obligation=obligation,
-                    business_purpose=(
-                        "Resume only the exact blocked literature item without "
-                        "repeating already obtained material."
-                    ),
-                    target_assertion=target,
-                    acceptance_conditions=conditions,
-                    direct_waiter=waiter,
-                    idempotency_key="ar-acq-hr:" + canonical_hash(command_binding),
-                    quest_ref=quest_ref,
-                )
-            ensured.append(result)
-        return tuple(ensured)
+            raise OwnerConflict("acquisition_request_identity_conflict")
+        execution = _acquisition_execution_from_row(
+            request_row,
+            session_row,
+            self._acquisition_private_root,
+        )
+        try:
+            validate_item_results(execution.request, execution.results)
+        except AcquisitionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+        return execution
 
     def _recover_acquisition_human_requests(self) -> None:
         with self._database.read() as connection:
             rows = connection.execute(
                 text(
-                    "SELECT requests.request_id, requests.request_hash, "
-                    "requests.attempt_count, sessions.session_ref, "
-                    "sessions.quest_ref, sessions.config_hash, "
-                    "sessions.preflight_generation, sessions.status AS "
-                    "session_status, sessions.reason_code AS session_reason_code, "
-                    "requests.results_json, requests.results_hash FROM "
+                    "SELECT DISTINCT sessions.session_ref FROM "
                     "ar_acquisition_requests AS requests "
                     "JOIN ar_acquisition_sessions AS sessions ON "
                     "sessions.session_ref = requests.session_ref WHERE "
@@ -11988,19 +12545,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 )
             ).all()
         for row in rows:
-            if _acquisition_reconciliation_pending(row.results_json, row.results_hash):
-                continue
-            self._ensure_acquisition_human_requests(
-                session_ref=row.session_ref,
-                quest_ref=row.quest_ref,
-                config_hash=row.config_hash,
-                preflight_generation=int(row.preflight_generation),
-                request_id=row.request_id,
-                request_hash=row.request_hash,
-                attempt_count=int(row.attempt_count),
-            )
-            if row.session_status == "ready":
-                self._reconcile_acquisition_human_requests(row.session_ref)
+            # Historical requests remain restart-safe, but recovery never creates
+            # or revises one on a Root Agent's behalf.
+            self._reconcile_acquisition_human_requests(row.session_ref)
 
     def _record_acquisition_runtime_wait(
         self,
@@ -12120,12 +12667,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise OwnerConflict(error.code) from error
         if self.query_acquisition_session(session_ref=session_ref) is None:
             raise OwnerConflict("acquisition_session_not_found")
-        target_dir = _acquisition_request_target_dir(
-            self._acquisition_private_root,
-            session_ref,
-            request.request_id,
-            create=True,
-        )
         resume_binding: tuple[str, str, int] | None = None
         resume_target: dict[str, object] | None = None
         resume_route: dict[str, object] | None = None
@@ -12149,6 +12690,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 ),
                 {"request_id": request.request_id, "session_ref": session_ref},
             ).first()
+        if waiting is not None and waiting.request_hash != request_hash:
+            raise OwnerConflict("acquisition_request_identity_conflict")
+        target_dir = _acquisition_request_target_dir(
+            self._acquisition_private_root,
+            session_ref,
+            request.request_id,
+            # An existing request already owns this directory. Polling its
+            # typed wait is therefore a verification-only filesystem read;
+            # only a genuinely new request may create custody here.
+            create=waiting is None,
+        )
         if waiting is not None:
             self._finish_recorded_acquisition_boundary(
                 _acquisition_runtime_effect(
@@ -12195,14 +12747,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             and not technical_reconciliation
             and not protection_waiting
         ):
-            human_requests = self._ensure_acquisition_human_requests(
+            human_requests = self._find_acquisition_human_requests(
                 session_ref=session_ref,
-                quest_ref=waiting.quest_ref,
-                config_hash=waiting.config_hash,
-                preflight_generation=int(waiting.preflight_generation),
                 request_id=request.request_id,
-                request_hash=request_hash,
                 attempt_count=int(waiting.attempt_count),
+                config_hash=waiting.config_hash,
+                request_hash=request_hash,
+                acquisition_row=waiting,
             )
             resumable = []
             for candidate in human_requests:
@@ -12218,28 +12769,39 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     and candidate_waiters[0].get("status") == "released"
                 ):
                     resumable.append((candidate, candidate_waiters[0]))
-            if not resumable:
-                raise OwnerConflict("acquisition_human_request_not_released")
-            human_request, waiter = sorted(
-                resumable,
-                key=lambda item: (
-                    str(item[0]["target_assertion"].get("acquisition_paper_id")),
-                    str(item[0]["request_ref"]),
-                ),
-            )[0]
-            resume_binding = (
-                cast(str, human_request["request_ref"]),
-                cast(str, waiter["waiter_ref"]),
-                cast(int, waiter["generation"]),
-            )
-            resume_target = cast(dict[str, object], human_request["target_assertion"])
-            resume_route = self._acquisition_resume_route(human_request, waiting)
-            if resume_route["route"] == "accepted_material":
-                materialized_asset, material_path = (
-                    self._prepare_accepted_material_route(
-                        resume_route,
-                        target_dir,
+            if resumable:
+                human_request, waiter = sorted(
+                    resumable,
+                    key=lambda item: (
+                        str(item[0]["target_assertion"].get("acquisition_paper_id")),
+                        str(item[0]["request_ref"]),
+                    ),
+                )[0]
+                resume_binding = (
+                    cast(str, human_request["request_ref"]),
+                    cast(str, waiter["waiter_ref"]),
+                    cast(int, waiter["generation"]),
+                )
+                resume_target = cast(
+                    dict[str, object], human_request["target_assertion"]
+                )
+                resume_route = self._acquisition_resume_route(human_request, waiting)
+                if resume_route["route"] == "accepted_material":
+                    materialized_asset, material_path = (
+                        self._prepare_accepted_material_route(
+                            resume_route,
+                            target_dir,
+                        )
                     )
+            elif waiting.session_status != "ready":
+                # A Provider wait is observable state, not authority for the
+                # system to impersonate a Root Agent. The same request becomes
+                # retryable after an exact successful preflight, or an already
+                # persisted legacy request can still release its waiter.
+                return self._waiting_acquisition_execution(
+                    session_ref=session_ref,
+                    request_id=request.request_id,
+                    request_hash=request_hash,
                 )
         now = time.time()
         previous_results: tuple[AcquisitionItemResult, ...] = ()
@@ -12313,6 +12875,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     for paper in request.papers
                 )
 
+            expected_current_request_id = (
+                None if new_request else request.request_id
+            )
+            if session_row.current_request_id != expected_current_request_id:
+                raise OwnerConflict("acquisition_session_busy")
+
             if resume_binding is not None:
                 assert resume_target is not None and resume_route is not None
                 if (
@@ -12348,7 +12916,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "UPDATE ar_acquisition_sessions SET status = 'acquiring', "
                     "current_request_id = :request_id, slot_held = 1, "
                     "reason_code = NULL, updated_at = :now WHERE session_ref = "
-                    ":session_ref AND slot_held = 0 AND (status = 'ready' OR "
+                    ":session_ref AND slot_held = 0 AND ((:new_request = 1 AND "
+                    "current_request_id IS NULL) OR (:new_request = 0 AND "
+                    "current_request_id = :request_id)) AND (status = 'ready' OR "
                     "(:reconcile_only = 1 AND status = 'waiting_user' AND "
                     "reason_code = 'acquisition_reconciliation_required') OR "
                     "(:protection_retry = 1 AND status = 'waiting_user') OR "
@@ -12357,6 +12927,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 {
                     "session_ref": session_ref,
                     "request_id": request.request_id,
+                    "new_request": 1 if new_request else 0,
                     "reconcile_only": 1 if reconcile_only else 0,
                     "protection_retry": 1 if protection_waiting else 0,
                     "human_resume": 1 if resume_binding is not None else 0,
@@ -12819,18 +13390,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     boundary=predecessor_boundary,
                     checkpoint_ref=predecessor_checkpoint_ref,
                 )
-        if status == "waiting_user" and not _acquisition_reconciliation_pending(
-            results_json, results_hash
-        ):
-            self._ensure_acquisition_human_requests(
-                session_ref=session_ref,
-                quest_ref=session_row.quest_ref,
-                config_hash=session_row.config_hash,
-                preflight_generation=int(session_row.preflight_generation),
-                request_id=request.request_id,
-                request_hash=request_hash,
-                attempt_count=attempt_count,
-            )
         return AcquisitionBatchExecution(
             request_id=request.request_id,
             session_ref=session_ref,
@@ -12961,39 +13520,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise OwnerConflict("deepfetch_acquisition_binding_invalid")
         if require_ready and (session.status != "ready" or session.slot_held):
             raise OwnerConflict("deepfetch_acquisition_not_ready")
-        if require_ready and session.current_request_id is not None:
-            with self._database.read() as connection:
-                acquisition_request = connection.execute(
-                    text(
-                        "SELECT status, attempt_count, request_hash FROM "
-                        "ar_acquisition_requests "
-                        "WHERE request_id = :request_id AND session_ref = :session_ref"
-                    ),
-                    {
-                        "request_id": session.current_request_id,
-                        "session_ref": session.session_ref,
-                    },
-                ).first()
-            if (
-                acquisition_request is not None
-                and acquisition_request.status == "waiting_user"
-            ):
-                human_requests = self._find_acquisition_human_requests(
-                    session_ref=session.session_ref,
-                    request_id=session.current_request_id,
-                    attempt_count=int(acquisition_request.attempt_count),
-                    config_hash=session.config_hash,
-                    request_hash=str(acquisition_request.request_hash),
-                )
-                if not any(
-                    human_request.get("status") == "satisfied"
-                    and (human_request.get("disposition") or {}).get("decision")
-                    == "satisfied"
-                    and len(human_request.get("direct_waiters", [])) == 1
-                    and human_request["direct_waiters"][0].get("status") == "released"
-                    for human_request in human_requests
-                ):
-                    raise OwnerConflict("deepfetch_acquisition_not_ready")
         return session
 
     def _find_acquisition_human_requests(
@@ -13004,23 +13530,41 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         attempt_count: int,
         config_hash: str,
         request_hash: str,
+        acquisition_row,
     ) -> tuple[dict[str, object], ...]:
-        matches = []
-        for request in self.query_human_requests(include_history=False):
-            target = request.get("target_assertion")
-            if (
-                isinstance(target, dict)
-                and target.get("schema_ref")
-                == "meta-research/acquisition-human-request-target/v1"
-                and target.get("operation") == "resume_acquisition_item"
-                and target.get("session_ref") == session_ref
-                and target.get("acquisition_request_id") == request_id
-                and isinstance(target.get("attempt_count"), int)
-                and cast(int, target["attempt_count"]) <= attempt_count
-                and target.get("config_hash") == config_hash
-                and target.get("acquisition_request_hash") == request_hash
-            ):
-                matches.append(request)
+        # This is a grandfathered replay path, not a request discovery loop.
+        # Restrict the read to terminal records of the one historical contract
+        # before invoking the full artifact verifier for each exact ref. In
+        # particular, do not query every open request and materialize unrelated
+        # expirations while polling an Acquisition wait.
+        with self._database.read() as connection:
+            request_refs = tuple(
+                row.request_ref
+                for row in connection.execute(
+                    text(
+                        "SELECT request_ref FROM owner_human_requests WHERE "
+                        "issuer = :issuer AND kind = 'library_reconnect' AND "
+                        "is_current = 1 AND status = 'satisfied' ORDER BY "
+                        "created_at, request_ref"
+                    ),
+                    {"issuer": AR_OWNER},
+                ).all()
+            )
+        verified = tuple(self.query_human_request(ref) for ref in request_refs)
+        matches = [
+            request
+            for request in verified
+            if request is not None
+            and _legacy_acquisition_human_request_matches(
+                request,
+                acquisition_row=acquisition_row,
+                session_ref=session_ref,
+                request_id=request_id,
+                attempt_count=attempt_count,
+                config_hash=config_hash,
+                request_hash=request_hash,
+            )
+        ]
         return tuple(
             sorted(
                 matches,
@@ -15205,16 +15749,26 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         evidence: BundleExhaustionEvidence,
         idempotency_key: str,
     ) -> VerifiedBundleExhaustionEvidence:
-        """Freeze one independently reviewed exact exploration inventory.
+        """Freeze one exact, Owner-verifiable exploration inventory.
 
-        AR proves provider-turn provenance, current Fence, exact content, and
-        per-record immutability.  AE remains the sole semantic exhaustion
+        AR proves the primary provider turn, current Fence, exact content, and
+        per-record immutability. Optional review provenance is retained but is
+        not an acceptance gate. AE remains the sole semantic exhaustion
         decision maker.
         """
 
         _validate_stage_idempotency_key(idempotency_key)
         if type(evidence) is not BundleExhaustionEvidence:
             raise OwnerConflict("bundle_exhaustion_evidence_invalid")
+        if evidence.review_trace is not None:
+            # Legacy trace-bearing rows remain readable, but the retired child
+            # completion envelope is not a production write format.
+            raise OwnerConflict("bundle_exhaustion_review_trace_read_only")
+        if (
+            evidence.reviewer_agent_ref is not None
+            or evidence.review_findings != ()
+        ):
+            raise OwnerConflict("bundle_exhaustion_advisory_review_invalid")
         verified_request = self._verified_bundle_exhaustion_request(evidence)
         accepted_plan = verified_request.accepted_formal_plan
         if accepted_plan is None:
@@ -15228,22 +15782,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise
         if revalidated_contract != evidence:
             raise OwnerConflict("bundle_exhaustion_evidence_invalid")
-        trace_verifier = self._bundle_exhaustion_review_trace_verifier
         current_run = self.query_bundle_stage_run(
             evidence.stage_run_request_ref
         )
-        if trace_verifier is None or current_run is None or (
+        if current_run is None or (
             current_run.run_ref != evidence.run_ref
             or current_run.attempt_ref != evidence.attempt_ref
             or current_run.fence_ref != evidence.execution_fence_ref
         ):
-            raise OwnerConflict(
-                "bundle_exhaustion_review_trace_verifier_unavailable"
-            )
-        trace_verifier.verify_bundle_exhaustion_review_trace(
-            evidence.review_trace,
-            runtime_binding_hash=current_run.runtime_binding_hash,
-        )
+            raise OwnerConflict("bundle_exhaustion_provider_proof_invalid")
         evidence_hash = evidence.evidence_hash
         review_response_hash = bundle_exhaustion_review_response_hash(evidence)
         completion_hash = completion_contract_hash(evidence.completion_contract)
@@ -15314,10 +15861,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     or review.attempt_ref != evidence.attempt_ref
                     or review.fence_ref != evidence.execution_fence_ref
                     or review.phase != "review"
-                    or review.status not in {"prepared", "completed"}
                     or (
-                        review.status == "completed"
-                        and review.response_hash != review_response_hash
+                        review.status != "prepared"
+                        or review.response_hash is not None
                     )
                     or run.runtime_binding_hash
                     != current_run.runtime_binding_hash
@@ -15350,24 +15896,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     session,
                     evidence.rejected_submissions,
                 )
-                if review.status == "prepared":
-                    updated = connection.execute(
-                        text(
-                            "UPDATE ar_stage_provider_invocations SET status = "
-                            "'completed', response_hash = :response_hash, "
-                            "completed_at = :completed_at WHERE invocation_ref = "
-                            ":invocation_ref AND status = 'prepared'"
-                        ),
-                        {
-                            "response_hash": review_response_hash,
-                            "completed_at": time.time(),
-                            "invocation_ref": evidence.review_invocation_ref,
-                        },
-                    )
-                    if updated.rowcount != 1:
-                        raise OwnerConflict(
-                            "bundle_exhaustion_provider_proof_invalid"
-                        )
                 evidence_ref = new_ref("bundle_exhaustion_evidence")
                 receipt_ref = new_ref("ar_bundle_exhaustion_evidence_receipt")
                 bindings = _bundle_exhaustion_evidence_bindings(
@@ -15600,9 +16128,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 or primary.invocation_ref != evidence.primary_invocation_ref
                 or primary.response_hash != evidence.primary_response_hash
                 or review.invocation_ref != evidence.review_invocation_ref
-                or review.status != "completed"
-                or review.response_hash
-                != bundle_exhaustion_review_response_hash(evidence)
+                or (
+                    evidence.review_trace is None
+                    and (
+                        review.status != "prepared"
+                        or review.response_hash is not None
+                    )
+                )
+                or (
+                    evidence.review_trace is not None
+                    and (
+                        review.status != "completed"
+                        or review.response_hash
+                        != bundle_exhaustion_review_response_hash(evidence)
+                    )
+                )
             ):
                 raise OwnerConflict("bundle_exhaustion_evidence_stale")
             assessment_receipt = _bundle_exhaustion_assessment_receipt(
@@ -15625,16 +16165,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 session,
                 evidence.rejected_submissions,
             )
-            runtime_binding_hash = run.runtime_binding_hash
-        trace_verifier = self._bundle_exhaustion_review_trace_verifier
-        if trace_verifier is None:
-            raise OwnerConflict(
-                "bundle_exhaustion_review_trace_verifier_unavailable"
-            )
-        trace_verifier.verify_bundle_exhaustion_review_trace(
-            evidence.review_trace,
-            runtime_binding_hash=runtime_binding_hash,
-        )
         return accepted
 
     def _verified_bundle_exhaustion_request(self, evidence):
@@ -16740,9 +17270,20 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
             if review_invocation.status != "prepared" and not review_is_accepted_exhaustion:
                 raise OwnerConflict("idea_provider_invocation_invalid")
+        elif primary_draft is None:
+            raise OwnerConflict("idea_provider_invocation_invalid")
         elif (
-            primary_draft is None
-            or review_invocation.status != "completed"
+            run.stage == "bundle"
+            and execution.review.get("review_mode")
+            == "advisory_unobserved"
+        ):
+            if (
+                review_invocation.status != "prepared"
+                or review_invocation.response_hash is not None
+            ):
+                raise OwnerConflict("idea_provider_invocation_invalid")
+        elif (
+            review_invocation.status != "completed"
             or review_invocation.response_hash
             != _review_provider_response_hash(
                 native_session_ref=execution.native_session_ref,
@@ -17189,10 +17730,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     ) -> IdeaPrimaryDraft:
         """Bind the real native Session immediately after primary generation.
 
-        Child-agent review is a later provider turn in this same native
-        Session. Persisting this transport checkpoint prevents review failure
-        or daemon restart from creating a second managed Session for the same
-        Attempt/Fence.
+        Persisting this transport checkpoint prevents any later correction,
+        advisory phase, or daemon restart from creating a second managed
+        Session for the same Attempt/Fence.
         """
 
         _validate_stage_idempotency_key(idempotency_key)
@@ -17511,6 +18051,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             review,
             reviewed_draft,
         )
+        if expected_stage == "bundle":
+            _validate_bundle_advisory_review_contract(
+                review,
+                outcome=outcome,
+                reviewed_draft=reviewed_draft,
+            )
         outcome_material_hash = _stage_material_hash(expected_stage, outcome)
         payload = {
             "schema_ref": _stage_execution_schema(expected_stage),
@@ -17520,12 +18066,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         }
         payload_json = canonical_json(payload)
         payload_hash = canonical_hash(payload)
-        provider_response_hash = _review_provider_response_hash(
-            native_session_ref=native_session_ref,
-            reviewed_draft=reviewed_draft,
-            outcome=outcome,
-            review=review,
-            stage=expected_stage,
+        advisory_bundle_review = (
+            expected_stage == "bundle"
+            and review.get("review_mode")
+            == "advisory_unobserved"
+        )
+        provider_response_hash = (
+            None
+            if advisory_bundle_review
+            else _review_provider_response_hash(
+                native_session_ref=native_session_ref,
+                reviewed_draft=reviewed_draft,
+                outcome=outcome,
+                review=review,
+                stage=expected_stage,
+            )
         )
         command_kind = f"record_{expected_stage}_attempt_execution"
         command_hash = canonical_hash(
@@ -17552,7 +18107,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             preview_run, preview_attempt, preview_session, preview_fence = (
                 _load_stage_fence(connection, run_ref, attempt_ref, fence_ref)
             )
-            if reviewer_agent_ref == preview_session.session_ref:
+            if (
+                expected_stage != "bundle"
+                and reviewer_agent_ref == preview_session.session_ref
+            ):
                 raise OwnerConflict("attempt_review_independence_invalid")
             if (
                 preview_run.stage != expected_stage
@@ -17588,8 +18146,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     adapter_kind=primary_draft.adapter_kind,
                     stage=preview_run.stage,
                 )
-                or review_invocation.status == "completed"
-                and review_invocation.response_hash != provider_response_hash
+                or (
+                    advisory_bundle_review
+                    and (
+                        review_invocation.status != "prepared"
+                        or review_invocation.response_hash is not None
+                    )
+                )
+                or (
+                    not advisory_bundle_review
+                    and review_invocation.status == "completed"
+                    and review_invocation.response_hash
+                    != provider_response_hash
+                )
             ):
                 raise OwnerConflict("idea_provider_invocation_invalid")
             _, predecessor_receipt, predecessor_submission_ref = (
@@ -17627,7 +18196,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
             if replay_submission_ref is None:
                 _assert_runtime_control_allows(connection, run_ref, fence_ref)
-            if reviewer_agent_ref == session.session_ref:
+            if (
+                expected_stage != "bundle"
+                and reviewer_agent_ref == session.session_ref
+            ):
                 raise OwnerConflict("attempt_review_independence_invalid")
             if (
                 run.stage != expected_stage
@@ -17649,14 +18221,26 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 )
             ):
                 raise OwnerConflict("idea_primary_draft_conflict")
-            _complete_provider_invocation(
-                connection,
-                run,
-                attempt,
-                fence,
-                phase="review",
-                response_hash=provider_response_hash,
-            )
+            if advisory_bundle_review:
+                _primary_invocation, current_review_invocation = (
+                    _provider_invocations(connection, run, attempt, fence)
+                )
+                if (
+                    current_review_invocation.status != "prepared"
+                    or current_review_invocation.response_hash is not None
+                ):
+                    raise OwnerConflict("idea_provider_invocation_invalid")
+            else:
+                if provider_response_hash is None:
+                    raise OwnerConflict("idea_provider_invocation_invalid")
+                _complete_provider_invocation(
+                    connection,
+                    run,
+                    attempt,
+                    fence,
+                    phase="review",
+                    response_hash=provider_response_hash,
+                )
             lineage, current_predecessor_receipt, current_predecessor_submission = (
                 _successor_execution_lineage(
                     connection,
@@ -17878,14 +18462,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         selected = [
             item for item in frontier if item.get("target_ref") == selected_target_ref
         ]
-        if action != "dispatch":
-            raise OwnerConflict("bundle_dispatch_authority_missing")
+        dispatchable = tuple(
+            item
+            for item in frontier
+            if item.get("dispatch_allowed", True) is True
+        )
         if (
             action not in {"dispatch", "wait", "replan_required"}
             or (
-                action == "dispatch" and (not selected_target_ref or len(selected) != 1)
+                action == "dispatch"
+                and (
+                    not selected_target_ref
+                    or len(selected) != 1
+                    or selected[0].get("dispatch_allowed", True) is not True
+                )
             )
             or (action != "dispatch" and selected_target_ref is not None)
+            or (action != "dispatch" and dispatchable)
         ):
             raise OwnerConflict("bundle_dispatch_target_not_in_frontier")
         validate_bundle_inbox_checkpoint(inbox_checkpoint)
@@ -17954,7 +18547,29 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     run_ref=run_ref,
                     graph_ref=graph_ref,
                     frontier=frontier,
+                    allow_legacy_high_risk=False,
                 )
+                expected_root = {
+                    "run_kind": "bundle_stage",
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "root_session_ref": session.session_ref,
+                    "fence_ref": fence_ref,
+                    "waiter_generation": int(attempt.generation),
+                }
+                for item in frontier:
+                    if (
+                        item.get("risk_class") != "high"
+                        or item.get("dispatch_allowed") is not False
+                    ):
+                        continue
+                    command = cast(
+                        dict[str, object], item["human_request_command"]
+                    )
+                    arguments = cast(dict[str, object], command["arguments"])
+                    wrapper = cast(dict[str, object], arguments["condition"])
+                    if wrapper.get("root") != expected_root:
+                        raise OwnerConflict("bundle_dispatch_frontier_invalid")
                 expected_generation = int(
                     connection.execute(
                         text(
@@ -18033,7 +18648,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 )
                 self._feed.record(
                     connection,
-                    "agent_runtime.bundle_target_dispatched",
+                    (
+                        "agent_runtime.bundle_target_dispatched"
+                        if action == "dispatch"
+                        else "agent_runtime.bundle_dispatch_decision_recorded"
+                    ),
                     {
                         "decision_ref": decision_ref,
                         "run_ref": run_ref,
@@ -22514,6 +23133,123 @@ def _acquisition_target_matches_waiting_item(target: dict[str, object], row) -> 
     )
 
 
+def _legacy_acquisition_human_request_matches(
+    request: dict[str, object],
+    *,
+    acquisition_row,
+    session_ref: str,
+    request_id: str,
+    attempt_count: int,
+    config_hash: str,
+    request_hash: str,
+) -> bool:
+    """Accept only the exact historical system-authored Acquisition contract."""
+
+    target = request.get("target_assertion")
+    waiters = request.get("direct_waiters")
+    disposition = request.get("disposition")
+    evaluation = request.get("evaluation")
+    if (
+        request.get("issuer") != AR_OWNER
+        or request.get("kind") != "library_reconnect"
+        or request.get("status") != "satisfied"
+        or request.get("current") is not True
+        or request.get("quest_ref") != acquisition_row.quest_ref
+        or request.get("required_authorization") is not None
+        or request.get("expires_at") is not None
+        or not isinstance(target, dict)
+        or set(target)
+        != {
+            "schema_ref",
+            "operation",
+            "session_ref",
+            "acquisition_request_id",
+            "acquisition_request_hash",
+            "acquisition_paper_id",
+            "acquisition_item_hash",
+            "config_hash",
+            "blocked_preflight_generation",
+            "attempt_count",
+        }
+        or target.get("schema_ref")
+        != "meta-research/acquisition-human-request-target/v1"
+        or target.get("operation") != "resume_acquisition_item"
+        or target.get("session_ref") != session_ref
+        or target.get("acquisition_request_id") != request_id
+        or target.get("acquisition_request_hash") != request_hash
+        or target.get("config_hash") != config_hash
+        or type(target.get("blocked_preflight_generation")) is not int
+        or cast(int, target["blocked_preflight_generation"]) < 0
+        or cast(int, target["blocked_preflight_generation"])
+        > int(acquisition_row.preflight_generation)
+        or type(target.get("attempt_count")) is not int
+        or not 0 < cast(int, target["attempt_count"]) <= attempt_count
+        or not _acquisition_target_matches_waiting_item(target, acquisition_row)
+        or not isinstance(waiters, list)
+        or len(waiters) != 1
+        or not isinstance(disposition, dict)
+        or disposition.get("decision") != "satisfied"
+        or not isinstance(evaluation, dict)
+        or evaluation.get("decision") != "satisfied"
+        or disposition.get("evaluation_ref") != evaluation.get("evaluation_ref")
+    ):
+        return False
+    paper_id = cast(str, target["acquisition_paper_id"])
+    if (
+        request.get("obligation")
+        != "Restore access or provide an accepted lawful copy for the exact "
+        f"literature item {paper_id}."
+        or request.get("business_purpose")
+        != "Resume only the exact blocked literature item without repeating "
+        "already obtained material."
+        or request.get("acceptance_conditions")
+        != [
+            "A newer preflight verifies the exact session and config, or the "
+            "Owner accepts an OA-only route for this exact item.",
+            "Any provided material is an accepted Research Asset bound to this "
+            "exact acquisition item.",
+        ]
+    ):
+        return False
+    waiter = waiters[0]
+    resume_validation = (
+        waiter.get("resume_validation") if isinstance(waiter, dict) else None
+    )
+    return (
+        isinstance(waiter, dict)
+        and set(waiter)
+        == {
+            "waiter_ref",
+            "generation",
+            "target_assertion",
+            "wait_scope",
+            "other_blockers",
+            "status",
+            "resume_validation",
+        }
+        and waiter.get("waiter_ref")
+        == "acquisition_item:"
+        + canonical_hash({"request_id": request_id, "paper_id": paper_id})[:32]
+        and waiter.get("generation") == target["attempt_count"]
+        and waiter.get("target_assertion") == target
+        and waiter.get("wait_scope") == "local"
+        and waiter.get("other_blockers") == []
+        and waiter.get("status") == "released"
+        and isinstance(resume_validation, dict)
+        and resume_validation.get("request_ref") == request.get("request_ref")
+        and resume_validation.get("waiter_ref") == waiter.get("waiter_ref")
+        and resume_validation.get("generation") == target["attempt_count"]
+        and resume_validation.get("target_assertion_hash")
+        == canonical_hash(target)
+        and resume_validation.get("authorization_receipt_ref") is None
+        and resume_validation.get("other_blockers") == []
+        and resume_validation.get("status") == "released"
+        and resume_validation.get("reason") is None
+        and resume_validation.get("started_work") is False
+        and resume_validation.get("consumption") is None
+    )
+
+
 def _acquisition_format_for_material(media_type: str, display_name: str) -> str | None:
     normalized = media_type.split(";", 1)[0].strip().lower()
     suffix = Path(display_name).suffix.lower()
@@ -23017,7 +23753,14 @@ def _bundle_exhaustion_evidence_bindings(
         "primary_assessment_hash": evidence.primary_assessment_hash,
         "review_invocation_ref": evidence.review_invocation_ref,
         "review_response_hash": review_response_hash,
-        "reviewer_agent_ref": evidence.reviewer_agent_ref,
+        # The legacy column is non-null.  This explicit sentinel preserves its
+        # shape without inventing a reviewer or child identity when optional
+        # advisory provenance was not observed.
+        "reviewer_agent_ref": (
+            evidence.reviewer_agent_ref
+            if evidence.reviewer_agent_ref is not None
+            else BUNDLE_EXHAUSTION_REVIEWER_UNOBSERVED
+        ),
         "completion_contract_hash": completion_contract_hash,
         "evidence_hash": evidence_hash,
     }
@@ -23159,6 +23902,16 @@ def _verify_execution_row(
         )
     ):
         raise OwnerConflict("attempt_execution_payload_invalid")
+    if row.stage == "bundle":
+        review_mode = review.get("review_mode")
+        if review_mode == "advisory_unobserved":
+            _validate_bundle_advisory_review_contract(
+                review,
+                outcome=outcome,
+                reviewed_draft=reviewed_draft,
+            )
+        elif review_mode != "harness_child_agent":
+            raise OwnerConflict("attempt_review_provenance_invalid")
     return outcome, reviewed_draft, review
 
 
@@ -23195,11 +23948,13 @@ def _validate_reasoning_checkpoint_review(
     native_session_ref: str,
     primary_draft_hash: str,
     checkpoint_hash: str,
+    allow_legacy_child: bool = False,
 ) -> None:
     _validate_attempt_review_for_write(
         review,
         native_session_ref=native_session_ref,
         stage="reasoning",
+        allow_legacy_child=allow_legacy_child,
     )
     if set(review) != {
         "schema_ref",
@@ -23273,6 +24028,7 @@ def _validate_reasoning_autonomous_checkpoint_material(
     checkpoint_hash: str,
     review: dict[str, object],
     review_hash: str,
+    allow_legacy_child: bool = False,
 ) -> None:
     # AR owns transport identity and the canonical checkpoint envelope, not the
     # frozen evidence closure carried by AE's context pack.  RM re-runs the
@@ -23367,6 +24123,7 @@ def _validate_reasoning_autonomous_checkpoint_material(
         native_session_ref=native_session_ref,
         primary_draft_hash=primary_draft.draft_hash,
         checkpoint_hash=checkpoint_hash,
+        allow_legacy_child=allow_legacy_child,
     )
 
 
@@ -23424,6 +24181,7 @@ def _reasoning_autonomous_checkpoint(
         checkpoint_hash=attempt.reasoning_checkpoint_hash,
         review=review,
         review_hash=attempt.reasoning_checkpoint_review_hash,
+        allow_legacy_child=True,
     )
     bindings = _reasoning_autonomous_checkpoint_bindings(
         request_ref=run.request_ref,
@@ -23769,6 +24527,11 @@ def _verify_provider_execution_chain(
     checkpoint = _primary_draft(row, row, row)
     if checkpoint is None:
         raise OwnerConflict("idea_primary_draft_required")
+    advisory_bundle_review = (
+        row.stage == "bundle"
+        and execution.review.get("review_mode")
+        == "advisory_unobserved"
+    )
     if (
         primary.status != "completed"
         or primary.response_hash
@@ -23778,14 +24541,23 @@ def _verify_provider_execution_chain(
             adapter_kind=checkpoint.adapter_kind,
             stage=row.stage,
         )
-        or review.status != "completed"
-        or review.response_hash
-        != _review_provider_response_hash(
-            native_session_ref=execution.native_session_ref,
-            reviewed_draft=execution.reviewed_draft,
-            outcome=execution.outcome,
-            review=execution.review,
-            stage=row.stage,
+        or (
+            advisory_bundle_review
+            and (review.status != "prepared" or review.response_hash is not None)
+        )
+        or (
+            not advisory_bundle_review
+            and (
+                review.status != "completed"
+                or review.response_hash
+                != _review_provider_response_hash(
+                    native_session_ref=execution.native_session_ref,
+                    reviewed_draft=execution.reviewed_draft,
+                    outcome=execution.outcome,
+                    review=execution.review,
+                    stage=row.stage,
+                )
+            )
         )
     ):
         raise OwnerConflict("idea_provider_invocation_invalid")
@@ -24220,6 +24992,7 @@ def _validate_writing_review_contract(
     citations: tuple[dict[str, str], ...],
     final_hash: str,
     citations_hash: str,
+    allow_legacy_child: bool,
 ) -> None:
     if set(review) != {
         "review_mode",
@@ -24237,7 +25010,13 @@ def _validate_writing_review_contract(
     findings = review.get("findings")
     dispositions = review.get("dispositions")
     claimed_review_hash = review.get("review_hash")
-    expected_review_task_hash = writing_child_review_task_hash(
+    review_mode = review.get("review_mode")
+    task_hash_factory = (
+        writing_child_review_task_hash
+        if allow_legacy_child and review_mode == "harness_child_agent"
+        else writing_advisory_review_task_hash
+    )
+    expected_review_task_hash = task_hash_factory(
         run_ref=run.run_ref,
         provider_job_ref=attempt.provider_job_ref,
         root_session_ref=run.root_session_ref,
@@ -24254,11 +25033,22 @@ def _validate_writing_review_contract(
     review_basis = dict(review)
     review_basis.pop("review_hash")
     if (
-        review.get("review_mode") != "harness_child_agent"
-        or not isinstance(reviewer, str)
-        or not reviewer.strip()
-        or len(reviewer) > 128
-        or reviewer in {run.root_session_ref, run.native_session_ref}
+        (
+            review_mode == "advisory_unobserved"
+            and reviewer is not None
+            or review_mode == "harness_child_agent"
+            and (
+                not allow_legacy_child
+                or not isinstance(reviewer, str)
+                or not reviewer.strip()
+                or len(reviewer) > 128
+                or reviewer in {run.root_session_ref, run.native_session_ref}
+            )
+            or review_mode not in {
+                "advisory_unobserved",
+                "harness_child_agent",
+            }
+        )
         or review.get("review_task_hash") != expected_review_task_hash
         or review.get("reviewed_markdown_hash") != checkpoint.markdown_hash
         or reviewed_markdown != checkpoint.markdown
@@ -24651,6 +25441,7 @@ def _validated_runtime_binding(
     ),
     *,
     stage: str | None = None,
+    allow_legacy_full_conformance: bool = False,
 ) -> tuple[
     IdeaRuntimeBinding
     | PlanRuntimeBinding
@@ -24709,9 +25500,52 @@ def _validated_runtime_binding(
         for resource in binding.resource_bindings
         if resource.startswith("harness-artifact:full-conformance-")
     )
-    full_conformance_valid = (
+    operation_binding_resources = tuple(
+        resource
+        for resource in binding.resource_bindings
+        if resource.startswith("harness-artifact:operation-binding-")
+    )
+    operation_binding_valid = (
+        stage in {"bundle", "reasoning"}
+        and binding.harness_adapter_ref.startswith("codex-cli/")
+        and "harness-operation-binding-v1" in binding.capability_bindings
+        and "harness-full-conformance-v1" not in binding.capability_bindings
+        and "semantic-mcp-resident" in binding.capability_bindings
+        and "mcp-config-empty" not in binding.capability_bindings
+        and len(binding.mcp_bindings) == 2
+        and {
+            item.rsplit("@sha256:", 1)[0] for item in binding.mcp_bindings
+        }
+        == {
+            "harness-operation-binding:semantic-mcp-catalog",
+            "harness-operation-binding:semantic-mcp-operation-bindings",
+        }
+        and all(
+            _is_sha256(item.rsplit("@sha256:", 1)[-1])
+            for item in binding.mcp_bindings
+        )
+        and not full_conformance_resources
+        and len(operation_binding_resources) == 2
+        and sum(
+            item.startswith("harness-artifact:operation-binding-contract:")
+            for item in operation_binding_resources
+        )
+        == 1
+        and sum(
+            item.startswith("harness-artifact:operation-binding-set:")
+            for item in operation_binding_resources
+        )
+        == 1
+        and all(
+            "@sha256:" in item
+            and _is_sha256(item.rsplit("@sha256:", 1)[-1])
+            for item in operation_binding_resources
+        )
+    )
+    legacy_full_conformance_valid = (
         stage in {"bundle", "reasoning"}
         and "harness-full-conformance-v1" in binding.capability_bindings
+        and "harness-operation-binding-v1" not in binding.capability_bindings
         and "semantic-mcp-resident" in binding.capability_bindings
         and "mcp-config-empty" not in binding.capability_bindings
         and len(binding.mcp_bindings) == 2
@@ -24727,6 +25561,7 @@ def _validated_runtime_binding(
             for item in binding.mcp_bindings
         )
         and len(full_conformance_resources) == 4
+        and not operation_binding_resources
         and sum(
             item.startswith(
                 "harness-artifact:full-conformance-contract:"
@@ -24760,28 +25595,55 @@ def _validated_runtime_binding(
         )
     )
     reasoning_binding_valid = stage == "reasoning" and (
-        full_conformance_valid
+        operation_binding_valid
+        or (
+            allow_legacy_full_conformance
+            and legacy_full_conformance_valid
+        )
         or (
             not binding.mcp_bindings
             and "harness-full-conformance-v1"
             not in binding.capability_bindings
+            and "harness-operation-binding-v1"
+            not in binding.capability_bindings
             and not full_conformance_resources
+            and not operation_binding_resources
+        )
+    )
+    bundle_binding_valid = stage == "bundle" and (
+        operation_binding_valid
+        or (
+            allow_legacy_full_conformance
+            and legacy_full_conformance_valid
         )
     )
     if (
-        (stage == "bundle" and not full_conformance_valid)
+        (stage == "bundle" and not bundle_binding_valid)
         or (stage == "reasoning" and not reasoning_binding_valid)
         or (stage not in {"bundle", "reasoning"} and binding.mcp_bindings)
         or (
             stage not in {"bundle", "reasoning"}
-            and "harness-full-conformance-v1" in binding.capability_bindings
+            and (
+                "harness-full-conformance-v1"
+                in binding.capability_bindings
+                or "harness-operation-binding-v1"
+                in binding.capability_bindings
+            )
         )
         or (
             stage not in {"bundle", "reasoning"}
-            and full_conformance_resources
+            and (full_conformance_resources or operation_binding_resources)
         )
         or any(
-            capability not in _IDEA_SAFE_CAPABILITIES
+            capability
+            not in (
+                _IDEA_SAFE_CAPABILITIES
+                | set(
+                    root_capability_profile(
+                        cast(RootAgentKind, stage)
+                    ).runtime_bindings()
+                )
+            )
             for capability in binding.capability_bindings
         )
         or any(
@@ -24814,14 +25676,57 @@ def _resolved_reviewed_draft(
     return outcome
 
 
+def _validate_bundle_advisory_review_contract(
+    review: dict[str, object],
+    *,
+    outcome: dict[str, object],
+    reviewed_draft: dict[str, object],
+) -> None:
+    """Validate the exact no-review Bundle payload used by new writes."""
+
+    if (
+        set(review)
+        != {
+            "schema_ref",
+            "review_mode",
+            "reviewer_agent_ref",
+            "reviewed_draft_hash",
+            "findings",
+            "dispositions",
+            "final_target_plan_hash",
+            "independent",
+            "advisory_only",
+        }
+        or review.get("schema_ref") != TARGET_PLAN_REVIEW_SCHEMA_REF
+        or review.get("review_mode") != "advisory_unobserved"
+        or review.get("reviewer_agent_ref") is not None
+        or review.get("findings") != []
+        or review.get("dispositions") != []
+        or review.get("independent") is not False
+        or review.get("advisory_only") is not True
+        or outcome != reviewed_draft
+        or review.get("reviewed_draft_hash")
+        != canonical_hash(reviewed_draft)
+        or review.get("final_target_plan_hash") != canonical_hash(outcome)
+    ):
+        raise OwnerConflict("attempt_review_provenance_invalid")
+
+
 def _validate_attempt_review_for_write(
-    review: dict[str, object], *, native_session_ref: str, stage: str = "idea"
-) -> str:
-    """Accept only the child-agent review contract for new AR executions.
+    review: dict[str, object],
+    *,
+    native_session_ref: str,
+    stage: str = "idea",
+    allow_legacy_child: bool = False,
+) -> str | None:
+    """Validate stage review provenance for new AR executions.
 
     Historical v1 reviews remain readable from their immutable execution
     payloads.  They are not a production write format: their
     ``reviewer_session_ref`` encoded the retired extra-Session topology.
+    Current Idea, Plan, Bundle, and Reasoning reviews may explicitly record that
+    no reviewer provenance was observed. ``allow_legacy_child`` is used only
+    while verifying immutable historical Reasoning checkpoints.
     """
 
     if stage == "idea" and review.get("schema_ref") == IDEA_REVIEW_SCHEMA_V1_REF:
@@ -24835,18 +25740,51 @@ def _validate_attempt_review_for_write(
     if expected_schema is None:
         raise OwnerConflict("stage_run_integrity_invalid")
     reviewer_agent_ref = review.get("reviewer_agent_ref")
-    if (
-        review.get("schema_ref") != expected_schema
-        or review.get("review_mode") != "harness_child_agent"
-        or not isinstance(reviewer_agent_ref, str)
-        or not reviewer_agent_ref.strip()
-        or len(reviewer_agent_ref) > 512
-        or reviewer_agent_ref == native_session_ref
-        or review.get("independent") is not True
-        or review.get("advisory_only") is not True
+    if stage == "bundle":
+        if (
+            set(review) != {
+                "schema_ref",
+                "review_mode",
+                "reviewer_agent_ref",
+                "reviewed_draft_hash",
+                "findings",
+                "dispositions",
+                "final_target_plan_hash",
+                "independent",
+                "advisory_only",
+            }
+            or review.get("schema_ref") != expected_schema
+            or review.get("review_mode") != "advisory_unobserved"
+            or reviewer_agent_ref is not None
+            or review.get("findings") != []
+            or review.get("dispositions") != []
+            or review.get("independent") is not False
+            or review.get("advisory_only") is not True
+        ):
+            raise OwnerConflict("attempt_review_provenance_invalid")
+        return None
+    if review.get("schema_ref") != expected_schema or (
+        review.get("advisory_only") is not True
     ):
-        raise OwnerConflict("attempt_review_independence_invalid")
-    return reviewer_agent_ref
+        raise OwnerConflict("attempt_review_provenance_invalid")
+    if review.get("review_mode") == "advisory_unobserved":
+        if (
+            reviewer_agent_ref is not None
+            or review.get("independent") is not False
+        ):
+            raise OwnerConflict("attempt_review_provenance_invalid")
+        return None
+    if allow_legacy_child and review.get("review_mode") == "harness_child_agent":
+        if (
+            not isinstance(reviewer_agent_ref, str)
+            or not reviewer_agent_ref.strip()
+            or len(reviewer_agent_ref) > 512
+            or reviewer_agent_ref == native_session_ref
+            or review.get("independent") is not True
+        ):
+            raise OwnerConflict("attempt_review_independence_invalid")
+        return reviewer_agent_ref
+    raise OwnerConflict("attempt_review_provenance_invalid")
 
 
 def _runtime_binding_from_row(
@@ -24896,7 +25834,9 @@ def _runtime_binding_from_row(
             schema_ref=value["schema_ref"],
         )
         binding, binding_json, binding_hash = _validated_runtime_binding(
-            binding, stage=row.stage
+            binding,
+            stage=row.stage,
+            allow_legacy_full_conformance=True,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise OwnerConflict("idea_runtime_binding_invalid") from error
@@ -25273,12 +26213,30 @@ def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
         or row.action not in {"dispatch", "wait", "replan_required"}
         or (
             row.action == "dispatch"
-            and sum(
-                item.get("target_ref") == row.selected_target_ref for item in frontier
+            and (
+                sum(
+                    item.get("target_ref") == row.selected_target_ref
+                    for item in frontier
+                )
+                != 1
+                or next(
+                    item
+                    for item in frontier
+                    if item.get("target_ref") == row.selected_target_ref
+                ).get("dispatch_allowed", True)
+                is not True
             )
-            != 1
         )
-        or (row.action != "dispatch" and row.selected_target_ref is not None)
+        or (
+            row.action != "dispatch"
+            and (
+                row.selected_target_ref is not None
+                or any(
+                    item.get("dispatch_allowed", True) is True
+                    for item in frontier
+                )
+            )
+        )
         or row.receipt_hash
         != _owner_receipt_hash(BUNDLE_DISPATCH_RECEIPT_KIND, row.decision_ref, bindings)
     ):
@@ -25907,8 +26865,14 @@ def _bundle_report_target_evidence(
                 connection, target_ref
             )
             if (
-                initial_handle != verified_root.handle
-                or handoff.handle_history != (verified_root.handle,)
+                initial_handle != verified_root.handle_history[0]
+                or handoff.handle_history != verified_root.handle_history
+                or handoff.code_review_preflights
+                or handoff.stop_decisions
+                or handoff.recovered_blockers
+                != verified_root.recovered_blockers
+                or handoff.recovery_evidence_refs
+                != verified_root.recovery_evidence_refs
                 or handoff.terminal != verified_root.terminal
                 or lifecycle_row.completion_ref
                 != transition.target_execution_closure_ref
@@ -25921,12 +26885,12 @@ def _bundle_report_target_evidence(
                 monitor=SimpleNamespace(snapshot_required=0),
                 candidate=candidate,
                 formal_plan=formal_plan,
-                handles=(verified_root.handle,),
+                handles=verified_root.handle_history,
                 preflights=(),
                 review_scopes=(),
                 stop_decisions=(),
-                recovered_blockers=(),
-                recovery_evidence_refs=(),
+                recovered_blockers=verified_root.recovered_blockers,
+                recovery_evidence_refs=verified_root.recovery_evidence_refs,
             )
         else:
             context = _target_handoff_context(
@@ -27365,6 +28329,9 @@ class _VerifiedTargetRootPublication:
     lifecycle: object
     completion: object
     handle: TargetWorkHandle
+    handle_history: tuple[TargetWorkHandle, ...]
+    recovered_blockers: tuple[TechnicalBlocker, ...]
+    recovery_evidence_refs: tuple[str, ...]
     terminal: AcceptedMeasurementClosure
     transition: AcceptedTargetCommitTransition
     completion_receipt: ReceiptProof
@@ -27395,13 +28362,29 @@ def _query_verified_target_root_publication(
     try:
         lifecycle = completion_reader.query(target_ref)
         completion = completion_reader.query_completion(target_ref)
+        history = completion_reader.query_handle_history(target_ref)
         handle = getattr(completion, "handle", None)
         receipt = getattr(completion, "receipt", None)
+        handle_history = getattr(history, "handle_history", None)
+        recovered_blockers = getattr(history, "recovered_blockers", None)
+        recovery_evidence_refs = getattr(
+            history, "recovery_evidence_refs", None
+        )
     except Exception as error:
         raise OwnerConflict(
             "target_root_completion_publication_authority_invalid"
         ) from error
-    if type(handle) is not TargetWorkHandle or type(receipt) is not AcceptanceReceipt:
+    if (
+        type(handle) is not TargetWorkHandle
+        or type(receipt) is not AcceptanceReceipt
+        or type(handle_history) is not tuple
+        or not handle_history
+        or any(type(item) is not TargetWorkHandle for item in handle_history)
+        or type(recovered_blockers) is not tuple
+        or any(type(item) is not TechnicalBlocker for item in recovered_blockers)
+        or type(recovery_evidence_refs) is not tuple
+        or any(type(item) is not str for item in recovery_evidence_refs)
+    ):
         raise OwnerConflict("target_root_completion_publication_authority_invalid")
     if (
         lifecycle is None
@@ -27417,6 +28400,11 @@ def _query_verified_target_root_publication(
         or getattr(lifecycle, "status", None) not in {"finalizing", "completed"}
         or getattr(completion, "completion_ref", None) != completion_ref
         or handle.target_ref != target_ref
+        or handle_history[-1] != handle
+        or any(item.target_ref != target_ref for item in handle_history)
+        or len(recovered_blockers) != len(handle_history) - 1
+        or recovery_evidence_refs
+        != tuple(sorted(set(recovery_evidence_refs)))
         or receipt.issuer != AR_OWNER
         or receipt.kind != TARGET_ROOT_COMPLETION_RECEIPT_KIND
         or receipt.subject_ref != handle.execution_attempt_ref
@@ -27462,6 +28450,9 @@ def _query_verified_target_root_publication(
         lifecycle=lifecycle,
         completion=completion,
         handle=handle,
+        handle_history=handle_history,
+        recovered_blockers=recovered_blockers,
+        recovery_evidence_refs=recovery_evidence_refs,
         terminal=terminal,
         transition=transition,
         completion_receipt=completion_receipt,

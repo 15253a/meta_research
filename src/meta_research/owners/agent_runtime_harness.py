@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from meta_research.runtime_protection import (
     record_runtime_boundary,
 )
 from meta_research.target_run_runtime_contract import (
+    TARGET_COMPLETION_BINDING_SCHEMA,
     TargetCompletionHandoff,
     TargetCompletionHandoffError,
     decode_target_completion_handoff,
@@ -46,6 +48,31 @@ _PROVIDER_CEILING_REASON_CODES = {
     "output_limit": "provider_output_limit",
     "descendant_process": "provider_descendant_process",
 }
+
+
+def target_provider_ceiling_recovery_ref(
+    *,
+    request_ref: str,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+    operation_ref: str,
+    failure_code: str,
+) -> str:
+    """Return the one stable recovery identity for a signed physical ceiling."""
+
+    if failure_code not in _PROVIDER_CEILING_CODES:
+        raise AgentRuntimeHarnessError("provider_ceiling_recovery_invalid")
+    return "harness_ceiling_recovery_" + canonical_hash(
+        {
+            "request_ref": request_ref,
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "fence_ref": fence_ref,
+            "operation_ref": operation_ref,
+            "failure_code": failure_code,
+        }
+    )
 
 
 class AgentRuntimeHarnessError(RuntimeError):
@@ -149,6 +176,37 @@ class AgentRuntimeTargetSuccessorReservation:
 
 
 @dataclass(frozen=True)
+class AgentRuntimeTargetProviderCeilingEvidence:
+    """Immutable signed transport ceiling behind one Target successor."""
+
+    recovery_ref: str
+    target_ref: str
+    target_run_ref: str
+    old_root_session_ref: str
+    old_attempt_ref: str
+    old_fence_ref: str
+    failed_operation_ref: str
+    failed_operation_generation: int
+    invocation_hash: str
+    failure_code: str
+    transport_receipt: dict[str, object]
+    transport_receipt_hash: str
+    evidence_ref: str
+    evidence_hash: str
+    runtime_effects: tuple[RuntimeEffectIdentity, ...]
+
+
+class TargetProviderCeilingReceiptVerifier(Protocol):
+    """Read-only verifier for one exact signed provider spool receipt."""
+
+    def verify_signed_transport_receipt(
+        self,
+        operation_ref: str,
+        receipt: object,
+    ) -> dict[str, object]: ...
+
+
+@dataclass(frozen=True)
 class TargetRootObservation:
     event_ref: str
     cursor: str
@@ -231,12 +289,20 @@ class TargetRootCompletionEvidence:
     operation_generation: int
     evidence_ref: str
     evidence_sequence: int
-    handoff: TargetCompletionHandoff
+    handoff: TargetCompletionHandoff | None
     observed_at: float
+    workspace_ref: str | None = None
+    final_text: str | None = None
+    final_text_sha256: str | None = None
 
 
 class AgentRuntimeHarnessInterface(Protocol):
     """AR-owned persistence seam for native Harness Typed Runs."""
+
+    def bind_target_provider_ceiling_receipt_verifier(
+        self,
+        verifier: TargetProviderCeilingReceiptVerifier,
+    ) -> None: ...
 
     def reserve_admission(
         self,
@@ -302,6 +368,23 @@ class AgentRuntimeHarnessInterface(Protocol):
         old_handle: TargetWorkHandle,
         recovery_ref: str,
     ) -> AgentRuntimeTargetSuccessorReservation: ...
+
+    def verify_target_provider_ceiling_successor(
+        self,
+        *,
+        old_handle: TargetWorkHandle,
+    ) -> tuple[
+        AgentRuntimeTargetSuccessorReservation,
+        AgentRuntimeTargetProviderCeilingEvidence,
+    ]: ...
+
+    def verify_target_provider_ceiling_history(
+        self,
+        *,
+        old_handle: TargetWorkHandle,
+        reservation: AgentRuntimeTargetSuccessorReservation,
+        evidence: AgentRuntimeTargetProviderCeilingEvidence,
+    ) -> AgentRuntimeTargetProviderCeilingEvidence: ...
 
     def query_request(self, run_ref: str) -> dict[str, object]: ...
 
@@ -371,7 +454,7 @@ class AgentRuntimeHarnessInterface(Protocol):
         self,
         handle: TargetWorkHandle,
         evidence: TargetRootCompletionEvidence,
-        handoff: TargetCompletionHandoff,
+        handoff: TargetCompletionHandoff | None,
     ) -> str: ...
 
     def complete_operation(
@@ -431,7 +514,27 @@ class SQLiteAgentRuntimeHarness:
     def __init__(self, database: Database, feed: DurableFeed) -> None:
         self._database = database
         self._feed = feed
+        self._target_provider_ceiling_receipt_verifier: (
+            TargetProviderCeilingReceiptVerifier | None
+        ) = None
         self._recover_interrupted_operations()
+
+    def bind_target_provider_ceiling_receipt_verifier(
+        self,
+        verifier: TargetProviderCeilingReceiptVerifier,
+    ) -> None:
+        if verifier is None or not callable(
+            getattr(verifier, "verify_signed_transport_receipt", None)
+        ):
+            raise AgentRuntimeHarnessError(
+                "provider_ceiling_receipt_verifier_invalid"
+            )
+        existing = self._target_provider_ceiling_receipt_verifier
+        if existing is not None and existing is not verifier:
+            raise AgentRuntimeHarnessError(
+                "provider_ceiling_receipt_verifier_conflict"
+            )
+        self._target_provider_ceiling_receipt_verifier = verifier
 
     def reserve_admission(
         self,
@@ -1378,7 +1481,7 @@ class SQLiteAgentRuntimeHarness:
         old_handle_json = canonical_json(old_handle_value)
         old_handle_hash = canonical_hash(old_handle_value)
         now = time.time()
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             row = connection.execute(
                 text(
                     "SELECT runs.*, bindings.target_ref AS bound_target_ref "
@@ -1391,12 +1494,21 @@ class SQLiteAgentRuntimeHarness:
             ).first()
             frontier = connection.execute(
                 text(
-                    "SELECT state, current_handle_json FROM "
+                    "SELECT state_revision, state, current_handle_json, "
+                    "current_handle_hash, terminal_fact_ref, "
+                    "currentness_known, current FROM "
                     "ar_target_frontier_entries WHERE target_ref = :target_ref"
                 ),
                 {"target_ref": None if row is None else row.bound_target_ref},
             ).first()
-            if row is None or frontier is None or frontier.state != "running":
+            if (
+                row is None
+                or frontier is None
+                or frontier.state != "running"
+                or frontier.terminal_fact_ref is not None
+                or bool(frontier.currentness_known) is not True
+                or bool(frontier.current) is not True
+            ):
                 raise AgentRuntimeHarnessError(
                     "target_harness_recovery_invalid"
                 )
@@ -1408,6 +1520,7 @@ class SQLiteAgentRuntimeHarness:
                 ) from error
             if (
                 frontier.current_handle_json != old_handle_json
+                or frontier.current_handle_hash != old_handle_hash
                 or canonical_hash(frontier_handle_value) != old_handle_hash
             ):
                 raise AgentRuntimeHarnessError("target_harness_recovery_stale")
@@ -1438,7 +1551,8 @@ class SQLiteAgentRuntimeHarness:
             ceiling_operation = (
                 connection.execute(
                     text(
-                        "SELECT status, outcome_code FROM "
+                        "SELECT operation_ref, generation, status, "
+                        "outcome_code FROM "
                         "ar_harness_provider_operations WHERE run_ref = "
                         ":run_ref ORDER BY generation DESC LIMIT 1"
                     ),
@@ -1454,6 +1568,33 @@ class SQLiteAgentRuntimeHarness:
                 and ceiling_operation.status == "failed"
                 and ceiling_operation.outcome_code == row.failure_code
             )
+            if ceiling_waiting:
+                expected_recovery_ref = target_provider_ceiling_recovery_ref(
+                    request_ref=str(row.request_ref),
+                    run_ref=str(row.run_ref),
+                    attempt_ref=str(row.attempt_ref),
+                    fence_ref=str(row.fence_ref),
+                    operation_ref=str(ceiling_operation.operation_ref),
+                    failure_code=str(row.failure_code),
+                )
+                evidence = self._query_target_provider_ceiling_evidence(
+                    expected_recovery_ref
+                )
+                if (
+                    recovery_ref != expected_recovery_ref
+                    or evidence is None
+                    or evidence.failed_operation_ref
+                    != str(ceiling_operation.operation_ref)
+                    or evidence.failed_operation_generation
+                    != int(ceiling_operation.generation)
+                    or evidence.failure_code != row.failure_code
+                    or evidence.old_root_session_ref != row.root_session_ref
+                    or evidence.old_attempt_ref != row.attempt_ref
+                    or evidence.old_fence_ref != row.fence_ref
+                ):
+                    raise AgentRuntimeHarnessError(
+                        "provider_ceiling_recovery_evidence_invalid"
+                    )
             if (
                 row.status not in {"admitted", "executed", "failed"}
                 and not ceiling_waiting
@@ -1503,7 +1644,7 @@ class SQLiteAgentRuntimeHarness:
                     ":root_session_ref, native_session_ref = NULL, fence_ref = "
                     ":fence_ref, mcp_binding_json = NULL, mcp_binding_hash = "
                     "NULL, profile_json = NULL, profile_hash = NULL, status = "
-                    "'admitting', failure_code = 'target_recovery_pending', "
+                    "'admitting', failure_code = :recovery_pending, "
                     "pending_recovery_ref = :recovery_ref, "
                     "pending_recovery_old_handle_json = :old_handle_json, "
                     "pending_recovery_old_handle_hash = :old_handle_hash, "
@@ -1511,7 +1652,10 @@ class SQLiteAgentRuntimeHarness:
                     "pending_recovery_binding_hash = :recovery_binding_hash, "
                     "completed_at = NULL, updated_at = :now WHERE run_ref = "
                     ":run_ref AND attempt_ref = :expected_attempt_ref AND "
-                    "fence_ref = :expected_fence_ref"
+                    "fence_ref = :expected_fence_ref AND status = "
+                    ":expected_status AND ((failure_code IS NULL AND "
+                    ":expected_failure_code IS NULL) OR failure_code = "
+                    ":expected_failure_code)"
                 ),
                 {
                     "attempt_ref": attempt_ref,
@@ -1522,15 +1666,73 @@ class SQLiteAgentRuntimeHarness:
                     "old_handle_json": old_handle_json,
                     "old_handle_hash": old_handle_hash,
                     "recovery_binding_hash": recovery_binding_hash,
+                    "recovery_pending": TARGET_ROOT_RECOVERY_PENDING_CODE,
                     "now": now,
                     "run_ref": target_run_ref,
                     "expected_attempt_ref": old_handle.execution_attempt_ref,
                     "expected_fence_ref": old_handle.execution_fence_ref,
+                    "expected_status": str(row.status),
+                    "expected_failure_code": row.failure_code,
                 },
             )
             if transition.rowcount != 1:
                 raise AgentRuntimeHarnessError(
                     "target_harness_recovery_conflict"
+                )
+            if ceiling_waiting:
+                assert ceiling_operation is not None
+                reservation = AgentRuntimeTargetSuccessorReservation(
+                    recovery_ref=recovery_ref,
+                    target_ref=str(row.bound_target_ref),
+                    target_run_ref=target_run_ref,
+                    old_handle_json=old_handle_json,
+                    old_handle_hash=old_handle_hash,
+                    new_root_session_ref=root_session_ref,
+                    new_attempt_ref=attempt_ref,
+                    new_fence_ref=fence_ref,
+                    generation=generation,
+                    binding_hash=recovery_binding_hash,
+                )
+                reservation_sequence = int(
+                    connection.execute(
+                        text(
+                            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM "
+                            "ar_harness_evidence_events WHERE operation_ref = "
+                            ":operation_ref"
+                        ),
+                        {
+                            "operation_ref": str(
+                                ceiling_operation.operation_ref
+                            )
+                        },
+                    ).scalar_one()
+                )
+                reservation_event = _target_successor_reservation_event(
+                    reservation=reservation,
+                    failed_operation_ref=str(
+                        ceiling_operation.operation_ref
+                    ),
+                    failure_code=str(row.failure_code),
+                    old_frontier_state_revision=int(frontier.state_revision),
+                    sequence=reservation_sequence,
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_harness_evidence_events (event_ref, "
+                        "operation_ref, sequence, summary_json, summary_hash, "
+                        "recorded_at) VALUES (:event_ref, :operation_ref, "
+                        ":sequence, :summary_json, :summary_hash, :recorded_at)"
+                    ),
+                    {
+                        "event_ref": reservation_event["event_ref"],
+                        "operation_ref": str(
+                            ceiling_operation.operation_ref
+                        ),
+                        "sequence": reservation_sequence,
+                        "summary_json": canonical_json(reservation_event),
+                        "summary_hash": canonical_hash(reservation_event),
+                        "recorded_at": now,
+                    },
                 )
             self._record_owner_change(
                 connection,
@@ -1598,12 +1800,7 @@ class SQLiteAgentRuntimeHarness:
         old_handle: TargetWorkHandle,
         recovery_ref: str,
     ) -> AgentRuntimeTargetSuccessorReservation:
-        """Verify an immutable reservation projection accepted at AR CAS.
-
-        The live run row owns only the pending/latest generation.  AR stores
-        this complete projection append-only with the recovery transition so
-        later generations cannot erase the historical issuer evidence.
-        """
+        """Verify one immutable reservation projection accepted at AR CAS."""
 
         if type(reservation) is not AgentRuntimeTargetSuccessorReservation or (
             not _reservation_matches(
@@ -1632,6 +1829,435 @@ class SQLiteAgentRuntimeHarness:
                 "target_harness_recovery_reservation_invalid"
             )
         return reservation
+
+    def _verify_target_provider_successor_reservation_evidence(
+        self,
+        reservation: AgentRuntimeTargetSuccessorReservation,
+        *,
+        old_handle: TargetWorkHandle,
+        recovery_ref: str,
+    ) -> AgentRuntimeTargetSuccessorReservation:
+        """Re-open the provider-ceiling issuer event and signed operation."""
+
+        self.verify_target_successor_reservation_evidence(
+            reservation,
+            old_handle=old_handle,
+            recovery_ref=recovery_ref,
+        )
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT events.event_ref, events.sequence, "
+                    "events.summary_json, events.summary_hash, "
+                    "operations.operation_ref, operations.run_ref, "
+                    "operations.generation AS operation_generation, "
+                    "operations.status AS operation_status, "
+                    "operations.outcome_code, runs.request_ref, "
+                    "admissions.target_ref FROM ar_harness_evidence_events "
+                    "AS events JOIN ar_harness_provider_operations AS "
+                    "operations ON operations.operation_ref = "
+                    "events.operation_ref JOIN ar_harness_runs AS runs ON "
+                    "runs.run_ref = operations.run_ref JOIN "
+                    "ar_target_harness_admissions AS admissions ON "
+                    "admissions.target_run_ref = runs.run_ref WHERE "
+                    "json_extract(events.summary_json, "
+                    "'$.target_successor_reservation.recovery_ref') = "
+                    ":recovery_ref"
+                ),
+                {"recovery_ref": recovery_ref},
+            ).all()
+        if len(rows) != 1:
+            raise AgentRuntimeHarnessError(
+                "target_harness_recovery_reservation_invalid"
+            )
+        row = rows[0]
+        try:
+            event = json.loads(str(row.summary_json))
+            value = event["target_successor_reservation"]
+            stored_value = value["successor_reservation"]
+            stored = AgentRuntimeTargetSuccessorReservation(
+                recovery_ref=stored_value["recovery_ref"],
+                target_ref=stored_value["target_ref"],
+                target_run_ref=stored_value["target_run_ref"],
+                old_handle_json=stored_value["old_handle_json"],
+                old_handle_hash=stored_value["old_handle_hash"],
+                new_root_session_ref=stored_value["new_root_session_ref"],
+                new_attempt_ref=stored_value["new_attempt_ref"],
+                new_fence_ref=stored_value["new_fence_ref"],
+                generation=stored_value["generation"],
+                binding_hash=stored_value["binding_hash"],
+            )
+            rebuilt = _target_successor_reservation_event(
+                reservation=stored,
+                failed_operation_ref=value["failed_operation_ref"],
+                failure_code=value["failure_code"],
+                old_frontier_state_revision=value[
+                    "old_frontier_state_revision"
+                ],
+                sequence=int(row.sequence),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise AgentRuntimeHarnessError(
+                "target_harness_recovery_reservation_invalid"
+            ) from error
+        if (
+            not isinstance(event, dict)
+            or not isinstance(value, dict)
+            or not isinstance(stored_value, dict)
+            or stored != reservation
+            or canonical_json(event) != str(row.summary_json)
+            or canonical_hash(event) != str(row.summary_hash)
+            or rebuilt != event
+            or rebuilt["event_ref"] != str(row.event_ref)
+            or row.operation_ref != value["failed_operation_ref"]
+            or row.run_ref != reservation.target_run_ref
+            or row.target_ref != reservation.target_ref
+            or row.operation_status != "failed"
+            or row.outcome_code != value["failure_code"]
+            or target_provider_ceiling_recovery_ref(
+                request_ref=str(row.request_ref),
+                run_ref=reservation.target_run_ref,
+                attempt_ref=old_handle.execution_attempt_ref,
+                fence_ref=old_handle.execution_fence_ref,
+                operation_ref=str(row.operation_ref),
+                failure_code=str(row.outcome_code),
+            )
+            != recovery_ref
+        ):
+            raise AgentRuntimeHarnessError(
+                "target_harness_recovery_reservation_invalid"
+            )
+        ceiling = self._query_target_provider_ceiling_evidence(recovery_ref)
+        if (
+            ceiling is None
+            or ceiling.failed_operation_ref != row.operation_ref
+            or ceiling.failed_operation_generation
+            != int(row.operation_generation)
+            or ceiling.failure_code != row.outcome_code
+            or ceiling.old_root_session_ref != old_handle.root_session_ref
+            or ceiling.old_attempt_ref != old_handle.execution_attempt_ref
+            or ceiling.old_fence_ref != old_handle.execution_fence_ref
+        ):
+            raise AgentRuntimeHarnessError(
+                "target_harness_recovery_reservation_invalid"
+            )
+        return reservation
+
+    def verify_target_provider_ceiling_successor(
+        self,
+        *,
+        old_handle: TargetWorkHandle,
+    ) -> tuple[
+        AgentRuntimeTargetSuccessorReservation,
+        AgentRuntimeTargetProviderCeilingEvidence,
+    ]:
+        """Re-open the exact signed ceiling before AR may replace its handle."""
+
+        if type(old_handle) is not TargetWorkHandle:
+            raise AgentRuntimeHarnessError("provider_ceiling_recovery_invalid")
+        reservation = self.query_target_successor_reservation(
+            old_handle.target_run_ref
+        )
+        if reservation is None:
+            raise AgentRuntimeHarnessError(
+                "target_harness_recovery_reservation_invalid"
+            )
+        self._verify_target_provider_successor_reservation_evidence(
+            reservation,
+            old_handle=old_handle,
+            recovery_ref=reservation.recovery_ref,
+        )
+        evidence = self._query_target_provider_ceiling_evidence(
+            reservation.recovery_ref
+        )
+        run = self.query_target_run_by_ref(old_handle.target_run_ref)
+        if (
+            evidence is None
+            or run is None
+            or evidence.target_ref != old_handle.target_ref
+            or evidence.target_run_ref != old_handle.target_run_ref
+            or evidence.old_root_session_ref != old_handle.root_session_ref
+            or evidence.old_attempt_ref
+            != old_handle.execution_attempt_ref
+            or evidence.old_fence_ref != old_handle.execution_fence_ref
+            or (
+                run.root_session_ref,
+                run.attempt_ref,
+                run.fence_ref,
+            )
+            != (
+                reservation.new_root_session_ref,
+                reservation.new_attempt_ref,
+                reservation.new_fence_ref,
+            )
+            or run.status not in {"admitting", "admitted"}
+            or run.failure_code
+            not in {
+                TARGET_ROOT_RECOVERY_PENDING_CODE,
+                TARGET_ROOT_RECOVERY_READY_CODE,
+            }
+        ):
+            raise AgentRuntimeHarnessError(
+                "provider_ceiling_recovery_evidence_invalid"
+            )
+        return reservation, evidence
+
+    def verify_target_provider_ceiling_history(
+        self,
+        *,
+        old_handle: TargetWorkHandle,
+        reservation: AgentRuntimeTargetSuccessorReservation,
+        evidence: AgentRuntimeTargetProviderCeilingEvidence,
+    ) -> AgentRuntimeTargetProviderCeilingEvidence:
+        """Reverify a persisted root recovery without trusting its row strings."""
+
+        self._verify_target_provider_successor_reservation_evidence(
+            reservation,
+            old_handle=old_handle,
+            recovery_ref=reservation.recovery_ref,
+        )
+        current = self._query_target_provider_ceiling_evidence(
+            reservation.recovery_ref
+        )
+        if (
+            current is None
+            or current != evidence
+            or current.target_ref != old_handle.target_ref
+            or current.target_run_ref != old_handle.target_run_ref
+            or current.old_root_session_ref != old_handle.root_session_ref
+            or current.old_attempt_ref != old_handle.execution_attempt_ref
+            or current.old_fence_ref != old_handle.execution_fence_ref
+        ):
+            raise AgentRuntimeHarnessError(
+                "provider_ceiling_recovery_evidence_invalid"
+            )
+        return current
+
+    def _query_target_provider_ceiling_evidence(
+        self, recovery_ref: str
+    ) -> AgentRuntimeTargetProviderCeilingEvidence | None:
+        if not isinstance(recovery_ref, str) or not recovery_ref:
+            raise AgentRuntimeHarnessError(
+                "provider_ceiling_recovery_evidence_invalid"
+            )
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT events.event_ref, events.sequence, "
+                    "events.summary_json, events.summary_hash, "
+                    "operations.run_ref, operations.generation, "
+                    "operations.invocation_hash, operations.status AS "
+                    "operation_status, operations.outcome_code, "
+                    "runs.request_ref, admissions.target_ref FROM "
+                    "ar_harness_evidence_events AS events JOIN "
+                    "ar_harness_provider_operations AS operations ON "
+                    "operations.operation_ref = events.operation_ref JOIN "
+                    "ar_harness_runs AS runs ON runs.run_ref = "
+                    "operations.run_ref JOIN ar_target_harness_admissions AS "
+                    "admissions ON admissions.target_run_ref = runs.run_ref "
+                    "WHERE json_extract(events.summary_json, "
+                    "'$.target_provider_ceiling.recovery_ref') = :recovery_ref"
+                ),
+                {"recovery_ref": recovery_ref},
+            ).all()
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                )
+            row = rows[0]
+            try:
+                event = json.loads(str(row.summary_json))
+            except (TypeError, ValueError) as error:
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                ) from error
+            if not isinstance(event, dict):
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                )
+            value = event.get("target_provider_ceiling")
+            if not isinstance(value, dict):
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                )
+            effect_values = value.get("runtime_effects")
+            receipt = value.get("transport_receipt")
+            if not isinstance(effect_values, list) or not isinstance(receipt, dict):
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                )
+            try:
+                effects = tuple(
+                    RuntimeEffectIdentity(
+                        responsibility_ref=str(item["responsibility_ref"]),
+                        owner_scope=str(item["owner_scope"]),
+                        root_run_ref=str(item["root_run_ref"]),
+                        attempt_ref=cast(str | None, item["attempt_ref"]),
+                        fence_ref=cast(str | None, item["fence_ref"]),
+                        operation_ref=str(item["operation_ref"]),
+                        effect_kind=str(item["effect_kind"]),
+                    )
+                    for item in effect_values
+                    if isinstance(item, dict)
+                )
+                rebuilt = _target_provider_ceiling_evidence_event(
+                    recovery_ref=str(value["recovery_ref"]),
+                    target_ref=str(value["target_ref"]),
+                    target_run_ref=str(value["target_run_ref"]),
+                    old_root_session_ref=str(value["old_root_session_ref"]),
+                    old_attempt_ref=str(value["old_attempt_ref"]),
+                    old_fence_ref=str(value["old_fence_ref"]),
+                    failed_operation_ref=str(value["failed_operation_ref"]),
+                    failed_operation_generation=int(
+                        value["failed_operation_generation"]
+                    ),
+                    invocation_hash=str(value["invocation_hash"]),
+                    failure_code=str(value["failure_code"]),
+                    transport_receipt=cast(dict[str, object], receipt),
+                    runtime_effects=effects,
+                    sequence=int(row.sequence),
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                ) from error
+            if (
+                len(effects) != len(effect_values)
+                or value.get("schema_ref")
+                != "meta-research/target-provider-ceiling-evidence/v1"
+                or canonical_json(event) != str(row.summary_json)
+                or canonical_hash(event) != str(row.summary_hash)
+                or rebuilt != event
+                or rebuilt["event_ref"] != str(row.event_ref)
+                or value.get("recovery_ref") != recovery_ref
+                or value.get("target_ref") != str(row.target_ref)
+                or value.get("target_run_ref") != str(row.run_ref)
+                or value.get("failed_operation_ref")
+                != str(effects[0].operation_ref)
+                or value.get("failed_operation_generation")
+                != int(row.generation)
+                or value.get("invocation_hash") != str(row.invocation_hash)
+                or row.operation_status != "failed"
+                or value.get("failure_code") != row.outcome_code
+                or value.get("transport_receipt_hash")
+                != canonical_hash(receipt)
+                or _verified_provider_ceiling_code(receipt) != row.outcome_code
+                or target_provider_ceiling_recovery_ref(
+                    request_ref=str(row.request_ref),
+                    run_ref=str(row.run_ref),
+                    attempt_ref=str(value.get("old_attempt_ref")),
+                    fence_ref=str(value.get("old_fence_ref")),
+                    operation_ref=str(value.get("failed_operation_ref")),
+                    failure_code=str(value.get("failure_code")),
+                )
+                != recovery_ref
+            ):
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                )
+            verifier = self._target_provider_ceiling_receipt_verifier
+            if verifier is None:
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                )
+            try:
+                verified_receipt = verifier.verify_signed_transport_receipt(
+                    str(value["failed_operation_ref"]),
+                    receipt,
+                )
+            except Exception as error:
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                ) from error
+            if verified_receipt != receipt:
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_evidence_invalid"
+                )
+            receipt_hash = canonical_hash(receipt)
+            for effect in effects:
+                _validate_provider_ceiling_effect(
+                    effect,
+                    run_ref=str(row.run_ref),
+                    attempt_ref=str(value["old_attempt_ref"]),
+                    fence_ref=str(value["old_fence_ref"]),
+                    operation_ref=str(value["failed_operation_ref"]),
+                )
+                boundary = connection.execute(
+                    text(
+                        "SELECT boundaries.*, responsibilities.effect_kind "
+                        "FROM ar_runtime_boundary_receipts AS boundaries JOIN "
+                        "ar_execution_responsibilities AS responsibilities ON "
+                        "responsibilities.responsibility_ref = "
+                        "boundaries.responsibility_ref WHERE "
+                        "boundaries.responsibility_ref = :responsibility_ref"
+                    ),
+                    {"responsibility_ref": effect.responsibility_ref},
+                ).first()
+                owner_evidence_ref = "harness_provider_ceiling_" + canonical_hash(
+                    {
+                        "responsibility_ref": effect.responsibility_ref,
+                        "failure_code": value["failure_code"],
+                        "transport_receipt_hash": receipt_hash,
+                    }
+                )
+                boundary_material = {
+                    "schema_ref": "meta-research/runtime-boundary-receipt/v1",
+                    "responsibility_ref": effect.responsibility_ref,
+                    "owner_scope": effect.owner_scope,
+                    "root_run_ref": effect.root_run_ref,
+                    "attempt_ref": effect.attempt_ref,
+                    "fence_ref": effect.fence_ref,
+                    "operation_ref": effect.operation_ref,
+                    "effect_kind": effect.effect_kind,
+                    "boundary": "permanent_fence",
+                    "checkpoint_ref": None,
+                    "owner_evidence_ref": owner_evidence_ref,
+                }
+                if boundary is None or (
+                    boundary.owner_scope,
+                    boundary.root_run_ref,
+                    boundary.attempt_ref,
+                    boundary.fence_ref,
+                    boundary.operation_ref,
+                    boundary.effect_kind,
+                    boundary.boundary,
+                    boundary.checkpoint_ref,
+                    boundary.owner_evidence_ref,
+                    boundary.evidence_hash,
+                ) != (
+                    effect.owner_scope,
+                    effect.root_run_ref,
+                    effect.attempt_ref,
+                    effect.fence_ref,
+                    effect.operation_ref,
+                    effect.effect_kind,
+                    "permanent_fence",
+                    None,
+                    owner_evidence_ref,
+                    canonical_hash(boundary_material),
+                ):
+                    raise AgentRuntimeHarnessError(
+                        "provider_ceiling_recovery_evidence_invalid"
+                    )
+        return AgentRuntimeTargetProviderCeilingEvidence(
+            recovery_ref=recovery_ref,
+            target_ref=str(value["target_ref"]),
+            target_run_ref=str(value["target_run_ref"]),
+            old_root_session_ref=str(value["old_root_session_ref"]),
+            old_attempt_ref=str(value["old_attempt_ref"]),
+            old_fence_ref=str(value["old_fence_ref"]),
+            failed_operation_ref=str(value["failed_operation_ref"]),
+            failed_operation_generation=int(value["failed_operation_generation"]),
+            invocation_hash=str(value["invocation_hash"]),
+            failure_code=str(value["failure_code"]),
+            transport_receipt=cast(dict[str, object], receipt),
+            transport_receipt_hash=canonical_hash(receipt),
+            evidence_ref=str(row.event_ref),
+            evidence_hash=str(row.summary_hash),
+            runtime_effects=effects,
+        )
 
     def query_request(self, run_ref: str) -> dict[str, object]:
         run = self.query_run_by_ref(run_ref)
@@ -1907,7 +2533,10 @@ class SQLiteAgentRuntimeHarness:
             row = connection.execute(
                 text(
                     "SELECT operations.run_ref, operations.generation, "
-                    "runs.request_ref, runs.attempt_ref, runs.fence_ref, "
+                    "runs.request_ref, runs.attempt_ref, "
+                    "runs.root_session_ref, runs.fence_ref, "
+                    "runs.harness_family, runs.profile_json, "
+                    "runs.profile_hash, "
                     "bindings.target_ref FROM "
                     "ar_harness_provider_operations AS operations JOIN "
                     "ar_harness_runs AS runs ON runs.run_ref = "
@@ -1952,10 +2581,60 @@ class SQLiteAgentRuntimeHarness:
                 raise AgentRuntimeHarnessError(
                     "harness_operation_state_conflict"
                 )
+            failure_profile_json: str | None = None
+            failure_profile_hash: str | None = None
+            if terminal_ceiling:
+                assert transport_receipt is not None
+                prior_profile = _profile_from_row(row)
+                failure_profile = (
+                    dict(prior_profile)
+                    if prior_profile is not None
+                    else {
+                        "schema_ref": (
+                            "meta-research/harness-failed-transport-profile/v1"
+                        ),
+                        "harness_family": str(row.harness_family),
+                        "run_ref": str(row.run_ref),
+                    }
+                )
+                prior_receipts = failure_profile.get(
+                    "provider_transport_receipts"
+                )
+                if prior_receipts is None:
+                    receipt_rows: list[object] = []
+                elif isinstance(prior_receipts, list):
+                    receipt_rows = list(prior_receipts)
+                else:
+                    raise AgentRuntimeHarnessError(
+                        "harness_profile_corrupt"
+                    )
+                receipt_row = {
+                    "provider_operation_ref": operation_ref,
+                    **transport_receipt,
+                }
+                existing_receipts = [
+                    item
+                    for item in receipt_rows
+                    if isinstance(item, dict)
+                    and item.get("provider_operation_ref") == operation_ref
+                ]
+                if existing_receipts and existing_receipts != [receipt_row]:
+                    raise AgentRuntimeHarnessError(
+                        "harness_profile_conflict"
+                    )
+                if not existing_receipts:
+                    receipt_rows.append(receipt_row)
+                failure_profile["provider_transport_receipts"] = receipt_rows
+                failure_profile_json = canonical_json(failure_profile)
+                failure_profile_hash = canonical_hash(failure_profile)
             connection.execute(
                 text(
                     "UPDATE ar_harness_runs SET status = :status, failure_code "
-                    "= :code, updated_at = :now, completed_at = :completed_at "
+                    "= :code, profile_json = CASE WHEN :profile_json IS NULL "
+                    "THEN profile_json ELSE :profile_json END, profile_hash = "
+                    "CASE WHEN :profile_hash IS NULL THEN profile_hash ELSE "
+                    ":profile_hash END, updated_at = :now, completed_at = "
+                    ":completed_at "
                     "WHERE run_ref = :run_ref"
                 ),
                 {
@@ -1964,6 +2643,8 @@ class SQLiteAgentRuntimeHarness:
                     "now": now,
                     "completed_at": None if unknown else now,
                     "run_ref": str(row.run_ref),
+                    "profile_json": failure_profile_json,
+                    "profile_hash": failure_profile_hash,
                 },
             )
             self._record_owner_change(
@@ -1978,6 +2659,7 @@ class SQLiteAgentRuntimeHarness:
             )
             if terminal_ceiling:
                 assert runtime_effect is not None
+                assert transport_receipt is not None
                 receipt_hash = canonical_hash(transport_receipt)
                 for effect in (runtime_effect, *predecessor_effects):
                     record_runtime_boundary(
@@ -1992,6 +2674,69 @@ class SQLiteAgentRuntimeHarness:
                                 "transport_receipt_hash": receipt_hash,
                             }
                         ),
+                    )
+                if row.target_ref is not None:
+                    recovery_ref = target_provider_ceiling_recovery_ref(
+                        request_ref=str(row.request_ref),
+                        run_ref=str(row.run_ref),
+                        attempt_ref=str(row.attempt_ref),
+                        fence_ref=str(row.fence_ref),
+                        operation_ref=operation_ref,
+                        failure_code=code,
+                    )
+                    evidence_sequence = int(
+                        connection.execute(
+                            text(
+                                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM "
+                                "ar_harness_evidence_events WHERE "
+                                "operation_ref = :operation_ref"
+                            ),
+                            {"operation_ref": operation_ref},
+                        ).scalar_one()
+                    )
+                    evidence = _target_provider_ceiling_evidence_event(
+                        recovery_ref=recovery_ref,
+                        target_ref=str(row.target_ref),
+                        target_run_ref=str(row.run_ref),
+                        old_root_session_ref=str(row.root_session_ref),
+                        old_attempt_ref=str(row.attempt_ref),
+                        old_fence_ref=str(row.fence_ref),
+                        failed_operation_ref=operation_ref,
+                        failed_operation_generation=int(row.generation),
+                        invocation_hash=str(
+                            connection.execute(
+                                text(
+                                    "SELECT invocation_hash FROM "
+                                    "ar_harness_provider_operations WHERE "
+                                    "operation_ref = :operation_ref"
+                                ),
+                                {"operation_ref": operation_ref},
+                            ).scalar_one()
+                        ),
+                        failure_code=code,
+                        transport_receipt=transport_receipt,
+                        runtime_effects=(
+                            runtime_effect,
+                            *predecessor_effects,
+                        ),
+                        sequence=evidence_sequence,
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_harness_evidence_events "
+                            "(event_ref, operation_ref, sequence, "
+                            "summary_json, summary_hash, recorded_at) VALUES "
+                            "(:event_ref, :operation_ref, :sequence, "
+                            ":summary_json, :summary_hash, :recorded_at)"
+                        ),
+                        {
+                            "event_ref": evidence["event_ref"],
+                            "operation_ref": operation_ref,
+                            "sequence": evidence_sequence,
+                            "summary_json": canonical_json(evidence),
+                            "summary_hash": canonical_hash(evidence),
+                            "recorded_at": now,
+                        },
                     )
                 self._feed.record(
                     connection,
@@ -2592,9 +3337,6 @@ class SQLiteAgentRuntimeHarness:
         if not root_messages:
             return None
         candidate_row, candidate_event = root_messages[-1]
-        candidate = candidate_event.get("target_root_completion_candidate")
-        if not isinstance(candidate, dict):
-            return None
         last_row, last_event = decoded_rows[-1]
         if (
             last_event.get("target_root_terminal") is not True
@@ -2606,17 +3348,112 @@ class SQLiteAgentRuntimeHarness:
             raise AgentRuntimeHarnessError(
                 "target_root_completion_evidence_invalid"
             )
-        try:
-            handoff = decode_target_completion_handoff(canonical_json(candidate))
-            validate_target_completion_handoff(
-                handoff,
-                expected_target_ref=target_ref,
-                expected_target_run_ref=str(run.run_ref),
+        binding = candidate_event.get("target_root_completion_binding")
+        handoff: TargetCompletionHandoff | None = None
+        workspace_ref: str | None = None
+        final_text: str | None = None
+        final_text_sha256: str | None = None
+        if isinstance(binding, dict):
+            scope = candidate_event.get("target_run_scope")
+            final_text = binding.get("final_text")
+            final_text_sha256 = binding.get("final_text_sha256")
+            final_text_bytes = binding.get("final_text_bytes")
+            workspace_ref = binding.get("workspace_ref")
+            scope_workspace_ref = (
+                scope.get("target_workspace_ref")
+                if isinstance(scope, dict)
+                else None
             )
-        except TargetCompletionHandoffError as error:
-            raise AgentRuntimeHarnessError(
-                "target_root_completion_evidence_invalid"
-            ) from error
+            try:
+                encoded_final_text = (
+                    final_text.encode("utf-8")
+                    if isinstance(final_text, str)
+                    else b""
+                )
+            except UnicodeError as error:
+                raise AgentRuntimeHarnessError(
+                    "target_root_completion_evidence_invalid"
+                ) from error
+            if (
+                set(binding)
+                != {
+                    "schema_ref",
+                    "final_text",
+                    "final_text_sha256",
+                    "final_text_bytes",
+                    "workspace_ref",
+                }
+                or binding.get("schema_ref")
+                != TARGET_COMPLETION_BINDING_SCHEMA
+                or not encoded_final_text
+                or not isinstance(final_text_bytes, int)
+                or isinstance(final_text_bytes, bool)
+                or final_text_bytes != len(encoded_final_text)
+                or not isinstance(final_text_sha256, str)
+                or final_text_sha256
+                != hashlib.sha256(encoded_final_text).hexdigest()
+                or not isinstance(workspace_ref, str)
+                or not workspace_ref
+                or scope_workspace_ref != workspace_ref
+                or not isinstance(last_event.get("target_run_scope"), dict)
+                or last_event["target_run_scope"].get(
+                    "target_workspace_ref"
+                )
+                != workspace_ref
+            ):
+                raise AgentRuntimeHarnessError(
+                    "target_root_completion_evidence_invalid"
+                )
+        else:
+            if "target_root_completion_binding" in candidate_event:
+                raise AgentRuntimeHarnessError(
+                    "target_root_completion_evidence_invalid"
+                )
+            # Historical/restart compatibility only.  New provider turns emit
+            # a system-owned text binding and never require an agent envelope.
+            candidate = candidate_event.get(
+                "target_root_completion_candidate"
+            )
+            result_candidate = candidate_event.get(
+                "target_root_completion_result_candidate"
+            )
+            if not isinstance(candidate, dict) and isinstance(
+                result_candidate, dict
+            ):
+                candidate = {
+                    "schema_ref": "meta-research/target-completion-handoff/v1",
+                    "target_ref": target_ref,
+                    "target_run_ref": str(run.run_ref),
+                    "status": "completed",
+                    **result_candidate,
+                }
+            if not isinstance(candidate, dict):
+                if candidate_event.get(
+                    "target_root_completion_binding_error"
+                ) is not None:
+                    raise AgentRuntimeHarnessError(
+                        "target_root_completion_evidence_invalid"
+                    )
+                if candidate_event.get(
+                    "target_root_completion_candidate_error"
+                ) == "target_completion_handoff_invalid":
+                    raise AgentRuntimeHarnessError(
+                        "target_root_completion_handoff_invalid"
+                    )
+                return None
+            try:
+                handoff = decode_target_completion_handoff(
+                    canonical_json(candidate)
+                )
+                validate_target_completion_handoff(
+                    handoff,
+                    expected_target_ref=target_ref,
+                    expected_target_run_ref=str(run.run_ref),
+                )
+            except TargetCompletionHandoffError as error:
+                raise AgentRuntimeHarnessError(
+                    "target_root_completion_evidence_invalid"
+                ) from error
         return TargetRootCompletionEvidence(
             target_ref=target_ref,
             target_run_ref=str(run.run_ref),
@@ -2631,20 +3468,26 @@ class SQLiteAgentRuntimeHarness:
             evidence_sequence=int(candidate_row.sequence),
             handoff=handoff,
             observed_at=float(candidate_row.recorded_at),
+            workspace_ref=workspace_ref,
+            final_text=final_text,
+            final_text_sha256=final_text_sha256,
         )
 
     def verify_target_root_completion_evidence(
         self,
         handle: TargetWorkHandle,
         evidence: TargetRootCompletionEvidence,
-        handoff: TargetCompletionHandoff,
+        handoff: TargetCompletionHandoff | None,
     ) -> str:
         """Re-open the issuer ledger and bind finalization to exact evidence."""
 
         if (
             type(handle) is not TargetWorkHandle
             or type(evidence) is not TargetRootCompletionEvidence
-            or type(handoff) is not TargetCompletionHandoff
+            or (
+                handoff is not None
+                and type(handoff) is not TargetCompletionHandoff
+            )
         ):
             raise AgentRuntimeHarnessError(
                 "target_root_completion_evidence_invalid"
@@ -2659,8 +3502,21 @@ class SQLiteAgentRuntimeHarness:
             or current.root_session_ref != handle.root_session_ref
             or current.attempt_ref != handle.execution_attempt_ref
             or current.fence_ref != handle.execution_fence_ref
-            or handoff.target_ref != handle.target_ref
-            or handoff.target_run_ref != handle.target_run_ref
+            or (
+                handoff is not None
+                and (
+                    handoff.target_ref != handle.target_ref
+                    or handoff.target_run_ref != handle.target_run_ref
+                )
+            )
+            or (
+                handoff is None
+                and (
+                    current.workspace_ref is None
+                    or current.final_text is None
+                    or current.final_text_sha256 is None
+                )
+            )
         ):
             raise AgentRuntimeHarnessError(
                 "target_root_completion_evidence_invalid"
@@ -3192,7 +4048,9 @@ def _target_root_scope_matches(
     value: object,
     expected_scope: dict[str, object],
 ) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict):
+        return False
+    base_fields = {
         "schema_ref",
         "target_run_ref",
         "attempt_ref",
@@ -3200,10 +4058,20 @@ def _target_root_scope_matches(
         "root_session_ref",
         "fence_ref",
         "native_session_ref",
+    }
+    schema_ref = value.get("schema_ref")
+    if (
+        schema_ref == "meta-research/target-root-observation-scope/v1"
+        and set(value) != base_fields
+    ) or (
+        schema_ref == "meta-research/target-root-observation-scope/v2"
+        and set(value) != base_fields | {"target_workspace_ref"}
+    ) or schema_ref not in {
+        "meta-research/target-root-observation-scope/v1",
+        "meta-research/target-root-observation-scope/v2",
     }:
         return False
     for field in (
-        "schema_ref",
         "target_run_ref",
         "attempt_ref",
         "attempt_generation",
@@ -3212,6 +4080,12 @@ def _target_root_scope_matches(
     ):
         if value.get(field) != expected_scope.get(field):
             return False
+    workspace_ref = value.get("target_workspace_ref")
+    if schema_ref == "meta-research/target-root-observation-scope/v2" and not (
+        workspace_ref is None
+        or (isinstance(workspace_ref, str) and bool(workspace_ref))
+    ):
+        return False
     native_session_ref = value.get("native_session_ref")
     expected_native = expected_scope.get("native_session_ref")
     return native_session_ref is None or native_session_ref == expected_native
@@ -3529,6 +4403,72 @@ def _reservation_matches(
     )
 
 
+def _target_successor_reservation_event(
+    *,
+    reservation: AgentRuntimeTargetSuccessorReservation,
+    failed_operation_ref: str,
+    failure_code: str,
+    old_frontier_state_revision: int,
+    sequence: int,
+) -> dict[str, object]:
+    if (
+        type(reservation) is not AgentRuntimeTargetSuccessorReservation
+        or not all(
+            isinstance(value, str) and value
+            for value in (
+                reservation.recovery_ref,
+                reservation.target_ref,
+                reservation.target_run_ref,
+                reservation.old_handle_json,
+                reservation.old_handle_hash,
+                reservation.new_root_session_ref,
+                reservation.new_attempt_ref,
+                reservation.new_fence_ref,
+                reservation.binding_hash,
+                failed_operation_ref,
+            )
+        )
+        or len(reservation.old_handle_hash) != 64
+        or len(reservation.binding_hash) != 64
+        or failure_code not in _PROVIDER_CEILING_CODES
+        or not isinstance(reservation.generation, int)
+        or isinstance(reservation.generation, bool)
+        or reservation.generation < 2
+        or not isinstance(old_frontier_state_revision, int)
+        or isinstance(old_frontier_state_revision, bool)
+        or old_frontier_state_revision < 1
+        or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 1
+    ):
+        raise AgentRuntimeHarnessError(
+            "target_harness_recovery_reservation_invalid"
+        )
+    reservation_value = projection_plain_value(reservation)
+    event_ref = "harness_successor:" + canonical_hash(
+        {
+            "recovery_ref": reservation.recovery_ref,
+            "binding_hash": reservation.binding_hash,
+            "failed_operation_ref": failed_operation_ref,
+        }
+    )
+    return {
+        "event_ref": event_ref,
+        "sequence": sequence,
+        "kind": "target_successor_reservation",
+        "target_successor_reservation": {
+            "schema_ref": (
+                "meta-research/target-successor-reservation-evidence/v1"
+            ),
+            "recovery_ref": reservation.recovery_ref,
+            "failed_operation_ref": failed_operation_ref,
+            "failure_code": failure_code,
+            "old_frontier_state_revision": old_frontier_state_revision,
+            "successor_reservation": reservation_value,
+        },
+    }
+
+
 def _verified_provider_ceiling_code(
     receipt: dict[str, object] | None,
 ) -> str | None:
@@ -3561,6 +4501,95 @@ def _verified_provider_ceiling_code(
     ):
         return None
     return _PROVIDER_CEILING_REASON_CODES.get(reason)
+
+
+def _target_provider_ceiling_evidence_event(
+    *,
+    recovery_ref: str,
+    target_ref: str,
+    target_run_ref: str,
+    old_root_session_ref: str,
+    old_attempt_ref: str,
+    old_fence_ref: str,
+    failed_operation_ref: str,
+    failed_operation_generation: int,
+    invocation_hash: str,
+    failure_code: str,
+    transport_receipt: dict[str, object],
+    runtime_effects: tuple[RuntimeEffectIdentity, ...],
+    sequence: int,
+) -> dict[str, object]:
+    if (
+        not all(
+            isinstance(value, str) and value
+            for value in (
+                recovery_ref,
+                target_ref,
+                target_run_ref,
+                old_root_session_ref,
+                old_attempt_ref,
+                old_fence_ref,
+                failed_operation_ref,
+            )
+        )
+        or not isinstance(failed_operation_generation, int)
+        or isinstance(failed_operation_generation, bool)
+        or failed_operation_generation < 1
+        or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 1
+        or len(invocation_hash) != 64
+        or _verified_provider_ceiling_code(transport_receipt) != failure_code
+        or not runtime_effects
+    ):
+        raise AgentRuntimeHarnessError("provider_ceiling_evidence_invalid")
+    effect_values = [
+        {
+            "responsibility_ref": effect.responsibility_ref,
+            "owner_scope": effect.owner_scope,
+            "root_run_ref": effect.root_run_ref,
+            "attempt_ref": effect.attempt_ref,
+            "fence_ref": effect.fence_ref,
+            "operation_ref": effect.operation_ref,
+            "effect_kind": effect.effect_kind,
+        }
+        for effect in runtime_effects
+    ]
+    if len({item["responsibility_ref"] for item in effect_values}) != len(
+        effect_values
+    ):
+        raise AgentRuntimeHarnessError("provider_ceiling_evidence_invalid")
+    receipt_hash = canonical_hash(transport_receipt)
+    evidence_ref = "harness_ceiling:" + canonical_hash(
+        {
+            "recovery_ref": recovery_ref,
+            "failed_operation_ref": failed_operation_ref,
+            "transport_receipt_hash": receipt_hash,
+        }
+    )
+    return {
+        "event_ref": evidence_ref,
+        "sequence": sequence,
+        "kind": "target_provider_ceiling",
+        "target_provider_ceiling": {
+            "schema_ref": (
+                "meta-research/target-provider-ceiling-evidence/v1"
+            ),
+            "recovery_ref": recovery_ref,
+            "target_ref": target_ref,
+            "target_run_ref": target_run_ref,
+            "old_root_session_ref": old_root_session_ref,
+            "old_attempt_ref": old_attempt_ref,
+            "old_fence_ref": old_fence_ref,
+            "failed_operation_ref": failed_operation_ref,
+            "failed_operation_generation": failed_operation_generation,
+            "invocation_hash": invocation_hash,
+            "failure_code": failure_code,
+            "transport_receipt": transport_receipt,
+            "transport_receipt_hash": receipt_hash,
+            "runtime_effects": effect_values,
+        },
+    }
 
 
 def _validate_provider_ceiling_effect(

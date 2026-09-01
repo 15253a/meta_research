@@ -2,8 +2,8 @@
 
 This request is a presentation, not a report renamed to `.pptx`. The shared
 Writing rules above still govern evidence, citation markers, the frozen
-Snapshot, lineage, and fresh-context review. Interpret every occurrence of
-“report” in the shared compatibility core as “candidate document” for this
+Snapshot, lineage, and root advisory finalization. Interpret every occurrence
+of “report” in the shared compatibility core as “candidate document” for this
 request only. Keep the same root native Session; do not start a deck-specific
 top-level Session.
 
@@ -29,9 +29,9 @@ acceptance and are not actions this Skill may take.
 
 ## Type-specific review
 
-In addition to the shared rubric, the fresh-context reviewer checks narrative
-spine, one-job-per-slide discipline, claim-to-slide placement, density risk,
-qualifier retention, title/takeaway agreement, and whether the deck's requested
-decision is justified for the exact audience and purpose. Structural
-conformance does not constitute visual QA, RG citation acceptance, or external
-delivery success.
+In addition to the shared rubric, the root advisory finalization checks the
+narrative spine, one-job-per-slide discipline, claim-to-slide placement,
+density risk, qualifier retention, title/takeaway agreement, and whether the
+deck's requested decision is justified for the exact audience and purpose.
+Structural conformance does not constitute visual QA, RG citation acceptance,
+or external delivery success.

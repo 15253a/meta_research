@@ -6,8 +6,10 @@ import pytest
 from sqlalchemy import text
 
 from meta_research.harness import (
-    FULL_CONFORMANCE_OPERATION_IDS,
     HarnessAdmissionError,
+)
+from meta_research.semantic_owner_gateway import (
+    BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
 )
 from test_public_bundle_stage import _bundle_runtime, _prepare_bundle_request
 
@@ -15,7 +17,9 @@ from test_public_bundle_stage import _bundle_runtime, _prepare_bundle_request
 def test_bundle_resident_mcp_channel_is_bound_to_current_ar_scope(
     tmp_path: Path,
 ) -> None:
-    runtime = _bundle_runtime(tmp_path / "resident-mcp")
+    runtime = _bundle_runtime(
+        tmp_path / "resident-mcp", harness_ready=False
+    )
     try:
         _prepare_bundle_request(runtime)
         assert runtime.bundle_stage.process_once()
@@ -31,9 +35,44 @@ def test_bundle_resident_mcp_channel_is_bound_to_current_ar_scope(
             root_session_ref=run.root_session_ref,
             fence_ref=run.fence_ref,
             capability_binding_hash=run.runtime_binding_hash,
-            operation_ids=("research_graph.snapshot.read",),
+            operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+            root_kind="bundle",
+            phase="primary",
+            subject_policy="operation_tree",
         )
-        status, response = runtime.harnesses.dispatch_mcp(
+        initialized, initialize_response, mcp_session_id = (
+            runtime.harnesses.dispatch_mcp_http(
+                channel.connection.token,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "bundle-root", "version": "1"},
+                    },
+                },
+                mcp_session_id=None,
+            )
+        )
+        assert initialized == 200
+        assert initialize_response is not None
+        assert isinstance(mcp_session_id, str) and mcp_session_id
+        acknowledged, acknowledgement, _ = (
+            runtime.harnesses.dispatch_mcp_http(
+                channel.connection.token,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                },
+                mcp_session_id=mcp_session_id,
+            )
+        )
+        assert acknowledged == 202
+        assert acknowledgement is None
+        status, response, _ = runtime.harnesses.dispatch_mcp_http(
             channel.connection.token,
             {
                 "jsonrpc": "2.0",
@@ -41,13 +80,29 @@ def test_bundle_resident_mcp_channel_is_bound_to_current_ar_scope(
                 "method": "tools/list",
                 "params": {},
             },
+            mcp_session_id=mcp_session_id,
         )
         assert status == 200
         assert response is not None
         tools = response["result"]["tools"]
-        assert [item["name"] for item in tools] == [
-            "research_graph.snapshot.read"
-        ]
+        assert [item["name"] for item in tools] == list(
+            BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+        )
+
+        with pytest.raises(
+            HarnessAdmissionError, match="mcp_channel_scope_invalid"
+        ):
+            runtime.harnesses.issue_resident_mcp_channel(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                root_session_ref=run.root_session_ref,
+                fence_ref=run.fence_ref,
+                capability_binding_hash=run.runtime_binding_hash,
+                operation_ids=("research_graph.snapshot.read",),
+                root_kind="bundle",
+                phase="primary",
+                subject_policy="operation_tree",
+            )
 
         with runtime._database.write() as connection:
             connection.execute(
@@ -82,7 +137,10 @@ def test_bundle_resident_mcp_channel_is_bound_to_current_ar_scope(
                 root_session_ref=run.root_session_ref,
                 fence_ref="stale-bundle-fence",
                 capability_binding_hash=run.runtime_binding_hash,
-                operation_ids=FULL_CONFORMANCE_OPERATION_IDS,
+                operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+                root_kind="bundle",
+                phase="primary",
+                subject_policy="operation_tree",
             )
     finally:
         runtime.close()
@@ -91,7 +149,10 @@ def test_bundle_resident_mcp_channel_is_bound_to_current_ar_scope(
 def test_bundle_resident_mcp_channel_allows_exact_executed_submission_scope(
     tmp_path: Path,
 ) -> None:
-    runtime = _bundle_runtime(tmp_path / "resident-mcp-awaiting-acceptance")
+    runtime = _bundle_runtime(
+        tmp_path / "resident-mcp-awaiting-acceptance",
+        harness_ready=False,
+    )
     try:
         _prepare_bundle_request(runtime)
         for _step in range(8):
@@ -134,7 +195,10 @@ def test_bundle_resident_mcp_channel_allows_exact_executed_submission_scope(
             root_session_ref=run.root_session_ref,
             fence_ref=run.fence_ref,
             capability_binding_hash=run.runtime_binding_hash,
-            operation_ids=("research_graph.snapshot.read",),
+            operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+            root_kind="bundle",
+            phase="primary",
+            subject_policy="operation_tree",
         )
         runtime.harnesses.revoke_resident_mcp_channel(channel)
     finally:

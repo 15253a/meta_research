@@ -7,7 +7,7 @@ description: 在冻结的 accepted Question binding 上形成、评审并提交 
 
 把当前 frozen binding 转化为可供 Plan 消费的候选全集或有证据边界的负向结果。拥有研究综合、review disposition 与最终修订；把内容 custody、领域接纳和 Stage 推进留给相应 Owner。
 
-需要核对输入、Submission 或 accepted handoff 时，读取[输入／输出契约](references/io-contract.md)；构造 Outcome、执行独立评审、处理 feedback 或判断 Exhaustion 时，读取[候选与闭包契约](references/contract.md)。
+需要核对输入、Submission 或 accepted handoff 时，读取[输入／输出契约](references/io-contract.md)；构造 Outcome、执行 advisory finalization、处理 feedback 或判断 Exhaustion 时，读取[候选与闭包契约](references/contract.md)。
 
 ## 1. 锁定输入
 
@@ -26,19 +26,19 @@ description: 在冻结的 accepted Question binding 上形成、评审并提交 
 4. 合并语义重复；只有会改变 Plan 研究承诺的方向才保留为独立候选。
 5. 形成且仅形成 `IdeaSet` 或 `NoViableCandidate`。后者是当前 frozen closure 下可接纳的负向 Outcome，不是空集合、技术失败或 Exhaustion。
 
-## 3. 独立挑战
+## 3. 根会合复核
 
-1. 首次正式提交前，根 Agent 必须在当前 managed native Session 内使用 Harness 原生能力 `spawn_agent` 启动一个短命 child reviewer，并 `wait` 到它完成；Codex 必须以 `fork_turns="none"` spawn，Claude Code 则使用等价的全新上下文 subagent。不要为 reviewer 另开或长期管理一个顶层 Codex／Claude Code Session。
-2. 只把 exact Question、完整去重草稿及本节 rubric 交给 child reviewer；不要把根 Agent 的隐藏推理当作评审依据。Reviewer 只检查 Question 对齐、实质重复、证据边界、可证伪性和 Plan 可用性；不批准、不评分、不选 winner。
-3. child reviewer 返回 `reviewer_agent_ref` 与 findings 后即结束。这个 ref 是 Harness 内的短命执行证据，不是 Agent Runtime Session，也不得被恢复成长期 reviewer。
-4. 根 Agent 在同一个 resumed turn 中对每条 finding 给出唯一 `revised | not_adopted` disposition，并返回 child identity、findings、最终完整 Outcome 与 dispositions；系统把此前已冻结的 reviewed draft checkpoint 与这些结果一起形成 Submission。reviewed draft 与最终 Outcome hash 不同，当且仅当至少一条 disposition 为 `revised`。
-5. 若 Harness 实际没有 child-agent 能力、child 未完成，或返回的 `reviewer_agent_ref` 与 Harness spawn/wait 事件不一致，返回 typed blocker；根 Agent 不得以自我评审伪造 `harness_child_agent`。
+1. Owner 保存 primary draft checkpoint 后，在同一 managed native 根 Session 发起第二个 provider turn，对 exact Question 与完整去重草稿执行 advisory finalization。
+2. 根 Agent 重新检查 Question 对齐、实质重复、证据边界、可证伪性和 Plan 可用性；形成 bounded findings，不批准、不评分、不选 winner。
+3. 对每条 finding 给出唯一 `revised | not_adopted` disposition，并返回 findings、最终完整 Outcome 与 dispositions。reviewed draft 与最终 Outcome hash 不同，当且仅当至少一条 disposition 为 `revised`。
+4. 当前 review record 固定为 `review_mode=advisory_unobserved`、`reviewer_agent_ref=null`、`independent=false`。模型不报告 reviewer identity，系统也不伪造 reviewer provenance。
+5. 第二个 provider turn 缺失、失败或 schema 不闭合时返回 typed blocker；不得绕过 substantive findings/dispositions 与最终 Outcome 校验。
 
 ## 4. 提交并恢复
 
 1. 每次正式写入前重验原 invocation closure。
 2. 先保存 RM content ref/receipt checkpoint，再提交 RG domain outcome；两层状态和 receipt 永不合并。
-3. `rejected` 在同一根 Session 中按正式 feedback 实质修订，并以新 submission identity 绑定 predecessor 与 rejection receipt；新 Attempt 的 bounded review 仍使用新的短命 child reviewer，不创建长期 reviewer Session。
+3. `rejected` 在同一根 Session 中按正式 feedback 实质修订，并以新 submission identity 绑定 predecessor 与 rejection receipt；新 Attempt 仍执行新的根 advisory finalization turn。
 4. `stale | needs_input | outcome_unknown | technical_blocker` 保留原生状态；unknown 只对账原 identity，不能盲重放。
 5. 一个 submission identity 只能绑定一个 immutable payload 与 invocation closure。
 

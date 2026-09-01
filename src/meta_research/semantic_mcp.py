@@ -11,6 +11,10 @@ from meta_research.owners.common import canonical_hash, new_ref
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
+ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS = (
+    "agent_runtime.human_request.open",
+    "agent_runtime.human_request.open.reconcile",
+)
 
 
 class SemanticMcpError(RuntimeError):

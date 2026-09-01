@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -50,15 +51,31 @@ from meta_research.provider_supervisor import (
     write_transport_envelope,
 )
 from meta_research.quest_drafting import (
+    CODEX_DRAFTING_LOCKED_VERSION,
     DraftingUnavailable,
     PROVIDER_RESULT_MAX_BYTES,
     _CancellableProcessRunner,
     _ProcessStopped,
     _text_exceeds_limit,
 )
+from meta_research.root_capabilities import (
+    CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS,
+    RootCapabilityEntryPath,
+    codex_feature_diagnostics,
+    merge_root_capability_bindings,
+    project_codex_post_turn_diagnostics,
+    root_capability_profile,
+)
+from meta_research.root_operation_diagnostics import (
+    RootOperationDiagnosticRecorder,
+    root_operation_diagnostic_ref,
+)
 
 if TYPE_CHECKING:
     from meta_research.owners.common import AcceptanceReceipt
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 DEEPFETCH_REQUEST_SCHEMA = "meta-research/first-question-deepfetch-request/v1"
@@ -78,6 +95,9 @@ DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA = (
 )
 DEEPFETCH_PROVIDER_OPERATION_REGISTRY_SCHEMA = (
     "meta-research/deepfetch-provider-operation-registry/v1"
+)
+_DEEPFETCH_PROVIDER_OPERATION_SCHEMA = (
+    "meta-research/deepfetch-provider-operation/v3"
 )
 MAX_DEEPFETCH_PAPERS = 500
 MAX_DEEPFETCH_FULLTEXTS = 100
@@ -516,10 +536,20 @@ def validate_runtime_binding(binding: DeepFetchRuntimeBinding) -> str:
         if not value or len(value) > 512:
             raise DeepFetchUnavailable("deepfetch_runtime_binding_invalid")
     capabilities = set(binding.capability_bindings)
-    if len(capabilities) != len(binding.capability_bindings) or not {
-        "web-search-live",
-        "web-fetch-live",
-    }.issubset(capabilities):
+    profile_capabilities = set(
+        root_capability_profile("deepfetch").runtime_bindings()
+    )
+    required_capabilities = {"web-search-live", "web-fetch-live"}
+    profile_claimed = any(
+        capability.startswith("root-capability-")
+        for capability in capabilities
+    )
+    if (
+        len(capabilities) != len(binding.capability_bindings)
+        or not required_capabilities.issubset(capabilities)
+        or profile_claimed
+        and not profile_capabilities.issubset(capabilities)
+    ):
         raise DeepFetchUnavailable("deepfetch_runtime_capability_unavailable")
     return canonical_hash(binding.as_dict())
 
@@ -750,11 +780,88 @@ class CodexDeepFetchAdapter:
         self._codex_ledger_reader = codex_ledger_reader
         if self._codex_ledger_reader is None and codex_home is not None:
             self._codex_ledger_reader = CodexHomeLedgerReader(codex_home)
+        self._root_operation_diagnostic_recorder: (
+            RootOperationDiagnosticRecorder | None
+        ) = None
+
+    def bind_root_operation_diagnostics_recorder(
+        self, recorder: RootOperationDiagnosticRecorder
+    ) -> None:
+        self._root_operation_diagnostic_recorder = recorder
 
     def request_stop(self) -> None:
         request_stop = getattr(self._runner, "request_stop", None)
         if callable(request_stop):
             request_stop()
+
+    def _root_capability_diagnostics(
+        self, *, entry_path: RootCapabilityEntryPath
+    ) -> dict[str, object]:
+        profile = root_capability_profile("deepfetch")
+        feature_output: str | None = None
+        run_command = getattr(self._runner, "run_command", None)
+        if callable(run_command):
+            argv = [
+                self._executable,
+                *profile.codex_arguments(entry_path=entry_path),
+                "features",
+                "list",
+            ]
+            try:
+                completed = run_command(
+                    argv, CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS
+                )
+            except Exception:
+                # Provider feature discovery is diagnostic-only. The real turn
+                # remains responsible for its own typed launch/stop outcome.
+                LOGGER.warning(
+                    "Codex feature inventory probe unavailable",
+                    exc_info=True,
+                    extra={"root_kind": "deepfetch"},
+                )
+            else:
+                if completed.returncode == 0 and len(completed.stdout) <= 64 * 1024:
+                    feature_output = completed.stdout
+        return codex_feature_diagnostics(
+            profile=profile,
+            entry_path=entry_path,
+            provider_version=CODEX_DRAFTING_LOCKED_VERSION,
+            feature_output=feature_output,
+        )
+
+    def _record_root_operation_diagnostics(
+        self,
+        *,
+        source_ref: str,
+        phase: str,
+        pre_turn: object,
+        stdout: str,
+    ) -> None:
+        recorder = self._root_operation_diagnostic_recorder
+        if recorder is None:
+            return
+        try:
+            recorder.record(
+                operation_ref=root_operation_diagnostic_ref(
+                    "deepfetch",
+                    source_ref=source_ref,
+                    phase=phase,
+                ),
+                root_kind="deepfetch",
+                diagnostics=project_codex_post_turn_diagnostics(
+                    pre_turn,
+                    stdout,
+                ),
+            )
+        except Exception:
+            # Public diagnostics are deliberately fail-open with respect to
+            # the DeepFetch result and its durable reconciliation identity.
+            LOGGER.warning(
+                "root operation diagnostic projection failed",
+                exc_info=True,
+                extra={"root_kind": "deepfetch"},
+            )
+            return
 
     def cancel_job(self, job_ref: str) -> None:
         if callable(getattr(self._runner, "run_durable_job", None)):
@@ -927,7 +1034,7 @@ class CodexDeepFetchAdapter:
                         segment_name = directory.name.removeprefix("deepfetch-")
                         if (
                             invocation.get("schema_ref")
-                            != "meta-research/deepfetch-provider-operation/v1"
+                            != _DEEPFETCH_PROVIDER_OPERATION_SCHEMA
                             or invocation.get("job_ref") != provider_job_ref
                             or invocation.get("segment_name") != segment_name
                         ):
@@ -1276,27 +1383,27 @@ class CodexDeepFetchAdapter:
             provider_version=DEEPFETCH_PROTOTYPE_COMMIT,
             model_ref=self._model_ref,
             harness_ref="codex-cli",
-            capability_bindings=(
-                "agent-workspace-policy:provider-operation-scoped-v2",
-                "approval-policy-never",
-                "codex-default-capabilities:v1",
-                "deepfetch-v4-main-agent",
-                f"deepfetch-v4-skill-bundle-sha256:{self._skill_bundle_hash}",
-                "filesystem-danger-full-access",
-                "hosted-acquisition-session",
-                "native-child-readers",
-                "papers-v4-finalize",
-                "codex-reader-ledger:v1",
-                "provider-output-limits:"
-                f"stream={DEEPFETCH_PROVIDER_STREAM_MAX_BYTES};"
-                f"result={PROVIDER_RESULT_MAX_BYTES}",
-                CODEX_REASONING_EFFORT_BINDING,
-                "sandbox-policy:danger-full-access",
-                "structured-output-json-schema",
-                "web-evidence-gate:v1",
-                "workspace-write-public-artifacts",
-                "web-fetch-live",
-                "web-search-live",
+            capability_bindings=merge_root_capability_bindings(
+                (
+                    "agent-workspace-policy:provider-operation-scoped-v2",
+                    "approval-policy-never",
+                    "deepfetch-v4-main-agent",
+                    f"deepfetch-v4-skill-bundle-sha256:{self._skill_bundle_hash}",
+                    "filesystem-danger-full-access",
+                    "hosted-acquisition-session",
+                    "native-child-readers",
+                    "papers-v4-finalize",
+                    "codex-reader-ledger:v1",
+                    "provider-output-limits:"
+                    f"stream={DEEPFETCH_PROVIDER_STREAM_MAX_BYTES};"
+                    f"result={PROVIDER_RESULT_MAX_BYTES}",
+                    CODEX_REASONING_EFFORT_BINDING,
+                    "sandbox-policy:danger-full-access",
+                    "structured-output-json-schema",
+                    "web-evidence-gate:v1",
+                    "workspace-write-public-artifacts",
+                ),
+                "deepfetch",
             ),
         )
 
@@ -1771,26 +1878,32 @@ class CodexDeepFetchAdapter:
                 )
                 gate_turn = schema_text == gate_schema_text
                 invocation_native = invocation.get("native_session_ref")
+                invocation_schema = invocation.get("schema_ref")
+                base_invocation_keys = {
+                    "schema_ref",
+                    "job_ref",
+                    "segment_name",
+                    "request_ref",
+                    "correlation_ref",
+                    "draft_hash",
+                    "scope_hash",
+                    "runtime_binding_hash",
+                    "native_session_ref",
+                    "prompt_hash",
+                    "output_schema_hash",
+                    "model_ref",
+                }
+                expected_invocation_keys = base_invocation_keys | {
+                    "root_capability_profile",
+                    "root_capability_profile_hash",
+                }
+                capability_profile = root_capability_profile("deepfetch")
                 if enforce_native and invocation_native != native_session_ref:
                     raise ValueError("deepfetch reconciliation session mismatch")
                 if (
-                    set(invocation)
-                    != {
-                        "schema_ref",
-                        "job_ref",
-                        "segment_name",
-                        "request_ref",
-                        "correlation_ref",
-                        "draft_hash",
-                        "scope_hash",
-                        "runtime_binding_hash",
-                        "native_session_ref",
-                        "prompt_hash",
-                        "output_schema_hash",
-                        "model_ref",
-                    }
-                    or invocation.get("schema_ref")
-                    != "meta-research/deepfetch-provider-operation/v1"
+                    set(invocation) != expected_invocation_keys
+                    or invocation_schema
+                    != _DEEPFETCH_PROVIDER_OPERATION_SCHEMA
                     or invocation.get("job_ref") != provider_job_ref
                     or invocation.get("segment_name") != segment_name
                     or invocation.get("request_ref") != request.request_ref
@@ -1808,6 +1921,10 @@ class CodexDeepFetchAdapter:
                     )
                     or invocation.get("model_ref")
                     != request.runtime_binding.model_ref
+                    or invocation.get("root_capability_profile")
+                    != capability_profile.as_dict()
+                    or invocation.get("root_capability_profile_hash")
+                    != capability_profile.digest
                     or schema_text not in {full_schema_text, gate_schema_text}
                     or gate_turn != expected_web_gate
                     or (
@@ -1854,6 +1971,18 @@ class CodexDeepFetchAdapter:
                     invocation_hash=invocation_hash,
                     native_session_ref=cast(str | None, invocation_native),
                     transport_key=transport_key,
+                )
+                self._record_root_operation_diagnostics(
+                    source_ref=f"{provider_job_ref}:{segment_name}",
+                    phase=segment_name,
+                    pre_turn=self._root_capability_diagnostics(
+                        entry_path=(
+                            "resume"
+                            if invocation_native is not None
+                            else "initial"
+                        )
+                    ),
+                    stdout=outcome[2],
                 )
                 traces.append(outcome[2])
                 observed_native = outcome[3]
@@ -2138,13 +2267,6 @@ class CodexDeepFetchAdapter:
             evidence_parts = (*checkpoint.evidence_parts, turn_evidence)
             if web_gate:
                 _validate_web_evidence_gate_result(raw)
-                if (
-                    turn_evidence["spawned_reader_agent_refs"]
-                    or turn_evidence["terminal_reader_agent_refs"]
-                ):
-                    raise DeepFetchUnavailable(
-                        "deepfetch_reader_agent_trace_invalid"
-                    )
                 _merge_web_evidence([turn_evidence])
                 checkpoint = replace(
                     checkpoint,
@@ -2194,17 +2316,6 @@ class CodexDeepFetchAdapter:
         assert checkpoint.final_envelope is not None
         assert checkpoint.native_session_ref is not None
         web_evidence = _merge_web_evidence(list(checkpoint.evidence_parts))
-        reader_agent_trace = _verified_reader_agent_refs(
-            checkpoint.evidence_parts,
-            ledger_reader=self._codex_ledger_reader,
-            root_session_ref=checkpoint.native_session_ref,
-            expected_working_directory=str(
-                self._agent_workspace_path(
-                    request.job_ref or f"{request.run_ref}:direct",
-                    canonical_hash(request.runtime_binding.as_dict()),
-                )
-            ),
-        )
         authoritative_acquisition_proofs = (
             self._query_authoritative_acquisition_proofs(
                 request,
@@ -2227,7 +2338,6 @@ class CodexDeepFetchAdapter:
             acquisition_session_ref=request.acquisition_session_ref,
             acquisition_request_ids=checkpoint.acquisition_request_ids,
             acquisition_item_proofs=authoritative_acquisition_proofs,
-            reader_agent_trace=reader_agent_trace,
         )
         web_evidence = {**web_evidence, "prototype": imported[6]}
         result = DeepFetchResult(
@@ -2458,6 +2568,15 @@ class CodexDeepFetchAdapter:
             schema_path.write_text(
                 canonical_json(schema), encoding="utf-8"
             )
+            capability_profile = root_capability_profile("deepfetch")
+            entry_path: RootCapabilityEntryPath = (
+                "resume"
+                if request.native_session_ref is not None
+                else "initial"
+            )
+            pre_turn_diagnostics = self._root_capability_diagnostics(
+                entry_path=entry_path
+            )
             argv = [
                 self._executable,
                 "exec",
@@ -2467,10 +2586,7 @@ class CodexDeepFetchAdapter:
                 'approval_policy="never"',
                 "--config",
                 CODEX_REASONING_EFFORT_CONFIG,
-                "--config",
-                'web_search="live"',
-                "--config",
-                "features.multi_agent=true",
+                *capability_profile.codex_arguments(),
                 "--sandbox",
                 self._sandbox_mode,
                 "--model",
@@ -2535,6 +2651,15 @@ class CodexDeepFetchAdapter:
                 and request.native_session_ref != observed_native_session_ref
             ):
                 raise DeepFetchUnavailable("deepfetch_native_session_changed")
+            self._record_root_operation_diagnostics(
+                source_ref=(
+                    f"{root_job_ref}:native-session:"
+                    f"{observed_native_session_ref}:prompt:{canonical_hash(prompt)}"
+                ),
+                phase="direct",
+                pre_turn=pre_turn_diagnostics,
+                stdout=completed.stdout,
+            )
             web_evidence = _verified_turn_evidence(completed.stdout)
             return (
                 cast(dict[str, object], decoded),
@@ -2621,8 +2746,15 @@ class CodexDeepFetchAdapter:
     ) -> tuple[str, dict[str, object] | None, str, str | None]:
         directory.mkdir(parents=True, exist_ok=True)
         schema = output_schema
+        capability_profile = root_capability_profile("deepfetch")
+        entry_path: RootCapabilityEntryPath = (
+            "resume" if native_session_ref is not None else "initial"
+        )
+        fresh_diagnostics = self._root_capability_diagnostics(
+            entry_path=entry_path
+        )
         invocation = {
-            "schema_ref": "meta-research/deepfetch-provider-operation/v1",
+            "schema_ref": _DEEPFETCH_PROVIDER_OPERATION_SCHEMA,
             "job_ref": job_ref,
             "segment_name": segment_name,
             "request_ref": request.request_ref,
@@ -2634,6 +2766,8 @@ class CodexDeepFetchAdapter:
             "prompt_hash": canonical_hash(prompt),
             "output_schema_hash": canonical_hash(schema),
             "model_ref": self._model_ref,
+            "root_capability_profile": capability_profile.as_dict(),
+            "root_capability_profile_hash": capability_profile.digest,
         }
         invocation_hash = canonical_hash(invocation)
         invocation_path = directory / "invocation.json"
@@ -2649,13 +2783,17 @@ class CodexDeepFetchAdapter:
         created = _write_exclusive_text(invocation_path, encoded_invocation)
         if not created:
             try:
-                persisted = json.loads(invocation_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                persisted_invocation = read_transport_envelope(
+                    invocation_path, transport_key
+                )
+            except ProviderSupervisorError as error:
                 raise DeepFetchUnavailable(
                     "deepfetch_provider_spool_invalid"
                 ) from error
-            if persisted != envelope:
+            if persisted_invocation != invocation:
                 raise DeepFetchUnavailable("deepfetch_provider_identity_conflict")
+            invocation = persisted_invocation
+            invocation_hash = canonical_hash(invocation)
 
         prompt_path = directory / "prompt.txt"
         schema_path = directory / "output-schema.json"
@@ -2747,12 +2885,19 @@ class CodexDeepFetchAdapter:
                         durable_outcome="pending",
                     ) from error
                 raise DeepFetchUnavailable("codex_deepfetch_io_unavailable") from error
-        return self._read_durable_segment(
+        outcome = self._read_durable_segment(
             directory=directory,
             invocation_hash=invocation_hash,
             native_session_ref=native_session_ref,
             transport_key=transport_key,
         )
+        self._record_root_operation_diagnostics(
+            source_ref=f"{job_ref}:{segment_name}",
+            phase=segment_name,
+            pre_turn=fresh_diagnostics,
+            stdout=outcome[2],
+        )
+        return outcome
 
     def _durable_argv(
         self,
@@ -2766,6 +2911,7 @@ class CodexDeepFetchAdapter:
         agent_workspace = self._agent_workspace_for(
             job_ref, runtime_binding_hash
         )
+        capability_profile = root_capability_profile("deepfetch")
         argv = [
             self._executable,
             "exec",
@@ -2775,10 +2921,7 @@ class CodexDeepFetchAdapter:
             'approval_policy="never"',
             "--config",
             CODEX_REASONING_EFFORT_CONFIG,
-            "--config",
-            'web_search="live"',
-            "--config",
-            "features.multi_agent=true",
+            *capability_profile.codex_arguments(),
             "--sandbox",
             self._sandbox_mode,
             "--model",
@@ -3623,7 +3766,6 @@ def _import_v4_public_artifacts(
     acquisition_session_ref: str,
     acquisition_request_ids: tuple[str, ...],
     acquisition_item_proofs: tuple[dict[str, object], ...],
-    reader_agent_trace: _VerifiedReaderAgentTrace,
 ) -> tuple[
     Literal["complete", "limited", "honest_empty"],
     str,
@@ -3775,17 +3917,6 @@ def _import_v4_public_artifacts(
         ):
             raise DeepFetchUnavailable("deepfetch_workflow_evidence_invalid")
         assignment_by_paper[cast(str, assignment["paper_id"])] = assignment
-    assignment_agent_refs = [
-        cast(str, assignment["reader_agent_ref"])
-        for assignment in assignments
-    ]
-    if (
-        len(set(assignment_agent_refs)) != len(assignment_agent_refs)
-        or len(assignment_agent_refs) != len(reader_agent_trace.refs)
-        or reader_agent_trace.identity_kind == "task_name"
-        and set(assignment_agent_refs) != set(reader_agent_trace.refs)
-    ):
-        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
     if assignments and not acquisition_request_ids:
         raise DeepFetchUnavailable("deepfetch_hosted_acquisition_proof_missing")
     obtained_artifacts: dict[str, dict[str, object]] = {}
@@ -4462,7 +4593,7 @@ def _collect_reader_trace(
         or not isinstance(receivers, list)
         or not isinstance(states, dict)
     ):
-        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+        return
     if tool == "spawn_agent":
         if (
             len(receivers) != 1
@@ -4470,17 +4601,18 @@ def _collect_reader_trace(
             or not receivers[0]
             or not isinstance(states.get(receivers[0]), dict)
         ):
-            raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
-        spawned.append(receivers[0])
+            return
+        if receivers[0] not in spawned:
+            spawned.append(receivers[0])
         return
     if receivers == [] and states == {}:
         return
     if any(not isinstance(value, str) or not value for value in receivers):
-        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+        return
     for receiver in cast(list[str], receivers):
         state = states.get(receiver)
         if not isinstance(state, dict):
-            raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
+            continue
         if state.get("status") == "completed" and receiver not in terminal:
             terminal.append(receiver)
 

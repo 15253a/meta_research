@@ -156,11 +156,23 @@ def validate_advisory_review(
     if set(review) != expected_fields:
         raise IdeaContractError("idea_review_shape_invalid")
     if schema_ref == IDEA_REVIEW_SCHEMA_REF:
-        if review["review_mode"] != "harness_child_agent":
+        review_mode = review["review_mode"]
+        reviewer_agent_ref = review["reviewer_agent_ref"]
+        if review_mode == "advisory_unobserved":
+            if reviewer_agent_ref is not None or review["independent"] is not False:
+                raise IdeaContractError("idea_review_authority_invalid")
+        elif review_mode == "harness_child_agent":
+            # Immutable executions written before ADR-0003 remain readable.
+            # Current Skill and Agent Runtime write gates reject this mode.
+            _require_text(reviewer_agent_ref, "reviewer_agent_ref")
+            if review["independent"] is not True:
+                raise IdeaContractError("idea_review_authority_invalid")
+        else:
             raise IdeaContractError("idea_review_mode_invalid")
-        _require_text(review["reviewer_agent_ref"], "reviewer_agent_ref")
     else:
         _require_text(review["reviewer_session_ref"], "reviewer_session_ref")
+        if review["independent"] is not True:
+            raise IdeaContractError("idea_review_authority_invalid")
     claimed_reviewed_draft_hash = review["reviewed_draft_hash"]
     final_outcome_hash = review["final_outcome_hash"]
     if (
@@ -173,7 +185,7 @@ def validate_advisory_review(
         and claimed_reviewed_draft_hash != reviewed_draft_hash
     ):
         raise IdeaContractError("idea_review_draft_hash_mismatch")
-    if review["independent"] is not True or review["advisory_only"] is not True:
+    if review["advisory_only"] is not True:
         raise IdeaContractError("idea_review_authority_invalid")
 
     findings = review["findings"]

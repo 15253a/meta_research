@@ -7,7 +7,7 @@
 - 行为基线固定为 `f2d3f3f0d77a6f50ab535d50d6d404a525c09757` 下的 `meta-research/vnext/skills/plan-stage/`；实现前已完整读取其中的 `SKILL.md`、`references/contract.md`、`references/owner-operations.md`、`agents/openai.yaml` 和确定性参考脚本。
 - 生产 Adapter 以 AE 签发的 ContextPack 冻结创建时完整、稳定的 Plan Evidence catalog，而不把原型的 `explore(open | follow | refresh)` 暴露为第二个产品状态面。后续新增且未被本 Plan 选择的 evidence 不改写旧 snapshot；正式写边界只实时重验 PlanDocument 实际选择的叶子，引用叶子 stale／unavailable／receipt mismatch 时 fail closed，绝不静默替换。
 - 普通 RG `role=evidence` 与 RM provenance metadata 不能证明成功 TargetCommit。后继 TargetCommit/Baseline Pool authority 接入前，生产 Plan catalog 因而诚实地冻结为空；非空目录 fail closed。当前票验证 empty catalog → gap 的真实闭环及 no-gap 的条件性机械合同，不伪造 TargetCommit、EvidenceRef 或 Owner receipt；TargetCommit-backed 正向复用与显式 refresh 由该唯一 authority seam 接入。
-- 原型的 `reviewer_session_ref` 在生产 Harness 中收敛为同一 managed root/native Session 内短命 child 的 `reviewer_agent_ref`；child trace 证明 fresh-context 独立审阅，但不制造第二个 Agent Runtime Session。
+- 原型的 `reviewer_session_ref` 在当前生产写入中收敛为同一 managed root/native Session 的第二个 advisory finalization turn；记录 `advisory_unobserved`、null reviewer 与 `independent=false`，不制造或声称第二个 Agent Runtime Session。历史 reviewer provenance 只读兼容。
 - `no_new_experiment_required` 由正式 Plan 内容机械派生并作为后续 Bundle skip basis 投影；Plan 不提前创建或伪造 Bundle Run。
 
 ## 权限

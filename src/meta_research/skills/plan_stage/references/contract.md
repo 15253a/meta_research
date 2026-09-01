@@ -62,7 +62,7 @@ any gap + every gap covered by briefs -> experiments_required
 
 ## Advisory review
 
-根 Agent 在同一 managed native Session 内以 `fork_turns="none"` spawn 一个 fresh child reviewer 并 wait。记录 `review_mode = harness_child_agent`、短命 `reviewer_agent_ref`、reviewed draft hash、findings、每条 finding 唯一的 `revised | not_adopted` disposition 与 final Plan hash。Reviewer 只提供建议，没有 RM/RG/AE authority；有 `revised` 当且仅当最终 Plan 实质改变。
+Owner 保存 primary draft 后，根 Agent 在同一 managed native Session 的第二个 provider turn 对 exact frozen closure 与 draft 执行 advisory finalization。记录 `review_mode = advisory_unobserved`、`reviewer_agent_ref = null`、`independent = false`、reviewed draft hash、findings、每条 finding 唯一的 `revised | not_adopted` disposition 与 final Plan hash。该 turn 没有 RM/RG/AE authority；有 `revised` 当且仅当最终 Plan 实质改变。
 
 ## Accepted handoff
 

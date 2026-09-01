@@ -2,10 +2,10 @@
 
 This request is a research paper, not a report with a different file extension.
 The shared Writing rules above still govern evidence, citation markers, the
-frozen Snapshot, lineage, and fresh-context review. Interpret every occurrence
-of “report” in the shared compatibility core as “candidate document” for this
-request only. Keep the same root native Session; do not start a paper-specific
-top-level Session.
+frozen Snapshot, lineage, and root advisory finalization. Interpret every
+occurrence of “report” in the shared compatibility core as “candidate document”
+for this request only. Keep the same root native Session; do not start a
+paper-specific top-level Session.
 
 ## Canonical semantic source
 
@@ -38,8 +38,8 @@ emit OOXML, base64, HTML, or a download link.
 
 ## Type-specific review
 
-In addition to the shared rubric, the fresh-context reviewer checks section-role
-coverage, methods/results separation, abstract-to-conclusion consistency,
-counterevidence, threats to validity, and whether the stated contribution
-exceeds the accepted evidence. Structural conformance does not constitute RG
-citation acceptance or publication readiness.
+In addition to the shared rubric, the root advisory finalization checks
+section-role coverage, methods/results separation, abstract-to-conclusion
+consistency, counterevidence, threats to validity, and whether the stated
+contribution exceeds the accepted evidence. Structural conformance does not
+constitute RG citation acceptance or publication readiness.

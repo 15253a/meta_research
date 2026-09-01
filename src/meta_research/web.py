@@ -45,6 +45,10 @@ from meta_research.quest_drafting import (
     QUESTION_FIELD_MAX_LENGTHS,
 )
 from meta_research.runtime_protection import RuntimeProtectionUnavailable
+from meta_research.root_capabilities import RootAgentKind
+from meta_research.root_operation_diagnostics import (
+    RootOperationDiagnosticError,
+)
 from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
 
 
@@ -61,15 +65,10 @@ MAX_CONCURRENT_ASSET_INTAKE_REQUESTS = 2
 MAX_CONCURRENT_ASSET_IO_OPERATIONS = 2
 ASSET_WORKER_WATCHDOG_SECONDS = 5.0
 ASSET_ROUTE_WATCHDOG_SECONDS = 5.0
-DRAFTING_WORKER_WATCHDOG_SECONDS = 190.0
-IDEA_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
-PLAN_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
-BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
-REASONING_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
+PROVIDER_WORKER_WATCHDOG_SECONDS: None = None
+WRITING_DELIVERY_STALL_SECONDS = 910.0
 REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS = 30.0
 EXPERIMENT_WORKER_WATCHDOG_SECONDS = 30.0
-WRITING_WORKER_WATCHDOG_SECONDS = 910.0
-HARNESS_CONFORMANCE_WORKER_WATCHDOG_SECONDS = 310.0
 BACKGROUND_WORKER_STARTUP_GRACE_SECONDS = 0.1
 # ``BundleStage.transient_error`` predates the durable pause/wait contract and
 # carries both actual failures and normal no-progress states.  Keep this list
@@ -159,8 +158,14 @@ class StartHarnessConformanceRequest(BaseModel):
 
     codex_model_ref: Literal["gpt-5.6-sol"] = CODEX_MODEL_REF
     codex_auth_profile_ref: str = Field(min_length=1, max_length=160)
-    claude_model_ref: str = Field(min_length=1, max_length=160)
-    claude_auth_profile_ref: str = Field(min_length=1, max_length=160)
+    # Accepted only so an older diagnostic client does not fail at the HTTP
+    # decoder boundary.  Production selection is Codex-only and ignores them.
+    claude_model_ref: str | None = Field(
+        default=None, min_length=1, max_length=160
+    )
+    claude_auth_profile_ref: str | None = Field(
+        default=None, min_length=1, max_length=160
+    )
 
 
 class OpenQuestRequest(BaseModel):
@@ -528,6 +533,7 @@ class StartExperimentRequest(BaseModel):
     hypothesis: str = Field(min_length=1, max_length=4000)
     variant_parameter: float = Field(allow_inf_nan=False)
     sample_count: int = Field(ge=4, le=4096)
+    wall_time_budget_seconds: float = Field(ge=1, le=24 * 60 * 60)
     request_kind: Literal["retrain", "remeasure"] = "retrain"
     source_variant_run_ref: str | None = Field(default=None, max_length=96)
     selected_checkpoint_role_refs: list[str] = Field(
@@ -1400,12 +1406,24 @@ def create_app(
                 return _error(400, "mcp_protocol_version_required")
             if protocol_version != MCP_PROTOCOL_VERSION:
                 return _error(400, "mcp_protocol_version_unsupported")
-        status, payload = await asyncio.to_thread(
-            runtime.harnesses.dispatch_mcp, token, message
+        status, payload, response_session_id = await asyncio.to_thread(
+            runtime.harnesses.dispatch_mcp_http,
+            token,
+            message,
+            mcp_session_id=request.headers.get("mcp-session-id"),
+        )
+        response_headers = (
+            {"Mcp-Session-Id": response_session_id}
+            if response_session_id is not None
+            else None
         )
         if payload is None:
-            return Response(status_code=status)
-        return JSONResponse(payload, status_code=status)
+            return Response(status_code=status, headers=response_headers)
+        return JSONResponse(
+            payload,
+            status_code=status,
+            headers=response_headers,
+        )
 
     @app.post("/auth/launch")
     async def exchange_browser_grant(request: Request) -> FileResponse:
@@ -2588,6 +2606,26 @@ def create_app(
             "next_after_sequence": (after if not items else items[-1]["sequence"]),
         }
 
+    @app.get("/api/v1/root-capability-diagnostics")
+    def query_root_capability_diagnostics(
+        root_kind: RootAgentKind | None = Query(default=None),
+        operation_ref: str | None = Query(
+            default=None, min_length=1, max_length=512
+        ),
+        limit: int = Query(default=128, ge=1, le=256),
+    ) -> dict[str, object]:
+        try:
+            return runtime.root_operation_diagnostics.query_page(
+                root_kind=root_kind,
+                operation_ref=operation_ref,
+                limit=limit,
+            )
+        except RootOperationDiagnosticError as error:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": error.code},
+            ) from error
+
     @app.get("/api/v1/idea-stage/current")
     def query_current_idea_stage() -> dict[str, object]:
         return runtime.idea_stage.query_current()
@@ -2669,6 +2707,24 @@ def create_app(
             limit=limit,
         )
         return page.as_dict()
+
+    @app.get("/api/v1/bundle/targets/{target_ref}/raw-output")
+    def query_target_raw_output(
+        target_ref: str,
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=64 * 1024, ge=4, le=256 * 1024),
+    ) -> dict[str, object]:
+        try:
+            return runtime.harnesses.query_target_raw_output(
+                target_ref,
+                after=after,
+                limit=limit,
+            )
+        except HarnessAdmissionError as error:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": error.code},
+            ) from error
 
     @app.get("/api/v1/events")
     async def stream_events(request: Request) -> StreamingResponse:
@@ -2905,7 +2961,7 @@ async def _process_quest_drafting(
                 health=health,
                 timeout_code="quest_drafting_operation_timeout",
                 on_health_change=on_health_change,
-                timeout_seconds=DRAFTING_WORKER_WATCHDOG_SECONDS,
+                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
             )
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
@@ -3060,12 +3116,7 @@ async def _process_writing(
                     health=health,
                     timeout_code="writing_operation_timeout",
                     on_health_change=on_health_change,
-                    on_timeout=lambda: runtime.writing.block_writing_claim(
-                        run_ref=run_ref,
-                        attempt_ref=attempt_ref,
-                        fence_ref=fence_ref,
-                    ),
-                    timeout_seconds=WRITING_WORKER_WATCHDOG_SECONDS,
+                    timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
                 )
                 if isinstance(outcome, _PendingWorkerRetirement):
                     quarantined[claim] = outcome
@@ -3106,7 +3157,7 @@ async def _process_writing(
                         timeout_code="writing_delivery_operation_timeout",
                         on_health_change=on_health_change,
                         retain_operation_on_timeout=True,
-                        timeout_seconds=WRITING_WORKER_WATCHDOG_SECONDS,
+                        timeout_seconds=WRITING_DELIVERY_STALL_SECONDS,
                     )
                 except Exception as error:
                     # Only a failure from this exact selected operation belongs
@@ -3279,7 +3330,7 @@ async def _await_monitored_worker_call(
     on_health_change: Callable[[], None] | None,
     on_timeout: Callable[[], None] | None = None,
     retain_operation_on_timeout: bool = False,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
 ) -> bool | _PendingWorkerOperation | _PendingWorkerRetirement:
     """Keep worker stalls outside the event loop and expose a watchdog.
 
@@ -3500,7 +3551,7 @@ async def _process_harness_conformance(
                 health=health,
                 timeout_code="harness_conformance_operation_timeout",
                 on_health_change=None,
-                timeout_seconds=HARNESS_CONFORMANCE_WORKER_WATCHDOG_SECONDS,
+                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
             )
         except HarnessAdmissionError as error:
             LOGGER.warning("Harness conformance turn unavailable: %s", error.code)
@@ -3526,7 +3577,7 @@ async def _process_idea_stage(
                 health=health,
                 timeout_code="idea_stage_operation_timeout",
                 on_health_change=on_health_change,
-                timeout_seconds=IDEA_STAGE_WORKER_WATCHDOG_SECONDS,
+                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
             )
             transient_error = runtime.idea_stage.transient_error
             if transient_error is not None:
@@ -3574,7 +3625,7 @@ async def _process_plan_stage(
                 health=health,
                 timeout_code="plan_stage_operation_timeout",
                 on_health_change=on_health_change,
-                timeout_seconds=PLAN_STAGE_WORKER_WATCHDOG_SECONDS,
+                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
             )
             transient_error = runtime.plan_stage.transient_error
             if transient_error is not None:
@@ -3761,7 +3812,7 @@ async def _process_bundle_stage(
                 health=health,
                 timeout_code="bundle_stage_operation_timeout",
                 on_health_change=on_health_change,
-                timeout_seconds=BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS,
+                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
             )
             transient_error = runtime.bundle_stage.transient_error
             if (
@@ -3817,7 +3868,7 @@ async def _process_reasoning_stage(
                 health=health,
                 timeout_code="reasoning_stage_operation_timeout",
                 on_health_change=on_health_change,
-                timeout_seconds=REASONING_STAGE_WORKER_WATCHDOG_SECONDS,
+                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
             )
             transient_error = runtime.reasoning_stage.transient_error
             if transient_error is not None:

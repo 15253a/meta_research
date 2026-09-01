@@ -841,6 +841,16 @@ export function ManualCreation({
     }
   };
 
+  const sendMessageOnEnter = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (
+      event.key !== "Enter"
+      || event.shiftKey
+      || event.nativeEvent.isComposing
+    ) return;
+    event.preventDefault();
+    void sendMessage();
+  };
+
   const persistProposal = useCallback(async (): Promise<ManualQuestionProposalView | null> => {
     const expectedBasisHash = view.research.basis_hash;
     if (
@@ -1502,6 +1512,7 @@ export function ManualCreation({
                       }
                       placeholder="讨论未知、答案形态、适用范围，或询问 DeepFetch 状态……"
                       onChange={(event) => setMessageDraft(event.target.value)}
+                      onKeyDown={sendMessageOnEnter}
                     />
                     <button
                       type="button"
@@ -1516,6 +1527,7 @@ export function ManualCreation({
                       ↑
                     </button>
                   </div>
+                  <small>Enter 发送 · Shift+Enter 换行</small>
                 </div>
 
                 <div className="manual-session-status">

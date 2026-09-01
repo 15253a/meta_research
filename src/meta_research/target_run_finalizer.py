@@ -60,6 +60,7 @@ from meta_research.target_implementation_bundle import (
 )
 from meta_research.target_run_runtime_contract import (
     TARGET_COMPLETION_ARTIFACT_ROLES,
+    TargetCompletionArtifact,
     TargetCompletionHandoff,
     validate_target_completion_handoff,
 )
@@ -78,60 +79,81 @@ TARGET_ROOT_MAX_RESULT_DOCUMENT_BYTES = 256 * 1024
 # definitions, and requires those two key sets to be disjoint.
 TARGET_ROOT_MAX_RESULT_METRICS = 2 * 64
 
+_SYSTEM_TARGET_COMPLETION_REQUIRED_ARTIFACTS = (
+    ("implementation", "implementation"),
+    ("result", "outputs/result.json"),
+)
+_SYSTEM_TARGET_COMPLETION_OPTIONAL_ARTIFACTS = (
+    ("checkpoint", "outputs/checkpoints"),
+    ("analysis", "outputs/analysis"),
+    ("log", "logs"),
+)
+
 _RM_RECOVERABLE_CANDIDATE_FEEDBACK = {
     "target_root_artifact_missing": (
-        "A declared completion artifact is missing from the Target workspace. "
-        "Create it or correct the relative path and submit a new completion "
-        "handoff."
+        "A required conventional completion path is missing from the Target "
+        "workspace. Create implementation/ and outputs/result.json as needed, "
+        "then complete another root turn."
     ),
     "target_root_artifact_too_large": (
         "A declared completion artifact exceeds the Research Memory intake "
-        "limit. Reduce or split it and submit a new completion handoff."
+        "limit. Reduce or split it and complete another root turn."
     ),
     "target_root_artifact_set_too_large": (
         "The declared completion artifact set exceeds the bounded finalization "
-        "budget. Reduce the handoff and submit a new completion handoff."
+        "budget. Reduce the conventional artifacts and complete another root turn."
     ),
     "target_root_artifact_type_unsupported": (
         "A declared completion artifact has an unsupported filesystem type. "
-        "Replace it with a regular file or directory and submit a new completion "
-        "handoff."
+        "Replace it with a regular file or directory and complete another root "
+        "turn."
+    ),
+    "target_root_artifact_symlink_forbidden": (
+        "A conventional completion path is a symbolic link. Replace it with a "
+        "regular file or directory inside the Target workspace and complete "
+        "another root turn."
     ),
     "target_implementation_workspace_invalid": (
         "The declared implementation artifact is not a valid directory. Correct "
-        "it and submit a new completion handoff."
+        "implementation/ and complete another root turn."
     ),
     "target_implementation_workspace_entry_unsupported": (
         "The implementation artifact contains an unsupported entry or an "
-        "oversized file. Correct it and submit a new completion handoff."
+        "oversized file. Correct it and complete another root turn."
     ),
     "target_implementation_bundle_too_large": (
         "The implementation artifact exceeds the accepted bundle limits. Reduce "
-        "it and submit a new completion handoff."
+        "it and complete another root turn."
     ),
     "target_root_result_document_invalid": (
         "The declared result document is not valid canonical JSON for the Target "
-        "result schema. Rewrite it and submit a new completion handoff."
+        "result schema. Rewrite outputs/result.json and complete another root turn."
     ),
     "target_root_result_document_too_large": (
         "The declared result document exceeds the bounded Target result schema "
-        "limit. Reduce it and submit a new completion handoff."
+        "limit. Reduce it and complete another root turn."
     ),
     "target_root_result_document_noncanonical": (
         "The declared result document is valid JSON but not in canonical form. "
-        "Rewrite it in canonical form and submit a new completion handoff."
+        "Rewrite it in canonical form and complete another root turn."
     ),
     "target_root_result_metrics_invalid": (
         "The declared result document contains invalid metric names or values. "
-        "Correct the metrics and submit a new completion handoff."
+        "Correct the metrics and complete another root turn."
+    ),
+    "target_root_checkpoint_policy_invalid": (
+        "The conventional checkpoint path does not match the Target checkpoint "
+        "policy. Create or remove outputs/checkpoints as directed and complete "
+        "another root turn."
     ),
     "asset_content_too_large": (
         "A completion artifact exceeds the Research Memory managed-content limit. "
-        "Reduce or split it and submit a new completion handoff."
+        "Reduce or split it and complete another root turn."
     ),
     "asset_provenance_too_large": (
         "The completion artifact set produces provenance beyond the Research "
-        "Memory limit. Reduce the handoff and submit a new completion handoff."
+        "Memory limit. Reduce the conventional artifacts and complete another root "
+        "turn."
     ),
 }
 
@@ -270,7 +292,7 @@ class TargetRootCompletionEvidenceReader(Protocol):
         *,
         handle: TargetWorkHandle,
         evidence: TargetRootCompletionEvidence,
-        handoff: TargetCompletionHandoff,
+        handoff: TargetCompletionHandoff | None,
     ) -> str: ...
 
 
@@ -954,18 +976,11 @@ class TargetRunFinalizer:
 
         _validate_evidence(evidence, handle=handle)
         try:
-            handoff = evidence.handoff
-            validate_target_completion_handoff(
-                handoff,
-                expected_target_ref=handle.target_ref,
-                expected_target_run_ref=handle.target_run_ref,
-            )
-            canonical_json(projection_plain_value(handoff))
             evidence_content_hash = (
                 self._evidence_reader.verify_target_root_completion_evidence(
                     handle=handle,
                     evidence=evidence,
-                    handoff=handoff,
+                    handoff=evidence.handoff,
                 )
             )
         except OwnerConflict:
@@ -994,19 +1009,29 @@ class TargetRunFinalizer:
         latest = self._lifecycle.query_completion(handle.target_ref)
         completion = None
         manifest = None
+        handoff: TargetCompletionHandoff | None = None
+        pinned_workspace: _PinnedWorkspaceRoot | None = None
         if latest is not None:
             rejection = self._lifecycle.query_completion_rejection(
                 latest.completion_ref
             )
             matches_latest = (
                 latest.handle == handle
-                and latest.handoff == handoff
                 and latest.harness_operation_ref == evidence.operation_ref
                 and latest.evidence_ref == evidence.evidence_ref
                 and latest.evidence_content_hash == evidence_content_hash
+                and (
+                    evidence.handoff is None
+                    or latest.handoff == evidence.handoff
+                )
+                and (
+                    evidence.workspace_ref is None
+                    or latest.workspace_ref == evidence.workspace_ref
+                )
             )
             if matches_latest:
                 completion = latest
+                handoff = latest.handoff
                 if rejection is not None:
                     return self._revision_result(rejection)
                 if completion.candidate_rejection_code is not None:
@@ -1025,14 +1050,56 @@ class TargetRunFinalizer:
             elif rejection is None:
                 raise OwnerConflict("target_root_completion_conflict")
 
+        if handoff is None:
+            try:
+                if evidence.handoff is not None:
+                    handoff = evidence.handoff
+                else:
+                    pinned_workspace = self._resolve_workspace(handle)
+                    if evidence.workspace_ref != pinned_workspace.workspace_ref:
+                        raise OwnerConflict(
+                            "target_root_completion_evidence_invalid"
+                        )
+                    handoff = _system_target_completion_handoff(
+                        handle=handle,
+                        evidence=evidence,
+                        root_descriptor=pinned_workspace.descriptor,
+                    )
+                validate_target_completion_handoff(
+                    handoff,
+                    expected_target_ref=handle.target_ref,
+                    expected_target_run_ref=handle.target_run_ref,
+                )
+                canonical_json(projection_plain_value(handoff))
+            except OwnerConflict:
+                if pinned_workspace is not None:
+                    os.close(pinned_workspace.descriptor)
+                raise
+            except Exception as error:
+                if pinned_workspace is not None:
+                    os.close(pinned_workspace.descriptor)
+                raise OwnerConflict(
+                    "target_root_completion_evidence_invalid"
+                ) from error
+
         if manifest is None:
-            pinned_workspace = self._resolve_workspace(handle)
+            if pinned_workspace is None:
+                pinned_workspace = self._resolve_workspace(handle)
+                if (
+                    evidence.workspace_ref is not None
+                    and evidence.workspace_ref != pinned_workspace.workspace_ref
+                ):
+                    os.close(pinned_workspace.descriptor)
+                    raise OwnerConflict(
+                        "target_root_completion_evidence_invalid"
+                    )
             workspace_ref = pinned_workspace.workspace_ref
             try:
                 frozen = self._freeze(
                     handle=handle,
                     handoff=handoff,
                     resolved_workspace=pinned_workspace,
+                    system_owned=evidence.handoff is None,
                 )
             except OwnerConflict as error:
                 feedback = self._memory.candidate_rejection_feedback(error.code)
@@ -1342,9 +1409,21 @@ class TargetRunFinalizer:
         handle: TargetWorkHandle,
         handoff: TargetCompletionHandoff,
         resolved_workspace: _PinnedWorkspaceRoot,
+        system_owned: bool,
     ) -> _FrozenWorkspace:
         workspace_ref = resolved_workspace.workspace_ref
         root_descriptor = resolved_workspace.descriptor
+        if system_owned:
+            declared_implementation = tuple(
+                artifact
+                for artifact in handoff.artifacts
+                if artifact.role == "implementation"
+            )
+            if (
+                len(declared_implementation) != 1
+                or declared_implementation[0].relative_path != "implementation"
+            ):
+                raise OwnerConflict("target_implementation_workspace_invalid")
         frozen_artifacts: list[_FrozenArtifact] = []
         total_artifact_bytes = 0
         for ordinal, artifact in enumerate(handoff.artifacts):
@@ -1371,6 +1450,12 @@ class TargetRunFinalizer:
         implementation = tuple(
             item for item in artifacts if item.role == "implementation"
         )
+        if system_owned and (
+            len(implementation) != 1
+            or implementation[0].declared_relative_path != "implementation"
+            or implementation[0].artifact_kind != "directory"
+        ):
+            raise OwnerConflict("target_implementation_workspace_invalid")
         if not implementation:
             raise OwnerConflict("target_root_implementation_missing")
         implementation_tree_hash = (
@@ -1445,6 +1530,96 @@ class TargetRunFinalizer:
             raise OwnerConflict("target_root_checkpoint_policy_invalid")
 
 
+def _system_target_completion_handoff(
+    *,
+    handle: TargetWorkHandle,
+    evidence: TargetRootCompletionEvidence,
+    root_descriptor: int,
+) -> TargetCompletionHandoff:
+    """Derive the internal handoff from fixed, descriptor-safe Owner paths."""
+
+    if evidence.final_text is None or evidence.final_text_sha256 is None:
+        raise OwnerConflict("target_root_completion_evidence_invalid")
+    artifacts = [
+        TargetCompletionArtifact(role=role, relative_path=relative_path)
+        for role, relative_path in _SYSTEM_TARGET_COMPLETION_REQUIRED_ARTIFACTS
+    ]
+    for role, relative_path in _SYSTEM_TARGET_COMPLETION_OPTIONAL_ARTIFACTS:
+        if _workspace_artifact_exists(root_descriptor, relative_path):
+            artifacts.append(
+                TargetCompletionArtifact(
+                    role=role,
+                    relative_path=relative_path,
+                )
+            )
+    final_text_bytes = evidence.final_text.encode("utf-8")
+    summary = (
+        "System-bound Target root completion; final_text_sha256="
+        f"{evidence.final_text_sha256}; "
+        f"final_text_utf8_bytes={len(final_text_bytes)}."
+    )
+    return TargetCompletionHandoff(
+        schema_ref="meta-research/target-completion-handoff/v1",
+        target_ref=handle.target_ref,
+        target_run_ref=handle.target_run_ref,
+        status="completed",
+        artifacts=tuple(artifacts),
+        result_document_path="outputs/result.json",
+        summary=summary,
+    )
+
+
+def _workspace_artifact_exists(
+    root_descriptor: int,
+    relative_path: str,
+) -> bool:
+    """Probe one fixed path without following a workspace symlink."""
+
+    try:
+        descriptor, _info = _open_workspace_artifact(
+            root_descriptor,
+            relative_path,
+        )
+    except OwnerConflict as error:
+        if error.code == "target_root_artifact_missing":
+            return False
+        if error.code == "target_root_artifact_symlink_forbidden":
+            # Include the fixed declaration so the normal freeze path records
+            # the same fail-closed error as a recoverable candidate rejection.
+            return True
+        raise
+    os.close(descriptor)
+    return True
+
+
+def _completion_evidence_mode_is_valid(
+    evidence: TargetRootCompletionEvidence,
+) -> bool:
+    if evidence.handoff is not None:
+        return (
+            type(evidence.handoff) is TargetCompletionHandoff
+            and evidence.workspace_ref is None
+            and evidence.final_text is None
+            and evidence.final_text_sha256 is None
+        )
+    if (
+        type(evidence.workspace_ref) is not str
+        or not evidence.workspace_ref
+        or type(evidence.final_text) is not str
+        or not evidence.final_text
+        or type(evidence.final_text_sha256) is not str
+        or len(evidence.final_text_sha256) != 64
+    ):
+        return False
+    try:
+        final_text_bytes = evidence.final_text.encode("utf-8")
+    except UnicodeError:
+        return False
+    return hashlib.sha256(final_text_bytes).hexdigest() == (
+        evidence.final_text_sha256
+    )
+
+
 def _validate_evidence(
     evidence: TargetRootCompletionEvidence, *, handle: TargetWorkHandle
 ) -> None:
@@ -1472,6 +1647,7 @@ def _validate_evidence(
         or evidence.evidence_sequence < 0
         or type(evidence.observed_at) is not float
         or not math.isfinite(evidence.observed_at)
+        or not _completion_evidence_mode_is_valid(evidence)
     ):
         raise OwnerConflict("target_root_completion_evidence_invalid")
 

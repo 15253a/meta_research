@@ -842,7 +842,7 @@ def validate_technical_blocker_recovery(
     *,
     old_handle: TargetWorkHandle,
     replacement_handle: TargetWorkHandle,
-    previous_preflight: TargetExecutionPreflight,
+    previous_preflight: TargetExecutionPreflight | None,
     replacement_preflight: TargetExecutionPreflight | None,
     expected_replacement_review_scope: CodeReviewScope | None,
     accepted_input_target_commit_refs: tuple[str, ...],
@@ -904,7 +904,11 @@ def validate_technical_blocker_recovery(
             _fail("pure execution retry must reuse the existing reviewed preflight")
     else:
         _require_ref(replacement_revision, "replacement Implementation Revision")
-        if replacement_preflight is None or expected_replacement_review_scope is None:
+        if (
+            previous_preflight is None
+            or replacement_preflight is None
+            or expected_replacement_review_scope is None
+        ):
             _fail("code-changing recovery lacks a fresh reviewed preflight")
         if replacement_preflight.implementation_revision_ref != replacement_revision:
             _fail("recovery preflight prepared another replacement revision")
@@ -1069,45 +1073,87 @@ def _validate_target_root_completion_handoff_notice(
     target_spec_acceptance_receipt: ReceiptProof,
     expected_review_scopes: tuple[CodeReviewScope, ...],
 ) -> str:
-    """Validate the deliberately history-free Target-root terminal handoff."""
+    """Validate a root terminal plus native provider-ceiling successions."""
 
     terminal = handoff.terminal
     root_receipt = getattr(terminal, "root_completion_receipt", None)
     if (
         type(terminal) is not AcceptedMeasurementClosure
         or type(root_receipt) is not ReceiptProof
-        or handoff.handle_history != (initial_handle,)
+        or not handoff.handle_history
+        or handoff.handle_history[0] != initial_handle
         or handoff.code_review_preflights
         or handoff.stop_decisions
-        or handoff.recovered_blockers
-        or handoff.recovery_evidence_refs
         or expected_review_scopes
         or getattr(terminal, "code_review", None) is not None
         or getattr(terminal, "result_review", None) is not None
         or terminal.ar_execution_receipt != root_receipt
+        or len(handoff.recovered_blockers) != len(handoff.handle_history) - 1
+        or handoff.recovery_evidence_refs
+        != tuple(sorted(set(handoff.recovery_evidence_refs)))
     ):
-        _fail("Target root completion handoff contains legacy execution history")
+        _fail("Target root completion handoff contains invalid execution history")
+    commits = initial_handle.accepted_input_target_commit_refs
+    assets = tuple(
+        proof.asset_ref for proof in initial_handle.accepted_input_asset_proofs
+    )
+    retired_sessions: set[str] = set()
+    retired_attempts: set[str] = set()
+    retired_fences: set[str] = set()
+    required_recovery_evidence: set[str] = set()
+    for index, handle in enumerate(handoff.handle_history):
+        validate_target_work_handle(
+            handle,
+            target_ref=initial_handle.target_ref,
+            accepted_input_target_commit_refs=commits,
+            accepted_input_asset_refs=assets,
+        )
+        if (
+            handle.target_run_ref != initial_handle.target_run_ref
+            or handle.root_session_ref in retired_sessions
+            or handle.execution_attempt_ref in retired_attempts
+            or handle.execution_fence_ref in retired_fences
+        ):
+            _fail("Target root recovery reused a retired identity")
+        if index:
+            previous = handoff.handle_history[index - 1]
+            retired_sessions.add(previous.root_session_ref)
+            retired_attempts.add(previous.execution_attempt_ref)
+            retired_fences.add(previous.execution_fence_ref)
+            required_recovery_evidence.update(
+                validate_technical_blocker_recovery(
+                    handoff.recovered_blockers[index - 1],
+                    old_handle=previous,
+                    replacement_handle=handle,
+                    previous_preflight=None,
+                    replacement_preflight=None,
+                    expected_replacement_review_scope=None,
+                    accepted_input_target_commit_refs=commits,
+                    accepted_input_asset_refs=assets,
+                )
+            )
+    if not required_recovery_evidence.issubset(
+        set(handoff.recovery_evidence_refs)
+    ):
+        _fail("Target root recovery evidence is incomplete")
+    final_handle = handoff.handle_history[-1]
     _validate_receipt(
         root_receipt,
-        initial_handle.execution_attempt_ref,
+        final_handle.execution_attempt_ref,
         "Target root completion receipt",
     )
     if (
-        terminal.target_ref != initial_handle.target_ref
-        or terminal.target_run_ref != initial_handle.target_run_ref
+        terminal.target_ref != final_handle.target_ref
+        or terminal.target_run_ref != final_handle.target_run_ref
         or terminal.execution_attempt_ref
-        != initial_handle.execution_attempt_ref
-        or terminal.execution_fence_ref != initial_handle.execution_fence_ref
+        != final_handle.execution_attempt_ref
+        or terminal.execution_fence_ref != final_handle.execution_fence_ref
         or terminal.formal_measurement_accepted is not True
         or terminal.currentness_known is not True
         or terminal.current is not True
     ):
         _fail("Target root completion points at a stale final handle")
 
-    commits = initial_handle.accepted_input_target_commit_refs
-    assets = tuple(
-        proof.asset_ref for proof in initial_handle.accepted_input_asset_proofs
-    )
     validate_target_frontier_entry(
         frontier,
         target_ref=initial_handle.target_ref,
@@ -1118,7 +1164,7 @@ def _validate_target_root_completion_handoff_notice(
     )
     if (
         frontier.state != "terminal"
-        or frontier.current_handle != initial_handle
+        or frontier.current_handle != final_handle
         or reconfirmed_frontier != frontier
     ):
         _fail("authoritative Target root frontier changed during handoff validation")
@@ -1132,11 +1178,11 @@ def _validate_target_root_completion_handoff_notice(
         or notice.compact_reason != reason
         or notice.pending_obligation_refs != obligations
         or frontier.terminal_fact_ref != terminal_fact_ref
-        or notice.target_ref != initial_handle.target_ref
-        or notice.target_run_ref != initial_handle.target_run_ref
+        or notice.target_ref != final_handle.target_ref
+        or notice.target_run_ref != final_handle.target_run_ref
         or notice.execution_attempt_ref
-        != initial_handle.execution_attempt_ref
-        or notice.execution_fence_ref != initial_handle.execution_fence_ref
+        != final_handle.execution_attempt_ref
+        or notice.execution_fence_ref != final_handle.execution_fence_ref
         or notice.handoff_manifest_sha256 != digest
         or notice.payload_sha256 != _notice_payload_digest(notice)
     ):

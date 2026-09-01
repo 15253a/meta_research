@@ -261,52 +261,117 @@ def test_typed_harness_admission_scopes_a_real_mcp_owner_query(tmp_path) -> None
             control_key="control-key",
         )
 
+        authorization = f"Bearer {admission.connection.token}"
+        sessions: set[str] = set()
+        call_results = []
         with TestClient(app) as client:
-            initialized = client.post(
-                "/mcp",
-                headers={
-                    "Authorization": f"Bearer {admission.connection.token}",
-                    "Accept": "application/json, text/event-stream",
-                },
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {},
-                        "clientInfo": {"name": "public-test", "version": "1"},
+            for index, client_name in enumerate(
+                ("root", "root-reconnect", "native-child"), 1
+            ):
+                initialized = client.post(
+                    "/mcp",
+                    headers={
+                        "Authorization": authorization,
+                        "Accept": "application/json, text/event-stream",
                     },
-                },
-            )
-            assert initialized.status_code == 200
-
-            called = client.post(
-                "/mcp",
-                headers={
-                    "Authorization": f"Bearer {admission.connection.token}",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": index * 10,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {
+                                "name": client_name,
+                                "version": "1",
+                            },
+                        },
+                    },
+                )
+                assert initialized.status_code == 200
+                session_id = initialized.headers["mcp-session-id"]
+                sessions.add(session_id)
+                session_headers = {
+                    "Authorization": authorization,
                     "Accept": "application/json, text/event-stream",
                     "MCP-Protocol-Version": "2025-06-18",
+                    "Mcp-Session-Id": session_id,
+                }
+                acknowledged = client.post(
+                    "/mcp",
+                    headers=session_headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                        "params": {},
+                    },
+                )
+                listed = client.post(
+                    "/mcp",
+                    headers=session_headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": index * 10 + 1,
+                        "method": "tools/list",
+                        "params": {},
+                    },
+                )
+                called = client.post(
+                    "/mcp",
+                    headers=session_headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": index * 10 + 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "research_graph.snapshot.read",
+                            "arguments": {},
+                        },
+                    },
+                )
+                assert acknowledged.status_code == 202
+                assert listed.status_code == 200
+                assert [
+                    item["name"]
+                    for item in listed.json()["result"]["tools"]
+                ] == ["research_graph.snapshot.read"]
+                assert called.status_code == 200
+                call_results.append(called.json()["result"])
+
+            forbidden = client.post(
+                "/mcp",
+                headers={
+                    "Authorization": authorization,
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-06-18",
+                    "Mcp-Session-Id": next(iter(sessions)),
                 },
                 json={
                     "jsonrpc": "2.0",
-                    "id": 2,
+                    "id": 99,
                     "method": "tools/call",
                     "params": {
-                        "name": "research_graph.snapshot.read",
+                        "name": "agent_runtime.snapshot.read",
                         "arguments": {},
                     },
                 },
             )
 
-        assert called.status_code == 200
-        result = called.json()["result"]
-        assert result["isError"] is False
-        assert result["structuredContent"]["owner"] == "research_graph"
-        assert result["structuredContent"]["status"] == "ready"
-        assert result["structuredContent"]["revision"] == 0
-        assert result["structuredContent"]["facts"]["quest_count"] == 0
-        assert result["structuredContent"]["facts"]["question_count"] == 0
+        assert len(sessions) == 3
+        assert all(result["isError"] is False for result in call_results)
+        for result in call_results:
+            assert result["structuredContent"]["owner"] == "research_graph"
+            assert result["structuredContent"]["status"] == "ready"
+            assert result["structuredContent"]["revision"] == 0
+            assert result["structuredContent"]["facts"]["quest_count"] == 0
+            assert result["structuredContent"]["facts"]["question_count"] == 0
+        assert forbidden.status_code == 200
+        forbidden_result = forbidden.json()["result"]
+        assert forbidden_result["isError"] is True
+        assert forbidden_result["structuredContent"] == {
+            "status": "capability_unavailable",
+            "code": "capability_unavailable",
+        }
         assert admission.run.native_session_ref is None
         assert "token" not in str(admission.run.as_public_dict())
         gateway_status = runtime.harnesses.query_status()["gateway"]
@@ -615,4 +680,137 @@ def test_mcp_http_boundary_rejects_browser_origin_and_protocol_drift(
             "mcp_protocol_version_unsupported"
         )
     finally:
+        runtime.close()
+
+
+def test_mcp_http_returns_and_forwards_independent_client_session_headers(
+    tmp_path,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "operation-tree-session-headers")
+    )
+    real_harnesses = runtime.harnesses
+
+    class OperationTreeHarness:
+        def __init__(self) -> None:
+            self.sessions: set[str] = set()
+
+        def dispatch_mcp_http(
+            self,
+            token: str | None,
+            message: object,
+            *,
+            mcp_session_id: str | None,
+        ) -> tuple[int, dict[str, object] | None, str | None]:
+            assert token == "root-bearer"
+            assert isinstance(message, dict)
+            if message.get("method") == "initialize":
+                assert mcp_session_id is None
+                session_id = f"operation-client-{len(self.sessions) + 1}"
+                self.sessions.add(session_id)
+                return 200, {
+                    "jsonrpc": "2.0",
+                    "id": message.get("id"),
+                    "result": {"protocolVersion": "2025-06-18"},
+                }, session_id
+            assert mcp_session_id in self.sessions
+            if message.get("method") == "tools/call":
+                return 200, {
+                    "jsonrpc": "2.0",
+                    "id": message.get("id"),
+                    "result": {
+                        "content": [],
+                        "structuredContent": {"status": "ok"},
+                        "isError": False,
+                    },
+                }, None
+            return 200, {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {"tools": [{"name": "example.read"}]},
+            }, None
+
+    operation_tree_harness = OperationTreeHarness()
+    runtime.harnesses = operation_tree_harness  # type: ignore[assignment]
+    try:
+        app = create_app(runtime, base_url="http://testserver", control_key="key")
+        authorization = "Bearer root-bearer"
+        with TestClient(app) as client:
+            initialized_clients = []
+            listed_clients = []
+            called_clients = []
+            for index, client_name in enumerate(("root", "native-child"), 1):
+                initialized = client.post(
+                    "/mcp",
+                    headers={
+                        "Authorization": authorization,
+                        "Accept": "application/json, text/event-stream",
+                    },
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": index * 10,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {
+                                "name": client_name,
+                                "version": "1",
+                            },
+                        },
+                    },
+                )
+                session_id = initialized.headers["mcp-session-id"]
+                listed = client.post(
+                    "/mcp",
+                    headers={
+                        "Authorization": authorization,
+                        "Accept": "application/json, text/event-stream",
+                        "MCP-Protocol-Version": "2025-06-18",
+                        "Mcp-Session-Id": session_id,
+                    },
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": index * 10 + 1,
+                        "method": "tools/list",
+                        "params": {},
+                    },
+                )
+                called = client.post(
+                    "/mcp",
+                    headers={
+                        "Authorization": authorization,
+                        "Accept": "application/json, text/event-stream",
+                        "MCP-Protocol-Version": "2025-06-18",
+                        "Mcp-Session-Id": session_id,
+                    },
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": index * 10 + 2,
+                        "method": "tools/call",
+                        "params": {"name": "example.read", "arguments": {}},
+                    },
+                )
+                initialized_clients.append(initialized)
+                listed_clients.append(listed)
+                called_clients.append(called)
+
+        assert all(item.status_code == 200 for item in initialized_clients)
+        session_ids = {
+            item.headers["mcp-session-id"] for item in initialized_clients
+        }
+        assert session_ids == operation_tree_harness.sessions
+        assert len(session_ids) == 2
+        assert all(item.status_code == 200 for item in listed_clients)
+        assert all(
+            item.json()["result"]["tools"] == [{"name": "example.read"}]
+            for item in listed_clients
+        )
+        assert all(item.status_code == 200 for item in called_clients)
+        assert all(
+            item.json()["result"]["isError"] is False
+            for item in called_clients
+        )
+    finally:
+        runtime.harnesses = real_harnesses
         runtime.close()

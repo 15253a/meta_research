@@ -35,7 +35,6 @@ from meta_research.idea_skill import (
 from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA,
     bundle_exhaustion_route_fingerprint,
-    bundle_exhaustion_review_response_document,
 )
 from meta_research.bundle_protocol import (
     BUNDLE_HANDOFF_MAX_SERIALIZED_BYTES,
@@ -583,7 +582,12 @@ class _FullConformanceAuthority:
             contract_hash="1" * 64,
             conformance_ref="hfc_bundle_adapter",
             semantic_mcp_catalog_hash="2" * 64,
-            semantic_mcp_operation_bindings_hash="3" * 64,
+            semantic_mcp_operation_bindings_hash=canonical_hash(
+                [
+                    {"semantic_operation_id": operation_id}
+                    for operation_id in BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+                ]
+            ),
             required_families=("codex", "claude"),
             required_capabilities=("semantic_mcp",),
             required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
@@ -595,9 +599,36 @@ class _FullConformanceAuthority:
     def require_full_conformance_binding(self) -> FullConformanceBinding:
         return self.binding
 
+    def require_operation_binding(
+        self,
+        *,
+        harness_family: str,
+        required_operation_ids: tuple[str, ...],
+        required_capabilities: tuple[str, ...],
+    ) -> FullConformanceBinding:
+        assert harness_family == "codex"
+        assert required_operation_ids == BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+        assert required_capabilities == ("semantic_mcp",)
+        return FullConformanceBinding(
+            contract_ref="meta-research/harness-operation-binding/v1",
+            contract_hash="6" * 64,
+            conformance_ref="operation_binding_" + "6" * 48,
+            semantic_mcp_catalog_hash=self.binding.semantic_mcp_catalog_hash,
+            semantic_mcp_operation_bindings_hash=(
+                self.binding.semantic_mcp_operation_bindings_hash
+            ),
+            required_families=("codex",),
+            required_capabilities=required_capabilities,
+            required_operation_ids=required_operation_ids,
+            profile_receipts=(),
+        )
+
     def issue_resident_mcp_channel(
         self,
         *,
+        root_kind: str,
+        phase: str,
+        subject_policy: str,
         run_ref: str,
         attempt_ref: str,
         root_session_ref: str,
@@ -605,7 +636,12 @@ class _FullConformanceAuthority:
         capability_binding_hash: str,
         operation_ids: tuple[str, ...],
     ) -> ResidentMcpChannel:
+        assert root_kind == "bundle"
+        assert subject_policy == "operation_tree"
         request = {
+            "root_kind": root_kind,
+            "phase": phase,
+            "subject_policy": subject_policy,
             "run_ref": run_ref,
             "attempt_ref": attempt_ref,
             "root_session_ref": root_session_ref,
@@ -645,7 +681,7 @@ def _fake_codex(path: Path) -> Path:
     return path
 
 
-def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
+def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     tmp_path: Path,
 ) -> None:
     plan = _plan_document()
@@ -667,12 +703,6 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     runner = _SequenceRunner(
         [
             {"target_plan": target_plan},
-            {
-                "reviewer_agent_ref": "codex-bundle-reviewer:1",
-                "findings": [],
-                "final_target_plan": target_plan,
-                "dispositions": [],
-            },
             {
                 "action": "dispatch",
                 "selected_target_ref": "target:accepted-structure",
@@ -894,7 +924,8 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     batch = adapter.propose_target_batch(batch_request)
 
     assert result.primary_session_ref == "codex-bundle-primary:1"
-    assert result.reviewer_agent_ref == "codex-bundle-reviewer:1"
+    assert result.review_mode == "advisory_unobserved"
+    assert result.reviewer_agent_ref is None
     assert binding.model_ref == "gpt-5.6-sol"
     assert (
         "codex-config:model_reasoning_effort=max"
@@ -911,17 +942,14 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
         for item in binding.resource_bindings
     )
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
-    review_argv, review_prompt, review_schema = runner.calls[1]
-    dispatch_argv, dispatch_prompt, dispatch_schema = runner.calls[2]
-    batch_argv, batch_prompt, batch_schema = runner.calls[3]
+    dispatch_argv, dispatch_prompt, dispatch_schema = runner.calls[1]
+    batch_argv, batch_prompt, batch_schema = runner.calls[2]
     serialized_checkpoint = canonical_json(request.inbox_checkpoint)
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert 'model_reasoning_effort="max"' in primary_argv
     assert f"inbox_checkpoint={serialized_checkpoint}" in primary_prompt
-    assert f"inbox_checkpoint={serialized_checkpoint}" in review_prompt
     assert "Agent Session 绝不是 Target 或 TargetRun" in primary_prompt
     assert "本回合仅执行 Primary draft phase" in primary_prompt
-    assert "禁止调用 spawn_agent 或 wait" in primary_prompt
     assert "TargetPlan 不选择 provider、adapter" in primary_prompt
     assert "installed_experiment_provider_catalog=" not in primary_prompt
     assert "Provider transport envelope" in primary_prompt
@@ -990,13 +1018,6 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     assert "execution" not in target_schema["properties"]
     assert "semantic_inputs" in target_schema["properties"]
     assert "ordered Metric definitions" in primary_prompt
-    assert "完整 measurement contract" in review_prompt
-    assert review_argv[-3:] == ["resume", "codex-bundle-primary:1", "-"]
-    assert 'fork_turns="none"' in review_prompt
-    assert "当前 frozen reviewed_draft" in review_prompt
-    assert "不得复用 Primary phase" in review_prompt
-    assert "DAG" in review_prompt
-    assert "final_target_plan" in review_schema["properties"]
     assert dispatch.selected_target_ref == "target:accepted-structure"
     assert dispatch.native_session_ref == result.primary_session_ref
     assert dispatch_argv[-3:] == ["resume", "codex-bundle-primary:1", "-"]
@@ -1052,27 +1073,37 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
         adapter.propose_target_batch(
             replace(batch_request, inbox_checkpoint=forged_checkpoint)
         )
-    assert len(runner.calls) == 4
-    assert len(authority.issued) == 4
-    assert len(authority.revoked) == 4
+    assert len(runner.calls) == 3
+    assert len(authority.issued) == 3
+    assert len(authority.revoked) == 3
     assert all(
         issued["operation_ids"] == BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
         for issued in authority.issued
     )
     assert all(
         environment is not None
-        and len(environment) == 1
-        and next(iter(environment)) == "META_RESEARCH_MCP_TOKEN"
-        and next(iter(environment.values())).startswith("resident-secret-")
+        and set(environment)
+        == {"META_RESEARCH_MCP_TOKEN", "NO_PROXY", "no_proxy"}
+        and environment["META_RESEARCH_MCP_TOKEN"].startswith(
+            "resident-secret-"
+        )
+        and environment["NO_PROXY"] == environment["no_proxy"]
+        and {"127.0.0.1", "localhost", "::1"}
+        <= set(environment["NO_PROXY"].split(","))
         for environment in runner.environments
     )
     for (argv, prompt, _schema), environment in zip(
         runner.calls, runner.environments, strict=True
     ):
         assert environment is not None
-        token = next(iter(environment.values()))
+        token = environment["META_RESEARCH_MCP_TOKEN"]
         assert token not in prompt
         assert all(token not in argument for argument in argv)
+        assert "mcp_servers.meta_research.required=true" in argv
+        assert (
+            'mcp_servers.meta_research.default_tools_approval_mode="approve"'
+            in argv
+        )
 
 
 def test_production_adapter_fails_before_provider_without_resident_mcp(
@@ -1167,7 +1198,7 @@ def test_production_adapter_fails_before_provider_without_resident_mcp(
     assert runner.calls == []
 
 
-def test_production_exhaustion_review_requires_exact_fresh_child_trace(
+def test_production_exhaustion_acceptance_does_not_require_child_trace(
     tmp_path: Path,
 ) -> None:
     plan = _plan_document()
@@ -1247,12 +1278,6 @@ def test_production_exhaustion_review_requires_exact_fresh_child_trace(
             ],
         }
     }
-    assessment_hash = canonical_hash(assessment)
-    review = bundle_exhaustion_review_response_document(
-        reviewer_agent_ref="codex-bundle-exhaustion-reviewer:1",
-        reviewed_assessment_hash=assessment_hash,
-    )
-
     def configured_adapter(runner: _SequenceRunner, name: str):
         adapter = CodexBundleSkillAdapter(
             tmp_path / name,
@@ -1264,7 +1289,7 @@ def test_production_exhaustion_review_requires_exact_fresh_child_trace(
         adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
         return adapter
 
-    runner = _SequenceRunner([assessment, review])
+    runner = _SequenceRunner([assessment])
     adapter = configured_adapter(runner, "exhaustion-provider")
     binding = adapter.runtime_binding()
     request = BundleSkillRequest(
@@ -1290,20 +1315,13 @@ def test_production_exhaustion_review_requires_exact_fresh_child_trace(
     result = adapter.execute(request)
     assert isinstance(result, BundleExhaustionSkillResult)
     validate_bundle_exhaustion_skill_result(request, result)
-    adapter.verify_bundle_exhaustion_review_trace(
-        result.review_trace,
-        runtime_binding_hash=canonical_hash(binding.as_dict()),
-    )
-    assert runner.calls[1][2]["required"] == [
-        "schema_ref",
-        "reviewer_agent_ref",
-        "reviewed_assessment_hash",
-        "accepted",
-        "findings",
-    ]
+    assert result.review_mode == "advisory_unobserved"
+    assert result.reviewer_agent_ref is None
+    assert result.review_trace is None
+    assert len(runner.calls) == 1
 
     missing_trace_runner = _SequenceRunner(
-        [assessment, review], emit_review_trace=False
+        [assessment], emit_review_trace=False
     )
     missing_trace_adapter = configured_adapter(
         missing_trace_runner, "missing-exhaustion-trace"
@@ -1314,28 +1332,17 @@ def test_production_exhaustion_review_requires_exact_fresh_child_trace(
         runtime_binding=missing_binding,
         job_ref="bundle-exhaustion-missing-trace-job",
     )
-    with pytest.raises(
-        BundleSkillUnavailable, match="codex_child_review_spawn_invalid"
-    ) as caught:
-        missing_trace_adapter.execute(missing_request)
-    assert caught.value.recovery_checkpoint is not None
-    assert caught.value.recovery_checkpoint["contract_failure_code"] == (
-        "codex_child_review_spawn_invalid"
-    )
-    assert caught.value.recovery_checkpoint["contract_failure_detail_code"] == (
-        "codex_child_review_spawn_invalid"
-    )
-    assert "当前 frozen reviewed_assessment" in missing_trace_runner.calls[1][1]
-    assert "不得复用 Primary phase" in missing_trace_runner.calls[1][1]
+    missing_result = missing_trace_adapter.execute(missing_request)
+    assert isinstance(missing_result, BundleExhaustionSkillResult)
+    assert missing_result.review_trace is None
+    assert len(missing_trace_runner.calls) == 1
 
     no_replay = _SequenceRunner([])
     restarted = configured_adapter(no_replay, "missing-exhaustion-trace")
-    with pytest.raises(
-        BundleSkillUnavailable, match="codex_child_review_spawn_invalid"
-    ):
-        restarted.execute(
-            replace(missing_request, runtime_binding=restarted.runtime_binding())
-        )
+    replay = restarted.execute(
+        replace(missing_request, runtime_binding=restarted.runtime_binding())
+    )
+    assert replay == missing_result
     assert no_replay.calls == []
 
 
@@ -1649,7 +1656,8 @@ def test_bundle_transport_limits_are_sealed_and_reused_on_durable_restart(
     invocation_path = operation / "invocation.json"
     invocation_envelope = json.loads(invocation_path.read_text(encoding="utf-8"))
     invocation = invocation_envelope["payload"]
-    assert invocation["schema_ref"] == "meta-research/codex-provider-operation/v2"
+    assert invocation["schema_ref"] == "meta-research/codex-provider-operation/v3"
+    assert "root_capability_diagnostics" not in invocation
     assert {
         name: invocation[name]
         for name in (

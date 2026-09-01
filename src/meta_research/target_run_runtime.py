@@ -22,6 +22,7 @@ from meta_research.harness import HarnessAdmissionError, HarnessRuntime
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.agent_runtime_harness import (
     TARGET_ROOT_RECOVERY_PENDING_CODE,
+    TARGET_ROOT_RECOVERY_READY_CODE,
     TargetRootCompletionEvidence,
 )
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
@@ -33,6 +34,15 @@ from meta_research.owners.target_run_runtime import (
     SQLiteTargetRunAgentAuthority,
     SQLiteTargetRunGraphAuthority,
     canonical_target_scope_binding,
+)
+
+
+_PROVIDER_CEILING_FAILURE_CODES = frozenset(
+    {
+        "provider_timeout",
+        "provider_output_limit",
+        "provider_descendant_process",
+    }
 )
 
 
@@ -139,7 +149,7 @@ class TargetRunRuntime:
         harness = self._target_agent.query_target_harness_admission(target_ref)
         if harness is None:
             try:
-                self._harnesses.admit_target_run_from_current_conformance(
+                self._harnesses.admit_target_run_from_current_binding(
                     target_ref=target_ref,
                     target_run_ref=launch.target_run_ref,
                     harness_family=self._harness_family,  # type: ignore[arg-type]
@@ -193,6 +203,137 @@ class TargetRunRuntime:
                 raise OwnerConflict("target_root_cancel_integrity_invalid")
             self._set_status(target_ref, "cancelled")
             return True
+
+        if (
+            getattr(harness, "status", None) == "running"
+            and getattr(harness, "failure_code", None)
+            in _PROVIDER_CEILING_FAILURE_CODES
+        ):
+            # Read the current issuer-verified handle before Harness rotates
+            # Session/Attempt/Fence.  recover_fenced_target_root performs the
+            # stricter durable operation/receipt checks; this driver merely
+            # selects the three signed physical-ceiling outcomes and never
+            # interprets ordinary provider or unknown-outcome failures as one.
+            handle = self._target_agent.query_current_target_work_handle(
+                target_ref
+            )
+            if handle is None:
+                raise OwnerConflict("target_run_handle_unavailable")
+            try:
+                self._harnesses.recover_fenced_target_root(
+                    harness.harness_request_ref,
+                    old_handle=handle,
+                )
+            except HarnessAdmissionError as error:
+                self._set_status(
+                    target_ref,
+                    "harness_ceiling_recovery_pending",
+                    error.code,
+                    next_retry_at=error.next_retry_at,
+                )
+                return False
+            self._set_status(target_ref, "harness_ceiling_recovered")
+            return True
+
+        if getattr(harness, "failure_code", None) == (
+            TARGET_ROOT_RECOVERY_PENDING_CODE
+        ):
+            # A crash may land between successor reservation and fresh channel
+            # activation.  Resume that exact reserved generation; the channel
+            # issuer changes the marker to READY before AR may bind or CAS it.
+            try:
+                self._harnesses.recover_failed_target_root(
+                    harness.harness_request_ref
+                )
+            except HarnessAdmissionError as error:
+                self._set_status(
+                    target_ref,
+                    "harness_ceiling_channel_pending",
+                    error.code,
+                    next_retry_at=error.next_retry_at,
+                )
+                return False
+            self._set_status(target_ref, "harness_ceiling_channel_ready")
+            return True
+
+        if getattr(harness, "failure_code", None) == (
+            TARGET_ROOT_RECOVERY_READY_CODE
+        ):
+            frontier = self._agent_runtime.query_target_frontier_entry(target_ref)
+            old_handle = getattr(frontier, "current_handle", None)
+            if type(old_handle) is not TargetWorkHandle:
+                raise OwnerConflict("target_run_handle_unavailable")
+            successor_identity = (
+                harness.target_run_ref,
+                harness.root_session_ref,
+                harness.execution_attempt_ref,
+                harness.execution_fence_ref,
+            )
+            frontier_identity = (
+                old_handle.target_run_ref,
+                old_handle.root_session_ref,
+                old_handle.execution_attempt_ref,
+                old_handle.execution_fence_ref,
+            )
+            if frontier_identity != successor_identity:
+                input_binding = (
+                    self._target_graph.query_execution_input_binding_for_attempt(
+                        target_ref=target_ref,
+                        target_run_ref=harness.target_run_ref,
+                        target_attempt_ref=harness.execution_attempt_ref,
+                        target_fence_ref=harness.execution_fence_ref,
+                    )
+                )
+                if input_binding is None:
+                    self._target_graph.accept_execution_input_binding(
+                        target_ref=target_ref,
+                        target_run_ref=harness.target_run_ref,
+                        target_attempt_ref=harness.execution_attempt_ref,
+                        target_fence_ref=harness.execution_fence_ref,
+                        target_spec_hash=(
+                            launch.request.target_spec_binding.content_hash_ref
+                        ),
+                        target_scope_binding_hash=canonical_hash(scope_binding),
+                        input_refs=tuple(
+                            sorted(
+                                (
+                                    *launch.request.accepted_input_target_commit_refs,
+                                    *launch.request.accepted_input_asset_refs,
+                                )
+                            )
+                        ),
+                        idempotency_key=(
+                            "target-root-input:"
+                            + target_ref
+                            + ":"
+                            + harness.execution_attempt_ref
+                        ),
+                    )
+                    self._set_status(
+                        target_ref,
+                        "harness_ceiling_input_scope_bound",
+                    )
+                    return True
+                replacement = self._target_root_lifecycle.recover_provider_ceiling_successor(
+                    old_handle=old_handle,
+                    idempotency_key=(
+                        "target-root-provider-recovery:"
+                        + target_ref
+                        + ":"
+                        + harness.execution_attempt_ref
+                    ),
+                )
+                if (
+                    replacement.target_run_ref,
+                    replacement.root_session_ref,
+                    replacement.execution_attempt_ref,
+                    replacement.execution_fence_ref,
+                ) != successor_identity:
+                    raise OwnerConflict(
+                        "target_root_provider_recovery_integrity_invalid"
+                    )
+                self._set_status(target_ref, "harness_ceiling_frontier_recovered")
+                return True
 
         if getattr(harness, "status", None) == "failed" or (
             getattr(harness, "failure_code", None)
@@ -257,7 +398,12 @@ class TargetRunRuntime:
         if workspace is None:
             self._target_agent.reserve_target_workspace(
                 handle=handle,
-                idempotency_key="target-root-workspace:" + target_ref,
+                idempotency_key=(
+                    "target-root-workspace:"
+                    + target_ref
+                    + ":"
+                    + handle.execution_attempt_ref
+                ),
             )
             self._set_status(target_ref, "workspace_reserved")
             return True
@@ -483,21 +629,23 @@ class TargetRunRuntime:
             ],
             "frozen_input_manifest_path": frozen_input_manifest_path,
             "owner_revision_request": revision_request,
-            "completion_handoff_contract": {
-                "schema_ref": "meta-research/target-completion-handoff/v1",
-                "target_ref": handle.target_ref,
-                "target_run_ref": handle.target_run_ref,
-                "status": "completed",
-                "required_artifact_fields": ["role", "relative_path"],
-                "allowed_artifact_roles": [
-                    "implementation",
-                    "checkpoint",
-                    "result",
-                    "log",
-                    "analysis",
+            "completion_binding": {
+                "owner": "system",
+                "required_workspace_paths": {
+                    "implementation": "implementation",
+                    "result": "outputs/result.json",
+                },
+                "optional_workspace_paths": {
+                    "checkpoint": "outputs/checkpoints",
+                    "analysis": "outputs/analysis",
+                    "log": "logs",
+                },
+                "result_document_fields": [
+                    "schema_ref",
+                    "metrics",
+                    "result_disposition",
                 ],
-                "required_result_document_path": True,
-                "required_summary": True,
+                "root_final_text": "exact text and UTF-8 sha256",
             },
         }
         return (
@@ -505,35 +653,45 @@ class TargetRunRuntime:
             "inside the assigned workspace and own the entire loop: implement or "
             "reuse code, run real training/evaluation commands in your terminal, "
             "inspect results, change code or configuration, and repeat as many times "
-            "as the evidence requires. For a long-running training process or log, "
-            "you may spawn a focused child agent in this Harness tree to watch the "
-            "process, tail output, and report observations; you remain responsible "
+            "as the evidence requires. You may use native multi-agent collaboration "
+            "when it helps, but delegation is optional and never an acceptance gate. "
+            "This authenticated Target Root operation owns every formal HumanRequest; "
+            "children do not gain a separate public requester identity. A provider, "
+            "validator, daemon, or other system condition must never synthesize or "
+            "impersonate a HumanRequest; report the condition so this root can "
+            "decide whether one of the four formal request kinds is warranted. "
+            "You remain responsible "
             "for every code change, stop decision, checkpoint choice, and final "
-            "handoff. Do not use or invent an external TargetExecutionPort, a "
+            "result. Do not use or invent an external TargetExecutionPort, a "
             "daemon-owned Supervisor, execution Attempt, monitor phase, RM receipt, "
-            "RG receipt, MetricResult, or TargetCommit. The light daemon only resumes this same "
-            "native Session and forwards terminal output to the Web UI.\n\n"
-            "Put final code under implementation/. Put checkpoints/results/logs "
-            "under outputs/ and logs/. If the Target is not genuinely finished at "
-            "the end of this turn, return a normal concise progress message; the same "
-            "Session will be resumed. Only when implementation and training are "
-            "fully complete, ensure every declared artifact exists and make the LAST "
-            "root agent message exactly one valid JSON object whose keys and "
-            "fixed values follow completion_handoff_contract below. The artifacts "
-            "array contains only objects with role and relative_path. Allowed roles "
-            "are implementation, checkpoint, result, log, analysis; paths are "
-            "workspace-relative. "
-            "The result_document_path must also be one result artifact. Do not put "
-            "prose around the final JSON. RM and RG receive nothing from this Target "
-            "until that final envelope has been issuer-verified. Accepted upstream "
+            "RG receipt, MetricResult, or TargetCommit. The light daemon continues "
+            "this logical root lifecycle and forwards activity to the Web UI; only "
+            "the Owner may rotate physical runtime identity after a signed provider "
+            "ceiling.\n\n"
+            "Put code under implementation/. Keep the canonical Target result at "
+            "outputs/result.json with exactly schema_ref, metrics, and "
+            "result_disposition. Do not create or retain that result file until its "
+            "content represents the genuinely finished current implementation and "
+            "evaluation. Optional checkpoints belong under outputs/checkpoints, "
+            "optional analysis under outputs/analysis, and logs under logs/. End "
+            "each provider turn with normal concise root text; do not emit a JSON "
+            "handoff or repeat Target, TargetRun, Attempt, Fence, operation, or "
+            "workspace identity. After a clean terminal turn, the Harness binds the "
+            "exact final root text and UTF-8 hash to the terminal operation and "
+            "Owner workspace. The Owner then scans only the fixed paths above and "
+            "constructs the internal completion handoff. Missing or invalid required "
+            "paths produce issuer feedback and another recoverable root revision; "
+            "they are not a request for an envelope. RM and RG receive nothing from "
+            "this Target until the binding, current workspace, and physical artifact "
+            "bytes have been issuer-verified. Accepted upstream "
             "TargetCommit outputs and direct assets are available through the exact "
             "read-only manifest at frozen_input_manifest_path. It is outside your "
             "workspace-write root; read it by that absolute path and treat it as "
             "immutable. inputs/manifest.json is only a convenience pointer. "
-            "When owner_revision_request is present, preserve the rejected "
-            "handoff, address its exact issuer feedback in this same Session, "
-            "and return a materially changed successor completion. Do not rotate "
-            "the TargetRun, Attempt, Fence, root Session, or native Session.\n\nExact Owner "
+            "When owner_revision_request is present, leave the Owner's rejected "
+            "binding immutable, address its exact issuer feedback, and finish a "
+            "materially changed successor root turn. Do not attempt to rotate the "
+            "TargetRun, Attempt, Fence, root Session, or native Session yourself.\n\nExact Owner "
             "context:\n" + canonical_json(material)
         )
 

@@ -66,6 +66,7 @@ class ExperimentIntent:
     hypothesis: str
     variant_parameter: float
     sample_count: int
+    wall_time_budget_seconds: float = 300.0
     request_kind: Literal["retrain", "remeasure"] = "retrain"
     source_variant_run_ref: str | None = None
     selected_checkpoint_role_refs: tuple[str, ...] = ()
@@ -79,6 +80,7 @@ class ExperimentIntent:
             "hypothesis": self.hypothesis,
             "variant_parameter": self.variant_parameter,
             "sample_count": self.sample_count,
+            "wall_time_budget_seconds": self.wall_time_budget_seconds,
             "request_kind": self.request_kind,
             "source_variant_run_ref": self.source_variant_run_ref,
             "selected_checkpoint_role_refs": list(self.selected_checkpoint_role_refs),
@@ -99,6 +101,13 @@ class ExperimentIntent:
             raise OwnerConflict("experiment_variant_parameter_invalid")
         if isinstance(self.sample_count, bool) or not 4 <= self.sample_count <= 4096:
             raise OwnerConflict("experiment_sample_count_invalid")
+        if (
+            isinstance(self.wall_time_budget_seconds, bool)
+            or not isinstance(self.wall_time_budget_seconds, (int, float))
+            or not math.isfinite(float(self.wall_time_budget_seconds))
+            or not 1 <= float(self.wall_time_budget_seconds) <= 24 * 60 * 60
+        ):
+            raise OwnerConflict("experiment_wall_time_budget_invalid")
         if self.request_kind not in {"retrain", "remeasure"}:
             raise OwnerConflict("experiment_request_kind_invalid")
         if self.request_kind == "retrain":
@@ -518,6 +527,7 @@ class ExperimentProviderRequest:
     selected_checkpoints: tuple[MaterializedExperimentCheckpoint, ...] = ()
     definition: dict[str, object] | None = None
     checkpoint_policy: Literal["forbidden", "optional", "required"] | None = None
+    wall_time_budget_seconds: float = 300.0
 
     def validate(self) -> None:
         if (
@@ -527,6 +537,13 @@ class ExperimentProviderRequest:
             or self.provider_operation_generation < 1
         ):
             raise OwnerConflict("experiment_provider_operation_ref_invalid")
+        if (
+            isinstance(self.wall_time_budget_seconds, bool)
+            or not isinstance(self.wall_time_budget_seconds, (int, float))
+            or not math.isfinite(float(self.wall_time_budget_seconds))
+            or not 1 <= float(self.wall_time_budget_seconds) <= 24 * 60 * 60
+        ):
+            raise OwnerConflict("experiment_wall_time_budget_invalid")
         if self.request_kind not in {"retrain", "new_variant", "remeasure"}:
             raise OwnerConflict("experiment_provider_request_invalid")
         if self.request_kind in {"retrain", "new_variant"} and self.selected_checkpoints:
@@ -538,6 +555,23 @@ class ExperimentProviderRequest:
             raise OwnerConflict("experiment_checkpoint_policy_invalid")
         if self.definition is not None:
             canonical_hash(self.definition)
+            intent_document = self.definition.get("intent")
+            if (
+                isinstance(intent_document, dict)
+                and "wall_time_budget_seconds" in intent_document
+                and (
+                    not isinstance(
+                        intent_document.get("wall_time_budget_seconds"),
+                        (int, float),
+                    )
+                    or isinstance(
+                        intent_document.get("wall_time_budget_seconds"), bool
+                    )
+                    or float(intent_document["wall_time_budget_seconds"])
+                    != float(self.wall_time_budget_seconds)
+                )
+            ):
+                raise OwnerConflict("experiment_wall_time_budget_invalid")
         if len(self.selected_checkpoints) > 32 or tuple(
             checkpoint.ordinal for checkpoint in self.selected_checkpoints
         ) != tuple(range(len(self.selected_checkpoints))):
@@ -931,6 +965,9 @@ def experiment_intent_from_document(value: dict[str, object]) -> ExperimentInten
                 hypothesis=str(value["hypothesis"]),
                 variant_parameter=float(value["variant_parameter"]),
                 sample_count=int(value["sample_count"]),
+                wall_time_budget_seconds=float(
+                    value.get("wall_time_budget_seconds", 300.0)
+                ),
                 request_kind=cast(
                     Literal["retrain", "remeasure"], str(value["request_kind"])
                 ),
@@ -944,7 +981,16 @@ def experiment_intent_from_document(value: dict[str, object]) -> ExperimentInten
                 ),
             )
         intent.validate()
-        if intent.as_dict() != value:
+        expected_document = intent.as_dict()
+        # Before the budget became user-visible, the built-in provider's
+        # documented 300-second value lived only in its runtime binding.
+        # Preserve exact historical decoding while every new Web intent carries
+        # the field explicitly.
+        if "wall_time_budget_seconds" not in value and isinstance(
+            intent, ExperimentIntent
+        ):
+            expected_document.pop("wall_time_budget_seconds", None)
+        if expected_document != value:
             raise OwnerConflict("experiment_intent_invalid")
         return intent
     except (KeyError, TypeError, ValueError) as error:

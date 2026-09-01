@@ -166,7 +166,7 @@ def test_cli_data_root_rejects_relative_paths(
         _explicit_data_root(argument)
 
 
-def test_default_codex_adapters_share_only_the_managed_codex_runner(
+def test_default_codex_adapters_share_managed_runner_and_stage_ledgers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -206,6 +206,11 @@ def test_default_codex_adapters_share_only_the_managed_codex_runner(
         assert runtime.deepfetch._provider._codex_ledger_reader._codex_home == (
             data_root.codex_home.resolve()
         )
+        for provider in codex_providers[1:5]:
+            assert provider._codex_ledger_reader._codex_home == (
+                data_root.codex_home.resolve()
+            )
+            assert provider._child_review_verifier is not None
         assert codex_harness.executable == expected_executable
         assert codex_harness._codex_child_ledger_reader._codex_home == (
             data_root.codex_home.resolve()

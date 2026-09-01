@@ -325,7 +325,7 @@ def test_long_legal_frozen_refs_do_not_expand_into_provider_schema(
     )
 
 
-def test_public_result_seam_records_one_advisory_child_review() -> None:
+def test_public_result_seam_does_not_claim_internal_reviewer_identity() -> None:
     request = _request()
     output = _stage_output()
     result = ReasoningSkillResult(
@@ -336,8 +336,8 @@ def test_public_result_seam_records_one_advisory_child_review() -> None:
         findings=(),
         dispositions=(),
         primary_session_ref="provider-session:1",
-        review_mode="harness_child_agent",
-        reviewer_agent_ref="provider-child:1",
+        review_mode="advisory_unobserved",
+        reviewer_agent_ref=None,
         adapter_kind="deterministic-test",
     )
 
@@ -346,13 +346,13 @@ def test_public_result_seam_records_one_advisory_child_review() -> None:
     assert final_output == output
     assert review == {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "review_mode": "harness_child_agent",
-        "reviewer_agent_ref": "provider-child:1",
+        "review_mode": "advisory_unobserved",
+        "reviewer_agent_ref": None,
         "reviewed_draft_hash": canonical_hash(output),
         "findings": [],
         "dispositions": [],
         "final_output_hash": canonical_hash(output),
-        "independent": True,
+        "independent": False,
         "advisory_only": True,
     }
     assert validate_reasoning_skill_result(request, result) == (
@@ -447,9 +447,36 @@ class _FullConformanceAuthority:
     def require_full_conformance_binding(self) -> FullConformanceBinding:
         return self.binding
 
+    def require_operation_binding(
+        self,
+        *,
+        harness_family: str,
+        required_operation_ids: tuple[str, ...],
+        required_capabilities: tuple[str, ...],
+    ) -> FullConformanceBinding:
+        assert harness_family == "codex"
+        assert required_operation_ids == REASONING_ROOT_SEMANTIC_OPERATION_IDS
+        assert required_capabilities == ("semantic_mcp",)
+        return FullConformanceBinding(
+            contract_ref="meta-research/harness-operation-binding/v1",
+            contract_hash="6" * 64,
+            conformance_ref="operation-binding:reasoning:1",
+            semantic_mcp_catalog_hash=self.binding.semantic_mcp_catalog_hash,
+            semantic_mcp_operation_bindings_hash=(
+                self.binding.semantic_mcp_operation_bindings_hash
+            ),
+            required_families=("codex",),
+            required_capabilities=required_capabilities,
+            required_operation_ids=required_operation_ids,
+            profile_receipts=(),
+        )
+
     def issue_resident_mcp_channel(
         self,
         *,
+        root_kind: str,
+        phase: str,
+        subject_policy: str,
         run_ref: str,
         attempt_ref: str,
         root_session_ref: str,
@@ -457,6 +484,9 @@ class _FullConformanceAuthority:
         capability_binding_hash: str,
         operation_ids: tuple[str, ...],
     ) -> ResidentMcpChannel:
+        assert root_kind == "reasoning"
+        assert phase in {"primary", "review", "autonomous-resume"}
+        assert subject_policy == "operation_tree"
         self.issued.append(
             {
                 "run_ref": run_ref,
@@ -646,22 +676,6 @@ def _durable_reasoning_codex(
         }
         for operation_id in REASONING_ROOT_SEMANTIC_OPERATION_IDS
     )
-    reviewer = output["reviewer_agent_ref"]
-    for tool, status in (("spawn_agent", "pending_init"), ("wait", "completed")):
-        events.append(
-            {
-                "type": "item.completed",
-                "item": {
-                    "id": f"collab:{tool}",
-                    "type": "collab_tool_call",
-                    "tool": tool,
-                    "sender_thread_id": "provider-session:1",
-                    "receiver_thread_ids": [reviewer],
-                    "agents_states": {reviewer: {"status": status}},
-                    "status": "completed",
-                },
-            }
-        )
     encoded_output = repr(json.dumps(output, ensure_ascii=False))
     encoded_events = repr(
         "\n".join(json.dumps(event, ensure_ascii=False) for event in events)
@@ -690,7 +704,6 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     primary = _stage_output()
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "reviewer_agent_ref": "provider-child:1",
         "findings": [],
         "final_output": primary,
         "dispositions": [],
@@ -707,11 +720,15 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     binding = adapter.runtime_binding()
     request = replace(_request(), runtime_binding=binding)
 
-    result = adapter.execute(request)
+    draft = adapter.generate_draft(request)
+    result = adapter.review_draft(
+        replace(request, native_session_ref=draft.primary_session_ref),
+        draft,
+    )
 
     assert result.outcome_document() == primary
     assert result.primary_session_ref == "provider-session:1"
-    assert result.reviewer_agent_ref == "provider-child:1"
+    assert result.reviewer_agent_ref is None
     assert binding.model_ref == "gpt-5.6-sol"
     assert (
         "codex-config:model_reasoning_effort=max"
@@ -726,10 +743,6 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     assert len(runner.calls) == 2
     assert 'model_reasoning_effort="max"' in runner.calls[0][0]
     assert runner.calls[1][0][-3:] == ["resume", "provider-session:1", "-"]
-    assert "本回合仅执行 Primary draft phase" in runner.calls[0][1]
-    assert "禁止调用 spawn_agent 或 wait" in runner.calls[0][1]
-    assert "当前 frozen reviewed_draft" in runner.calls[1][1]
-    assert "不得复用 Primary phase" in runner.calls[1][1]
     assert len(authority.issued) == 2
     assert len(authority.revoked) == 2
     assert all(
@@ -738,7 +751,11 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     )
     assert all(
         environment is not None
-        and set(environment) == {"META_RESEARCH_MCP_TOKEN"}
+        and set(environment)
+        == {"META_RESEARCH_MCP_TOKEN", "NO_PROXY", "no_proxy"}
+        and environment["NO_PROXY"] == environment["no_proxy"]
+        and {"127.0.0.1", "localhost", "::1"}
+        <= set(environment["NO_PROXY"].split(","))
         for environment in runner.environments
     )
     for (argv, prompt, schema), environment in zip(
@@ -749,6 +766,11 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
         token = environment["META_RESEARCH_MCP_TOKEN"]
         assert token not in prompt
         assert all(token not in value for value in argv)
+        assert "mcp_servers.meta_research.required=true" in argv
+        assert (
+            'mcp_servers.meta_research.default_tools_approval_mode="approve"'
+            in argv
+        )
     primary_schema = runner.calls[0][2]
     assert primary_schema["required"] == ["provider_output"]
     provider_variants = primary_schema["properties"]["provider_output"][
@@ -812,7 +834,7 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
 
 
 @pytest.mark.parametrize("autonomous", [False, True])
-def test_durable_reasoning_review_trace_failure_is_terminal_for_both_branches(
+def test_reasoning_result_does_not_require_internal_review_trace(
     tmp_path: Path,
     autonomous: bool,
 ) -> None:
@@ -821,13 +843,10 @@ def test_durable_reasoning_review_trace_failure_is_terminal_for_both_branches(
         from test_public_autonomous_creation import _AutonomousReasoningSkill
 
         primary = _AutonomousReasoningSkill().generate_draft(base_request).draft
-        reviewer = "provider-autonomous-child:1"
     else:
         primary = _stage_output()
-        reviewer = "provider-normal-child:1"
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "reviewer_agent_ref": reviewer,
         "findings": [],
         "final_output": primary,
         "dispositions": [],
@@ -856,28 +875,14 @@ def test_durable_reasoning_review_trace_failure_is_terminal_for_both_branches(
         job_ref=f"reasoning-terminal-{autonomous}-job",
     )
 
-    with pytest.raises(
-        ReasoningSkillUnavailable, match="codex_child_review_spawn_invalid"
-    ) as caught:
-        adapter.execute(request)
-    assert caught.value.recovery_checkpoint is not None
-    assert caught.value.recovery_checkpoint["contract_failure_code"] == (
-        "codex_child_review_spawn_invalid"
+    draft = adapter.generate_draft(request)
+    result = adapter.review_draft(
+        replace(request, native_session_ref=draft.primary_session_ref),
+        draft,
     )
-    assert caught.value.recovery_checkpoint["contract_failure_detail_code"] == (
-        "codex_child_review_spawn_invalid"
-    )
-    assert len(runner.calls) == 2
 
-    no_replay = _SequenceRunner([])
-    restarted = configured(no_replay)
-    with pytest.raises(
-        ReasoningSkillUnavailable, match="codex_child_review_spawn_invalid"
-    ):
-        restarted.execute(
-            replace(request, runtime_binding=restarted.runtime_binding())
-        )
-    assert no_replay.calls == []
+    assert result is not None
+    assert len(runner.calls) == 2
 
 
 def _autonomous_resume_fixture(
@@ -916,7 +921,6 @@ def _autonomous_resume_fixture(
     )
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "reviewer_agent_ref": expected.reviewer_agent_ref,
         "findings": list(expected.findings),
         "final_output": expected.outcome_document(),
         "dispositions": list(expected.dispositions),
@@ -925,17 +929,11 @@ def _autonomous_resume_fixture(
 
 
 @pytest.mark.parametrize(
-    ("operation_name", "failure_code"),
-    [
-        ("primary", "reasoning_primary_result_contract_invalid"),
-        ("review", "reasoning_review_result_contract_invalid"),
-        ("autonomous-resume", "reasoning_review_result_contract_invalid"),
-    ],
+    "operation_name", ["primary", "review", "autonomous-resume"]
 )
-def test_durable_reasoning_semantic_trace_failure_is_terminal_without_replay(
+def test_reasoning_result_does_not_require_semantic_call_trace(
     tmp_path: Path,
     operation_name: str,
-    failure_code: str,
 ) -> None:
     workspace = tmp_path / f"reasoning-semantic-terminal-{operation_name}"
     executable = _fake_codex(tmp_path / f"codex-{operation_name}")
@@ -943,7 +941,6 @@ def test_durable_reasoning_semantic_trace_failure_is_terminal_without_replay(
     primary = _stage_output()
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "reviewer_agent_ref": "provider-child:1",
         "findings": [],
         "final_output": primary,
         "dispositions": [],
@@ -1005,21 +1002,10 @@ def test_durable_reasoning_semantic_trace_failure_is_terminal_without_replay(
             creation_result,
         )
 
-    with pytest.raises(ReasoningSkillUnavailable, match=failure_code) as caught:
-        invoke(adapter)
-    terminal = caught.value.recovery_checkpoint
-    assert terminal is not None
-    assert terminal["contract_failure_code"] == failure_code
-    assert terminal["contract_failure_detail_code"] == (
-        "reasoning_semantic_mcp_currentness_unobserved"
-    )
+    result = invoke(adapter)
 
-    no_replay = _SequenceRunner([])
-    restarted = configured(no_replay)
-    with pytest.raises(ReasoningSkillUnavailable, match=failure_code) as replayed:
-        invoke(restarted)
-    assert replayed.value.recovery_checkpoint == terminal
-    assert no_replay.calls == []
+    assert result is not None
+    assert len(runner.calls) == len(outputs)
 
 
 def test_restart_reconciles_cancelled_autonomous_resume_operation(

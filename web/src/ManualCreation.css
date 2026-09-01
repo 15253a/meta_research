@@ -953,6 +953,13 @@
   border-color: #d9dee7;
 }
 
+.manual-session-compose > small {
+  display: block;
+  margin-top: 6px;
+  color: #85839a;
+  font: 8px/1.35 var(--utility);
+}
+
 .manual-session-status {
   display: flex;
   justify-content: space-between;

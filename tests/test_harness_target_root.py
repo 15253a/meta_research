@@ -40,13 +40,16 @@ from meta_research.runtime_protection import (
     RuntimeProtection,
     RuntimeProtectionUnavailable,
 )
+from meta_research.root_capabilities import root_capability_profile
 from meta_research.semantic_mcp import (
     McpConnection,
     ResidentMcpBinding,
     SemanticMcpError,
 )
 from meta_research.semantic_owner_gateway import (
-    TARGET_RUN_SEMANTIC_OPERATION_IDS,
+    BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+    REASONING_ROOT_SEMANTIC_OPERATION_IDS,
+    TARGET_ROOT_SEMANTIC_OPERATION_IDS,
 )
 from meta_research.target_run_runtime_contract import (
     TargetCompletionArtifact,
@@ -186,6 +189,13 @@ class _TargetRootAdapter:
             )
             for capability in HARNESS_CAPABILITIES
         }
+        used_capabilities = tuple(
+            sorted(available - {self.evidence_free_capability})
+        )
+        usage_evidence_refs = {
+            capability: (str(event_refs[capability]),)
+            for capability in used_capabilities
+        }
         return HarnessTurnEvidence(
             native_session_ref=native_session_ref,
             profile={
@@ -195,6 +205,20 @@ class _TargetRootAdapter:
                 "provider_version": self.locked_version,
                 "native_session_ref": native_session_ref,
                 "capabilities": capabilities,
+                "root_capability_diagnostics": root_capability_profile(
+                    "target"
+                ).public_diagnostics(
+                    entry_path=invocation.entry_path,
+                    used_capabilities=used_capabilities,
+                    authorized_operation_ids=(
+                        invocation.authorized_operation_ids
+                    ),
+                    unavailable_capabilities={
+                        capability: "harness_capability_unsupported"
+                        for capability in self.missing_capabilities
+                    },
+                    usage_evidence_refs=usage_evidence_refs,
+                ),
             },
             evidence_events=evidence_events,
             stream_hash=canonical_hash(evidence_events),
@@ -204,6 +228,7 @@ class _TargetRootAdapter:
 class _Gateway:
     def __init__(self) -> None:
         self._counter = 0
+        self._operation_ids_by_token: dict[str, tuple[str, ...]] = {}
 
     def required_bindings(
         self, operation_ids: tuple[str, ...]
@@ -230,8 +255,10 @@ class _Gateway:
         del capability_binding_hash
         self._counter += 1
         grant_ref = f"grant:{self._counter}"
+        token = f"token:{self._counter}"
+        self._operation_ids_by_token[token] = operation_ids
         return (
-            McpConnection(token=f"token:{self._counter}", grant_ref=grant_ref),
+            McpConnection(token=token, grant_ref=grant_ref),
             ResidentMcpBinding(
                 server_instance_ref="mcp-server:test",
                 endpoint_ref="/mcp",
@@ -243,8 +270,71 @@ class _Gateway:
             ),
         )
 
-    def revoke_channel(self, _token: str) -> None:
-        return None
+    def revoke_channel(self, token: str) -> None:
+        self._operation_ids_by_token.pop(token, None)
+
+    def dispatch(
+        self, _token: str | None, message: object
+    ) -> tuple[int, dict[str, object] | None]:
+        assert isinstance(message, dict)
+        operation_ids = self._operation_ids_by_token.get(_token or "")
+        if operation_ids is None:
+            return 401, {
+                "error": {
+                    "code": "mcp_channel_authentication_required",
+                    "message": "A current scope-bound MCP channel is required.",
+                }
+            }
+        if message.get("method") == "initialize":
+            return 200, {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {"protocolVersion": "2025-06-18"},
+            }
+        if message.get("method") == "notifications/initialized":
+            return 202, None
+        if message.get("method") == "tools/list":
+            return 200, {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {
+                    "tools": [
+                        {"name": operation_id}
+                        for operation_id in operation_ids
+                    ]
+                },
+            }
+        if message.get("method") == "tools/call":
+            params = message.get("params")
+            operation_id = (
+                params.get("name") if isinstance(params, dict) else None
+            )
+            if operation_id not in operation_ids:
+                return 200, {
+                    "jsonrpc": "2.0",
+                    "id": message.get("id"),
+                    "result": {
+                        "content": [],
+                        "structuredContent": {
+                            "status": "capability_unavailable",
+                            "code": "capability_unavailable",
+                        },
+                        "isError": True,
+                    },
+                }
+            return 200, {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {
+                    "content": [],
+                    "structuredContent": {
+                        "status": "ok",
+                        "operation_id": operation_id,
+                    },
+                    "isError": False,
+                },
+            }
+        return 400, None
 
 
 class _WorkspaceResolver:
@@ -253,6 +343,33 @@ class _WorkspaceResolver:
 
     def resolve_target_workspace(self, **_scope: object) -> tuple[str, Path]:
         return "target-workspace:test", self.path
+
+
+class _DiagnosticRecorder:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.records: list[dict[str, object]] = []
+
+    def record(self, **values: object) -> object:
+        if self.fail:
+            raise RuntimeError("diagnostic store unavailable")
+        self.records.append(values)
+        return values
+
+
+class _ResidentScopeVerifier:
+    def __init__(self) -> None:
+        self.current = True
+
+    def verify_bundle_runtime_scope(self, **_scope: object) -> None:
+        if not self.current:
+            raise RuntimeError("resident_scope_stale")
+        return None
+
+    def verify_reasoning_runtime_scope(self, **_scope: object) -> None:
+        if not self.current:
+            raise RuntimeError("resident_scope_stale")
+        return None
 
 
 class _Owner:
@@ -290,6 +407,9 @@ class _Owner:
 
     def query_run(self, request_ref: str) -> AgentRuntimeHarnessRun | None:
         return self.run if request_ref == self.run.request_ref else None
+
+    def channel_is_current(self, _token_hash: str) -> bool:
+        return False
 
     def query_run_by_ref(self, run_ref: str) -> AgentRuntimeHarnessRun | None:
         return self.run if run_ref == self.run.run_ref else None
@@ -516,7 +636,7 @@ def _target_request(
         harness_family="codex",
         model_ref="gpt-target-root",
         auth_profile_ref="harness-profile:test",
-        required_operation_ids=TARGET_RUN_SEMANTIC_OPERATION_IDS,
+        required_operation_ids=TARGET_ROOT_SEMANTIC_OPERATION_IDS,
         required_capabilities=HARNESS_CAPABILITIES,
         target_ref="target:test",
         target_run_ref="target-run:test",
@@ -550,10 +670,261 @@ def _runtime(
     runtime = HarnessRuntime(
         owner,
         _Gateway(),
-        (codex, _TargetRootAdapter("claude")),
+        (codex,),
     )
     runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
     return runtime, owner, codex
+
+
+def test_resident_root_channel_rejects_catalog_selected_by_the_caller(
+    tmp_path: Path,
+) -> None:
+    runtime, owner, _adapter = _runtime(tmp_path)
+    runtime.bind_resident_mcp_scope_verifier(_ResidentScopeVerifier())
+    scope = {
+        "run_ref": owner.run.run_ref,
+        "attempt_ref": owner.run.attempt_ref,
+        "root_session_ref": owner.run.root_session_ref,
+        "fence_ref": owner.run.fence_ref,
+        "capability_binding_hash": owner.run.capability_binding_hash,
+        "root_kind": "bundle",
+        "phase": "primary",
+        "subject_policy": "operation_tree",
+    }
+
+    with pytest.raises(
+        HarnessAdmissionError, match="mcp_channel_scope_invalid"
+    ):
+        runtime.issue_resident_mcp_channel(
+            **scope,
+            operation_ids=("research_graph.snapshot.read",),
+        )
+
+    channel = runtime.issue_resident_mcp_channel(
+        **scope,
+        operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+    )
+    assert tuple(
+        item["semantic_operation_id"]
+        for item in channel.binding.operation_bindings
+    ) == BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+
+
+def test_operation_tree_channel_allows_root_reconnect_and_child_clients(
+    tmp_path: Path,
+) -> None:
+    runtime, owner, _adapter = _runtime(tmp_path)
+    runtime.bind_resident_mcp_scope_verifier(_ResidentScopeVerifier())
+    channel = runtime.issue_resident_mcp_channel(
+        run_ref=owner.run.run_ref,
+        attempt_ref=owner.run.attempt_ref,
+        root_session_ref=owner.run.root_session_ref,
+        fence_ref=owner.run.fence_ref,
+        capability_binding_hash=owner.run.capability_binding_hash,
+        operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+        root_kind="bundle",
+        phase="primary",
+        subject_policy="operation_tree",
+    )
+    operation_id = BUNDLE_ROOT_SEMANTIC_OPERATION_IDS[0]
+
+    def initialize_list_and_call(
+        client_name: str, request_id: int
+    ) -> tuple[str, tuple[str, ...], dict[str, object]]:
+        status, response, session_id = runtime.dispatch_mcp_http(
+            channel.connection.token,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": client_name, "version": "1"},
+                },
+            },
+            mcp_session_id=None,
+        )
+        assert status == 200
+        assert response is not None
+        assert isinstance(session_id, str) and session_id
+
+        ack_status, ack_response, _ = runtime.dispatch_mcp_http(
+            channel.connection.token,
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            },
+            mcp_session_id=session_id,
+        )
+        assert ack_status == 202
+        assert ack_response is None
+
+        listed_status, listed, _ = runtime.dispatch_mcp_http(
+            channel.connection.token,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id + 1,
+                "method": "tools/list",
+                "params": {},
+            },
+            mcp_session_id=session_id,
+        )
+        assert listed_status == 200
+        assert listed is not None
+        result = listed.get("result")
+        assert isinstance(result, dict)
+        tools = result.get("tools")
+        assert isinstance(tools, list)
+        catalog = tuple(
+            item["name"] for item in tools if isinstance(item, dict)
+        )
+
+        called_status, called, _ = runtime.dispatch_mcp_http(
+            channel.connection.token,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id + 2,
+                "method": "tools/call",
+                "params": {"name": operation_id, "arguments": {}},
+            },
+            mcp_session_id=session_id,
+        )
+        assert called_status == 200
+        assert called is not None
+        called_result = called.get("result")
+        assert isinstance(called_result, dict)
+        assert called_result["isError"] is False
+        return session_id, catalog, called_result
+
+    # A fresh transport in the same Root operation must retain a callable
+    # catalog after reconnect, including initialize/initialized response loss.
+    root = initialize_list_and_call("root-client", 10)
+    reconnect = initialize_list_and_call("root-reconnect", 20)
+
+    # Native child Sessions inherit and can call the same operation bearer.
+    child = initialize_list_and_call("native-child", 30)
+
+    assert len({root[0], reconnect[0], child[0]}) == 3
+    assert root[1] == BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+    assert reconnect[1] == root[1]
+    assert child[1] == root[1]
+
+
+def test_operation_tree_bearers_keep_exact_catalog_and_revocation_boundaries(
+    tmp_path: Path,
+) -> None:
+    runtime, owner, _adapter = _runtime(tmp_path)
+    verifier = _ResidentScopeVerifier()
+    runtime.bind_resident_mcp_scope_verifier(verifier)
+    common_scope = {
+        "run_ref": owner.run.run_ref,
+        "attempt_ref": owner.run.attempt_ref,
+        "root_session_ref": owner.run.root_session_ref,
+        "fence_ref": owner.run.fence_ref,
+        "capability_binding_hash": owner.run.capability_binding_hash,
+        "phase": "primary",
+        "subject_policy": "operation_tree",
+    }
+    bundle = runtime.issue_resident_mcp_channel(
+        **common_scope,
+        operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+        root_kind="bundle",
+    )
+    reasoning = runtime.issue_resident_mcp_channel(
+        **common_scope,
+        operation_ids=REASONING_ROOT_SEMANTIC_OPERATION_IDS,
+        root_kind="reasoning",
+    )
+
+    def list_operations(token: str, request_id: int) -> tuple[str, ...]:
+        status, payload, _ = runtime.dispatch_mcp_http(
+            token,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/list",
+                "params": {},
+            },
+            mcp_session_id="client-session",
+        )
+        assert status == 200
+        assert payload is not None
+        result = payload.get("result")
+        assert isinstance(result, dict)
+        tools = result.get("tools")
+        assert isinstance(tools, list)
+        return tuple(
+            item["name"] for item in tools if isinstance(item, dict)
+        )
+
+    assert list_operations(bundle.connection.token, 1) == (
+        BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+    )
+    assert list_operations(reasoning.connection.token, 2) == (
+        REASONING_ROOT_SEMANTIC_OPERATION_IDS
+    )
+
+    bundle_only = next(
+        item
+        for item in BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+        if item not in REASONING_ROOT_SEMANTIC_OPERATION_IDS
+    )
+    reasoning_only = next(
+        item
+        for item in REASONING_ROOT_SEMANTIC_OPERATION_IDS
+        if item not in BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+    )
+    for request_id, token, forbidden_operation in (
+        (3, bundle.connection.token, reasoning_only),
+        (4, reasoning.connection.token, bundle_only),
+    ):
+        status, payload, _ = runtime.dispatch_mcp_http(
+            token,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": forbidden_operation, "arguments": {}},
+            },
+            mcp_session_id="client-session",
+        )
+        assert status == 200
+        assert payload is not None
+        result = payload.get("result")
+        assert isinstance(result, dict)
+        assert result["isError"] is True
+        assert result["structuredContent"] == {
+            "status": "capability_unavailable",
+            "code": "capability_unavailable",
+        }
+
+    runtime.revoke_resident_mcp_channel(bundle)
+    revoked_status, revoked_payload, _ = runtime.dispatch_mcp_http(
+        bundle.connection.token,
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}},
+        mcp_session_id="client-session",
+    )
+    assert revoked_status == 401
+    assert revoked_payload is not None
+    assert revoked_payload["error"] == {
+        "code": "mcp_channel_authentication_required",
+        "message": "A current scope-bound MCP channel is required.",
+    }
+
+    verifier.current = False
+    stale_status, stale_payload, _ = runtime.dispatch_mcp_http(
+        reasoning.connection.token,
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {}},
+        mcp_session_id="client-session",
+    )
+    assert stale_status == 401
+    assert stale_payload is not None
+    assert stale_payload["error"] == {
+        "code": "mcp_channel_authentication_required",
+        "message": "A current scope-bound MCP channel is required.",
+    }
 
 
 def test_failed_initial_root_turn_recovers_same_handle_then_runs_next_generation(
@@ -817,8 +1188,51 @@ def test_target_root_lifecycle_chooses_first_then_resume_in_one_native_session(
         None,
         "native-target-root",
     ]
+    assert [item.mcp_token for item in adapter.invocations] == [
+        "token:1",
+        "token:1",
+    ]
     assert [item.generation for item in owner.operations] == [1, 2]
     assert all(item.status == "executed" for item in owner.operations)
+
+
+@pytest.mark.parametrize("sink_fails", [False, True])
+def test_target_root_publishes_diagnostics_without_gating_owner_completion(
+    tmp_path: Path,
+    sink_fails: bool,
+) -> None:
+    request = _target_request()
+    owner = _Owner(request)
+    adapter = _TargetRootAdapter("codex")
+    recorder = _DiagnosticRecorder(fail=sink_fails)
+    runtime = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (adapter,),
+        root_operation_diagnostic_recorder=recorder,  # type: ignore[arg-type]
+    )
+    runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+
+    completed = runtime.run_or_resume_target_root(
+        request.request_ref,
+        prompt="Own this exact Target operation.",
+        mcp_base_url="http://127.0.0.1:8765",
+    )
+
+    assert completed.status == "executed"
+    assert owner.operations[-1].status == "executed"
+    if sink_fails:
+        assert recorder.records == []
+        return
+    assert len(recorder.records) == 1
+    recorded = recorder.records[0]
+    assert recorded["root_kind"] == "target"
+    diagnostics = recorded["diagnostics"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["side_effect_authorization"]["operation_ids"] == list(
+        TARGET_ROOT_SEMANTIC_OPERATION_IDS
+    )
+    assert diagnostics["usage"]["shell"]["status"] == "used"
 
 
 def test_target_root_lifecycle_reconciles_unknown_outcome_inside_one_call(
@@ -1424,19 +1838,17 @@ def test_target_root_lifecycle_fails_when_required_capability_is_unavailable(
 @pytest.mark.parametrize(
     "capability", sorted(_TARGET_ROOT_REQUIRED_EVIDENCE)
 )
-def test_target_root_lifecycle_fails_when_required_evidence_is_missing(
+def test_target_root_lifecycle_does_not_require_unused_capability_evidence(
     tmp_path: Path, capability: str
 ) -> None:
     runtime, _owner, _adapter = _runtime(
         tmp_path, evidence_free_capability=capability
     )
 
-    with pytest.raises(
-        HarnessAdmissionError,
-        match="required_harness_capability_unavailable",
-    ):
-        runtime.run_or_resume_target_root(
-            "target-harness-request:test",
-            prompt="Own implementation through final training completion.",
-            mcp_base_url="http://127.0.0.1:8765",
-        )
+    result = runtime.run_or_resume_target_root(
+        "target-harness-request:test",
+        prompt="Own implementation through final training completion.",
+        mcp_base_url="http://127.0.0.1:8765",
+    )
+
+    assert result.status == "executed"

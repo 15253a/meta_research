@@ -259,8 +259,8 @@ def _result(
         findings=findings,
         dispositions=dispositions,
         primary_session_ref="codex-plan-primary:1",
-        review_mode="harness_child_agent",
-        reviewer_agent_ref="codex-plan-reviewer:1",
+        review_mode="advisory_unobserved",
+        reviewer_agent_ref=None,
         adapter_kind="codex_cli",
     )
 
@@ -276,7 +276,6 @@ def test_packaged_plan_skill_is_the_runtime_authority() -> None:
     )
 
     assert "execution completed != content accepted != domain accepted" in skill
-    assert "fork_turns=\"none\"" in skill
     assert "AnswerContract" in contract
     assert "每个 obligation" in contract
     assert "ExperimentBrief" in contract
@@ -429,7 +428,7 @@ def _fake_codex(path: Path) -> Path:
     return path
 
 
-def test_production_adapter_uses_one_native_root_and_a_fresh_child_reviewer(
+def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     tmp_path: Path,
 ) -> None:
     draft = _plan()
@@ -456,7 +455,8 @@ def test_production_adapter_uses_one_native_root_and_a_fresh_child_reviewer(
     validate_plan_skill_result(request, result)
 
     assert result.primary_session_ref == "codex-plan-primary:1"
-    assert result.reviewer_agent_ref == "codex-plan-reviewer:1"
+    assert result.review_mode == "advisory_unobserved"
+    assert result.reviewer_agent_ref is None
     assert binding.model_ref == "gpt-5.6-sol"
     assert (
         "codex-config:model_reasoning_effort=max"
@@ -478,13 +478,9 @@ def test_production_adapter_uses_one_native_root_and_a_fresh_child_reviewer(
     assert "完整 IdeaSet" in primary_prompt
     assert "EvidenceRef" in primary_prompt
     assert "本回合仅执行 Primary draft phase" in primary_prompt
-    assert "禁止调用 spawn_agent 或 wait" in primary_prompt
     assert "下一次 resumed review turn" in primary_prompt
     assert primary_schema["properties"]["plan"]["properties"]["answer_contract"]
     assert review_argv[-3:] == ["resume", "codex-plan-primary:1", "-"]
-    assert 'fork_turns="none"' in review_prompt
-    assert "当前 frozen reviewed_draft" in review_prompt
-    assert "不得复用 Primary phase" in review_prompt
     assert "ExperimentBrief" in review_prompt
     assert "final_plan" in review_schema["properties"]
 
@@ -544,7 +540,7 @@ def test_production_adapter_derives_answer_contract_hash_after_each_turn(
         assert "answer_contract_hash" not in answer_schema["required"]
 
 
-def test_production_adapter_accepts_root_review_without_child_trace(
+def test_production_adapter_does_not_require_child_trace(
     tmp_path: Path,
 ) -> None:
     plan = _plan()
@@ -565,11 +561,15 @@ def test_production_adapter_accepts_root_review_without_child_trace(
         executable=str(_fake_codex(tmp_path / "codex-root-review")),
         process_runner=runner,
     )
-    request = _request(runtime_binding=adapter.runtime_binding())
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        job_ref="plan-missing-review-trace-job",
+    )
 
     result = adapter.execute(request)
 
-    validate_plan_skill_result(request, result)
+    assert result.review_mode == "advisory_unobserved"
+    assert result.reviewer_agent_ref is None
     assert len(runner.calls) == 2
 
 
@@ -629,7 +629,7 @@ def test_durable_plan_review_shape_failure_is_terminal_and_not_replayed(
     assert no_replay.calls == []
 
 
-def test_durable_plan_primary_rejects_early_review_without_replay(
+def test_durable_plan_primary_treats_collaboration_trace_as_diagnostic(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "durable-plan-primary-phase"
@@ -647,11 +647,9 @@ def test_durable_plan_primary_rejects_early_review_without_replay(
         job_ref="plan-primary-phase-job",
     )
 
-    with pytest.raises(
-        PlanSkillUnavailable, match="codex_primary_review_phase_invalid"
-    ) as caught:
-        adapter.generate_draft(request)
-    assert caught.value.recovery_checkpoint is not None
+    draft = adapter.generate_draft(request)
+
+    assert draft.primary_session_ref == "codex-plan-primary:1"
     assert len(runner.calls) == 1
 
     no_replay = _SequenceRunner([])
@@ -660,12 +658,10 @@ def test_durable_plan_primary_rejects_early_review_without_replay(
         executable=str(tmp_path / "codex-plan-primary-phase"),
         process_runner=no_replay,
     )
-    with pytest.raises(
-        PlanSkillUnavailable, match="codex_primary_review_phase_invalid"
-    ):
-        restarted.generate_draft(
-            replace(request, runtime_binding=restarted.runtime_binding())
-        )
+    replay = restarted.generate_draft(
+        replace(request, runtime_binding=restarted.runtime_binding())
+    )
+    assert replay == draft
     assert no_replay.calls == []
 
 

@@ -66,17 +66,24 @@ def test_missing_resident_mcp_fails_before_provider(tmp_path: Path) -> None:
 
 def test_missing_required_operation_fails_before_provider(tmp_path: Path) -> None:
     runner = _SequenceRunner([_stage_output()])
-    authority = _FullConformanceAuthority()
-    authority.binding = replace(
-        authority.binding,
-        required_operation_ids=REASONING_ROOT_SEMANTIC_OPERATION_IDS[:-1],
-    )
+
+    class _MissingOperationAuthority(_FullConformanceAuthority):
+        def require_operation_binding(self, **kwargs: object):
+            binding = super().require_operation_binding(**kwargs)  # type: ignore[arg-type]
+            return replace(
+                binding,
+                required_operation_ids=(
+                    REASONING_ROOT_SEMANTIC_OPERATION_IDS[:-1]
+                ),
+            )
+
+    authority = _MissingOperationAuthority()
     adapter = _adapter(tmp_path, runner)
     adapter.bind_full_conformance_authority(authority)
 
     with pytest.raises(
         ReasoningSkillUnavailable,
-        match="reasoning_semantic_mcp_conformance_incomplete",
+        match="reasoning_semantic_mcp_operation_binding_incomplete",
     ):
         adapter.runtime_binding()
 
@@ -140,7 +147,7 @@ def test_malformed_effect_admission_fails_before_provider(
     assert len(authority.revoked) == 1
 
 
-def test_missing_currentness_trace_is_not_accepted_as_skill_output(
+def test_missing_currentness_usage_trace_is_diagnostic_only(
     tmp_path: Path,
 ) -> None:
     runner = _SequenceRunner(
@@ -157,22 +164,14 @@ def test_missing_currentness_trace_is_not_accepted_as_skill_output(
         job_ref="reasoning-missing-currentness-job",
     )
 
-    with pytest.raises(
-        ReasoningSkillUnavailable,
-        match="reasoning_primary_result_contract_invalid",
-    ) as caught:
-        adapter.generate_draft(request)
+    draft = adapter.generate_draft(request)
 
-    assert caught.value.recovery_checkpoint is not None
-    assert caught.value.recovery_checkpoint["contract_failure_detail_code"] == (
-        "reasoning_semantic_mcp_currentness_unobserved"
-    )
-
+    assert draft.draft == _stage_output()
     assert len(runner.calls) == 1
     assert len(authority.revoked) == 1
 
 
-def test_reasoning_observations_must_follow_the_fixed_currentness_order(
+def test_reasoning_observation_order_is_not_an_admission_gate(
     tmp_path: Path,
 ) -> None:
     runner = _SequenceRunner(
@@ -193,17 +192,9 @@ def test_reasoning_observations_must_follow_the_fixed_currentness_order(
         job_ref="reasoning-observation-order-job",
     )
 
-    with pytest.raises(
-        ReasoningSkillUnavailable,
-        match="reasoning_primary_result_contract_invalid",
-    ) as caught:
-        adapter.generate_draft(request)
+    draft = adapter.generate_draft(request)
 
-    assert caught.value.recovery_checkpoint is not None
-    assert caught.value.recovery_checkpoint["contract_failure_detail_code"] == (
-        "reasoning_semantic_mcp_observation_order_invalid"
-    )
-
+    assert draft.draft == _stage_output()
     assert len(runner.calls) == 1
     assert len(authority.revoked) == 1
 
@@ -263,8 +254,46 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
             fence_ref=run.fence_ref,
             capability_binding_hash=run.runtime_binding_hash,
             operation_ids=REASONING_ROOT_SEMANTIC_OPERATION_IDS,
+            root_kind="reasoning",
+            phase="primary",
+            subject_policy="operation_tree",
         )
-        status, response = runtime.harnesses.dispatch_mcp(
+        initialized, initialize_response, mcp_session_id = (
+            runtime.harnesses.dispatch_mcp_http(
+                channel.connection.token,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "reasoning-root",
+                            "version": "1",
+                        },
+                    },
+                },
+                mcp_session_id=None,
+            )
+        )
+        assert initialized == 200
+        assert initialize_response is not None
+        assert isinstance(mcp_session_id, str) and mcp_session_id
+        acknowledged, acknowledgement, _ = (
+            runtime.harnesses.dispatch_mcp_http(
+                channel.connection.token,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                },
+                mcp_session_id=mcp_session_id,
+            )
+        )
+        assert acknowledged == 202
+        assert acknowledgement is None
+        status, response, _ = runtime.harnesses.dispatch_mcp_http(
             channel.connection.token,
             {
                 "jsonrpc": "2.0",
@@ -272,6 +301,7 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
                 "method": "tools/list",
                 "params": {},
             },
+            mcp_session_id=mcp_session_id,
         )
         assert status == 200
         assert response is not None
@@ -290,6 +320,9 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
                 fence_ref="stale-reasoning-fence",
                 capability_binding_hash=run.runtime_binding_hash,
                 operation_ids=REASONING_ROOT_SEMANTIC_OPERATION_IDS,
+                root_kind="reasoning",
+                phase="primary",
+                subject_policy="operation_tree",
             )
 
         runtime.harnesses.revoke_resident_mcp_channel(channel)
@@ -368,6 +401,9 @@ def test_reasoning_resident_mcp_rejects_post_execution_submission_scope(
                 fence_ref=run.fence_ref,
                 capability_binding_hash=run.runtime_binding_hash,
                 operation_ids=REASONING_ROOT_SEMANTIC_OPERATION_IDS,
+                root_kind="reasoning",
+                phase="primary",
+                subject_policy="operation_tree",
             )
     finally:
         runtime.close()

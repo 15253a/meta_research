@@ -10,6 +10,7 @@ import {
 type ExperimentDraft = Pick<
   ExperimentStartRequest,
   "title" | "hypothesis" | "variant_parameter" | "sample_count"
+  | "wall_time_budget_seconds"
 >;
 
 const INITIAL_DRAFT: ExperimentDraft = {
@@ -17,6 +18,7 @@ const INITIAL_DRAFT: ExperimentDraft = {
   hypothesis: "",
   variant_parameter: -0.25,
   sample_count: 16,
+  wall_time_budget_seconds: 300,
 };
 
 type RequestKind = ExperimentStartRequest["request_kind"];
@@ -168,6 +170,9 @@ export function ExperimentLauncher({
     Number.isInteger(draft.sample_count) &&
     draft.sample_count >= 4 &&
     draft.sample_count <= 4_096 &&
+    Number.isFinite(draft.wall_time_budget_seconds) &&
+    draft.wall_time_budget_seconds >= 1 &&
+    draft.wall_time_budget_seconds <= 86_400 &&
     (requestKind === "retrain" || remeasureAvailable);
 
   if (executionIsActive) {
@@ -207,6 +212,7 @@ export function ExperimentLauncher({
         hypothesis: draft.hypothesis.trim(),
         variant_parameter: draft.variant_parameter,
         sample_count: draft.sample_count,
+        wall_time_budget_seconds: draft.wall_time_budget_seconds,
       };
       const experiment = await startExperiment(requestKind === "retrain"
         ? { ...baseIntent, request_kind: "retrain" }
@@ -309,6 +315,23 @@ export function ExperimentLauncher({
               disabled={submitting || submitted || requestKind === "remeasure"}
               onChange={(event) => revise("sample_count", event.target.valueAsNumber)}
             />
+          </label>
+          <label>
+            <span>科学运行预算（秒）</span>
+            <input
+              required
+              type="number"
+              min={1}
+              max={86_400}
+              step={1}
+              value={draft.wall_time_budget_seconds}
+              disabled={submitting || submitted}
+              onChange={(event) => revise(
+                "wall_time_budget_seconds",
+                event.target.valueAsNumber,
+              )}
+            />
+            <small>这是本次实验的显式测量预算，不是 Agent Session 上限。</small>
           </label>
         </div>
         {requestKind === "remeasure" && sourceVariantRef ? (

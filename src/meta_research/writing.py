@@ -54,6 +54,27 @@ from meta_research.writing_skill import (
 
 _WRITING_PROVIDER_UNIT_KINDS = ("writing_primary", "writing_review")
 _PROVIDER_RECONCILIATION_PENDING = "codex_operation_reconciliation_pending"
+_WRITING_PROVIDER_CONTRACT_CORRECTIONS = frozenset(
+    {
+        "writing_adapter_kind_invalid",
+        "writing_child_review_result_invalid",
+        "writing_child_review_result_missing",
+        "writing_child_review_trace_invalid",
+        "writing_citation_source_unaccepted",
+        "writing_citations_invalid",
+        "writing_markdown_invalid",
+        "writing_native_session_invalid",
+        "writing_paper_structure_invalid",
+        "writing_presentation_structure_invalid",
+        "writing_review_invalid",
+        "writing_review_mode_invalid",
+        "writing_review_not_independent",
+        "writing_review_revision_not_material",
+        "writing_review_task_invalid",
+        "writing_reviewed_checkpoint_mismatch",
+        "writing_reviewer_invalid",
+    }
+)
 # Persisted operation timestamps enforce this across daemon restarts.  One
 # second prevents a tight reconciliation loop without hiding an ambiguous
 # user-visible delivery behind a long interactive delay.
@@ -651,8 +672,13 @@ class WritingReportService:
                 )
             except OwnerConflict:
                 return claim
-            if decision is None or decision.decision == "rejected":
+            if decision is None:
                 return claim
+            if decision.decision == "rejected":
+                # Citation/content review is a durable warning while research
+                # continues. It becomes a hard gate only if the user asks to
+                # render for publication or external delivery.
+                continue
             if run.document_type != "report":
                 try:
                     renderer = self._query_renderer_artifact(
@@ -689,7 +715,15 @@ class WritingReportService:
             )
             if (
                 observed is None
-                or observed.status != "active"
+                or (
+                    observed.status != "active"
+                    and not (
+                        observed.status == "blocked"
+                        and self._is_provider_contract_correction(
+                            observed.failure_code or ""
+                        )
+                    )
+                )
                 or observed.attempt_ref != expected_attempt_ref
                 or observed.fence_ref != expected_fence_ref
             ):
@@ -698,6 +732,9 @@ class WritingReportService:
         else:
             runs = self._agent_runtime.query_active_writing_reports()
         for run in runs:
+            if run.status == "blocked":
+                self._resume_contract_correction(run)
+                return True
             try:
                 self._agent_runtime.verify_current_writing_attempt(
                     run_ref=run.run_ref,
@@ -774,7 +811,15 @@ class WritingReportService:
                     if not self._defer_provider_start_if_protection_wait(
                         run, "writing_primary", error
                     ):
-                        self._block_if_still_current(run, error.code)
+                        if self._is_provider_contract_correction(error.code):
+                            if unit_ref is not None:
+                                self._acknowledge_provider_unit(run, unit_ref)
+                                unit_ref = None
+                            self._schedule_correction_if_still_current(
+                                run, error.code
+                            )
+                        else:
+                            self._block_if_still_current(run, error.code)
                 finally:
                     if unit_ref is not None and provider_safe:
                         self._acknowledge_provider_unit(run, unit_ref)
@@ -834,7 +879,15 @@ class WritingReportService:
                     if not self._defer_provider_start_if_protection_wait(
                         run, "writing_review", error
                     ):
-                        self._block_if_still_current(run, error.code)
+                        if self._is_provider_contract_correction(error.code):
+                            if unit_ref is not None:
+                                self._acknowledge_provider_unit(run, unit_ref)
+                                unit_ref = None
+                            self._schedule_correction_if_still_current(
+                                run, error.code
+                            )
+                        else:
+                            self._block_if_still_current(run, error.code)
                     return True
                 finally:
                     if unit_ref is not None and provider_safe:
@@ -914,32 +967,11 @@ class WritingReportService:
                     self._block_if_still_current(run, error.code)
                 return True
             if decision.decision == "rejected":
-                if self._content_revision(run) >= int(
-                    run.execution_budget["max_content_revisions"]
-                ):
-                    self._agent_runtime.fail_writing_report(
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        failure_code="writing_revision_budget_exhausted",
-                    )
-                    return True
-                try:
-                    self._agent_runtime.begin_writing_revision(
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        predecessor_version_ref=decision.asset.version_ref,
-                        feedback=decision.feedback,
-                        decision_receipt=decision.receipt,
-                        decision_status="rejected",
-                        idempotency_key=_operation_key(
-                            "writing-rg-revision", run.run_ref, run.attempt_ref
-                        ),
-                    )
-                except OwnerConflict as error:
-                    self._block_if_still_current(run, error.code)
-                return True
+                # Keep the exact deliverable and RG feedback visible. Automatic
+                # research progress is not fenced by citation quality; a person
+                # may request another revision, while publish/delivery paths below
+                # continue to require an accepted decision.
+                continue
             if run.document_type != "report":
                 output_format = self._renderer_registry.default_format(
                     run.document_type
@@ -1188,7 +1220,7 @@ class WritingReportService:
         decision = self._research_graph.query_writing_citation_decision(
             run_ref=run_ref, attempt_ref=run.attempt_ref
         )
-        if decision is None or decision.decision != "accepted":
+        if decision is None:
             raise OwnerConflict("writing_revision_basis_unavailable")
         revised = self._agent_runtime.begin_writing_revision(
             run_ref=run.run_ref,
@@ -1197,7 +1229,7 @@ class WritingReportService:
             predecessor_version_ref=decision.asset.version_ref,
             feedback=feedback,
             decision_receipt=decision.receipt,
-            decision_status="accepted",
+            decision_status=decision.decision,
             idempotency_key=operation_key,
         )
         return self.query_writing_report(revised.run_ref)
@@ -2373,6 +2405,55 @@ class WritingReportService:
                 fence_ref=run.fence_ref,
                 failure_code=code,
             )
+
+    @staticmethod
+    def _is_provider_contract_correction(code: str) -> bool:
+        return code in _WRITING_PROVIDER_CONTRACT_CORRECTIONS or code.startswith(
+            "codex_child_review_"
+        )
+
+    def _schedule_correction_if_still_current(
+        self, run: WritingRun, code: str
+    ) -> None:
+        """Retain the failed Attempt and immediately install its successor."""
+
+        current = self._agent_runtime.query_writing_report(run.run_ref)
+        if (
+            current is None
+            or current.status != "active"
+            or current.attempt_ref != run.attempt_ref
+            or current.fence_ref != run.fence_ref
+        ):
+            return
+        blocked = self._agent_runtime.fail_writing_report(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            failure_code=code,
+            recoverable_contract=True,
+        )
+        if blocked.status != "blocked":
+            return
+        self._resume_contract_correction(blocked)
+
+    def _resume_contract_correction(self, run: WritingRun) -> None:
+        code = run.failure_code or ""
+        if run.status != "blocked" or not self._is_provider_contract_correction(
+            code
+        ):
+            return
+        self._agent_runtime.control_writing_report(
+            run.run_ref,
+            action="resume",
+            idempotency_key=_operation_key(
+                "writing-contract-correction",
+                run.run_ref,
+                run.attempt_ref,
+                code,
+            ),
+            expected_attempt_ref=run.attempt_ref,
+            expected_fence_ref=run.fence_ref,
+        )
 
     @staticmethod
     def _writing_payload(command: dict[str, object]) -> dict[str, object]:

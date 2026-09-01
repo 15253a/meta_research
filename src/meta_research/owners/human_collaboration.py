@@ -5699,6 +5699,14 @@ class SQLiteHumanCollaboration:
                 "generation_basis_invalid",
             )
             return True
+        with self._database.read() as connection:
+            companion_native_session_ref = connection.execute(
+                text(
+                    "SELECT native_session_ref FROM hc_intent_drafting_sessions "
+                    "WHERE initialization_id = :initialization_id AND status = 'open'"
+                ),
+                {"initialization_id": job.initialization_id},
+            ).scalar_one_or_none()
         literature_snapshot: dict[str, object] | None = None
         if job.route == "deepfetch":
             if job.literature_snapshot_ref is None:
@@ -5766,9 +5774,22 @@ class SQLiteHumanCollaboration:
                     draft=decoded_object(revision.draft_json),
                     job_ref=provider_job_ref,
                     literature_snapshot=literature_snapshot,
+                    companion_native_session_ref=companion_native_session_ref,
                 )
             )
             content = _validate_question_content(result.content)
+            if result.adapter_kind == "codex_companion_fork" and (
+                not isinstance(result.companion_native_session_ref, str)
+                or not result.companion_native_session_ref
+                or not isinstance(result.proposal_fork_native_session_ref, str)
+                or not result.proposal_fork_native_session_ref
+                or result.proposal_fork_native_session_ref
+                == result.companion_native_session_ref
+                or companion_native_session_ref is not None
+                and result.companion_native_session_ref
+                != companion_native_session_ref
+            ):
+                raise OwnerConflict("companion_proposal_fork_invalid")
         except DraftingUnavailable as error:
             if error.code in _DRAFTING_RECONCILIATION_CODES:
                 return False
@@ -5866,6 +5887,25 @@ class SQLiteHumanCollaboration:
                     },
                 )
             else:
+                if result.companion_native_session_ref is not None:
+                    updated_companion = connection.execute(
+                        text(
+                            "UPDATE hc_intent_drafting_sessions SET "
+                            "native_session_ref = :native_session_ref, updated_at = "
+                            ":now WHERE initialization_id = :initialization_id AND "
+                            "status = 'open' AND (native_session_ref IS NULL OR "
+                            "native_session_ref = :native_session_ref)"
+                        ),
+                        {
+                            "initialization_id": job.initialization_id,
+                            "native_session_ref": (
+                                result.companion_native_session_ref
+                            ),
+                            "now": time.time(),
+                        },
+                    )
+                    if not updated_companion.rowcount:
+                        raise OwnerConflict("companion_native_session_stale")
                 proposal_ref, proposal_hash = self._record_proposal(
                     connection,
                     job.initialization_id,
@@ -6331,10 +6371,16 @@ class SQLiteHumanCollaboration:
                 return True
             connection.execute(
                 text(
-                    "UPDATE hc_intent_drafting_sessions SET updated_at = :now WHERE "
-                    "session_ref = :session_ref"
+                    "UPDATE hc_intent_drafting_sessions SET native_session_ref = "
+                    ":native_session_ref, updated_at = :now WHERE session_ref = "
+                    ":session_ref AND (native_session_ref IS NULL OR "
+                    "native_session_ref = :native_session_ref)"
                 ),
-                {"session_ref": turn.session_ref, "now": now},
+                {
+                    "session_ref": turn.session_ref,
+                    "native_session_ref": result.native_session_ref,
+                    "now": now,
+                },
             )
             connection.execute(
                 text(

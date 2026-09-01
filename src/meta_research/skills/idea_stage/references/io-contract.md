@@ -8,7 +8,7 @@
 
 ## IdeaSubmission
 
-Submission 包含唯一 identity、Stage request、runtime binding、ContextPack、AcceptedQuestionBinding、实际 consumed/discovered inputs、`IdeaSet | NoViableCandidate`、Outcome hash、v2 child-agent review record 和 lineage。review record 使用 `review_mode = harness_child_agent` 与短命 `reviewer_agent_ref`；它证明 bounded review 工作，不创建另一个长期 Session。未被 Owner 接纳的新材料不能标记为 Evidence。
+Submission 包含唯一 identity、Stage request、runtime binding、ContextPack、AcceptedQuestionBinding、实际 consumed/discovered inputs、`IdeaSet | NoViableCandidate`、Outcome hash、advisory review record 和 lineage。当前 review record 使用 `review_mode = advisory_unobserved`、`reviewer_agent_ref = null` 与 `independent = false`；真实的第二个根 provider turn 绑定 reviewed draft、bounded findings/dispositions 与 final Outcome，不声称未观测的 reviewer provenance。未被 Owner 接纳的新材料不能标记为 Evidence。
 
 ## Accepted handoff
 

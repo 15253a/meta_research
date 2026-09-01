@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import math
 import os
 import re
@@ -29,21 +30,36 @@ from meta_research.provider_supervisor import (
     read_verified_exit_receipt,
     write_supervisor_request,
 )
+from meta_research.root_capabilities import (
+    CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS,
+    ROOT_CAPABILITY_FLOOR,
+    RootAgentKind,
+    RootCapabilityEntryPath,
+    capabilities_from_codex_feature_inventory,
+    codex_feature_inventory_evidence_ref,
+    parse_codex_feature_inventory,
+    root_capability_profile,
+)
 from meta_research.quest_drafting import (
     _CancellableProcessRunner,
     _ProcessStopped,
 )
 from meta_research.target_run_runtime_contract import (
-    TargetCompletionHandoff,
-    TargetCompletionHandoffError,
-    decode_target_completion_handoff,
-    validate_target_completion_handoff,
+    TARGET_COMPLETION_BINDING_SCHEMA,
 )
+from meta_research.target_raw_output import (
+    TargetRawOutputStore,
+    TargetRawOutputUnavailable,
+)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 HarnessFamily = Literal["codex", "claude"]
 HarnessProcessRunner = Callable[
-    [list[str], str, float, dict[str, str]], subprocess.CompletedProcess[str]
+    [list[str], str, float | None, dict[str, str]],
+    subprocess.CompletedProcess[str],
 ]
 HarnessEventSink = Callable[
     [str, tuple[dict[str, object], ...]], None
@@ -90,7 +106,8 @@ _TARGET_ROOT_COMMAND_STATE_LIMIT = max(256, _STREAM_LIMIT // 256)
 _TARGET_ROOT_OUTPUT_SAMPLE_BYTES = 256 * 1024
 _TARGET_ROOT_OUTPUT_SAMPLE_EVENTS = 64
 _TARGET_ROOT_EVENT_BATCH_LIMIT = 64
-TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
+TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS: float | None = None
+_CODEX_ITEM_ACTOR_CONFLICT = object()
 # The private spool is capped at 64 MiB, so no raw JSONL stream can reach this
 # sequence range. Observation-only rows can share the Harness ledger without
 # colliding with formal evidence stored at raw sequences.
@@ -103,24 +120,7 @@ _TARGET_RESULT_REVIEW_REQUEST_SCHEMA = (
     "meta-research/target-result-review-request/v1"
 )
 _TARGET_REVIEW_EVIDENCE_SCHEMA = "meta-research/target-review-evidence/v1"
-HARNESS_CAPABILITIES = (
-    "tool_inventory",
-    "shell",
-    "file_access",
-    "semantic_mcp",
-    "skill",
-    "plugin",
-    "hook",
-    "subagent",
-    "stream",
-    "native_session",
-    "fork",
-    "steer",
-    "interrupt",
-    "resume",
-    "web_search",
-    "web_fetch",
-)
+HARNESS_CAPABILITIES = ROOT_CAPABILITY_FLOOR
 
 
 class HarnessAdapterUnavailable(RuntimeError):
@@ -158,6 +158,9 @@ class HarnessInvocation:
     target_workspace_ref: str | None = None
     working_directory: str | None = None
     provider_operation_timeout_seconds: float | None = None
+    root_kind: RootAgentKind | None = None
+    entry_path: RootCapabilityEntryPath = "initial"
+    authorized_operation_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -187,18 +190,21 @@ def _target_root_observation_scope(
     invocation: HarnessInvocation,
 ) -> dict[str, object]:
     return {
-        "schema_ref": "meta-research/target-root-observation-scope/v1",
+        "schema_ref": "meta-research/target-root-observation-scope/v2",
         "target_run_ref": invocation.run_ref,
         "attempt_ref": invocation.attempt_ref,
         "attempt_generation": invocation.attempt_generation,
         "root_session_ref": invocation.root_session_ref,
         "fence_ref": invocation.fence_ref,
         "native_session_ref": invocation.native_session_ref,
+        "target_workspace_ref": invocation.target_workspace_ref,
     }
 
 
 def _target_root_observation_scope_is_valid(value: object) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict):
+        return False
+    base_fields = {
         "schema_ref",
         "target_run_ref",
         "attempt_ref",
@@ -206,14 +212,24 @@ def _target_root_observation_scope_is_valid(value: object) -> bool:
         "root_session_ref",
         "fence_ref",
         "native_session_ref",
+    }
+    schema_ref = value.get("schema_ref")
+    if (
+        schema_ref == "meta-research/target-root-observation-scope/v1"
+        and set(value) != base_fields
+    ) or (
+        schema_ref == "meta-research/target-root-observation-scope/v2"
+        and set(value) != base_fields | {"target_workspace_ref"}
+    ) or schema_ref not in {
+        "meta-research/target-root-observation-scope/v1",
+        "meta-research/target-root-observation-scope/v2",
     }:
         return False
     generation = value.get("attempt_generation")
     native_session_ref = value.get("native_session_ref")
+    workspace_ref = value.get("target_workspace_ref")
     return (
-        value.get("schema_ref")
-        == "meta-research/target-root-observation-scope/v1"
-        and all(
+        all(
             isinstance(value.get(field), str) and bool(value[field])
             for field in (
                 "target_run_ref",
@@ -229,6 +245,11 @@ def _target_root_observation_scope_is_valid(value: object) -> bool:
             native_session_ref is None
             or (isinstance(native_session_ref, str) and bool(native_session_ref))
         )
+        and (
+            schema_ref == "meta-research/target-root-observation-scope/v1"
+            or workspace_ref is None
+            or (isinstance(workspace_ref, str) and bool(workspace_ref))
+        )
     )
 
 
@@ -240,7 +261,9 @@ class HarnessAdapter(Protocol):
 
     def installation_profile(self) -> dict[str, object]: ...
 
-    def provider_operation_timeout_seconds(self, *, target_root: bool) -> float: ...
+    def provider_operation_timeout_seconds(
+        self, *, target_root: bool
+    ) -> float | None: ...
 
 
 class _NativeCliHarnessAdapter:
@@ -254,16 +277,24 @@ class _NativeCliHarnessAdapter:
         *,
         executable: str | None = None,
         runner: HarnessProcessRunner | None = None,
-        timeout_seconds: float = 300.0,
-        target_root_timeout_seconds: float = TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
+        target_root_timeout_seconds: float | None = (
+            TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS
+        ),
         codex_child_ledger_reader: CodexChildLedgerReader | None = None,
         codex_home: Path | None = None,
     ) -> None:
-        if (
-            not 0 < timeout_seconds <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
-            or not 0
-            < target_root_timeout_seconds
-            <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+        if any(
+            value is not None
+            and (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or not 0
+                < float(value)
+                <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+            )
+            for value in (timeout_seconds, target_root_timeout_seconds)
         ):
             raise ValueError("harness_timeout_invalid")
         self._workspace = workspace
@@ -287,8 +318,10 @@ class _NativeCliHarnessAdapter:
                     configured_codex_home
                 )
 
-    def provider_operation_timeout_seconds(self, *, target_root: bool) -> float:
-        """Return the ceiling to freeze before a durable request is signed."""
+    def provider_operation_timeout_seconds(
+        self, *, target_root: bool
+    ) -> float | None:
+        """Return an exceptional ceiling, or ``None`` for normal execution."""
 
         return (
             self._target_root_timeout_seconds
@@ -300,14 +333,14 @@ class _NativeCliHarnessAdapter:
         self._validate_invocation(invocation)
         provider_version = self._provider_version()
         self._record_provider_capability(provider_version)
+        provider_feature_inventory = self._provider_feature_inventory(
+            invocation,
+            provider_version=provider_version,
+        )
         argv = self._argv(invocation)
         evidence_scope_ref = _harness_evidence_scope_ref(invocation)
         observation_scope = _target_root_observation_scope(invocation)
-        timeout_seconds = (
-            invocation.provider_operation_timeout_seconds
-            if invocation.provider_operation_timeout_seconds is not None
-            else self._timeout_seconds
-        )
+        timeout_seconds = invocation.provider_operation_timeout_seconds
         environment = {
             _MCP_TOKEN_ENV: invocation.mcp_token,
             _HARNESS_FAMILY_ENV: self.family,
@@ -391,11 +424,128 @@ class _NativeCliHarnessAdapter:
                 else str(self._workspace.resolve())
             ),
         )
+        root_diagnostics: dict[str, object] | None = None
+        if invocation.root_kind is not None:
+            capabilities = evidence.profile.get("capabilities")
+            if not isinstance(capabilities, dict):
+                raise HarnessAdapterUnavailable("harness_profile_invalid")
+            used_capabilities: list[str] = []
+            usage_evidence_refs: dict[str, tuple[str, ...]] = {}
+            for capability in ROOT_CAPABILITY_FLOOR:
+                item = capabilities.get(capability)
+                if not isinstance(item, dict) or item.get("status") != "available":
+                    continue
+                refs = tuple(
+                    ref
+                    for ref in item.get("evidence_refs", [])
+                    if isinstance(ref, str) and ref
+                )
+                used_capabilities.append(capability)
+                usage_evidence_refs[capability] = refs
+            inventory_names: list[str] = []
+            inventory_evidence_refs: list[str] = []
+            for event in evidence.evidence_events:
+                names = event.get("inventory_kinds")
+                if not isinstance(names, list):
+                    continue
+                event_ref = event.get("event_ref")
+                if isinstance(event_ref, str) and event_ref:
+                    inventory_evidence_refs.append(event_ref)
+                for name in names:
+                    if (
+                        isinstance(name, str)
+                        and name
+                        and name not in inventory_names
+                    ):
+                        inventory_names.append(name)
+            inventory_capabilities = _capabilities_from_inventory(
+                tuple(inventory_names)
+            )
+            available_capabilities = set(used_capabilities)
+            available_capabilities.update(inventory_capabilities)
+            feature_inventory = (
+                {}
+                if provider_feature_inventory is None
+                else provider_feature_inventory[0]
+            )
+            (
+                feature_capabilities,
+                feature_unavailable_capabilities,
+            ) = capabilities_from_codex_feature_inventory(feature_inventory)
+            available_capabilities.update(feature_capabilities)
+            if self.family == "codex":
+                # A completed turn could not have started unless the configured
+                # required MCP server initialized successfully. This is a
+                # provider startup fact, not evidence that any operation ran.
+                available_capabilities.add("semantic_mcp")
+            if invocation.entry_path != "initial":
+                # A successful native resume-family invocation is direct
+                # provider evidence for the resume control, regardless of
+                # whether the provider emits a separate lifecycle event.
+                available_capabilities.add("resume")
+            inventory_bound = {
+                "shell",
+                "file_access",
+                "semantic_mcp",
+                "skill",
+                "plugin",
+                "hook",
+                "subagent",
+                "web_search",
+                "web_fetch",
+            }
+            unavailable_capabilities = {
+                **feature_unavailable_capabilities,
+                **(
+                    {
+                        capability: "harness_tool_inventory_missing"
+                        for capability in sorted(
+                            inventory_bound - available_capabilities
+                        )
+                    }
+                    if inventory_evidence_refs
+                    else {}
+                ),
+            }
+            unavailable_capabilities = {
+                capability: code
+                for capability, code in unavailable_capabilities.items()
+                if capability not in available_capabilities
+            }
+            root_diagnostics = root_capability_profile(
+                invocation.root_kind
+            ).public_diagnostics(
+                entry_path=invocation.entry_path,
+                available_capabilities=tuple(
+                    capability
+                    for capability in ROOT_CAPABILITY_FLOOR
+                    if capability in available_capabilities
+                ),
+                used_capabilities=tuple(used_capabilities),
+                authorized_operation_ids=invocation.authorized_operation_ids,
+                unavailable_capabilities=unavailable_capabilities,
+                usage_evidence_refs=usage_evidence_refs,
+                tool_inventory_evidence_refs=tuple(
+                    dict.fromkeys(inventory_evidence_refs)
+                ),
+                tool_inventory_names=tuple(inventory_names),
+                provider_feature_inventory=feature_inventory,
+                provider_feature_inventory_evidence_refs=(
+                    ()
+                    if provider_feature_inventory is None
+                    else (provider_feature_inventory[1],)
+                ),
+            )
         return replace(
             evidence,
             profile={
                 **evidence.profile,
                 "sandbox_mode": self._sandbox_mode(invocation),
+                **(
+                    {}
+                    if root_diagnostics is None
+                    else {"root_capability_diagnostics": root_diagnostics}
+                ),
             },
         )
 
@@ -631,6 +781,50 @@ class _NativeCliHarnessAdapter:
             raise HarnessAdapterUnavailable("provider_version_drift")
         return observed
 
+    def _provider_feature_inventory(
+        self,
+        invocation: HarnessInvocation,
+        *,
+        provider_version: str,
+    ) -> tuple[dict[str, bool], str] | None:
+        """Read Codex's effective feature flags without inventing tool JSONL."""
+
+        if self.family != "codex" or invocation.root_kind is None:
+            return None
+        profile = root_capability_profile(invocation.root_kind)
+        argv = [
+            self.executable,
+            *profile.codex_arguments(entry_path=invocation.entry_path),
+            "features",
+            "list",
+        ]
+        try:
+            completed = self._runner(
+                argv,
+                "",
+                CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS,
+                {},
+            )
+        except Exception:
+            LOGGER.warning(
+                "Codex feature inventory probe unavailable",
+                exc_info=True,
+                extra={"root_kind": invocation.root_kind},
+            )
+            return None
+        if completed.returncode != 0 or len(completed.stdout) > 64 * 1024:
+            return None
+        features = parse_codex_feature_inventory(completed.stdout)
+        if features is None:
+            return None
+        evidence_ref = codex_feature_inventory_evidence_ref(
+            profile=profile,
+            entry_path=invocation.entry_path,
+            provider_version=provider_version,
+            features=features,
+        )
+        return features, evidence_ref
+
     def _validate_invocation(self, invocation: HarnessInvocation) -> None:
         refs = (
             invocation.run_ref,
@@ -677,10 +871,7 @@ class _NativeCliHarnessAdapter:
             )
             or (
                 invocation.target_workspace_ref is not None
-                and (
-                    invocation.working_directory is None
-                    or invocation.provider_operation_timeout_seconds is None
-                )
+                and invocation.working_directory is None
             )
         ):
             raise HarnessAdapterUnavailable("harness_invocation_invalid")
@@ -705,15 +896,22 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
         )
 
     def _argv(self, invocation: HarnessInvocation) -> list[str]:
+        target_environment_arguments: tuple[str, ...] = ()
+        if invocation.target_workspace_ref is not None:
+            # HumanRequest effects remain attributed to this authenticated
+            # Target operation. Native child Sessions intentionally share the
+            # operation bearer, while shell subprocesses do not inherit it.
+            target_environment_arguments = (
+                "--config",
+                'shell_environment_policy.inherit="none"',
+            )
+        capability_profile = root_capability_profile("target")
         argv = [
             self.executable,
             "exec",
             "--skip-git-repo-check",
-            "--ignore-user-config",
-            "--ignore-rules",
             "--strict-config",
-            "--enable",
-            "multi_agent",
+            *capability_profile.codex_arguments(),
             "--json",
             "--model",
             invocation.model_ref,
@@ -722,9 +920,8 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             "--config",
             CODEX_REASONING_EFFORT_CONFIG,
             "--config",
-            'web_search="live"',
-            "--config",
             "mcp_servers={}",
+            *target_environment_arguments,
             "--sandbox",
             self._sandbox_mode(invocation),
             "--cd",
@@ -739,6 +936,13 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             (
                 "mcp_servers.meta_research.bearer_token_env_var="
                 f'"{_MCP_TOKEN_ENV}"'
+            ),
+            "--config",
+            "mcp_servers.meta_research.required=true",
+            "--config",
+            (
+                "mcp_servers.meta_research."
+                'default_tools_approval_mode="approve"'
             ),
         ]
         if invocation.native_session_ref is None:
@@ -931,21 +1135,25 @@ class HarnessSupervisorTransport:
         *,
         process_runner: _CancellableProcessRunner | None = None,
         event_sink: HarnessEventSink | None = None,
+        raw_output_store: TargetRawOutputStore | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         _key_path, self._transport_key = ensure_transport_key(self._workspace)
         self._process_runner = process_runner or _CancellableProcessRunner()
         self._event_sink = event_sink
+        self._raw_output_store = raw_output_store
 
     def __call__(
         self,
         argv: list[str],
         prompt: str,
-        timeout: float,
+        timeout: float | None,
         environment: dict[str, str],
     ) -> subprocess.CompletedProcess[str]:
-        if "--version" in argv and not prompt:
+        if not prompt and (
+            "--version" in argv or argv[-2:] == ["features", "list"]
+        ):
             return self._process_runner(argv, prompt, timeout, environment)
         family = environment.get(_HARNESS_FAMILY_ENV)
         if family not in {"codex", "claude"}:
@@ -963,6 +1171,17 @@ class HarnessSupervisorTransport:
             "environment_names": sorted(environment),
         }
         invocation_hash = canonical_hash(invocation)
+        if self._raw_output_store is not None:
+            try:
+                self._raw_output_store.bind_operation(
+                    operation_ref,
+                    invocation_hash,
+                    family=family,
+                )
+            except TargetRawOutputUnavailable:
+                # Raw output is a private display mapping.  It can never turn
+                # a real provider operation into a failed Target Run.
+                pass
         operation_root = self._workspace / "provider-operations"
         directory = operation_root / invocation_hash[:2] / invocation_hash
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1376,18 +1595,24 @@ class _TargetRootEventProjector:
             if root_message is not None:
                 summary["actor_session_ref"] = self._root_native_session_ref
                 summary["target_root_agent_message"] = True
+                workspace_ref = self._scope.get("target_workspace_ref")
                 try:
-                    handoff = decode_target_completion_handoff(root_message)
-                    validate_target_completion_handoff(
-                        handoff,
-                        expected_target_run_ref=str(self._scope["target_run_ref"]),
+                    root_message_bytes = root_message.encode("utf-8")
+                except UnicodeError:
+                    summary["target_root_completion_binding_error"] = (
+                        "target_root_completion_text_invalid"
                     )
-                except TargetCompletionHandoffError:
-                    pass
                 else:
-                    summary["target_root_completion_candidate"] = (
-                        _target_completion_handoff_value(handoff)
-                    )
+                    if root_message_bytes and isinstance(workspace_ref, str):
+                        summary["target_root_completion_binding"] = {
+                            "schema_ref": TARGET_COMPLETION_BINDING_SCHEMA,
+                            "final_text": root_message,
+                            "final_text_sha256": hashlib.sha256(
+                                root_message_bytes
+                            ).hexdigest(),
+                            "final_text_bytes": len(root_message_bytes),
+                            "workspace_ref": workspace_ref,
+                        }
             if terminal:
                 summary["target_root_terminal"] = True
         output = self._root_output(event)
@@ -1587,7 +1812,11 @@ class _TargetRootEventProjector:
                 # Native Codex root item envelopes do not always repeat the
                 # thread id learned from ``thread.started``.  An explicit
                 # actor must still match, so child-ledger items fail closed.
-                or actor_ref not in (None, self._root_native_session_ref)
+                or actor_ref is _CODEX_ITEM_ACTOR_CONFLICT
+                or (
+                    actor_ref is not None
+                    and actor_ref != self._root_native_session_ref
+                )
             ):
                 return None
             value = item.get("text") or item.get("content")
@@ -1638,7 +1867,11 @@ class _TargetRootEventProjector:
                 event.get("type") not in {"item.updated", "item.completed"}
                 or not isinstance(item, dict)
                 or item.get("type") != "command_execution"
-                or actor_ref not in (None, self._root_native_session_ref)
+                or actor_ref is _CODEX_ITEM_ACTOR_CONFLICT
+                or (
+                    actor_ref is not None
+                    and actor_ref != self._root_native_session_ref
+                )
             ):
                 return None
             output = next(
@@ -1699,23 +1932,6 @@ def _claude_tool_result_text(value: object) -> str | None:
         and isinstance(item.get("text"), str)
     ]
     return "\n".join(parts) if parts else None
-
-
-def _target_completion_handoff_value(
-    handoff: TargetCompletionHandoff,
-) -> dict[str, object]:
-    return {
-        "schema_ref": handoff.schema_ref,
-        "target_ref": handoff.target_ref,
-        "target_run_ref": handoff.target_run_ref,
-        "status": handoff.status,
-        "artifacts": [
-            {"role": artifact.role, "relative_path": artifact.relative_path}
-            for artifact in handoff.artifacts
-        ],
-        "result_document_path": handoff.result_document_path,
-        "summary": handoff.summary,
-    }
 
 
 def _consume_target_root_ansi_delta(
@@ -2299,8 +2515,7 @@ def _evidence_from_events(
             }
             if observed[name]
             else {
-                "status": "capability_unavailable",
-                "reason": {"code": "probe_evidence_missing"},
+                "status": "not_observed",
                 "evidence_refs": [],
             }
         )
@@ -2343,6 +2558,7 @@ def _summarize_codex_event(
     if not isinstance(event_type, str):
         return None, set(), None, False
     capabilities: set[str] = set()
+    inventory_names: list[str] | None = None
     native_ref = event.get("thread_id")
     if not isinstance(native_ref, str):
         native_ref = None
@@ -2350,8 +2566,9 @@ def _summarize_codex_event(
     item_type = item.get("type") if isinstance(item, dict) else None
     tool = item.get("tool") if isinstance(item, dict) else None
     server = item.get("server") if isinstance(item, dict) else None
-    if event_type == "thread.started" and isinstance(event.get("tools"), list):
-        capabilities.add("tool_inventory")
+    # Locked Codex 0.147 JSONL reports only ``thread_id`` on
+    # ``thread.started``. Feature support is probed separately; never promote
+    # a synthetic ``tools`` test field into production inventory evidence.
     if event_type == "item.completed":
         capabilities.update(
             _capabilities_for_tool(item_type, tool, server=server)
@@ -2383,6 +2600,8 @@ def _summarize_codex_event(
     if event_type in lifecycle:
         capabilities.add(lifecycle[event_type])
     summary: dict[str, object] = {"kind": event_type}
+    if inventory_names is not None:
+        summary["inventory_kinds"] = list(dict.fromkeys(inventory_names))
     if isinstance(item_type, str):
         summary["item_kind"] = item_type
     if (
@@ -2596,7 +2815,7 @@ def _verified_codex_subagent_evidence(
             item.get("tool") == "wait"
             and event.get("type") == "item.completed"
             and item.get("status") == "completed"
-            and item.get("sender_thread_id") == root_session_ref
+            and _codex_item_actor(event, item) == root_session_ref
         ):
             wait_calls.append((sequence, item))
     child_spawn_counts = {
@@ -2756,7 +2975,7 @@ def _is_completed_codex_spawn(
     return (
         event.get("type") == "item.completed"
         and item.get("status") == "completed"
-        and item.get("sender_thread_id") == root_session_ref
+        and _codex_item_actor(event, item) == root_session_ref
         and isinstance(receivers, list)
         and len(receivers) == 1
         and isinstance(receivers[0], str)
@@ -2813,13 +3032,30 @@ def _codex_subagent_result(
     }
 
 
-def _codex_item_actor(event: dict[str, object], item: dict[str, object]) -> str | None:
-    """Return an explicit actor only; never infer a child event is root-owned."""
+def _codex_item_actor(
+    event: dict[str, object],
+    item: dict[str, object],
+) -> object:
+    """Return one unambiguous explicit actor, or a conflict sentinel."""
 
-    for value in (event.get("thread_id"), item.get("sender_thread_id")):
-        if isinstance(value, str) and value:
-            return value
-    return None
+    actors: set[str] = set()
+    for owner, field in (
+        (event, "thread_id"),
+        (event, "sender_thread_id"),
+        (item, "thread_id"),
+        (item, "sender_thread_id"),
+    ):
+        if field not in owner or owner[field] is None:
+            continue
+        value = owner[field]
+        if not isinstance(value, str) or not value:
+            return _CODEX_ITEM_ACTOR_CONFLICT
+        actors.add(value)
+    if not actors:
+        return None
+    if len(actors) != 1:
+        return _CODEX_ITEM_ACTOR_CONFLICT
+    return next(iter(actors))
 
 
 def _codex_successful_command(item: dict[str, object]) -> dict[str, object] | None:
@@ -3521,6 +3757,37 @@ def _capabilities_for_tool(
         "webfetch",
     }:
         capabilities.add("web_fetch")
+    return capabilities
+
+
+def _capabilities_from_inventory(names: tuple[str, ...]) -> set[str]:
+    """Map the provider's actual tool inventory onto the common Root floor."""
+
+    capabilities: set[str] = set()
+    for name in names:
+        normalized = name.casefold()
+        capabilities.update(_capabilities_for_tool(name, name))
+        if normalized in {
+            "shell",
+            "bash",
+            "exec",
+            "exec_command",
+            "unified_exec",
+        }:
+            # Codex workspace file access is carried by the sandboxed shell
+            # surface even when no separate Read/Edit tool is advertised.
+            capabilities.update({"shell", "file_access"})
+        if normalized == "mcp" or normalized.startswith("mcp__"):
+            capabilities.add("semantic_mcp")
+        if normalized in {
+            "agent",
+            "spawn_agent",
+            "collaboration",
+            "collab_tool_call",
+        }:
+            capabilities.add("subagent")
+    if names:
+        capabilities.add("tool_inventory")
     return capabilities
 
 

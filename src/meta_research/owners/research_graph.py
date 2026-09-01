@@ -93,6 +93,8 @@ from meta_research.plan_contract import (
 )
 from meta_research.bundle_contract import (
     BundleContractError,
+    target_execution_assertion,
+    target_execution_authorization_requirement,
     validate_bundle_context_pack,
     validate_target_graph_append_proposal,
     validate_target_plan,
@@ -135,6 +137,7 @@ from meta_research.owners.human_requests import (
     HumanRequestOwnerMixin,
     HumanResponseVerifier,
 )
+from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.target_execution import target_experiment_intent
 from meta_research.target_execution_legacy import (
     TargetExecutionRequest,
@@ -174,6 +177,28 @@ if TYPE_CHECKING:
 
 RG_OWNER = "research_graph"
 _BUNDLE_TARGET_EXPERIMENT_REQUEST_PREFIX = "bundle-target-"
+_TARGET_AUTHORIZATION_OBLIGATION = (
+    "决定是否仅为这一精确高风险 Target 授予一次执行权限。"
+)
+_TARGET_AUTHORIZATION_PURPOSE = (
+    "只恢复对应 Target；同一 DAG 中其他普通 Target 继续推进。"
+)
+_TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS = (
+    "Human Collaboration 保存 exact granted authorization receipt。",
+    "Agent Runtime 重验 current Target/spec 与同一 waiter generation。",
+)
+_BUNDLE_DISPATCH_TARGET_BASE_KEYS = frozenset(
+    {
+        "target_ref",
+        "target_key",
+        "spec_hash",
+        "spec",
+        "candidate",
+        "risk_class",
+        "dependency_refs",
+        "receipt",
+    }
+)
 QUEST_RECEIPT_KIND = "quest_acceptance"
 QUESTION_RECEIPT_KIND = "root_question_acceptance"
 MANUAL_QUESTION_RECEIPT_KIND = "manual_question_acceptance"
@@ -1096,6 +1121,176 @@ class TargetLaunchVerification:
     quest_ref: str
     risk_class: str
     asset_proofs: tuple[AcceptedInputAssetProof, ...]
+
+
+def _bundle_dispatch_target_projection(
+    target: AcceptedTarget,
+) -> dict[str, object]:
+    return {
+        "target_ref": target.target_ref,
+        "target_key": target.target_key,
+        "spec_hash": target.spec_hash,
+        "spec": target.spec,
+        "candidate": target.spec["candidate"],
+        "risk_class": target.spec["risk_class"],
+        "dependency_refs": list(target.dependency_refs),
+        "receipt": target.receipt.as_public_dict(),
+    }
+
+
+def _verify_bundle_high_risk_coordination(
+    *,
+    graph: AcceptedTargetGraph,
+    target: AcceptedTarget,
+    item: dict[str, object],
+    projection_digest: str,
+    run_ref: str,
+) -> None:
+    """Verify RG-owned semantics without claiming AR HumanRequest currentness."""
+
+    base = _bundle_dispatch_target_projection(target)
+    dispatch_allowed = item.get("dispatch_allowed")
+    request_ref = item.get("human_request_ref")
+    request_status = item.get("human_request_status")
+    if not isinstance(dispatch_allowed, bool):
+        raise OwnerConflict("bundle_dispatch_frontier_invalid")
+    if dispatch_allowed:
+        if (
+            set(item) != _BUNDLE_DISPATCH_TARGET_BASE_KEYS
+            | {
+                "dispatch_allowed",
+                "human_request_ref",
+                "human_request_status",
+            }
+            or not isinstance(request_ref, str)
+            or not request_ref
+            or request_status != "satisfied"
+            or item
+            != {
+                **base,
+                "dispatch_allowed": True,
+                "human_request_ref": request_ref,
+                "human_request_status": "satisfied",
+            }
+        ):
+            raise OwnerConflict("bundle_dispatch_frontier_invalid")
+        return
+
+    if (
+        set(item) != _BUNDLE_DISPATCH_TARGET_BASE_KEYS
+        | {
+            "dispatch_allowed",
+            "human_request_ref",
+            "human_request_status",
+            "human_request_command",
+        }
+        or request_status not in {"not_open", "open", "satisfied", "declined"}
+        or (request_status == "not_open") != (request_ref is None)
+        or (
+            request_ref is not None
+            and (not isinstance(request_ref, str) or not request_ref)
+        )
+    ):
+        raise OwnerConflict("bundle_dispatch_frontier_invalid")
+    command = item.get("human_request_command")
+    if not isinstance(command, dict) or set(command) != {
+        "semantic_operation_id",
+        "reconciliation_operation_id",
+        "arguments",
+    }:
+        raise OwnerConflict("bundle_dispatch_frontier_invalid")
+    arguments = command.get("arguments")
+    if not isinstance(arguments, dict) or set(arguments) != {
+        "effect_id",
+        "request_kind",
+        "obligation",
+        "business_purpose",
+        "condition",
+        "acceptance_conditions",
+        "required_authorization",
+    }:
+        raise OwnerConflict("bundle_dispatch_frontier_invalid")
+    wrapper = arguments.get("condition")
+    if not isinstance(wrapper, dict) or set(wrapper) != {
+        "schema_ref",
+        "root",
+        "condition",
+    }:
+        raise OwnerConflict("bundle_dispatch_frontier_invalid")
+    root = wrapper.get("root")
+    if not isinstance(root, dict) or set(root) != {
+        "run_kind",
+        "run_ref",
+        "attempt_ref",
+        "root_session_ref",
+        "fence_ref",
+        "waiter_generation",
+    }:
+        raise OwnerConflict("bundle_dispatch_frontier_invalid")
+    generation = root.get("waiter_generation")
+    if (
+        root.get("run_kind") != "bundle_stage"
+        or root.get("run_ref") != run_ref
+        or any(
+            not isinstance(root.get(key), str) or not root.get(key)
+            for key in ("attempt_ref", "root_session_ref", "fence_ref")
+        )
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+    ):
+        raise OwnerConflict("bundle_dispatch_frontier_invalid")
+    assertion = target_execution_assertion(
+        quest_ref=graph.quest_ref,
+        stage_request_ref=graph.request_ref,
+        graph_ref=graph.graph_ref,
+        target_ref=target.target_ref,
+        target_spec_hash=projection_digest,
+        risk_class="high",
+    )
+    requirement = target_execution_authorization_requirement(
+        quest_ref=graph.quest_ref,
+        stage_request_ref=graph.request_ref,
+        graph_ref=graph.graph_ref,
+        target_ref=target.target_ref,
+        target_spec_hash=projection_digest,
+    )
+    expected_wrapper = {
+        "schema_ref": "meta-research/root-agent-human-request-target/v1",
+        "root": root,
+        "condition": assertion,
+    }
+    expected_command = {
+        "semantic_operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+        "reconciliation_operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
+        "arguments": {
+            "effect_id": "target-authorization-"
+            + canonical_hash(
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": root["attempt_ref"],
+                    "target_ref": target.target_ref,
+                    "condition": assertion,
+                }
+            )[:64],
+            "request_kind": "capability_authorization",
+            "obligation": _TARGET_AUTHORIZATION_OBLIGATION,
+            "business_purpose": _TARGET_AUTHORIZATION_PURPOSE,
+            "condition": expected_wrapper,
+            "acceptance_conditions": list(
+                _TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS
+            ),
+            "required_authorization": requirement,
+        },
+    }
+    if wrapper != expected_wrapper or command != expected_command or item != {
+        **base,
+        "dispatch_allowed": False,
+        "human_request_ref": request_ref,
+        "human_request_status": request_status,
+        "human_request_command": expected_command,
+    }:
+        raise OwnerConflict("bundle_dispatch_frontier_invalid")
 
 
 class TargetInputAssetProofReader(Protocol):
@@ -2708,10 +2903,6 @@ class SQLiteResearchGraphReceiptVerifier:
             or row.attempt_ref != attempt_ref
             or row.version_ref != version_ref
             or row.decision != expected_decision
-            or (
-                expected_decision == "rejected"
-                and tuple(stored_feedback) != feedback
-            )
             or receipt.subject_ref != row.decision_ref
             or receipt.payload_hash != row.receipt_hash
             or canonical_hash(allowed) != row.allowed_sources_hash
@@ -6287,7 +6478,10 @@ class SQLiteResearchGraphReceiptVerifier:
         run_ref: str,
         graph_ref: str,
         frontier: tuple[dict[str, object], ...],
+        allow_legacy_high_risk: bool = True,
     ) -> None:
+        if not isinstance(allow_legacy_high_risk, bool):
+            raise OwnerConflict("bundle_dispatch_frontier_invalid")
         with self._database.read() as connection:
             graph_row = connection.execute(
                 text("SELECT * FROM rg_target_graphs WHERE graph_ref = :graph_ref"),
@@ -6357,7 +6551,9 @@ class SQLiteResearchGraphReceiptVerifier:
             or graph_row.run_ref != run_ref
         ):
             raise OwnerConflict("bundle_dispatch_frontier_invalid")
-        _accepted_target_graph(graph_row, target_rows, append_rows, plan_document)
+        graph = _accepted_target_graph(
+            graph_row, target_rows, append_rows, plan_document
+        )
         authoritative = tuple(
             target
             for target in (_accepted_target(row) for row in target_rows)
@@ -6371,27 +6567,81 @@ class SQLiteResearchGraphReceiptVerifier:
         ) != len(passed_refs):
             raise OwnerConflict("bundle_dispatch_frontier_invalid")
         passed_set = set(cast(tuple[str, ...], passed_refs))
-        expected = tuple(
+        authoritative_by_ref = {
+            target.target_ref: target for target in authoritative
+        }
+        if not passed_set <= set(authoritative_by_ref):
+            raise OwnerConflict("bundle_dispatch_frontier_invalid")
+        high_risk = tuple(
             target
             for target in authoritative
-            if target.spec.get("risk_class") == "normal"
-            or target.target_ref in passed_set
+            if target.spec.get("risk_class") == "high"
         )
-        expected_projection = tuple(
-            {
-                "target_ref": target.target_ref,
-                "target_key": target.target_key,
-                "spec_hash": target.spec_hash,
-                "spec": target.spec,
-                "candidate": target.spec["candidate"],
-                "risk_class": target.spec["risk_class"],
-                "dependency_refs": list(target.dependency_refs),
-                "receipt": target.receipt.as_public_dict(),
-            }
-            for target in expected
+        has_coordination = any(
+            ref in authoritative_by_ref
+            and authoritative_by_ref[cast(str, ref)].spec.get("risk_class")
+            == "high"
+            and set(item) != _BUNDLE_DISPATCH_TARGET_BASE_KEYS
+            for ref, item in zip(passed_refs, frontier, strict=True)
         )
-        if frontier != expected_projection:
+        if not has_coordination:
+            # Historical dispatch rows predate root-Agent coordination fields.
+            # They remain verifiable for restart/launch only; new AR records call
+            # this verifier with legacy disabled.
+            if high_risk and not allow_legacy_high_risk:
+                raise OwnerConflict("bundle_dispatch_frontier_invalid")
+            expected = tuple(
+                target
+                for target in authoritative
+                if target.spec.get("risk_class") == "normal"
+                or target.target_ref in passed_set
+            )
+            if frontier != tuple(
+                _bundle_dispatch_target_projection(target) for target in expected
+            ):
+                raise OwnerConflict("bundle_dispatch_frontier_invalid")
+            return
+
+        # The current projection carries every RG-owned frontier Target.  Normal
+        # entries stay the exact RG base projection; only high-risk entries may
+        # add the closed coordination envelope.  HumanRequest liveness and
+        # waiter currentness deliberately remain AR-owned.
+        if passed_refs != tuple(target.target_ref for target in authoritative):
             raise OwnerConflict("bundle_dispatch_frontier_invalid")
+        projection_authority = self._target_formal_plan_projection_verifier
+        if projection_authority is None:
+            raise OwnerConflict("bundle_dispatch_frontier_invalid")
+        for target, item in zip(authoritative, frontier, strict=True):
+            if target.spec.get("risk_class") == "normal":
+                if item != _bundle_dispatch_target_projection(target):
+                    raise OwnerConflict("bundle_dispatch_frontier_invalid")
+                continue
+            projection = projection_authority.query_candidate_projection(
+                target_ref=target.target_ref
+            )
+            if projection is None:
+                raise OwnerConflict("bundle_dispatch_frontier_invalid")
+            try:
+                projection_authority.verify_candidate_projection(
+                    target_ref=target.target_ref,
+                    candidate=projection.candidate,
+                    source_spec_hash=projection.source_spec_hash,
+                    source_acceptance_receipt=(
+                        projection.source_acceptance_receipt
+                    ),
+                    receipt=projection.receipt,
+                )
+            except OwnerConflict as error:
+                raise OwnerConflict("bundle_dispatch_frontier_invalid") from error
+            if projection.source_spec_hash != target.spec_hash:
+                raise OwnerConflict("bundle_dispatch_frontier_invalid")
+            _verify_bundle_high_risk_coordination(
+                graph=graph,
+                target=target,
+                item=item,
+                projection_digest=projection.projection_digest,
+                run_ref=run_ref,
+            )
 
     def verify_target_commit_set(
         self,

@@ -4,7 +4,6 @@ from dataclasses import dataclass, replace
 import hashlib
 import hmac
 from importlib.resources import files
-import json
 from pathlib import Path
 import subprocess
 from typing import Callable, Protocol, cast
@@ -14,8 +13,7 @@ from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA,
     BUNDLE_EXHAUSTION_REVIEW_RESPONSE_SCHEMA,
     BundleExhaustionReviewTrace,
-    bundle_exhaustion_review_response_document,
-    bundle_exhaustion_review_task_hash,
+    bundle_exhaustion_advisory_review_document,
     validate_bundle_exhaustion_assessment,
 )
 from meta_research.bundle_contract import (
@@ -25,7 +23,6 @@ from meta_research.bundle_contract import (
     BundleContractError,
     validate_bundle_context_pack,
     validate_target_plan,
-    validate_target_plan_review,
 )
 from meta_research.bundle_target_contract import (
     FORMAL_STRATEGY_UPDATE_SCHEMA_REF,
@@ -49,6 +46,7 @@ from meta_research.bundle_protocol import (
     BUNDLE_ROOT_MAX_SERIALIZED_BYTES,
     TERMINAL_EXTERNAL_OUTCOMES,
 )
+from meta_research.codex_ledger import CodexSessionLedgerReader
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
@@ -62,12 +60,11 @@ from meta_research.idea_skill import (
     _codex_harness_manifest,
     _file_sha256,
     _shared_codex_adapter_source_hash,
-    _verify_child_review_trace,
-    _verify_primary_phase_trace,
 )
 from meta_research.harness import (
     FullConformanceBinding,
     HarnessAdmissionError,
+    OPERATION_BINDING_V1,
     ResidentMcpChannel,
 )
 from meta_research.owners.agent_runtime import (
@@ -80,6 +77,7 @@ from meta_research.owners.common import OwnerConflict, canonical_hash, canonical
 from meta_research.plan_contract import MAX_PLAN_EXPERIMENT_BRIEFS
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
+from meta_research.root_capabilities import merge_root_capability_bindings
 BundleSkillContractError = BundleContractError
 BundleSkillUnavailable = IdeaSkillUnavailable
 BUNDLE_PROVIDER_TRANSPORT_LIMITS = ProviderTransportLimits(
@@ -90,17 +88,28 @@ BUNDLE_PROVIDER_TRANSPORT_LIMITS = ProviderTransportLimits(
 BUNDLE_TARGET_BATCH_PROMPT_MAX_BYTES = (
     BUNDLE_PROVIDER_TRANSPORT_LIMITS.prompt_max_bytes
 )
-_FULL_CONFORMANCE_CAPABILITY = "harness-full-conformance-v1"
-_FULL_CONFORMANCE_MCP_PREFIX = "harness-full-conformance:semantic-mcp-"
-_FULL_CONFORMANCE_RESOURCE_PREFIX = "harness-artifact:full-conformance-"
+_FULL_CONFORMANCE_CAPABILITY = "harness-operation-binding-v1"
+_FULL_CONFORMANCE_MCP_PREFIX = "harness-operation-binding:semantic-mcp-"
+_FULL_CONFORMANCE_RESOURCE_PREFIX = "harness-artifact:operation-binding-"
 
 
 class BundleFullConformanceAuthority(Protocol):
+    def require_operation_binding(
+        self,
+        *,
+        harness_family: str,
+        required_operation_ids: tuple[str, ...],
+        required_capabilities: tuple[str, ...],
+    ) -> FullConformanceBinding: ...
+
     def require_full_conformance_binding(self) -> FullConformanceBinding: ...
 
     def issue_resident_mcp_channel(
         self,
         *,
+        root_kind: str,
+        phase: str,
+        subject_policy: str,
         run_ref: str,
         attempt_ref: str,
         root_session_ref: str,
@@ -115,14 +124,20 @@ class BundleFullConformanceAuthority(Protocol):
 def bind_bundle_runtime_to_full_conformance(
     binding: BundleRuntimeBinding,
     conformance: FullConformanceBinding,
+    *,
+    required_operation_ids: tuple[str, ...],
 ) -> BundleRuntimeBinding:
-    """Freeze one current Harness evidence set into Bundle AR admission.
+    """Freeze one operation-local Harness binding into Bundle AR admission.
 
     The operation is idempotent so both the Stage boundary and the production
-    adapter can independently apply the same current evidence without creating
+    adapter can independently apply the same current binding without creating
     duplicate bindings.
     """
 
+    _require_exact_bundle_operation_binding(
+        conformance,
+        required_operation_ids=required_operation_ids,
+    )
     mcp_bindings = tuple(
         item
         for item in binding.mcp_bindings
@@ -150,9 +165,9 @@ def bind_bundle_runtime_to_full_conformance(
         for item in binding.resource_bindings
         if not item.startswith(_FULL_CONFORMANCE_RESOURCE_PREFIX)
     ) + (
-        "harness-artifact:full-conformance-contract:"
+        "harness-artifact:operation-binding-contract:"
         f"{conformance.contract_ref}@sha256:{conformance.contract_hash}",
-        "harness-artifact:full-conformance-set:"
+        "harness-artifact:operation-binding-set:"
         f"{conformance.conformance_ref}@sha256:{conformance.binding_hash}",
         *conformance.profile_receipts,
     )
@@ -162,6 +177,40 @@ def bind_bundle_runtime_to_full_conformance(
         capability_bindings=capability_bindings,
         resource_bindings=resource_bindings,
     )
+
+
+def _require_exact_bundle_operation_binding(
+    conformance: FullConformanceBinding,
+    *,
+    required_operation_ids: tuple[str, ...],
+) -> None:
+    """Reject diagnostic/global or cross-family evidence at production seams."""
+
+    if type(conformance) is not FullConformanceBinding:
+        raise BundleSkillUnavailable("bundle_runtime_binding_drift")
+    digest_values = (
+        conformance.contract_hash,
+        conformance.semantic_mcp_catalog_hash,
+        conformance.semantic_mcp_operation_bindings_hash,
+    )
+    if (
+        not required_operation_ids
+        or len(required_operation_ids) != len(set(required_operation_ids))
+        or conformance.contract_ref != OPERATION_BINDING_V1
+        or conformance.required_families != ("codex",)
+        or conformance.required_capabilities != ("semantic_mcp",)
+        or conformance.required_operation_ids != required_operation_ids
+        or conformance.profile_receipts != ()
+        or any(
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in digest_values
+        )
+        or conformance.conformance_ref
+        != "operation_binding_" + conformance.contract_hash[:48]
+    ):
+        raise BundleSkillUnavailable("bundle_runtime_binding_drift")
 
 
 @dataclass(frozen=True)
@@ -201,7 +250,7 @@ class BundleSkillResult:
     dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
-    reviewer_agent_ref: str
+    reviewer_agent_ref: str | None
     adapter_kind: str
 
 
@@ -212,9 +261,9 @@ class BundleExhaustionSkillResult:
     findings: tuple[str, ...]
     primary_session_ref: str
     review_mode: str
-    reviewer_agent_ref: str
+    reviewer_agent_ref: str | None
     adapter_kind: str
-    review_trace: BundleExhaustionReviewTrace
+    review_trace: BundleExhaustionReviewTrace | None
 
 
 @dataclass(frozen=True)
@@ -330,13 +379,22 @@ def validate_bundle_dispatch_result(
         for item in request.frontier
         if item.get("target_ref") == result.selected_target_ref
     ]
-    if request.frontier and result.action != "dispatch":
+    dispatchable = [
+        item
+        for item in request.frontier
+        if item.get("dispatch_allowed", True) is True
+    ]
+    if dispatchable and result.action != "dispatch":
         raise BundleSkillContractError("bundle_dispatch_requires_authoritative_blocker")
     if (
         result.action not in {"dispatch", "wait", "replan_required"}
         or (
             result.action == "dispatch"
-            and (not result.selected_target_ref or len(matching) != 1)
+            and (
+                not result.selected_target_ref
+                or len(matching) != 1
+                or matching[0].get("dispatch_allowed", True) is not True
+            )
         )
         or (result.action != "dispatch" and result.selected_target_ref is not None)
     ):
@@ -534,14 +592,17 @@ def validate_bundle_skill_result(
     _validate_identity(
         request,
         primary_session_ref=result.primary_session_ref,
-        reviewer_agent_ref=result.reviewer_agent_ref,
+        reviewer_agent_ref=None,
         adapter_kind=result.adapter_kind,
     )
-    if result.review_mode != "harness_child_agent" or result.reviewer_agent_ref in {
-        request.root_session_ref,
-        result.primary_session_ref,
-    }:
-        raise BundleSkillContractError("target_plan_review_not_independent")
+    if (
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
+        or result.findings != ()
+        or result.dispositions != ()
+        or result.final_target_plan != result.reviewed_draft
+    ):
+        raise BundleSkillContractError("bundle_advisory_review_invalid")
     draft_hash = validate_target_plan(
         result.reviewed_draft,
         formal_plan_ref=request.formal_plan_ref,
@@ -559,11 +620,7 @@ def validate_bundle_skill_result(
     review = review_record(
         result, draft_hash=draft_hash, final_target_plan_hash=final_hash
     )
-    review_hash = validate_target_plan_review(
-        review,
-        reviewed_draft_hash=draft_hash,
-        final_target_plan_hash=final_hash,
-    )
+    review_hash = canonical_hash(review)
     return draft_hash, final_hash, review_hash
 
 
@@ -571,20 +628,24 @@ def validate_bundle_exhaustion_skill_result(
     request: BundleSkillRequest,
     result: BundleExhaustionSkillResult,
 ) -> tuple[str, str]:
-    """Validate the immutable assessment and exact independent review."""
+    """Validate the immutable assessment; review provenance is advisory."""
 
     _validate_request(request)
     _validate_identity(
         request,
         primary_session_ref=result.primary_session_ref,
-        reviewer_agent_ref=result.reviewer_agent_ref,
+        reviewer_agent_ref=None,
         adapter_kind=result.adapter_kind,
     )
-    if result.review_mode != "harness_child_agent" or result.reviewer_agent_ref in {
-        request.root_session_ref,
-        result.primary_session_ref,
-    }:
-        raise BundleSkillContractError("bundle_exhaustion_review_not_independent")
+    if (
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
+        or result.findings != ()
+        or result.review_trace is not None
+    ):
+        raise BundleSkillContractError(
+            "bundle_exhaustion_advisory_review_invalid"
+        )
     try:
         assessment_hash = validate_bundle_exhaustion_assessment(
             result.reviewed_assessment,
@@ -592,30 +653,17 @@ def validate_bundle_exhaustion_skill_result(
         )
     except OwnerConflict as error:
         raise BundleSkillContractError(error.code) from error
-    if (
-        result.reviewed_assessment_hash != assessment_hash
-        or result.findings
-        or result.review_trace.run_ref != request.run_ref
-        or result.review_trace.attempt_ref != request.attempt_ref
-        or result.review_trace.fence_ref != request.fence_ref
-        or result.review_trace.primary_session_ref != result.primary_session_ref
-        or result.review_trace.reviewer_agent_ref != result.reviewer_agent_ref
-        or result.review_trace.reviewed_assessment_hash != assessment_hash
-        or result.review_trace.review_task_hash
-        != bundle_exhaustion_review_task_hash(
+    if result.reviewed_assessment_hash != assessment_hash:
+        raise BundleSkillContractError("bundle_exhaustion_review_binding_invalid")
+    try:
+        advisory_document = bundle_exhaustion_advisory_review_document(
             reviewed_assessment_hash=assessment_hash,
-            formal_plan_content_hash=canonical_hash(request.plan_document),
+            reviewer_agent_ref=result.reviewer_agent_ref,
+            findings=result.findings,
         )
-    ):
-        raise BundleSkillContractError("bundle_exhaustion_review_binding_invalid")
-    review_document = bundle_exhaustion_review_response_document(
-        reviewer_agent_ref=result.reviewer_agent_ref,
-        reviewed_assessment_hash=assessment_hash,
-    )
-    review_hash = canonical_hash(review_document)
-    if result.review_trace.review_response_hash != review_hash:
-        raise BundleSkillContractError("bundle_exhaustion_review_binding_invalid")
-    return assessment_hash, review_hash
+    except OwnerConflict as error:
+        raise BundleSkillContractError(error.code) from error
+    return assessment_hash, canonical_hash(advisory_document)
 
 
 def review_record(
@@ -624,15 +672,25 @@ def review_record(
     draft_hash: str,
     final_target_plan_hash: str,
 ) -> dict[str, object]:
+    if (
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
+        or result.findings != ()
+        or result.dispositions != ()
+        or result.final_target_plan != result.reviewed_draft
+        or draft_hash != canonical_hash(result.reviewed_draft)
+        or final_target_plan_hash != canonical_hash(result.final_target_plan)
+    ):
+        raise BundleSkillContractError("bundle_advisory_review_invalid")
     return {
         "schema_ref": TARGET_PLAN_REVIEW_SCHEMA_REF,
-        "review_mode": result.review_mode,
-        "reviewer_agent_ref": result.reviewer_agent_ref,
+        "review_mode": "advisory_unobserved",
+        "reviewer_agent_ref": None,
         "reviewed_draft_hash": draft_hash,
-        "findings": list(result.findings),
-        "dispositions": list(result.dispositions),
+        "findings": [],
+        "dispositions": [],
         "final_target_plan_hash": final_target_plan_hash,
-        "independent": True,
+        "independent": False,
         "advisory_only": True,
     }
 
@@ -793,6 +851,7 @@ def _validate_identity(
 
 
 class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
+    _root_agent_kind = "bundle"
     """Production Bundle adapter using one managed native root Session."""
 
     _provider_transport_limits = BUNDLE_PROVIDER_TRANSPORT_LIMITS
@@ -803,11 +862,13 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         *,
         executable: str = "codex",
         model_ref: str = CODEX_MODEL_REF,
-        timeout_seconds: float = 15 * 60,
+        timeout_seconds: float | None = None,
         process_runner: Callable[
-            [list[str], str, float], subprocess.CompletedProcess[str]
+            [list[str], str, float | None], subprocess.CompletedProcess[str]
         ]
         | None = None,
+        codex_ledger_reader: CodexSessionLedgerReader | None = None,
+        codex_home: Path | None = None,
     ) -> None:
         super().__init__(
             workspace,
@@ -815,6 +876,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             model_ref=model_ref,
             timeout_seconds=timeout_seconds,
             process_runner=process_runner,
+            codex_ledger_reader=codex_ledger_reader,
+            codex_home=codex_home,
         )
         self._full_conformance_authority: (
             BundleFullConformanceAuthority | None
@@ -907,19 +970,33 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         if authority is None or base_url is None:
             raise BundleSkillUnavailable("bundle_semantic_mcp_unavailable")
         operation_ids = self._bundle_semantic_operation_ids()
+        # The bearer belongs to this exact operation tree. Root reconnects and
+        # native children may use its catalog; Owner/currentness checks remain
+        # bound to the admitted Bundle scope.
+        subject_policy = "operation_tree"
         try:
-            conformance = authority.require_full_conformance_binding()
+            conformance = authority.require_operation_binding(
+                harness_family="codex",
+                required_operation_ids=operation_ids,
+                required_capabilities=("semantic_mcp",),
+            )
         except HarnessAdmissionError as error:
             raise BundleSkillUnavailable(error.code) from error
-        if not set(operation_ids) <= set(conformance.required_operation_ids):
-            raise BundleSkillUnavailable(
-                "bundle_semantic_mcp_conformance_incomplete"
-            )
+        rebound = bind_bundle_runtime_to_full_conformance(
+            self._base_runtime_binding(),
+            conformance,
+            required_operation_ids=operation_ids,
+        )
+        if rebound != runtime_binding:
+            raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         channel_key = (job_ref or run_ref, operation_name)
         channel = self._resident_mcp_channels.get(channel_key)
         if channel is None:
             try:
                 channel = authority.issue_resident_mcp_channel(
+                    root_kind="bundle",
+                    phase=operation_name,
+                    subject_policy=subject_policy,
                     run_ref=run_ref,
                     attempt_ref=attempt_ref,
                     root_session_ref=root_session_ref,
@@ -932,6 +1009,16 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             except HarnessAdmissionError as error:
                 raise BundleSkillUnavailable(error.code) from error
             self._resident_mcp_channels[channel_key] = channel
+        if (
+            channel.connection.grant_ref
+            != channel.binding.connection_grant_ref
+            or channel.binding.catalog_hash
+            != conformance.semantic_mcp_catalog_hash
+            or canonical_hash(list(channel.binding.operation_bindings))
+            != conformance.semantic_mcp_operation_bindings_hash
+        ):
+            self._release_resident_channel(channel_key)
+            raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         endpoint_ref = channel.binding.endpoint_ref
         if not endpoint_ref.startswith("/") or "?" in endpoint_ref or "#" in endpoint_ref:
             self._release_resident_channel(channel_key)
@@ -952,6 +1039,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 mcp_url=base_url + endpoint_ref,
                 mcp_token=channel.connection.token,
                 mcp_scope_binding_hash=scope_binding_hash,
+                semantic_mcp_protected_environment=True,
+                authorized_operation_ids=operation_ids,
             )
         except BundleSkillUnavailable as error:
             if error.code != "codex_operation_reconciliation_pending":
@@ -1009,7 +1098,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             return "bundle_review_result_contract_invalid"
         raise BundleSkillUnavailable("codex_operation_spool_invalid")
 
-    def runtime_binding(self) -> BundleRuntimeBinding:
+    def _base_runtime_binding(self) -> BundleRuntimeBinding:
         resources = _bundle_skill_resources()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_source_hash = _file_sha256(Path(__file__).resolve())
@@ -1022,7 +1111,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "target-plan-envelope": _target_plan_envelope_schema(
                 _schema_template_request()
             ),
-            "target-plan-review": _review_schema(_schema_template_request()),
             "target-dispatch": _dispatch_schema(("__target__",)),
             "target-batch": _target_batch_schema(_schema_template_request()),
         }
@@ -1043,17 +1131,17 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             model_ref=self._model_ref,
             harness_adapter_ref=harness_ref,
             mcp_bindings=(),
-            capability_bindings=(
-                "approval-policy-never",
-                "filesystem-danger-full-access",
-                "global-config-ignored",
-                "harness-child-agent-review",
-                "semantic-mcp-resident",
-                "native-session-resume",
-                "shell-tool-enabled",
-                "structured-output-json-schema",
-                "trusted-local-quest-authorization",
-                "web-search-live",
+            capability_bindings=merge_root_capability_bindings(
+                (
+                    "approval-policy-never",
+                    "filesystem-danger-full-access",
+                    "user-config-loaded",
+                    "semantic-mcp-resident",
+                    "native-session-resume",
+                    "structured-output-json-schema",
+                    "trusted-local-quest-authorization",
+                ),
+                self._root_agent_kind,
             ),
             resource_bindings=tuple(
                 f"package:meta_research.skills.bundle_stage/{name}@sha256:"
@@ -1082,17 +1170,27 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 f"prompt={BUNDLE_PROVIDER_TRANSPORT_LIMITS.prompt_max_bytes};"
                 f"stream={BUNDLE_PROVIDER_TRANSPORT_LIMITS.stream_max_bytes};"
                 f"result={BUNDLE_PROVIDER_TRANSPORT_LIMITS.result_max_bytes}",
-                "provider-timeout-seconds:" + format(self._timeout_seconds, ".17g"),
+                self._provider_wall_clock_binding(),
                 "runtime-policy:trusted-local-broad/v1",
                 "sandbox-policy:danger-full-access",
                 "transport-seal-key:sha256:" + transport_key_hash(transport_key),
             ),
         )
+        return binding
+
+    def runtime_binding(self) -> BundleRuntimeBinding:
+        binding = self._base_runtime_binding()
         if self._full_conformance_authority is None:
             return binding
+        operation_ids = self._bundle_semantic_operation_ids()
         return bind_bundle_runtime_to_full_conformance(
             binding,
-            self._full_conformance_authority.require_full_conformance_binding(),
+            self._full_conformance_authority.require_operation_binding(
+                harness_family="codex",
+                required_operation_ids=operation_ids,
+                required_capabilities=("semantic_mcp",),
+            ),
+            required_operation_ids=operation_ids,
         )
 
     def generate_draft(self, request: BundleSkillRequest) -> BundleSkillDraft:
@@ -1101,9 +1199,13 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
-            "本回合仅执行 Primary draft phase。禁止调用 spawn_agent 或 wait，禁止委派 "
-            "child、独立评审或预先处理 review；必须先返回 frozen draft。独立评审只能在 "
-            "Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
+            "本回合仅执行 Primary draft phase。根据内容复杂度可选使用 "
+            "collaboration；child 仅能返回 advisory material，不获得 Owner "
+            "authority，也不以 child 数量、拓扑、顺序或本回合未使用 "
+            "collaboration 判定成败。返回 frozen TargetPlan 或 exhaustion "
+            "assessment。TargetPlan 由 "
+            "Skill 结构/domain validator 接纳，不再要求第二个 completion wrapper；"
+            "exhaustion assessment 直接进入 Owner inventory/frontier/currentness 重验。"
             '你是 Bundle 根 Agent。返回且只返回下列两个闭合分支之一：'
             '{"target_plan": ...} 的 formal v3，或固定合同中的 '
             '{"exhaustion_assessment": ...}。不得同时返回、混合或扩展两分支。'
@@ -1167,7 +1269,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{canonical_json(list(request.predecessor_rejections))}\n"
             f"plan_document={canonical_json(request.plan_document)}"
         )
-        output, session_ref, primary_stdout = self._invoke_with_resident_mcp(
+        output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
             run_ref=request.run_ref,
             attempt_ref=request.attempt_ref,
             root_session_ref=request.root_session_ref,
@@ -1181,15 +1283,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if session_ref is None or type(output) is not dict:
             raise BundleSkillUnavailable("codex_bundle_primary_invalid")
-        try:
-            _verify_primary_phase_trace(primary_stdout)
-        except BundleSkillUnavailable as error:
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="primary",
-                native_session_ref=session_ref,
-                failure_code=error.code,
-            ) from error
+        # Collaboration trace is advisory provenance.  TargetPlan and
+        # exhaustion assessment acceptance stays with the Skill-defined
+        # structural/domain validators.
         if set(output) == {"target_plan"} and isinstance(
             output.get("target_plan"), dict
         ):
@@ -1229,83 +1325,17 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             return self._review_exhaustion_assessment(request, draft)
         if draft.output_kind != "target_plan":
             raise BundleSkillUnavailable("bundle_skill_output_kind_invalid")
-        prompt = (
-            f"{_bundle_skill_instructions()}\n\n"
-            "本回合是 Review phase。必须针对下方当前 frozen reviewed_draft 现在新建一个 "
-            "child reviewer；不得复用 Primary phase、任何先前 child 或先前评审结论。"
-            "在当前 Bundle 根 Session 内使用 Harness 原生 spawn_agent，以 "
-            'fork_turns="none" 启动一个短命、全新上下文 child reviewer，并 wait '
-            "到完成。它只审查 FormalPlan lineage、"
-            "GapSet 闭合、去重、DAG、可执行性与 Owner 边界，不批准 Target。根 Agent "
-            "逐条处置 finding 后返回 reviewer_agent_ref、findings、final_target_plan、"
-            "dispositions。审查必须覆盖完整 normalization/cells、reuse proof、held-fixed、"
-            "implementation revision 与 initial append-only update，并逐 Target 检查 exact "
-            "ExperimentKeys/cell 绑定及完整 measurement contract：四份领域文档、ordered "
-            "Metric definitions、parts/aggregation、preregistered stop rules、checkpoint policy "
-            "和完整 result schema 都必须进入所审 exact revision/hash。不得把 legacy v2 "
-            "最小切片判成正式合同；TargetPlan 不得选择执行 provider/adapter，执行资格和"
-            "通用 operation handle 只能由后续 TargetRun Owner 门禁产生。不得创建第二个"
-            "顶层 Session。\n"
-            f"formal_plan_ref={request.formal_plan_ref}\n"
-            f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
-            "predecessor_rejections_hash="
-            f"{canonical_hash(list(request.predecessor_rejections))}\n"
-            "predecessor_rejections="
-            f"{canonical_json(list(request.predecessor_rejections))}\n"
-            f"plan_document={canonical_json(request.plan_document)}\n"
-            f"reviewed_draft={canonical_json(draft.draft)}"
-        )
-        output, session_ref, stdout = self._invoke_with_resident_mcp(
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding,
-            operation_name="review",
-            prompt=prompt,
-            schema=_review_schema(request, draft=draft),
-            native_session_ref=draft.primary_session_ref,
-            job_ref=request.job_ref,
-        )
-        reviewer = output.get("reviewer_agent_ref")
-        findings = output.get("findings")
-        final = output.get("final_target_plan")
-        dispositions = output.get("dispositions")
-        if (
-            session_ref != draft.primary_session_ref
-            or not isinstance(reviewer, str)
-            or not isinstance(findings, list)
-            or not isinstance(final, dict)
-            or not isinstance(dispositions, list)
-        ):
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code="bundle_review_result_contract_invalid",
-                detail_code="codex_bundle_review_invalid",
-            )
-        try:
-            _verify_child_review_trace(
-                stdout,
-                root_session_ref=draft.primary_session_ref,
-                reviewer_agent_ref=reviewer,
-            )
-        except BundleSkillUnavailable as error:
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code=error.code,
-            ) from error
+        # The primary TargetPlan has already passed the exact Skill-defined
+        # structural/domain validator.  Do not require another provider turn,
+        # child choreography, or completion wrapper before persisting it.
         return BundleSkillResult(
             reviewed_draft=draft.draft,
-            final_target_plan=cast(dict[str, object], final),
-            findings=tuple(cast(dict[str, str], item) for item in findings),
-            dispositions=tuple(cast(dict[str, str], item) for item in dispositions),
+            final_target_plan=draft.draft,
+            findings=(),
+            dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=reviewer,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
 
@@ -1321,143 +1351,22 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             )
         except OwnerConflict as error:
             raise BundleSkillUnavailable(error.code) from error
-        task_hash = bundle_exhaustion_review_task_hash(
+        # Exhaustion acceptance is rebuilt from the exact primary assessment,
+        # the Owner inventory/frontier, HumanRequest currentness, and the
+        # frozen FormalPlan.  A second provider turn or child transcript adds
+        # optional advice only, so absence of either cannot reject the usable
+        # assessment and must not be replaced with synthetic child events.
+        result = BundleExhaustionSkillResult(
+            reviewed_assessment=draft.draft,
             reviewed_assessment_hash=assessment_hash,
-            formal_plan_content_hash=canonical_hash(request.plan_document),
+            findings=(),
+            primary_session_ref=draft.primary_session_ref,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
+            adapter_kind=draft.adapter_kind,
+            review_trace=None,
         )
-        child_task = (
-            "你是一个全新上下文的 Bundle exhaustion 审查 child。"
-            "严格审查整份 primary assessment，不得只抽样单个 cell 或 route；"
-            "核对 exact completion cells、所有已声明 routes、不存在 frozen-contract "
-            "内实质不同可接纳候选，也不存在应归为 replan 的 semantic "
-            "barrier。拒绝 attempt/count/time/cost shortcut。只返回给根 Agent "
-            "明确的 accepted 或 findings；不调用 Owner 写入。\n"
-            f"review_task_hash={task_hash}\n"
-            f"reviewed_assessment_hash={assessment_hash}\n"
-            f"formal_plan_content_hash={canonical_hash(request.plan_document)}\n"
-            f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
-            "predecessor_rejections_hash="
-            f"{canonical_hash(list(request.predecessor_rejections))}\n"
-            "predecessor_rejections="
-            f"{canonical_json(list(request.predecessor_rejections))}\n"
-            f"reviewed_assessment={canonical_json(draft.draft)}"
-        )
-        prompt = (
-            f"{_bundle_skill_instructions()}\n\n"
-            "本回合是 Review phase。必须针对下方当前 frozen reviewed_assessment 现在新建 "
-            "一个 child reviewer；不得复用 Primary phase、任何先前 child 或先前评审结论。"
-            "在当前 Bundle 根 Session 内使用 Harness 原生 spawn_agent，"
-            'fork_turns="none"，且将下面 child_task 原样作为 prompt。'
-            "wait 直到该独立 child terminal completed。根 Agent 不得自审，"
-            "不得改写 primary assessment。只有 child 无 finding 时，"
-            "返回闭合 review response：reviewer_agent_ref 必须是该 child identity，"
-            "reviewed_assessment_hash 必须是下面 exact hash，accepted=true，findings=[]。\n"
-            f"child_task={canonical_json(child_task)}\n"
-            f"reviewed_assessment_hash={assessment_hash}"
-        )
-        output, session_ref, stdout = self._invoke_with_resident_mcp(
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding,
-            operation_name="review",
-            prompt=prompt,
-            schema=_review_schema(request, draft=draft),
-            native_session_ref=draft.primary_session_ref,
-            job_ref=request.job_ref,
-        )
-        reviewer = output.get("reviewer_agent_ref")
-        findings = output.get("findings")
-        if (
-            session_ref != draft.primary_session_ref
-            or type(reviewer) is not str
-            or type(findings) is not list
-            or output
-            != bundle_exhaustion_review_response_document(
-                reviewer_agent_ref=reviewer,
-                reviewed_assessment_hash=assessment_hash,
-            )
-        ):
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code="bundle_review_result_contract_invalid",
-                detail_code="codex_bundle_exhaustion_review_invalid",
-            )
-        try:
-            _verify_child_review_trace(
-                stdout,
-                root_session_ref=draft.primary_session_ref,
-                reviewer_agent_ref=reviewer,
-                expected_spawn_prompt=child_task,
-            )
-        except BundleSkillUnavailable as error:
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code=error.code,
-            ) from error
-        try:
-            spawn_hash, completion_hash = _child_review_event_hashes(
-                stdout,
-                root_session_ref=draft.primary_session_ref,
-                reviewer_agent_ref=reviewer,
-            )
-        except BundleSkillUnavailable as error:
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code=error.code,
-            ) from error
-        try:
-            unsigned_trace = BundleExhaustionReviewTrace(
-                run_ref=request.run_ref,
-                attempt_ref=request.attempt_ref,
-                fence_ref=request.fence_ref,
-                primary_session_ref=draft.primary_session_ref,
-                reviewer_agent_ref=reviewer,
-                reviewed_assessment_hash=assessment_hash,
-                review_task_hash=task_hash,
-                review_response_hash=canonical_hash(output),
-                spawn_event_hash=spawn_hash,
-                completion_event_hash=completion_hash,
-                transport_seal="0" * 64,
-            )
-            trace = replace(
-                unsigned_trace,
-                transport_seal=self._bundle_exhaustion_trace_seal(
-                    unsigned_trace,
-                    runtime_binding_hash=canonical_hash(
-                        request.runtime_binding.as_dict()
-                    ),
-                ),
-            )
-            result = BundleExhaustionSkillResult(
-                reviewed_assessment=draft.draft,
-                reviewed_assessment_hash=assessment_hash,
-                findings=(),
-                primary_session_ref=draft.primary_session_ref,
-                review_mode="harness_child_agent",
-                reviewer_agent_ref=reviewer,
-                adapter_kind=draft.adapter_kind,
-                review_trace=trace,
-            )
-            validate_bundle_exhaustion_skill_result(request, result)
-        except (OwnerConflict, BundleSkillContractError) as error:
-            detail_code = (
-                error.code if isinstance(error, OwnerConflict) else str(error)
-            )
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code="bundle_review_result_contract_invalid",
-                detail_code=detail_code,
-            ) from error
+        validate_bundle_exhaustion_skill_result(request, result)
         return result
 
     def _bundle_exhaustion_trace_seal(
@@ -1519,7 +1428,16 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "优先级、依赖、已实现结果与局部阻塞；不得把 Agent tree 当成 Target DAG，"
             "不得选择 frontier 之外的 Target，也不得伪造 Owner receipt。有可执行 "
             "Target 时返回 dispatch；只有技术/授权等待返回 wait；只有冻结语义确需 "
-            "改变才返回 replan_required。\n"
+            "改变才返回 replan_required。frontier 中的高风险 Target 若 "
+            "dispatch_allowed=false，它是本次 Bundle 根 Agent 的授权协作义务，"
+            "不是可调度 Target。human_request_status=not_open 时，必须原样使用 "
+            "human_request_command.semantic_operation_id 和 arguments 调用 resident semantic "
+            "MCP 创建 formal HumanRequest；若 effect outcome 不明，必须用同一 "
+            "arguments 调用 reconciliation_operation_id，不得换 effect_id 重放。"
+            "请求已打开、已满足或已拒绝时不得再造新请求；返回 wait，"
+            "由 Owner 评估 response、重验 authorization 并释放 waiter。绝对不得把 "
+            "dispatch_allowed=false 的 Target 返回为 dispatch，也不得因 provider、"
+            "validator 或 readiness 错误自行伪造 HumanRequest。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"run_ref={request.run_ref}\n"
             f"attempt_ref={request.attempt_ref}\n"
@@ -1719,54 +1637,6 @@ def _bundle_skill_instructions() -> str:
     )
 
 
-def _child_review_event_hashes(
-    stdout: str,
-    *,
-    root_session_ref: str,
-    reviewer_agent_ref: str,
-) -> tuple[str, str]:
-    """Hash the exact successful spawn and terminal wait event sequence.
-
-    `_verify_child_review_trace` is the semantic validator.  This helper only
-    extracts the already-validated immutable transport evidence so the
-    production adapter can seal it for AR.
-    """
-
-    spawns: list[dict[str, object]] = []
-    terminal_waits: list[dict[str, object]] = []
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if type(event) is not dict or event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if (
-            type(item) is not dict
-            or item.get("type") != "collab_tool_call"
-            or item.get("status") != "completed"
-            or item.get("sender_thread_id") != root_session_ref
-        ):
-            continue
-        if item.get("tool") == "spawn_agent":
-            spawns.append(cast(dict[str, object], event))
-            continue
-        if item.get("tool") != "wait":
-            continue
-        states = item.get("agents_states")
-        if (
-            type(states) is dict
-            and type(states.get(reviewer_agent_ref)) is dict
-            and cast(dict[str, object], states[reviewer_agent_ref]).get("status")
-            == "completed"
-        ):
-            terminal_waits.append(cast(dict[str, object], event))
-    if len(spawns) != 1 or not terminal_waits:
-        raise BundleSkillUnavailable("codex_child_review_trace_invalid")
-    return canonical_hash(spawns[0]), canonical_hash(terminal_waits)
-
-
 def _schema_template_request() -> BundleSkillRequest:
     plan = {
         "gap_set": ["__gap__"],
@@ -1872,12 +1742,7 @@ def _review_schema(
         if draft.output_kind != "target_plan":
             raise BundleSkillUnavailable("bundle_skill_output_kind_invalid")
         return target_review
-    return {
-        "oneOf": [
-            target_review,
-            _exhaustion_review_schema(reviewed_assessment_hash=None),
-        ]
-    }
+    return target_review
 
 
 def _target_plan_review_schema(
@@ -1931,12 +1796,7 @@ def _target_plan_review_schema(
                 },
             },
         },
-        "required": [
-            "reviewer_agent_ref",
-            "findings",
-            "final_target_plan",
-            "dispositions",
-        ],
+        "required": ["final_target_plan"],
     }
 
 

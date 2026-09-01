@@ -26,6 +26,7 @@ async function openQuestionTreeFixture(
   page: Page,
   options: {
     transformQuestionHistory?: (body: JsonRecord) => JsonRecord;
+    skipInitialSummaryAssertions?: boolean;
   } = {},
 ) {
   product = await DeterministicProduct.start();
@@ -417,23 +418,64 @@ async function openQuestionTreeFixture(
     );
   }, "run-tree-1:g1:session-tree-1");
   await page.goto(product.baseUrl, { waitUntil: "domcontentloaded" });
-  await expect(page.getByTestId("return-summary")).toContainText(
-    "验证问题树只读上下文与当前研究目标保持一致",
-  );
-  await expect(page.getByTestId("return-summary")).toContainText(
-    "三个宽度均可导航，并且选择不写 Owner",
-  );
-  await expect(page.getByTestId("return-summary")).toContainText(
-    "Local wait · library_reconnect",
-  );
-  await expect(page.getByTestId("return-summary")).not.toContainText(
-    "Local wait · offline_action",
-  );
+  if (!options.skipInitialSummaryAssertions) {
+    await expect(page.getByTestId("return-summary")).toContainText(
+      "验证问题树只读上下文与当前研究目标保持一致",
+    );
+    await expect(page.getByTestId("return-summary")).toContainText(
+      "三个宽度均可导航，并且选择不写 Owner",
+    );
+    await expect(page.getByTestId("return-summary")).toContainText(
+      "Local wait · library_reconnect",
+    );
+    await expect(page.getByTestId("return-summary")).not.toContainText(
+      "Local wait · offline_action",
+    );
+  }
   await page.getByRole("button", { name: "问题树", exact: true }).click();
   const tree = page.getByTestId("question-tree");
   await expect(tree).toBeVisible();
   return tree;
 }
+
+test("QuestionTree rail overview reveals the cached overview by the next paint", async ({
+  page,
+}) => {
+  const tree = await openQuestionTreeFixture(page, {
+    skipInitialSummaryAssertions: true,
+  });
+  const overview = page.locator("main.lumen-main");
+  await expect(tree).toBeVisible();
+  await expect(overview).toBeHidden();
+
+  await page.unroute("**/api/v1/snapshot");
+  let releaseSnapshot!: () => void;
+  const snapshotGate = new Promise<void>((resolve) => {
+    releaseSnapshot = resolve;
+  });
+  let snapshotDeferred = false;
+  await page.route("**/api/v1/snapshot", async (route) => {
+    snapshotDeferred = true;
+    await snapshotGate;
+    await fulfill(route, {});
+  });
+  await page.evaluate(() => {
+    void fetch("/api/v1/snapshot");
+  });
+  await expect.poll(() => snapshotDeferred).toBe(true);
+
+  await page.getByRole("button", { name: "Quest 总览", exact: true }).click();
+  const visibleByNextPaint = await page.evaluate(() => new Promise<boolean>((resolve) => {
+    window.requestAnimationFrame(() => {
+      resolve(!document.querySelector("main.lumen-main")?.hasAttribute("hidden"));
+    });
+  }));
+
+  expect(visibleByNextPaint).toBe(true);
+  await expect(overview).toBeVisible();
+  await expect(tree).toBeHidden();
+  releaseSnapshot();
+});
 
 test("QuestionTree keeps canvas at 800/1440 and reflows the same keyboard tree into a 390 outline", async ({
   page,

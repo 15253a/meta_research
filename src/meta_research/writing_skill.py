@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 import hashlib
 from importlib.resources import files
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -23,21 +24,20 @@ from meta_research.idea_skill import (
     _codex_harness_manifest,
     _file_sha256,
     _shared_codex_adapter_source_hash,
-    _verify_child_review_trace,
 )
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.provider_supervisor import transport_key_hash
+from meta_research.root_capabilities import merge_root_capability_bindings
 from meta_research.writing_contract import (
-    WRITING_MAX_CONTENT_REVISIONS,
     WRITING_MAX_OUTPUT_BYTES,
-    WRITING_CHILD_REVIEW_RUBRIC,
-    WRITING_CHILD_REVIEW_TASK_SCHEMA,
+    WRITING_ADVISORY_REVIEW_RUBRIC,
+    WRITING_ADVISORY_REVIEW_TASK_SCHEMA,
     WritingRuntimeBinding,
     normalize_writing_intent,
     validate_writing_document,
-    writing_child_review_document_profile,
+    writing_advisory_review_document_profile,
+    writing_advisory_review_task_hash,
     writing_document_profile,
-    writing_child_review_task_hash,
 )
 
 
@@ -45,11 +45,6 @@ WRITING_MARKDOWN_MAX_LENGTH = 2 * 1024 * 1024
 WRITING_MAX_CITATIONS = 512
 WRITING_MAX_REVIEW_FINDINGS = 128
 WRITING_MAX_SOURCE_BYTES = 512 * 1024 * 1024
-_WRITING_CHILD_REVIEW_RESULT_SCHEMA = (
-    "meta-research/writing-child-review-result/v1"
-)
-_CHILD_TASK_BEGIN = "<<<WRITING_CHILD_REVIEW_TASK_BEGIN>>>"
-_CHILD_TASK_END = "<<<WRITING_CHILD_REVIEW_TASK_END>>>"
 # 0030 changed this module's source hash when paper and presentation became
 # first-class document types. Runs admitted by the immediately preceding 0029
 # runtime keep this exact report-only executable and Skill bundle instead of
@@ -134,7 +129,7 @@ class WritingSkillResult:
     dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
-    reviewer_agent_ref: str
+    reviewer_agent_ref: str | None
     review_task_hash: str
     adapter_kind: str
 
@@ -179,14 +174,11 @@ def validate_writing_skill_result(
         raise OwnerConflict("writing_reviewed_checkpoint_mismatch")
     if result.primary_session_ref != draft.primary_session_ref:
         raise OwnerConflict("writing_native_session_changed")
-    if result.review_mode != "harness_child_agent":
+    if (
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
+    ):
         raise OwnerConflict("writing_review_mode_invalid")
-    _text(result.reviewer_agent_ref, "writing_reviewer_invalid", 128)
-    if result.reviewer_agent_ref in {
-        request.root_session_ref,
-        result.primary_session_ref,
-    }:
-        raise OwnerConflict("writing_review_not_independent")
     expected_review_task_hash = writing_review_task_hash(request, draft)
     if result.review_task_hash != expected_review_task_hash:
         raise OwnerConflict("writing_review_task_invalid")
@@ -244,11 +236,12 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
     """Codex Harness Adapter for one resumable Writing root Session."""
 
     # Writing consumes untrusted Intent/source text. Its custom permission
-    # profile grants shell reads only to Codex's minimal runtime plus the exact
-    # Frozen Snapshot source root, and writes only to the dedicated provider
-    # workspace. Hosted discovery and arbitrary command egress are disabled.
+    # profile keeps the Frozen Snapshot read-only and writes confined to the
+    # dedicated provider workspace. Root tool availability remains complete;
+    # the prompt and Owner acceptance boundary constrain what may be committed.
+    _root_agent_kind = "writing"
     _shell_environment_inherit = "none"
-    _web_search_mode = "disabled"
+    _web_search_mode = "live"
     _reconciliation_operation_names = ("writing-primary", "writing-review")
 
     def _sandbox_arguments(
@@ -274,7 +267,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             'Snapshot only",filesystem={":minimal"="read",'
             f'{json.dumps(str(agent_workspace))}="write",'
             f'{json.dumps(str(source_root))}="read"}},'
-            'network={enabled=false}}'
+            'network={enabled=true}}'
         )
         return (
             "--config",
@@ -294,7 +287,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         _key_path, transport_key = self._transport_key()
         output_contracts = {
             "writing-draft": _draft_schema(),
-            "writing-child-review-finalization": _review_schema(),
+            "writing-advisory-finalization": _review_schema(),
         }
         output_contracts = {
             name: _compile_codex_output_schema(schema)
@@ -313,19 +306,19 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             model_ref=self._model_ref,
             harness_adapter_ref=harness_ref,
             mcp_bindings=(),
-            capability_bindings=(
-                "approval-policy-never",
-                "accepted-rm-source-staging",
-                "environment-inheritance-none",
-                "filesystem-read-root-confined",
-                "global-config-ignored",
-                "harness-child-agent-review",
-                "mcp-config-empty",
-                "native-session-resume",
-                "shell-tool-enabled",
-                "structured-output-json-schema",
-                "trusted-local-quest-authorization",
-                "external-research-disabled",
+            capability_bindings=merge_root_capability_bindings(
+                (
+                    "approval-policy-never",
+                    "accepted-rm-source-staging",
+                    "environment-inheritance-none",
+                    "filesystem-read-root-confined",
+                    "user-config-loaded",
+                    "mcp-config-empty",
+                    "native-session-resume",
+                    "structured-output-json-schema",
+                    "trusted-local-quest-authorization",
+                ),
+                self._root_agent_kind,
             ),
             resource_bindings=tuple(
                 f"package:meta_research.skills.writing-report/{name}@sha256:"
@@ -350,22 +343,21 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 CODEX_REASONING_EFFORT_BINDING,
                 "codex-config:permissions.writing_snapshot=exact-frozen-read-root",
                 "codex-config:shell_environment_policy.inherit=none",
-                "codex-config:web_search=disabled",
+                "codex-config:web_search=live",
                 "output-route:codex-output-last-message/json-schema/v1",
                 "provider-output-limits:"
                 f"stream={PROVIDER_STREAM_MAX_BYTES};"
                 f"result={PROVIDER_RESULT_MAX_BYTES}",
-                "provider-timeout-seconds:"
-                + format(self._timeout_seconds, ".17g"),
+                self._provider_wall_clock_binding(),
                 "runtime-policy:untrusted-writing-input-confined/v1",
                 "sandbox-policy:permission-profile;minimal=read;"
-                "agent-workspace=write;frozen-source-root=read;network=false",
+                "agent-workspace=write;frozen-source-root=read;network=true",
                 "external-effects:forbidden",
                 "transport-seal-key:sha256:"
                 + transport_key_hash(transport_key),
                 "writing-run-limits:"
-                f"revisions={WRITING_MAX_CONTENT_REVISIONS};"
-                f"output={WRITING_MAX_OUTPUT_BYTES}",
+                "revisions=unbounded;accumulated-output=unbounded;"
+                f"artifact-output={WRITING_MAX_OUTPUT_BYTES}",
             ),
         )
 
@@ -456,6 +448,24 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             adapter_type.__new__(adapter_type),
         )
         adapter.__dict__.update(self.__dict__)
+        timeout_bindings = tuple(
+            item
+            for item in request.runtime_binding.resource_bindings
+            if item.startswith("provider-timeout-seconds:")
+        )
+        if len(timeout_bindings) != 1:
+            raise WritingSkillUnavailable("writing_runtime_binding_drift")
+        try:
+            legacy_timeout = float(timeout_bindings[0].rsplit(":", 1)[1])
+        except ValueError as error:
+            raise WritingSkillUnavailable(
+                "writing_runtime_binding_drift"
+            ) from error
+        if not math.isfinite(legacy_timeout) or legacy_timeout <= 0:
+            raise WritingSkillUnavailable("writing_runtime_binding_drift")
+        # The hash-pinned adapter predates unbounded production execution and
+        # formats its original numeric ceiling into the historical binding.
+        adapter._timeout_seconds = legacy_timeout
         if request.runtime_binding != adapter.runtime_binding():
             raise WritingSkillUnavailable("writing_runtime_binding_drift")
         return module, adapter
@@ -492,33 +502,26 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         source_manifest = self._stage_source_materials(request)
         source_root = Path(cast(str, source_manifest["manifest_path"])).parent
         review_task_hash = writing_review_task_hash(request, draft)
-        child_prompt = _child_review_prompt(
+        advisory_prompt = _advisory_review_prompt(
             request,
             draft,
             source_manifest=source_manifest,
             review_task_hash=review_task_hash,
         )
-        root_context_canary = canonical_hash(
-            {
-                "kind": "writing-root-context-canary",
-                "root_session_ref": request.root_session_ref,
-                "review_task_hash": review_task_hash,
-            }
-        )
         prompt = (
             f"{_writing_skill_instructions(request.document_type)}\n\n"
-            f"你仍是 {request.document_type} Writing 根 Agent。使用 Harness 原生 spawn_agent，以"
-            " fork_turns=\"none\" 启动一个短命 fresh-context child reviewer，并等待"
-            "完成。spawn_agent 的 message 必须逐字等于下方标记内文本。这个 root-only"
-            " canary 不得复制到 child message；若 child 因继承历史而能看到它，child"
-            " 必须如实返回 context_canary_seen=true，此次执行将 fail closed。根 Agent"
-            " 必须逐条处置 child 返回的原始 findings，并在当前 resumed Session 返回最终"
-            " Markdown 与 citations。\n"
-            f"root_context_canary={root_context_canary}\n"
-            f"{_CHILD_TASK_BEGIN}\n{child_prompt}\n{_CHILD_TASK_END}"
+            f"你仍是同一个 {request.document_type} Writing 根 Agent。本回合执行第二次 "
+            "advisory finalization provider turn：重新检查 exact frozen draft、citations、"
+            "Intent、Snapshot 与 source manifest，形成 bounded findings；对每条 finding "
+            "给出 revised | not_adopted disposition，并在当前 resumed Session 返回最终 "
+            "Markdown 与 citations。revised 必须实际改变稿件或 citations。不要返回或"
+            "声称 reviewer identity，不调用 Owner 写入。可按需使用无 Owner "
+            "authority 的 advisory child，但验收不依赖 child 数量、拓扑、"
+            "顺序或 reviewer identity。\n"
+            f"{advisory_prompt}"
         )
         try:
-            output, session_ref, stdout = self._invoke(
+            output, session_ref, _stdout = self._invoke(
                 operation_name="writing-review",
                 prompt=prompt,
                 schema=_review_schema(),
@@ -531,24 +534,6 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             raise WritingSkillUnavailable(str(code)) from error
         if session_ref != draft.primary_session_ref:
             raise WritingSkillUnavailable("writing_native_session_changed")
-        reviewer_agent_ref = output.get("reviewer_agent_ref")
-        if not isinstance(reviewer_agent_ref, str):
-            raise WritingSkillUnavailable("writing_review_invalid")
-        try:
-            child_message = _verify_child_review_trace(
-                stdout,
-                root_session_ref=draft.primary_session_ref,
-                reviewer_agent_ref=reviewer_agent_ref,
-                expected_spawn_prompt=child_prompt,
-            )
-        except Exception as error:
-            code = getattr(error, "code", "writing_child_review_trace_invalid")
-            raise WritingSkillUnavailable(str(code)) from error
-        _validate_child_review_message(
-            child_message,
-            review_task_hash=review_task_hash,
-            expected_findings=output.get("findings"),
-        )
         result = WritingSkillResult(
             reviewed_markdown=draft.markdown,
             final_markdown=cast(str, output.get("final_markdown")),
@@ -556,8 +541,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             findings=_review_items(output.get("findings")),
             dispositions=_review_items(output.get("dispositions")),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=reviewer_agent_ref,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             review_task_hash=review_task_hash,
             adapter_kind=draft.adapter_kind,
         )
@@ -632,7 +617,7 @@ def writing_review_task_hash(
     snapshot_hash = request.snapshot.get("snapshot_hash")
     if not isinstance(snapshot_hash, str):
         raise OwnerConflict("writing_snapshot_invalid")
-    return writing_child_review_task_hash(
+    return writing_advisory_review_task_hash(
         run_ref=request.run_ref,
         provider_job_ref=request.job_ref,
         root_session_ref=request.root_session_ref,
@@ -648,7 +633,7 @@ def writing_review_task_hash(
     )
 
 
-def _child_review_prompt(
+def _advisory_review_prompt(
     request: WritingSkillRequest,
     draft: WritingSkillDraft,
     *,
@@ -656,7 +641,7 @@ def _child_review_prompt(
     review_task_hash: str,
 ) -> str:
     task = {
-        "schema_ref": WRITING_CHILD_REVIEW_TASK_SCHEMA,
+        "schema_ref": WRITING_ADVISORY_REVIEW_TASK_SCHEMA,
         "review_task_hash": review_task_hash,
         "run_ref": request.run_ref,
         "provider_job_ref": request.job_ref,
@@ -670,11 +655,10 @@ def _child_review_prompt(
         "accepted_source_manifest": source_manifest,
         "reviewed_markdown": draft.markdown,
         "reviewed_citations": list(draft.citations),
-        "rubric": list(WRITING_CHILD_REVIEW_RUBRIC),
-        "fresh_context_mode": "fork_turns:none",
+        "rubric": list(WRITING_ADVISORY_REVIEW_RUBRIC),
     }
     if request.document_type != "report":
-        document_profile = writing_child_review_document_profile(
+        document_profile = writing_advisory_review_document_profile(
             request.document_type
         )
         if document_profile is None:
@@ -691,48 +675,11 @@ def _child_review_prompt(
         else "按 rubric 与 document profile 检查稿件。"
     )
     return (
-        "你是一次性 Writing child reviewer，只能审查下面这一个精确任务。不得创建"
-        " Owner receipt、修改文件、发布或启动其他 Agent。读取 manifest 中已冻结文件，"
-        f"{review_subject}若你从任何继承的 root 历史看到了名为"
-        " root_context_canary 的 token，必须返回 context_canary_seen=true；否则为 false。"
-        "只返回单个 JSON 对象，不要 Markdown fence。返回对象必须精确包含"
-        " schema_ref、review_task_hash、context_canary_seen、findings；findings 每项只含"
-        " category 与 finding。\nreview_task="
-        f"{canonical_json(task)}\nresponse_schema_ref="
-        f"{_WRITING_CHILD_REVIEW_RESULT_SCHEMA}"
+        "只处理下面这一个精确 advisory task。读取 manifest 中已冻结文件，"
+        f"{review_subject}最终响应只含 findings、dispositions、final_markdown、citations。"
+        "findings 每项只含 category 与 finding；dispositions 与 findings 顺序一一对应。"
+        f"\nadvisory_task={canonical_json(task)}"
     )
-
-
-def _validate_child_review_message(
-    message: str | None,
-    *,
-    review_task_hash: str,
-    expected_findings: object,
-) -> None:
-    if not isinstance(message, str):
-        raise WritingSkillUnavailable("writing_child_review_result_missing")
-    try:
-        value = json.loads(message)
-    except json.JSONDecodeError as error:
-        raise WritingSkillUnavailable(
-            "writing_child_review_result_invalid"
-        ) from error
-    if (
-        not isinstance(value, dict)
-        or set(value)
-        != {
-            "schema_ref",
-            "review_task_hash",
-            "context_canary_seen",
-            "findings",
-        }
-        or value.get("schema_ref") != _WRITING_CHILD_REVIEW_RESULT_SCHEMA
-        or value.get("review_task_hash") != review_task_hash
-        or value.get("context_canary_seen") is not False
-        or value.get("findings") != expected_findings
-    ):
-        raise WritingSkillUnavailable("writing_child_review_result_invalid")
-    _review_items(value.get("findings"))
 
 
 def _validate_request(request: WritingSkillRequest) -> None:
@@ -1056,7 +1003,7 @@ def _writing_skill_resources(document_type: str = "report") -> dict[str, str]:
         ),
     }
     if document_type != "report":
-        reference_name = f"references/{profile.profile_ref}.md"
+        reference_name = f"references/{profile.profile_ref}-advisory.md"
         resources[reference_name] = (root / reference_name).read_text(
             encoding="utf-8"
         )
@@ -1072,7 +1019,7 @@ def _writing_skill_instructions(document_type: str = "report") -> str:
     return (
         instructions
         + "\n\n"
-        + resources[f"references/{profile.profile_ref}.md"]
+        + resources[f"references/{profile.profile_ref}-advisory.md"]
     )
 
 
@@ -1157,14 +1104,12 @@ def _review_schema() -> dict[str, object]:
         "type": "object",
         "additionalProperties": False,
         "required": [
-            "reviewer_agent_ref",
             "findings",
             "dispositions",
             "final_markdown",
             "citations",
         ],
         "properties": {
-            "reviewer_agent_ref": {"type": "string", "minLength": 1},
             "findings": {"type": "array", "items": finding},
             "dispositions": {"type": "array", "items": disposition},
             "final_markdown": {"type": "string", "minLength": 1},

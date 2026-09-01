@@ -1355,7 +1355,7 @@ def test_plan_raw_transport_proof_rejects_missing_or_changed_artifact(
     assert rejected.value.recovery_checkpoint is None
 
 
-def test_plan_production_adapter_root_review_completes_without_replay(
+def test_plan_production_adapter_missing_review_trace_never_replays(
     tmp_path: Path,
 ) -> None:
     data_path = tmp_path / "plan-production-review-trace"
@@ -1418,19 +1418,44 @@ def test_plan_production_adapter_root_review_completes_without_replay(
             ]
         )
 
-        for _step in range(12):
-            current = runtime.plan_stage.query_current()
-            if current["stage_commit"] is not None:
-                break
-            assert runtime.plan_stage.process_once()
-        completed = runtime.plan_stage.query_current()
-        assert completed["run"]["status"] == "completed"
-        assert completed["stage_commit"]["outcome_kind"] == "FormalPlan"
+        assert runtime.plan_stage.process_once()
+        assert not runtime.plan_stage.process_once()
+        blocked_view = runtime.plan_stage.query_current()
+        blocked = blocked_view["run"]
+        assert blocked["status"] == "suspended_fenced"
+        assert blocked["fence_status"] == "revoked"
+        assert blocked["blocker"] == {
+            "status": "durable",
+            "reason": {"code": "codex_child_review_spawn_invalid"},
+        }
+        checkpoint = blocked["recovery_checkpoint"]
+        provider_exit = checkpoint["checkpoint"]["provider_exit"]
+        assert provider_exit["schema_ref"] == (
+            "meta-research/provider-terminal-contract-failure/v1"
+        )
+        assert provider_exit["contract_failure_code"] == (
+            "codex_child_review_spawn_invalid"
+        )
+        assert provider_exit["contract_failure_detail_code"] == (
+            "codex_child_review_spawn_invalid"
+        )
+        assert checkpoint["checkpoint"]["attempt_ref"] == blocked["attempt_ref"]
+        assert checkpoint["checkpoint"]["fence_ref"] == blocked["fence_ref"]
+        assert blocked_view["stage_commit"] is None
         operation_ref = run.review_invocation.operation_ref
         terminal_rows = _provider_terminal_rows(runtime, operation_ref)
+        assert len(terminal_rows["units"]) == 1
+        assert terminal_rows["units"][0][1] == "revoked"
+        assert terminal_rows["units"][0][3] is not None
+        assert len(terminal_rows["responsibilities"]) == 1
+        assert terminal_rows["responsibilities"][0][1:3] == (
+            "finished",
+            "permanent_fence",
+        )
         assert len(runner.calls) == 2
 
         assert not runtime.plan_stage.process_once()
+        assert runtime.plan_stage.query_current()["stage_commit"] is None
         assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
         assert len(runner.calls) == 2
     finally:
@@ -1448,7 +1473,10 @@ def test_plan_production_adapter_root_review_completes_without_replay(
     )
     try:
         assert not restarted.plan_stage.process_once()
-        assert restarted.plan_stage.query_current()["stage_commit"] is not None
+        restarted_view = restarted.plan_stage.query_current()
+        assert restarted_view["run"]["status"] == "suspended_fenced"
+        assert restarted_view["run"]["fence_status"] == "revoked"
+        assert restarted_view["stage_commit"] is None
         assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
         assert no_replay.calls == []
     finally:

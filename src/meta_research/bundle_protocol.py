@@ -867,13 +867,15 @@ def validate_target_run_handoff(handoff: TargetRunHandoff) -> str:
         and terminal.root_completion_receipt is not None
     )
     if is_root_completion:
-        handle = handoff.handle_history[0] if len(handoff.handle_history) == 1 else None
+        handle = handoff.handle_history[-1] if handoff.handle_history else None
         if (
             handle is None
             or handoff.code_review_preflights
             or handoff.stop_decisions
-            or handoff.recovered_blockers
-            or handoff.recovery_evidence_refs
+            or len(handoff.recovered_blockers)
+            != len(handoff.handle_history) - 1
+            or bool(handoff.recovered_blockers)
+            is not bool(handoff.recovery_evidence_refs)
             or terminal.code_review is not None
             or terminal.result_review is not None
             or handle.target_ref != terminal.target_ref

@@ -1,6 +1,6 @@
 ---
 name: writing-report
-description: Draft and revise an evidence-grounded Markdown research report from one frozen Meta-research Quest Snapshot. Use when a Writing Run requests a report draft, child-agent citation review, or a feedback-driven successor revision; never use it to publish, accept, or advance a Quest Stage.
+description: Draft and revise an evidence-grounded Markdown research report from one frozen Meta-research Quest Snapshot. Use when a Writing Run requests a report draft, root advisory citation finalization, or a feedback-driven successor revision; never use it to publish, accept, or advance a Quest Stage.
 ---
 
 # Writing Report
@@ -53,13 +53,15 @@ restart resumes the sealed cut without recapture, revalidation, or replacement.
 - Do not create receipts, accept content or citations, render a formal artifact,
   advance a Stage, or publish/send/submit anything externally.
 
-## Self-review and revise
+## Root advisory finalization
 
-- Ask the Harness to spawn one fresh-context child reviewer inside the same root
-  Session. The child is advisory and must inspect evidence coverage, citation
-  bindings, unsupported certainty, internal consistency, and Intent alignment.
+- After the primary draft is durably checkpointed, use the second provider turn
+  in the same root Session to inspect evidence coverage, citation bindings,
+  unsupported certainty, internal consistency, and Intent alignment.
 - Return each finding and a `revised` or `not_adopted` disposition. A `revised`
   disposition must materially change the final Markdown or citation set.
+- Persist `review_mode=advisory_unobserved`, `reviewer_agent_ref=null`, and the
+  neutral advisory task hash. Do not report an unobserved reviewer identity.
 - Keep the root native Session identity unchanged while applying the review.
 - On RG or human feedback, revise in that same Session and preserve predecessor
   lineage. Do not overwrite any previously accepted content version.

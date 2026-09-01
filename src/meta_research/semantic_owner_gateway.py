@@ -35,14 +35,17 @@ from meta_research.owners.common import (
     canonical_hash,
     canonical_json,
 )
+from meta_research.owners.human_requests import HUMAN_REQUEST_KINDS
 from meta_research.owners.research_graph import ResearchGraphInterface
 from meta_research.owners.research_memory import ResearchMemoryInterface
 from meta_research.semantic_mcp import (
+    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
     SemanticCallContext,
     SemanticMcpError,
     SemanticMcpGateway,
     SemanticOperation,
 )
+from meta_research.root_capabilities import root_operation_catalog
 from meta_research.target_run_semantic import (
     TARGET_RUN_DAEMON_BOUNDARIES,
     TARGET_RUN_SEMANTIC_OPERATION_IDS,
@@ -55,27 +58,19 @@ from meta_research.owners.target_run_runtime import (
 )
 
 
-BUNDLE_ROOT_SEMANTIC_OPERATION_IDS = (
-    "advancement_engine.bundle_stage_run.observe",
-    "advancement_engine.bundle_exhaustion.submit",
-    "advancement_engine.bundle_exhaustion.reconcile",
-    "agent_runtime.bundle_run_binding.observe",
-    "research_memory.implementation_content.accept",
-    "research_memory.implementation_content.accept.reconcile",
-    "research_memory.implementation_content.read",
-    "research_graph.reuse_eligibility.read",
-    "research_graph.reuse_inputs.verify",
-    "research_graph.target_launch_request.read",
-    "agent_runtime.target_work.request",
-    "agent_runtime.target_work.request.reconcile",
-    "agent_runtime.target_frontier.read",
-    "agent_runtime.bundle_inbox.read",
+BUNDLE_ROOT_SEMANTIC_OPERATION_IDS = root_operation_catalog(
+    "bundle",
+    common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
 )
 
-REASONING_ROOT_SEMANTIC_OPERATION_IDS = (
-    "advancement_engine.reasoning_stage_run.observe",
-    "research_memory.reasoning_evidence.read",
-    "research_graph.reasoning_context.read",
+REASONING_ROOT_SEMANTIC_OPERATION_IDS = root_operation_catalog(
+    "reasoning",
+    common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+)
+
+TARGET_ROOT_SEMANTIC_OPERATION_IDS = root_operation_catalog(
+    "target",
+    common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
 )
 
 # These boundaries are intentionally not Semantic MCP tools.  The Bundle
@@ -99,6 +94,16 @@ class MissingSemanticOwnerOperation:
     owning_module: str
     reason_code: str
     required_public_interface: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RootHumanRequestCommand:
+    request_kind: str
+    obligation: str
+    business_purpose: str
+    condition: dict[str, object]
+    acceptance_conditions: tuple[str, ...]
+    required_authorization: dict[str, object] | None
 
 
 BUNDLE_TARGET_SEMANTIC_MISSING_MATRIX = (
@@ -299,6 +304,9 @@ def create_semantic_owner_gateway(
             handler=lambda context, arguments: _verify_quest_receipt(
                 research_graph, context, arguments
             ),
+        ),
+        *_root_agent_human_request_operations(
+            agent_runtime=agent_runtime,
         ),
     ]
     if advancement_engine is not None:
@@ -629,6 +637,267 @@ def _target_work_operations(
             ),
         ),
     )
+
+
+def _root_agent_human_request_operations(
+    *,
+    agent_runtime: AgentRuntimeInterface,
+) -> tuple[SemanticOperation, SemanticOperation]:
+    open_id, reconcile_id = ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+    return (
+        SemanticOperation(
+            semantic_operation_id=open_id,
+            owning_module="agent_runtime",
+            description=(
+                "Open one blocking HumanRequest from this exact current root Agent. "
+                "The server derives the root waiter identity; this operation performs "
+                "no requested external effect and does not validate a later response."
+            ),
+            input_schema=_root_human_request_input_schema(),
+            output_schema=_root_human_request_output_schema(),
+            access_mode="effect",
+            reconciliation_operation_id=reconcile_id,
+            handler=lambda context, arguments: _open_root_agent_human_request(
+                agent_runtime,
+                context,
+                arguments,
+            ),
+        ),
+        SemanticOperation(
+            semantic_operation_id=reconcile_id,
+            owning_module="agent_runtime",
+            description=(
+                "Reconcile a root Agent HumanRequest open effect without replaying "
+                "the request or treating a human response as Owner validation."
+            ),
+            input_schema=_root_human_request_input_schema(),
+            output_schema=_root_human_request_output_schema(),
+            access_mode="reconcile",
+            handler=lambda context, arguments: _reconcile_root_agent_human_request(
+                agent_runtime,
+                context,
+                arguments,
+            ),
+        ),
+    )
+
+
+def _open_root_agent_human_request(
+    owner: AgentRuntimeInterface,
+    context: SemanticCallContext,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    effect_id, effect_key = _semantic_effect_key(context, arguments)
+    scope = _root_agent_human_request_scope(owner, context)
+    command = _root_human_request_command(arguments)
+    target_assertion = _root_human_request_target(
+        scope, context, command.condition
+    )
+    try:
+        request = owner.open_human_request(
+            request_kind=command.request_kind,
+            obligation=command.obligation,
+            business_purpose=command.business_purpose,
+            target_assertion=target_assertion,
+            acceptance_conditions=command.acceptance_conditions,
+            direct_waiter={
+                "waiter_ref": scope["waiter_ref"],
+                "generation": scope["waiter_generation"],
+                "target_assertion": target_assertion,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            idempotency_key=effect_key,
+            quest_ref=scope.get("quest_ref"),
+            required_authorization=command.required_authorization,
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    return _root_human_request_result(
+        effect_id=effect_id,
+        request=request,
+        scope=scope,
+        target_assertion=target_assertion,
+        command=command,
+    )
+
+
+def _reconcile_root_agent_human_request(
+    owner: AgentRuntimeInterface,
+    context: SemanticCallContext,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    effect_id, effect_key = _semantic_effect_key(context, arguments)
+    scope = _root_agent_human_request_scope(owner, context)
+    command = _root_human_request_command(arguments)
+    try:
+        request = owner.reconcile_human_request_open(effect_key)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    if request is None:
+        return {"status": "unknown_outcome", "effect_id": effect_id}
+    target_assertion = _root_human_request_target(
+        scope, context, command.condition
+    )
+    return _root_human_request_result(
+        effect_id=effect_id,
+        request=request,
+        scope=scope,
+        target_assertion=target_assertion,
+        command=command,
+    )
+
+
+def _root_agent_human_request_scope(
+    owner: AgentRuntimeInterface,
+    context: SemanticCallContext,
+) -> dict[str, object]:
+    try:
+        return owner.verify_root_agent_human_request_scope(
+            run_ref=context.run_ref,
+            attempt_ref=context.attempt_ref,
+            root_session_ref=context.root_session_ref,
+            fence_ref=context.fence_ref,
+            runtime_binding_hash=context.capability_binding_hash,
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+
+
+def _root_human_request_command(
+    arguments: dict[str, object],
+) -> _RootHumanRequestCommand:
+    request_kind = arguments.get("request_kind")
+    obligation = arguments.get("obligation")
+    business_purpose = arguments.get("business_purpose")
+    condition = arguments.get("condition")
+    acceptance_conditions = arguments.get("acceptance_conditions")
+    authorization = arguments.get("required_authorization")
+    if (
+        request_kind not in HUMAN_REQUEST_KINDS
+        or not isinstance(obligation, str)
+        or not obligation.strip()
+        or not isinstance(business_purpose, str)
+        or not business_purpose.strip()
+        or not isinstance(condition, dict)
+        or not condition
+        or not isinstance(acceptance_conditions, list)
+        or not acceptance_conditions
+        or len(acceptance_conditions) > 32
+        or not all(
+            isinstance(item, str) and bool(item.strip())
+            for item in acceptance_conditions
+        )
+        or (authorization is not None and not isinstance(authorization, dict))
+        or (isinstance(authorization, dict) and not authorization)
+        or (
+            request_kind == "capability_authorization"
+            and not isinstance(authorization, dict)
+        )
+    ):
+        raise SemanticMcpError("root_agent_human_request_condition_invalid")
+    normalized_conditions = tuple(
+        str(item).strip() for item in acceptance_conditions
+    )
+    if len(set(normalized_conditions)) != len(normalized_conditions):
+        raise SemanticMcpError("root_agent_human_request_condition_invalid")
+    return _RootHumanRequestCommand(
+        request_kind=str(request_kind),
+        obligation=obligation.strip(),
+        business_purpose=business_purpose.strip(),
+        condition=condition,
+        acceptance_conditions=normalized_conditions,
+        required_authorization=(
+            authorization if isinstance(authorization, dict) else None
+        ),
+    )
+
+
+def _root_human_request_target(
+    scope: dict[str, object],
+    context: SemanticCallContext,
+    condition: dict[str, object],
+) -> dict[str, object]:
+    root = {
+        "run_kind": scope["run_kind"],
+        "run_ref": context.run_ref,
+        "attempt_ref": context.attempt_ref,
+        "root_session_ref": context.root_session_ref,
+        "fence_ref": context.fence_ref,
+        "waiter_generation": scope["waiter_generation"],
+    }
+    if isinstance(scope.get("target_ref"), str):
+        root["target_ref"] = scope["target_ref"]
+    return {
+        "schema_ref": "meta-research/root-agent-human-request-target/v1",
+        "root": root,
+        "condition": condition,
+    }
+
+
+def _root_human_request_result(
+    *,
+    effect_id: str,
+    request: dict[str, object],
+    scope: dict[str, object],
+    target_assertion: dict[str, object],
+    command: _RootHumanRequestCommand,
+) -> dict[str, object]:
+    waiters = request.get("direct_waiters")
+    if (
+        request.get("issuer") != "agent_runtime"
+        or request.get("kind") != command.request_kind
+        or request.get("quest_ref") != scope.get("quest_ref")
+        or request.get("obligation") != command.obligation
+        or request.get("business_purpose") != command.business_purpose
+        or request.get("target_assertion") != target_assertion
+        or request.get("acceptance_conditions")
+        != list(command.acceptance_conditions)
+        or request.get("required_authorization")
+        != command.required_authorization
+        or request.get("expires_at") is not None
+        or request.get("current") is not True
+        or not isinstance(waiters, list)
+        or len(waiters) != 1
+        or not isinstance(waiters[0], dict)
+        or waiters[0].get("waiter_ref") != scope["waiter_ref"]
+        or waiters[0].get("generation") != scope["waiter_generation"]
+        or waiters[0].get("target_assertion") != target_assertion
+        or waiters[0].get("wait_scope") != "local"
+        or waiters[0].get("other_blockers") != []
+    ):
+        raise SemanticMcpError("root_agent_human_request_artifact_invalid")
+    request_status = request.get("status")
+    waiter_status = waiters[0].get("status")
+    if (
+        not isinstance(request.get("request_ref"), str)
+        or not isinstance(request_status, str)
+        or not isinstance(waiter_status, str)
+    ):
+        raise SemanticMcpError("root_agent_human_request_artifact_invalid")
+    if waiter_status == "consumed":
+        resume_requirement = "consumed"
+    elif waiter_status == "released":
+        resume_requirement = "owner_validation_released"
+    elif waiter_status == "blocked" and request_status == "satisfied":
+        resume_requirement = "owner_validation_required"
+    elif waiter_status == "blocked" and request_status == "open":
+        resume_requirement = "human_response_required"
+    else:
+        resume_requirement = "closed"
+    return {
+        "status": "condition_reported",
+        "effect_id": effect_id,
+        "condition": {
+            "schema_ref": "meta-research/blocking-human-request-condition/v1",
+            "code": "blocking_human_request",
+            "request_ref": request["request_ref"],
+            "request_kind": command.request_kind,
+            "request_status": request_status,
+            "waiter_status": waiter_status,
+            "resume_requirement": resume_requirement,
+        },
+    }
 
 
 def _snapshot_operation(
@@ -1588,6 +1857,88 @@ def _effect_input_schema() -> dict[str, object]:
     )
 
 
+def _root_human_request_input_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "effect_id": _string(max_length=128),
+            "request_kind": _string(enum=tuple(sorted(HUMAN_REQUEST_KINDS))),
+            "obligation": _string(max_length=8000),
+            "business_purpose": _string(max_length=4000),
+            "condition": {"type": "object"},
+            "acceptance_conditions": {
+                "type": "array",
+                "items": _string(max_length=2000),
+            },
+            "required_authorization": {"type": "object"},
+        },
+        required=(
+            "effect_id",
+            "request_kind",
+            "obligation",
+            "business_purpose",
+            "condition",
+            "acceptance_conditions",
+        ),
+    )
+
+
+def _root_human_request_output_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "status": _string(
+                enum=("condition_reported", "unknown_outcome")
+            ),
+            "effect_id": _string(max_length=128),
+            "condition": _closed_object(
+                {
+                    "schema_ref": _string(
+                        enum=(
+                            "meta-research/blocking-human-request-condition/v1",
+                        )
+                    ),
+                    "code": _string(enum=("blocking_human_request",)),
+                    "request_ref": _string(max_length=96),
+                    "request_kind": _string(
+                        enum=tuple(sorted(HUMAN_REQUEST_KINDS))
+                    ),
+                    "request_status": _string(
+                        enum=(
+                            "open",
+                            "satisfied",
+                            "declined",
+                            "withdrawn",
+                            "expired",
+                            "superseded",
+                        )
+                    ),
+                    "waiter_status": _string(
+                        enum=("blocked", "released", "consumed", "cancelled")
+                    ),
+                    "resume_requirement": _string(
+                        enum=(
+                            "human_response_required",
+                            "owner_validation_required",
+                            "owner_validation_released",
+                            "consumed",
+                            "closed",
+                        )
+                    ),
+                },
+                required=(
+                    "schema_ref",
+                    "code",
+                    "request_ref",
+                    "request_kind",
+                    "request_status",
+                    "waiter_status",
+                    "resume_requirement",
+                ),
+            ),
+        },
+        required=("status", "effect_id"),
+    )
+
+
 def _semantic_effect_key(
     context: SemanticCallContext, arguments: dict[str, object]
 ) -> tuple[str, str]:
@@ -2431,6 +2782,7 @@ __all__ = [
     "BUNDLE_TARGET_SEMANTIC_MISSING_MATRIX",
     "MissingSemanticOwnerOperation",
     "TARGET_RUN_DAEMON_BOUNDARIES",
+    "TARGET_ROOT_SEMANTIC_OPERATION_IDS",
     "TARGET_RUN_SEMANTIC_OPERATION_IDS",
     "create_semantic_owner_gateway",
 ]

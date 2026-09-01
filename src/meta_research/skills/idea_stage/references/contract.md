@@ -10,11 +10,11 @@
 
 `NoViableCandidate` 必须记录探索范围、已考虑候选族及为何不可行、Evidence boundary、推翻条件和 Plan 当前为何不能负责地继续。它只约束当前 frozen closure。
 
-## 独立评审
+## Advisory finalization
 
-首次提交携带 v2 advisory review：`review_mode = harness_child_agent`、Harness 返回的短命 `reviewer_agent_ref`、reviewed draft hash、分类为 `question_alignment | material_duplicate | evidence_boundary | falsifiability | plan_usability` 的 findings、每条 finding 唯一的 `revised | not_adopted` disposition，以及 final outcome hash。Reviewer 由根 Agent 在当前 managed native Session 内原生 spawn 并 wait；Adapter 从同一 Codex JSONL 中交叉验证恰好一次成功 `spawn_agent`、同一 child 的成功 `wait/completed`、root sender 与最终 `reviewer_agent_ref`。它不是另一个 Agent Runtime Session，也没有 Owner authority。
+首次提交携带 advisory review：`review_mode = advisory_unobserved`、`reviewer_agent_ref = null`、`independent = false`、reviewed draft hash、分类为 `question_alignment | material_duplicate | evidence_boundary | falsifiability | plan_usability` 的 findings、每条 finding 唯一的 `revised | not_adopted` disposition，以及 final outcome hash。Owner 保存 primary draft 后，根 Agent 在同一 managed native Session 的第二个 provider turn 重新审查 exact frozen draft；该 turn 没有 Owner authority，也不报告未观测的 reviewer identity。
 
-根 Agent 在同一个 resumed turn 中消费 child findings、形成 dispositions 并返回最终 Outcome。reviewed draft hash 与 final outcome hash 不同，当且仅当至少一条 disposition 的 action 为 `revised`。历史 v1 `reviewer_session_ref` 只允许读取既有 immutable payload；新 Submission 不得再写 v1。
+根 Agent 在同一个 resumed turn 中形成 findings、dispositions 并返回最终 Outcome。reviewed draft hash 与 final outcome hash 不同，当且仅当至少一条 disposition 的 action 为 `revised`。历史 reviewer Session/child provenance 形状只允许读取既有 immutable payload；新 Submission 只写当前 advisory shape。
 
 Owner rejection 的 successor 必须绑定 predecessor submission、真实 rejection receipt 和根 Agent 的修订，并产生实质不同的 Outcome hash。
 

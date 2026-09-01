@@ -99,22 +99,22 @@ const fallbackCompanionCopy: Record<CompanionShellState, {
 }> = {
   loading: {
     label: "正在建立上下文",
-    message: "我会在首个 Snapshot 返回后，用同一个窗口解释研究空间。",
+    message: "研究状态返回后，我会在同一个窗口解释正在发生什么。",
   },
   "first-error": {
     label: "本地连接不可用",
-    message: "首个 Snapshot 尚未返回；Shell 保持在位，修复 daemon 后可以重新读取。",
+    message: "研究状态尚未返回；页面会保持在原处，服务恢复后可以重新读取。",
   },
   "readiness-unavailable": {
     label: "底座尚未就绪",
-    message: "readiness 当前不可用。研究浏览保持只读，不会猜测或补写 Owner 状态。",
+    message: "研究服务当前不可用。页面保持只读，不会猜测或补写研究状态。",
   },
   "ready-empty": {
     label: "研究空间已就绪",
     message: "这里还没有 Quest。使用左侧 ＋ 后，我会继续留在这个位置。",
   },
   "ready-active": {
-    label: "跟随当前 Projection",
+    label: "跟随当前研究",
     message: "我会在这里解释研究状态；普通聊天不会直接写入领域事实。",
   },
 };
@@ -137,6 +137,20 @@ function documentText(
 function reasonCode(error: unknown): string {
   return error instanceof Error ? error.message : "request_failed";
 }
+
+function submitTextareaOnEnter(
+  event: ReactKeyboardEvent<HTMLTextAreaElement>,
+): void {
+  if (
+    event.key !== "Enter"
+    || event.shiftKey
+    || event.nativeEvent.isComposing
+  ) return;
+  event.preventDefault();
+  event.currentTarget.form?.requestSubmit();
+}
+
+const COMPANION_MESSAGE_PAGE_SIZE = 50;
 
 function openRequests(projection?: HumanCollaborationProjection): HumanRequestItem[] {
   return projection?.human_requests.items.filter((item) => item.status === "open") ?? [];
@@ -175,6 +189,10 @@ export function QuestCompanion({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [visibleMessageCount, setVisibleMessageCount] = useState(
+    COMPANION_MESSAGE_PAGE_SIZE,
+  );
+  const chatRef = useRef<HTMLDivElement>(null);
   const scopeRef = companion?.scope_ref ?? null;
   const requests = scopeRef
     ? openRequests(collaboration).filter((request) => Boolean(request.quest_ref)
@@ -186,6 +204,10 @@ export function QuestCompanion({
   const messages = scopeRef
     ? companion?.messages.filter((item) => item.scope_ref === scopeRef) ?? []
     : [];
+  const hiddenMessageCount = Math.max(0, messages.length - visibleMessageCount);
+  const visibleMessages = hiddenMessageCount
+    ? messages.slice(-visibleMessageCount)
+    : messages;
   const softConstraints = scopeRef
     ? companion?.soft_constraints.filter((item) => item.scope_ref === scopeRef) ?? []
     : [];
@@ -212,6 +234,19 @@ export function QuestCompanion({
     && currentBroadAuthorization.effective_decision !== "revoked"
     ? [currentBroadAuthorization]
     : [];
+
+  useEffect(() => {
+    setVisibleMessageCount(COMPANION_MESSAGE_PAGE_SIZE);
+  }, [scopeRef]);
+
+  const newestMessageRef = messages.at(-1)?.message_ref
+    ?? messages.at(-1)?.created_at
+    ?? messages.length;
+  useEffect(() => {
+    const chat = chatRef.current;
+    if (!chat) return;
+    chat.scrollTop = chat.scrollHeight;
+  }, [newestMessageRef, scopeRef]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const message = draft.trim();
@@ -243,21 +278,21 @@ export function QuestCompanion({
   return (
     <aside
       className="lumen-companion"
-      aria-label="Quest Companion"
+      aria-label="研究助手"
       data-shell-region="companion"
       tabIndex={0}
     >
       <header className="lumen-companion-head">
         <span className="lumen-orb" aria-hidden="true" />
         <div>
-          <b>Quest Companion</b>
+          <b>研究助手</b>
           <small>{questionContext
             ? `正在跟随 ${questionContext.question_ref}`
-            : "贯穿研究空间的高频入口"}</small>
+            : "随时询问正在发生的研究"}</small>
         </div>
-        <code>{ready ? "conversation · ready" : "capability_unavailable"}</code>
+        <code>{ready ? "可交流" : "暂不可用"}</code>
       </header>
-      <div className="lumen-chat" aria-live="polite">
+      <div ref={chatRef} className="lumen-chat" aria-live="polite">
         {questionContext ? (
           <article
             className="lumen-message lumen-question-context"
@@ -265,7 +300,7 @@ export function QuestCompanion({
           >
             <small>选中问题 · 只读上下文</small>
             <b>{questionContext.title ?? questionContext.question_ref}</b>
-            <p>{questionContext.unknown_statement ?? "公开 Projection 未提供 unknown statement。"}</p>
+            <p>{questionContext.unknown_statement ?? "这个问题暂时没有更多说明。"}</p>
           </article>
         ) : null}
         {attention ? (
@@ -278,7 +313,18 @@ export function QuestCompanion({
             </button>
           </article>
         ) : null}
-        {ready && messages.length ? messages.map((message, index) => (
+        {hiddenMessageCount ? (
+          <button
+            className="lumen-chat-history"
+            type="button"
+            onClick={() => setVisibleMessageCount((current) => (
+              current + COMPANION_MESSAGE_PAGE_SIZE
+            ))}
+          >
+            显示更早的 {Math.min(hiddenMessageCount, COMPANION_MESSAGE_PAGE_SIZE)} 条消息
+          </button>
+        ) : null}
+        {ready && visibleMessages.length ? visibleMessages.map((message, index) => (
           <article
             key={message.message_ref ?? `${message.role}-${index}`}
             className={`lumen-message ${message.role === "user" ? "me" : ""}`}
@@ -352,16 +398,18 @@ export function QuestCompanion({
       </div>
       <form className="lumen-compose" onSubmit={(event) => void submit(event)}>
         <div>
-          <input
-            aria-label="给 Quest Companion 发消息"
+          <textarea
+            aria-label="给研究助手发消息"
             disabled={!canSend || sending}
+            rows={1}
             placeholder={canSend
               ? "问为什么，或提出一个软约束……"
               : ready
                 ? "创建 Quest 后开始对话"
-                : "Quest Companion 尚未启用"}
+                : "研究助手尚未启用"}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={submitTextareaOnEnter}
           />
           <button
             type="submit"
@@ -371,7 +419,7 @@ export function QuestCompanion({
             ↑
           </button>
         </div>
-        <small>{error ? `发送失败 · ${error}` : "普通聊天不会被猜成硬命令"}</small>
+        <small>{error ? `发送失败 · ${error}` : "Enter 发送 · Shift+Enter 换行"}</small>
       </form>
     </aside>
   );
@@ -1166,26 +1214,46 @@ function ImpactPreview({ preview }: { preview: HumanRequestImpactPreview }) {
 
 export function HumanRequestSurface({
   open,
+  blocking,
   selectedRef,
   collaboration,
   onSelect,
+  onBeforeOpen,
   onClose,
   onChanged,
 }: {
   open: boolean;
+  blocking: boolean;
   selectedRef: string | null;
   collaboration?: HumanCollaborationProjection;
   onSelect: (requestRef: string | null) => void;
+  onBeforeOpen: () => void;
   onClose: () => void;
   onChanged: () => void;
 }) {
   const items = collaboration?.human_requests.items ?? [];
-  const selected = items.find((item) => item.request_ref === selectedRef) ?? null;
-  const dialogRef = useRef<HTMLElement>(null);
+  const currentItems = items.filter((item) => item.status === "open");
+  const requestedSelected = items.find(
+    (item) => item.request_ref === selectedRef,
+  ) ?? null;
+  const selected = blocking
+    ? currentItems.find((item) => item.request_ref === selectedRef)
+      ?? currentItems[0]
+      ?? null
+    : requestedSelected;
+  const queuePosition = selected
+    ? currentItems.findIndex((item) => item.request_ref === selected.request_ref) + 1
+    : 0;
+  const previousRequest = queuePosition > 1
+    ? currentItems[queuePosition - 2] ?? null
+    : null;
+  const nextRequest = queuePosition > 0 && queuePosition < currentItems.length
+    ? currentItems[queuePosition] ?? null
+    : null;
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const onCloseRef = useRef(onClose);
   const [orphanRecoveryAttempt, setOrphanRecoveryAttempt] = useState(0);
-  const currentRequestRefs = items
-    .filter((item) => item.status === "open")
-    .map((item) => item.request_ref);
+  const currentRequestRefs = currentItems.map((item) => item.request_ref);
   const currentRequestRefsKey = currentRequestRefs.join("\n");
 
   useEffect(() => {
@@ -1211,9 +1279,26 @@ export function HumanRequestSurface({
   }, [currentRequestRefsKey]);
 
   useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    onBeforeOpen();
+    if (!dialog.open) dialog.showModal();
+    return () => {
+      if (dialog.open) dialog.close();
+    };
+  }, [onBeforeOpen, open]);
+
+  useEffect(() => {
     if (!open) return;
     const backgrounds = Array.from(
-      document.querySelectorAll<HTMLElement>("[data-hc-background]"),
+      document.querySelectorAll<HTMLElement>(
+        "[data-hc-background]:not([data-hc-inert-owner])",
+      ),
     ).map((element) => ({ element, inert: element.inert }));
     const previousOverflow = document.body.style.overflow;
     backgrounds.forEach(({ element }) => {
@@ -1223,7 +1308,11 @@ export function HumanRequestSurface({
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
-      onClose();
+      if (blocking) {
+        event.stopImmediatePropagation();
+        return;
+      }
+      onCloseRef.current();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => {
@@ -1233,17 +1322,22 @@ export function HumanRequestSurface({
       });
       document.body.style.overflow = previousOverflow;
     };
-  }, [open]);
+  }, [blocking, open]);
 
   useEffect(() => {
     if (!open) return;
     const frame = window.requestAnimationFrame(() => {
-      dialogRef.current
-        ?.querySelector<HTMLButtonElement>(".hc-close")
-        ?.focus({ preventScroll: true });
+      const dialog = dialogRef.current;
+      const target = blocking
+        ? dialog?.querySelector<HTMLElement>(
+          "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), "
+          + "select:not([disabled]), summary, a[href]",
+        )
+        : dialog?.querySelector<HTMLElement>(".hc-close");
+      (target ?? dialog)?.focus({ preventScroll: true });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [open, selectedRef]);
+  }, [blocking, open, selectedRef]);
 
   const trapDialogFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key !== "Tab") return;
@@ -1276,23 +1370,27 @@ export function HumanRequestSurface({
   if (!open) return null;
 
   return (
-    <div
+    <dialog
+      ref={dialogRef}
       className="hc-backdrop"
       data-open="true"
+      data-blocking={blocking ? "true" : "false"}
+      aria-label={blocking ? "需要你处理的 HumanRequest" : "HumanRequest"}
+      tabIndex={-1}
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!blocking) onClose();
+      }}
+      onKeyDown={trapDialogFocus}
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (!blocking && event.target === event.currentTarget) onClose();
       }}
     >
       <section
-        ref={dialogRef}
         className={`hc-dialog ${selected?.kind === "library_reconnect"
           ? "hc-dialog-library"
           : ""}`}
-        role="dialog"
-        aria-modal="true"
-        aria-label="HumanRequest"
-        tabIndex={-1}
-        onKeyDown={trapDialogFocus}
+        data-blocking={blocking ? "true" : "false"}
       >
         {selected ? (
           <HumanRequestView
@@ -1302,12 +1400,28 @@ export function HumanRequestSurface({
             onBack={() => onSelect(null)}
             onClose={onClose}
             onChanged={onChanged}
+            blocking={blocking}
+            queuePosition={queuePosition}
+            queueSize={currentItems.length}
+            onPrevious={() => {
+              if (previousRequest) onSelect(previousRequest.request_ref);
+            }}
+            onNext={() => {
+              if (nextRequest) onSelect(nextRequest.request_ref);
+            }}
+            hasPrevious={previousRequest !== null}
+            hasNext={nextRequest !== null}
           />
         ) : (
-          <HumanRequestList items={items} onSelect={onSelect} onClose={onClose} />
+          <HumanRequestList
+            items={items}
+            onSelect={onSelect}
+            onClose={onClose}
+            blocking={blocking}
+          />
         )}
       </section>
-    </div>
+    </dialog>
   );
 }
 
@@ -1315,10 +1429,12 @@ function HumanRequestList({
   items,
   onSelect,
   onClose,
+  blocking,
 }: {
   items: HumanRequestItem[];
   onSelect: (requestRef: string) => void;
   onClose: () => void;
+  blocking: boolean;
 }) {
   const orderedKinds = Object.keys(requestCopy) as HumanRequestItem["kind"][];
   return (
@@ -1326,11 +1442,13 @@ function HumanRequestList({
       <header className="hc-head">
         <span className="hc-symbol" aria-hidden="true">!</span>
         <div>
-          <small>HUMAN WAITING PROJECTION</small>
+          <small>{blocking ? "NEEDS YOU · CURRENT REQUESTS" : "HUMAN WAITING PROJECTION"}</small>
           <h2>HumanRequest</h2>
           <p>每个请求只阻塞直接 waiter；人的回应仍需 Owner 验收。</p>
         </div>
-        <button type="button" className="hc-close" onClick={onClose} aria-label="关闭 HumanRequest">×</button>
+        {!blocking ? (
+          <button type="button" className="hc-close" onClick={onClose} aria-label="关闭 HumanRequest">×</button>
+        ) : null}
       </header>
       <main className="hc-list">
         {items.length ? orderedKinds.map((kind) => {
@@ -1370,12 +1488,26 @@ function HumanRequestView({
   onBack,
   onClose,
   onChanged,
+  blocking,
+  queuePosition,
+  queueSize,
+  onPrevious,
+  onNext,
+  hasPrevious,
+  hasNext,
 }: {
   request: HumanRequestItem;
   collaboration?: HumanCollaborationProjection;
   onBack: () => void;
   onClose: () => void;
   onChanged: () => void;
+  blocking: boolean;
+  queuePosition: number;
+  queueSize: number;
+  onPrevious: () => void;
+  onNext: () => void;
+  hasPrevious: boolean;
+  hasNext: boolean;
 }) {
   const copy = requestCopy[request.kind];
   const waiter = request.direct_waiters?.find((item) => item.status === "blocked")
@@ -1390,14 +1522,40 @@ function HumanRequestView({
       <header className="hc-head">
         <span className="hc-symbol" aria-hidden="true">↻</span>
         <div>
-          <small>{copy.eyebrow} · {scopeLabel(request)}</small>
+          <small>
+            {blocking
+              ? `NEEDS YOU · ${queuePosition} / ${queueSize} · ${copy.eyebrow}`
+              : `${copy.eyebrow} · ${scopeLabel(request)}`}
+          </small>
           <h2>{copy.title}</h2>
           <p>{request.obligation}</p>
         </div>
-        <div className="hc-head-actions">
-          <button type="button" onClick={onBack}>返回请求列表</button>
-          <button type="button" className="hc-close" onClick={onClose} aria-label="关闭 HumanRequest">×</button>
-        </div>
+        {blocking ? (
+          <nav className="hc-queue-nav" aria-label="当前 HumanRequest 队列">
+            <button
+              type="button"
+              disabled={!hasPrevious}
+              onClick={onPrevious}
+              aria-label="查看上一个 HumanRequest"
+            >
+              ← 上一个
+            </button>
+            <span><b>{queuePosition}</b> / {queueSize}</span>
+            <button
+              type="button"
+              disabled={!hasNext}
+              onClick={onNext}
+              aria-label="查看下一个 HumanRequest"
+            >
+              下一个 →
+            </button>
+          </nav>
+        ) : (
+          <div className="hc-head-actions">
+            <button type="button" onClick={onBack}>返回请求列表</button>
+            <button type="button" className="hc-close" onClick={onClose} aria-label="关闭 HumanRequest">×</button>
+          </div>
+        )}
       </header>
       <div className="hc-request-workspace">
         <main className="hc-request-core">
@@ -1577,6 +1735,7 @@ function IntentDraftingSession({
               placeholder={requestCopy[request.kind].draftPlaceholder}
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={submitTextareaOnEnter}
               disabled={sending}
             />
             <button
@@ -1586,7 +1745,7 @@ function IntentDraftingSession({
             >↑</button>
           </span>
         </label>
-        <small>{error ? `发送失败 · ${error}` : `${draft.length} 字 · session draft`}</small>
+        <small>{error ? `发送失败 · ${error}` : `${draft.length} 字 · Enter 发送 · Shift+Enter 换行`}</small>
       </form>
       <div className="hc-draft-status">Drafting Session 不会提交、满足或拒绝左侧 HumanRequest。</div>
       <div className="hc-draft-boundary">聊天帮助解释状态和形成草案；只有左侧明确提交才形成 HumanRequestResponse。</div>

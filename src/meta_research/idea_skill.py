@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import platform
@@ -17,8 +18,20 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Callable, Protocol, cast
 
+from meta_research.codex_child_review import (
+    CodexChildReviewEvidenceError,
+    SealedReviewOperationEvidence,
+    TrustedChildReviewRequest,
+    TrustedChildReviewVerifier,
+    VerifiedChildReviewProof,
+)
+from meta_research.codex_ledger import (
+    CodexHomeLedgerReader,
+    CodexSessionLedgerReader,
+)
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
+    CODEX_REASONING_EFFORT,
     CODEX_REASONING_EFFORT_BINDING,
     CODEX_REASONING_EFFORT_CONFIG,
 )
@@ -39,7 +52,6 @@ from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES,
     ProviderSupervisorError,
-    SUPERVISOR_REQUEST_SCHEMA,
     ensure_transport_key,
     read_transport_envelope,
     read_transport_key_for_operation,
@@ -51,7 +63,21 @@ from meta_research.provider_supervisor import (
     write_supervisor_request,
     write_supervisor_stop_request,
 )
+from meta_research.root_capabilities import (
+    CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS,
+    RootAgentKind,
+    RootCapabilityEntryPath,
+    codex_feature_diagnostics,
+    merge_root_capability_bindings,
+    project_codex_post_turn_diagnostics,
+    root_capability_profile,
+)
+from meta_research.root_operation_diagnostics import (
+    RootOperationDiagnosticRecorder,
+    root_operation_diagnostic_ref,
+)
 from meta_research.quest_drafting import (
+    CODEX_DRAFTING_LOCKED_VERSION,
     PROVIDER_RESULT_MAX_BYTES,
     PROVIDER_STREAM_MAX_BYTES,
     _CancellableProcessRunner,
@@ -60,20 +86,18 @@ from meta_research.quest_drafting import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 _DISABLED_CODEX_FEATURES = (
     "apps",
     "browser_use",
     "computer_use",
     "image_generation",
     "memories",
-    "plugins",
-    "remote_plugin",
 )
 _SEMANTIC_MCP_TOKEN_ENV = "META_RESEARCH_MCP_TOKEN"
-_CODEX_PROVIDER_OPERATION_SCHEMA = "meta-research/codex-provider-operation/v2"
-_LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA = (
-    "meta-research/codex-provider-operation/v1"
-)
+_CODEX_PROVIDER_OPERATION_SCHEMA = "meta-research/codex-provider-operation/v3"
 _COMPLETION_ENVELOPE_MAX_BYTES = 64 * 1024
 _CODEX_ROOT_OUTPUT_KEY = "provider_output"
 _CODEX_JSON_OBJECT_STRING_MARKER = (
@@ -121,9 +145,23 @@ _JSON_OBJECT_LIMIT_FIELDS = frozenset(
 )
 _CHILD_REVIEW_TRACE_FAILURES = frozenset(
     {
+        "codex_child_review_causal_order_invalid",
+        "codex_child_review_child_ledger_invalid",
+        "codex_child_review_child_runtime_invalid",
+        "codex_child_review_delivery_invalid",
+        "codex_child_review_hash_mismatch",
+        "codex_child_review_lineage_invalid",
+        "codex_child_review_operation_invalid",
+        "codex_child_review_request_invalid",
+        "codex_child_review_root_ledger_invalid",
+        "codex_child_review_root_runtime_invalid",
         "codex_child_review_spawn_invalid",
         "codex_child_review_ref_mismatch",
+        "codex_child_review_stdout_identity_mismatch",
+        "codex_child_review_stdout_invalid",
         "codex_child_review_task_mismatch",
+        "codex_child_review_terminal_invalid",
+        "codex_child_review_turn_invalid",
         "codex_child_review_wait_invalid",
         "codex_child_review_result_missing",
     }
@@ -715,7 +753,7 @@ class IdeaSkillResult:
     dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
-    reviewer_agent_ref: str
+    reviewer_agent_ref: str | None
     adapter_kind: str
 
 
@@ -790,17 +828,14 @@ def validate_idea_skill_result(
         ("context_pack_ref", request.context_pack_ref),
         ("root_session_ref", request.root_session_ref),
         ("primary_session_ref", result.primary_session_ref),
-        ("reviewer_agent_ref", result.reviewer_agent_ref),
         ("adapter_kind", result.adapter_kind),
     ):
         _require_text(value, label)
-    if result.review_mode != "harness_child_agent":
+    if (
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
+    ):
         raise IdeaSkillContractError("idea_review_mode_invalid")
-    if result.reviewer_agent_ref in {
-        request.root_session_ref,
-        result.primary_session_ref,
-    }:
-        raise IdeaSkillContractError("idea_review_not_independent")
     if request.native_session_ref is not None and (
         result.primary_session_ref != request.native_session_ref
     ):
@@ -842,7 +877,7 @@ def validate_idea_skill_result(
         "findings": list(result.findings),
         "dispositions": list(result.dispositions),
         "final_outcome_hash": outcome_hash,
-        "independent": True,
+        "independent": False,
         "advisory_only": True,
     }
     review_hash = validate_advisory_review(review_payload, outcome_hash=outcome_hash)
@@ -863,7 +898,7 @@ def review_record(
         "findings": list(result.findings),
         "dispositions": list(result.dispositions),
         "final_outcome_hash": outcome_hash,
-        "independent": True,
+        "independent": False,
         "advisory_only": True,
     }
 
@@ -874,13 +909,14 @@ def _require_text(value: object, label: str) -> None:
 
 
 class CodexIdeaSkillAdapter:
-    """Production Adapter: one root Codex Session plus an independent reviewer.
+    """Production Adapter: one root Codex Session with advisory finalization.
 
     It receives immutable data and returns a schema-constrained candidate/review.
     It has no Owner Interface and cannot create receipts or advance a Stage.
     """
 
     _sandbox_mode = "danger-full-access"
+    _root_agent_kind: RootAgentKind = "idea"
     _shell_environment_inherit: str | None = None
     _web_search_mode = "live"
     _reconciliation_operation_names = ("primary", "review")
@@ -909,11 +945,13 @@ class CodexIdeaSkillAdapter:
         *,
         executable: str = "codex",
         model_ref: str = CODEX_MODEL_REF,
-        timeout_seconds: float = 15 * 60,
+        timeout_seconds: float | None = None,
         process_runner: Callable[
-            [list[str], str, float], subprocess.CompletedProcess[str]
+            [list[str], str, float | None], subprocess.CompletedProcess[str]
         ]
         | None = None,
+        codex_ledger_reader: CodexSessionLedgerReader | None = None,
+        codex_home: Path | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
@@ -923,6 +961,246 @@ class CodexIdeaSkillAdapter:
         self._model_ref = model_ref
         self._timeout_seconds = timeout_seconds
         self._runner = process_runner or _CancellableProcessRunner()
+        self._codex_ledger_reader = codex_ledger_reader
+        if self._codex_ledger_reader is None and codex_home is not None:
+            self._codex_ledger_reader = CodexHomeLedgerReader(codex_home)
+        self._child_review_verifier = (
+            TrustedChildReviewVerifier(self._codex_ledger_reader)
+            if self._codex_ledger_reader is not None
+            else None
+        )
+        self._child_review_evidence_mode = (
+            "trusted-codex-ledger-v1"
+            if self._child_review_verifier is not None
+            else "sealed-stdout-compat-v1"
+        )
+        self._root_operation_diagnostic_recorder: (
+            RootOperationDiagnosticRecorder | None
+        ) = None
+
+    def bind_root_operation_diagnostics_recorder(
+        self, recorder: RootOperationDiagnosticRecorder
+    ) -> None:
+        self._root_operation_diagnostic_recorder = recorder
+
+    def _provider_wall_clock_binding(self) -> str:
+        """Describe the exceptional deadline policy without inventing one."""
+
+        if self._timeout_seconds is None:
+            return "provider-timeout-seconds:none"
+        return "provider-timeout-seconds:" + format(
+            self._timeout_seconds, ".17g"
+        )
+
+    def _root_capability_diagnostics(
+        self,
+        *,
+        entry_path: RootCapabilityEntryPath,
+        authorized_operation_ids: tuple[str, ...] = (),
+        semantic_mcp_available: bool = False,
+    ) -> dict[str, object]:
+        """Probe effective Codex features when the real runner supports it."""
+
+        profile = root_capability_profile(self._root_agent_kind)
+        feature_output: str | None = None
+        run_command = getattr(self._runner, "run_command", None)
+        if callable(run_command):
+            argv = [
+                self._executable,
+                *profile.codex_arguments(entry_path=entry_path),
+                "features",
+                "list",
+            ]
+            try:
+                completed = run_command(
+                    argv, CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS
+                )
+            except Exception:
+                # Feature inventory is diagnostic-only. The provider turn owns
+                # its own typed launch/stop failure and must still be attempted.
+                LOGGER.warning(
+                    "Codex feature inventory probe unavailable",
+                    exc_info=True,
+                    extra={"root_kind": self._root_agent_kind},
+                )
+            else:
+                if completed.returncode == 0 and len(completed.stdout) <= 64 * 1024:
+                    feature_output = completed.stdout
+        return codex_feature_diagnostics(
+            profile=profile,
+            entry_path=entry_path,
+            provider_version=CODEX_DRAFTING_LOCKED_VERSION,
+            feature_output=feature_output,
+            authorized_operation_ids=authorized_operation_ids,
+            semantic_mcp_available=semantic_mcp_available,
+        )
+
+    def _record_root_operation_diagnostics(
+        self,
+        *,
+        source_ref: str,
+        phase: str,
+        pre_turn: object,
+        stdout: str,
+        semantic_mcp_available: bool,
+    ) -> None:
+        recorder = self._root_operation_diagnostic_recorder
+        if recorder is None:
+            return
+        try:
+            diagnostics = project_codex_post_turn_diagnostics(
+                pre_turn,
+                stdout,
+                semantic_mcp_available=semantic_mcp_available,
+            )
+            recorder.record(
+                operation_ref=root_operation_diagnostic_ref(
+                    self._root_agent_kind,
+                    source_ref=source_ref,
+                    phase=phase,
+                ),
+                root_kind=self._root_agent_kind,
+                diagnostics=diagnostics,
+            )
+        except Exception:
+            # This is a diagnostic-only projection. Storage/projection failure
+            # must never change provider identity or a Stage/Owner outcome.
+            LOGGER.warning(
+                "root operation diagnostic projection failed",
+                exc_info=True,
+                extra={"root_kind": self._root_agent_kind},
+            )
+            return
+
+    def _verify_child_review(
+        self,
+        stdout: str,
+        *,
+        job_ref: str | None,
+        operation_name: str,
+        root_session_ref: str,
+        reviewer_agent_ref: str,
+        structured_result: dict[str, object],
+        expected_spawn_message: str | None = None,
+    ) -> VerifiedChildReviewProof | None:
+        """Verify one fresh reviewer without treating lossy stdout as truth."""
+
+        if self._child_review_verifier is None:
+            _verify_child_review_trace(
+                stdout,
+                root_session_ref=root_session_ref,
+                reviewer_agent_ref=reviewer_agent_ref,
+                expected_spawn_prompt=(
+                    expected_spawn_message
+                    if _stdout_child_review_spawn_prompt_visible(stdout)
+                    else None
+                ),
+            )
+            return None
+        if job_ref is None:
+            raise IdeaSkillUnavailable("codex_child_review_operation_invalid")
+        try:
+            operation = self._sealed_review_operation_evidence(
+                job_ref=job_ref,
+                operation_name=operation_name,
+                root_session_ref=root_session_ref,
+            )
+            if operation.stdout != stdout:
+                raise CodexChildReviewEvidenceError(
+                    "codex_child_review_hash_mismatch"
+                )
+            return self._child_review_verifier.verify(
+                TrustedChildReviewRequest(
+                    root_session_ref=root_session_ref,
+                    expected_working_directory=str(
+                        self._agent_workspace.absolute()
+                    ),
+                    expected_cli_version=CODEX_DRAFTING_LOCKED_VERSION,
+                    expected_model_ref=self._model_ref,
+                    expected_reasoning_effort=CODEX_REASONING_EFFORT,
+                    expected_sandbox_mode=self._sandbox_mode,
+                    expected_multi_agent_version="v2",
+                    reviewer_agent_ref=reviewer_agent_ref,
+                    structured_result=structured_result,
+                    operation=operation,
+                    expected_spawn_message=expected_spawn_message,
+                )
+            )
+        except CodexChildReviewEvidenceError as error:
+            raise IdeaSkillUnavailable(error.code) from error
+
+    def _sealed_review_operation_evidence(
+        self,
+        *,
+        job_ref: str,
+        operation_name: str,
+        root_session_ref: str,
+    ) -> SealedReviewOperationEvidence:
+        directory = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": job_ref})
+            / operation_name
+        )
+        try:
+            _key_path, transport_key = self._transport_key()
+            invocation = read_transport_envelope(
+                directory / "invocation.json", transport_key
+            )
+            if not isinstance(invocation, dict):
+                raise ValueError("review invocation")
+            invocation_hash = canonical_hash(invocation)
+            transport_limits = _operation_transport_limits(invocation)
+            if (
+                invocation.get("job_ref") != job_ref
+                or invocation.get("operation_name") != operation_name
+                or invocation.get("native_session_ref") != root_session_ref
+                or invocation.get("model_ref") != self._model_ref
+            ):
+                raise ValueError("review invocation identity")
+            result, recovered_session, stdout = _read_completed_operation(
+                directory,
+                invocation_hash=invocation_hash,
+                native_session_ref=root_session_ref,
+                transport_limits=transport_limits,
+            )
+            prompt = _read_spool_text(
+                directory / "prompt.txt", transport_limits.prompt_max_bytes
+            )
+            result_text = _read_idea_result(
+                directory / "last-message.json",
+                result_max_bytes=transport_limits.result_max_bytes,
+            )
+            exit_marker = _verified_success_exit(
+                directory, invocation_hash=invocation_hash
+            )
+            if (
+                recovered_session != root_session_ref
+                or invocation.get("prompt_hash") != canonical_hash(prompt)
+            ):
+                raise ValueError("review operation identity")
+            return SealedReviewOperationEvidence(
+                invocation_hash=invocation_hash,
+                prompt=prompt,
+                stdout=stdout,
+                result_text=result_text,
+                result=result,
+                exit_marker=exit_marker,
+                stdout_hash=canonical_hash(stdout),
+                result_hash=canonical_hash(result),
+                exit_hash=canonical_hash(exit_marker),
+            )
+        except (
+            IdeaSkillUnavailable,
+            OSError,
+            ProviderSupervisorError,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+        ) as error:
+            raise CodexChildReviewEvidenceError(
+                "codex_child_review_operation_invalid"
+            ) from error
 
     def request_stop(self) -> None:
         request_stop = getattr(self._runner, "request_stop", None)
@@ -952,7 +1230,11 @@ class CodexIdeaSkillAdapter:
                 invocation = read_transport_envelope(
                     invocation_path, transport_key
                 )
-                if invocation.get("job_ref") != job_ref:
+                if (
+                    invocation.get("schema_ref")
+                    != _CODEX_PROVIDER_OPERATION_SCHEMA
+                    or invocation.get("job_ref") != job_ref
+                ):
                     raise ProviderSupervisorError(
                         "provider_supervisor_stop_invalid"
                     )
@@ -1000,10 +1282,6 @@ class CodexIdeaSkillAdapter:
                     continue
                 invocation = read_transport_envelope(invocation_path, key)
                 transport_limits = _operation_transport_limits(invocation)
-                legacy_operation = (
-                    invocation.get("schema_ref")
-                    == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA
-                )
                 expected_fields = {
                     "schema_ref",
                     "job_ref",
@@ -1015,20 +1293,14 @@ class CodexIdeaSkillAdapter:
                     "mcp_url",
                     "mcp_scope_binding_hash",
                     "transport_mode",
+                    *transport_limits.as_dict(),
+                    "root_capability_profile",
+                    "root_capability_profile_hash",
                 }
-                if legacy_operation:
-                    expected_fields.difference_update(
-                        {"mcp_url", "mcp_scope_binding_hash"}
-                    )
-                else:
-                    expected_fields.update(transport_limits.as_dict())
                 if (
                     set(invocation) != expected_fields
                     or invocation.get("schema_ref")
-                    not in {
-                        _CODEX_PROVIDER_OPERATION_SCHEMA,
-                        _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA,
-                    }
+                    != _CODEX_PROVIDER_OPERATION_SCHEMA
                     or invocation.get("job_ref") != job_ref
                     or invocation.get("operation_name") != operation_name
                 ):
@@ -1050,11 +1322,7 @@ class CodexIdeaSkillAdapter:
                             directory,
                             key=key,
                             invocation_hash=invocation_hash,
-                            request_schema=(
-                                SUPERVISOR_REQUEST_SCHEMA
-                                if legacy_operation
-                                else CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
-                            ),
+                            request_schema=CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
                         ):
                             return False
                         continue
@@ -1097,7 +1365,7 @@ class CodexIdeaSkillAdapter:
             "outcome-envelope-template": _outcome_envelope_schema(
                 "__question_ref__", "__context_pack_ref__"
             ),
-            "child-review-finalization-template": _review_finalization_schema(
+            "advisory-finalization-template": _review_finalization_schema(
                 "__question_ref__",
                 "__context_pack_ref__",
             ),
@@ -1118,17 +1386,17 @@ class CodexIdeaSkillAdapter:
             model_ref=self._model_ref,
             harness_adapter_ref=harness_ref,
             mcp_bindings=(),
-            capability_bindings=(
-                "approval-policy-never",
-                "filesystem-danger-full-access",
-                "global-config-ignored",
-                "harness-child-agent-review",
-                "mcp-config-empty",
-                "native-session-resume",
-                "shell-tool-enabled",
-                "structured-output-json-schema",
-                "trusted-local-quest-authorization",
-                "web-search-live",
+            capability_bindings=merge_root_capability_bindings(
+                (
+                    "approval-policy-never",
+                    "filesystem-danger-full-access",
+                    "user-config-loaded",
+                    "mcp-config-empty",
+                    "native-session-resume",
+                    "structured-output-json-schema",
+                    "trusted-local-quest-authorization",
+                ),
+                self._root_agent_kind,
             ),
             resource_bindings=tuple(
                 f"package:meta_research.skills.idea_stage/{name}@sha256:"
@@ -1155,8 +1423,7 @@ class CodexIdeaSkillAdapter:
                 "provider-output-limits:"
                 f"stream={PROVIDER_STREAM_MAX_BYTES};"
                 f"result={PROVIDER_RESULT_MAX_BYTES}",
-                "provider-timeout-seconds:"
-                + format(self._timeout_seconds, ".17g"),
+                self._provider_wall_clock_binding(),
                 "runtime-policy:trusted-local-broad/v1",
                 "sandbox-policy:danger-full-access",
                 "transport-seal-key:sha256:"
@@ -1269,7 +1536,6 @@ class CodexIdeaSkillAdapter:
             )
             if not isinstance(invocation, dict):
                 raise IdeaSkillUnavailable("codex_operation_spool_invalid")
-            schema_ref = invocation.get("schema_ref")
             transport_limits = _operation_transport_limits(invocation)
             expected_fields = {
                 "schema_ref",
@@ -1282,15 +1548,14 @@ class CodexIdeaSkillAdapter:
                 "mcp_url",
                 "mcp_scope_binding_hash",
                 "transport_mode",
+                "root_capability_profile",
+                "root_capability_profile_hash",
                 *transport_limits.as_dict(),
             }
-            if schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA:
-                expected_fields.difference_update(
-                    {"mcp_url", "mcp_scope_binding_hash"}
-                )
-                expected_fields.difference_update(transport_limits.as_dict())
             if (
                 set(invocation) != expected_fields
+                or invocation.get("schema_ref")
+                != _CODEX_PROVIDER_OPERATION_SCHEMA
                 or invocation.get("job_ref") != job_ref
                 or invocation.get("operation_name") != operation_name
                 or invocation.get("native_session_ref") != native_session_ref
@@ -1385,9 +1650,8 @@ class CodexIdeaSkillAdapter:
             )
         primary_prompt = (
             f"{skill}\n\n"
-            "本回合仅执行 Primary draft phase。禁止调用 spawn_agent 或 wait，禁止委派 "
-            "child、独立评审或预先处理 review；必须先返回 frozen draft。独立评审只能在 "
-            "Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
+            "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
+            "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是 Idea 主 Agent。只返回 {\"outcome\": ...}，其中 outcome 是一个完整 "
             "IdeaSet 或 NoViableCandidate。"
             "不得创建 Question、Plan、Run、receipt、selected Idea 或 StageCommit。"
@@ -1411,21 +1675,9 @@ class CodexIdeaSkillAdapter:
         )
         if primary_session is None:
             raise IdeaSkillUnavailable("codex_primary_session_missing")
-        try:
-            _verify_primary_phase_trace(_primary_stdout)
-        except IdeaSkillUnavailable as error:
-            if request.job_ref is None:
-                raise
-            raise IdeaSkillUnavailable(
-                error.code,
-                recovery_checkpoint=self.terminal_contract_failure_checkpoint(
-                    job_ref=request.job_ref,
-                    operation_name="primary",
-                    native_session_ref=primary_session,
-                    failure_code=error.code,
-                    detail_code=error.code,
-                ),
-            ) from error
+        # Child/tool trace is diagnostic provenance, not part of the Idea
+        # artifact contract.  A sealed, structurally valid draft must remain
+        # usable even when the Harness omits or reshapes collaboration events.
         draft_value = primary_output.get("outcome")
         if not isinstance(draft_value, dict):
             raise self._sealed_result_failure(
@@ -1449,30 +1701,24 @@ class CodexIdeaSkillAdapter:
         if request.native_session_ref != draft.primary_session_ref:
             raise IdeaSkillUnavailable("codex_primary_session_changed")
         skill = _idea_skill_instructions()
-
         reviewer_prompt = (
             f"{skill}\n\n"
-            "本回合是 Review phase。必须针对下方当前 frozen reviewed_draft 现在新建一个 "
-            "child reviewer；不得复用 Primary phase、任何先前 child 或先前评审结论。"
-            "你仍是根 Idea Agent。必须把独立 advisory reviewer 委派给 Harness：在当前 "
-            "managed native Session 内使用 Harness "
-            "原生 spawn_agent 能力以 fork_turns=\"none\" 启动一个全新上下文的短命 child "
-            "reviewer，并 wait 到它完成；Claude Code 使用等价的全新上下文 "
-            "subagent。不要另开、"
-            "持久化或管理第二个顶层 Codex Session。child reviewer 只检查 Question 对齐、"
-            "实质重复、证据边界、可证伪性与 Plan 可用性，不批准 Outcome、不评分、"
-            "不选择 winner。根 Idea Agent 必须根据 child findings 逐条给出 revised | "
+            "本回合是同一个根 Idea Agent 的 Review phase。针对下方 exact frozen "
+            "reviewed_draft，重新检查 Question 对齐、实质重复、证据边界、可证伪性与 "
+            "Plan 可用性；这次 advisory finalization 不批准 Outcome、不评分、不选择 "
+            "winner，也不调用 Owner 写入。必须形成 bounded findings，并对每条 finding "
+            "逐条给出 revised | "
             "not_adopted disposition，并在同一个 resumed turn 返回最终完整 Outcome。"
             "revised 必须实际改变 Outcome；没有 finding 时返回空 findings/dispositions。"
-            "只返回 reviewer_agent_ref、findings、final_outcome、dispositions。不得声称 "
-            "reviewer 或根 Agent 拥有 Owner 接纳权。\n"
+            "只返回 findings、final_outcome、dispositions。不得声称根 Agent 拥有 Owner "
+            "接纳权。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"question_ref={request.question_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"question={canonical_json(request.accepted_question_content)}\n"
             f"reviewed_draft={canonical_json(draft.draft)}"
         )
-        reviewed, resumed_session, review_stdout = self._invoke(
+        reviewed, resumed_session, _review_stdout = self._invoke(
             operation_name="review",
             prompt=reviewer_prompt,
             schema=_review_finalization_schema(
@@ -1483,14 +1729,11 @@ class CodexIdeaSkillAdapter:
         )
         if resumed_session != draft.primary_session_ref:
             raise IdeaSkillUnavailable("codex_primary_session_changed")
-        reviewer_agent_ref = reviewed.get("reviewer_agent_ref")
         findings_value = reviewed.get("findings")
         final_value = reviewed.get("final_outcome")
         disposition_value = reviewed.get("dispositions")
         if (
-            not isinstance(reviewer_agent_ref, str)
-            or not reviewer_agent_ref
-            or not isinstance(findings_value, list)
+            not isinstance(findings_value, list)
             or not isinstance(final_value, dict)
             or not isinstance(disposition_value, list)
         ):
@@ -1501,27 +1744,9 @@ class CodexIdeaSkillAdapter:
                 failure_code="idea_review_result_contract_invalid",
                 detail_code="codex_review_invalid",
             )
-        try:
-            _verify_child_review_trace(
-                review_stdout,
-                root_session_ref=draft.primary_session_ref,
-                reviewer_agent_ref=reviewer_agent_ref,
-            )
-        except IdeaSkillUnavailable as error:
-            if request.job_ref is None or error.code not in (
-                _CHILD_REVIEW_TRACE_FAILURES
-            ):
-                raise
-            raise IdeaSkillUnavailable(
-                error.code,
-                recovery_checkpoint=self.terminal_contract_failure_checkpoint(
-                    job_ref=request.job_ref,
-                    operation_name="review",
-                    native_session_ref=draft.primary_session_ref,
-                    failure_code=error.code,
-                    detail_code=error.code,
-                ),
-            ) from error
+        # The structured result remains contract-validated below.  The sealed
+        # stdout/ledger and verifier remain available for diagnostics, but are
+        # deliberately not an acceptance gate.
         findings = tuple(cast(dict[str, str], item) for item in findings_value)
         dispositions = tuple(
             cast(dict[str, str], item) for item in disposition_value
@@ -1533,8 +1758,8 @@ class CodexIdeaSkillAdapter:
             findings=findings,
             dispositions=dispositions,
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=reviewer_agent_ref,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
         return result
@@ -1580,8 +1805,13 @@ class CodexIdeaSkillAdapter:
         mcp_url: str | None = None,
         mcp_token: str | None = None,
         mcp_scope_binding_hash: str | None = None,
+        semantic_mcp_protected_environment: bool = False,
+        authorized_operation_ids: tuple[str, ...] = (),
         sandbox_read_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
+        entry_path: RootCapabilityEntryPath = (
+            "resume" if native_session_ref is not None else "initial"
+        )
         raw_schema = schema
         if isinstance(raw_schema.get("oneOf"), list):
             prompt = (
@@ -1622,14 +1852,23 @@ class CodexIdeaSkillAdapter:
                 mcp_url=mcp_url,
                 mcp_token=mcp_token,
                 mcp_scope_binding_hash=mcp_scope_binding_hash,
+                semantic_mcp_protected_environment=(
+                    semantic_mcp_protected_environment
+                ),
+                authorized_operation_ids=authorized_operation_ids,
                 sandbox_read_root=sandbox_read_root,
                 transport_limits=transport_limits,
             )
         else:
+            pre_turn_diagnostics = self._root_capability_diagnostics(
+                entry_path=entry_path,
+                authorized_operation_ids=authorized_operation_ids,
+                semantic_mcp_available=False,
+            )
             with tempfile.TemporaryDirectory(
                 prefix="idea-provider-", dir=self._workspace
             ) as raw_directory:
-                result = self._invoke_once(
+                invoked = self._invoke_once(
                     directory=Path(raw_directory),
                     prompt=prompt,
                     schema=schema,
@@ -1637,13 +1876,30 @@ class CodexIdeaSkillAdapter:
                     job_ref=None,
                     stdout_path=None,
                     invocation_hash=None,
-                    supervisor_request_schema=CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
                     mcp_url=mcp_url,
                     mcp_token=mcp_token,
                     mcp_scope_binding_hash=mcp_scope_binding_hash,
+                    semantic_mcp_protected_environment=(
+                        semantic_mcp_protected_environment
+                    ),
                     sandbox_read_root=sandbox_read_root,
                     transport_limits=transport_limits,
                 )
+                result = (*invoked, pre_turn_diagnostics)
+        self._record_root_operation_diagnostics(
+            source_ref=(
+                job_ref
+                if job_ref is not None
+                else (
+                    f"native-session:{result[1]}:prompt:"
+                    + canonical_hash(prompt)
+                )
+            ),
+            phase=operation_name,
+            pre_turn=result[3],
+            stdout=result[2],
+            semantic_mcp_available=mcp_url is not None,
+        )
         try:
             unwrapped = _unwrap_codex_root_output(result[0], raw_schema)
             decoded = _decode_codex_provider_output(unwrapped, raw_schema)
@@ -1667,10 +1923,21 @@ class CodexIdeaSkillAdapter:
         mcp_url: str | None,
         mcp_token: str | None,
         mcp_scope_binding_hash: str | None,
+        semantic_mcp_protected_environment: bool,
+        authorized_operation_ids: tuple[str, ...],
         sandbox_read_root: Path | None,
         transport_limits: ProviderTransportLimits,
-    ) -> tuple[dict[str, object], str | None, str]:
+    ) -> tuple[dict[str, object], str | None, str, dict[str, object]]:
         directory.mkdir(parents=True, exist_ok=True)
+        capability_profile = root_capability_profile(self._root_agent_kind)
+        entry_path: RootCapabilityEntryPath = (
+            "resume" if native_session_ref is not None else "initial"
+        )
+        diagnostics_for_projection = self._root_capability_diagnostics(
+            entry_path=entry_path,
+            authorized_operation_ids=authorized_operation_ids,
+            semantic_mcp_available=False,
+        )
         invocation_base = {
             "schema_ref": _CODEX_PROVIDER_OPERATION_SCHEMA,
             "job_ref": job_ref,
@@ -1679,6 +1946,8 @@ class CodexIdeaSkillAdapter:
             "output_schema_hash": canonical_hash(schema),
             "native_session_ref": native_session_ref,
             "model_ref": self._model_ref,
+            "root_capability_profile": capability_profile.as_dict(),
+            "root_capability_profile_hash": capability_profile.digest,
             "mcp_url": mcp_url,
             "mcp_scope_binding_hash": mcp_scope_binding_hash,
             **transport_limits.as_dict(),
@@ -1695,7 +1964,6 @@ class CodexIdeaSkillAdapter:
         _key_path, transport_key = self._transport_key()
         invocation_json = _sealed_operation_invocation(invocation, transport_key)
         invocation_hash = canonical_hash(invocation)
-        supervisor_request_schema = CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
         invocation_path = directory / "invocation.json"
         if not invocation_path.exists() and any(directory.iterdir()):
             raise IdeaSkillUnavailable("codex_operation_spool_invalid")
@@ -1709,14 +1977,10 @@ class CodexIdeaSkillAdapter:
             persisted_transport_mode = cast(
                 str, persisted_invocation["transport_mode"]
             )
+            invocation = persisted_invocation
             transport_limits = _operation_transport_limits(
                 persisted_invocation
             )
-            if (
-                persisted_invocation.get("schema_ref")
-                == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA
-            ):
-                supervisor_request_schema = SUPERVISOR_REQUEST_SCHEMA
             _validate_provider_inputs(
                 prompt,
                 schema,
@@ -1736,12 +2000,17 @@ class CodexIdeaSkillAdapter:
                 path.exists() for path in effect_files
             ):
                 try:
-                    return _read_completed_operation(
+                    completed = _read_completed_operation(
                         directory,
                         invocation_hash=invocation_hash,
                         native_session_ref=native_session_ref,
                         transport_limits=transport_limits,
                     )
+                    if not isinstance(diagnostics_for_projection, dict):
+                        raise IdeaSkillUnavailable(
+                            "codex_operation_spool_invalid"
+                        )
+                    return (*completed, diagnostics_for_projection)
                 except IdeaSkillUnavailable as error:
                     if error.code in _SEALED_TRANSPORT_CONTRACT_FAILURES:
                         raise self._sealed_transport_contract_failure(
@@ -1766,10 +2035,12 @@ class CodexIdeaSkillAdapter:
                 job_ref=job_ref,
                 stdout_path=directory / "stdout.jsonl",
                 invocation_hash=invocation_hash,
-                supervisor_request_schema=supervisor_request_schema,
                 mcp_url=mcp_url,
                 mcp_token=mcp_token,
                 mcp_scope_binding_hash=mcp_scope_binding_hash,
+                semantic_mcp_protected_environment=(
+                    semantic_mcp_protected_environment
+                ),
                 sandbox_read_root=sandbox_read_root,
                 transport_limits=transport_limits,
             )
@@ -1792,7 +2063,9 @@ class CodexIdeaSkillAdapter:
             native_session_ref=result[1],
             transport_limits=transport_limits,
         )
-        return result
+        if not isinstance(diagnostics_for_projection, dict):
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+        return (*result, diagnostics_for_projection)
 
     def _invoke_once(
         self,
@@ -1805,10 +2078,10 @@ class CodexIdeaSkillAdapter:
         stdout_path: Path | None,
         invocation_hash: str | None,
         transport_limits: ProviderTransportLimits,
-        supervisor_request_schema: str,
         mcp_url: str | None = None,
         mcp_token: str | None = None,
         mcp_scope_binding_hash: str | None = None,
+        semantic_mcp_protected_environment: bool = False,
         sandbox_read_root: Path | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         mcp_values = (mcp_url, mcp_token, mcp_scope_binding_hash)
@@ -1818,6 +2091,12 @@ class CodexIdeaSkillAdapter:
         ):
             raise IdeaSkillUnavailable("semantic_mcp_invocation_invalid")
         semantic_mcp_enabled = all(value is not None for value in mcp_values)
+        if (
+            type(semantic_mcp_protected_environment) is not bool
+            or semantic_mcp_protected_environment
+            and not semantic_mcp_enabled
+        ):
+            raise IdeaSkillUnavailable("semantic_mcp_invocation_invalid")
         directory.mkdir(parents=True, exist_ok=True)
         schema_path = directory / "output-schema.json"
         result_path = directory / "last-message.json"
@@ -1827,14 +2106,15 @@ class CodexIdeaSkillAdapter:
                 raise IdeaSkillUnavailable("codex_operation_identity_conflict")
         else:
             _write_durable(schema_path, schema_json)
+        # The authenticated effect channel is owned by the current operation
+        # tree. Root reconnects and native children share it, while shell
+        # subprocesses do not inherit the bearer environment.
+        capability_profile = root_capability_profile(self._root_agent_kind)
         argv = [
             self._executable,
             "exec",
-            "--enable",
-            "multi_agent",
+            *capability_profile.codex_arguments(),
             "--skip-git-repo-check",
-            "--ignore-user-config",
-            "--ignore-rules",
             "--strict-config",
             "--config",
             "mcp_servers={}",
@@ -1847,6 +2127,13 @@ class CodexIdeaSkillAdapter:
                         "mcp_servers.meta_research.bearer_token_env_var="
                         f'"{_SEMANTIC_MCP_TOKEN_ENV}"'
                     ),
+                    "--config",
+                    "mcp_servers.meta_research.required=true",
+                    "--config",
+                    (
+                        "mcp_servers.meta_research."
+                        'default_tools_approval_mode="approve"'
+                    ),
                 )
                 if semantic_mcp_enabled
                 else ()
@@ -1855,14 +2142,13 @@ class CodexIdeaSkillAdapter:
             'approval_policy="never"',
             "--config",
             CODEX_REASONING_EFFORT_CONFIG,
-            "--config",
-            f'web_search="{self._web_search_mode}"',
             *(
                 (
                     "--config",
                     "shell_environment_policy.inherit=\"none\"",
                 )
-                if self._shell_environment_inherit == "none"
+                if semantic_mcp_protected_environment
+                or self._shell_environment_inherit == "none"
                 else ()
             ),
             *(
@@ -1887,7 +2173,11 @@ class CodexIdeaSkillAdapter:
             argv.extend(["resume", native_session_ref, "-"])
         try:
             environment = (
-                {_SEMANTIC_MCP_TOKEN_ENV: cast(str, mcp_token)}
+                {
+                    _SEMANTIC_MCP_TOKEN_ENV: cast(str, mcp_token),
+                    "NO_PROXY": _loopback_no_proxy(),
+                    "no_proxy": _loopback_no_proxy(),
+                }
                 if semantic_mcp_enabled
                 else None
             )
@@ -1917,7 +2207,7 @@ class CodexIdeaSkillAdapter:
                     supervisor_request_path = directory / "supervisor-request.json"
                     try:
                         supervisor_payload: dict[str, object] = {
-                            "schema_ref": supervisor_request_schema,
+                            "schema_ref": CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
                             "invocation_hash": invocation_hash,
                             "argv": argv,
                             "timeout_seconds": self._timeout_seconds,
@@ -1945,13 +2235,9 @@ class CodexIdeaSkillAdapter:
                                 directory / "supervisor-stop.json"
                             ),
                         }
-                        if (
-                            supervisor_request_schema
-                            == CODEX_SUPERVISOR_REQUEST_SCHEMA_V2
-                        ):
-                            supervisor_payload["prompt_max_bytes"] = (
-                                transport_limits.prompt_max_bytes
-                            )
+                        supervisor_payload["prompt_max_bytes"] = (
+                            transport_limits.prompt_max_bytes
+                        )
                         write_supervisor_request(
                             supervisor_request_path,
                             supervisor_payload,
@@ -2091,10 +2377,7 @@ def _sealed_operation_invocation(
 def _operation_transport_limits(
     invocation: dict[str, object],
 ) -> ProviderTransportLimits:
-    schema_ref = invocation.get("schema_ref")
-    if schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA:
-        return DEFAULT_PROVIDER_TRANSPORT_LIMITS
-    if schema_ref != _CODEX_PROVIDER_OPERATION_SCHEMA:
+    if invocation.get("schema_ref") != _CODEX_PROVIDER_OPERATION_SCHEMA:
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
     try:
         return ProviderTransportLimits(
@@ -2104,6 +2387,14 @@ def _operation_transport_limits(
         )
     except ValueError as error:
         raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+
+def _loopback_no_proxy() -> str:
+    configured = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    values = [item.strip() for item in configured.split(",") if item.strip()]
+    for loopback in ("127.0.0.1", "localhost", "::1"):
+        if loopback not in values:
+            values.append(loopback)
+    return ",".join(values)
 
 
 def _validate_provider_inputs(
@@ -2145,12 +2436,8 @@ def _read_operation_invocation(
         hashlib.sha256,
     ).hexdigest()
     transport_mode = typed_invocation.get("transport_mode")
-    transport_limits = _operation_transport_limits(typed_invocation)
-    schema_ref = typed_invocation.get("schema_ref")
+    _operation_transport_limits(typed_invocation)
     expected_keys = {*expected_base, "transport_mode"}
-    if schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA:
-        expected_keys.difference_update(transport_limits.as_dict())
-        expected_keys.difference_update({"mcp_url", "mcp_scope_binding_hash"})
     identity_fields = set(expected_base).difference(
         {
             "schema_ref",
@@ -2159,26 +2446,12 @@ def _read_operation_invocation(
             "result_max_bytes",
         }
     )
-    if schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA:
-        identity_fields.difference_update(
-            {"mcp_url", "mcp_scope_binding_hash"}
-        )
     if (
         set(envelope) != {"payload", "seal"}
         or not hmac.compare_digest(seal, expected_seal)
         or set(typed_invocation) != expected_keys
-        or schema_ref
-        not in {
-            _CODEX_PROVIDER_OPERATION_SCHEMA,
-            _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA,
-        }
-        or (
-            schema_ref == _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA
-            and (
-                expected_base.get("mcp_url") is not None
-                or expected_base.get("mcp_scope_binding_hash") is not None
-            )
-        )
+        or typed_invocation.get("schema_ref")
+        != _CODEX_PROVIDER_OPERATION_SCHEMA
         or any(
             typed_invocation.get(name) != expected_base[name]
             for name in identity_fields
@@ -2444,10 +2717,7 @@ def _verified_operation_inputs(
         )
         or canonical_hash(envelope["payload"]) != invocation_hash
         or invocation.get("schema_ref")
-        not in {
-            _CODEX_PROVIDER_OPERATION_SCHEMA,
-            _LEGACY_CODEX_PROVIDER_OPERATION_SCHEMA,
-        }
+        != _CODEX_PROVIDER_OPERATION_SCHEMA
         or invocation.get("prompt_hash") != canonical_hash(prompt)
         or invocation.get("output_schema_hash") != canonical_hash(schema)
     ):
@@ -2602,6 +2872,27 @@ def _verify_child_review_trace(
     if expected_spawn_prompt is not None and terminal_message is None:
         raise IdeaSkillUnavailable("codex_child_review_result_missing")
     return terminal_message
+
+
+def _stdout_child_review_spawn_prompt_visible(stdout: str) -> bool:
+    """Whether the compatibility projection exposes a spawn prompt at all."""
+
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "collab_tool_call"
+            and item.get("tool") == "spawn_agent"
+            and "prompt" in item
+        ):
+            return True
+    return False
 
 
 def _write_completed_operation(
@@ -2875,6 +3166,21 @@ def _shared_codex_adapter_source_hash() -> str:
     return _file_sha256(Path(__file__).resolve())
 
 
+def _trusted_child_review_source_hash() -> str:
+    """Bind the shared verifier and its trusted ledger reader as one seam."""
+
+    return canonical_hash(
+        {
+            "verifier": _file_sha256(
+                Path(__file__).with_name("codex_child_review.py").resolve()
+            ),
+            "ledger_reader": _file_sha256(
+                Path(__file__).with_name("codex_ledger.py").resolve()
+            ),
+        }
+    )
+
+
 def _idea_skill_resources() -> dict[str, str]:
     package = files("meta_research.skills.idea_stage")
     resources = (
@@ -3017,7 +3323,6 @@ def _review_finalization_schema(
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "reviewer_agent_ref": {"type": "string", "minLength": 1},
             "findings": {
                 "type": "array",
                 "items": {
@@ -3050,7 +3355,6 @@ def _review_finalization_schema(
             },
         },
         "required": [
-            "reviewer_agent_ref",
             "findings",
             "final_outcome",
             "dispositions",

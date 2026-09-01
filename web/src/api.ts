@@ -1063,6 +1063,34 @@ export type TargetRootObservationPointer = {
   head_cursor: string;
 };
 
+export type TargetRawOutputPage = {
+  schema_ref: string;
+  target_ref: string;
+  target_run_ref: string;
+  attempt_ref: string;
+  attempt_generation: number;
+  root_session_ref: string;
+  native_session_ref: string | null;
+  root_native_session_ref: string | null;
+  fence_ref: string;
+  operation_ref: string;
+  operation_generation: number;
+  operation_status: string;
+  operation_outcome_code: string | null;
+  transport_invocation_hash: string;
+  stream_ref: string;
+  status: string;
+  text: string;
+  offset: number;
+  next_offset: number;
+  mapped_bytes: number;
+  source_bytes: number;
+  has_more: boolean;
+  source_caught_up: boolean;
+  exact: true;
+  unredacted: true;
+};
+
 export type BundleExhaustionProjection = {
   kind: "BundleExhaustion";
   status: string;
@@ -2544,6 +2572,48 @@ export function fetchTargetRootObservations(
   );
 }
 
+export async function fetchTargetRawOutput(
+  targetRef: string,
+  options: {
+    after?: number;
+    limit?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<TargetRawOutputPage> {
+  const after = options.after ?? 0;
+  const limit = options.limit ?? 64 * 1024;
+  if (!Number.isSafeInteger(after) || after < 0) {
+    throw new ProductError("target_raw_output_cursor_invalid");
+  }
+  if (!Number.isSafeInteger(limit) || limit < 4 || limit > 256 * 1024) {
+    throw new ProductError("target_raw_output_limit_invalid");
+  }
+  const parameters = new URLSearchParams({
+    after: String(after),
+    limit: String(limit),
+  });
+  const response = await fetch(
+    `/api/v1/bundle/targets/${encodeURIComponent(targetRef)}`
+      + `/raw-output?${parameters}`,
+    {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+      signal: options.signal,
+    },
+  );
+  if (!response.ok) {
+    let code = `request_failed:${response.status}`;
+    try {
+      const payload = (await response.json()) as { detail?: { code?: string } };
+      code = payload.detail?.code ?? code;
+    } catch {
+      // Preserve the status fallback if the authenticated endpoint has no JSON body.
+    }
+    throw new ProductError(code);
+  }
+  return (await response.json()) as TargetRawOutputPage;
+}
+
 export function fetchWriting(signal?: AbortSignal): Promise<WritingOverview> {
   return readJson("/api/v1/writing", signal);
 }
@@ -3659,6 +3729,7 @@ type ExperimentStartRequestBase = {
   hypothesis: string;
   variant_parameter: number;
   sample_count: number;
+  wall_time_budget_seconds: number;
 };
 
 export type ExperimentStartRequest = ExperimentStartRequestBase & (
@@ -5867,6 +5938,11 @@ export function followProjection(
   onTargetRootObservationsAvailable?: (
     pointer: TargetRootObservationPointer,
   ) => void,
+  onResearchActivity?: (activity: {
+    event_type: string;
+    revision: number;
+    observed_at: number;
+  }) => void,
 ): () => void {
   const eventTypes = [
     "system.ready",
@@ -6019,6 +6095,22 @@ export function followProjection(
     };
     const update = (event: Event) => {
       if (!acceptCursor(event)) return;
+      if (onResearchActivity && event.type === "projection.updated") {
+        try {
+          const payload = JSON.parse((event as MessageEvent<string>).data) as {
+            event_type?: unknown;
+          };
+          if (typeof payload.event_type === "string" && payload.event_type) {
+            onResearchActivity({
+              event_type: payload.event_type,
+              revision: cursor,
+              observed_at: Date.now(),
+            });
+          }
+        } catch {
+          // Activity copy is advisory. Snapshot reload remains authoritative.
+        }
+      }
       scheduleSnapshotReload();
     };
     next.addEventListener(

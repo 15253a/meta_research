@@ -16,6 +16,7 @@ import pytest
 from meta_research.idea_skill import (
     CodexIdeaSkillAdapter,
     IdeaSkillContractError,
+    IdeaSkillDraft,
     IdeaSkillRequest,
     IdeaSkillResult,
     IdeaSkillUnavailable,
@@ -30,11 +31,11 @@ from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
-    SUPERVISOR_REQUEST_SCHEMA,
     read_transport_envelope,
     write_transport_envelope,
 )
 from meta_research.quest_drafting import (
+    DraftingUnavailable,
     PROVIDER_RESULT_MAX_BYTES,
     PROVIDER_STREAM_MAX_BYTES,
 )
@@ -138,8 +139,8 @@ def _result(
     final: dict[str, object] | None = None,
     findings: tuple[dict[str, str], ...] = (),
     dispositions: tuple[dict[str, str], ...] = (),
-    review_mode: str = "harness_child_agent",
-    reviewer_agent_ref: str = "codex-child-reviewer:1",
+    review_mode: str = "advisory_unobserved",
+    reviewer_agent_ref: str | None = None,
 ) -> IdeaSkillResult:
     draft = draft or _idea_set()
     return IdeaSkillResult(
@@ -161,8 +162,8 @@ def _review_turn_output(
     dispositions: list[dict[str, str]] | None = None,
     reviewer_agent_ref: str = "codex-child-reviewer:1",
 ) -> dict[str, object]:
+    del reviewer_agent_ref
     return {
-        "reviewer_agent_ref": reviewer_agent_ref,
         "findings": findings or [],
         "final_outcome": final_outcome or _idea_set(),
         "dispositions": dispositions or [],
@@ -178,9 +179,6 @@ def test_canonical_skill_is_an_installed_runtime_resource() -> None:
     assert "execution completed != content accepted != domain accepted" in skill
     assert "NoViableCandidate" in contract
     assert "canonical selected Idea" in skill
-    assert "spawn" in skill
-    assert "短命 child reviewer" in skill
-    assert 'fork_turns="none"' in skill
 
 
 def test_runtime_binding_fixes_harness_artifact_and_output_contract(
@@ -220,7 +218,7 @@ def test_runtime_binding_fixes_harness_artifact_and_output_contract(
     assert "filesystem-danger-full-access" in first_binding.capability_bindings
     assert "shell-tool-enabled" in first_binding.capability_bindings
     assert "web-search-live" in first_binding.capability_bindings
-    assert "harness-child-agent-review" in first_binding.capability_bindings
+    assert "native-subagent-enabled" in first_binding.capability_bindings
     assert any(
         binding == "runtime-policy:trusted-local-broad/v1"
         for binding in first_binding.resource_bindings
@@ -391,8 +389,8 @@ def test_complete_idea_set_rejects_materially_duplicate_candidates() -> None:
         validate_idea_skill_result(_request(), _result(draft=outcome))
 
 
-def test_validator_rejects_a_child_reviewer_ref_from_the_root_session() -> None:
-    with pytest.raises(IdeaSkillContractError, match="idea_review_not_independent"):
+def test_validator_rejects_a_claimed_internal_reviewer_identity() -> None:
+    with pytest.raises(IdeaSkillContractError, match="idea_review_mode_invalid"):
         validate_idea_skill_result(
             _request(), _result(reviewer_agent_ref="run-session:1")
         )
@@ -551,6 +549,447 @@ class _SequenceRunner:
         return self(argv, prompt, timeout)
 
 
+class _OversizedFeatureProbeRunner(_SequenceRunner):
+    def run_command(
+        self, argv: list[str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        del argv, timeout
+        raise DraftingUnavailable("codex_output_too_large")
+
+
+class _Codex0147LossyReviewRunner:
+    """Record the production 0.147 ledger shape hidden by exec stdout."""
+
+    root_session_ref = "01a04b6b-36e8-73a2-bc36-6996523d5fdb"
+    child_session_ref = "01a04b71-2c39-7cf3-b8d2-863b5742ed73"
+    reviewer_task_name = "idea_review_bd8f646f"
+    reviewer_task_path = f"/root/{reviewer_task_name}"
+    primary_turn_id = "01a04b6b-3724-78a3-b77e-fe603857db73"
+    review_turn_id = "01a04b6e-e5ba-70d2-9fbb-ac9c0e87b846"
+    child_turn_id = "01a04b71-2c66-7031-83e2-1c0ed94f8bd9"
+
+    def __init__(self, codex_home: Path) -> None:
+        self._codex_home = codex_home
+        self.job_refs: list[str] = []
+
+    def __call__(
+        self, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("the regression must use the durable job seam")
+
+    def run_job(
+        self, job_ref: str, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout
+        self.job_refs.append(job_ref)
+        assert argv[-3:] == ["resume", self.root_session_ref, "-"]
+        output_path = Path(argv[argv.index("--output-last-message") + 1])
+        output = _review_turn_output(reviewer_agent_ref=self.reviewer_task_path)
+        result_json = json.dumps(
+            output,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        output_path.write_text(result_json, encoding="utf-8")
+
+        empty_wait = {
+            "id": "item_1",
+            "type": "collab_tool_call",
+            "tool": "wait",
+            "sender_thread_id": self.root_session_ref,
+            "receiver_thread_ids": [],
+            "prompt": None,
+            "agents_states": {},
+        }
+        lossy_stdout = (
+            {"type": "thread.started", "thread_id": self.root_session_ref},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "agent_message",
+                    "text": "Starting the independent review.",
+                },
+            },
+            {"type": "item.started", "item": {**empty_wait, "status": "in_progress"}},
+            {"type": "item.completed", "item": {**empty_wait, "status": "completed"}},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_2",
+                    "type": "agent_message",
+                    "text": result_json,
+                },
+            },
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 147,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 147,
+                },
+            },
+        )
+        assert len(lossy_stdout) == 7
+        assert not any("spawn" in json.dumps(event) for event in lossy_stdout)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="\n".join(json.dumps(event) for event in lossy_stdout),
+            stderr="",
+        )
+
+    def _write_ledgers(
+        self,
+        *,
+        cwd: str,
+        model: str,
+        review_prompt: str,
+        result_json: str,
+        child_prompt: str,
+        child_terminal: str,
+    ) -> None:
+        spawn_call_id = "call_wIt1xv0w7R7wMFBSFHRL5VHk"
+        wait_call_id = "call_H0tSZvhUWCkmvR7X6IQpnLRX"
+        root_records = (
+            self._record(
+                "2026-08-29T02:48:32.813Z",
+                "session_meta",
+                {
+                    "id": self.root_session_ref,
+                    "session_id": self.root_session_ref,
+                    "timestamp": "2026-08-29T02:48:32.745Z",
+                    "cwd": cwd,
+                    "originator": "codex_exec",
+                    "cli_version": "0.147.0",
+                    "source": "exec",
+                    "thread_source": "user",
+                    "model_provider": "openai",
+                    "base_instructions": {},
+                    "history_mode": "legacy",
+                    "context_window": {"window_id": self.root_session_ref},
+                },
+            ),
+            self._record(
+                "2026-08-29T02:48:40.165Z",
+                "turn_context",
+                self._turn_context(self.primary_turn_id, cwd=cwd, model=model),
+            ),
+            self._record(
+                "2026-08-29T02:52:16.294Z",
+                "event_msg",
+                {
+                    "type": "task_complete",
+                    "turn_id": self.primary_turn_id,
+                    "started_at": 1787971720,
+                    "completed_at": 1787971936,
+                    "duration_ms": 216_131,
+                    "time_to_first_token_ms": 1_000,
+                    "last_agent_message": json.dumps(
+                        {"outcome": _idea_set()},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+            ),
+            self._record(
+                "2026-08-29T02:52:34.111Z",
+                "event_msg",
+                {
+                    "type": "task_started",
+                    "turn_id": self.review_turn_id,
+                    "started_at": 1787971954,
+                    "model_context_window": 258_400,
+                    "collaboration_mode_kind": "Default",
+                },
+            ),
+            self._record(
+                "2026-08-29T02:52:37.443Z",
+                "turn_context",
+                self._turn_context(self.review_turn_id, cwd=cwd, model=model),
+            ),
+            self._record(
+                "2026-08-29T02:52:37.456Z",
+                "response_item",
+                {
+                    "id": "review-user-message",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": review_prompt}],
+                },
+            ),
+            self._record(
+                "2026-08-29T02:55:03.220Z",
+                "response_item",
+                {
+                    "id": "spawn-reviewer",
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "namespace": "collaboration",
+                    "call_id": spawn_call_id,
+                    "arguments": json.dumps(
+                        {
+                            "fork_turns": "none",
+                            "message": child_prompt,
+                            "task_name": self.reviewer_task_name,
+                        },
+                        sort_keys=True,
+                    ),
+                },
+            ),
+            self._record(
+                "2026-08-29T02:55:03.271Z",
+                "event_msg",
+                {
+                    "type": "sub_agent_activity",
+                    "kind": "started",
+                    "event_id": spawn_call_id,
+                    "agent_path": self.reviewer_task_path,
+                    "agent_thread_id": self.child_session_ref,
+                    "occurred_at_ms": 1_787_972_103_271,
+                },
+            ),
+            self._record(
+                "2026-08-29T02:55:03.275Z",
+                "response_item",
+                {
+                    "id": "spawn-reviewer-output",
+                    "type": "function_call_output",
+                    "call_id": spawn_call_id,
+                    "output": json.dumps({"task_name": self.reviewer_task_path}),
+                },
+            ),
+            self._record(
+                "2026-08-29T02:55:08.323Z",
+                "response_item",
+                {
+                    "id": "wait-reviewer",
+                    "type": "function_call",
+                    "name": "wait_agent",
+                    "namespace": "collaboration",
+                    "call_id": wait_call_id,
+                    "arguments": json.dumps({"timeout_ms": 120_000}),
+                },
+            ),
+            self._record(
+                "2026-08-29T02:56:52.923Z",
+                "response_item",
+                {
+                    "id": "wait-reviewer-output",
+                    "type": "function_call_output",
+                    "call_id": wait_call_id,
+                    "output": json.dumps(
+                        {"message": "Wait completed.", "timed_out": False},
+                        sort_keys=True,
+                    ),
+                },
+            ),
+            self._record(
+                "2026-08-29T02:56:52.929Z",
+                "response_item",
+                {
+                    "id": "reviewer-delivery",
+                    "type": "agent_message",
+                    "author": self.reviewer_task_path,
+                    "recipient": "/root",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Message Type: FINAL_ANSWER\n"
+                                "Task name: /root\n"
+                                f"Sender: {self.reviewer_task_path}\n"
+                                f"Payload:\n{child_terminal}"
+                            ),
+                        },
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": child_prompt,
+                        },
+                    ],
+                },
+            ),
+            self._record(
+                "2026-08-29T02:58:29.780Z",
+                "response_item",
+                {
+                    "id": "review-result",
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": result_json}],
+                },
+            ),
+            self._record(
+                "2026-08-29T02:58:29.800Z",
+                "event_msg",
+                {
+                    "type": "task_complete",
+                    "turn_id": self.review_turn_id,
+                    "started_at": 1787971954,
+                    "completed_at": 1787972309,
+                    "duration_ms": 355_689,
+                    "time_to_first_token_ms": 14_648,
+                    "last_agent_message": result_json,
+                },
+            ),
+        )
+        child_records = (
+            self._record(
+                "2026-08-29T02:55:03.273Z",
+                "session_meta",
+                {
+                    "id": self.child_session_ref,
+                    "session_id": self.root_session_ref,
+                    "parent_thread_id": self.root_session_ref,
+                    "timestamp": "2026-08-29T02:55:03.225Z",
+                    "cwd": cwd,
+                    "originator": "codex_exec",
+                    "cli_version": "0.147.0",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": self.root_session_ref,
+                                "depth": 1,
+                                "agent_path": self.reviewer_task_path,
+                                "agent_nickname": "Tesla",
+                                "agent_role": None,
+                            }
+                        }
+                    },
+                    "thread_source": "subagent",
+                    "agent_nickname": "Tesla",
+                    "agent_path": self.reviewer_task_path,
+                    "model_provider": "openai",
+                    "base_instructions": {},
+                    "history_mode": "legacy",
+                    "multi_agent_version": "v2",
+                    "context_window": {"window_id": self.child_session_ref},
+                },
+            ),
+            self._record(
+                "2026-08-29T02:55:03.273Z",
+                "event_msg",
+                {
+                    "type": "task_started",
+                    "turn_id": self.child_turn_id,
+                    "started_at": 1787972103,
+                    "model_context_window": 258_400,
+                    "collaboration_mode_kind": "Default",
+                },
+            ),
+            self._record(
+                "2026-08-29T02:55:06.367Z",
+                "turn_context",
+                self._turn_context(self.child_turn_id, cwd=cwd, model=model),
+            ),
+            self._record(
+                "2026-08-29T02:55:06.370Z",
+                "response_item",
+                {
+                    "id": "child-task-delivery",
+                    "type": "agent_message",
+                    "author": "/root",
+                    "recipient": self.reviewer_task_path,
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Message Type: NEW_TASK\n"
+                                f"Task name: {self.reviewer_task_path}\n"
+                                "Sender: /root\n"
+                                f"Payload:\n{child_prompt}"
+                            ),
+                        }
+                    ],
+                },
+            ),
+            self._record(
+                "2026-08-29T02:56:52.828Z",
+                "response_item",
+                {
+                    "id": "child-result",
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [
+                        {"type": "output_text", "text": child_terminal}
+                    ],
+                },
+            ),
+            self._record(
+                "2026-08-29T02:56:52.880Z",
+                "event_msg",
+                {
+                    "type": "task_complete",
+                    "turn_id": self.child_turn_id,
+                    "started_at": 1787972103,
+                    "completed_at": 1787972212,
+                    "duration_ms": 109_607,
+                    "time_to_first_token_ms": 14_471,
+                    "last_agent_message": child_terminal,
+                },
+            ),
+        )
+        self._write_ledger(
+            "2026/08/29/rollout-2026-08-29T02-48-32-"
+            f"{self.root_session_ref}.jsonl",
+            root_records,
+        )
+        self._write_ledger(
+            "2026/08/29/rollout-2026-08-29T02-55-03-"
+            f"{self.child_session_ref}.jsonl",
+            child_records,
+        )
+
+    @staticmethod
+    def _turn_context(turn_id: str, *, cwd: str, model: str) -> dict[str, object]:
+        return {
+            "turn_id": turn_id,
+            "cwd": cwd,
+            "model": model,
+            "effort": "max",
+            "approval_policy": "never",
+            "sandbox_policy": {"type": "danger-full-access"},
+            "permission_profile": {"type": "disabled"},
+            "collaboration_mode": {
+                "mode": "default",
+                "settings": {
+                    "model": model,
+                    "reasoning_effort": "max",
+                    "developer_instructions": None,
+                },
+            },
+            "multi_agent_version": "v2",
+            "workspace_roots": [cwd],
+            "current_date": "2026-08-29",
+            "timezone": "Etc/UTC",
+        }
+
+    @staticmethod
+    def _record(
+        timestamp: str, record_type: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        return {"timestamp": timestamp, "type": record_type, "payload": payload}
+
+    def _write_ledger(
+        self, relative_path: str, records: tuple[dict[str, object], ...]
+    ) -> None:
+        path = self._codex_home / "sessions" / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                for record in records
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+
 def _assert_codex_schema_types(value: object, path: str = "$") -> None:
     """Match the provider's strict requirement for every const schema node."""
 
@@ -608,6 +1047,24 @@ class _OutcomeUnknownRunner:
     ) -> subprocess.CompletedProcess[str]:
         del job_ref
         return self(argv, prompt, timeout)
+
+
+class _FeatureProbeOutcomeUnknownRunner(_OutcomeUnknownRunner):
+    def __init__(self, feature_output: str | None) -> None:
+        super().__init__()
+        self._feature_output = feature_output
+
+    def run_command(
+        self, argv: list[str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout
+        assert argv[-2:] == ["features", "list"]
+        return subprocess.CompletedProcess(
+            argv,
+            0 if self._feature_output is not None else 1,
+            stdout=self._feature_output or "",
+            stderr="",
+        )
 
 
 class _ExitFailureRunner:
@@ -789,7 +1246,7 @@ def _descendant_codex_executable(path: Path, child_pid_path: Path) -> Path:
     return path
 
 
-def test_production_adapter_runs_the_packaged_skill_and_independent_review(
+def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     tmp_path: Path,
 ) -> None:
     runner = _SequenceRunner(
@@ -804,17 +1261,16 @@ def test_production_adapter_runs_the_packaged_skill_and_independent_review(
     validate_idea_skill_result(request, result)
 
     assert result.primary_session_ref == "codex-primary:1"
-    assert result.review_mode == "harness_child_agent"
-    assert result.reviewer_agent_ref == "codex-child-reviewer:1"
+    assert result.review_mode == "advisory_unobserved"
+    assert result.reviewer_agent_ref is None
     assert result.adapter_kind == "codex_cli"
     assert len(runner.calls) == 2
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
     review_argv, review_prompt, review_schema = runner.calls[1]
     assert primary_argv[:2] == ["codex", "exec"]
     assert primary_argv[2:4] == ["--enable", "multi_agent"]
-    assert "--ignore-user-config" in primary_argv
-    assert "--ignore-rules" in primary_argv
-    assert primary_argv[primary_argv.index("--config") + 1] == "mcp_servers={}"
+    assert "--ignore-user-config" not in primary_argv
+    assert "--ignore-rules" not in primary_argv
     config_values = {
         primary_argv[index + 1]
         for index, value in enumerate(primary_argv[:-1])
@@ -839,33 +1295,30 @@ def test_production_adapter_runs_the_packaged_skill_and_independent_review(
         if value == "--disable"
     }
     assert {"apps", "browser_use", "computer_use"} <= disabled
+    assert "plugins" not in disabled
+    assert "remote_plugin" not in disabled
+    enabled = {
+        primary_argv[index + 1]
+        for index, value in enumerate(primary_argv[:-1])
+        if value == "--enable"
+    }
+    assert {"multi_agent", "plugins", "remote_plugin", "hooks"} <= enabled
     assert "shell_tool" not in disabled
     assert "skill_search" not in disabled
     assert "view_image" not in disabled
     assert "execution completed != content accepted" in primary_prompt
     assert "## IdeaStageInvocation" in primary_prompt
     assert "## Accepted handoff" in primary_prompt
-    assert "本回合仅执行 Primary draft phase" in primary_prompt
-    assert "禁止调用 spawn_agent 或 wait" in primary_prompt
-    assert "下一次 resumed review turn" in primary_prompt
     assert "一个 submission identity" in primary_prompt
     assert "不得创建 Question、Plan、Run、receipt" in primary_prompt
     assert set(primary_schema["properties"]) == {"outcome"}
     assert "anyOf" in primary_schema["properties"]["outcome"]
     _assert_codex_schema_types(primary_schema)
-    assert "独立 advisory reviewer" in review_prompt
-    assert "spawn" in review_prompt
-    assert "wait" in review_prompt
-    assert "短命 child reviewer" in review_prompt
-    assert 'fork_turns="none"' in review_prompt
     assert "## IdeaStageInvocation" in review_prompt
     assert "## Accepted handoff" in review_prompt
     assert "reviewed_draft=" in review_prompt
     assert review_argv[-3:] == ["resume", "codex-primary:1", "-"]
-    assert "当前 frozen reviewed_draft" in review_prompt
-    assert "不得复用 Primary phase" in review_prompt
     assert set(review_schema["properties"]) == {
-        "reviewer_agent_ref",
         "findings",
         "final_outcome",
         "dispositions",
@@ -873,7 +1326,7 @@ def test_production_adapter_runs_the_packaged_skill_and_independent_review(
     _assert_codex_schema_types(review_schema)
 
 
-def test_production_adapter_rejects_review_without_a_successful_spawn(
+def test_production_adapter_does_not_require_a_review_spawn_trace(
     tmp_path: Path,
 ) -> None:
     runner = _SequenceRunner(
@@ -885,14 +1338,12 @@ def test_production_adapter_rejects_review_without_a_successful_spawn(
         process_runner=runner,
     )
 
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_child_review_spawn_invalid",
-    ):
-        adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+    result = adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+
+    assert result.reviewer_agent_ref is None
 
 
-def test_production_adapter_rejects_review_without_a_completed_wait(
+def test_production_adapter_does_not_require_a_review_wait_trace(
     tmp_path: Path,
 ) -> None:
     runner = _SequenceRunner(
@@ -904,11 +1355,9 @@ def test_production_adapter_rejects_review_without_a_completed_wait(
         process_runner=runner,
     )
 
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_child_review_wait_invalid",
-    ):
-        adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+    result = adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+
+    assert result.reviewer_agent_ref is None
 
 
 def test_production_adapter_accepts_timeout_then_terminal_wait(
@@ -925,10 +1374,38 @@ def test_production_adapter_accepts_timeout_then_terminal_wait(
 
     result = adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
 
-    assert result.reviewer_agent_ref == "codex-child-reviewer:1"
+    assert result.reviewer_agent_ref is None
 
 
-def test_production_adapter_rejects_a_forged_reviewer_agent_ref(
+def test_codex_0147_lossy_stdout_does_not_gate_public_review_result(
+    tmp_path: Path,
+) -> None:
+    codex_home = (tmp_path / "codex-home").absolute()
+    runner = _Codex0147LossyReviewRunner(codex_home)
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "idea-provider",
+        process_runner=runner,
+        codex_home=codex_home,
+    )
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        native_session_ref=runner.root_session_ref,
+        job_ref="idea-review-operation:codex-0147-lossy-stdout",
+    )
+    draft = IdeaSkillDraft(
+        draft=_idea_set(),
+        primary_session_ref=runner.root_session_ref,
+        adapter_kind="codex_cli",
+    )
+
+    result = adapter.review_draft(request, draft)
+
+    assert result.reviewer_agent_ref is None
+    assert result.primary_session_ref == runner.root_session_ref
+    assert runner.job_refs == [request.job_ref]
+
+
+def test_production_adapter_does_not_accept_a_provider_reviewer_identity(
     tmp_path: Path,
 ) -> None:
     runner = _SequenceRunner(
@@ -940,14 +1417,12 @@ def test_production_adapter_rejects_a_forged_reviewer_agent_ref(
         process_runner=runner,
     )
 
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_child_review_ref_mismatch",
-    ):
-        adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+    result = adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+
+    assert result.reviewer_agent_ref is None
 
 
-def test_production_adapter_rechecks_child_trace_on_durable_recovery(
+def test_durable_review_recovery_does_not_require_child_trace(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "durable-review-missing-wait"
@@ -966,23 +1441,17 @@ def test_production_adapter_rechecks_child_trace_on_durable_recovery(
         native_session_ref=draft.primary_session_ref,
     )
 
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_child_review_wait_invalid",
-    ):
-        first.review_draft(review_request, draft)
+    first_result = first.review_draft(review_request, draft)
 
     no_replay = _SequenceRunner([])
     restarted = CodexIdeaSkillAdapter(workspace, process_runner=no_replay)
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_child_review_wait_invalid",
-    ):
-        restarted.review_draft(review_request, draft)
+    recovered = restarted.review_draft(review_request, draft)
+
+    assert recovered.final_outcome == first_result.final_outcome
     assert no_replay.calls == []
 
 
-def test_durable_primary_rejects_an_early_review_trace_without_replay(
+def test_durable_primary_ignores_internal_review_trace_on_replay(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "durable-primary-early-review"
@@ -996,36 +1465,17 @@ def test_durable_primary_rejects_an_early_review_trace_without_replay(
         job_ref="idea-primary-operation:early-review",
     )
 
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_primary_review_phase_invalid",
-    ) as failed:
-        first.generate_draft(request)
-    checkpoint = failed.value.recovery_checkpoint
-    assert checkpoint is not None
-    assert checkpoint["schema_ref"] == (
-        "meta-research/provider-terminal-contract-failure/v1"
-    )
-    assert checkpoint["termination_reason"] == "completed"
-    assert checkpoint["contract_failure_code"] == (
-        "codex_primary_review_phase_invalid"
-    )
-    assert checkpoint["contract_failure_detail_code"] == (
-        "codex_primary_review_phase_invalid"
-    )
+    first_draft = first.generate_draft(request)
 
     no_replay = _SequenceRunner([])
     restarted = CodexIdeaSkillAdapter(workspace, process_runner=no_replay)
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_primary_review_phase_invalid",
-    ) as recovered:
-        restarted.generate_draft(request)
-    assert recovered.value.recovery_checkpoint == failed.value.recovery_checkpoint
+    recovered = restarted.generate_draft(request)
+
+    assert recovered.draft == first_draft.draft
     assert no_replay.calls == []
 
 
-def test_durable_review_trace_failure_seals_a_non_replayable_checkpoint(
+def test_durable_review_without_spawn_trace_replays_public_result(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "durable-review-invalid-trace"
@@ -1044,22 +1494,13 @@ def test_durable_review_trace_failure_seals_a_non_replayable_checkpoint(
         native_session_ref=draft.primary_session_ref,
     )
 
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_child_review_spawn_invalid",
-    ) as failed:
-        first.review_draft(review_request, draft)
-    assert failed.value.recovery_checkpoint is not None
-    assert failed.value.recovery_checkpoint["termination_reason"] == "completed"
+    first_result = first.review_draft(review_request, draft)
 
     no_replay = _SequenceRunner([])
     restarted = CodexIdeaSkillAdapter(workspace, process_runner=no_replay)
-    with pytest.raises(
-        IdeaSkillUnavailable,
-        match="codex_child_review_spawn_invalid",
-    ) as recovered:
-        restarted.review_draft(review_request, draft)
-    assert recovered.value.recovery_checkpoint == failed.value.recovery_checkpoint
+    recovered = restarted.review_draft(review_request, draft)
+
+    assert recovered.final_outcome == first_result.final_outcome
     assert no_replay.calls == []
 
 
@@ -1104,7 +1545,6 @@ def test_production_adapter_resumes_the_root_session_for_review_dispositions(
     assert review_argv[-3:] == ["resume", "codex-primary:1", "-"]
     assert "根 Idea Agent" in review_prompt
     assert set(review_schema["properties"]) == {
-        "reviewer_agent_ref",
         "findings",
         "final_outcome",
         "dispositions",
@@ -1245,6 +1685,66 @@ def test_durable_provider_operation_fails_closed_when_outcome_is_unknown(
     ):
         restarted.generate_draft(request)
     assert forbidden_replay.calls == []
+
+
+def test_durable_retry_uses_the_sealed_feature_snapshot_not_a_fresh_probe(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "volatile-feature-probe"
+    first_runner = _FeatureProbeOutcomeUnknownRunner(None)
+    first = CodexIdeaSkillAdapter(workspace, process_runner=first_runner)
+    request = _request(
+        runtime_binding=first.runtime_binding(),
+        job_ref="idea-primary-operation:volatile-feature-probe",
+    )
+
+    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_timeout"):
+        first.generate_draft(request)
+
+    recovered_probe = """\
+hooks stable true
+multi_agent stable true
+plugins stable true
+remote_plugin stable true
+shell_tool stable true
+skill_search stable true
+unified_exec stable true
+"""
+    restarted_runner = _FeatureProbeOutcomeUnknownRunner(recovered_probe)
+    restarted = CodexIdeaSkillAdapter(
+        workspace,
+        process_runner=restarted_runner,
+    )
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_operation_reconciliation_pending",
+    ):
+        restarted.generate_draft(request)
+
+    assert restarted_runner.calls == 0
+
+
+def test_oversized_feature_probe_is_diagnostic_only(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "oversized-feature-probe"
+    runner = _OversizedFeatureProbeRunner([{"outcome": _idea_set()}])
+    adapter = CodexIdeaSkillAdapter(workspace, process_runner=runner)
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        job_ref="idea-primary-operation:oversized-feature-probe",
+    )
+
+    draft = adapter.generate_draft(request)
+
+    assert draft.draft == _idea_set()
+    _key_path, key = adapter._transport_key()
+    invocation = read_transport_envelope(
+        next(workspace.glob("provider-operations/*/primary/invocation.json")),
+        key,
+    )
+    assert invocation["schema_ref"] == "meta-research/codex-provider-operation/v3"
+    assert "root_capability_diagnostics" not in invocation
 
 
 @pytest.mark.parametrize("tamper", ["mode", "delete_invocation"])
@@ -1755,12 +2255,19 @@ def test_durable_supervisor_recovers_a_prelaunch_daemon_loss(
     assert (operation / "completed.json").is_file()
 
 
-def test_durable_supervisor_recovers_a_legacy_sealed_prelaunch_request(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "legacy_schema",
+    (
+        "meta-research/codex-provider-operation/v1",
+        "meta-research/codex-provider-operation/v2",
+    ),
+)
+def test_durable_supervisor_rejects_old_operation_schemas(
+    tmp_path: Path, legacy_schema: str
 ) -> None:
-    workspace = tmp_path / "legacy-prelaunch-recovery-provider"
+    workspace = tmp_path / "old-operation-schema-provider"
     executable = _fake_codex_executable(
-        tmp_path / "fake-codex-legacy-prelaunch",
+        tmp_path / "fake-codex-old-operation-schema",
         read_all_input=True,
     )
     first = CodexIdeaSkillAdapter(
@@ -1770,7 +2277,7 @@ def test_durable_supervisor_recovers_a_legacy_sealed_prelaunch_request(
     )
     request = _request(
         runtime_binding=first.runtime_binding(),
-        job_ref="idea-primary-operation:legacy-prelaunch-loss",
+        job_ref="idea-primary-operation:old-operation-schema",
     )
 
     with pytest.raises(IdeaSkillUnavailable, match="codex_cli_io_unavailable"):
@@ -1779,33 +2286,17 @@ def test_durable_supervisor_recovers_a_legacy_sealed_prelaunch_request(
     _key_path, key = first._transport_key()
     invocation_path = operation / "invocation.json"
     invocation = read_transport_envelope(invocation_path, key)
-    invocation["schema_ref"] = "meta-research/codex-provider-operation/v1"
-    for field in (
-        "prompt_max_bytes",
-        "stream_max_bytes",
-        "result_max_bytes",
-        "mcp_url",
-        "mcp_scope_binding_hash",
-    ):
-        invocation.pop(field)
+    invocation["schema_ref"] = legacy_schema
     invocation_path.unlink()
     write_transport_envelope(invocation_path, invocation, key)
 
-    request_path = operation / "supervisor-request.json"
-    supervisor_request = read_transport_envelope(request_path, key)
-    supervisor_request["schema_ref"] = SUPERVISOR_REQUEST_SCHEMA
-    supervisor_request["invocation_hash"] = canonical_hash(invocation)
-    supervisor_request.pop("prompt_max_bytes")
-    request_path.unlink()
-    write_transport_envelope(request_path, supervisor_request, key)
-
     restarted = CodexIdeaSkillAdapter(workspace, executable=str(executable))
-    recovered = restarted.generate_draft(request)
-
-    assert recovered.primary_session_ref == "supervised-primary"
-    assert recovered.draft == _idea_set()
-    assert (operation / "provider-started.json").is_file()
-    assert (operation / "completed.json").is_file()
+    with pytest.raises(
+        IdeaSkillUnavailable, match="codex_operation_spool_invalid"
+    ):
+        restarted.generate_draft(request)
+    assert not (operation / "provider-started.json").exists()
+    assert not (operation / "completed.json").exists()
 
 
 def test_cancelled_prelaunch_operation_becomes_safe_after_startup_window(

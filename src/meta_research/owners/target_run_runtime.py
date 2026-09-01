@@ -8,9 +8,13 @@ Harness child-review evidence, and the TargetRun-to-Experiment bridge.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import math
+import os
+import stat
 import time
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
@@ -67,6 +71,7 @@ from meta_research.feed import DurableFeed
 from meta_research.owners.agent_runtime_harness import (
     AgentRuntimeHarnessInterface,
     AgentRuntimeTargetChildSession,
+    AgentRuntimeTargetProviderCeilingEvidence,
     AgentRuntimeTargetSuccessorReservation,
 )
 from meta_research.owners.common import (
@@ -164,6 +169,16 @@ class TargetExecutionFailureProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetProviderCeilingRecoveryProjection:
+    """Signed Harness ceiling plus its exact root-owned successor."""
+
+    reservation: AgentRuntimeTargetSuccessorReservation
+    evidence: AgentRuntimeTargetProviderCeilingEvidence
+    blocker: TechnicalBlocker
+    replacement_handle: TargetWorkHandle
+
+
+@dataclass(frozen=True, slots=True)
 class _TargetExecutionFailureBasis:
     """Exact immutable terminal basis, before a successor can exist."""
 
@@ -229,6 +244,12 @@ AR_TARGET_NATIVE_EXECUTION_CLOSURE_RECEIPT_KIND = (
     "target_native_execution_closure_accepted"
 )
 AR_TARGET_RUN_WORKSPACE_RECEIPT_KIND = "target_run_workspace_reserved"
+AR_TARGET_ROOT_WORKSPACE_CONTINUITY_RECEIPT_KIND = (
+    "target_root_workspace_continuity_accepted"
+)
+TARGET_ROOT_WORKSPACE_CONTINUITY_MANIFEST_SCHEMA_REF = (
+    "meta-research/target-root-workspace-continuity-manifest/v1"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,6 +455,101 @@ def _receipt(
             }
         ),
     )
+
+
+def _target_workspace_continuity_payload(
+    *,
+    continuity_ref: str,
+    transition_ref: str,
+    target_ref: str,
+    predecessor_workspace_ref: str,
+    predecessor_workspace_payload_hash: str,
+    successor_workspace_ref: str,
+    successor_workspace_payload_hash: str,
+    manifest_hash: str,
+) -> dict[str, object]:
+    return {
+        "continuity_ref": continuity_ref,
+        "transition_ref": transition_ref,
+        "target_ref": target_ref,
+        "predecessor_workspace_ref": predecessor_workspace_ref,
+        "predecessor_workspace_payload_hash": (
+            predecessor_workspace_payload_hash
+        ),
+        "successor_workspace_ref": successor_workspace_ref,
+        "successor_workspace_payload_hash": successor_workspace_payload_hash,
+        "manifest_hash": manifest_hash,
+    }
+
+
+def _decode_target_workspace_continuity_manifest(
+    document: str,
+    expected_hash: str,
+) -> dict[str, object]:
+    """Decode the exact non-input tree copied between Target attempts."""
+
+    try:
+        value = json.loads(document)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict(
+            "target_root_workspace_continuity_integrity_invalid"
+        ) from error
+    if (
+        type(value) is not dict
+        or set(value) != {"schema_ref", "excluded_top_level_paths", "entries"}
+        or value.get("schema_ref")
+        != TARGET_ROOT_WORKSPACE_CONTINUITY_MANIFEST_SCHEMA_REF
+        or value.get("excluded_top_level_paths") != ["inputs"]
+        or type(value.get("entries")) is not list
+        or canonical_json(value) != document
+        or canonical_hash(value) != expected_hash
+    ):
+        raise OwnerConflict("target_root_workspace_continuity_integrity_invalid")
+    prior_path: str | None = None
+    for entry in value["entries"]:
+        if type(entry) is not dict or entry.get("kind") not in {
+            "directory",
+            "file",
+        }:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_integrity_invalid"
+            )
+        relative_path = entry.get("relative_path")
+        if (
+            type(relative_path) is not str
+            or not relative_path
+            or relative_path == "inputs"
+            or relative_path.startswith("inputs/")
+            or relative_path.startswith("/")
+            or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+            or (prior_path is not None and relative_path <= prior_path)
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_integrity_invalid"
+            )
+        prior_path = relative_path
+        if entry["kind"] == "directory":
+            if set(entry) != {"kind", "relative_path"}:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_integrity_invalid"
+                )
+            continue
+        sha256 = entry.get("sha256")
+        if (
+            set(entry)
+            != {"kind", "relative_path", "mode", "byte_count", "sha256"}
+            or type(entry.get("mode")) is not int
+            or not 0 <= entry["mode"] <= 0o777
+            or type(entry.get("byte_count")) is not int
+            or entry["byte_count"] < 0
+            or type(sha256) is not str
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_integrity_invalid"
+            )
+    return value
 
 
 def _proof(receipt: AcceptanceReceipt) -> ReceiptProof:
@@ -4360,14 +4476,37 @@ class SQLiteTargetRunAgentAuthority:
                         "receipt_ref": receipt.receipt_ref,
                     },
                 )
-        workspace = self.query_target_workspace(handle.target_run_ref)
+        workspace = self._query_target_workspace_record(
+            handle.target_run_ref,
+            allow_pending_continuity=True,
+        )
         if workspace is None or workspace.workspace_ref != workspace_ref:
             raise OwnerConflict("target_run_workspace_integrity_invalid")
         self._ensure_target_workspace_layout(workspace)
-        return workspace
+        self._ensure_target_workspace_continuity(
+            handle=handle,
+            workspace=workspace,
+        )
+        accepted = self.query_target_workspace(handle.target_run_ref)
+        if accepted is None or accepted.workspace_ref != workspace_ref:
+            raise OwnerConflict("target_run_workspace_integrity_invalid")
+        return accepted
 
     def query_target_workspace(
         self, target_run_ref: str
+    ) -> TargetRunWorkspace | None:
+        """Return only an executable workspace with completed continuity."""
+
+        return self._query_target_workspace_record(
+            target_run_ref,
+            allow_pending_continuity=False,
+        )
+
+    def _query_target_workspace_record(
+        self,
+        target_run_ref: str,
+        *,
+        allow_pending_continuity: bool,
     ) -> TargetRunWorkspace | None:
         with self._database.read() as connection:
             rows = connection.execute(
@@ -4378,12 +4517,110 @@ class SQLiteTargetRunAgentAuthority:
                 ),
                 {"run_ref": target_run_ref},
             ).all()
-        if not rows:
-            return None
-        if len(rows) != 1:
-            raise OwnerConflict("target_run_workspace_integrity_invalid")
-        row = rows[0]
-        run = self._harness.query_target_run_by_ref(target_run_ref)
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise OwnerConflict("target_run_workspace_integrity_invalid")
+            row = rows[0]
+            recovery_rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_root_provider_recoveries WHERE "
+                    "target_ref = :target_ref AND new_execution_attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {
+                    "target_ref": row.target_ref,
+                    "attempt_ref": row.target_attempt_ref,
+                },
+            ).all()
+            continuity_rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_root_workspace_continuities WHERE "
+                    "successor_workspace_ref = :workspace_ref"
+                ),
+                {"workspace_ref": row.workspace_ref},
+            ).all()
+            predecessor = (
+                None
+                if len(recovery_rows) != 1
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_workspaces WHERE "
+                        "workspace_ref = :workspace_ref"
+                    ),
+                    {
+                        "workspace_ref": recovery_rows[0].retired_workspace_ref,
+                    },
+                ).first()
+            )
+            handle_rows = (
+                ()
+                if len(recovery_rows) != 1
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_root_handle_history WHERE "
+                        "target_ref = :target_ref AND execution_attempt_ref IN "
+                        "(:old_attempt_ref, :new_attempt_ref) ORDER BY ordinal"
+                    ),
+                    {
+                        "target_ref": row.target_ref,
+                        "old_attempt_ref": (
+                            recovery_rows[0].old_execution_attempt_ref
+                        ),
+                        "new_attempt_ref": (
+                            recovery_rows[0].new_execution_attempt_ref
+                        ),
+                    },
+                ).all()
+            )
+        workspace = self._stored_target_workspace(row, require_current=True)
+        if not recovery_rows:
+            if continuity_rows:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_integrity_invalid"
+                )
+            return workspace
+        if (
+            len(recovery_rows) != 1
+            or predecessor is None
+            or len(handle_rows) != 2
+            or len(continuity_rows) > 1
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_integrity_invalid"
+            )
+        recovery = recovery_rows[0]
+        predecessor_workspace = self._stored_target_workspace(
+            predecessor,
+            require_current=False,
+        )
+        self._verify_target_workspace_recovery_link(
+            recovery=recovery,
+            predecessor=predecessor_workspace,
+            successor=workspace,
+            handle_rows=handle_rows,
+        )
+        if not continuity_rows:
+            return workspace if allow_pending_continuity else None
+        self._verify_target_workspace_continuity_row(
+            continuity=continuity_rows[0],
+            recovery=recovery,
+            predecessor=predecessor_workspace,
+            successor=workspace,
+        )
+        return workspace
+
+    def _stored_target_workspace(
+        self,
+        row: object,
+        *,
+        require_current: bool,
+    ) -> TargetRunWorkspace:
+        run = (
+            self._harness.query_target_run_by_ref(str(row.target_run_ref))
+            if require_current
+            else None
+        )
         payload = {
             "target_ref": row.target_ref,
             "target_run_ref": row.target_run_ref,
@@ -4408,7 +4645,18 @@ class SQLiteTargetRunAgentAuthority:
             },
         )
         if (
-            run is None
+            row.status not in {"active", "retired"}
+            or row.root_name != canonical_hash({"workspace_ref": row.workspace_ref})
+            or row.payload_json != canonical_json(payload)
+            or row.payload_hash != payload_hash
+            or row.request_hash
+            != canonical_hash({"command": "reserve_target_run_workspace", **payload})
+            or row.receipt_hash != receipt.payload_hash
+        ):
+            raise OwnerConflict("target_run_workspace_integrity_invalid")
+        if require_current and (
+            row.status != "active"
+            or run is None
             or (run.run_ref, run.root_session_ref, run.attempt_ref, run.fence_ref)
             != (
                 row.target_run_ref,
@@ -4417,12 +4665,6 @@ class SQLiteTargetRunAgentAuthority:
                 row.target_fence_ref,
             )
             or run.request.get("target_ref") != row.target_ref
-            or row.root_name != canonical_hash({"workspace_ref": row.workspace_ref})
-            or row.payload_json != canonical_json(payload)
-            or row.payload_hash != payload_hash
-            or row.request_hash
-            != canonical_hash({"command": "reserve_target_run_workspace", **payload})
-            or row.receipt_hash != receipt.payload_hash
         ):
             raise OwnerConflict("target_run_workspace_integrity_invalid")
         return TargetRunWorkspace(
@@ -4440,6 +4682,1341 @@ class SQLiteTargetRunAgentAuthority:
             status=row.status,
             created_at=float(row.created_at),
         )
+
+    @staticmethod
+    def _verify_target_workspace_recovery_link(
+        *,
+        recovery: object,
+        predecessor: TargetRunWorkspace,
+        successor: TargetRunWorkspace,
+        handle_rows: object,
+    ) -> None:
+        handles_by_attempt = {
+            str(item.execution_attempt_ref): item for item in handle_rows
+        }
+        old_handle = handles_by_attempt.get(str(recovery.old_execution_attempt_ref))
+        new_handle = handles_by_attempt.get(str(recovery.new_execution_attempt_ref))
+        if (
+            predecessor.status != "retired"
+            or successor.status != "active"
+            or recovery.target_ref != successor.target_ref
+            or recovery.retired_workspace_ref != predecessor.workspace_ref
+            or recovery.old_execution_attempt_ref
+            != predecessor.target_attempt_ref
+            or recovery.new_execution_attempt_ref != successor.target_attempt_ref
+            or predecessor.target_ref != successor.target_ref
+            or predecessor.target_run_ref != successor.target_run_ref
+            or successor.ordinal != predecessor.ordinal + 1
+            or old_handle is None
+            or new_handle is None
+            or int(recovery.ordinal) != int(old_handle.ordinal)
+            or int(new_handle.ordinal) != int(old_handle.ordinal) + 1
+            or predecessor.ordinal != int(old_handle.ordinal)
+            or successor.ordinal != int(new_handle.ordinal)
+            or (
+                old_handle.target_run_ref,
+                old_handle.root_session_ref,
+                old_handle.execution_attempt_ref,
+                old_handle.execution_fence_ref,
+            )
+            != (
+                predecessor.target_run_ref,
+                predecessor.root_session_ref,
+                predecessor.target_attempt_ref,
+                predecessor.target_fence_ref,
+            )
+            or (
+                new_handle.target_run_ref,
+                new_handle.root_session_ref,
+                new_handle.execution_attempt_ref,
+                new_handle.execution_fence_ref,
+            )
+            != (
+                successor.target_run_ref,
+                successor.root_session_ref,
+                successor.target_attempt_ref,
+                successor.target_fence_ref,
+            )
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_integrity_invalid"
+            )
+
+    @staticmethod
+    def _verify_target_workspace_continuity_row(
+        *,
+        continuity: object,
+        recovery: object,
+        predecessor: TargetRunWorkspace,
+        successor: TargetRunWorkspace,
+    ) -> dict[str, object]:
+        manifest = _decode_target_workspace_continuity_manifest(
+            continuity.manifest_json,
+            continuity.manifest_hash,
+        )
+        payload = _target_workspace_continuity_payload(
+            continuity_ref=str(continuity.continuity_ref),
+            transition_ref=str(recovery.transition_ref),
+            target_ref=successor.target_ref,
+            predecessor_workspace_ref=predecessor.workspace_ref,
+            predecessor_workspace_payload_hash=predecessor.payload_hash,
+            successor_workspace_ref=successor.workspace_ref,
+            successor_workspace_payload_hash=successor.payload_hash,
+            manifest_hash=str(continuity.manifest_hash),
+        )
+        receipt = _receipt(
+            "agent_runtime",
+            AR_TARGET_ROOT_WORKSPACE_CONTINUITY_RECEIPT_KIND,
+            continuity.receipt_ref,
+            continuity.continuity_ref,
+            {"payload_hash": canonical_hash(payload), **payload},
+        )
+        if (
+            continuity.transition_ref != recovery.transition_ref
+            or continuity.target_ref != successor.target_ref
+            or continuity.predecessor_workspace_ref
+            != predecessor.workspace_ref
+            or continuity.successor_workspace_ref != successor.workspace_ref
+            or continuity.payload_json != canonical_json(payload)
+            or continuity.payload_hash != canonical_hash(payload)
+            or continuity.request_hash
+            != canonical_hash(
+                {
+                    "command": "accept_target_root_workspace_continuity",
+                    **payload,
+                }
+            )
+            or continuity.receipt_hash != receipt.payload_hash
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_integrity_invalid"
+            )
+        return manifest
+
+    def _ensure_target_workspace_continuity(
+        self,
+        *,
+        handle: TargetWorkHandle,
+        workspace: TargetRunWorkspace,
+    ) -> None:
+        """Copy a retired root before exposing its provider successor.
+
+        The workspace reservation and filesystem copy intentionally form a
+        receipt-last two-phase protocol.  A crash can leave an exact prefix in
+        the private successor root, but public workspace queries remain closed
+        until the complete manifest has been re-read and accepted.
+        """
+
+        with self._database.read() as connection:
+            recovery_rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_root_provider_recoveries WHERE "
+                    "target_ref = :target_ref AND new_execution_attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {
+                    "target_ref": workspace.target_ref,
+                    "attempt_ref": workspace.target_attempt_ref,
+                },
+            ).all()
+            continuity_rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_root_workspace_continuities WHERE "
+                    "successor_workspace_ref = :workspace_ref"
+                ),
+                {"workspace_ref": workspace.workspace_ref},
+            ).all()
+            predecessor_row = (
+                None
+                if len(recovery_rows) != 1
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_workspaces WHERE "
+                        "workspace_ref = :workspace_ref"
+                    ),
+                    {
+                        "workspace_ref": recovery_rows[0].retired_workspace_ref,
+                    },
+                ).first()
+            )
+            handle_rows = (
+                ()
+                if len(recovery_rows) != 1
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_root_handle_history WHERE "
+                        "target_ref = :target_ref AND execution_attempt_ref IN "
+                        "(:old_attempt_ref, :new_attempt_ref) ORDER BY ordinal"
+                    ),
+                    {
+                        "target_ref": workspace.target_ref,
+                        "old_attempt_ref": (
+                            recovery_rows[0].old_execution_attempt_ref
+                        ),
+                        "new_attempt_ref": (
+                            recovery_rows[0].new_execution_attempt_ref
+                        ),
+                    },
+                ).all()
+            )
+        if not recovery_rows:
+            if continuity_rows:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_integrity_invalid"
+                )
+            return
+        if (
+            len(recovery_rows) != 1
+            or predecessor_row is None
+            or len(handle_rows) != 2
+            or len(continuity_rows) > 1
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_integrity_invalid"
+            )
+        recovery = recovery_rows[0]
+        predecessor = self._stored_target_workspace(
+            predecessor_row,
+            require_current=False,
+        )
+        self._verify_target_workspace_recovery_link(
+            recovery=recovery,
+            predecessor=predecessor,
+            successor=workspace,
+            handle_rows=handle_rows,
+        )
+        if continuity_rows:
+            self._verify_target_workspace_continuity_row(
+                continuity=continuity_rows[0],
+                recovery=recovery,
+                predecessor=predecessor,
+                successor=workspace,
+            )
+            return
+
+        lock_fd = self._acquire_target_workspace_continuity_lock(workspace)
+        try:
+            # Another process may have completed while this process waited for
+            # the crash-released lock.  Re-open the exact row before any file
+            # publication so a stale copier can never mutate an accepted root.
+            rechecked = self._query_target_workspace_record(
+                workspace.target_run_ref,
+                allow_pending_continuity=True,
+            )
+            if rechecked is None or rechecked != workspace:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_stale"
+                )
+            with self._database.read() as connection:
+                accepted_rows = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_root_workspace_continuities "
+                        "WHERE successor_workspace_ref = :workspace_ref"
+                    ),
+                    {"workspace_ref": workspace.workspace_ref},
+                ).all()
+            if len(accepted_rows) > 1:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_integrity_invalid"
+                )
+            if accepted_rows:
+                self._verify_target_workspace_continuity_row(
+                    continuity=accepted_rows[0],
+                    recovery=recovery,
+                    predecessor=predecessor,
+                    successor=workspace,
+                )
+                return
+            manifest = self._copy_target_workspace_continuity_tree(
+                predecessor=predecessor,
+                successor=workspace,
+            )
+            self._accept_target_workspace_continuity(
+                handle=handle,
+                recovery=recovery,
+                predecessor=predecessor,
+                successor=workspace,
+                manifest=manifest,
+            )
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+    def _acquire_target_workspace_continuity_lock(
+        self,
+        workspace: TargetRunWorkspace,
+    ) -> int:
+        root_base = self._workspace_root
+        if root_base is None:
+            raise OwnerConflict("target_run_workspace_unavailable")
+        base_fd = staging_fd = lock_fd = -1
+        try:
+            base_fd = os.open(
+                root_base,
+                self._continuity_open_flags(directory=True),
+            )
+            staging_name = ".target-workspace-continuity-staging"
+            try:
+                os.mkdir(staging_name, mode=0o700, dir_fd=base_fd)
+                os.fsync(base_fd)
+            except FileExistsError:
+                pass
+            staging_fd = os.open(
+                staging_name,
+                self._continuity_open_flags(directory=True),
+                dir_fd=base_fd,
+            )
+            os.fchmod(staging_fd, 0o700)
+            lock_name = "lock-" + canonical_hash(
+                {"successor_workspace_ref": workspace.workspace_ref}
+            )
+            lock_fd = os.open(
+                lock_name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=staging_fd,
+            )
+            lock_stat = os.fstat(lock_fd)
+            if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_capability_unavailable"
+                )
+            os.fchmod(lock_fd, 0o600)
+            os.fsync(staging_fd)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            result = lock_fd
+            lock_fd = -1
+            return result
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_capability_unavailable"
+            ) from error
+        finally:
+            for descriptor in (lock_fd, staging_fd, base_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+    @staticmethod
+    def _stable_workspace_stat(stat_result: os.stat_result) -> tuple[int, ...]:
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_mode,
+            stat_result.st_nlink,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _continuity_open_flags(*, directory: bool = False) -> int:
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_capability_unavailable"
+            )
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        return flags | os.O_DIRECTORY if directory else flags
+
+    @classmethod
+    def _hash_workspace_file_at(
+        cls,
+        *,
+        parent_fd: int,
+        name: str,
+        expected_stat: os.stat_result | None = None,
+    ) -> tuple[int, int, str]:
+        file_fd = -1
+        try:
+            file_fd = os.open(
+                name,
+                cls._continuity_open_flags(),
+                dir_fd=parent_fd,
+            )
+            before = os.fstat(file_fd)
+            if not stat.S_ISREG(before.st_mode) or (
+                expected_stat is not None
+                and cls._stable_workspace_stat(before)
+                != cls._stable_workspace_stat(expected_stat)
+            ):
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_source_invalid"
+                )
+            digest = hashlib.sha256()
+            byte_count = 0
+            while True:
+                chunk = os.read(file_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                byte_count += len(chunk)
+            after = os.fstat(file_fd)
+            if (
+                cls._stable_workspace_stat(before)
+                != cls._stable_workspace_stat(after)
+                or byte_count != before.st_size
+            ):
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_source_unstable"
+                )
+            return stat.S_IMODE(before.st_mode) & 0o777, byte_count, digest.hexdigest()
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_source_invalid"
+            ) from error
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+
+    @classmethod
+    def _scan_workspace_tree_fd(
+        cls,
+        *,
+        root_fd: int,
+        require_single_file_link: bool = False,
+    ) -> dict[str, object]:
+        entries: list[dict[str, object]] = []
+        root_before = os.fstat(root_fd)
+
+        def scan(directory_fd: int, prefix: str) -> None:
+            try:
+                names = sorted(os.listdir(directory_fd))
+            except OSError as error:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_source_invalid"
+                ) from error
+            for name in names:
+                try:
+                    name.encode("utf-8", errors="strict")
+                except UnicodeEncodeError as error:
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_source_invalid"
+                    ) from error
+                if not prefix and name == "inputs":
+                    continue
+                if not name or name in {".", ".."} or "/" in name:
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_source_invalid"
+                    )
+                relative_path = name if not prefix else f"{prefix}/{name}"
+                try:
+                    before = os.stat(
+                        name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_source_invalid"
+                    ) from error
+                if before.st_dev != root_before.st_dev:
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_source_invalid"
+                    )
+                if stat.S_ISDIR(before.st_mode):
+                    child_fd = -1
+                    try:
+                        child_fd = os.open(
+                            name,
+                            cls._continuity_open_flags(directory=True),
+                            dir_fd=directory_fd,
+                        )
+                        opened = os.fstat(child_fd)
+                        if cls._stable_workspace_stat(opened) != (
+                            cls._stable_workspace_stat(before)
+                        ):
+                            raise OwnerConflict(
+                                "target_root_workspace_continuity_source_unstable"
+                            )
+                        entries.append(
+                            {
+                                "kind": "directory",
+                                "relative_path": relative_path,
+                            }
+                        )
+                        scan(child_fd, relative_path)
+                        after = os.fstat(child_fd)
+                        if cls._stable_workspace_stat(opened) != (
+                            cls._stable_workspace_stat(after)
+                        ):
+                            raise OwnerConflict(
+                                "target_root_workspace_continuity_source_unstable"
+                            )
+                    except OSError as error:
+                        raise OwnerConflict(
+                            "target_root_workspace_continuity_source_invalid"
+                        ) from error
+                    finally:
+                        if child_fd >= 0:
+                            os.close(child_fd)
+                    continue
+                if not stat.S_ISREG(before.st_mode):
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_source_invalid"
+                    )
+                if require_single_file_link and before.st_nlink != 1:
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_destination_invalid"
+                    )
+                mode, byte_count, sha256 = cls._hash_workspace_file_at(
+                    parent_fd=directory_fd,
+                    name=name,
+                    expected_stat=before,
+                )
+                entries.append(
+                    {
+                        "kind": "file",
+                        "relative_path": relative_path,
+                        "mode": mode,
+                        "byte_count": byte_count,
+                        "sha256": sha256,
+                    }
+                )
+
+        scan(root_fd, "")
+        root_after = os.fstat(root_fd)
+        if cls._stable_workspace_stat(root_before) != cls._stable_workspace_stat(
+            root_after
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_source_unstable"
+            )
+        manifest = {
+            "schema_ref": TARGET_ROOT_WORKSPACE_CONTINUITY_MANIFEST_SCHEMA_REF,
+            "excluded_top_level_paths": ["inputs"],
+            "entries": sorted(entries, key=lambda item: str(item["relative_path"])),
+        }
+        return _decode_target_workspace_continuity_manifest(
+            canonical_json(manifest),
+            canonical_hash(manifest),
+        )
+
+    @classmethod
+    def _open_workspace_relative_directory(
+        cls,
+        *,
+        root_fd: int,
+        parts: tuple[str, ...],
+        create: bool,
+    ) -> int:
+        current_fd = os.dup(root_fd)
+        try:
+            for part in parts:
+                if create:
+                    try:
+                        os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                        os.fsync(current_fd)
+                    except FileExistsError:
+                        pass
+                next_fd = os.open(
+                    part,
+                    cls._continuity_open_flags(directory=True),
+                    dir_fd=current_fd,
+                )
+                if create:
+                    os.fsync(next_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+        except (OSError, OwnerConflict) as error:
+            if current_fd >= 0:
+                os.close(current_fd)
+            if isinstance(error, OwnerConflict):
+                raise
+            raise OwnerConflict(
+                "target_root_workspace_continuity_destination_invalid"
+            ) from error
+
+    @classmethod
+    def _verify_workspace_file_entry_at(
+        cls,
+        *,
+        parent_fd: int,
+        name: str,
+        entry: dict[str, object],
+    ) -> None:
+        try:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_destination_invalid"
+            ) from error
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_destination_invalid"
+            )
+        mode, byte_count, sha256 = cls._hash_workspace_file_at(
+            parent_fd=parent_fd,
+            name=name,
+            expected_stat=before,
+        )
+        if (mode, byte_count, sha256) != (
+            entry["mode"],
+            entry["byte_count"],
+            entry["sha256"],
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_destination_invalid"
+            )
+
+    @staticmethod
+    def _workspace_staging_copy_prefix(successor_workspace_ref: str) -> str:
+        return "copy-" + hashlib.sha256(
+            successor_workspace_ref.encode("utf-8")
+        ).hexdigest() + "-"
+
+    @classmethod
+    def _workspace_staging_copy_name(
+        cls,
+        *,
+        successor_workspace_ref: str,
+        relative_path: str,
+    ) -> str:
+        return cls._workspace_staging_copy_prefix(successor_workspace_ref) + (
+            hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
+        )
+
+    @classmethod
+    def _remove_workspace_staging_alias(
+        cls,
+        *,
+        staging_fd: int,
+        destination_parent_fd: int,
+        destination_name: str,
+        successor_workspace_ref: str,
+        relative_path: str,
+        entry: dict[str, object],
+    ) -> None:
+        """Remove only the deterministic alias owned by this successor/path."""
+
+        temp_name = cls._workspace_staging_copy_name(
+            successor_workspace_ref=successor_workspace_ref,
+            relative_path=relative_path,
+        )
+        try:
+            before = os.stat(
+                temp_name,
+                dir_fd=staging_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_staging_invalid"
+            ) from error
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink not in {1, 2}:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_staging_invalid"
+            )
+
+        staged_fd = -1
+        try:
+            staged_fd = os.open(
+                temp_name,
+                cls._continuity_open_flags(),
+                dir_fd=staging_fd,
+            )
+            opened = os.fstat(staged_fd)
+            if cls._stable_workspace_stat(opened) != cls._stable_workspace_stat(
+                before
+            ):
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_staging_invalid"
+                )
+            if before.st_nlink == 2:
+                try:
+                    destination = os.stat(
+                        destination_name,
+                        dir_fd=destination_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_staging_invalid"
+                    ) from error
+                if (
+                    not stat.S_ISREG(destination.st_mode)
+                    or destination.st_nlink != 2
+                    or (destination.st_dev, destination.st_ino)
+                    != (before.st_dev, before.st_ino)
+                ):
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_staging_invalid"
+                    )
+                mode, byte_count, sha256 = cls._hash_workspace_file_at(
+                    parent_fd=staging_fd,
+                    name=temp_name,
+                    expected_stat=before,
+                )
+                if (mode, byte_count, sha256) != (
+                    entry["mode"],
+                    entry["byte_count"],
+                    entry["sha256"],
+                ):
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_staging_invalid"
+                    )
+                # The destination directory entry may have been published by
+                # the prior process immediately before it crashed.  Persist
+                # that name before persisting removal of its staging alias, so
+                # another crash cannot lose both names for the same inode.
+                os.fsync(destination_parent_fd)
+            current = os.stat(
+                temp_name,
+                dir_fd=staging_fd,
+                follow_symlinks=False,
+            )
+            if cls._stable_workspace_stat(current) != cls._stable_workspace_stat(
+                opened
+            ):
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_staging_invalid"
+                )
+            os.unlink(temp_name, dir_fd=staging_fd)
+            os.fsync(staging_fd)
+            after = os.fstat(staged_fd)
+            if after.st_nlink != before.st_nlink - 1:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_staging_invalid"
+                )
+            if before.st_nlink == 2:
+                destination_after = os.stat(
+                    destination_name,
+                    dir_fd=destination_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(destination_after.st_mode)
+                    or destination_after.st_nlink != 1
+                    or (destination_after.st_dev, destination_after.st_ino)
+                    != (before.st_dev, before.st_ino)
+                ):
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_staging_invalid"
+                    )
+            try:
+                os.stat(
+                    temp_name,
+                    dir_fd=staging_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_staging_invalid"
+                )
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_staging_invalid"
+            ) from error
+        finally:
+            if staged_fd >= 0:
+                os.close(staged_fd)
+
+    @classmethod
+    def _assert_no_workspace_staging_aliases(
+        cls,
+        *,
+        staging_fd: int,
+        successor_workspace_ref: str,
+    ) -> None:
+        prefix = cls._workspace_staging_copy_prefix(successor_workspace_ref)
+        try:
+            os.fsync(staging_fd)
+            names = tuple(
+                name for name in os.listdir(staging_fd) if name.startswith(prefix)
+            )
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_staging_invalid"
+            ) from error
+        for name in names:
+            staged_fd = -1
+            try:
+                before = os.stat(
+                    name,
+                    dir_fd=staging_fd,
+                    follow_symlinks=False,
+                )
+                staged_fd = os.open(
+                    name,
+                    cls._continuity_open_flags(),
+                    dir_fd=staging_fd,
+                )
+                opened = os.fstat(staged_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or cls._stable_workspace_stat(before)
+                    != cls._stable_workspace_stat(opened)
+                ):
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_staging_invalid"
+                    )
+            except OSError as error:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_staging_invalid"
+                ) from error
+            finally:
+                if staged_fd >= 0:
+                    os.close(staged_fd)
+        if names:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_staging_invalid"
+            )
+
+    @classmethod
+    def _copy_workspace_file_entry(
+        cls,
+        *,
+        source_root_fd: int,
+        destination_root_fd: int,
+        staging_fd: int,
+        successor_workspace_ref: str,
+        entry: dict[str, object],
+    ) -> None:
+        relative_path = str(entry["relative_path"])
+        parts = tuple(relative_path.split("/"))
+        source_parent_fd = cls._open_workspace_relative_directory(
+            root_fd=source_root_fd,
+            parts=parts[:-1],
+            create=False,
+        )
+        destination_parent_fd = cls._open_workspace_relative_directory(
+            root_fd=destination_root_fd,
+            parts=parts[:-1],
+            create=True,
+        )
+        name = parts[-1]
+        temp_name = cls._workspace_staging_copy_name(
+            successor_workspace_ref=successor_workspace_ref,
+            relative_path=relative_path,
+        )
+        try:
+            cls._remove_workspace_staging_alias(
+                staging_fd=staging_fd,
+                destination_parent_fd=destination_parent_fd,
+                destination_name=name,
+                successor_workspace_ref=successor_workspace_ref,
+                relative_path=relative_path,
+                entry=entry,
+            )
+            try:
+                cls._verify_workspace_file_entry_at(
+                    parent_fd=destination_parent_fd,
+                    name=name,
+                    entry=entry,
+                )
+                os.fsync(destination_parent_fd)
+                return
+            except FileNotFoundError:
+                pass
+
+            source_fd = -1
+            temp_fd = -1
+            temp_exists = False
+            try:
+                source_fd = os.open(
+                    name,
+                    cls._continuity_open_flags(),
+                    dir_fd=source_parent_fd,
+                )
+                source_before = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(source_before.st_mode)
+                    or stat.S_IMODE(source_before.st_mode) & 0o777
+                    != entry["mode"]
+                    or source_before.st_size != entry["byte_count"]
+                ):
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_source_unstable"
+                    )
+                temp_fd = os.open(
+                    temp_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=staging_fd,
+                )
+                temp_exists = True
+                digest = hashlib.sha256()
+                byte_count = 0
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    byte_count += len(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(temp_fd, view)
+                        if written <= 0:
+                            raise OSError(errno.EIO, "short continuity write")
+                        view = view[written:]
+                source_after = os.fstat(source_fd)
+                if (
+                    cls._stable_workspace_stat(source_before)
+                    != cls._stable_workspace_stat(source_after)
+                    or byte_count != entry["byte_count"]
+                    or digest.hexdigest() != entry["sha256"]
+                ):
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_source_unstable"
+                    )
+                os.fchmod(temp_fd, int(entry["mode"]))
+                os.fsync(temp_fd)
+                os.close(temp_fd)
+                temp_fd = -1
+                try:
+                    os.link(
+                        temp_name,
+                        name,
+                        src_dir_fd=staging_fd,
+                        dst_dir_fd=destination_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    cls._verify_workspace_file_entry_at(
+                        parent_fd=destination_parent_fd,
+                        name=name,
+                        entry=entry,
+                    )
+                os.fsync(destination_parent_fd)
+                cls._remove_workspace_staging_alias(
+                    staging_fd=staging_fd,
+                    destination_parent_fd=destination_parent_fd,
+                    destination_name=name,
+                    successor_workspace_ref=successor_workspace_ref,
+                    relative_path=relative_path,
+                    entry=entry,
+                )
+                temp_exists = False
+                cls._verify_workspace_file_entry_at(
+                    parent_fd=destination_parent_fd,
+                    name=name,
+                    entry=entry,
+                )
+                os.fsync(destination_parent_fd)
+            except OSError as error:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_capability_unavailable"
+                ) from error
+            finally:
+                if source_fd >= 0:
+                    os.close(source_fd)
+                if temp_fd >= 0:
+                    os.close(temp_fd)
+                if temp_exists:
+                    cls._remove_workspace_staging_alias(
+                        staging_fd=staging_fd,
+                        destination_parent_fd=destination_parent_fd,
+                        destination_name=name,
+                        successor_workspace_ref=successor_workspace_ref,
+                        relative_path=relative_path,
+                        entry=entry,
+                    )
+        finally:
+            os.close(source_parent_fd)
+            os.close(destination_parent_fd)
+
+    def _copy_target_workspace_continuity_tree(
+        self,
+        *,
+        predecessor: TargetRunWorkspace,
+        successor: TargetRunWorkspace,
+    ) -> dict[str, object]:
+        root_base = self._workspace_root
+        if root_base is None:
+            raise OwnerConflict("target_run_workspace_unavailable")
+        required_dir_fd_functions = (os.open, os.stat, os.mkdir, os.unlink, os.link)
+        if (
+            os.listdir not in os.supports_fd
+            or any(function not in os.supports_dir_fd for function in required_dir_fd_functions)
+        ):
+            raise OwnerConflict(
+                "target_root_workspace_continuity_capability_unavailable"
+            )
+        base_fd = source_fd = destination_fd = staging_fd = -1
+        try:
+            base_fd = os.open(
+                root_base,
+                self._continuity_open_flags(directory=True),
+            )
+            source_fd = os.open(
+                canonical_hash({"workspace_ref": predecessor.workspace_ref}),
+                self._continuity_open_flags(directory=True),
+                dir_fd=base_fd,
+            )
+            destination_fd = os.open(
+                canonical_hash({"workspace_ref": successor.workspace_ref}),
+                self._continuity_open_flags(directory=True),
+                dir_fd=base_fd,
+            )
+            staging_name = ".target-workspace-continuity-staging"
+            try:
+                os.mkdir(staging_name, mode=0o700, dir_fd=base_fd)
+                os.fsync(base_fd)
+            except FileExistsError:
+                pass
+            staging_fd = os.open(
+                staging_name,
+                self._continuity_open_flags(directory=True),
+                dir_fd=base_fd,
+            )
+            os.fchmod(staging_fd, 0o700)
+            self._verify_continuity_inputs_directory(
+                root_fd=source_fd,
+                require_empty=False,
+            )
+            self._verify_continuity_inputs_directory(
+                root_fd=destination_fd,
+                require_empty=True,
+            )
+            source_manifest = self._scan_workspace_tree_fd(root_fd=source_fd)
+            for entry in source_manifest["entries"]:
+                if entry["kind"] != "directory":
+                    continue
+                directory_fd = self._open_workspace_relative_directory(
+                    root_fd=destination_fd,
+                    parts=tuple(str(entry["relative_path"]).split("/")),
+                    create=True,
+                )
+                os.close(directory_fd)
+            for entry in source_manifest["entries"]:
+                if entry["kind"] == "file":
+                    self._copy_workspace_file_entry(
+                        source_root_fd=source_fd,
+                        destination_root_fd=destination_fd,
+                        staging_fd=staging_fd,
+                        successor_workspace_ref=successor.workspace_ref,
+                        entry=entry,
+                    )
+            source_after = self._scan_workspace_tree_fd(root_fd=source_fd)
+            destination_manifest = self._scan_workspace_tree_fd(
+                root_fd=destination_fd,
+                require_single_file_link=True,
+            )
+            self._verify_continuity_inputs_directory(
+                root_fd=destination_fd,
+                require_empty=True,
+            )
+            if (
+                source_after != source_manifest
+                or destination_manifest != source_manifest
+            ):
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_source_unstable"
+                )
+            self._assert_no_workspace_staging_aliases(
+                staging_fd=staging_fd,
+                successor_workspace_ref=successor.workspace_ref,
+            )
+            os.fsync(destination_fd)
+            os.fsync(base_fd)
+            return source_manifest
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_capability_unavailable"
+            ) from error
+        finally:
+            for descriptor in (staging_fd, destination_fd, source_fd, base_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+    @classmethod
+    def _verify_continuity_inputs_directory(
+        cls,
+        *,
+        root_fd: int,
+        require_empty: bool,
+    ) -> None:
+        inputs_fd = -1
+        try:
+            inputs_fd = os.open(
+                "inputs",
+                cls._continuity_open_flags(directory=True),
+                dir_fd=root_fd,
+            )
+            if require_empty and os.listdir(inputs_fd):
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_destination_invalid"
+                )
+            if require_empty:
+                os.fsync(inputs_fd)
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_source_invalid"
+            ) from error
+        finally:
+            if inputs_fd >= 0:
+                os.close(inputs_fd)
+
+    def _verify_no_target_workspace_staging_aliases(
+        self,
+        successor_workspace_ref: str,
+    ) -> None:
+        root_base = self._workspace_root
+        if root_base is None:
+            raise OwnerConflict("target_run_workspace_unavailable")
+        base_fd = staging_fd = -1
+        try:
+            base_fd = os.open(
+                root_base,
+                self._continuity_open_flags(directory=True),
+            )
+            staging_fd = os.open(
+                ".target-workspace-continuity-staging",
+                self._continuity_open_flags(directory=True),
+                dir_fd=base_fd,
+            )
+            self._assert_no_workspace_staging_aliases(
+                staging_fd=staging_fd,
+                successor_workspace_ref=successor_workspace_ref,
+            )
+        except OSError as error:
+            raise OwnerConflict(
+                "target_root_workspace_continuity_staging_invalid"
+            ) from error
+        finally:
+            for descriptor in (staging_fd, base_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+    def _accept_target_workspace_continuity(
+        self,
+        *,
+        handle: TargetWorkHandle,
+        recovery: object,
+        predecessor: TargetRunWorkspace,
+        successor: TargetRunWorkspace,
+        manifest: dict[str, object],
+    ) -> None:
+        self._verify_no_target_workspace_staging_aliases(
+            successor.workspace_ref
+        )
+        manifest_json = canonical_json(manifest)
+        manifest_hash = canonical_hash(manifest)
+        continuity_ref = new_ref("target_root_workspace_continuity")
+        payload = _target_workspace_continuity_payload(
+            continuity_ref=continuity_ref,
+            transition_ref=str(recovery.transition_ref),
+            target_ref=successor.target_ref,
+            predecessor_workspace_ref=predecessor.workspace_ref,
+            predecessor_workspace_payload_hash=predecessor.payload_hash,
+            successor_workspace_ref=successor.workspace_ref,
+            successor_workspace_payload_hash=successor.payload_hash,
+            manifest_hash=manifest_hash,
+        )
+        payload_hash = canonical_hash(payload)
+        request_hash = canonical_hash(
+            {"command": "accept_target_root_workspace_continuity", **payload}
+        )
+        receipt = _receipt(
+            "agent_runtime",
+            AR_TARGET_ROOT_WORKSPACE_CONTINUITY_RECEIPT_KIND,
+            new_ref("ar_target_root_workspace_continuity_receipt"),
+            continuity_ref,
+            {"payload_hash": payload_hash, **payload},
+        )
+        now = time.time()
+        try:
+            with self._database.fenced_write() as connection:
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_root_workspace_continuities "
+                        "WHERE transition_ref = :transition_ref OR "
+                        "successor_workspace_ref = :successor_workspace_ref"
+                    ),
+                    {
+                        "transition_ref": recovery.transition_ref,
+                        "successor_workspace_ref": successor.workspace_ref,
+                    },
+                ).first()
+                if existing is not None:
+                    if (
+                        existing.transition_ref != recovery.transition_ref
+                        or existing.successor_workspace_ref
+                        != successor.workspace_ref
+                        or existing.manifest_json != manifest_json
+                        or existing.manifest_hash != manifest_hash
+                    ):
+                        raise OwnerConflict(
+                            "target_root_workspace_continuity_conflict"
+                        )
+                    return
+                persisted_recovery = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_root_provider_recoveries WHERE "
+                        "transition_ref = :transition_ref"
+                    ),
+                    {"transition_ref": recovery.transition_ref},
+                ).first()
+                old_workspace = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_workspaces WHERE "
+                        "workspace_ref = :workspace_ref"
+                    ),
+                    {"workspace_ref": predecessor.workspace_ref},
+                ).first()
+                new_workspace = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_workspaces WHERE "
+                        "workspace_ref = :workspace_ref"
+                    ),
+                    {"workspace_ref": successor.workspace_ref},
+                ).first()
+                lifecycle = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_root_lifecycles WHERE "
+                        "target_ref = :target_ref"
+                    ),
+                    {"target_ref": successor.target_ref},
+                ).first()
+                frontier = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_frontier_entries WHERE "
+                        "target_ref = :target_ref"
+                    ),
+                    {"target_ref": successor.target_ref},
+                ).first()
+                harness_run = connection.execute(
+                    text(
+                        "SELECT * FROM ar_harness_runs WHERE run_ref = :run_ref"
+                    ),
+                    {"run_ref": successor.target_run_ref},
+                ).first()
+                handle_json = canonical_json(projection_plain_value(handle))
+                if (
+                    persisted_recovery is None
+                    or old_workspace is None
+                    or new_workspace is None
+                    or lifecycle is None
+                    or frontier is None
+                    or harness_run is None
+                    or persisted_recovery.target_ref != successor.target_ref
+                    or persisted_recovery.retired_workspace_ref
+                    != predecessor.workspace_ref
+                    or persisted_recovery.old_execution_attempt_ref
+                    != predecessor.target_attempt_ref
+                    or persisted_recovery.new_execution_attempt_ref
+                    != successor.target_attempt_ref
+                    or old_workspace.status != "retired"
+                    or old_workspace.payload_hash != predecessor.payload_hash
+                    or new_workspace.status != "active"
+                    or new_workspace.payload_hash != successor.payload_hash
+                    or lifecycle.status != "running"
+                    or lifecycle.completion_ref is not None
+                    or lifecycle.cancel_ref is not None
+                    or (
+                        lifecycle.target_run_ref,
+                        lifecycle.root_session_ref,
+                        lifecycle.target_attempt_ref,
+                        lifecycle.target_fence_ref,
+                    )
+                    != (
+                        handle.target_run_ref,
+                        handle.root_session_ref,
+                        handle.execution_attempt_ref,
+                        handle.execution_fence_ref,
+                    )
+                    or frontier.state != "running"
+                    or frontier.terminal_fact_ref is not None
+                    or bool(frontier.currentness_known) is not True
+                    or bool(frontier.current) is not True
+                    or frontier.current_handle_json != handle_json
+                    or frontier.current_handle_hash
+                    != canonical_hash(projection_plain_value(handle))
+                    or (
+                        harness_run.run_ref,
+                        harness_run.root_session_ref,
+                        harness_run.attempt_ref,
+                        harness_run.fence_ref,
+                    )
+                    != (
+                        handle.target_run_ref,
+                        handle.root_session_ref,
+                        handle.execution_attempt_ref,
+                        handle.execution_fence_ref,
+                    )
+                    or harness_run.status not in {"admitted", "running"}
+                ):
+                    raise OwnerConflict(
+                        "target_root_workspace_continuity_stale"
+                    )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_root_workspace_continuities "
+                        "(continuity_ref, transition_ref, target_ref, "
+                        "predecessor_workspace_ref, successor_workspace_ref, "
+                        "manifest_json, manifest_hash, payload_json, payload_hash, "
+                        "request_hash, receipt_ref, receipt_hash, accepted_at) "
+                        "VALUES (:continuity_ref, :transition_ref, :target_ref, "
+                        ":predecessor_workspace_ref, :successor_workspace_ref, "
+                        ":manifest_json, :manifest_hash, :payload_json, "
+                        ":payload_hash, :request_hash, :receipt_ref, "
+                        ":receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        "continuity_ref": continuity_ref,
+                        "transition_ref": recovery.transition_ref,
+                        "target_ref": successor.target_ref,
+                        "predecessor_workspace_ref": predecessor.workspace_ref,
+                        "successor_workspace_ref": successor.workspace_ref,
+                        "manifest_json": manifest_json,
+                        "manifest_hash": manifest_hash,
+                        "payload_json": canonical_json(payload),
+                        "payload_hash": payload_hash,
+                        "request_hash": request_hash,
+                        "receipt_ref": receipt.receipt_ref,
+                        "receipt_hash": receipt.payload_hash,
+                        "accepted_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.target_root_workspace_continuity_accepted",
+                    {
+                        "continuity_ref": continuity_ref,
+                        "transition_ref": recovery.transition_ref,
+                        "target_ref": successor.target_ref,
+                        "predecessor_workspace_ref": predecessor.workspace_ref,
+                        "successor_workspace_ref": successor.workspace_ref,
+                        "manifest_hash": manifest_hash,
+                        "receipt_ref": receipt.receipt_ref,
+                    },
+                )
+        except IntegrityError:
+            with self._database.read() as connection:
+                persisted = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_root_workspace_continuities "
+                        "WHERE successor_workspace_ref = :workspace_ref"
+                    ),
+                    {"workspace_ref": successor.workspace_ref},
+                ).first()
+            if (
+                persisted is None
+                or persisted.transition_ref != recovery.transition_ref
+                or persisted.manifest_json != manifest_json
+                or persisted.manifest_hash != manifest_hash
+            ):
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_conflict"
+                )
+            accepted = self.query_target_workspace(successor.target_run_ref)
+            if accepted is None or accepted.workspace_ref != successor.workspace_ref:
+                raise OwnerConflict(
+                    "target_root_workspace_continuity_conflict"
+                )
 
     def resolve_target_workspace(
         self,
@@ -4991,8 +6568,11 @@ class SQLiteTargetRunAgentAuthority:
             ).first()
             retired = connection.execute(
                 text(
-                    "SELECT identity_ref FROM ar_target_retired_identities WHERE "
-                    "identity_ref IN (:root_ref, :attempt_ref, :fence_ref)"
+                    "SELECT identity_ref FROM ar_target_retired_identities "
+                    "WHERE identity_ref IN (:root_ref, :attempt_ref, "
+                    ":fence_ref) UNION SELECT identity_ref FROM "
+                    "ar_target_root_retired_identities WHERE identity_ref IN "
+                    "(:root_ref, :attempt_ref, :fence_ref)"
                 ),
                 {
                     "root_ref": handle.root_session_ref,
@@ -5186,7 +6766,11 @@ class SQLiteTargetRunAgentAuthority:
             retired = {
                 row.identity_ref
                 for row in connection.execute(
-                    text("SELECT identity_ref FROM ar_target_retired_identities")
+                    text(
+                        "SELECT identity_ref FROM ar_target_retired_identities "
+                        "UNION SELECT identity_ref FROM "
+                        "ar_target_root_retired_identities"
+                    )
                 ).all()
             }
         if run is None or binding is None or launch is None or (
@@ -5235,6 +6819,264 @@ class SQLiteTargetRunAgentAuthority:
         ):
             raise OwnerConflict("target_run_recovery_successor_invalid")
         return replacement_handle
+
+    def query_target_provider_ceiling_recovery(
+        self, old_handle: TargetWorkHandle
+    ) -> TargetProviderCeilingRecoveryProjection:
+        """Build one successor only from Harness's signed ceiling evidence."""
+
+        validate_target_work_handle(
+            old_handle,
+            target_ref=old_handle.target_ref,
+            accepted_input_target_commit_refs=(
+                old_handle.accepted_input_target_commit_refs
+            ),
+            accepted_input_asset_refs=tuple(
+                proof.asset_ref for proof in old_handle.accepted_input_asset_proofs
+            ),
+        )
+        try:
+            reservation, evidence = (
+                self._harness.verify_target_provider_ceiling_successor(
+                    old_handle=old_handle
+                )
+            )
+        except Exception as error:
+            raise OwnerConflict(
+                "target_provider_ceiling_recovery_invalid"
+            ) from error
+        binding = self._graph.query_execution_input_binding_for_attempt(
+            target_ref=old_handle.target_ref,
+            target_run_ref=old_handle.target_run_ref,
+            target_attempt_ref=reservation.new_attempt_ref,
+            target_fence_ref=reservation.new_fence_ref,
+        )
+        if binding is None:
+            raise OwnerConflict("target_provider_ceiling_input_binding_required")
+        replacement_handle = TargetWorkHandle(
+            target_ref=old_handle.target_ref,
+            target_run_ref=old_handle.target_run_ref,
+            root_session_ref=reservation.new_root_session_ref,
+            execution_attempt_ref=reservation.new_attempt_ref,
+            execution_fence_ref=reservation.new_fence_ref,
+            execution_input_binding_ref=binding.proof.binding_ref,
+            execution_input_binding_receipt=binding.proof.acceptance_receipt,
+            accepted_input_target_commit_refs=(
+                old_handle.accepted_input_target_commit_refs
+            ),
+            accepted_input_asset_proofs=old_handle.accepted_input_asset_proofs,
+            recoverable=True,
+        )
+        verified = self.verify_target_run_recovery_successor(
+            old_handle,
+            replacement_handle,
+            reservation.recovery_ref,
+        )
+        if verified != replacement_handle:
+            raise OwnerConflict("target_provider_ceiling_recovery_invalid")
+        blocker = self._canonical_provider_ceiling_blocker(old_handle, evidence)
+        return TargetProviderCeilingRecoveryProjection(
+            reservation=reservation,
+            evidence=evidence,
+            blocker=blocker,
+            replacement_handle=replacement_handle,
+        )
+
+    def verify_target_provider_ceiling_recovery_history(
+        self,
+        *,
+        old_handle: TargetWorkHandle,
+        replacement_handle: TargetWorkHandle,
+        blocker: TechnicalBlocker,
+        reservation: AgentRuntimeTargetSuccessorReservation,
+        evidence: AgentRuntimeTargetProviderCeilingEvidence,
+    ) -> TargetProviderCeilingRecoveryProjection:
+        """Re-open both Harness issuances for one append-only root transition."""
+
+        try:
+            current_evidence = (
+                self._harness.verify_target_provider_ceiling_history(
+                    old_handle=old_handle,
+                    reservation=reservation,
+                    evidence=evidence,
+                )
+            )
+        except Exception as error:
+            raise OwnerConflict(
+                "target_provider_ceiling_recovery_history_invalid"
+            ) from error
+        validate_target_work_handle(
+            old_handle,
+            target_ref=old_handle.target_ref,
+            accepted_input_target_commit_refs=(
+                old_handle.accepted_input_target_commit_refs
+            ),
+            accepted_input_asset_refs=tuple(
+                proof.asset_ref for proof in old_handle.accepted_input_asset_proofs
+            ),
+        )
+        validate_target_work_handle(
+            replacement_handle,
+            target_ref=old_handle.target_ref,
+            accepted_input_target_commit_refs=(
+                old_handle.accepted_input_target_commit_refs
+            ),
+            accepted_input_asset_refs=tuple(
+                proof.asset_ref for proof in old_handle.accepted_input_asset_proofs
+            ),
+        )
+        old_binding = self._graph.query_execution_input_binding(
+            old_handle.execution_input_binding_ref
+        )
+        replacement_binding = self._graph.query_execution_input_binding(
+            replacement_handle.execution_input_binding_ref
+        )
+        run = self._harness.query_target_run_by_ref(old_handle.target_run_ref)
+        query_launch = getattr(
+            self._execution_verifier, "query_admitted_target_launch", None
+        )
+        launch = (
+            None
+            if not callable(query_launch)
+            else query_launch(old_handle.target_ref)
+        )
+        expected_input_refs = tuple(
+            sorted(
+                (
+                    *old_handle.accepted_input_target_commit_refs,
+                    *(
+                        proof.asset_ref
+                        for proof in old_handle.accepted_input_asset_proofs
+                    ),
+                )
+            )
+        )
+        expected_blocker = self._canonical_provider_ceiling_blocker(
+            old_handle, current_evidence
+        )
+        if (
+            blocker != expected_blocker
+            or run is None
+            or launch is None
+            or old_binding is None
+            or replacement_binding is None
+        ):
+            raise OwnerConflict(
+                "target_provider_ceiling_recovery_history_invalid"
+            )
+        if (
+            run.request.get("target_ref") != old_handle.target_ref
+            or run.request.get("target_scope_binding_hash")
+            != old_binding.target_scope_binding_hash
+            or (
+                replacement_handle.root_session_ref,
+                replacement_handle.execution_attempt_ref,
+                replacement_handle.execution_fence_ref,
+            )
+            != (
+                reservation.new_root_session_ref,
+                reservation.new_attempt_ref,
+                reservation.new_fence_ref,
+            )
+            or replacement_handle.target_ref != old_handle.target_ref
+            or replacement_handle.target_run_ref != old_handle.target_run_ref
+            or replacement_handle.accepted_input_target_commit_refs
+            != old_handle.accepted_input_target_commit_refs
+            or replacement_handle.accepted_input_asset_proofs
+            != old_handle.accepted_input_asset_proofs
+            or (
+                old_binding.target_ref,
+                old_binding.target_run_ref,
+                old_binding.target_attempt_ref,
+                old_binding.target_fence_ref,
+                old_binding.target_spec_hash,
+                old_binding.proof.subject_ref,
+                old_binding.proof.input_refs,
+            )
+            != (
+                old_handle.target_ref,
+                old_handle.target_run_ref,
+                old_handle.execution_attempt_ref,
+                old_handle.execution_fence_ref,
+                launch.request.target_spec_binding.content_hash_ref,
+                old_handle.execution_attempt_ref,
+                expected_input_refs,
+            )
+            or old_binding.proof.acceptance_receipt
+            != old_handle.execution_input_binding_receipt
+            or replacement_binding.proof.acceptance_receipt
+            != replacement_handle.execution_input_binding_receipt
+            or (
+                replacement_binding.target_ref,
+                replacement_binding.target_run_ref,
+                replacement_binding.target_attempt_ref,
+                replacement_binding.target_fence_ref,
+                replacement_binding.target_spec_hash,
+                replacement_binding.target_scope_binding_hash,
+                replacement_binding.proof.subject_ref,
+                replacement_binding.proof.input_refs,
+            )
+            != (
+                replacement_handle.target_ref,
+                replacement_handle.target_run_ref,
+                replacement_handle.execution_attempt_ref,
+                replacement_handle.execution_fence_ref,
+                launch.request.target_spec_binding.content_hash_ref,
+                old_binding.target_scope_binding_hash,
+                replacement_handle.execution_attempt_ref,
+                expected_input_refs,
+            )
+        ):
+            raise OwnerConflict(
+                "target_provider_ceiling_recovery_history_invalid"
+            )
+        return TargetProviderCeilingRecoveryProjection(
+            reservation=reservation,
+            evidence=current_evidence,
+            blocker=expected_blocker,
+            replacement_handle=replacement_handle,
+        )
+
+    @staticmethod
+    def _canonical_provider_ceiling_blocker(
+        handle: TargetWorkHandle,
+        evidence: AgentRuntimeTargetProviderCeilingEvidence,
+    ) -> TechnicalBlocker:
+        digest = canonical_hash(
+            {
+                "recovery_ref": evidence.recovery_ref,
+                "failed_provider_operation_ref": evidence.failed_operation_ref,
+                "failure_code": evidence.failure_code,
+                "transport_receipt_hash": evidence.transport_receipt_hash,
+                "provider_evidence_hash": evidence.evidence_hash,
+            }
+        )
+        blocker_ref = "target-ceiling:" + digest
+        return TechnicalBlocker(
+            target_ref=handle.target_ref,
+            target_run_ref=handle.target_run_ref,
+            execution_attempt_ref=handle.execution_attempt_ref,
+            execution_fence_ref=handle.execution_fence_ref,
+            blocker_ref=blocker_ref,
+            blocker_receipt=ReceiptProof(
+                receipt_ref="target-ceiling-blocker:" + digest,
+                subject_ref=blocker_ref,
+                verified=True,
+                currentness_known=True,
+                current=True,
+            ),
+            reason=evidence.failure_code,
+            recovery_ready=True,
+            old_session_fenced=True,
+            recovery_pack_complete=True,
+            recovery_receipt=ReceiptProof(
+                receipt_ref="target-ceiling-recovery:" + digest,
+                subject_ref=blocker_ref,
+                verified=True,
+                currentness_known=True,
+                current=True,
+            ),
+        )
 
     def query_target_execution_failure(
         self,

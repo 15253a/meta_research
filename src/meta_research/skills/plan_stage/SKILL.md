@@ -36,13 +36,13 @@ description: 从当前 accepted Question binding 与完整 accepted IdeaSet 形�
 
 完成标准：AnswerContract、EvidenceReuseSet、coverage、GapSet、Brief 与 IdeaTrace 彼此闭合。
 
-## 4. 独立质询
+## 4. 根会合质询
 
-1. 首次正式提交前，在当前 managed native Session 内使用 Harness 原生 `spawn_agent`，以 `fork_turns="none"` 启动一个全新上下文的短命 child reviewer，并 `wait` 到完成。
-2. 只交付冻结闭包和完整草稿。Reviewer 检查 Question 对齐、obligation/Idea 完整性、Evidence 支持边界、gap/Brief 闭合和 Owner 权限边界；它不批准内容。
-3. 根 Agent 在同一个 resumed turn 中对每条 finding 给出唯一 `revised | not_adopted` disposition，并返回最终完整 PlanDocument。`revised` 必须产生实质变化。
+1. Owner 保存 primary draft checkpoint 后，在同一 managed native 根 Session 发起第二个 provider turn，只处理冻结闭包和完整草稿。
+2. 根 Agent 重新检查 Question 对齐、obligation/Idea 完整性、Evidence 支持边界、gap/Brief 闭合和 Owner 权限边界，形成 bounded findings；它不批准内容。
+3. 对每条 finding 给出唯一 `revised | not_adopted` disposition，并返回最终完整 PlanDocument。`revised` 必须产生实质变化。当前 record 固定为 `advisory_unobserved`、null reviewer、`independent=false`。
 
-完成标准：Harness trace 证明一个 fresh child reviewer，且每条 finding 均有处置。
+完成标准：真实第二个 provider turn 已完成并绑定 response hash，且每条 finding 均有处置。
 
 ## 5. 提交与恢复
 

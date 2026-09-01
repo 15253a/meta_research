@@ -8,6 +8,7 @@ import subprocess
 from typing import Callable, Protocol, cast
 from urllib.parse import urlsplit
 
+from meta_research.codex_ledger import CodexSessionLedgerReader
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
@@ -25,13 +26,16 @@ from meta_research.idea_skill import (
     _codex_harness_manifest,
     _file_sha256,
     _shared_codex_adapter_source_hash,
-    _verify_child_review_trace,
-    _verify_primary_phase_trace,
 )
 from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
+from meta_research.root_capabilities import (
+    ROOT_ROLE_OPERATION_DELTAS,
+    merge_root_capability_bindings,
+    root_operation_catalog,
+)
 from meta_research.reasoning_contract import (
     AUTONOMOUS_QUESTION_SCOPE_SCHEMA_REF,
     CANDIDATE_COMPLETION_SCHEMA_REF,
@@ -47,6 +51,7 @@ from meta_research.reasoning_contract import (
     validate_reasoning_stage_output,
     validate_scientific_outcome,
 )
+from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 
 
 ReasoningSkillContractError = ReasoningContractError
@@ -56,17 +61,19 @@ REASONING_PROVIDER_TRANSPORT_LIMITS = ProviderTransportLimits(
     stream_max_bytes=64 * 1024 * 1024,
     result_max_bytes=16 * 1024 * 1024,
 )
-REASONING_ROOT_SEMANTIC_OPERATION_IDS = (
-    "advancement_engine.reasoning_stage_run.observe",
-    "research_memory.reasoning_evidence.read",
-    "research_graph.reasoning_context.read",
+_REASONING_REQUIRED_SEMANTIC_OPERATION_IDS = ROOT_ROLE_OPERATION_DELTAS[
+    "reasoning"
+]
+REASONING_ROOT_SEMANTIC_OPERATION_IDS = root_operation_catalog(
+    "reasoning",
+    common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
 )
 _REASONING_CURRENTNESS_OPERATION_ID = (
     "advancement_engine.reasoning_stage_run.observe"
 )
-_FULL_CONFORMANCE_CAPABILITY = "harness-full-conformance-v1"
-_FULL_CONFORMANCE_MCP_PREFIX = "harness-full-conformance:semantic-mcp-"
-_FULL_CONFORMANCE_RESOURCE_PREFIX = "harness-artifact:full-conformance-"
+_FULL_CONFORMANCE_CAPABILITY = "harness-operation-binding-v1"
+_FULL_CONFORMANCE_MCP_PREFIX = "harness-operation-binding:semantic-mcp-"
+_FULL_CONFORMANCE_RESOURCE_PREFIX = "harness-artifact:operation-binding-"
 REASONING_REVIEW_CATEGORIES = frozenset(
     {
         "source_binding",
@@ -85,11 +92,22 @@ _DIAGNOSTIC_EVIDENCE_KINDS = frozenset(
 
 
 class ReasoningFullConformanceAuthority(Protocol):
+    def require_operation_binding(
+        self,
+        *,
+        harness_family: str,
+        required_operation_ids: tuple[str, ...],
+        required_capabilities: tuple[str, ...],
+    ) -> FullConformanceBinding: ...
+
     def require_full_conformance_binding(self) -> FullConformanceBinding: ...
 
     def issue_resident_mcp_channel(
         self,
         *,
+        root_kind: str,
+        phase: str,
+        subject_policy: str,
         run_ref: str,
         attempt_ref: str,
         root_session_ref: str,
@@ -105,7 +123,7 @@ def bind_reasoning_runtime_to_full_conformance(
     binding: ReasoningRuntimeBinding,
     conformance: FullConformanceBinding,
 ) -> ReasoningRuntimeBinding:
-    """Freeze the current Harness evidence into one Reasoning binding."""
+    """Freeze the operation-local Harness binding into Reasoning admission."""
 
     mcp_bindings = tuple(
         item
@@ -134,9 +152,9 @@ def bind_reasoning_runtime_to_full_conformance(
         for item in binding.resource_bindings
         if not item.startswith(_FULL_CONFORMANCE_RESOURCE_PREFIX)
     ) + (
-        "harness-artifact:full-conformance-contract:"
+        "harness-artifact:operation-binding-contract:"
         f"{conformance.contract_ref}@sha256:{conformance.contract_hash}",
-        "harness-artifact:full-conformance-set:"
+        "harness-artifact:operation-binding-set:"
         f"{conformance.conformance_ref}@sha256:{conformance.binding_hash}",
         *conformance.profile_receipts,
     )
@@ -186,7 +204,7 @@ class ReasoningSkillResult:
     dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
-    reviewer_agent_ref: str
+    reviewer_agent_ref: str | None
     adapter_kind: str
 
     def outcome_document(self) -> dict[str, object]:
@@ -210,14 +228,14 @@ class ReasoningSkillResult:
             "findings": list(self.findings),
             "dispositions": list(self.dispositions),
             "final_output_hash": canonical_hash(self.outcome_document()),
-            "independent": True,
+            "independent": False,
             "advisory_only": True,
         }
 
 
 @dataclass(frozen=True)
 class ReasoningAutonomousCheckpointResult:
-    """Independent review of a non-terminal create_question checkpoint."""
+    """Advisory finalization of a non-terminal create_question checkpoint."""
 
     primary_draft: dict[str, object]
     reviewed_checkpoint: dict[str, object]
@@ -225,7 +243,7 @@ class ReasoningAutonomousCheckpointResult:
     dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
-    reviewer_agent_ref: str
+    reviewer_agent_ref: str | None
     adapter_kind: str
 
     def review_document(self) -> dict[str, object]:
@@ -237,7 +255,7 @@ class ReasoningAutonomousCheckpointResult:
             "findings": list(self.findings),
             "dispositions": list(self.dispositions),
             "final_output_hash": canonical_hash(self.reviewed_checkpoint),
-            "independent": True,
+            "independent": False,
             "advisory_only": True,
         }
 
@@ -307,7 +325,7 @@ def validate_reasoning_autonomous_checkpoint_result(
     draft: ReasoningSkillDraft,
     result: ReasoningAutonomousCheckpointResult,
 ) -> tuple[str, str, str, str]:
-    """Validate the child-reviewed, non-terminal Autonomous checkpoint."""
+    """Validate the root-finalized, non-terminal Autonomous checkpoint."""
 
     _validate_request(request)
     _validate_result_identity(
@@ -317,7 +335,8 @@ def validate_reasoning_autonomous_checkpoint_result(
         adapter_kind=result.adapter_kind,
     )
     if (
-        result.review_mode != "harness_child_agent"
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
         or result.primary_draft != draft.draft
         or result.primary_session_ref != draft.primary_session_ref
         or result.adapter_kind != draft.adapter_kind
@@ -367,7 +386,10 @@ def validate_reasoning_autonomous_resume_result(
         reviewer_agent_ref=result.reviewer_agent_ref,
         adapter_kind=result.adapter_kind,
     )
-    if result.review_mode != "harness_child_agent":
+    if (
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
+    ):
         raise ReasoningContractError("reasoning_review_mode_invalid")
     _validate_output_bindings(request, checkpoint)
     checkpoint_hash, _checkpoint_outcome_hash, _checkpoint_scope_hash = (
@@ -441,7 +463,7 @@ def validate_reasoning_skill_result(
     request: ReasoningSkillRequest,
     result: ReasoningSkillResult,
 ) -> tuple[str, str, str, str, str]:
-    """Validate the draft, final output and advisory child-review record."""
+    """Validate the draft, final output and advisory finalization record."""
 
     _validate_request(request)
     _validate_result_identity(
@@ -450,7 +472,10 @@ def validate_reasoning_skill_result(
         reviewer_agent_ref=result.reviewer_agent_ref,
         adapter_kind=result.adapter_kind,
     )
-    if result.review_mode != "harness_child_agent":
+    if (
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
+    ):
         raise ReasoningContractError("reasoning_review_mode_invalid")
 
     _validate_output_bindings(request, result.reviewed_draft)
@@ -511,10 +536,11 @@ def _validate_reasoning_review(
         "advisory_only",
     } or (
         review.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
-        or review.get("review_mode") != "harness_child_agent"
+        or review.get("review_mode") != "advisory_unobserved"
+        or review.get("reviewer_agent_ref") is not None
         or review.get("reviewed_draft_hash") != reviewed_draft_hash
         or review.get("final_output_hash") != final_output_hash
-        or review.get("independent") is not True
+        or review.get("independent") is not False
         or review.get("advisory_only") is not True
     ):
         raise ReasoningContractError("reasoning_review_invalid")
@@ -740,6 +766,7 @@ def _validate_result_identity(
 
 
 class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
+    _root_agent_kind = "reasoning"
     """Production Reasoning adapter using one managed native root Session."""
 
     _provider_transport_limits = REASONING_PROVIDER_TRANSPORT_LIMITS
@@ -762,11 +789,13 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         *,
         executable: str = "codex",
         model_ref: str = CODEX_MODEL_REF,
-        timeout_seconds: float = 15 * 60,
+        timeout_seconds: float | None = None,
         process_runner: Callable[
-            [list[str], str, float], subprocess.CompletedProcess[str]
+            [list[str], str, float | None], subprocess.CompletedProcess[str]
         ]
         | None = None,
+        codex_ledger_reader: CodexSessionLedgerReader | None = None,
+        codex_home: Path | None = None,
     ) -> None:
         super().__init__(
             workspace,
@@ -774,6 +803,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             model_ref=model_ref,
             timeout_seconds=timeout_seconds,
             process_runner=process_runner,
+            codex_ledger_reader=codex_ledger_reader,
+            codex_home=codex_home,
         )
         self._full_conformance_authority: (
             ReasoningFullConformanceAuthority | None
@@ -863,19 +894,30 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         if authority is None or base_url is None:
             raise ReasoningSkillUnavailable("reasoning_semantic_mcp_unavailable")
         operation_ids = self._reasoning_semantic_operation_ids()
+        subject_policy = "operation_tree"
+        human_request_enabled = bool(
+            set(operation_ids) & set(ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS)
+        )
         try:
-            conformance = authority.require_full_conformance_binding()
+            conformance = authority.require_operation_binding(
+                harness_family="codex",
+                required_operation_ids=operation_ids,
+                required_capabilities=("semantic_mcp",),
+            )
         except HarnessAdmissionError as error:
             raise ReasoningSkillUnavailable(error.code) from error
         if not set(operation_ids) <= set(conformance.required_operation_ids):
             raise ReasoningSkillUnavailable(
-                "reasoning_semantic_mcp_conformance_incomplete"
+                "reasoning_semantic_mcp_operation_binding_incomplete"
             )
         channel_key = (request.job_ref or request.run_ref, operation_name)
         channel = self._resident_mcp_channels.get(channel_key)
         if channel is None:
             try:
                 channel = authority.issue_resident_mcp_channel(
+                    root_kind="reasoning",
+                    phase=operation_name,
+                    subject_policy=subject_policy,
                     run_ref=request.run_ref,
                     attempt_ref=request.attempt_ref,
                     root_session_ref=request.root_session_ref,
@@ -909,6 +951,10 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                     "operation_bindings": list(
                         channel.binding.operation_bindings
                     ),
+                    "root_kind": "reasoning",
+                    "phase": operation_name,
+                    "subject_policy": subject_policy,
+                    "semantic_mcp_shared_with_children": True,
                 }
             )
             result = self._invoke(
@@ -920,27 +966,12 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 mcp_url=base_url + endpoint.path,
                 mcp_token=channel.connection.token,
                 mcp_scope_binding_hash=scope_binding_hash,
+                semantic_mcp_protected_environment=human_request_enabled,
+                authorized_operation_ids=operation_ids,
             )
-            try:
-                _verify_reasoning_semantic_trace(result[2], operation_ids)
-            except (
-                ReasoningSkillContractError,
-                ReasoningSkillUnavailable,
-            ) as error:
-                detail_code = (
-                    error.code
-                    if isinstance(error, ReasoningSkillUnavailable)
-                    else str(error)
-                )
-                raise self._sealed_result_failure(
-                    job_ref=request.job_ref,
-                    operation_name=operation_name,
-                    native_session_ref=cast(str, result[1]),
-                    failure_code=self._transport_contract_failure_code(
-                        operation_name
-                    ),
-                    detail_code=detail_code,
-                ) from error
+            # The sealed stream remains diagnostic evidence.  The scoped
+            # channel already owns authorization, so a Root may use only the
+            # operations needed by this turn without a call-order ritual.
         except ReasoningSkillUnavailable as error:
             if error.code != "codex_operation_reconciliation_pending":
                 self._release_resident_channel(channel_key)
@@ -1010,17 +1041,17 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             model_ref=self._model_ref,
             harness_adapter_ref=harness_ref,
             mcp_bindings=(),
-            capability_bindings=(
-                "approval-policy-never",
-                "filesystem-danger-full-access",
-                "global-config-ignored",
-                "harness-child-agent-review",
-                "semantic-mcp-resident",
-                "native-session-resume",
-                "shell-tool-enabled",
-                "structured-output-json-schema",
-                "trusted-local-quest-authorization",
-                "web-search-live",
+            capability_bindings=merge_root_capability_bindings(
+                (
+                    "approval-policy-never",
+                    "filesystem-danger-full-access",
+                    "user-config-loaded",
+                    "semantic-mcp-resident",
+                    "native-session-resume",
+                    "structured-output-json-schema",
+                    "trusted-local-quest-authorization",
+                ),
+                self._root_agent_kind,
             ),
             resource_bindings=tuple(
                 "package:meta_research.skills.reasoning_stage/"
@@ -1042,7 +1073,12 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 "disabled-codex-features:"
                 + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
-                "codex-config:features.multi_agent=true",
+                "codex-config:reasoning-primary.features.multi_agent=true",
+                "codex-config:reasoning-primary."
+                "shell_environment_policy.inherit=none",
+                "codex-config:reasoning-review.features.multi_agent=true",
+                "codex-config:reasoning-autonomous-resume."
+                "features.multi_agent=true",
                 CODEX_REASONING_EFFORT_BINDING,
                 "codex-config:web_search=live",
                 "output-route:codex-output-last-message/json-schema/v1",
@@ -1050,8 +1086,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 f"prompt={REASONING_PROVIDER_TRANSPORT_LIMITS.prompt_max_bytes};"
                 f"stream={REASONING_PROVIDER_TRANSPORT_LIMITS.stream_max_bytes};"
                 f"result={REASONING_PROVIDER_TRANSPORT_LIMITS.result_max_bytes}",
-                "provider-timeout-seconds:"
-                + format(self._timeout_seconds, ".17g"),
+                self._provider_wall_clock_binding(),
                 "runtime-policy:trusted-local-broad/v1",
                 "sandbox-policy:danger-full-access",
                 "transport-seal-key:sha256:"
@@ -1062,13 +1097,17 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         if authority is None:
             return binding
         try:
-            conformance = authority.require_full_conformance_binding()
+            conformance = authority.require_operation_binding(
+                harness_family="codex",
+                required_operation_ids=self._reasoning_semantic_operation_ids(),
+                required_capabilities=("semantic_mcp",),
+            )
         except HarnessAdmissionError as error:
             raise ReasoningSkillUnavailable(error.code) from error
         operation_ids = self._reasoning_semantic_operation_ids()
         if not set(operation_ids) <= set(conformance.required_operation_ids):
             raise ReasoningSkillUnavailable(
-                "reasoning_semantic_mcp_conformance_incomplete"
+                "reasoning_semantic_mcp_operation_binding_incomplete"
             )
         return bind_reasoning_runtime_to_full_conformance(binding, conformance)
 
@@ -1080,12 +1119,14 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable("reasoning_runtime_binding_drift")
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
-            "本回合仅执行 Primary draft phase。禁止调用 spawn_agent 或 wait，禁止委派 "
-            "child、独立评审或预先处理 review；必须先返回 frozen draft。独立评审只能在 "
-            "Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
+            "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
+            "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是当前 Reasoning 根 Agent，而不是 State Owner。先通过 resident "
-            "Semantic MCP 严格按顺序调用 advancement_engine.reasoning_stage_run.observe、"
-            "research_memory.reasoning_evidence.read、research_graph.reasoning_context.read，"
+            "Semantic MCP 按当前内容需要使用 "
+            "advancement_engine.reasoning_stage_run.observe、"
+            "research_memory.reasoning_evidence.read 与 "
+            "research_graph.reasoning_context.read；不要为证明 capability 可用而"
+            "仪式化地全部调用，也不要依赖固定工具顺序。但必须"
             "并核对 exact request/run/attempt/fence、Foreground epoch、Question/Quest/Goal "
             "binding 与冻结 evidence closure；任何 missing、stale、unknown 或不一致都停止，"
             "不得输出看似成功的候选。若目标是已存在且可选择的 Question，或提出完成，"
@@ -1119,7 +1160,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "frozen_evidence_closure="
             f"{canonical_json(list(request.frozen_evidence_closure))}"
         )
-        output, session_ref, primary_stdout = self._invoke_with_resident_mcp(
+        output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
             request=request,
             operation_name="primary",
             prompt=prompt,
@@ -1128,15 +1169,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         )
         if session_ref is None or not isinstance(output, dict):
             raise ReasoningSkillUnavailable("codex_reasoning_primary_invalid")
-        try:
-            _verify_primary_phase_trace(primary_stdout)
-        except ReasoningSkillUnavailable as error:
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="primary",
-                native_session_ref=session_ref,
-                failure_code=error.code,
-            ) from error
+        # Collaboration trace is advisory provenance.  The frozen Reasoning
+        # artifact is accepted or rejected by its Stage contract below.
         draft = ReasoningSkillDraft(
             draft=output,
             primary_session_ref=session_ref,
@@ -1171,24 +1205,20 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable(error.args[0]) from error
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
-            "本回合是 Review phase。必须针对下方当前 frozen reviewed_draft 现在新建一个 "
-            "child reviewer；不得复用 Primary phase、任何先前 child 或先前评审结论。"
-            "你仍是同一个 Reasoning 根 Agent。先再次通过三项 resident Semantic MCP "
-            "操作核对 current request/fence/epoch 与冻结 evidence/context。然后必须在当前 "
-            "managed native Session 内使用 Harness 原生 spawn_agent，以 "
-            'fork_turns="none" 启动一个全新上下文的短命 child reviewer，并 wait 到完成；'
-            "不得创建第二个顶层 supervisor 或 Session。child 只审查 source binding、"
+            "本回合是同一个 Reasoning 根 Agent 的 Review phase。先再次通过三项 resident "
+            "Semantic MCP 操作核对 current request/fence/epoch 与冻结 evidence/context，"
+            "再针对下方 exact frozen reviewed_draft 重新审查 source binding、"
             "evidence role/disposition 边界、transition 或 internal autonomous scope 边界与 "
-            "Owner 权限，不批准结论。"
-            "根 Agent 对每条 finding 给出 revised | not_adopted；revised 必须实际改变 "
-            "output。只返回 schema_ref、reviewer_agent_ref、findings、final_output、"
+            "Owner 权限。这次 advisory finalization 不批准结论，也不调用 Owner 写入。"
+            "形成 bounded findings，并对每条 finding 给出 revised | not_adopted；revised "
+            "必须实际改变 output。只返回 schema_ref、findings、final_output、"
             "dispositions。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
             f"frozen_evidence_closure={canonical_json(list(request.frozen_evidence_closure))}\n"
             f"reviewed_draft={canonical_json(draft.draft)}"
         )
-        reviewed, resumed_session, stdout = self._invoke_with_resident_mcp(
+        reviewed, resumed_session, _stdout = self._invoke_with_resident_mcp(
             request=request,
             operation_name="review",
             prompt=prompt,
@@ -1208,13 +1238,11 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             or set(reviewed)
             != {
                 "schema_ref",
-                "reviewer_agent_ref",
                 "findings",
                 "final_output",
                 "dispositions",
             }
             or reviewed.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
-            or not isinstance(reviewed.get("reviewer_agent_ref"), str)
             or not isinstance(reviewed.get("findings"), list)
             or not isinstance(reviewed.get("final_output"), dict)
             or not isinstance(reviewed.get("dispositions"), list)
@@ -1226,20 +1254,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 failure_code="reasoning_review_result_contract_invalid",
                 detail_code="codex_reasoning_review_invalid",
             )
-        reviewer_agent_ref = cast(str, reviewed["reviewer_agent_ref"])
-        try:
-            _verify_child_review_trace(
-                stdout,
-                root_session_ref=draft.primary_session_ref,
-                reviewer_agent_ref=reviewer_agent_ref,
-            )
-        except ReasoningSkillUnavailable as error:
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="review",
-                native_session_ref=draft.primary_session_ref,
-                failure_code=error.code,
-            ) from error
         final_output = cast(dict[str, object], reviewed["final_output"])
         if (
             draft.draft.get("schema_ref")
@@ -1257,8 +1271,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                     for item in cast(list[object], reviewed["dispositions"])
                 ),
                 primary_session_ref=draft.primary_session_ref,
-                review_mode="harness_child_agent",
-                reviewer_agent_ref=reviewer_agent_ref,
+                review_mode="advisory_unobserved",
+                reviewer_agent_ref=None,
                 adapter_kind=draft.adapter_kind,
             )
             try:
@@ -1305,8 +1319,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 for item in cast(list[object], reviewed["dispositions"])
             ),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=reviewer_agent_ref,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
         try:
@@ -1346,20 +1360,21 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable("reasoning_native_session_missing")
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
-            "本回合是 Review phase。必须针对下方当前 frozen checkpoint 与当前 creation "
-            "result 现在新建一个 child reviewer；不得复用 Primary phase、任何先前 child "
-            "或先前评审结论。"
-            "继续同一 Reasoning root/native Session。create_question 已通过五 Owner 公共 "
+            "本回合是同一 Reasoning root/native Session 的 autonomous finalization phase。"
+            "create_question 已通过五 Owner 公共 "
             "seam 返回 RG accepted QuestionAnchor、同一 graph revision 的 present/open facts "
             "以及真实 QuestionLiteratureRevision。先按既定顺序重查三项 resident Semantic "
-            "MCP currentness/evidence/context，再用 fresh-context child reviewer 审查 exact "
-            "checkpoint 与 creation result。ScientificOutcome 必须逐字节复用 checkpoint；"
+            "MCP currentness/evidence/context，再针对 exact checkpoint 与 creation result "
+            "重新审查 source/currentness binding、accepted Anchor/graph/literature binding 与"
+            "唯一 NextCycleProposal 边界，形成 bounded findings。ScientificOutcome "
+            "必须逐字节复用 checkpoint；"
             "只形成一个指向 accepted Anchor 的 NextCycleProposal，不创建 Cycle、不形成 "
-            "StageCommit。reviewed_draft 必须视为 checkpoint；根 Agent逐条 disposition。\n"
+            "StageCommit，也不调用 Owner 写入。reviewed_draft 必须视为 checkpoint；根 Agent"
+            "逐条给出 revised | not_adopted disposition。\n"
             f"checkpoint={canonical_json(checkpoint)}\n"
             f"creation_result={canonical_json(creation_result)}"
         )
-        reviewed, resumed_session, stdout = self._invoke_with_resident_mcp(
+        reviewed, resumed_session, _stdout = self._invoke_with_resident_mcp(
             request=request,
             operation_name="autonomous-resume",
             prompt=prompt,
@@ -1373,13 +1388,11 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             or set(reviewed)
             != {
                 "schema_ref",
-                "reviewer_agent_ref",
                 "findings",
                 "final_output",
                 "dispositions",
             }
             or reviewed.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
-            or not isinstance(reviewed.get("reviewer_agent_ref"), str)
             or not isinstance(reviewed.get("findings"), list)
             or not isinstance(reviewed.get("final_output"), dict)
             or not isinstance(reviewed.get("dispositions"), list)
@@ -1391,20 +1404,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 failure_code="reasoning_review_result_contract_invalid",
                 detail_code="codex_reasoning_review_invalid",
             )
-        reviewer_agent_ref = cast(str, reviewed["reviewer_agent_ref"])
-        try:
-            _verify_child_review_trace(
-                stdout,
-                root_session_ref=request.native_session_ref,
-                reviewer_agent_ref=reviewer_agent_ref,
-            )
-        except ReasoningSkillUnavailable as error:
-            raise self._sealed_result_failure(
-                job_ref=request.job_ref,
-                operation_name="autonomous-resume",
-                native_session_ref=request.native_session_ref,
-                failure_code=error.code,
-            ) from error
         final_output = cast(dict[str, object], reviewed["final_output"])
         outcome = final_output.get("scientific_outcome")
         next_cycle = final_output.get("next_cycle_proposal")
@@ -1430,8 +1429,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 for item in cast(list[object], reviewed["dispositions"])
             ),
             primary_session_ref=request.native_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=reviewer_agent_ref,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind="codex_cli",
         )
         try:
@@ -1566,12 +1565,21 @@ def _verify_reasoning_semantic_trace(
         raise ReasoningSkillUnavailable(
             "reasoning_semantic_mcp_currentness_unobserved"
         )
-    if not set(operation_ids) <= set(observed):
+    required_operation_ids = tuple(
+        operation_id
+        for operation_id in operation_ids
+        if operation_id not in ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+    )
+    if not set(required_operation_ids) <= set(observed):
         raise ReasoningSkillUnavailable(
             "reasoning_semantic_mcp_operation_unobserved"
         )
     first_observations = tuple(dict.fromkeys(observed))
-    if first_observations != operation_ids:
+    if (
+        first_observations[: len(required_operation_ids)]
+        != required_operation_ids
+        or not set(first_observations) <= set(operation_ids)
+    ):
         raise ReasoningSkillUnavailable(
             "reasoning_semantic_mcp_observation_order_invalid"
         )
@@ -2142,14 +2150,12 @@ def _reasoning_review_response_schema(
         "additionalProperties": False,
         "properties": {
             "schema_ref": {"const": REASONING_REVIEW_SCHEMA_REF},
-            "reviewer_agent_ref": {"type": "string", "minLength": 1},
             "findings": {"type": "array", "items": finding},
             "final_output": final_output_schema,
             "dispositions": {"type": "array", "items": disposition},
         },
         "required": [
             "schema_ref",
-            "reviewer_agent_ref",
             "findings",
             "final_output",
             "dispositions",

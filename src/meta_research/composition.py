@@ -14,6 +14,7 @@ from meta_research.acquisition import (
     NatureDownloaderAdapter,
 )
 from meta_research.auth import Authentication
+from meta_research.acquisition_root import CodexAcquisitionRootAdapter
 from meta_research.autonomous_creation import AutonomousCreationService
 from meta_research.bundle_exhaustion import BundleExhaustionOwnerProofVerifier
 from meta_research.bundle_stage import BundleStageWorker
@@ -21,6 +22,7 @@ from meta_research.bundle_skill import CodexBundleSkillAdapter, BundleSkillProvi
 from meta_research.bundle_reuse_owner_proofs import (
     BundleTargetCandidateOwnerProofVerifier,
 )
+from meta_research.companion import CodexCompanionAdapter
 from meta_research.database import Database
 from meta_research.deepfetch import (
     CodexDeepFetchAdapter,
@@ -38,7 +40,6 @@ from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
 from meta_research.harness import HarnessRuntime
 from meta_research.harness_control import DurableHarnessOperationCanceller
 from meta_research.harness_adapters import (
-    ClaudeHarnessAdapter,
     CodexHarnessAdapter,
     HarnessAdapter,
     HarnessSupervisorTransport,
@@ -97,7 +98,6 @@ from meta_research.power_inhibitors import (
 )
 from meta_research.projection import PublicProjection
 from meta_research.quest_drafting import (
-    CodexDraftingAdapter,
     HostComputeProbe,
     IntentDraftingProvider,
     NvidiaSmiProbe,
@@ -110,6 +110,7 @@ from meta_research.target_run_finalizer import (
     TargetRunFinalizer,
 )
 from meta_research.target_run_runtime import TargetRunRuntime
+from meta_research.target_raw_output import TargetRawOutputStore
 from meta_research.reasoning_skill import (
     CodexReasoningSkillAdapter,
     ReasoningSkillProvider,
@@ -122,6 +123,9 @@ from meta_research.runtime_protection import (
     RuntimeEventLogger,
     RuntimeProtection,
     TelemetryExporter,
+)
+from meta_research.root_operation_diagnostics import (
+    RootOperationDiagnosticStore,
 )
 from meta_research.telemetry import (
     OtlpHttpTelemetryExporter,
@@ -258,6 +262,7 @@ class ProductionRuntime:
     target_run_finalizer: TargetRunFinalizer
     target_root_readiness: dict[str, object]
     runtime_protection: RuntimeProtection
+    root_operation_diagnostics: RootOperationDiagnosticStore
     _database: Database
     _telemetry_exporter_factory: Callable[[str], TelemetryExporter]
     _provider_lifecycles: tuple[object, ...] = ()
@@ -492,7 +497,9 @@ def build_production_runtime(
     writing_delivery_provider_registry: WritingDeliveryProviderRegistry | None = None,
     writing_renderer_registry: WritingRendererRegistry | None = None,
     harness_adapters: tuple[HarnessAdapter, ...] | None = None,
-    target_root_timeout_seconds: float = TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS,
+    target_root_timeout_seconds: float | None = (
+        TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS
+    ),
     power_inhibitor: PowerInhibitor | None = None,
     startup_power_probe: bool | None = None,
     startup_harness_diagnostics: bool = True,
@@ -517,6 +524,9 @@ def build_production_runtime(
             else startup_power_probe
         ),
     )
+    root_operation_diagnostics = RootOperationDiagnosticStore(
+        data_root.root / "root-operation-diagnostics"
+    )
     with database.read() as connection:
         daemon_incarnation_ref = str(
             connection.execute(
@@ -530,18 +540,18 @@ def build_production_runtime(
     codex_provider_runner = _CancellableProcessRunner(
         protected_environment=data_root.codex_environment
     )
-    claude_provider_runner = _CancellableProcessRunner()
-    codex_adapter = (
-        CodexDraftingAdapter(
-            data_root.root / "drafting-provider",
+    companion_adapter = (
+        CodexCompanionAdapter(
+            data_root.root / "companion-provider",
             executable=codex_executable,
             process_runner=codex_provider_runner,
+            codex_home=data_root.codex_home.absolute(),
         )
         if proposal_drafter is None or intent_drafting_provider is None
         else None
     )
-    proposal_drafter = proposal_drafter or codex_adapter
-    intent_drafting_provider = intent_drafting_provider or codex_adapter
+    proposal_drafter = proposal_drafter or companion_adapter
+    intent_drafting_provider = intent_drafting_provider or companion_adapter
     assert proposal_drafter is not None
     assert intent_drafting_provider is not None
     host_compute_probe = host_compute_probe or NvidiaSmiProbe()
@@ -549,16 +559,19 @@ def build_production_runtime(
         data_root.root / "idea-skill-provider",
         executable=codex_executable,
         process_runner=codex_provider_runner,
+        codex_home=data_root.codex_home.absolute(),
     )
     plan_skill_provider = plan_skill_provider or CodexPlanSkillAdapter(
         data_root.root / "plan-skill-provider",
         executable=codex_executable,
         process_runner=codex_provider_runner,
+        codex_home=data_root.codex_home.absolute(),
     )
     bundle_skill_provider = bundle_skill_provider or CodexBundleSkillAdapter(
         data_root.root / "bundle-skill-provider",
         executable=codex_executable,
         process_runner=codex_provider_runner,
+        codex_home=data_root.codex_home.absolute(),
     )
     reasoning_skill_provider = (
         reasoning_skill_provider
@@ -566,9 +579,16 @@ def build_production_runtime(
             data_root.root / "reasoning-skill-provider",
             executable=codex_executable,
             process_runner=codex_provider_runner,
+            codex_home=data_root.codex_home.absolute(),
         )
     )
-    acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
+    acquisition_provider = acquisition_provider or CodexAcquisitionRootAdapter(
+        data_root.root / "acquisition-root-provider",
+        NatureDownloaderAdapter(),
+        executable=codex_executable,
+        process_runner=codex_provider_runner,
+        codex_home=data_root.codex_home.absolute(),
+    )
     experiment_provider = experiment_provider or BuiltinMicroExperimentProvider(
         data_root.run / "experiment-provider"
     )
@@ -647,6 +667,26 @@ def build_production_runtime(
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
     )
+    diagnostic_bound_providers: list[object] = []
+    for provider in (
+        proposal_drafter,
+        intent_drafting_provider,
+        idea_skill_provider,
+        plan_skill_provider,
+        bundle_skill_provider,
+        reasoning_skill_provider,
+        deepfetch_provider,
+        acquisition_provider,
+        writing_skill_provider,
+    ):
+        if any(provider is bound for bound in diagnostic_bound_providers):
+            continue
+        bind_diagnostics = getattr(
+            provider, "bind_root_operation_diagnostics_recorder", None
+        )
+        if callable(bind_diagnostics):
+            bind_diagnostics(root_operation_diagnostics)
+            diagnostic_bound_providers.append(provider)
     agent_runtime.bind_provider_quiescence_driver(
         idea_skill_provider,
         unit_kinds=("idea_primary", "idea_review"),
@@ -864,16 +904,18 @@ def build_production_runtime(
         target_run_agent=target_run_agent,
     )
     harness_operation_canceller = None
+    target_raw_output_store = TargetRawOutputStore(
+        data_root.run / "harness-supervisor"
+    )
+    owners.agent_runtime.harness_runs.bind_target_provider_ceiling_receipt_verifier(
+        target_raw_output_store
+    )
     if harness_adapters is None:
         codex_harness_transport = HarnessSupervisorTransport(
             data_root.run / "harness-supervisor",
             process_runner=codex_provider_runner,
             event_sink=owners.agent_runtime.harness_runs.append_target_root_events,
-        )
-        claude_harness_transport = HarnessSupervisorTransport(
-            data_root.run / "harness-supervisor",
-            process_runner=claude_provider_runner,
-            event_sink=owners.agent_runtime.harness_runs.append_target_root_events,
+            raw_output_store=target_raw_output_store,
         )
         harness_adapters = (
             CodexHarnessAdapter(
@@ -881,11 +923,6 @@ def build_production_runtime(
                 executable=codex_executable,
                 runner=codex_harness_transport,
                 codex_home=data_root.codex_home.absolute(),
-                target_root_timeout_seconds=target_root_timeout_seconds,
-            ),
-            ClaudeHarnessAdapter(
-                data_root.run / "harness",
-                runner=claude_harness_transport,
                 target_root_timeout_seconds=target_root_timeout_seconds,
             ),
         )
@@ -900,6 +937,8 @@ def build_production_runtime(
         runtime_protection=runtime_protection,
         runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
         daemon_incarnation_ref=daemon_incarnation_ref,
+        target_raw_output_store=target_raw_output_store,
+        root_operation_diagnostic_recorder=root_operation_diagnostics,
     )
     harnesses.bind_resident_mcp_scope_verifier(owners.agent_runtime)
     harnesses.bind_target_workspace_resolver(target_run_agent)
@@ -1026,7 +1065,6 @@ def build_production_runtime(
     provider_lifecycles: list[object] = []
     for provider in (
         codex_provider_runner,
-        claude_provider_runner,
         proposal_drafter,
         intent_drafting_provider,
         idea_skill_provider,
@@ -1071,6 +1109,7 @@ def build_production_runtime(
             "status": "ready",
         },
         runtime_protection=runtime_protection,
+        root_operation_diagnostics=root_operation_diagnostics,
         _database=database,
         _telemetry_exporter_factory=(
             telemetry_exporter_factory

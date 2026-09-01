@@ -38,9 +38,9 @@ description: 在 current Reasoning StageRunRequest 的冻结 Question、路线�
 - `CandidateCompletion` 只绑定 current Quest、exact Goal revision、明确 milestone basis 与 rationale；它不是用户确认、RG acceptance 或 AE ending transition。
 - 两项必须 XOR。Reasoning 不输出 QuestionProposal，不把 autonomous lifecycle 的 draft/local id 泄漏成后继。
 
-## 5. Fresh child advisory review
+## 5. Root advisory finalization
 
-在同一 managed native root Session 的 resumed turn 内，以 `fork_turns="none"` spawn 一个全新上下文的短命 child reviewer 并 wait。child 只检查 source/currentness、证据角色、disposition、唯一 transition 与 Owner 边界；它不是第二个 supervisor 或 State Owner。根 Agent 对每条 finding 给出唯一 `revised | not_adopted`，`revised` 必须实际改变闭合 output。
+Owner 保存 primary draft 后，在同一 managed native root Session 的第二个 provider turn 重新核对三项 resident Semantic MCP，并检查 source/currentness、证据角色、disposition、唯一 transition 或 internal Autonomous scope 与 Owner 边界。根 Agent 形成 bounded findings，对每条 finding 给出唯一 `revised | not_adopted`，`revised` 必须实际改变闭合 output。Autonomous checkpoint 与 creation 后 resume 都使用同一 `advisory_unobserved`、null reviewer、`independent=false` 形状；不声称未观测的 reviewer provenance。
 
 ## 收口边界
 

@@ -1308,9 +1308,12 @@ def _validated_request_paths(
     }
     if schema_ref == CODEX_SUPERVISOR_REQUEST_SCHEMA_V2:
         expected_fields.add("prompt_max_bytes")
-    timeout_valid = timeout_seconds is None and schema_ref == (
-        SUPERVISOR_REQUEST_SCHEMA
-    )
+    # ``None`` is the normal long-running Provider policy: a valid operation
+    # ends because the Provider exits, the Owner requests stop, or a bounded
+    # output/process-integrity check fails.  A numeric wall-clock ceiling is an
+    # explicit exceptional policy, not an implicit requirement of newer
+    # transport schemas.
+    timeout_valid = timeout_seconds is None
     if isinstance(timeout_seconds, (int, float)) and not isinstance(
         timeout_seconds, bool
     ):
@@ -1806,7 +1809,8 @@ def _supervise_locked(
                 if provider_job is None and process_platform.process_group_running(
                     process.pid
                 ):
-                    termination_reason = "descendant_process"
+                    if termination_reason == "completed":
+                        termination_reason = "descendant_process"
                     if not process_platform.terminate_process_group(process.pid):
                         raise ProviderSupervisorError(
                             "provider_descendant_cleanup_failed"

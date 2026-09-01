@@ -7,6 +7,7 @@ import re
 from typing import Protocol
 
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
+from meta_research.root_capabilities import root_capability_profile
 
 
 WRITING_REPORT_INTENT_SCHEMA = "meta-research/writing-report-intent/v1"
@@ -18,6 +19,9 @@ WRITING_RESEARCH_SNAPSHOT_SCHEMA = "meta-research/writing-research-snapshot/v1"
 WRITING_RUNTIME_BINDING_SCHEMA = "meta-research/writing-runtime-binding/v1"
 WRITING_EXECUTION_BUDGET_SCHEMA = "meta-research/writing-execution-budget/v1"
 WRITING_CHILD_REVIEW_TASK_SCHEMA = "meta-research/writing-child-review-task/v1"
+WRITING_ADVISORY_REVIEW_TASK_SCHEMA = (
+    "meta-research/writing-advisory-review-task/v1"
+)
 
 WRITING_CHILD_REVIEW_RUBRIC = (
     "evidence_coverage",
@@ -26,9 +30,16 @@ WRITING_CHILD_REVIEW_RUBRIC = (
     "internal_consistency",
     "intent_alignment",
 )
+WRITING_ADVISORY_REVIEW_RUBRIC = WRITING_CHILD_REVIEW_RUBRIC
 
+# Deprecated public alias retained only because the immutable pre-0030 Writing
+# module imports it while reconstructing its historical runtime binding. Current
+# admissions use ``default_writing_execution_budget`` below and never enforce
+# this value as a logical ceiling.
 WRITING_MAX_CONTENT_REVISIONS = 5
 WRITING_MAX_OUTPUT_BYTES = 24 * 1024 * 1024
+_LEGACY_WRITING_MAX_CONTENT_REVISIONS = WRITING_MAX_CONTENT_REVISIONS
+_LEGACY_WRITING_MAX_OUTPUT_BYTES = 24 * 1024 * 1024
 
 _CLAIM_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SUPPORTED_CLAIM_MARKER = re.compile(
@@ -64,6 +75,7 @@ _WRITING_SAFE_CAPABILITIES = {
     "environment-inheritance-none",
     "filesystem-read-root-confined",
     "global-config-ignored",
+    "user-config-loaded",
     "harness-child-agent-review",
     "mcp-config-empty",
     "native-session-resume",
@@ -185,6 +197,34 @@ def writing_child_review_document_profile(
     }
 
 
+def writing_advisory_review_document_profile(
+    document_type: str,
+) -> dict[str, str] | None:
+    """Return the current root-finalization profile without changing history.
+
+    The original profile bytes remain an input to historical child task hashes.
+    Current bindings use a separately named advisory resource so those immutable
+    hashes stay reproducible.
+    """
+
+    profile = writing_document_profile(document_type)
+    if document_type == "report":
+        return None
+    reference_name = f"references/{profile.profile_ref}-advisory.md"
+    content = (
+        files("meta_research")
+        / "skills"
+        / "writing-report"
+        / reference_name
+    ).read_text(encoding="utf-8")
+    return {
+        "document_type": profile.document_type,
+        "profile_ref": profile.profile_ref,
+        "content": content,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+
+
 def writing_intent_schema(document_type: str) -> str:
     return writing_document_profile(document_type).intent_schema_ref
 
@@ -241,7 +281,13 @@ class WritingRuntimeBinding:
         if (
             self.mcp_bindings
             or any(
-                value not in _WRITING_SAFE_CAPABILITIES
+                value
+                not in (
+                    _WRITING_SAFE_CAPABILITIES
+                    | set(
+                        root_capability_profile("writing").runtime_bindings()
+                    )
+                )
                 for value in self.capability_bindings
             )
             or any(
@@ -258,16 +304,27 @@ class WritingRuntimeBinding:
 def default_writing_execution_budget() -> dict[str, object]:
     return {
         "schema_ref": WRITING_EXECUTION_BUDGET_SCHEMA,
-        "max_content_revisions": WRITING_MAX_CONTENT_REVISIONS,
-        "max_output_bytes": WRITING_MAX_OUTPUT_BYTES,
+        "max_content_revisions": None,
+        "max_output_bytes": None,
     }
 
 
 def validate_writing_execution_budget(value: object) -> dict[str, object]:
     expected = default_writing_execution_budget()
-    if not isinstance(value, dict) or value != expected:
+    if isinstance(value, dict) and value == expected:
+        return dict(expected)
+    # Runs admitted by an older build retain their immutable budget document,
+    # but those former logical ceilings are no longer enforced. Accepting the
+    # exact legacy shape preserves restart compatibility without carrying the
+    # old stop policy into successor Attempts.
+    legacy = {
+        "schema_ref": WRITING_EXECUTION_BUDGET_SCHEMA,
+        "max_content_revisions": _LEGACY_WRITING_MAX_CONTENT_REVISIONS,
+        "max_output_bytes": _LEGACY_WRITING_MAX_OUTPUT_BYTES,
+    }
+    if not isinstance(value, dict) or value != legacy:
         raise OwnerConflict("writing_execution_budget_invalid")
-    return dict(expected)
+    return dict(legacy)
 
 
 def writing_child_review_task_hash(
@@ -310,6 +367,44 @@ def writing_child_review_task_hash(
         "fresh_context_mode": "fork_turns:none",
     }
     document_profile = writing_child_review_document_profile(document_type)
+    if document_profile is not None:
+        task["document_profile"] = document_profile
+    return canonical_hash(task)
+
+
+def writing_advisory_review_task_hash(
+    *,
+    run_ref: str,
+    provider_job_ref: str | None,
+    root_session_ref: str,
+    primary_session_ref: str,
+    intent_hash: str,
+    snapshot_hash: str,
+    predecessor_version_ref: str | None,
+    predecessor_markdown_hash: str | None,
+    feedback_hash: str,
+    reviewed_markdown_hash: str,
+    reviewed_citations_hash: str,
+    document_type: str = "report",
+) -> str:
+    """Bind the current root advisory finalization to immutable inputs."""
+
+    task = {
+        "schema_ref": WRITING_ADVISORY_REVIEW_TASK_SCHEMA,
+        "run_ref": run_ref,
+        "provider_job_ref": provider_job_ref,
+        "root_session_ref": root_session_ref,
+        "primary_session_ref": primary_session_ref,
+        "intent_hash": intent_hash,
+        "snapshot_hash": snapshot_hash,
+        "predecessor_version_ref": predecessor_version_ref,
+        "predecessor_markdown_hash": predecessor_markdown_hash,
+        "feedback_hash": feedback_hash,
+        "reviewed_markdown_hash": reviewed_markdown_hash,
+        "reviewed_citations_hash": reviewed_citations_hash,
+        "rubric": list(WRITING_ADVISORY_REVIEW_RUBRIC),
+    }
+    document_profile = writing_advisory_review_document_profile(document_type)
     if document_profile is not None:
         task["document_profile"] = document_profile
     return canonical_hash(task)

@@ -36,9 +36,24 @@ _REAL_CODEX_CHILD_LEDGER = Path(
 
 
 class _RecordedRunner:
-    def __init__(self, family: str, stream: tuple[dict[str, object], ...]) -> None:
+    def __init__(
+        self,
+        family: str,
+        stream: tuple[dict[str, object], ...],
+        *,
+        codex_features: dict[str, bool] | None = None,
+    ) -> None:
         self.family = family
         self.stream = stream
+        self.codex_features = codex_features or {
+            "hooks": True,
+            "multi_agent": True,
+            "plugins": True,
+            "remote_plugin": True,
+            "shell_tool": True,
+            "skill_search": True,
+            "unified_exec": True,
+        }
         self.calls: list[tuple[list[str], str, dict[str, str]]] = []
 
     def __call__(
@@ -48,11 +63,17 @@ class _RecordedRunner:
         timeout: float,
         environment: dict[str, str],
     ) -> subprocess.CompletedProcess[str]:
-        assert timeout > 0
+        assert timeout is None or timeout > 0
         self.calls.append((list(argv), prompt, dict(environment)))
         if "--version" in argv:
             version = "codex-cli 0.147.0\n" if self.family == "codex" else "2.1.220\n"
             return subprocess.CompletedProcess(argv, 0, version, "")
+        if argv[-2:] == ["features", "list"]:
+            stdout = "\n".join(
+                f"{name} stable {str(enabled).lower()}"
+                for name, enabled in self.codex_features.items()
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout + "\n", "")
         return subprocess.CompletedProcess(
             argv,
             0,
@@ -669,7 +690,9 @@ def _invocation(family: str) -> HarnessInvocation:
     )
 
 
-def _assert_profile_is_event_derived(profile: dict[str, object]) -> None:
+def _assert_profile_is_event_derived(
+    profile: dict[str, object], *, expected_available: set[str]
+) -> None:
     capabilities = profile["capabilities"]
     assert isinstance(capabilities, dict)
     for name in (
@@ -690,8 +713,14 @@ def _assert_profile_is_event_derived(profile: dict[str, object]) -> None:
         "web_search",
         "web_fetch",
     ):
-        assert capabilities[name]["status"] == "available"
-        assert capabilities[name]["evidence_refs"]
+        if name in expected_available:
+            assert capabilities[name]["status"] == "available"
+            assert capabilities[name]["evidence_refs"]
+        else:
+            assert capabilities[name] == {
+                "status": "not_observed",
+                "evidence_refs": [],
+            }
     assert "opaque-channel-token" not in json.dumps(profile)
 
 
@@ -701,15 +730,12 @@ def test_codex_adapter_derives_native_identity_and_capabilities_from_jsonl(
     runner = _RecordedRunner(
         "codex",
         (
-            {"type": "thread.started", "thread_id": "codex-thread-1", "tools": ["shell", "mcp"]},
+            {"type": "thread.started", "thread_id": "codex-thread-1"},
             {"type": "item.completed", "item": {"type": "command_execution"}},
             {"type": "item.completed", "item": {"type": "file_change"}},
             {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "meta_research"}},
             {"type": "item.completed", "item": {"type": "web_search", "query": "MCP spec", "action": {"type": "search"}}},
             {"type": "item.completed", "item": {"type": "web_search", "query": "https://modelcontextprotocol.io/specification/2025-06-18", "action": {"type": "open_page"}}},
-            {"type": "item.completed", "item": {"type": "skill", "name": "probe"}},
-            {"type": "item.completed", "item": {"type": "plugin", "name": "probe"}},
-            {"type": "item.completed", "item": {"type": "hook", "name": "probe"}},
             {
                 "type": "item.completed",
                 "item": {
@@ -736,10 +762,6 @@ def test_codex_adapter_derives_native_identity_and_capabilities_from_jsonl(
                     },
                 },
             },
-            {"type": "thread.forked", "thread_id": "codex-thread-1"},
-            {"type": "turn.steered", "thread_id": "codex-thread-1"},
-            {"type": "turn.interrupted", "thread_id": "codex-thread-1"},
-            {"type": "thread.resumed", "thread_id": "codex-thread-1"},
             {"type": "turn.completed"},
         ),
     )
@@ -749,7 +771,19 @@ def test_codex_adapter_derives_native_identity_and_capabilities_from_jsonl(
 
     assert result.native_session_ref == "codex-thread-1"
     assert result.profile["provider_version"] == "0.147.0"
-    _assert_profile_is_event_derived(result.profile)
+    _assert_profile_is_event_derived(
+        result.profile,
+        expected_available={
+            "shell",
+            "file_access",
+            "semantic_mcp",
+            "subagent",
+            "stream",
+            "native_session",
+            "web_search",
+            "web_fetch",
+        },
+    )
     argv, _prompt, environment = runner.calls[-1]
     assert argv[:2] == ["codex", "exec"]
     config_values = [
@@ -758,8 +792,17 @@ def test_codex_adapter_derives_native_identity_and_capabilities_from_jsonl(
         if value == "--config"
     ]
     assert 'model_reasoning_effort="max"' in config_values
+    assert "mcp_servers.meta_research.required=true" in config_values
+    assert (
+        'mcp_servers.meta_research.default_tools_approval_mode="approve"'
+        in config_values
+    )
     assert "opaque-channel-token" not in " ".join(argv)
     assert environment["META_RESEARCH_MCP_TOKEN"] == "opaque-channel-token"
+    assert environment["NO_PROXY"] == environment["no_proxy"]
+    assert {"127.0.0.1", "localhost", "::1"} <= set(
+        environment["NO_PROXY"].split(",")
+    )
 
 
 def test_installation_profile_is_a_pure_read_of_durable_provider_capability(
@@ -1019,7 +1062,27 @@ def test_claude_adapter_derives_capabilities_without_model_self_report(
 
     assert result.native_session_ref == "claude-session-1"
     assert result.profile["provider_version"] == "2.1.220"
-    _assert_profile_is_event_derived(result.profile)
+    _assert_profile_is_event_derived(
+        result.profile,
+        expected_available={
+            "tool_inventory",
+            "shell",
+            "file_access",
+            "semantic_mcp",
+            "skill",
+            "plugin",
+            "hook",
+            "subagent",
+            "stream",
+            "native_session",
+            "fork",
+            "steer",
+            "interrupt",
+            "resume",
+            "web_search",
+            "web_fetch",
+        },
+    )
     argv, _prompt, environment = runner.calls[-1]
     assert argv[:2] == ["claude", "-p"]
     assert "opaque-channel-token" not in " ".join(argv)
@@ -1029,7 +1092,7 @@ def test_claude_adapter_derives_capabilities_without_model_self_report(
     assert "opaque-channel-token" not in config_path.read_text(encoding="utf-8")
 
 
-def test_missing_web_events_are_typed_unavailable_not_inferred_from_text(
+def test_missing_web_events_are_not_observed_or_inferred_from_text(
     tmp_path: Path,
 ) -> None:
     runner = _RecordedRunner(
@@ -1052,11 +1115,10 @@ def test_missing_web_events_are_typed_unavailable_not_inferred_from_text(
 
     capabilities = result.profile["capabilities"]
     assert capabilities["web_search"] == {
-        "status": "capability_unavailable",
-        "reason": {"code": "probe_evidence_missing"},
+        "status": "not_observed",
         "evidence_refs": [],
     }
-    assert capabilities["web_fetch"]["status"] == "capability_unavailable"
+    assert capabilities["web_fetch"]["status"] == "not_observed"
 
 
 def test_claude_tool_request_without_successful_result_is_not_capability_proof(
@@ -1117,11 +1179,11 @@ def test_claude_tool_request_without_successful_result_is_not_capability_proof(
 
     capabilities = result.profile["capabilities"]
     assert capabilities["tool_inventory"]["status"] == "available"
-    assert capabilities["shell"]["status"] == "capability_unavailable"
-    assert capabilities["web_search"]["status"] == "capability_unavailable"
-    assert capabilities["skill"]["status"] == "capability_unavailable"
-    assert capabilities["plugin"]["status"] == "capability_unavailable"
-    assert capabilities["hook"]["status"] == "capability_unavailable"
+    assert capabilities["shell"]["status"] == "not_observed"
+    assert capabilities["web_search"]["status"] == "not_observed"
+    assert capabilities["skill"]["status"] == "not_observed"
+    assert capabilities["plugin"]["status"] == "not_observed"
+    assert capabilities["hook"]["status"] == "not_observed"
 
 
 def test_subagent_requires_one_root_spawn_and_terminal_child_provenance(
@@ -1156,8 +1218,7 @@ def test_subagent_requires_one_root_spawn_and_terminal_child_provenance(
     )
 
     assert result.profile["capabilities"]["subagent"] == {
-        "status": "capability_unavailable",
-        "reason": {"code": "probe_evidence_missing"},
+        "status": "not_observed",
         "evidence_refs": [],
     }
 
@@ -1383,7 +1444,7 @@ def test_codex_parallel_complete_reviewers_are_ambiguous_and_rejected(
 
     assert result.profile["subagent_evidence"] == []
     assert result.profile["capabilities"]["subagent"]["status"] == (
-        "capability_unavailable"
+        "not_observed"
     )
 
 
@@ -1520,7 +1581,7 @@ def test_codex_result_review_fails_closed_without_exact_native_child_proof(
 
     assert result.profile["subagent_evidence"] == []
     assert result.profile["capabilities"]["subagent"]["status"] == (
-        "capability_unavailable"
+        "not_observed"
     )
 
 
@@ -2329,6 +2390,72 @@ def test_target_codex_invocation_is_workspace_write_and_profiles_it(
         target_workspace_ref="target-workspace:1",
         working_directory=str(tmp_path.resolve()),
         provider_operation_timeout_seconds=300.0,
+        root_kind="target",
+        entry_path="recovery",
+        authorized_operation_ids=("agent_runtime.target_run.observe",),
+    )
+    runner = _RecordedRunner(
+        "codex",
+        (
+            {
+                "type": "thread.started",
+                "thread_id": "target-root",
+            },
+            {"type": "turn.completed", "thread_id": "target-root"},
+        ),
+    )
+    result = CodexHarnessAdapter(tmp_path, runner=runner).invoke(invocation)
+
+    argv, _prompt, _environment = runner.calls[-1]
+    assert runner.calls[-2][0][-2:] == ["features", "list"]
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+    assert "--ignore-user-config" not in argv
+    assert "--ignore-rules" not in argv
+    enabled = {
+        argv[index + 1]
+        for index, value in enumerate(argv[:-1])
+        if value == "--enable"
+    }
+    assert {"multi_agent", "plugins", "remote_plugin", "hooks"} <= enabled
+    target_config = {
+        argv[index + 1]
+        for index, value in enumerate(argv[:-1])
+        if value == "--config"
+    }
+    assert "mcp_servers.meta_research.required=true" in target_config
+    assert (
+        'mcp_servers.meta_research.default_tools_approval_mode="approve"'
+        in target_config
+    )
+    assert result.profile["sandbox_mode"] == "workspace-write"
+    diagnostics = result.profile["root_capability_diagnostics"]
+    assert diagnostics["entry_path"] == "recovery"
+    assert diagnostics["availability"]["shell"]["status"] == "available"
+    assert diagnostics["availability"]["semantic_mcp"]["status"] == "available"
+    assert diagnostics["availability"]["plugin"]["status"] == "available"
+    assert diagnostics["usage"]["shell"]["status"] == "not_used"
+    assert diagnostics["tool_inventory"] == {
+        "status": "not_reported",
+        "evidence_refs": [],
+        "names": [],
+    }
+    assert diagnostics["provider_feature_inventory"]["status"] == "observed"
+    assert diagnostics["provider_feature_inventory"]["features"]["plugins"] is True
+    assert diagnostics["provider_feature_inventory"]["evidence_refs"]
+    assert diagnostics["side_effect_authorization"]["operation_ids"] == [
+        "agent_runtime.target_run.observe"
+    ]
+
+
+def test_target_codex_reports_one_disabled_provider_feature_locally(
+    tmp_path: Path,
+) -> None:
+    invocation = replace(
+        _invocation("codex"),
+        target_workspace_ref="target-workspace:unsupported-plugin",
+        working_directory=str(tmp_path.resolve()),
+        root_kind="target",
+        authorized_operation_ids=("agent_runtime.target_run.observe",),
     )
     runner = _RecordedRunner(
         "codex",
@@ -2336,12 +2463,29 @@ def test_target_codex_invocation_is_workspace_write_and_profiles_it(
             {"type": "thread.started", "thread_id": "target-root"},
             {"type": "turn.completed", "thread_id": "target-root"},
         ),
+        codex_features={
+            "hooks": True,
+            "multi_agent": True,
+            "plugins": False,
+            "remote_plugin": True,
+            "shell_tool": True,
+            "skill_search": True,
+            "unified_exec": True,
+        },
     )
-    result = CodexHarnessAdapter(tmp_path, runner=runner).invoke(invocation)
 
-    argv, _prompt, _environment = runner.calls[-1]
-    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
-    assert result.profile["sandbox_mode"] == "workspace-write"
+    result = CodexHarnessAdapter(tmp_path, runner=runner).invoke(invocation)
+    diagnostics = result.profile["root_capability_diagnostics"]
+
+    assert diagnostics["availability"]["plugin"] == {
+        "status": "capability_unavailable",
+        "reason": {"code": "codex_feature_plugin_disabled"},
+    }
+    assert diagnostics["availability"]["shell"]["status"] == "available"
+    assert diagnostics["usage"]["plugin"]["status"] == "not_used"
+    assert diagnostics["side_effect_authorization"]["operation_ids"] == [
+        "agent_runtime.target_run.observe"
+    ]
 
 
 def test_claude_parent_stream_cannot_prove_child_code_review_skill(
@@ -2471,7 +2615,7 @@ def test_claude_parent_stream_cannot_prove_child_code_review_skill(
             },
             {"type": "turn.completed"},
             ),
-            "capability_unavailable",
+            "not_observed",
             id="terminal-wait-before-spawn",
         ),
         pytest.param(
@@ -2587,7 +2731,7 @@ def test_claude_subagent_result_must_follow_its_root_request(
     ).invoke(_invocation("claude"))
 
     assert result.profile["capabilities"]["subagent"]["status"] == (
-        "capability_unavailable"
+        "not_observed"
     )
 
 

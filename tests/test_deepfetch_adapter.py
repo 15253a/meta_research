@@ -24,6 +24,7 @@ from meta_research.deepfetch import (
     DeepFetchResult,
     DeepFetchRuntimeBinding,
     DeepFetchUnavailable,
+    _deepfetch_web_evidence_gate_output_schema,
     _read_hosted_acquisition_artifact,
     _verified_codex_reader_ledger_refs,
     canonical_hash,
@@ -38,6 +39,9 @@ from meta_research.provider_supervisor import (
 from meta_research.quest_drafting import (
     PROVIDER_RESULT_MAX_BYTES,
     _CancellableProcessRunner,
+)
+from meta_research.root_operation_diagnostics import (
+    RootOperationDiagnosticStore,
 )
 
 RESULT = {
@@ -950,6 +954,24 @@ class DurableSegmentSequenceRunner:
         )
 
 
+class VolatileFeatureDurableSegmentRunner(DurableSegmentSequenceRunner):
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace, stopped_segments=0)
+        self.feature_output: str | None = None
+
+    def run_command(
+        self, argv: list[str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout
+        assert argv[-2:] == ["features", "list"]
+        return subprocess.CompletedProcess(
+            argv,
+            0 if self.feature_output is not None else 1,
+            stdout=self.feature_output or "",
+            stderr="",
+        )
+
+
 class OversizedDurableStreamRunner:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
@@ -1541,6 +1563,60 @@ def test_codex_deepfetch_retires_signed_gate_ack_loss_without_new_effect(
     assert tuple(runner.calls) == calls_before
     assert acquisition.calls == []
     assert checkpoint_path.read_bytes() == checkpoint_before
+
+
+def test_deepfetch_retry_uses_the_sealed_feature_snapshot_not_a_fresh_probe(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "volatile-feature-probe"
+    runner = VolatileFeatureDurableSegmentRunner(workspace)
+    adapter = CodexDeepFetchAdapter(workspace, process_runner=runner)
+    request = replace(
+        _request(),
+        runtime_binding=adapter.runtime_binding(),
+        job_ref="deepfetch-run:volatile-feature-probe",
+    )
+    _key_path, transport_key = ensure_transport_key(workspace)
+    directory = (
+        workspace / "provider-operations" / "volatile" / "deepfetch-initial"
+    )
+    prompt = "web_evidence_gate=v1\nverify the provider boundary"
+    schema = _deepfetch_web_evidence_gate_output_schema()
+
+    first = adapter._run_durable_segment(
+        directory=directory,
+        segment_name="initial",
+        job_ref=request.job_ref or "deepfetch-run:volatile-feature-probe",
+        request=request,
+        prompt=prompt,
+        output_schema=schema,
+        timeout_seconds=None,
+        native_session_ref=None,
+        transport_key=transport_key,
+    )
+    runner.feature_output = """\
+hooks stable true
+multi_agent stable true
+plugins stable true
+remote_plugin stable true
+shell_tool stable true
+skill_search stable true
+unified_exec stable true
+"""
+    recovered = adapter._run_durable_segment(
+        directory=directory,
+        segment_name="initial",
+        job_ref=request.job_ref or "deepfetch-run:volatile-feature-probe",
+        request=request,
+        prompt=prompt,
+        output_schema=schema,
+        timeout_seconds=None,
+        native_session_ref=None,
+        transport_key=transport_key,
+    )
+
+    assert recovered == first
+    assert len(runner.calls) == 1
 
 
 def test_codex_deepfetch_treats_selected_oa_as_the_primary_route(
@@ -2764,7 +2840,7 @@ def test_codex_deepfetch_replays_the_exact_pending_batch_after_user_login(
     assert len(acquisition.calls) == 2
 
 
-def test_codex_deepfetch_rejects_reader_output_when_native_trace_and_ledger_are_unavailable(
+def test_codex_deepfetch_accepts_public_result_without_internal_reader_trace(
     tmp_path: Path,
 ) -> None:
     runner = SequencedPrototypeRunner(
@@ -2779,10 +2855,9 @@ def test_codex_deepfetch_rejects_reader_output_when_native_trace_and_ledger_are_
         process_runner=runner,
     )
 
-    with pytest.raises(DeepFetchUnavailable) as failure:
-        _execute(adapter)
+    result = _execute(adapter)
 
-    assert failure.value.code == "deepfetch_reader_agent_trace_invalid"
+    assert result.completion == "complete"
 
 
 def test_codex_deepfetch_accepts_reader_output_from_verified_codex_ledgers(
@@ -2914,7 +2989,7 @@ def test_codex_deepfetch_rejects_nonterminal_last_reader_delivery(
     assert failure.value.code == "deepfetch_reader_agent_trace_invalid"
 
 
-def test_codex_deepfetch_configured_ledger_failure_does_not_fall_back_to_stdout(
+def test_codex_deepfetch_ledger_diagnostic_failure_does_not_block_result(
     tmp_path: Path,
 ) -> None:
     class MissingLedger(RecordedCodexReaderLedger):
@@ -2932,13 +3007,12 @@ def test_codex_deepfetch_configured_ledger_failure_does_not_fall_back_to_stdout(
         codex_ledger_reader=MissingLedger(),
     )
 
-    with pytest.raises(DeepFetchUnavailable) as failure:
-        _execute(adapter)
+    result = _execute(adapter)
 
-    assert failure.value.code == "deepfetch_reader_agent_trace_invalid"
+    assert result.completion == "complete"
 
 
-def test_codex_deepfetch_rejects_same_count_different_stdout_and_ledger_child(
+def test_codex_deepfetch_does_not_bind_result_to_internal_child_identity(
     tmp_path: Path,
 ) -> None:
     class DifferentChildRunner(SequencedPrototypeRunner):
@@ -2998,13 +3072,12 @@ def test_codex_deepfetch_rejects_same_count_different_stdout_and_ledger_child(
         )
     )
 
-    with pytest.raises(DeepFetchUnavailable) as failure:
-        adapter.execute(request)
+    result = adapter.execute(request)
 
-    assert failure.value.code == "deepfetch_reader_agent_trace_invalid"
+    assert result.completion == "complete"
 
 
-def test_codex_deepfetch_rejects_malformed_native_agent_trace(
+def test_codex_deepfetch_ignores_malformed_internal_agent_diagnostics(
     tmp_path: Path,
 ) -> None:
     runner = MalformedReaderTraceRunner(
@@ -3018,10 +3091,9 @@ def test_codex_deepfetch_rejects_malformed_native_agent_trace(
         process_runner=runner,
     )
 
-    with pytest.raises(DeepFetchUnavailable) as failure:
-        _execute(adapter)
+    result = _execute(adapter)
 
-    assert failure.value.code == "deepfetch_reader_agent_trace_invalid"
+    assert result.completion == "complete"
 
 
 def test_codex_deepfetch_accepts_completed_close_agent_reader_evidence(
@@ -3065,7 +3137,7 @@ def test_codex_deepfetch_accepts_visible_reader_name_with_verified_native_child(
     assert result.papers_ledger is not None
 
 
-def test_codex_deepfetch_rejects_reader_count_mismatch_when_trace_is_available(
+def test_codex_deepfetch_does_not_require_reader_trace_count_match(
     tmp_path: Path,
 ) -> None:
     runner = AdditionalNativeReaderRunner(
@@ -3079,10 +3151,9 @@ def test_codex_deepfetch_rejects_reader_count_mismatch_when_trace_is_available(
         process_runner=runner,
     )
 
-    with pytest.raises(DeepFetchUnavailable) as failure:
-        _execute(adapter)
+    result = _execute(adapter)
 
-    assert failure.value.code == "deepfetch_reader_agent_trace_invalid"
+    assert result.completion == "complete"
 
 
 def test_codex_deepfetch_rejects_duplicate_visible_reader_names(
@@ -3114,7 +3185,7 @@ def test_codex_deepfetch_rejects_duplicate_visible_reader_names(
     with pytest.raises(DeepFetchUnavailable) as failure:
         _execute(adapter)
 
-    assert failure.value.code == "deepfetch_reader_agent_trace_invalid"
+    assert failure.value.code == "deepfetch_hosted_acquisition_proof_mismatch"
 
 
 def test_codex_deepfetch_deduplicates_wait_and_close_for_one_reader(
@@ -3165,7 +3236,12 @@ def test_codex_deepfetch_uses_live_web_in_a_dedicated_full_access_root_session(
     assert 'approval_policy="never"' in config_values
     assert 'model_reasoning_effort="max"' in config_values
     assert 'web_search="live"' in config_values
-    assert "features.multi_agent=true" in config_values
+    enabled = {
+        argv[index + 1]
+        for index, value in enumerate(argv[:-1])
+        if value == "--enable"
+    }
+    assert {"multi_agent", "plugins", "remote_plugin", "hooks"} <= enabled
     assert argv[argv.index("--model") + 1] == "gpt-5.6-sol"
     assert gate_argv[-1] == "-"
     assert gate_timeout is None
@@ -3195,9 +3271,8 @@ def test_codex_deepfetch_uses_live_web_in_a_dedicated_full_access_root_session(
         "codex-config:model_reasoning_effort=max"
         in adapter.runtime_binding().capability_bindings
     )
-    assert (
-        "codex-default-capabilities:v1"
-        in adapter.runtime_binding().capability_bindings
+    assert "root-capability-floor:v3" in (
+        adapter.runtime_binding().capability_bindings
     )
 
 
@@ -3219,6 +3294,36 @@ def test_codex_deepfetch_does_not_require_user_namespaces_on_the_deployed_host(
         "sandbox-policy:danger-full-access",
         "workspace-write-public-artifacts",
     } <= set(adapter.runtime_binding().capability_bindings)
+
+
+def test_codex_deepfetch_publishes_actual_turn_usage_to_the_shared_diagnostic_store(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingRunner(PROTOTYPE_EMPTY_FINAL)
+    adapter = CodexDeepFetchAdapter(
+        tmp_path / "provider",
+        model_ref="gpt-test",
+        process_runner=runner,
+    )
+    store = RootOperationDiagnosticStore(tmp_path / "diagnostics")
+    adapter.bind_root_operation_diagnostics_recorder(store)
+
+    result = _execute(adapter)
+
+    assert result.completion == "honest_empty"
+    page = store.query_page(root_kind="deepfetch")
+    assert page["status"] == "observed"
+    diagnostics = [item["diagnostics"] for item in page["items"]]
+    assert any(
+        item["usage"]["web_search"]["status"] == "used"
+        and item["usage"]["web_fetch"]["status"] == "used"
+        for item in diagnostics
+    )
+    assert all(
+        item["side_effect_authorization"]["operation_ids"] == []
+        and item["tool_inventory"]["status"] == "not_reported"
+        for item in diagnostics
+    )
 
 
 def test_codex_deepfetch_rejects_a_forged_receipt_field_even_if_runner_bypasses_schema(

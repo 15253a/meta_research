@@ -59,7 +59,10 @@ class _SequenceRunner:
             {"type": "thread.started", "thread_id": thread_ref}
         ]
         reviewer_ref = output.get("reviewer_agent_ref")
-        if isinstance(reviewer_ref, str):
+        if (
+            isinstance(reviewer_ref, str)
+            and "<<<WRITING_CHILD_REVIEW_TASK_BEGIN>>>\n" in prompt
+        ):
             child_prompt = prompt.split(
                 "<<<WRITING_CHILD_REVIEW_TASK_BEGIN>>>\n", 1
             )[1].split("\n<<<WRITING_CHILD_REVIEW_TASK_END>>>", 1)[0]
@@ -321,19 +324,17 @@ def test_type_specific_skill_resource_uses_the_same_resumable_session_seam(
     ]
     assert profile_heading in runner.calls[0][1]
     assert f'"document_type":"{document_type}"' in runner.calls[1][1]
-    child_task = json.loads(
-        runner.calls[1][1]
-        .split("\nreview_task=", 1)[1]
-        .split("\nresponse_schema_ref=", 1)[0]
+    advisory_task = json.loads(
+        runner.calls[1][1].split("\nadvisory_task=", 1)[1]
     )
     profile_content = (
         files("meta_research")
         / "skills"
         / "writing-report"
         / "references"
-        / f"{profile_ref}.md"
+        / f"{profile_ref}-advisory.md"
     ).read_text(encoding="utf-8")
-    assert child_task["document_profile"] == {
+    assert advisory_task["document_profile"] == {
         "content": profile_content,
         "content_sha256": hashlib.sha256(
             profile_content.encode("utf-8")
@@ -356,7 +357,7 @@ def test_type_specific_skill_resource_uses_the_same_resumable_session_seam(
         ).hexdigest(),
         reviewed_citations_hash=canonical_hash(draft["citations"]),
     )
-    assert child_task["review_task_hash"] != unprofiled_hash
+    assert advisory_task["review_task_hash"] != unprofiled_hash
     assert (
         adapter.runtime_binding("report").packaged_skill_bundle_hash
         != request.runtime_binding.packaged_skill_bundle_hash
@@ -389,7 +390,7 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     result = adapter.execute(request)
 
     assert result.primary_session_ref == "codex-writing-primary:1"
-    assert result.reviewer_agent_ref == "codex-writing-reviewer:1"
+    assert result.reviewer_agent_ref is None
     assert request.runtime_binding.model_ref == "gpt-5.6-sol"
     assert (
         "codex-config:model_reasoning_effort=max"
@@ -401,21 +402,23 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert 'model_reasoning_effort="max"' in primary_argv
     assert review_argv[-3:] == ["resume", "codex-writing-primary:1", "-"]
-    assert 'web_search="disabled"' in primary_argv
-    assert 'web_search="disabled"' in review_argv
-    assert 'web_search="live"' not in primary_argv
-    assert 'web_search="live"' not in review_argv
+    assert 'web_search="live"' in primary_argv
+    assert 'web_search="live"' in review_argv
     assert "mcp_servers={}" in primary_argv
     assert "mcp_servers={}" in review_argv
     assert 'shell_environment_policy.inherit="none"' in primary_argv
     assert "danger-full-access" not in primary_argv
-    assert "external-research-disabled" in request.runtime_binding.capability_bindings
-    assert "web-search-live" not in request.runtime_binding.capability_bindings
+    assert (
+        "external-research-disabled"
+        not in request.runtime_binding.capability_bindings
+    )
+    assert "web-search-live" in request.runtime_binding.capability_bindings
+    assert "plugins-enabled" in request.runtime_binding.capability_bindings
     assert "accepted_source_manifest=" in primary_prompt
     assert '"accepted_source_manifest":' in review_prompt
-    assert 'fresh_context_mode":"fork_turns:none"' in review_prompt
+    assert "advisory finalization provider turn" in review_prompt
     assert '"document_profile":' not in review_prompt
-    assert "root_context_canary=" in review_prompt
+    assert "root_context_canary=" not in review_prompt
     assert "attempt_ref=" not in primary_prompt
     assert "fence_ref=" not in primary_prompt
 
@@ -449,7 +452,7 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
         f'{json.dumps(str(tmp_path / "provider" / "writing-inputs"))}="read"'
         not in permission_profile
     )
-    assert 'network={enabled=false}' in permission_profile
+    assert 'network={enabled=true}' in permission_profile
     manifest = json.loads((source_root / "manifest.json").read_text("utf-8"))
     assert manifest["snapshot_hash"] == request.snapshot["snapshot_hash"]
     assert manifest["sources"][0]["version_ref"] == "asset_version:source-1"
@@ -460,7 +463,7 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     )
 
 
-def test_report_review_task_hash_remains_pre_profile_extension_compatible(
+def test_report_review_task_hash_uses_the_root_advisory_identity(
     tmp_path: Path,
 ) -> None:
     adapter = CodexWritingSkillAdapter(
@@ -480,7 +483,7 @@ def test_report_review_task_hash_remains_pre_profile_extension_compatible(
     )
 
     assert writing_review_task_hash(request, draft) == (
-        "821ea7efbecb3e0f316d426674b810f61901b94319f56a82d8729940bb6f3e2a"
+        "31e437acfb758901edba8cc2d3e6e5948c05538a38b3a3203b35e22271d7e5f2"
     )
 
 
@@ -579,7 +582,7 @@ def test_production_adapter_fails_closed_if_staged_source_is_replaced(
     assert len(runner.calls) == 1
 
 
-def test_production_adapter_rejects_a_child_that_inherited_root_context(
+def test_production_adapter_does_not_admit_or_reject_on_child_trace(
     tmp_path: Path,
 ) -> None:
     draft = _draft_output()
@@ -602,10 +605,10 @@ def test_production_adapter_rejects_a_child_that_inherited_root_context(
         process_runner=runner,
     )
 
-    with pytest.raises(
-        WritingSkillUnavailable, match="writing_child_review_result_invalid"
-    ):
-        adapter.execute(_request(adapter))
+    result = adapter.execute(_request(adapter))
+
+    assert result.review_mode == "advisory_unobserved"
+    assert result.reviewer_agent_ref is None
 
 
 def test_writing_runtime_binding_seals_the_complete_provider_contract(

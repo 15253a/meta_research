@@ -66,6 +66,10 @@ BUNDLE_EXHAUSTION_REVIEW_RESPONSE_SCHEMA = (
 BUNDLE_EXHAUSTION_REVIEW_TASK_SCHEMA = (
     "meta-research/bundle-exhaustion-review-task/v1"
 )
+BUNDLE_EXHAUSTION_ADVISORY_REVIEW_SCHEMA = (
+    "meta-research/bundle-exhaustion-advisory-review/v1"
+)
+BUNDLE_EXHAUSTION_REVIEWER_UNOBSERVED = "advisory-review-unobserved"
 BUNDLE_EXHAUSTION_BASIS_KIND = "bundle_exhaustion_proposal"
 
 _EXPLORATION_DISPOSITIONS = frozenset(
@@ -721,14 +725,51 @@ def bundle_exhaustion_review_response_document(
     }
 
 
+def bundle_exhaustion_advisory_review_document(
+    *,
+    reviewed_assessment_hash: str,
+    reviewer_agent_ref: str | None,
+    findings: tuple[str, ...],
+) -> dict[str, object]:
+    """Describe optional review provenance without claiming a child event."""
+
+    if reviewer_agent_ref is not None:
+        _text(
+            reviewer_agent_ref,
+            "bundle_exhaustion_reviewer_agent_ref_invalid",
+            maximum=256,
+        )
+    if (
+        type(findings) is not tuple
+        or len(findings) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS
+        or any(
+            type(item) is not str
+            or not item.strip()
+            or len(item.encode("utf-8")) > 4096
+            for item in findings
+        )
+    ):
+        raise OwnerConflict("bundle_exhaustion_review_findings_invalid")
+    return {
+        "schema_ref": BUNDLE_EXHAUSTION_ADVISORY_REVIEW_SCHEMA,
+        "reviewed_assessment_hash": _hash(
+            reviewed_assessment_hash,
+            "bundle_exhaustion_assessment_content_hash_invalid",
+        ),
+        "reviewer_agent_ref": reviewer_agent_ref,
+        "findings": list(findings),
+        "trace_observed": False,
+        "advisory_only": True,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class BundleExhaustionReviewTrace:
-    """Adapter-sealed proof of one real, terminal child-review turn.
+    """Legacy optional provenance for one terminal child-review turn.
 
-    Event hashes are derived from the actual Harness stdout by the production
-    adapter.  They are not independently authoritative: the transport seal is
-    revalidated through the exact adapter/runtime binding before AR accepts
-    the surrounding evidence.
+    Historical evidence can retain this shape.  New exhaustion acceptance does
+    not require or synthesize it, and Owner acceptance never treats it as the
+    semantic exhaustion decision.
     """
 
     run_ref: str
@@ -811,9 +852,9 @@ class BundleExhaustionEvidence:
     primary_response_hash: str
     primary_assessment_hash: str
     review_invocation_ref: str
-    reviewer_agent_ref: str
+    reviewer_agent_ref: str | None
     review_findings: tuple[str, ...]
-    review_trace: BundleExhaustionReviewTrace
+    review_trace: BundleExhaustionReviewTrace | None
     completion_contract: NormalizedCompletionContract
     exploration_records: tuple[BundleExhaustionExplorationRecord, ...]
     rejected_submissions: tuple[BundleExhaustionRejectedSubmission, ...]
@@ -849,9 +890,14 @@ class BundleExhaustionEvidence:
                 self.review_invocation_ref,
                 "bundle_exhaustion_review_invocation_ref_invalid",
             ),
-            (self.reviewer_agent_ref, "bundle_exhaustion_reviewer_agent_ref_invalid"),
         ):
             _text(value, code, maximum=256)
+        if self.reviewer_agent_ref is not None:
+            _text(
+                self.reviewer_agent_ref,
+                "bundle_exhaustion_reviewer_agent_ref_invalid",
+                maximum=256,
+            )
         for value, code in (
             (
                 self.stage_run_request_receipt_hash,
@@ -876,37 +922,44 @@ class BundleExhaustionEvidence:
             raise OwnerConflict("bundle_exhaustion_epoch_invalid")
         if type(self.completion_contract) is not NormalizedCompletionContract:
             raise OwnerConflict("bundle_exhaustion_completion_contract_invalid")
-        if self.reviewer_agent_ref in {
-            self.root_session_ref,
-            self.native_session_ref,
-        }:
-            raise OwnerConflict("bundle_exhaustion_review_not_independent")
-        if type(self.review_findings) is not tuple or self.review_findings:
-            raise OwnerConflict("bundle_exhaustion_review_findings_unresolved")
-        if type(self.review_trace) is not BundleExhaustionReviewTrace:
-            raise OwnerConflict("bundle_exhaustion_review_trace_invalid")
-        expected_review_hash = canonical_hash(
-            bundle_exhaustion_review_response_document(
-                reviewer_agent_ref=self.reviewer_agent_ref,
-                reviewed_assessment_hash=self.primary_assessment_hash,
-            )
-        )
-        expected_task_hash = bundle_exhaustion_review_task_hash(
+        bundle_exhaustion_advisory_review_document(
             reviewed_assessment_hash=self.primary_assessment_hash,
-            formal_plan_content_hash=self.formal_plan_content_hash,
+            reviewer_agent_ref=self.reviewer_agent_ref,
+            findings=self.review_findings,
         )
-        if (
-            self.review_trace.run_ref != self.run_ref
-            or self.review_trace.attempt_ref != self.attempt_ref
-            or self.review_trace.fence_ref != self.execution_fence_ref
-            or self.review_trace.primary_session_ref != self.native_session_ref
-            or self.review_trace.reviewer_agent_ref != self.reviewer_agent_ref
-            or self.review_trace.reviewed_assessment_hash
-            != self.primary_assessment_hash
-            or self.review_trace.review_task_hash != expected_task_hash
-            or self.review_trace.review_response_hash != expected_review_hash
-        ):
-            raise OwnerConflict("bundle_exhaustion_review_trace_invalid")
+        if self.review_trace is not None:
+            if (
+                type(self.review_trace) is not BundleExhaustionReviewTrace
+                or self.reviewer_agent_ref is None
+                or self.reviewer_agent_ref
+                in {self.root_session_ref, self.native_session_ref}
+            ):
+                raise OwnerConflict("bundle_exhaustion_review_trace_invalid")
+            expected_review_hash = canonical_hash(
+                bundle_exhaustion_review_response_document(
+                    reviewer_agent_ref=self.reviewer_agent_ref,
+                    reviewed_assessment_hash=self.primary_assessment_hash,
+                )
+            )
+            expected_task_hash = bundle_exhaustion_review_task_hash(
+                reviewed_assessment_hash=self.primary_assessment_hash,
+                formal_plan_content_hash=self.formal_plan_content_hash,
+            )
+            if (
+                self.review_trace.run_ref != self.run_ref
+                or self.review_trace.attempt_ref != self.attempt_ref
+                or self.review_trace.fence_ref != self.execution_fence_ref
+                or self.review_trace.primary_session_ref
+                != self.native_session_ref
+                or self.review_trace.reviewer_agent_ref
+                != self.reviewer_agent_ref
+                or self.review_trace.reviewed_assessment_hash
+                != self.primary_assessment_hash
+                or self.review_trace.review_task_hash != expected_task_hash
+                or self.review_trace.review_response_hash
+                != expected_review_hash
+            ):
+                raise OwnerConflict("bundle_exhaustion_review_trace_invalid")
         if self.completion_contract.plan_document_hash != self.formal_plan_content_hash:
             raise OwnerConflict("bundle_exhaustion_completion_contract_drift")
         if type(self.exploration_records) is not tuple or not self.exploration_records:
@@ -1057,7 +1110,9 @@ class BundleExhaustionEvidence:
             "review_invocation_ref": self.review_invocation_ref,
             "reviewer_agent_ref": self.reviewer_agent_ref,
             "review_findings": list(self.review_findings),
-            "review_trace": self.review_trace.as_dict(),
+            "review_trace": (
+                None if self.review_trace is None else self.review_trace.as_dict()
+            ),
             "completion_contract": normalized_completion_contract_to_dict(
                 self.completion_contract
             ),
@@ -1124,12 +1179,20 @@ def bundle_exhaustion_review_response_hash(
 ) -> str:
     if type(evidence) is not BundleExhaustionEvidence:
         raise OwnerConflict("bundle_exhaustion_evidence_invalid")
-    return canonical_hash(
-        bundle_exhaustion_review_response_document(
+    if evidence.review_trace is not None:
+        if evidence.reviewer_agent_ref is None:
+            raise OwnerConflict("bundle_exhaustion_review_trace_invalid")
+        document = bundle_exhaustion_review_response_document(
             reviewer_agent_ref=evidence.reviewer_agent_ref,
             reviewed_assessment_hash=evidence.primary_assessment_hash,
         )
-    )
+    else:
+        document = bundle_exhaustion_advisory_review_document(
+            reviewed_assessment_hash=evidence.primary_assessment_hash,
+            reviewer_agent_ref=evidence.reviewer_agent_ref,
+            findings=evidence.review_findings,
+        )
+    return canonical_hash(document)
 
 
 def verify_bundle_exhaustion_assessment_envelope(
@@ -1649,7 +1712,21 @@ class BundleExhaustionOwnerProofVerifier:
                 request_ref = item.get("request_ref")
                 if type(request_ref) is not str or not request_ref:
                     raise OwnerConflict("bundle_exhaustion_human_request_invalid")
-                open_requests.append(request_ref)
+                direct_waiters = item.get("direct_waiters")
+                if not isinstance(direct_waiters, list):
+                    raise OwnerConflict("bundle_exhaustion_human_request_invalid")
+                # HumanRequest waiters are local. An unrelated acquisition,
+                # Writing, or sibling Target request must not make the Bundle
+                # root look globally blocked. Target-local waits are evaluated
+                # by the target inventory below; only this exact root wait is a
+                # direct exhaustion blocker here.
+                if any(
+                    isinstance(waiter, dict)
+                    and waiter.get("run_ref") == proposal.run_ref
+                    and waiter.get("status") == "waiting"
+                    for waiter in direct_waiters
+                ):
+                    open_requests.append(request_ref)
             if open_requests:
                 return BundleExhaustionEvaluation(
                     status="needs_input",
@@ -1951,35 +2028,37 @@ def bundle_exhaustion_evidence_from_dict(
     if type(value["review_findings"]) is not list:
         raise OwnerConflict("bundle_exhaustion_review_findings_unresolved")
     raw_trace = value["review_trace"]
-    if type(raw_trace) is not dict or set(raw_trace) != {
-        "schema_ref",
-        "run_ref",
-        "attempt_ref",
-        "fence_ref",
-        "primary_session_ref",
-        "reviewer_agent_ref",
-        "reviewed_assessment_hash",
-        "review_task_hash",
-        "review_response_hash",
-        "spawn_event_hash",
-        "completion_event_hash",
-        "transport_seal",
-    }:
-        raise OwnerConflict("bundle_exhaustion_review_trace_invalid")
-    review_trace = BundleExhaustionReviewTrace(
-        schema_ref=raw_trace["schema_ref"],
-        run_ref=raw_trace["run_ref"],
-        attempt_ref=raw_trace["attempt_ref"],
-        fence_ref=raw_trace["fence_ref"],
-        primary_session_ref=raw_trace["primary_session_ref"],
-        reviewer_agent_ref=raw_trace["reviewer_agent_ref"],
-        reviewed_assessment_hash=raw_trace["reviewed_assessment_hash"],
-        review_task_hash=raw_trace["review_task_hash"],
-        review_response_hash=raw_trace["review_response_hash"],
-        spawn_event_hash=raw_trace["spawn_event_hash"],
-        completion_event_hash=raw_trace["completion_event_hash"],
-        transport_seal=raw_trace["transport_seal"],
-    )
+    review_trace = None
+    if raw_trace is not None:
+        if type(raw_trace) is not dict or set(raw_trace) != {
+            "schema_ref",
+            "run_ref",
+            "attempt_ref",
+            "fence_ref",
+            "primary_session_ref",
+            "reviewer_agent_ref",
+            "reviewed_assessment_hash",
+            "review_task_hash",
+            "review_response_hash",
+            "spawn_event_hash",
+            "completion_event_hash",
+            "transport_seal",
+        }:
+            raise OwnerConflict("bundle_exhaustion_review_trace_invalid")
+        review_trace = BundleExhaustionReviewTrace(
+            schema_ref=raw_trace["schema_ref"],
+            run_ref=raw_trace["run_ref"],
+            attempt_ref=raw_trace["attempt_ref"],
+            fence_ref=raw_trace["fence_ref"],
+            primary_session_ref=raw_trace["primary_session_ref"],
+            reviewer_agent_ref=raw_trace["reviewer_agent_ref"],
+            reviewed_assessment_hash=raw_trace["reviewed_assessment_hash"],
+            review_task_hash=raw_trace["review_task_hash"],
+            review_response_hash=raw_trace["review_response_hash"],
+            spawn_event_hash=raw_trace["spawn_event_hash"],
+            completion_event_hash=raw_trace["completion_event_hash"],
+            transport_seal=raw_trace["transport_seal"],
+        )
     try:
         completion_contract = normalized_completion_contract_from_dict(
             value["completion_contract"],

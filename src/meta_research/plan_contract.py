@@ -304,13 +304,22 @@ def validate_plan_review(
     )
     if (
         review.get("schema_ref") != PLAN_REVIEW_SCHEMA_REF
-        or review.get("review_mode") != "harness_child_agent"
-        or not _text(review.get("reviewer_agent_ref"))
         or review.get("reviewed_draft_hash") != reviewed_draft_hash
         or review.get("final_plan_hash") != final_plan_hash
-        or review.get("independent") is not True
         or review.get("advisory_only") is not True
     ):
+        raise PlanContractError("plan_review_invalid")
+    review_mode = review.get("review_mode")
+    reviewer_agent_ref = review.get("reviewer_agent_ref")
+    if review_mode == "advisory_unobserved":
+        if reviewer_agent_ref is not None or review.get("independent") is not False:
+            raise PlanContractError("plan_review_invalid")
+    elif review_mode == "harness_child_agent":
+        # Immutable pre-ADR-0003 content remains readable. Current Skill and
+        # Agent Runtime write gates reject this historical provenance shape.
+        if not _text(reviewer_agent_ref) or review.get("independent") is not True:
+            raise PlanContractError("plan_review_invalid")
+    else:
         raise PlanContractError("plan_review_invalid")
     _sha256(reviewed_draft_hash, "plan_review_invalid")
     _sha256(final_plan_hash, "plan_review_invalid")

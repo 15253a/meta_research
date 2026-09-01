@@ -27,7 +27,7 @@ ScientificOutcome 还闭合 `support_scope`、`limitations`、`causal_interpreta
 
 ## Closed review
 
-Review response 恰含 schema ref、fresh child identity、findings、完整 final output 与 dispositions。每条 finding 恰有一条同 id disposition；`revised` 当且仅当 final output hash 与 reviewed draft hash 不同。Review advisory-only，不能批准科学语义。
+Review response 恰含 schema ref、findings、完整 final output 与 dispositions。持久化 review 使用 `advisory_unobserved`、null reviewer 与 `independent=false`。每条 finding 恰有一条同 id disposition；`revised` 当且仅当 final output hash 与 reviewed draft hash 不同。Review advisory-only，不能批准科学语义。
 
 ## Fail-closed matrix
 
@@ -40,11 +40,11 @@ Review response 恰含 schema ref、fresh child identity、findings、完整 fin
 | 任一未来 effect 缺 matching reconcile binding | effect 前停止；本版本不授予 Agent-callable effect |
 | provider trace 未先观察 currentness，或未完成三项 read | 不接纳 provider output |
 | ContextPack/evidence hash、source binding 或 closed schema 不一致 | 不形成 Skill result |
-| primary/review native Session 改变或 child trace 不成立 | 不形成 Skill result |
+| primary/review native Session 改变或第二个 provider turn 不闭合 | 不形成 Skill result |
 | durable provider outcome unknown | 保留原 operation/channel 进入 reconciliation，不重放 |
 
 技术 blocker 不得重写成 `insufficient_evidence`。后者只表示所有冻结输入均有效且终态，但科学覆盖仍不足。
 
 ## Prototype Delta
 
-固定 commit `f2d3f3f0d77a6f50ab535d50d6d404a525c09757` 的 fixture 使用了开放式 synthesis、causal interpretation、selection facts 与 fake semantic ports 来验证行为。生产实现保留其科学语义，但把 synthesis/causal 字段收敛为 `reasoning_contract.py` 已版本化的 closed ScientificOutcome，并把每个尺度绑定到 AE 冻结、RG issuer-verified 的 context；AE/RM/RG 三项真实 read 替代 fake currentness；同一 native root Session 内的 child identity 替代 fixture reviewer session。AutonomousCreation 的高层 effect 与 Quest-ending 写链由对应 Owner/daemon 独立完成，Reasoning adapter 只在拿到已接纳 QuestionAnchor 后输出 NextCycleProposal，也不把部分 creation state 暴露成第二分支。
+固定 commit `f2d3f3f0d77a6f50ab535d50d6d404a525c09757` 的 fixture 使用了开放式 synthesis、causal interpretation、selection facts 与 fake semantic ports 来验证行为。生产实现保留其科学语义，但把 synthesis/causal 字段收敛为 `reasoning_contract.py` 已版本化的 closed ScientificOutcome，并把每个尺度绑定到 AE 冻结、RG issuer-verified 的 context；AE/RM/RG 三项真实 read 替代 fake currentness；同一 native root Session 的第二个 advisory finalization turn 替代 fixture reviewer session。AutonomousCreation 的高层 effect 与 Quest-ending 写链由对应 Owner/daemon 独立完成，Reasoning adapter 只在拿到已接纳 QuestionAnchor 后输出 NextCycleProposal，也不把部分 creation state 暴露成第二分支。

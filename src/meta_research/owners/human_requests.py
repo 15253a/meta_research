@@ -163,6 +163,10 @@ class HumanRequestOwnerInterface(Protocol):
         include_history: bool = False,
     ) -> tuple[dict[str, object], ...]: ...
 
+    def reconcile_human_request_open(
+        self, idempotency_key: str
+    ) -> dict[str, object] | None: ...
+
 
 
 class HumanRequestOwnerMixin:
@@ -214,6 +218,13 @@ class HumanRequestOwnerMixin:
 
     def query_human_requests(self, **values) -> tuple[dict[str, object], ...]:
         return self._human_request_owner.query_human_requests(**values)
+
+    def reconcile_human_request_open(
+        self, idempotency_key: str
+    ) -> dict[str, object] | None:
+        return self._human_request_owner.reconcile_human_request_open(
+            idempotency_key
+        )
 
 
 
@@ -1111,6 +1122,33 @@ class SQLiteHumanRequestOwner:
             )
         results = tuple(self.query_human_request(ref) for ref in refs)
         return tuple(item for item in results if item is not None)
+
+    def reconcile_human_request_open(
+        self, idempotency_key: str
+    ) -> dict[str, object] | None:
+        """Resolve an open effect by its caller-known identity without replaying it."""
+
+        _validate_idempotency_key(idempotency_key)
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT command_kind, result_ref FROM "
+                    "owner_human_request_commands WHERE issuer = :issuer AND "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {
+                    "issuer": self._issuer,
+                    "idempotency_key": idempotency_key,
+                },
+            ).first()
+        if row is None:
+            return None
+        if row.command_kind != "open":
+            raise OwnerConflict("idempotency_conflict")
+        request = self.query_human_request(cast(str, row.result_ref))
+        if request is None:
+            raise OwnerConflict("human_request_artifact_invalid")
+        return request
 
     def _materialize_expiration_if_due(self, request_ref: str) -> None:
         now = time.time()

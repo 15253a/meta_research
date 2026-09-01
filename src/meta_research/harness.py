@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 import math
 import re
 import secrets
@@ -32,6 +33,7 @@ from meta_research.owners.agent_runtime_harness import (
     AgentRuntimeTargetChildSession,
     TargetRootCompletionEvidence,
     TargetRootObservationPage,
+    target_provider_ceiling_recovery_ref,
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.provider_supervisor import (
@@ -44,8 +46,14 @@ from meta_research.runtime_protection import (
     RuntimeProtection,
     RuntimeProtectionUnavailable,
 )
+from meta_research.root_capabilities import root_capability_profile
+from meta_research.root_operation_diagnostics import (
+    RootOperationDiagnosticRecorder,
+    root_operation_diagnostic_ref,
+)
 from meta_research.semantic_mcp import (
     McpConnection,
+    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
     ResidentMcpBinding,
     SemanticMcpError,
     SemanticMcpGateway,
@@ -53,9 +61,16 @@ from meta_research.semantic_mcp import (
 from meta_research.semantic_owner_gateway import (
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
     REASONING_ROOT_SEMANTIC_OPERATION_IDS,
-    TARGET_RUN_SEMANTIC_OPERATION_IDS,
+    TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+)
+from meta_research.target_raw_output import (
+    TargetRawOutputStore,
+    TargetRawOutputUnavailable,
 )
 from meta_research.target_run_runtime_contract import TargetCompletionHandoff
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 HarnessFamily = Literal["codex", "claude"]
@@ -72,7 +87,9 @@ _PROVIDER_CEILING_CODES = frozenset(
 )
 
 FULL_CONFORMANCE_V1 = "meta-research/harness-full-conformance/v1"
-FULL_CONFORMANCE_FAMILIES: tuple[HarnessFamily, ...] = ("codex", "claude")
+FULL_CONFORMANCE_V2 = "meta-research/harness-full-conformance/codex-only/v2"
+OPERATION_BINDING_V1 = "meta-research/harness-operation-binding/v1"
+FULL_CONFORMANCE_FAMILIES: tuple[HarnessFamily, ...] = ("codex",)
 FULL_CONFORMANCE_OPERATION_IDS = tuple(
     sorted(
         {
@@ -86,7 +103,7 @@ FULL_CONFORMANCE_OPERATION_IDS = tuple(
             "research_memory.snapshot.read",
             *BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
             *REASONING_ROOT_SEMANTIC_OPERATION_IDS,
-            *TARGET_RUN_SEMANTIC_OPERATION_IDS,
+            *TARGET_ROOT_SEMANTIC_OPERATION_IDS,
         }
     )
 )
@@ -246,6 +263,21 @@ class HarnessProbeRequest:
 
 
 @dataclass(frozen=True)
+class ConformanceHarnessRequest(HarnessProbeRequest):
+    """A full-conformance probe with its wall-clock policy frozen at admission."""
+
+    provider_operation_timeout_seconds: float | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            **super().as_dict(),
+            "provider_operation_timeout_seconds": (
+                self.provider_operation_timeout_seconds
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class TargetHarnessRequest(HarnessProbeRequest):
     """One independently admitted TargetRun root Harness request."""
 
@@ -264,11 +296,10 @@ class TargetHarnessRequest(HarnessProbeRequest):
             "full_conformance_binding": self.full_conformance_binding,
             "full_conformance_binding_hash": self.full_conformance_binding_hash,
             "target_scope_binding_hash": self.target_scope_binding_hash,
-        }
-        if self.provider_operation_timeout_seconds is not None:
-            value["provider_operation_timeout_seconds"] = (
+            "provider_operation_timeout_seconds": (
                 self.provider_operation_timeout_seconds
-            )
+            ),
+        }
         return value
 
 
@@ -328,21 +359,25 @@ class _ResidentMcpScope:
     fence_ref: str
     capability_binding_hash: str
     operation_ids: tuple[str, ...]
+    root_kind: Literal["bundle", "reasoning"]
+    phase: str
+    subject_policy: Literal["operation_tree", "review_tree"]
 
 
 @dataclass(frozen=True)
 class FullConformanceRequest:
     codex_model_ref: str
     codex_auth_profile_ref: str
-    claude_model_ref: str
-    claude_auth_profile_ref: str
+    # Deprecated compatibility inputs are decoded but never selected.
+    claude_model_ref: str | None = None
+    claude_auth_profile_ref: str | None = None
 
     def provider_configuration(
         self, family: HarnessFamily
     ) -> tuple[str, str]:
         if family == "codex":
             return self.codex_model_ref, self.codex_auth_profile_ref
-        return self.claude_model_ref, self.claude_auth_profile_ref
+        raise HarnessAdmissionError("research_harness_family_not_selected")
 
 
 @dataclass(frozen=True)
@@ -372,12 +407,12 @@ class FullConformanceRunSet:
 
 @dataclass(frozen=True)
 class FullConformanceBinding:
-    """Content-addressed summary of the current fixed Harness contract.
+    """Compatibility envelope for content-addressed Harness bindings.
 
-    This is a projection of Agent Runtime's accepted conformance Runs, not a
-    second readiness authority.  Consumers freeze it into their own runtime
-    admission and compare it with a freshly projected value before resuming a
-    provider side effect.
+    Diagnostic Full Conformance and production operation bindings share the
+    persisted shape while their ``contract_ref`` keeps the meanings distinct.
+    This avoids rewriting existing Owner storage merely to remove a global
+    production admission gate.
     """
 
     contract_ref: str
@@ -423,11 +458,19 @@ class HarnessRuntime:
         runtime_protection: RuntimeProtection | None = None,
         runtime_boundary_recorder: RuntimeBoundaryRecorder | None = None,
         daemon_incarnation_ref: str | None = None,
+        target_raw_output_store: TargetRawOutputStore | None = None,
+        root_operation_diagnostic_recorder: (
+            RootOperationDiagnosticRecorder | None
+        ) = None,
     ) -> None:
         self._owner = owner
         self._gateway = gateway
         self._adapters = {adapter.family: adapter for adapter in adapters}
-        if set(self._adapters) != {"codex", "claude"}:
+        adapter_families = set(self._adapters)
+        if (
+            "codex" not in adapter_families
+            or not adapter_families <= {"codex", "claude"}
+        ):
             raise HarnessAdmissionError("harness_adapter_catalog_invalid")
         try:
             self._full_conformance_operation_bindings = (
@@ -435,8 +478,11 @@ class HarnessRuntime:
                     FULL_CONFORMANCE_OPERATION_IDS
                 )
             )
-        except SemanticMcpError as error:
-            raise HarnessAdmissionError(error.code) from error
+        except SemanticMcpError:
+            # The matrix is a diagnostic.  A missing global operation must not
+            # prevent the selected production Harness from being constructed;
+            # the diagnostic admission itself will report the missing binding.
+            self._full_conformance_operation_bindings = ()
         gateway_status = self._gateway.query_status()
         catalog_hash = gateway_status.get("catalog_hash")
         if not isinstance(catalog_hash, str) or len(catalog_hash) != 64:
@@ -444,7 +490,7 @@ class HarnessRuntime:
         self._full_conformance_catalog_hash = catalog_hash
         self._full_conformance_contract_hash = canonical_hash(
             {
-                "contract_ref": FULL_CONFORMANCE_V1,
+                "contract_ref": FULL_CONFORMANCE_V2,
                 "harness_families": list(FULL_CONFORMANCE_FAMILIES),
                 "locked_versions": {
                     family: self._adapters[family].locked_version
@@ -466,6 +512,10 @@ class HarnessRuntime:
         self._runtime_protection = runtime_protection
         self._runtime_boundary_recorder = runtime_boundary_recorder
         self._daemon_incarnation_ref = daemon_incarnation_ref
+        self._target_raw_output_store = target_raw_output_store
+        self._root_operation_diagnostic_recorder = (
+            root_operation_diagnostic_recorder
+        )
         self._startup_diagnostics_ran = False
         if (runtime_protection is None) != (runtime_boundary_recorder is None):
             raise HarnessAdmissionError("runtime_protection_binding_incomplete")
@@ -708,8 +758,11 @@ class HarnessRuntime:
         fence_ref: str,
         capability_binding_hash: str,
         operation_ids: tuple[str, ...],
+        root_kind: Literal["bundle", "reasoning"],
+        phase: str,
+        subject_policy: Literal["operation_tree", "review_tree"],
     ) -> ResidentMcpChannel:
-        """Issue a scoped channel after the fixed Harness contract is ready.
+        """Issue a scoped channel for one already-admitted operation scope.
 
         This method does not admit or invent a Run, Attempt, Session, or Fence;
         the caller must supply the exact identities already admitted by the
@@ -717,14 +770,41 @@ class HarnessRuntime:
         is never placed in a runtime binding or durable provider spool.
         """
 
-        self.require_full_conformance_binding()
         verifier = self._resident_scope_verifier
         if verifier is None:
             raise HarnessAdmissionError("mcp_scope_verifier_unavailable")
+        expected_operation_ids = (
+            REASONING_ROOT_SEMANTIC_OPERATION_IDS
+            if root_kind == "reasoning"
+            else BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+        )
+        if (
+            root_kind not in {"bundle", "reasoning"}
+            or not isinstance(phase, str)
+            or not phase
+            or len(phase) > 128
+            or subject_policy not in {"operation_tree", "review_tree"}
+            or len(operation_ids) != len(set(operation_ids))
+            or (
+                subject_policy == "operation_tree"
+                and operation_ids != expected_operation_ids
+            )
+            or (
+                subject_policy == "review_tree"
+                and not set(operation_ids) <= set(expected_operation_ids)
+            )
+            or (
+                subject_policy == "review_tree"
+                and set(operation_ids).intersection(
+                    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+                )
+            )
+        ):
+            raise HarnessAdmissionError("mcp_channel_scope_invalid")
         try:
             verify_scope = (
                 verifier.verify_reasoning_runtime_scope
-                if operation_ids == REASONING_ROOT_SEMANTIC_OPERATION_IDS
+                if root_kind == "reasoning"
                 else verifier.verify_bundle_runtime_scope
             )
             verify_scope(
@@ -756,6 +836,9 @@ class HarnessRuntime:
                 fence_ref=fence_ref,
                 capability_binding_hash=capability_binding_hash,
                 operation_ids=operation_ids,
+                root_kind=root_kind,
+                phase=phase,
+                subject_policy=subject_policy,
             )
         )
         return ResidentMcpChannel(connection=connection, binding=binding)
@@ -765,8 +848,11 @@ class HarnessRuntime:
 
         if not isinstance(channel, ResidentMcpChannel):
             raise HarnessAdmissionError("mcp_channel_scope_invalid")
-        self._resident_channel_scopes.pop(_token_hash(channel.connection.token), None)
+        token_hash = _token_hash(channel.connection.token)
+        # Deny first so a concurrent request cannot bypass the resident scope
+        # verifier while local diagnostic metadata is being removed.
         self._gateway.revoke_channel(channel.connection.token)
+        self._resident_channel_scopes.pop(token_hash, None)
 
     def start_full_conformance(
         self, request: FullConformanceRequest
@@ -781,13 +867,16 @@ class HarnessRuntime:
         for family in FULL_CONFORMANCE_FAMILIES:
             model_ref, auth_profile_ref = request.provider_configuration(family)
             request_ref = self._full_conformance_request_ref(token, family)
-            probe_request = HarnessProbeRequest(
+            probe_request = ConformanceHarnessRequest(
                 request_ref=request_ref,
                 harness_family=family,
                 model_ref=model_ref,
                 auth_profile_ref=auth_profile_ref,
                 required_operation_ids=FULL_CONFORMANCE_OPERATION_IDS,
                 required_capabilities=HARNESS_CAPABILITIES,
+                provider_operation_timeout_seconds=(
+                    self._conformance_provider_operation_timeout_seconds(family)
+                ),
             )
             self._validate_request(probe_request, request_ref)
             self._capability_binding_hash(probe_request)
@@ -801,7 +890,7 @@ class HarnessRuntime:
             runs.append(admission.run)
         return FullConformanceRunSet(
             conformance_ref=conformance_ref,
-            contract_ref=FULL_CONFORMANCE_V1,
+            contract_ref=FULL_CONFORMANCE_V2,
             contract_hash=self._full_conformance_contract_hash,
             runs=tuple(runs),
         )
@@ -889,13 +978,18 @@ class HarnessRuntime:
         auth_profile_ref: str,
         target_scope_binding: dict[str, object],
     ) -> HarnessAdmission:
-        """Admit an independent TargetRun root under the fixed Harness contract.
+        """Admit an independent TargetRun root under its actual operation binding.
 
         Agent Runtime already owns ``target_run_ref``.  Harness consumes that
         exact identity and only creates its Session/Attempt/Fence children.
         """
 
-        full_conformance = self.require_full_conformance_binding()
+        required_capabilities = _target_root_lifecycle_capabilities(resume=False)
+        operation_binding = self.require_operation_binding(
+            harness_family=harness_family,
+            required_operation_ids=TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+            required_capabilities=required_capabilities,
+        )
         provider_operation_timeout_seconds = (
             self._target_provider_operation_timeout_seconds(harness_family)
         )
@@ -906,9 +1000,9 @@ class HarnessRuntime:
             "harness_family": harness_family,
             "model_ref": model_ref,
             "auth_profile_ref": auth_profile_ref,
-            "required_operation_ids": list(TARGET_RUN_SEMANTIC_OPERATION_IDS),
-            "required_capabilities": list(HARNESS_CAPABILITIES),
-            "full_conformance_binding_hash": full_conformance.binding_hash,
+            "required_operation_ids": list(TARGET_ROOT_SEMANTIC_OPERATION_IDS),
+            "required_capabilities": list(required_capabilities),
+            "full_conformance_binding_hash": operation_binding.binding_hash,
             "target_scope_binding_hash": target_scope_binding_hash,
             "provider_operation_timeout_seconds": (
                 provider_operation_timeout_seconds
@@ -920,12 +1014,14 @@ class HarnessRuntime:
             harness_family=harness_family,
             model_ref=model_ref,
             auth_profile_ref=auth_profile_ref,
-            required_operation_ids=TARGET_RUN_SEMANTIC_OPERATION_IDS,
-            required_capabilities=HARNESS_CAPABILITIES,
+            required_operation_ids=TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+            required_capabilities=required_capabilities,
             target_ref=target_ref,
             target_run_ref=target_run_ref,
-            full_conformance_binding=full_conformance.as_dict(),
-            full_conformance_binding_hash=full_conformance.binding_hash,
+            # Persisted field names are retained for storage compatibility.  The
+            # value is an operation-local binding, not a Full Conformance gate.
+            full_conformance_binding=operation_binding.as_dict(),
+            full_conformance_binding_hash=operation_binding.binding_hash,
             target_scope_binding_hash=target_scope_binding_hash,
             provider_operation_timeout_seconds=(
                 provider_operation_timeout_seconds
@@ -939,7 +1035,7 @@ class HarnessRuntime:
 
     def _target_provider_operation_timeout_seconds(
         self, harness_family: HarnessFamily
-    ) -> float:
+    ) -> float | None:
         adapter = self._adapters[harness_family]
         binding_reader = getattr(
             adapter, "provider_operation_timeout_seconds", None
@@ -954,6 +1050,8 @@ class HarnessRuntime:
             raise HarnessAdmissionError(
                 "target_harness_runtime_binding_unavailable"
             ) from error
+        if value is None:
+            return None
         if (
             not isinstance(value, (int, float))
             or isinstance(value, bool)
@@ -965,6 +1063,57 @@ class HarnessRuntime:
             )
         return float(value)
 
+    def _conformance_provider_operation_timeout_seconds(
+        self, harness_family: HarnessFamily
+    ) -> float | None:
+        adapter = self._adapters[harness_family]
+        binding_reader = getattr(
+            adapter, "provider_operation_timeout_seconds", None
+        )
+        if not callable(binding_reader):
+            raise HarnessAdmissionError(
+                "full_conformance_runtime_binding_unavailable"
+            )
+        try:
+            value = binding_reader(target_root=False)
+        except Exception as error:
+            raise HarnessAdmissionError(
+                "full_conformance_runtime_binding_unavailable"
+            ) from error
+        if value is None:
+            return None
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or not 0 < float(value) <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+        ):
+            raise HarnessAdmissionError(
+                "full_conformance_runtime_binding_invalid"
+            )
+        return float(value)
+
+    def admit_target_run_from_current_binding(
+        self,
+        *,
+        target_ref: str,
+        target_run_ref: str,
+        harness_family: HarnessFamily,
+        target_scope_binding: dict[str, object],
+    ) -> HarnessAdmission:
+        """Admit production Target work from the selected live Codex binding."""
+
+        if harness_family != "codex":
+            raise HarnessAdmissionError("research_harness_family_not_selected")
+        return self.admit_target_run(
+            target_ref=target_ref,
+            target_run_ref=target_run_ref,
+            harness_family=harness_family,
+            model_ref=CODEX_MODEL_REF,
+            auth_profile_ref="harness-profile:codex-default",
+            target_scope_binding=target_scope_binding,
+        )
+
     def admit_target_run_from_current_conformance(
         self,
         *,
@@ -973,26 +1122,12 @@ class HarnessRuntime:
         harness_family: HarnessFamily,
         target_scope_binding: dict[str, object],
     ) -> HarnessAdmission:
-        """Admit a Target root with the exact current conformance profile.
+        """Compatibility alias; Full Conformance is diagnostic-only."""
 
-        Model and authentication bindings are reread from the current complete
-        conformance run for the requested family.  The Target runtime therefore
-        cannot guess credentials or silently fall back to a fixture profile.
-        """
-
-        self.require_full_conformance_binding()
-        _conformance_ref, runs, _operations = self._current_full_conformance()
-        conformance_run = runs.get(harness_family)
-        if conformance_run is None:
-            raise HarnessAdmissionError(
-                "bundle_harness_full_conformance_unavailable"
-            )
-        return self.admit_target_run(
+        return self.admit_target_run_from_current_binding(
             target_ref=target_ref,
             target_run_ref=target_run_ref,
             harness_family=harness_family,
-            model_ref=conformance_run.model_ref,
-            auth_profile_ref=conformance_run.auth_profile_ref,
             target_scope_binding=target_scope_binding,
         )
 
@@ -1381,15 +1516,13 @@ class HarnessRuntime:
                 raise AgentRuntimeHarnessError(
                     "provider_ceiling_recovery_required"
                 )
-            recovery_ref = "harness_ceiling_recovery_" + canonical_hash(
-                {
-                    "request_ref": request_ref,
-                    "run_ref": run.run_ref,
-                    "attempt_ref": run.attempt_ref,
-                    "fence_ref": run.fence_ref,
-                    "operation_ref": operation.operation_ref,
-                    "failure_code": run.failure_code,
-                }
+            recovery_ref = target_provider_ceiling_recovery_ref(
+                request_ref=request_ref,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                operation_ref=operation.operation_ref,
+                failure_code=run.failure_code,
             )
             recovered = self._owner.reserve_target_successor(
                 old_handle=old_handle,
@@ -1467,9 +1600,9 @@ class HarnessRuntime:
         *,
         handle: TargetWorkHandle,
         evidence: TargetRootCompletionEvidence,
-        handoff: TargetCompletionHandoff,
+        handoff: TargetCompletionHandoff | None,
     ) -> str:
-        """Issuer-reverify one final envelope against the durable event ledger."""
+        """Issuer-reverify one final binding against the durable event ledger."""
 
         try:
             return self._owner.verify_target_root_completion_evidence(
@@ -1496,6 +1629,160 @@ class HarnessRuntime:
                 limit=limit,
             )
         except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+
+    def query_target_raw_output(
+        self,
+        target_ref: str,
+        *,
+        after: int = 0,
+        limit: int = 64 * 1024,
+    ) -> dict[str, object]:
+        """Read exact root command output from the private provider spool.
+
+        This is a display-only projection.  It never participates in Target
+        acceptance and a missing/corrupt spool must not change the Run.
+        """
+
+        store = self._target_raw_output_store
+        if store is None:
+            raise HarnessAdmissionError("target_raw_output_unavailable")
+        try:
+            observation = self._owner.query_target_root_observations(
+                target_ref,
+                limit=1,
+            )
+            run = self._owner.query_target_run_by_ref(
+                observation.target_run_ref
+            )
+            operation = (
+                None if run is None else self._owner.latest_operation(run.run_ref)
+            )
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+        operation_is_current = bool(
+            run is not None
+            and operation is not None
+            and (
+                (
+                    run.status == "running"
+                    and operation.status == "running"
+                    and run.failure_code is None
+                )
+                or (
+                    run.status == "running"
+                    and operation.status == "failed"
+                    and run.failure_code in _PROVIDER_CEILING_CODES
+                    and operation.outcome_code == run.failure_code
+                )
+                or (
+                    run.status == "executed"
+                    and operation.status == "executed"
+                    and run.failure_code is None
+                )
+                or (
+                    run.status == "failed"
+                    and operation.status == "failed"
+                    and operation.outcome_code == run.failure_code
+                )
+            )
+        )
+        if run is None or operation is None or not operation_is_current or (
+            observation.target_ref,
+            observation.target_run_ref,
+            observation.attempt_ref,
+            observation.attempt_generation,
+            observation.root_session_ref,
+            observation.fence_ref,
+        ) != (
+            target_ref,
+            run.run_ref,
+            run.attempt_ref,
+            run.attempt_generation,
+            run.root_session_ref,
+            run.fence_ref,
+        ):
+            raise HarnessAdmissionError("target_raw_output_identity_invalid")
+        terminal = operation.status in {"executed", "failed"}
+        try:
+            page = store.query(
+                operation.operation_ref,
+                after=after,
+                limit=limit,
+                expected_native_session_ref=run.native_session_ref,
+                terminal=terminal,
+            )
+        except TargetRawOutputUnavailable as error:
+            if error.code != "target_raw_output_binding_unavailable":
+                raise HarnessAdmissionError(error.code) from error
+            self._recover_target_raw_output_binding(
+                run_ref=run.run_ref,
+                operation_ref=operation.operation_ref,
+            )
+            try:
+                page = store.query(
+                    operation.operation_ref,
+                    after=after,
+                    limit=limit,
+                    expected_native_session_ref=run.native_session_ref,
+                    terminal=terminal,
+                )
+            except TargetRawOutputUnavailable as retry_error:
+                raise HarnessAdmissionError(retry_error.code) from retry_error
+        return {
+            **page.as_dict(),
+            "target_ref": target_ref,
+            "target_run_ref": run.run_ref,
+            "attempt_ref": run.attempt_ref,
+            "attempt_generation": run.attempt_generation,
+            "root_session_ref": run.root_session_ref,
+            "native_session_ref": (
+                run.native_session_ref or page.root_native_session_ref
+            ),
+            "fence_ref": run.fence_ref,
+            "operation_generation": operation.generation,
+            "operation_status": operation.status,
+            "operation_outcome_code": operation.outcome_code,
+        }
+
+    def _recover_target_raw_output_binding(
+        self,
+        *,
+        run_ref: str,
+        operation_ref: str,
+    ) -> None:
+        store = self._target_raw_output_store
+        if store is None:
+            raise HarnessAdmissionError("target_raw_output_unavailable")
+        try:
+            profile = self._owner.query_profile(run_ref)
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+        receipts = (
+            profile.get("provider_transport_receipts")
+            if isinstance(profile, dict)
+            else None
+        )
+        matching = (
+            [
+                receipt
+                for receipt in receipts
+                if isinstance(receipt, dict)
+                and receipt.get("provider_operation_ref") == operation_ref
+            ]
+            if isinstance(receipts, list)
+            else []
+        )
+        if len(matching) != 1:
+            raise HarnessAdmissionError(
+                "target_raw_output_binding_unavailable"
+            )
+        try:
+            store.bind_verified_transport_receipt(
+                operation_ref,
+                matching[0],
+            )
+        except TargetRawOutputUnavailable as error:
             raise HarnessAdmissionError(error.code) from error
 
     def resume_probe_turn(
@@ -1643,6 +1930,12 @@ class HarnessRuntime:
         generation = self._next_operation_generation(admission.run.run_ref)
         if generation == 1 and resume:
             raise HarnessAdmissionError("harness_turn_generation_invalid")
+        recovered_generation = self._recovered_target_requests.get(request_ref)
+        consume_recovery_channel = (
+            isinstance(request, TargetHarnessRequest)
+            and generation > 1
+            and recovered_generation == generation - 1
+        )
         operation_ref = provider_operation_ref(
             admission.run.run_ref, "harness_turn", generation
         )
@@ -1667,6 +1960,8 @@ class HarnessRuntime:
             invocation_hash=invocation_hash,
             resume=resume,
         )
+        if consume_recovery_channel:
+            self._recovered_target_requests.pop(request_ref, None)
         return self._invoke_provider_turn(
             admission,
             request,
@@ -1788,6 +2083,9 @@ class HarnessRuntime:
         working_directory: Path | None = None,
     ) -> HarnessProbeRun:
         adapter = self._adapters[request.harness_family]
+        entry_path = (
+            "recovery" if reconciling else "resume" if resume else "initial"
+        )
         protection_effect = _harness_runtime_effect(
             run_ref=admission.run.run_ref,
             attempt_ref=admission.run.attempt_ref,
@@ -1861,9 +2159,19 @@ class HarnessRuntime:
                     ),
                     provider_operation_timeout_seconds=(
                         request.provider_operation_timeout_seconds
+                        if isinstance(
+                            request,
+                            (ConformanceHarnessRequest, TargetHarnessRequest),
+                        )
+                        else None
+                    ),
+                    root_kind=(
+                        "target"
                         if isinstance(request, TargetHarnessRequest)
                         else None
                     ),
+                    entry_path=entry_path,
+                    authorized_operation_ids=request.required_operation_ids,
                 )
             )
         except HarnessAdapterUnavailable as error:
@@ -2028,6 +2336,28 @@ class HarnessRuntime:
             operation_ref=operation_ref,
             resumed=resume,
         )
+        if isinstance(request, TargetHarnessRequest):
+            diagnostics = result.profile.get("root_capability_diagnostics")
+            recorder = self._root_operation_diagnostic_recorder
+            if isinstance(diagnostics, dict) and recorder is not None:
+                try:
+                    recorder.record(
+                        operation_ref=root_operation_diagnostic_ref(
+                            "target",
+                            source_ref=operation_ref,
+                            phase=entry_path,
+                        ),
+                        root_kind="target",
+                        diagnostics=diagnostics,
+                    )
+                except Exception:
+                    # Target admission and Owner completion never depend on
+                    # this public diagnostic-only sidecar.
+                    LOGGER.warning(
+                        "root operation diagnostic projection failed",
+                        exc_info=True,
+                        extra={"root_kind": "target"},
+                    )
         required = (
             request.required_capabilities
             if required_capabilities is None
@@ -2036,7 +2366,7 @@ class HarnessRuntime:
         missing = [
             capability
             for capability in required
-            if not _capability_has_evidence(profile, capability)
+            if not _capability_is_available(profile, capability)
         ]
         if missing:
             retry = self._record_operation_failure(
@@ -2178,7 +2508,7 @@ class HarnessRuntime:
                 else "capability_unavailable"
             ),
             "conformance": {
-                "contract_ref": FULL_CONFORMANCE_V1,
+                "contract_ref": FULL_CONFORMANCE_V2,
                 "contract_hash": self._full_conformance_contract_hash,
                 "conformance_ref": conformance_ref,
                 "required_families": list(FULL_CONFORMANCE_FAMILIES),
@@ -2190,6 +2520,69 @@ class HarnessRuntime:
             "gateway": self._gateway.query_status(),
             "adapters": adapters,
         }
+
+    def require_operation_binding(
+        self,
+        *,
+        harness_family: HarnessFamily,
+        required_operation_ids: tuple[str, ...],
+        required_capabilities: tuple[str, ...],
+    ) -> FullConformanceBinding:
+        """Freeze only the provider and capabilities needed by this operation.
+
+        Full Conformance remains available through ``query_status`` and
+        ``require_full_conformance_binding`` for diagnostics.  Production
+        admission instead proves the selected adapter, the live Semantic MCP
+        catalog, and the operation's actual capability subset.
+        """
+
+        if (
+            harness_family not in self._adapters
+            or not required_operation_ids
+            or len(required_operation_ids) != len(set(required_operation_ids))
+            or not required_capabilities
+            or len(required_capabilities) != len(set(required_capabilities))
+            or not set(required_capabilities) <= set(HARNESS_CAPABILITIES)
+        ):
+            raise HarnessAdmissionError("harness_operation_binding_invalid")
+        try:
+            operation_bindings = self._gateway.required_bindings(
+                required_operation_ids
+            )
+        except SemanticMcpError as error:
+            raise HarnessAdmissionError(error.code) from error
+        gateway_status = self._gateway.query_status()
+        catalog_hash = gateway_status.get("catalog_hash")
+        if (
+            gateway_status.get("status") != "ready"
+            or not isinstance(catalog_hash, str)
+            or len(catalog_hash) != 64
+        ):
+            raise HarnessAdmissionError("semantic_mcp_catalog_invalid")
+        material = {
+            "contract_ref": OPERATION_BINDING_V1,
+            "harness_family": harness_family,
+            "locked_version": self._adapters[harness_family].locked_version,
+            "required_capabilities": list(required_capabilities),
+            "required_operation_bindings": list(operation_bindings),
+            "semantic_mcp_catalog_hash": catalog_hash,
+        }
+        contract_hash = canonical_hash(material)
+        return FullConformanceBinding(
+            contract_ref=OPERATION_BINDING_V1,
+            contract_hash=contract_hash,
+            conformance_ref="operation_binding_" + contract_hash[:48],
+            semantic_mcp_catalog_hash=catalog_hash,
+            semantic_mcp_operation_bindings_hash=canonical_hash(
+                list(operation_bindings)
+            ),
+            required_families=(harness_family,),
+            required_capabilities=required_capabilities,
+            required_operation_ids=required_operation_ids,
+            # Capability evidence is produced by the real turn.  Do not mint a
+            # synthetic conformance/profile receipt at admission.
+            profile_receipts=(),
+        )
 
     def require_full_conformance_binding(self) -> FullConformanceBinding:
         """Return the current complete conformance evidence or fail closed.
@@ -2208,7 +2601,7 @@ class HarnessRuntime:
         if (
             status.get("status") != "ready"
             or not isinstance(conformance, dict)
-            or conformance.get("contract_ref") != FULL_CONFORMANCE_V1
+            or conformance.get("contract_ref") != FULL_CONFORMANCE_V2
             or conformance.get("contract_hash")
             != self._full_conformance_contract_hash
             or not isinstance(conformance.get("conformance_ref"), str)
@@ -2261,7 +2654,7 @@ class HarnessRuntime:
             )
 
         return FullConformanceBinding(
-            contract_ref=FULL_CONFORMANCE_V1,
+            contract_ref=FULL_CONFORMANCE_V2,
             contract_hash=self._full_conformance_contract_hash,
             conformance_ref=str(conformance["conformance_ref"]),
             semantic_mcp_catalog_hash=self._full_conformance_catalog_hash,
@@ -2416,8 +2809,37 @@ class HarnessRuntime:
     def dispatch_mcp(
         self, token: str | None, message: object
     ) -> tuple[int, dict[str, object] | None]:
+        """Compatibility entry for trusted in-process callers.
+
+        Public HTTP transport must use :meth:`dispatch_mcp_http` so the
+        protocol session header can be returned after ``initialize``.
+        """
+
+        status, payload, _response_session_id = self.dispatch_mcp_http(
+            token,
+            message,
+            mcp_session_id=None,
+        )
+        return status, payload
+
+    def dispatch_mcp_http(
+        self,
+        token: str | None,
+        message: object,
+        *,
+        mcp_session_id: str | None,
+    ) -> tuple[int, dict[str, object] | None, str | None]:
+        """Dispatch one current operation bearer across its MCP client tree.
+
+        Streamable HTTP session IDs are transport hints, not principals. Root
+        reconnects and native child Sessions may initialize independently and
+        receive the same operation-local catalog. Authorization remains bound
+        to the current bearer, Owner scope, and gateway grant.
+        """
+
         if token is None:
-            return self._gateway.dispatch(None, message)
+            status, payload = self._gateway.dispatch(None, message)
+            return status, payload, None
         token_hash = _token_hash(token)
         try:
             current = self._owner.channel_is_current(token_hash)
@@ -2432,8 +2854,7 @@ class HarnessRuntime:
                 try:
                     verify_scope = (
                         verifier.verify_reasoning_runtime_scope
-                        if resident_scope.operation_ids
-                        == REASONING_ROOT_SEMANTIC_OPERATION_IDS
+                        if resident_scope.root_kind == "reasoning"
                         else verifier.verify_bundle_runtime_scope
                     )
                     verify_scope(
@@ -2450,16 +2871,31 @@ class HarnessRuntime:
                 else:
                     current = True
             if not current:
-                self._resident_channel_scopes.pop(token_hash, None)
                 self._gateway.revoke_channel(token)
+                self._resident_channel_scopes.pop(token_hash, None)
         if not current:
             return 401, {
                 "error": {
                     "code": "mcp_channel_authentication_required",
                     "message": "A current scope-bound MCP channel is required.",
                 }
-            }
-        return self._gateway.dispatch(token, message)
+            }, None
+
+        status, payload = self._gateway.dispatch(token, message)
+        method = message.get("method") if isinstance(message, dict) else None
+        response_session_id = (
+            secrets.token_urlsafe(24)
+            if method == "initialize"
+            and status == 200
+            and isinstance(payload, dict)
+            and "result" in payload
+            else None
+        )
+        # ``mcp_session_id`` is deliberately not an authority check. It is
+        # accepted so each reconnecting Root/child transport can follow the
+        # Streamable HTTP protocol without losing the operation bearer.
+        _ = mcp_session_id
+        return status, payload, response_session_id
 
     def _full_conformance_request_ref(
         self, token: str, family: HarnessFamily
@@ -2494,6 +2930,12 @@ class HarnessRuntime:
         }
         if request.harness_family == "codex":
             material["model_reasoning_effort"] = CODEX_REASONING_EFFORT
+        if isinstance(
+            request, (ConformanceHarnessRequest, TargetHarnessRequest)
+        ):
+            material["provider_operation_timeout_seconds"] = (
+                request.provider_operation_timeout_seconds
+            )
         if isinstance(request, TargetHarnessRequest):
             material.update(
                 {
@@ -2503,9 +2945,6 @@ class HarnessRuntime:
                         request.full_conformance_binding_hash
                     ),
                     "target_scope_binding_hash": request.target_scope_binding_hash,
-                    "provider_operation_timeout_seconds": (
-                        request.provider_operation_timeout_seconds
-                    ),
                 }
             )
         return canonical_hash(material)
@@ -2524,7 +2963,7 @@ class HarnessRuntime:
         )
         if (
             not isinstance(request.harness_family, str)
-            or request.harness_family not in {"codex", "claude"}
+            or request.harness_family not in self._adapters
             or not isinstance(request.request_ref, str)
             or not request.request_ref
             or len(request.request_ref) > 96
@@ -2551,10 +2990,6 @@ class HarnessRuntime:
         ):
             raise HarnessAdmissionError("harness_probe_request_invalid")
         if isinstance(request, TargetHarnessRequest):
-            if request.provider_operation_timeout_seconds is None:
-                raise HarnessAdmissionError(
-                    "target_harness_runtime_binding_unavailable"
-                )
             if (
                 not request.target_ref
                 or len(request.target_ref) > 96
@@ -2565,20 +3000,62 @@ class HarnessRuntime:
                 or len(request.full_conformance_binding_hash) != 64
                 or len(request.target_scope_binding_hash) != 64
                 or request.required_operation_ids
-                != TARGET_RUN_SEMANTIC_OPERATION_IDS
-                or request.required_capabilities != HARNESS_CAPABILITIES
-                or not isinstance(
-                    request.provider_operation_timeout_seconds, (int, float)
+                != TARGET_ROOT_SEMANTIC_OPERATION_IDS
+                or request.required_capabilities
+                not in {
+                    _target_root_lifecycle_capabilities(resume=False),
+                    HARNESS_CAPABILITIES,
+                }
+                or (
+                    request.provider_operation_timeout_seconds is not None
+                    and (
+                        not isinstance(
+                            request.provider_operation_timeout_seconds,
+                            (int, float),
+                        )
+                        or isinstance(
+                            request.provider_operation_timeout_seconds, bool
+                        )
+                        or not math.isfinite(
+                            float(request.provider_operation_timeout_seconds)
+                        )
+                        or not 0
+                        < float(request.provider_operation_timeout_seconds)
+                        <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+                    )
                 )
-                or isinstance(request.provider_operation_timeout_seconds, bool)
-                or not math.isfinite(
-                    float(request.provider_operation_timeout_seconds)
-                )
-                or not 0
-                < float(request.provider_operation_timeout_seconds)
-                <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
             ):
                 raise HarnessAdmissionError("target_harness_request_invalid")
+        if isinstance(request, ConformanceHarnessRequest):
+            if (
+                not request.request_ref.startswith(
+                    f"hfc1:{self._full_conformance_contract_hash}:"
+                )
+                or request.required_operation_ids
+                != FULL_CONFORMANCE_OPERATION_IDS
+                or request.required_capabilities != HARNESS_CAPABILITIES
+                or (
+                    request.provider_operation_timeout_seconds is not None
+                    and (
+                        not isinstance(
+                            request.provider_operation_timeout_seconds,
+                            (int, float),
+                        )
+                        or isinstance(
+                            request.provider_operation_timeout_seconds, bool
+                        )
+                        or not math.isfinite(
+                            float(request.provider_operation_timeout_seconds)
+                        )
+                        or not 0
+                        < float(request.provider_operation_timeout_seconds)
+                        <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+                    )
+                )
+            ):
+                raise HarnessAdmissionError(
+                    "full_conformance_runtime_binding_invalid"
+                )
 
     def _begin_operation_reconciliation(self, operation_ref: str) -> int:
         try:
@@ -2797,6 +3274,13 @@ class HarnessRuntime:
                         "provider_operation_timeout_seconds"
                     ),
                 )
+            elif "provider_operation_timeout_seconds" in value:
+                request = ConformanceHarnessRequest(
+                    **base,
+                    provider_operation_timeout_seconds=value[
+                        "provider_operation_timeout_seconds"
+                    ],
+                )
             else:
                 request = HarnessProbeRequest(**base)
         except (KeyError, TypeError) as error:
@@ -3014,10 +3498,15 @@ def _turn_invocation_material(
         "capability_binding_hash": admission.run.capability_binding_hash,
         "target_workspace_ref": workspace_ref,
     }
-    if isinstance(request, TargetHarnessRequest):
+    if isinstance(request, (ConformanceHarnessRequest, TargetHarnessRequest)):
         material["provider_operation_timeout_seconds"] = (
             request.provider_operation_timeout_seconds
         )
+    if isinstance(request, TargetHarnessRequest):
+        profile = root_capability_profile("target")
+        material["multi_agent_enabled"] = profile.multi_agent_enabled
+        material["root_capability_profile"] = profile.as_dict()
+        material["root_capability_profile_hash"] = profile.digest
     return material
 
 
@@ -3103,9 +3592,25 @@ def _target_root_lifecycle_capabilities(*, resume: bool) -> tuple[str, ...]:
     return (*required, "resume") if resume else required
 
 
-def _capability_has_evidence(
+def _capability_is_available(
     profile: dict[str, object], capability: str
 ) -> bool:
+    root_diagnostics = profile.get("root_capability_diagnostics")
+    if isinstance(root_diagnostics, dict):
+        availability = root_diagnostics.get("availability")
+        if not isinstance(availability, dict):
+            return False
+        entry = availability.get(capability)
+        # Root admission rejects only a real, typed unsupported fact.  Missing
+        # turn evidence remains an explicit diagnostic unknown and must not
+        # recreate the old ritualized-use gate.
+        return isinstance(entry, dict) and entry.get("status") in {
+            "available",
+            "availability_not_observed",
+        }
+
+    # Full Conformance remains a separate diagnostic probe: without a Root
+    # effective profile it continues to require its explicit probe evidence.
     capabilities = profile.get("capabilities")
     if not isinstance(capabilities, dict):
         return False
