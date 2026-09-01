@@ -5,6 +5,7 @@ import time
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -20,6 +21,7 @@ from meta_research.bundle_skill import (
     BundleTargetBatchRequest,
     BundleTargetBatchResult,
 )
+from meta_research.bundle_stage import _public_target_graph_rejection
 from meta_research.bundle_target_contract import (
     FORMAL_STRATEGY_UPDATE_SCHEMA_REF,
     FORMAL_TARGET_CANDIDATE_SCHEMA_REF,
@@ -36,7 +38,12 @@ from meta_research.experiment_contract import (
 from meta_research.harness import HarnessProbeRequest
 from meta_research.owners.agent_runtime import BundleRuntimeBinding
 from meta_research.owners.agent_runtime_harness import TargetRootCompletionEvidence
-from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
+from meta_research.owners.common import (
+    AcceptanceReceipt,
+    OwnerConflict,
+    canonical_hash,
+    canonical_json,
+)
 from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.paths import prepare_data_root
 from meta_research.runtime_protection import (
@@ -76,6 +83,38 @@ def _proof_receipt(receipt_ref: str, subject_ref: str) -> dict[str, object]:
         "verified": True,
         "currentness_known": True,
         "current": True,
+    }
+
+
+def test_bundle_rejection_projection_includes_actionable_feedback() -> None:
+    receipt = AcceptanceReceipt(
+        issuer="research_graph",
+        kind="target_graph_rejected",
+        receipt_ref="rg-target-rejection-receipt:1",
+        subject_ref="bundle-submission:rejected",
+        payload_hash="a" * 64,
+    )
+    projection = _public_target_graph_rejection(
+        SimpleNamespace(
+            submission_ref="bundle-submission:rejected",
+            target_plan_hash="b" * 64,
+            reason_code="target_candidate_owner_proof_unverified",
+            feedback=("Attach accepted Owner proofs to every candidate.",),
+            receipt=receipt,
+        )
+    )
+
+    assert projection == {
+        "status": "rejected",
+        "targets": [],
+        "frontier": [],
+        "submission_ref": "bundle-submission:rejected",
+        "target_plan_hash": "b" * 64,
+        "rejection": {
+            "code": "target_candidate_owner_proof_unverified",
+            "feedback": ["Attach accepted Owner proofs to every candidate."],
+            "receipt": receipt.as_public_dict(),
+        },
     }
 
 

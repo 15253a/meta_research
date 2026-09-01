@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import cast
 
 from meta_research.bundle_contract import (
@@ -33,6 +33,7 @@ from meta_research.bundle_skill import (
     BundleSkillResult,
     BundleSkillUnavailable,
     BundleTargetBatchRequest,
+    RecoverableBundleSkillCandidateError,
     review_record,
     validate_bundle_dispatch_result,
     validate_bundle_skill_draft,
@@ -74,6 +75,7 @@ from meta_research.owners.research_graph import (
     FormalPlanDecision,
     ResearchGraphInterface,
     TargetCommit,
+    TargetGraphRejection,
 )
 from meta_research.owners.human_collaboration import HumanCollaborationInterface
 from meta_research.owners.research_memory import (
@@ -1612,6 +1614,35 @@ class BundleStageWorker:
             "targets": [],
             "frontier": [],
         }
+        graph_rejection = None
+        if run is not None and graph is None:
+            lineage_execution = run.execution or run.predecessor_execution
+            if lineage_execution is not None:
+                graph_rejection = (
+                    self._research_graph.query_target_graph_rejection(
+                        lineage_execution.submission_ref
+                    )
+                )
+                if graph_rejection is not None and (
+                    graph_rejection.request_ref != request.request_ref
+                    or graph_rejection.run_ref != run.run_ref
+                    or graph_rejection.attempt_ref
+                    != lineage_execution.attempt_ref
+                    or graph_rejection.fence_ref != lineage_execution.fence_ref
+                    or graph_rejection.target_plan_hash
+                    != lineage_execution.material_outcome_hash
+                    or graph_rejection.execution_payload_hash
+                    != lineage_execution.payload_hash
+                    or graph_rejection.execution_receipt
+                    != lineage_execution.receipt
+                    or (
+                        run.predecessor_execution is lineage_execution
+                        and run.rejection_receipt != graph_rejection.receipt
+                    )
+                ):
+                    raise OwnerConflict("target_graph_rejection_binding_invalid")
+        if graph_rejection is not None:
+            graph_projection = _public_target_graph_rejection(graph_rejection)
         target_commit_projection: list[dict[str, object]] = []
         baseline_pool: list[dict[str, object]] = []
         if graph is not None:
@@ -2271,6 +2302,12 @@ class BundleStageWorker:
                 fence_ref=run.fence_ref,
             )
         )
+        (
+            predecessor_candidate_ref,
+            owner_rejection_receipt_ref,
+            owner_rejection_kind,
+            owner_feedback,
+        ) = self._owner_rejection_context(request, run)
         skill_request = BundleSkillRequest(
             stage_request_ref=request.request_ref,
             run_ref=run.run_ref,
@@ -2291,6 +2328,10 @@ class BundleStageWorker:
             predecessor_rejections=tuple(
                 item.as_dict() for item in predecessor_rejections
             ),
+            predecessor_candidate_ref=predecessor_candidate_ref,
+            owner_rejection_receipt_ref=owner_rejection_receipt_ref,
+            owner_rejection_kind=owner_rejection_kind,
+            owner_feedback=owner_feedback,
         )
         if run.primary_draft is None:
             try:
@@ -2312,6 +2353,26 @@ class BundleStageWorker:
                     draft = self._provider.generate_draft(skill_request)
                     draft_hash = validate_bundle_skill_draft(skill_request, draft)
                 except BundleSkillUnavailable as error:
+                    if error.rejected_candidate is not None:
+                        if (
+                            error.rejected_native_session_ref is None
+                            or error.rejected_detail_code is None
+                        ):
+                            raise OwnerConflict(
+                                "stage_completion_rejection_invalid"
+                            )
+                        self._reject_completion_candidate(
+                            unit_ref=unit_ref,
+                            run=run,
+                            operation_name="primary",
+                            native_session_ref=error.rejected_native_session_ref,
+                            candidate=error.rejected_candidate,
+                            failure_code=error.code,
+                            detail_code=error.rejected_detail_code,
+                        )
+                        provider_safe = False
+                        self._transient_error = error.code
+                        return True
                     if error.code == "codex_operation_reconciliation_pending":
                         provider_safe = False
                     elif error.recovery_checkpoint is not None:
@@ -2326,28 +2387,25 @@ class BundleStageWorker:
                         )
                     self._transient_error = error.code
                     return False
-                except BundleSkillContractError as error:
+                except RecoverableBundleSkillCandidateError as error:
                     if draft is None:
                         self._transient_error = str(error)
                         return False
                     failure_code = "bundle_primary_result_contract_invalid"
-                    try:
-                        terminal = self._record_terminal_contract_failure(
-                            unit_ref=unit_ref,
-                            run=run,
-                            job_ref=job_ref,
-                            operation_name="primary",
-                            native_session_ref=draft.primary_session_ref,
-                            failure_code=failure_code,
-                            detail_code=str(error),
-                        )
-                    except BundleSkillUnavailable as checkpoint_error:
-                        provider_safe = False
-                        self._transient_error = checkpoint_error.code
-                        return False
-                    if terminal:
-                        provider_safe = False
+                    self._reject_completion_candidate(
+                        unit_ref=unit_ref,
+                        run=run,
+                        operation_name="primary",
+                        native_session_ref=draft.primary_session_ref,
+                        candidate=asdict(draft),
+                        failure_code=failure_code,
+                        detail_code=str(error),
+                    )
+                    provider_safe = False
                     self._transient_error = failure_code
+                    return True
+                except BundleSkillContractError as error:
+                    self._transient_error = str(error)
                     return False
                 checkpoint = self._agent_runtime.record_bundle_primary_draft(
                     run_ref=run.run_ref,
@@ -2379,40 +2437,131 @@ class BundleStageWorker:
             adapter_kind=run.primary_draft.adapter_kind,
             output_kind=cast(str, _bundle_primary_output_kind(run)),
         )
+        # Exhaustion review is the only review-phase provider effect. TargetPlan
+        # review is an adapter-local projection of the validated primary draft.
+        if draft.output_kind == "exhaustion_assessment":
+            try:
+                self._agent_runtime.begin_provider_unit(
+                    unit_ref=unit_ref,
+                    operation_ref=job_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    unit_kind="bundle_review",
+                )
+            except OwnerConflict as error:
+                self._transient_error = error.code
+                return False
+            provider_safe = True
+            result = None
+            try:
+                try:
+                    result = self._provider.review_draft(skill_request, draft)
+                    if not isinstance(result, BundleExhaustionSkillResult):
+                        raise BundleSkillContractError(
+                            "bundle_skill_result_invalid"
+                        )
+                    validate_bundle_exhaustion_skill_result(
+                        skill_request,
+                        result,
+                    )
+                except BundleSkillUnavailable as error:
+                    if error.rejected_candidate is not None:
+                        if (
+                            error.rejected_native_session_ref is None
+                            or error.rejected_detail_code is None
+                        ):
+                            raise OwnerConflict(
+                                "stage_completion_rejection_invalid"
+                            )
+                        self._reject_completion_candidate(
+                            unit_ref=unit_ref,
+                            run=run,
+                            operation_name="review",
+                            native_session_ref=error.rejected_native_session_ref,
+                            candidate=error.rejected_candidate,
+                            failure_code=error.code,
+                            detail_code=error.rejected_detail_code,
+                        )
+                        provider_safe = False
+                        self._transient_error = error.code
+                        return True
+                    if error.code == "codex_operation_reconciliation_pending":
+                        provider_safe = False
+                    elif error.recovery_checkpoint is not None:
+                        provider_safe = False
+                        self._agent_runtime.record_stage_provider_hard_ceiling(
+                            unit_ref=unit_ref,
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            failure_code=error.code,
+                            provider_exit=error.recovery_checkpoint,
+                        )
+                    self._transient_error = error.code
+                    return False
+                except RecoverableBundleSkillCandidateError as error:
+                    if result is None:
+                        self._transient_error = str(error)
+                        return False
+                    failure_code = "bundle_review_result_contract_invalid"
+                    self._reject_completion_candidate(
+                        unit_ref=unit_ref,
+                        run=run,
+                        operation_name="review",
+                        native_session_ref=result.primary_session_ref,
+                        candidate=asdict(result),
+                        failure_code=failure_code,
+                        detail_code=str(error),
+                    )
+                    provider_safe = False
+                    self._transient_error = failure_code
+                    return True
+                except BundleSkillContractError as error:
+                    self._transient_error = str(error)
+                    return False
+                self._accept_exhaustion_review(
+                    request=request,
+                    run=run,
+                    result=result,
+                )
+                self._transient_error = None
+                return True
+            finally:
+                if provider_safe:
+                    self._agent_runtime.acknowledge_provider_safe_point(
+                        unit_ref=unit_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                    )
+
+        if draft.output_kind != "target_plan":
+            self._transient_error = "bundle_skill_output_kind_invalid"
+            return False
         result = None
         try:
             result = self._provider.review_draft(skill_request, draft)
-            if isinstance(result, BundleExhaustionSkillResult):
-                validate_bundle_exhaustion_skill_result(
-                    skill_request,
-                    result,
-                )
-            elif isinstance(result, BundleSkillResult):
-                draft_hash, target_plan_hash, _review_hash = (
-                    validate_bundle_skill_result(skill_request, result)
-                )
-            else:
+            if not isinstance(result, BundleSkillResult):
                 raise BundleSkillContractError(
                     "bundle_skill_result_invalid"
                 )
+            draft_hash, target_plan_hash, _review_hash = (
+                validate_bundle_skill_result(skill_request, result)
+            )
         except BundleSkillUnavailable as error:
             self._transient_error = error.code
             return False
-        except BundleSkillContractError as error:
+        except RecoverableBundleSkillCandidateError as error:
             self._transient_error = (
                 str(error)
                 if result is None
                 else "bundle_review_result_contract_invalid"
             )
             return False
-        if isinstance(result, BundleExhaustionSkillResult):
-            self._accept_exhaustion_review(
-                request=request,
-                run=run,
-                result=result,
-            )
-            self._transient_error = None
-            return True
+        except BundleSkillContractError as error:
+            self._transient_error = str(error)
+            return False
         review = review_record(
             result,
             draft_hash=draft_hash,
@@ -2446,6 +2595,107 @@ class BundleStageWorker:
         self._transient_error = None
         return True
 
+    def _owner_rejection_context(
+        self,
+        request: StageRunRequest,
+        run: BundleStageRun,
+    ) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
+        predecessor = run.predecessor_execution
+        rejection_receipt = run.rejection_receipt
+        completion_rejection = run.completion_rejection
+        if (predecessor is None) != (rejection_receipt is None):
+            raise OwnerConflict("rejection_lineage_incomplete")
+        domain_feedback: tuple[str, ...] = ()
+        if predecessor is not None and rejection_receipt is not None:
+            rejection = self._research_graph.query_target_graph_rejection(
+                predecessor.submission_ref
+            )
+            if (
+                rejection is None
+                or rejection.receipt != rejection_receipt
+                or rejection.request_ref != request.request_ref
+                or rejection.run_ref != run.run_ref
+                or rejection.attempt_ref != predecessor.attempt_ref
+                or rejection.fence_ref != predecessor.fence_ref
+                or rejection.target_plan_hash
+                != predecessor.material_outcome_hash
+                or rejection.execution_payload_hash != predecessor.payload_hash
+                or rejection.execution_receipt != predecessor.receipt
+                or not rejection.feedback
+                or run.native_session_ref is None
+            ):
+                raise OwnerConflict("rejection_lineage_invalid")
+            domain_feedback = rejection.feedback
+
+        if completion_rejection is not None:
+            if (
+                not completion_rejection.feedback
+                or run.native_session_ref is None
+                or completion_rejection.request_ref != request.request_ref
+                or completion_rejection.run_ref != run.run_ref
+                or completion_rejection.stage != "bundle"
+                or completion_rejection.successor_attempt_ref != run.attempt_ref
+                or completion_rejection.root_session_ref != run.root_session_ref
+                or completion_rejection.native_session_ref
+                != run.native_session_ref
+                or run.technical_predecessor_attempt_ref
+                != completion_rejection.attempt_ref
+            ):
+                raise OwnerConflict("completion_rejection_lineage_invalid")
+        if predecessor is not None or completion_rejection is not None:
+            return (
+                (
+                    completion_rejection.candidate_ref
+                    if completion_rejection is not None
+                    else predecessor.submission_ref
+                ),
+                (
+                    completion_rejection.receipt.receipt_ref
+                    if completion_rejection is not None
+                    else rejection_receipt.receipt_ref
+                ),
+                "domain" if predecessor is not None else "completion",
+                domain_feedback
+                + (
+                    ()
+                    if completion_rejection is None
+                    else completion_rejection.feedback
+                ),
+            )
+
+        if (
+            run.attempt_generation != 1
+            and run.technical_predecessor_attempt_ref is None
+        ) or ((run.native_session_ref is None) != (run.primary_draft is None)):
+            raise OwnerConflict("attempt_lineage_invalid")
+        return None, None, None, ()
+
+    def _reject_completion_candidate(
+        self,
+        *,
+        unit_ref: str,
+        run: BundleStageRun,
+        operation_name: str,
+        native_session_ref: str,
+        candidate: dict[str, object],
+        failure_code: str,
+        detail_code: str,
+    ) -> None:
+        self._agent_runtime.reject_stage_completion_candidate(
+            unit_ref=unit_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            native_session_ref=native_session_ref,
+            candidate={"phase": operation_name, "result": candidate},
+            reason_code=failure_code,
+            detail_code=detail_code,
+            feedback=(
+                "Return a corrected structured completion that satisfies "
+                f"{detail_code}, then resubmit it in this Root Session.",
+            ),
+        )
+
     def _record_terminal_contract_failure(
         self,
         *,
@@ -2457,6 +2707,8 @@ class BundleStageWorker:
         failure_code: str,
         detail_code: str,
     ) -> bool:
+        """Preserve the non-completion rolling-operation failure path."""
+
         checkpoint_factory = getattr(
             self._provider,
             "terminal_contract_failure_checkpoint",
@@ -2804,6 +3056,23 @@ def _public_request(request: StageRunRequest) -> dict[str, object]:
         "context_pack_ref": request.context_pack_ref,
         "context_pack_hash": request.context_pack_hash,
         "receipt": request.receipt.as_public_dict(),
+    }
+
+
+def _public_target_graph_rejection(
+    rejection: TargetGraphRejection,
+) -> dict[str, object]:
+    return {
+        "status": "rejected",
+        "targets": [],
+        "frontier": [],
+        "submission_ref": rejection.submission_ref,
+        "target_plan_hash": rejection.target_plan_hash,
+        "rejection": {
+            "code": rejection.reason_code,
+            "feedback": list(rejection.feedback),
+            "receipt": rejection.receipt.as_public_dict(),
+        },
     }
 
 

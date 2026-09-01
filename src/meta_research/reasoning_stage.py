@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import cast
 
 from meta_research.feed import DurableFeed
@@ -38,6 +38,7 @@ from meta_research.reasoning_skill import (
     ReasoningSkillProvider,
     ReasoningSkillRequest,
     ReasoningSkillUnavailable,
+    RecoverableReasoningSkillCandidateError,
     validate_reasoning_autonomous_checkpoint_result,
     validate_reasoning_autonomous_resume_result,
     validate_reasoning_skill_draft,
@@ -397,6 +398,28 @@ class ReasoningStageWorker:
                         validate_reasoning_skill_draft(skill_request, draft)
                     )
                 except ReasoningSkillUnavailable as error:
+                    if error.rejected_candidate is not None:
+                        if (
+                            error.rejected_native_session_ref is None
+                            or error.rejected_detail_code is None
+                        ):
+                            raise OwnerConflict(
+                                "stage_completion_rejection_invalid"
+                            )
+                        self._reject_completion_candidate(
+                            unit_ref=unit_ref,
+                            run=run,
+                            operation_name="primary",
+                            native_session_ref=error.rejected_native_session_ref,
+                            candidate=error.rejected_candidate,
+                            failure_code=error.code,
+                            detail_code=error.rejected_detail_code,
+                        )
+                        provider_safe = False
+                        self._transient_error = error.code
+                        return _CycleStep(
+                            True, provider_boundary_attempted=True
+                        )
                     if error.code == "codex_operation_reconciliation_pending":
                         provider_safe = False
                     elif error.recovery_checkpoint is not None:
@@ -411,32 +434,27 @@ class ReasoningStageWorker:
                         )
                     self._transient_error = error.code
                     return _CycleStep(False, provider_boundary_attempted=True)
-                except ReasoningSkillContractError as error:
+                except RecoverableReasoningSkillCandidateError as error:
                     if draft is None:
                         self._transient_error = str(error)
                         return _CycleStep(
                             False, provider_boundary_attempted=True
                         )
                     failure_code = "reasoning_primary_result_contract_invalid"
-                    try:
-                        terminal = self._record_terminal_contract_failure(
-                            unit_ref=unit_ref,
-                            run=run,
-                            job_ref=job_ref,
-                            operation_name="primary",
-                            native_session_ref=draft.primary_session_ref,
-                            failure_code=failure_code,
-                            detail_code=str(error),
-                        )
-                    except ReasoningSkillUnavailable as checkpoint_error:
-                        provider_safe = False
-                        self._transient_error = checkpoint_error.code
-                        return _CycleStep(
-                            False, provider_boundary_attempted=True
-                        )
-                    if terminal:
-                        provider_safe = False
+                    self._reject_completion_candidate(
+                        unit_ref=unit_ref,
+                        run=run,
+                        operation_name="primary",
+                        native_session_ref=draft.primary_session_ref,
+                        candidate=asdict(draft),
+                        failure_code=failure_code,
+                        detail_code=str(error),
+                    )
+                    provider_safe = False
                     self._transient_error = failure_code
+                    return _CycleStep(True, provider_boundary_attempted=True)
+                except ReasoningSkillContractError as error:
+                    self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
                 checkpoint = self._agent_runtime.record_reasoning_primary_draft(
                     run_ref=run.run_ref,
@@ -531,6 +549,24 @@ class ReasoningStageWorker:
                     review_hash,
                 ) = validate_reasoning_skill_result(skill_request, result)
             except ReasoningSkillUnavailable as error:
+                if error.rejected_candidate is not None:
+                    if (
+                        error.rejected_native_session_ref is None
+                        or error.rejected_detail_code is None
+                    ):
+                        raise OwnerConflict("stage_completion_rejection_invalid")
+                    self._reject_completion_candidate(
+                        unit_ref=unit_ref,
+                        run=run,
+                        operation_name="review",
+                        native_session_ref=error.rejected_native_session_ref,
+                        candidate=error.rejected_candidate,
+                        failure_code=error.code,
+                        detail_code=error.rejected_detail_code,
+                    )
+                    provider_safe = False
+                    self._transient_error = error.code
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 if error.code == "codex_operation_reconciliation_pending":
                     provider_safe = False
                 elif error.recovery_checkpoint is not None:
@@ -545,28 +581,25 @@ class ReasoningStageWorker:
                     )
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
-            except ReasoningSkillContractError as error:
+            except RecoverableReasoningSkillCandidateError as error:
                 if result is None:
                     self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
                 failure_code = "reasoning_review_result_contract_invalid"
-                try:
-                    terminal = self._record_terminal_contract_failure(
-                        unit_ref=unit_ref,
-                        run=run,
-                        job_ref=job_ref,
-                        operation_name="review",
-                        native_session_ref=result.primary_session_ref,
-                        failure_code=failure_code,
-                        detail_code=str(error),
-                    )
-                except ReasoningSkillUnavailable as checkpoint_error:
-                    provider_safe = False
-                    self._transient_error = checkpoint_error.code
-                    return _CycleStep(False, provider_boundary_attempted=True)
-                if terminal:
-                    provider_safe = False
+                self._reject_completion_candidate(
+                    unit_ref=unit_ref,
+                    run=run,
+                    operation_name="review",
+                    native_session_ref=result.primary_session_ref,
+                    candidate=asdict(result),
+                    failure_code=failure_code,
+                    detail_code=str(error),
+                )
+                provider_safe = False
                 self._transient_error = failure_code
+                return _CycleStep(True, provider_boundary_attempted=True)
+            except ReasoningSkillContractError as error:
+                self._transient_error = str(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
             review = result.review_document()
             submission_ref = "reasoning_submission_" + canonical_hash(
@@ -617,6 +650,12 @@ class ReasoningStageWorker:
         *,
         job_ref: str | None = None,
     ) -> ReasoningSkillRequest:
+        (
+            predecessor_candidate_ref,
+            owner_rejection_receipt_ref,
+            owner_rejection_kind,
+            owner_feedback,
+        ) = self._owner_rejection_context(request, run)
         return ReasoningSkillRequest(
             stage_request_ref=request.request_ref,
             run_ref=run.run_ref,
@@ -634,8 +673,84 @@ class ReasoningStageWorker:
             root_session_ref=run.root_session_ref,
             runtime_binding=run.runtime_binding,
             native_session_ref=run.native_session_ref,
+            predecessor_candidate_ref=predecessor_candidate_ref,
+            owner_rejection_receipt_ref=owner_rejection_receipt_ref,
+            owner_rejection_kind=owner_rejection_kind,
+            owner_feedback=owner_feedback,
             job_ref=job_ref,
         )
+
+    def _owner_rejection_context(
+        self,
+        request: StageRunRequest,
+        run: ReasoningStageRun,
+    ) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
+        predecessor = run.predecessor_execution
+        rejection_receipt = run.rejection_receipt
+        completion_rejection = run.completion_rejection
+        if (predecessor is None) != (rejection_receipt is None):
+            raise OwnerConflict("rejection_lineage_incomplete")
+        domain_feedback: tuple[str, ...] = ()
+        if predecessor is not None and rejection_receipt is not None:
+            decision = self._research_graph.query_reasoning_outcome_decision(
+                predecessor.submission_ref
+            )
+            if (
+                decision is None
+                or decision.decision != "rejected"
+                or decision.receipt != rejection_receipt
+                or decision.request_ref != request.request_ref
+                or decision.run_ref != run.run_ref
+                or decision.attempt_ref != predecessor.attempt_ref
+                or decision.fence_ref != predecessor.fence_ref
+                or not decision.feedback
+                or run.native_session_ref is None
+            ):
+                raise OwnerConflict("rejection_lineage_invalid")
+            domain_feedback = decision.feedback
+
+        if completion_rejection is not None:
+            if (
+                not completion_rejection.feedback
+                or run.native_session_ref is None
+                or completion_rejection.request_ref != request.request_ref
+                or completion_rejection.run_ref != run.run_ref
+                or completion_rejection.stage != "reasoning"
+                or completion_rejection.successor_attempt_ref != run.attempt_ref
+                or completion_rejection.root_session_ref != run.root_session_ref
+                or completion_rejection.native_session_ref
+                != run.native_session_ref
+                or run.technical_predecessor_attempt_ref
+                != completion_rejection.attempt_ref
+            ):
+                raise OwnerConflict("completion_rejection_lineage_invalid")
+        if predecessor is not None or completion_rejection is not None:
+            return (
+                (
+                    completion_rejection.candidate_ref
+                    if completion_rejection is not None
+                    else predecessor.submission_ref
+                ),
+                (
+                    completion_rejection.receipt.receipt_ref
+                    if completion_rejection is not None
+                    else rejection_receipt.receipt_ref
+                ),
+                "domain" if predecessor is not None else "completion",
+                domain_feedback
+                + (
+                    ()
+                    if completion_rejection is None
+                    else completion_rejection.feedback
+                ),
+            )
+
+        if (
+            run.attempt_generation != 1
+            and run.technical_predecessor_attempt_ref is None
+        ) or ((run.native_session_ref is None) != (run.primary_draft is None)):
+            raise OwnerConflict("attempt_lineage_invalid")
+        return None, None, None, ()
 
     def _resume_after_autonomous_creation(
         self,
@@ -692,6 +807,24 @@ class ReasoningStageWorker:
                     result,
                 )
             except ReasoningSkillUnavailable as error:
+                if error.rejected_candidate is not None:
+                    if (
+                        error.rejected_native_session_ref is None
+                        or error.rejected_detail_code is None
+                    ):
+                        raise OwnerConflict("stage_completion_rejection_invalid")
+                    self._reject_completion_candidate(
+                        unit_ref=unit_ref,
+                        run=run,
+                        operation_name="autonomous-resume",
+                        native_session_ref=error.rejected_native_session_ref,
+                        candidate=error.rejected_candidate,
+                        failure_code=error.code,
+                        detail_code=error.rejected_detail_code,
+                    )
+                    provider_safe = False
+                    self._transient_error = error.code
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 if error.code == "codex_operation_reconciliation_pending":
                     provider_safe = False
                 elif error.recovery_checkpoint is not None:
@@ -706,28 +839,25 @@ class ReasoningStageWorker:
                     )
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
-            except ReasoningSkillContractError as error:
+            except RecoverableReasoningSkillCandidateError as error:
                 if result is None:
                     self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
                 failure_code = "reasoning_review_result_contract_invalid"
-                try:
-                    terminal = self._record_terminal_contract_failure(
-                        unit_ref=unit_ref,
-                        run=run,
-                        job_ref=job_ref,
-                        operation_name="autonomous-resume",
-                        native_session_ref=result.primary_session_ref,
-                        failure_code=failure_code,
-                        detail_code=str(error),
-                    )
-                except ReasoningSkillUnavailable as checkpoint_error:
-                    provider_safe = False
-                    self._transient_error = checkpoint_error.code
-                    return _CycleStep(False, provider_boundary_attempted=True)
-                if terminal:
-                    provider_safe = False
+                self._reject_completion_candidate(
+                    unit_ref=unit_ref,
+                    run=run,
+                    operation_name="autonomous-resume",
+                    native_session_ref=result.primary_session_ref,
+                    candidate=asdict(result),
+                    failure_code=failure_code,
+                    detail_code=str(error),
+                )
+                provider_safe = False
                 self._transient_error = failure_code
+                return _CycleStep(True, provider_boundary_attempted=True)
+            except ReasoningSkillContractError as error:
+                self._transient_error = str(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
             submission_ref = "reasoning_submission_" + canonical_hash(
                 {
@@ -772,44 +902,31 @@ class ReasoningStageWorker:
                     fence_ref=run.fence_ref,
                 )
 
-    def _record_terminal_contract_failure(
+    def _reject_completion_candidate(
         self,
         *,
         unit_ref: str,
         run: ReasoningStageRun,
-        job_ref: str,
         operation_name: str,
         native_session_ref: str,
+        candidate: dict[str, object],
         failure_code: str,
         detail_code: str,
-    ) -> bool:
-        checkpoint_factory = getattr(
-            self._provider,
-            "terminal_contract_failure_checkpoint",
-            None,
-        )
-        if not callable(checkpoint_factory):
-            return False
-        checkpoint = checkpoint_factory(
-            job_ref=job_ref,
-            operation_name=operation_name,
-            native_session_ref=native_session_ref,
-            failure_code=failure_code,
-            detail_code=detail_code,
-        )
-        if not isinstance(checkpoint, dict):
-            raise ReasoningSkillUnavailable(
-                "codex_contract_failure_checkpoint_invalid"
-            )
-        self._agent_runtime.record_stage_provider_hard_ceiling(
+    ) -> None:
+        self._agent_runtime.reject_stage_completion_candidate(
             unit_ref=unit_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
-            failure_code=failure_code,
-            provider_exit=checkpoint,
+            native_session_ref=native_session_ref,
+            candidate={"phase": operation_name, "result": candidate},
+            reason_code=failure_code,
+            detail_code=detail_code,
+            feedback=(
+                "Return a corrected structured completion that satisfies "
+                f"{detail_code}, then resubmit it in this Root Session.",
+            ),
         )
-        return True
 
     def _accepted_checkpoint_facts(self, checkpoint_ref: str):
         candidate = (
@@ -1228,13 +1345,17 @@ def _public_acceptance(
             "receipt": decision.receipt.as_public_dict(),
         }
     else:
+        reason_code = (
+            decision.reason_code or "reasoning_outcome_requires_revision"
+        )
         result["status"] = "rejected"
+        result["rejection"] = {
+            "code": reason_code,
+            "feedback": list(decision.feedback),
+        }
         result["domain"] = {
             "status": "rejected",
-            "reason": {
-                "code": decision.reason_code
-                or "reasoning_outcome_requires_revision"
-            },
+            "reason": {"code": reason_code},
             "receipt": decision.receipt.as_public_dict(),
         }
     return result

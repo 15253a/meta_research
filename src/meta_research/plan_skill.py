@@ -46,6 +46,10 @@ PlanSkillContractError = PlanContractError
 PlanSkillUnavailable = IdeaSkillUnavailable
 
 
+class RecoverablePlanSkillCandidateError(PlanSkillContractError):
+    """A completed Plan candidate failed its content/result contract."""
+
+
 @dataclass(frozen=True)
 class PlanSkillRequest:
     stage_request_ref: str
@@ -63,6 +67,7 @@ class PlanSkillRequest:
     native_session_ref: str | None = None
     predecessor_submission_ref: str | None = None
     owner_rejection_receipt_ref: str | None = None
+    owner_rejection_kind: str | None = None
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
 
@@ -112,12 +117,15 @@ def validate_plan_skill_draft(
         reviewer_agent_ref=None,
         adapter_kind=result.adapter_kind,
     )
-    return _validate_document(
-        request,
-        result.draft,
-        evidence_by_ref=evidence_by_ref,
-        evidence_revision=evidence_revision,
-    )
+    try:
+        return _validate_document(
+            request,
+            result.draft,
+            evidence_by_ref=evidence_by_ref,
+            evidence_revision=evidence_revision,
+        )
+    except PlanSkillContractError as error:
+        raise RecoverablePlanSkillCandidateError(str(error)) from error
 
 
 def validate_plan_skill_result(
@@ -139,31 +147,41 @@ def validate_plan_skill_result(
         result.review_mode != "advisory_unobserved"
         or result.reviewer_agent_ref is not None
     ):
-        raise PlanSkillContractError("plan_review_mode_invalid")
+        raise RecoverablePlanSkillCandidateError("plan_review_mode_invalid")
 
-    draft_hash = _validate_document(
-        request,
-        result.reviewed_draft,
-        evidence_by_ref=evidence_by_ref,
-        evidence_revision=evidence_revision,
-    )
-    final_hash = _validate_document(
-        request,
-        result.final_plan,
-        evidence_by_ref=evidence_by_ref,
-        evidence_revision=evidence_revision,
-    )
+    try:
+        draft_hash = _validate_document(
+            request,
+            result.reviewed_draft,
+            evidence_by_ref=evidence_by_ref,
+            evidence_revision=evidence_revision,
+        )
+        final_hash = _validate_document(
+            request,
+            result.final_plan,
+            evidence_by_ref=evidence_by_ref,
+            evidence_revision=evidence_revision,
+        )
+    except PlanSkillContractError as error:
+        raise RecoverablePlanSkillCandidateError(str(error)) from error
 
-    feedback_revision = request.predecessor_submission_ref is not None
-    if feedback_revision != (request.owner_rejection_receipt_ref is not None):
+    feedback_revision = request.owner_rejection_kind is not None
+    if request.owner_rejection_kind not in {None, "domain", "completion"}:
+        raise PlanSkillContractError("owner_feedback_lineage_incomplete")
+    if feedback_revision != (request.predecessor_submission_ref is not None) or (
+        feedback_revision != (request.owner_rejection_receipt_ref is not None)
+    ):
         raise PlanSkillContractError("owner_feedback_lineage_incomplete")
     if feedback_revision:
         if not request.owner_feedback:
             raise PlanSkillContractError("owner_feedback_missing")
-        if predecessor_material_plan_hash is None or (
-            predecessor_material_plan_hash == material_plan_hash(result.final_plan)
+        if request.owner_rejection_kind == "domain" and (
+            predecessor_material_plan_hash is None
+            or predecessor_material_plan_hash == material_plan_hash(result.final_plan)
         ):
-            raise PlanSkillContractError("owner_feedback_revision_not_material")
+            raise RecoverablePlanSkillCandidateError(
+                "owner_feedback_revision_not_material"
+            )
     elif request.owner_feedback:
         raise PlanSkillContractError("owner_feedback_without_rejection")
 
@@ -172,11 +190,14 @@ def validate_plan_skill_result(
         draft_hash=draft_hash,
         final_plan_hash=final_hash,
     )
-    review_hash = validate_plan_review(
-        review,
-        reviewed_draft_hash=draft_hash,
-        final_plan_hash=final_hash,
-    )
+    try:
+        review_hash = validate_plan_review(
+            review,
+            reviewed_draft_hash=draft_hash,
+            final_plan_hash=final_hash,
+        )
+    except PlanSkillContractError as error:
+        raise RecoverablePlanSkillCandidateError(str(error)) from error
     return draft_hash, final_hash, review_hash
 
 
@@ -281,6 +302,24 @@ def _validate_document(
 def _require_text(value: object, label: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise PlanSkillContractError(f"{label}_invalid")
+
+
+def _plan_owner_rejection_prompt(request: PlanSkillRequest) -> str:
+    if not request.owner_feedback:
+        return ""
+    revision_requirement = (
+        "必须实质改变 PlanDocument"
+        if request.owner_rejection_kind == "domain"
+        else "必须修正被指出的 structured completion 问题"
+    )
+    return (
+        "\n这是 Owner rejection 后在同一根 Session 中的修订。"
+        f"{revision_requirement}并逐条处理正式 feedback。\n"
+        f"owner_rejection_kind={request.owner_rejection_kind}\n"
+        f"predecessor_submission_ref={request.predecessor_submission_ref}\n"
+        f"owner_rejection_receipt_ref={request.owner_rejection_receipt_ref}\n"
+        f"owner_feedback={canonical_json(list(request.owner_feedback))}\n"
+    )
 
 
 class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
@@ -400,16 +439,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
     def generate_draft(self, request: PlanSkillRequest) -> PlanSkillDraft:
         if request.runtime_binding != self.runtime_binding():
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
-        lineage = ""
-        if request.owner_feedback:
-            lineage = (
-                "\n这是 RG rejection 后在同一根 Session 中的修订。必须实质改变 "
-                "PlanDocument 并逐条处理正式 feedback。\n"
-                f"predecessor_submission_ref={request.predecessor_submission_ref}\n"
-                "owner_rejection_receipt_ref="
-                f"{request.owner_rejection_receipt_ref}\n"
-                f"owner_feedback={canonical_json(list(request.owner_feedback))}\n"
-            )
+        lineage = _plan_owner_rejection_prompt(request)
         primary_prompt = (
             f"{_plan_skill_instructions()}\n\n"
             "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
@@ -456,6 +486,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 native_session_ref=primary_session,
                 failure_code="plan_primary_result_contract_invalid",
                 detail_code="codex_plan_invalid",
+                rejected_candidate=primary_output,
             )
         return PlanSkillDraft(
             draft=_with_derived_answer_contract_hash(
@@ -472,6 +503,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:
             raise PlanSkillUnavailable("codex_primary_session_changed")
+        lineage = _plan_owner_rejection_prompt(request)
         reviewer_prompt = (
             f"{_plan_skill_instructions()}\n\n"
             "本回合是同一个根 Plan Agent 的 Review phase。针对下方 exact frozen "
@@ -483,7 +515,8 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "revised | not_adopted disposition，并返回最终完整 PlanDocument。revised "
             "必须实际改变 Plan；没有 finding 时 findings/dispositions 都为空。只返回 "
             "findings、final_plan、dispositions。final_plan 中的 "
-            "answer_contract_hash 由适配器计算，不要返回该字段。\n"
+            "answer_contract_hash 由适配器计算，不要返回该字段。"
+            f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"question_ref={request.question_ref}\n"
             f"idea_set_ref={request.idea_set_ref}\n"
@@ -516,6 +549,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 native_session_ref=draft.primary_session_ref,
                 failure_code="plan_review_result_contract_invalid",
                 detail_code="codex_review_invalid",
+                rejected_candidate=reviewed,
             )
         # The final document and substantive review contents remain validated
         # through ``validate_plan_skill_result``.
@@ -549,6 +583,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         native_session_ref: str,
         failure_code: str,
         detail_code: str | None = None,
+        rejected_candidate: dict[str, object] | None = None,
     ) -> PlanSkillUnavailable:
         checkpoint = None
         if job_ref is not None:
@@ -562,6 +597,15 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         return PlanSkillUnavailable(
             failure_code,
             recovery_checkpoint=checkpoint,
+            rejected_candidate=rejected_candidate,
+            rejected_native_session_ref=(
+                native_session_ref if rejected_candidate is not None else None
+            ),
+            rejected_detail_code=(
+                (detail_code or failure_code)
+                if rejected_candidate is not None
+                else None
+            ),
         )
 
 

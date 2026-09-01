@@ -80,6 +80,10 @@ from meta_research.provider_supervisor import transport_key_hash
 from meta_research.root_capabilities import merge_root_capability_bindings
 BundleSkillContractError = BundleContractError
 BundleSkillUnavailable = IdeaSkillUnavailable
+
+
+class RecoverableBundleSkillCandidateError(BundleSkillContractError):
+    """A completed Bundle candidate failed its content/result contract."""
 BUNDLE_PROVIDER_TRANSPORT_LIMITS = ProviderTransportLimits(
     prompt_max_bytes=64 * 1024 * 1024,
     stream_max_bytes=64 * 1024 * 1024,
@@ -231,6 +235,10 @@ class BundleSkillRequest:
     inbox_checkpoint: dict[str, object]
     predecessor_rejections: tuple[dict[str, object], ...] = ()
     native_session_ref: str | None = None
+    predecessor_candidate_ref: str | None = None
+    owner_rejection_receipt_ref: str | None = None
+    owner_rejection_kind: str | None = None
+    owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
 
 
@@ -566,23 +574,25 @@ def validate_bundle_skill_draft(
         reviewer_agent_ref=None,
         adapter_kind=result.adapter_kind,
     )
-    if result.output_kind == "target_plan":
-        return validate_target_plan(
-            result.draft,
-            formal_plan_ref=request.formal_plan_ref,
-            context_pack_ref=request.context_pack_ref,
-            context_pack_hash=request.context_pack_hash,
-            plan_document=request.plan_document,
-        )
-    if result.output_kind == "exhaustion_assessment":
-        try:
+    try:
+        if result.output_kind == "target_plan":
+            return validate_target_plan(
+                result.draft,
+                formal_plan_ref=request.formal_plan_ref,
+                context_pack_ref=request.context_pack_ref,
+                context_pack_hash=request.context_pack_hash,
+                plan_document=request.plan_document,
+            )
+        if result.output_kind == "exhaustion_assessment":
             return validate_bundle_exhaustion_assessment(
                 result.draft,
                 plan_document=request.plan_document,
             )
-        except OwnerConflict as error:
-            raise BundleSkillContractError(error.code) from error
-    raise BundleSkillContractError("bundle_skill_output_kind_invalid")
+        raise BundleSkillContractError("bundle_skill_output_kind_invalid")
+    except OwnerConflict as error:
+        raise RecoverableBundleSkillCandidateError(error.code) from error
+    except BundleSkillContractError as error:
+        raise RecoverableBundleSkillCandidateError(str(error)) from error
 
 
 def validate_bundle_skill_result(
@@ -595,32 +605,35 @@ def validate_bundle_skill_result(
         reviewer_agent_ref=None,
         adapter_kind=result.adapter_kind,
     )
-    if (
-        result.review_mode != "advisory_unobserved"
-        or result.reviewer_agent_ref is not None
-        or result.findings != ()
-        or result.dispositions != ()
-        or result.final_target_plan != result.reviewed_draft
-    ):
-        raise BundleSkillContractError("bundle_advisory_review_invalid")
-    draft_hash = validate_target_plan(
-        result.reviewed_draft,
-        formal_plan_ref=request.formal_plan_ref,
-        context_pack_ref=request.context_pack_ref,
-        context_pack_hash=request.context_pack_hash,
-        plan_document=request.plan_document,
-    )
-    final_hash = validate_target_plan(
-        result.final_target_plan,
-        formal_plan_ref=request.formal_plan_ref,
-        context_pack_ref=request.context_pack_ref,
-        context_pack_hash=request.context_pack_hash,
-        plan_document=request.plan_document,
-    )
-    review = review_record(
-        result, draft_hash=draft_hash, final_target_plan_hash=final_hash
-    )
-    review_hash = canonical_hash(review)
+    try:
+        if (
+            result.review_mode != "advisory_unobserved"
+            or result.reviewer_agent_ref is not None
+            or result.findings != ()
+            or result.dispositions != ()
+            or result.final_target_plan != result.reviewed_draft
+        ):
+            raise BundleSkillContractError("bundle_advisory_review_invalid")
+        draft_hash = validate_target_plan(
+            result.reviewed_draft,
+            formal_plan_ref=request.formal_plan_ref,
+            context_pack_ref=request.context_pack_ref,
+            context_pack_hash=request.context_pack_hash,
+            plan_document=request.plan_document,
+        )
+        final_hash = validate_target_plan(
+            result.final_target_plan,
+            formal_plan_ref=request.formal_plan_ref,
+            context_pack_ref=request.context_pack_ref,
+            context_pack_hash=request.context_pack_hash,
+            plan_document=request.plan_document,
+        )
+        review = review_record(
+            result, draft_hash=draft_hash, final_target_plan_hash=final_hash
+        )
+        review_hash = canonical_hash(review)
+    except BundleSkillContractError as error:
+        raise RecoverableBundleSkillCandidateError(str(error)) from error
     return draft_hash, final_hash, review_hash
 
 
@@ -637,32 +650,33 @@ def validate_bundle_exhaustion_skill_result(
         reviewer_agent_ref=None,
         adapter_kind=result.adapter_kind,
     )
-    if (
-        result.review_mode != "advisory_unobserved"
-        or result.reviewer_agent_ref is not None
-        or result.findings != ()
-        or result.review_trace is not None
-    ):
-        raise BundleSkillContractError(
-            "bundle_exhaustion_advisory_review_invalid"
-        )
     try:
+        if (
+            result.review_mode != "advisory_unobserved"
+            or result.reviewer_agent_ref is not None
+            or result.findings != ()
+            or result.review_trace is not None
+        ):
+            raise BundleSkillContractError(
+                "bundle_exhaustion_advisory_review_invalid"
+            )
         assessment_hash = validate_bundle_exhaustion_assessment(
             result.reviewed_assessment,
             plan_document=request.plan_document,
         )
-    except OwnerConflict as error:
-        raise BundleSkillContractError(error.code) from error
-    if result.reviewed_assessment_hash != assessment_hash:
-        raise BundleSkillContractError("bundle_exhaustion_review_binding_invalid")
-    try:
+        if result.reviewed_assessment_hash != assessment_hash:
+            raise BundleSkillContractError(
+                "bundle_exhaustion_review_binding_invalid"
+            )
         advisory_document = bundle_exhaustion_advisory_review_document(
             reviewed_assessment_hash=assessment_hash,
             reviewer_agent_ref=result.reviewer_agent_ref,
             findings=result.findings,
         )
     except OwnerConflict as error:
-        raise BundleSkillContractError(error.code) from error
+        raise RecoverableBundleSkillCandidateError(error.code) from error
+    except BundleSkillContractError as error:
+        raise RecoverableBundleSkillCandidateError(str(error)) from error
     return assessment_hash, canonical_hash(advisory_document)
 
 
@@ -718,6 +732,29 @@ def _validate_request(request: BundleSkillRequest) -> None:
         fence_ref=request.fence_ref,
     )
     _validate_predecessor_rejections(request.predecessor_rejections)
+    feedback_revision = request.predecessor_candidate_ref is not None
+    if feedback_revision != (request.owner_rejection_receipt_ref is not None) or (
+        feedback_revision != (request.owner_rejection_kind is not None)
+    ):
+        raise BundleSkillContractError("owner_feedback_lineage_incomplete")
+    if feedback_revision:
+        if (
+            not isinstance(request.predecessor_candidate_ref, str)
+            or not request.predecessor_candidate_ref.strip()
+            or not isinstance(request.owner_rejection_receipt_ref, str)
+            or not request.owner_rejection_receipt_ref.strip()
+            or request.owner_rejection_kind not in {"domain", "completion"}
+            or request.native_session_ref is None
+            or type(request.owner_feedback) is not tuple
+            or not request.owner_feedback
+            or any(
+                not isinstance(item, str) or not item.strip()
+                for item in request.owner_feedback
+            )
+        ):
+            raise BundleSkillContractError("owner_feedback_invalid")
+    elif type(request.owner_feedback) is not tuple or request.owner_feedback:
+        raise BundleSkillContractError("owner_feedback_without_rejection")
     question = request.context_pack.get("accepted_question_binding")
     formal_plan = request.context_pack.get("accepted_formal_plan_binding")
     if not isinstance(question, dict) or not isinstance(formal_plan, dict):
@@ -848,6 +885,28 @@ def _validate_identity(
         and not reviewer_agent_ref
     ):
         raise BundleSkillContractError("bundle_skill_session_invalid")
+
+
+def _owner_rejection_prompt(request: BundleSkillRequest) -> str:
+    if not request.owner_feedback:
+        return ""
+    if request.owner_rejection_kind == "domain":
+        instruction = (
+            "这是 RG domain rejection 后在同一 Root/native Session 中的新 Attempt。"
+            "必须实质修订 TargetPlan 并逐条处理正式 feedback。"
+        )
+    else:
+        instruction = (
+            "这是 Owner structured-completion rejection 后在同一 Root/native Session "
+            "中的新 Attempt。必须修正被拒绝的 completion 表达并逐条处理正式 feedback。"
+        )
+    return (
+        f"\n{instruction}\n"
+        f"predecessor_candidate_ref={request.predecessor_candidate_ref}\n"
+        f"owner_rejection_receipt_ref={request.owner_rejection_receipt_ref}\n"
+        f"owner_rejection_kind={request.owner_rejection_kind}\n"
+        f"owner_feedback={canonical_json(list(request.owner_feedback))}\n"
+    )
 
 
 class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
@@ -1197,6 +1256,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         _validate_request(request)
         if request.runtime_binding != self.runtime_binding():
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
+        lineage = _owner_rejection_prompt(request)
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
             "本回合仅执行 Primary draft phase。根据内容复杂度可选使用 "
@@ -1255,7 +1315,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             " predecessor_rejections 必须为空。任何可执行 route、semantic "
             "barrier、active/blocked/pending/unknown work、HumanRequest、未对账 external "
             "operation 或 accepted-unconsumed result 都禁止该分支。失败次数、"
-            "attempt 上限、耗时、费用和只失败一条 route 都不是耗尽证明。\n"
+            "attempt 上限、耗时、费用和只失败一条 route 都不是耗尽证明。"
+            f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"cycle_ref={request.cycle_ref}\n"
             f"question_ref={request.question_ref}\n"
@@ -1310,6 +1371,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             native_session_ref=session_ref,
             failure_code="bundle_primary_result_contract_invalid",
             detail_code="codex_bundle_primary_invalid",
+            rejected_candidate=output,
         )
 
     def review_draft(

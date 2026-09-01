@@ -34,6 +34,7 @@ from meta_research.reasoning_skill import (
     REASONING_ROOT_SEMANTIC_OPERATION_IDS,
     ReasoningSkillContractError,
 )
+from meta_research.owners.agent_runtime import BundleRuntimeBinding
 from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.runtime_protection import InhibitorLease, RuntimeProtectionUnavailable
@@ -91,6 +92,32 @@ def _signed_ceiling_evidence(reason: str) -> dict[str, object]:
         "result_file_hash": canonical_hash({"result": reason}),
         "supervisor_receipt_hash": canonical_hash({"receipt": reason}),
     }
+
+
+def _operation_bound_bundle_runtime_binding() -> BundleRuntimeBinding:
+    binding_hash = canonical_hash({"fixture": "bundle-operation-binding"})
+    return BundleRuntimeBinding(
+        packaged_skill_bundle_hash=canonical_hash({"fixture": "bundle-skill"}),
+        instruction_set_hash=canonical_hash({"fixture": "bundle-instructions"}),
+        model_ref="test-model-v1",
+        harness_adapter_ref="codex-cli/test",
+        mcp_bindings=(
+            "harness-operation-binding:semantic-mcp-catalog@sha256:"
+            + binding_hash,
+            "harness-operation-binding:semantic-mcp-operation-bindings@sha256:"
+            + binding_hash,
+        ),
+        capability_bindings=(
+            "harness-operation-binding-v1",
+            "semantic-mcp-resident",
+        ),
+        resource_bindings=(
+            "harness-artifact:operation-binding-contract:test@sha256:"
+            + binding_hash,
+            "harness-artifact:operation-binding-set:test@sha256:"
+            + binding_hash,
+        ),
+    )
 
 
 def _signed_contract_failure_evidence(
@@ -410,6 +437,8 @@ class _SealedMaterialContractFailureIdeaProvider(_IdeaProvider):
         result = super().review_draft(request, draft)
         return replace(
             result,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             findings=(
                 {
                     "finding_id": "finding-material",
@@ -479,15 +508,20 @@ class _SealedMaterialContractFailurePlanProvider(_DeterministicPlanSkill):
         )
 
 
-class _SealedMaterialContractFailureBundleProvider(_DeterministicBundleSkill):
+class _InvalidLocalTargetPlanReviewProvider(_DeterministicBundleSkill):
     def __init__(self) -> None:
         self.review_calls = 0
+
+    def runtime_binding(self) -> BundleRuntimeBinding:
+        return _operation_bound_bundle_runtime_binding()
 
     def review_draft(self, request, draft):
         self.review_calls += 1
         result = super().review_draft(request, draft)
         return replace(
             result,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             findings=(
                 {
                     "finding_id": "bundle-material",
@@ -495,24 +529,50 @@ class _SealedMaterialContractFailureBundleProvider(_DeterministicBundleSkill):
                     "message": "必须形成实质修订。",
                 },
             ),
-            dispositions=(
-                {
-                    "finding_id": "bundle-material",
-                    "action": "revised",
-                    "rationale": "声称修订但 TargetPlan 未改变。",
-                },
-            ),
+            dispositions=(),
         )
 
-    def terminal_contract_failure_checkpoint(self, **values):
-        assert values["operation_name"] == "review"
-        assert values["failure_code"] == "bundle_review_result_contract_invalid"
-        assert values["detail_code"] == (
-            "target_plan_review_revision_not_material"
+
+class _AdvisoryExhaustionBundleProvider(_ExhaustionBundleSkill):
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_calls = 0
+
+    def runtime_binding(self) -> BundleRuntimeBinding:
+        return _operation_bound_bundle_runtime_binding()
+
+    def review_draft(self, request, draft):
+        self.review_calls += 1
+        result = super().review_draft(request, draft)
+        return replace(
+            result,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
+            review_trace=None,
         )
-        return _signed_contract_failure_evidence(
-            values["failure_code"], values["detail_code"]
+
+
+class _CeilingExhaustionBundleProvider(_ExhaustionBundleSkill):
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_calls = 0
+
+    def runtime_binding(self) -> BundleRuntimeBinding:
+        return _operation_bound_bundle_runtime_binding()
+
+    def review_draft(self, request, draft):
+        del request, draft
+        self.review_calls += 1
+        raise IdeaSkillUnavailable(
+            "codex_operation_timeout",
+            recovery_checkpoint=_signed_ceiling_evidence("timeout"),
         )
+
+
+class _InvalidExhaustionBundleProvider(_AdvisoryExhaustionBundleProvider):
+    def review_draft(self, request, draft):
+        result = super().review_draft(request, draft)
+        return replace(result, reviewed_assessment_hash="0" * 64)
 
 
 class _SealedMaterialContractFailureReasoningProvider(
@@ -724,7 +784,7 @@ def test_idea_signed_terminal_failure_is_fenced_without_replay(
         runtime.close()
 
 
-def test_idea_sealed_review_trace_failure_is_fenced_without_replay(
+def test_idea_sealed_review_trace_failure_stays_local_to_the_attempt(
     tmp_path: Path,
 ) -> None:
     provider = _SealedReviewTraceFailureIdeaProvider()
@@ -741,25 +801,20 @@ def test_idea_sealed_review_trace_failure_is_fenced_without_replay(
 
         assert not runtime.idea_stage.process_once()
         run = runtime.idea_stage.query_current()["run"]
-        assert run["status"] == "suspended_fenced"
-        assert run["fence_status"] == "revoked"
-        assert run["blocker"] == {
-            "status": "durable",
-            "reason": {"code": "codex_child_review_spawn_invalid"},
-        }
-        assert run["recovery_checkpoint"]["checkpoint"]["provider_exit"] == (
-            _signed_contract_failure_evidence(
-                "codex_child_review_spawn_invalid"
-            )
-        )
-
-        assert not runtime.idea_stage.process_once()
+        assert run["status"] == "admitted"
+        assert run["attempt_generation"] == 2
+        assert run["attempt_ref"] != primary_complete["attempt_ref"]
+        assert run["root_session_ref"] == primary_complete["root_session_ref"]
+        assert run["native_session_ref"] == primary_complete["native_session_ref"]
+        assert run["blocker"] is None
+        assert run["recovery_checkpoint"] is None
+        assert run["completion_rejection"] is None
         assert provider.review_calls == 1
     finally:
         runtime.close()
 
 
-def test_idea_sealed_material_contract_failure_is_fenced_without_replay(
+def test_idea_material_contract_failure_creates_same_session_successor(
     tmp_path: Path,
 ) -> None:
     provider = _SealedMaterialContractFailureIdeaProvider()
@@ -771,29 +826,32 @@ def test_idea_sealed_material_contract_failure_is_fenced_without_replay(
         runtime.idea_stage.start("idea-material-contract-failure-start")
 
         assert runtime.idea_stage.process_once()
-        assert not runtime.idea_stage.process_once()
+        original = runtime.idea_stage.query_current()["run"]
+        assert runtime.idea_stage.process_once()
         run = runtime.idea_stage.query_current()["run"]
-        assert run["status"] == "suspended_fenced"
-        assert run["fence_status"] == "revoked"
-        assert run["blocker"] == {
-            "status": "durable",
-            "reason": {"code": "idea_review_result_contract_invalid"},
+        assert run["status"] == "admitted"
+        assert run["attempt_generation"] == 2
+        assert run["attempt_ref"] != original["attempt_ref"]
+        assert run["root_session_ref"] == original["root_session_ref"]
+        assert run["native_session_ref"] == original["native_session_ref"]
+        assert run["blocker"] is None
+        assert run["completion_rejection"]["reason"] == {
+            "code": "idea_review_result_contract_invalid",
+            "detail": "review_revision_not_material",
         }
-        assert run["recovery_checkpoint"]["checkpoint"]["provider_exit"] == (
-            _signed_contract_failure_evidence(
-                "idea_review_result_contract_invalid",
-                "review_revision_not_material",
-            )
+        assert run["completion_rejection"]["attempt_ref"] == original[
+            "attempt_ref"
+        ]
+        assert run["completion_rejection"]["receipt"]["kind"] == (
+            "root_completion_rejected"
         )
-
-        assert not runtime.idea_stage.process_once()
         assert provider.review_calls == 1
-        assert provider.checkpoint_calls == 1
+        assert provider.checkpoint_calls == 0
     finally:
         runtime.close()
 
 
-def test_plan_post_result_contract_failure_is_terminal(
+def test_plan_post_result_contract_failure_creates_successor(
     tmp_path: Path,
 ) -> None:
     provider = _SealedMaterialContractFailurePlanProvider()
@@ -808,48 +866,229 @@ def test_plan_post_result_contract_failure_is_terminal(
         for _step in range(5):
             changed = runtime.plan_stage.process_once()
             if provider.review_calls:
-                assert not changed
+                assert changed
                 break
             assert changed
-        blocked = runtime.plan_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"]["reason"] == {
-            "code": "plan_review_result_contract_invalid"
+        successor = runtime.plan_stage.query_current()["run"]
+        assert successor["status"] == "admitted"
+        assert successor["attempt_generation"] == 2
+        assert successor["blocker"] is None
+        assert successor["completion_rejection"]["reason"] == {
+            "code": "plan_review_result_contract_invalid",
+            "detail": "plan_review_revision_not_material",
         }
-        assert not runtime.plan_stage.process_once()
         assert provider.review_calls == 1
     finally:
         runtime.close()
 
 
-def test_bundle_post_result_contract_failure_is_terminal(
+def test_bundle_local_target_plan_review_failure_does_not_invent_provider_phase(
     tmp_path: Path,
 ) -> None:
-    provider = _SealedMaterialContractFailureBundleProvider()
+    provider = _InvalidLocalTargetPlanReviewProvider()
     runtime = _bundle_runtime(
         tmp_path / "bundle-material-contract-failure",
         bundle_skill_provider=provider,
+        harness_ready=False,
     )
     try:
         _prepare_bundle_request(runtime)
-        for _step in range(4):
-            changed = runtime.bundle_stage.process_once()
-            if provider.review_calls:
-                assert not changed
-                break
-            assert changed
-        blocked = runtime.bundle_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"]["reason"] == {
-            "code": "bundle_review_result_contract_invalid"
+        assert runtime.bundle_stage.process_once()  # Run admission.
+        assert runtime.bundle_stage.process_once()  # Real primary provider turn.
+        before = runtime.bundle_stage.query_current()["run"]
+        review_invocation_ref = before["provider_operations"]["review"][
+            "invocation_ref"
+        ]
+
+        assert not runtime.bundle_stage.process_once()
+        assert provider.review_calls == 1
+        current = runtime.bundle_stage.query_current()["run"]
+        assert current["status"] == "admitted"
+        assert current["attempt_ref"] == before["attempt_ref"]
+        assert current["completion_rejection"] is None
+        assert runtime.bundle_stage.transient_error == (
+            "bundle_review_result_contract_invalid"
+        )
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM ar_provider_units WHERE unit_ref = "
+                    ":unit_ref"
+                ),
+                {"unit_ref": review_invocation_ref},
+            ).scalar_one() == 0
+            assert connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM ar_stage_completion_rejections WHERE "
+                    "provider_invocation_ref = :invocation_ref"
+                ),
+                {"invocation_ref": review_invocation_ref},
+            ).scalar_one() == 0
+    finally:
+        runtime.close()
+
+
+def test_bundle_exhaustion_review_unit_wraps_effect_and_acknowledges_safe_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _AdvisoryExhaustionBundleProvider()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-exhaustion-review-provider-unit",
+        bundle_skill_provider=provider,
+        harness_ready=False,
+    )
+    try:
+        _prepare_bundle_request(runtime)
+        assert runtime.bundle_stage.process_once()  # Run admission.
+        assert runtime.bundle_stage.process_once()  # Primary assessment.
+        current = runtime.bundle_stage.query_current()
+        request_ref = current["stage_run_request"]["request_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        assert run is not None
+
+        review_draft = provider.review_draft
+
+        def review_after_begin(request, draft):
+            with runtime._database.read() as connection:
+                unit = connection.execute(
+                    text(
+                        "SELECT unit_kind, status FROM ar_provider_units WHERE "
+                        "unit_ref = :unit_ref"
+                    ),
+                    {"unit_ref": run.review_invocation.invocation_ref},
+                ).one()
+            assert tuple(unit) == ("bundle_review", "active")
+            return review_draft(request, draft)
+
+        acknowledged: list[str] = []
+        acknowledge = runtime.owners.agent_runtime.acknowledge_provider_safe_point
+
+        def record_acknowledgement(**values):
+            acknowledged.append(values["unit_ref"])
+            return acknowledge(**values)
+
+        monkeypatch.setattr(provider, "review_draft", review_after_begin)
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            record_acknowledgement,
+        )
+
+        assert runtime.bundle_stage.process_once()
+        assert provider.review_calls == 1
+        assert acknowledged == [run.review_invocation.invocation_ref]
+        with runtime._database.read() as connection:
+            unit = connection.execute(
+                text(
+                    "SELECT unit_kind, status FROM ar_provider_units WHERE "
+                    "unit_ref = :unit_ref"
+                ),
+                {"unit_ref": run.review_invocation.invocation_ref},
+            ).one()
+        assert tuple(unit) == ("bundle_review", "completed")
+    finally:
+        runtime.close()
+
+
+def test_bundle_exhaustion_invalid_candidate_uses_active_review_seam(
+    tmp_path: Path,
+) -> None:
+    provider = _InvalidExhaustionBundleProvider()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-exhaustion-review-rejection",
+        bundle_skill_provider=provider,
+        harness_ready=False,
+    )
+    try:
+        _prepare_bundle_request(runtime)
+        assert runtime.bundle_stage.process_once()  # Run admission.
+        assert runtime.bundle_stage.process_once()  # Primary assessment.
+        before = runtime.bundle_stage.query_current()["run"]
+
+        assert runtime.bundle_stage.process_once()
+        current = runtime.bundle_stage.query_current()["run"]
+        assert current["attempt_ref"] != before["attempt_ref"]
+        assert current["root_session_ref"] == before["root_session_ref"]
+        assert current["native_session_ref"] == before["native_session_ref"]
+        assert current["completion_rejection"]["reason"] == {
+            "code": "bundle_review_result_contract_invalid",
+            "detail": "bundle_exhaustion_review_binding_invalid",
         }
+        with runtime._database.read() as connection:
+            old_unit_status = connection.execute(
+                text(
+                    "SELECT status FROM ar_provider_units WHERE unit_ref = "
+                    ":unit_ref"
+                ),
+                {
+                    "unit_ref": before["provider_operations"]["review"][
+                        "invocation_ref"
+                    ]
+                },
+            ).scalar_one()
+        assert old_unit_status == "completed"
+    finally:
+        runtime.close()
+
+
+def test_bundle_exhaustion_review_signed_ceiling_fences_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _CeilingExhaustionBundleProvider()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-exhaustion-review-ceiling",
+        bundle_skill_provider=provider,
+        harness_ready=False,
+    )
+    try:
+        _prepare_bundle_request(runtime)
+        assert runtime.bundle_stage.process_once()  # Run admission.
+        assert runtime.bundle_stage.process_once()  # Primary assessment.
+
+        acknowledged: list[str] = []
+        acknowledge = runtime.owners.agent_runtime.acknowledge_provider_safe_point
+
+        def record_acknowledgement(**values):
+            acknowledged.append(values["unit_ref"])
+            return acknowledge(**values)
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            record_acknowledgement,
+        )
+        assert not runtime.bundle_stage.process_once()
+
+        current = runtime.bundle_stage.query_current()
+        run = current["run"]
+        assert run["status"] == "suspended_fenced"
+        assert run["blocker"]["reason"] == {"code": "codex_operation_timeout"}
+        assert run["recovery_checkpoint"]["checkpoint"]["provider_exit"] == (
+            _signed_ceiling_evidence("timeout")
+        )
+        with runtime._database.read() as connection:
+            unit = connection.execute(
+                text(
+                    "SELECT unit_kind, status FROM ar_provider_units WHERE "
+                    "unit_ref = :unit_ref"
+                ),
+                {
+                    "unit_ref": run["provider_operations"]["review"][
+                        "invocation_ref"
+                    ]
+                },
+            ).one()
+        assert tuple(unit) == ("bundle_review", "revoked")
+        assert acknowledged == []
         assert not runtime.bundle_stage.process_once()
         assert provider.review_calls == 1
     finally:
         runtime.close()
 
 
-def test_reasoning_post_result_contract_failure_is_terminal(
+def test_reasoning_post_result_contract_failure_creates_successor(
     tmp_path: Path,
 ) -> None:
     provider = _SealedMaterialContractFailureReasoningProvider()
@@ -860,18 +1099,29 @@ def test_reasoning_post_result_contract_failure_is_terminal(
     try:
         _confirm_deepfetch_quest(runtime)
         _finish_idea_stage(runtime)
+        original = None
         for _step in range(5):
+            before = runtime.reasoning_stage.query_current()["run"]
             changed = runtime.reasoning_stage.process_once()
             if provider.review_calls:
-                assert not changed
+                assert changed
+                original = before
                 break
             assert changed
-        blocked = runtime.reasoning_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"]["reason"] == {
-            "code": "reasoning_review_result_contract_invalid"
+        assert original is not None
+        successor = runtime.reasoning_stage.query_current()["run"]
+        assert successor["status"] == "admitted"
+        assert successor["attempt_generation"] == (
+            original["attempt_generation"] + 1
+        )
+        assert successor["attempt_ref"] != original["attempt_ref"]
+        assert successor["root_session_ref"] == original["root_session_ref"]
+        assert successor["native_session_ref"] == original["native_session_ref"]
+        assert successor["blocker"] is None
+        assert successor["completion_rejection"]["reason"] == {
+            "code": "reasoning_review_result_contract_invalid",
+            "detail": "reasoning_review_revision_invalid",
         }
-        assert not runtime.reasoning_stage.process_once()
         assert provider.review_calls == 1
     finally:
         runtime.close()
@@ -951,7 +1201,7 @@ def test_direct_provider_contract_error_remains_transient(
         ),
     ],
 )
-def test_production_adapter_invalid_shape_is_terminal_without_replay(
+def test_production_adapter_invalid_shape_creates_same_session_successor(
     tmp_path: Path,
     phase: str,
     failure_code: str,
@@ -982,55 +1232,33 @@ def test_production_adapter_invalid_shape_is_terminal_without_replay(
             )
             assert runtime.idea_stage.process_once()
 
-        assert not runtime.idea_stage.process_once()
-        blocked = runtime.idea_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"] == {
-            "status": "durable",
-            "reason": {"code": failure_code},
-        }
-        provider_exit = blocked["recovery_checkpoint"]["checkpoint"][
-            "provider_exit"
+        before = runtime.idea_stage.query_current()["run"]
+        assert runtime.idea_stage.process_once()
+        successor = runtime.idea_stage.query_current()["run"]
+        assert successor["status"] == "admitted"
+        assert successor["attempt_generation"] == 2
+        assert successor["attempt_ref"] != before["attempt_ref"]
+        assert successor["root_session_ref"] == before["root_session_ref"]
+        rejection = successor["completion_rejection"]
+        assert successor["native_session_ref"] == rejection[
+            "native_session_ref"
         ]
-        assert provider_exit["contract_failure_code"] == failure_code
-        assert provider_exit["contract_failure_detail_code"] == detail_code
-
-        run = runtime.owners.agent_runtime.query_idea_stage_run(
-            request.request_ref
-        )
-        assert run is not None
-        invocation = (
-            run.primary_invocation if phase == "primary" else run.review_invocation
-        )
-        operation_ref = invocation.operation_ref
-        terminal_rows = _provider_terminal_rows(runtime, operation_ref)
-        assert len(terminal_rows["units"]) == 1
-        assert terminal_rows["units"][0][1] == "revoked"
-        assert terminal_rows["units"][0][3] is not None
-        assert len(terminal_rows["responsibilities"]) == 1
-        assert terminal_rows["responsibilities"][0][1:3] == (
-            "finished",
-            "permanent_fence",
-        )
-        assert len(runner.calls) == expected_calls
-
-        assert not runtime.idea_stage.process_once()
-        assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
+        if before["native_session_ref"] is not None:
+            assert successor["native_session_ref"] == before[
+                "native_session_ref"
+            ]
+        assert rejection["attempt_ref"] == before["attempt_ref"]
+        assert rejection["reason"] == {
+            "code": failure_code,
+            "detail": detail_code,
+        }
+        assert rejection["candidate"]
+        assert rejection["feedback"]
+        assert rejection["receipt"]["kind"] == "root_completion_rejected"
+        assert rejection["provider_completion"]["status"] == "completed"
         assert len(runner.calls) == expected_calls
     finally:
         runtime.close()
-
-    no_replay = _SequenceRunner([])
-    restarted = _runtime(
-        data_root,
-        CodexIdeaSkillAdapter(workspace, process_runner=no_replay),
-    )  # type: ignore[arg-type]
-    try:
-        assert not restarted.idea_stage.process_once()
-        assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert no_replay.calls == []
-    finally:
-        restarted.close()
 
 
 def test_production_adapter_sealed_review_trace_failure_never_replays(
@@ -1141,12 +1369,11 @@ def test_production_adapter_primary_phase_violation_is_owner_terminal(
 @pytest.mark.parametrize(
     "detail_code",
     [
-        "codex_output_invalid",
         "codex_native_session_missing",
         "codex_native_session_mismatch",
     ],
 )
-def test_plan_sealed_transport_contract_failure_is_terminal_without_replay(
+def test_plan_native_session_transport_failure_is_terminal_without_replay(
     tmp_path: Path,
     detail_code: str,
 ) -> None:
@@ -1200,11 +1427,11 @@ def test_plan_sealed_transport_contract_failure_is_terminal_without_replay(
         operation = next(workspace.glob("provider-operations/*/primary"))
         assert (operation / "exit.json").is_file()
         assert not (operation / "completed.json").exists()
-        assert call_counter.read_text(encoding="utf-8") == "1"
+        calls_after_fence = call_counter.read_text(encoding="utf-8")
 
         assert not runtime.plan_stage.process_once()
         assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
-        assert call_counter.read_text(encoding="utf-8") == "1"
+        assert call_counter.read_text(encoding="utf-8") == calls_after_fence
     finally:
         runtime.close()
 
@@ -1216,7 +1443,7 @@ def test_plan_sealed_transport_contract_failure_is_terminal_without_replay(
     try:
         assert not restarted.plan_stage.process_once()
         assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert call_counter.read_text(encoding="utf-8") == "1"
+        assert call_counter.read_text(encoding="utf-8") == calls_after_fence
     finally:
         restarted.close()
 
@@ -1224,12 +1451,11 @@ def test_plan_sealed_transport_contract_failure_is_terminal_without_replay(
 @pytest.mark.parametrize(
     "detail_code",
     [
-        "codex_output_invalid",
         "codex_native_session_missing",
         "codex_native_session_mismatch",
     ],
 )
-def test_plan_restart_terminalizes_preexisting_raw_transport_failure(
+def test_plan_restart_terminalizes_preexisting_native_session_failure(
     tmp_path: Path,
     detail_code: str,
 ) -> None:
@@ -1271,7 +1497,6 @@ def test_plan_restart_terminalizes_preexisting_raw_transport_failure(
             (operation / "exit.json").read_text(encoding="utf-8")
         )
         assert not (operation / "completed.json").exists()
-        assert call_counter.read_text(encoding="utf-8") == "1"
         operation_ref = run.primary_invocation.operation_ref
         assert _provider_terminal_rows(runtime, operation_ref) == {
             "units": (),
@@ -1305,11 +1530,13 @@ def test_plan_restart_terminalizes_preexisting_raw_transport_failure(
             assert provider_exit[field] == exit_marker[field]
         terminal_rows = _provider_terminal_rows(restarted, operation_ref)
         assert any(row[1] == "revoked" for row in terminal_rows["units"])
-        assert call_counter.read_text(encoding="utf-8") == "1"
+        calls_after_restart_fence = call_counter.read_text(encoding="utf-8")
 
         assert not restarted.plan_stage.process_once()
         assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert call_counter.read_text(encoding="utf-8") == "1"
+        assert call_counter.read_text(encoding="utf-8") == (
+            calls_after_restart_fence
+        )
     finally:
         restarted.close()
 

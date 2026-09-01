@@ -24,6 +24,8 @@ from meta_research.bundle_skill import (
     BundleSkillUnavailable,
     BundleTargetBatchRequest,
     CodexBundleSkillAdapter,
+    _owner_rejection_prompt,
+    _validate_request as _validate_bundle_request,
     validate_bundle_exhaustion_skill_result,
     validate_bundle_skill_result,
 )
@@ -47,6 +49,7 @@ from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.owners.agent_runtime import (
     BUNDLE_INBOX_CHECKPOINT_RECEIPT_KIND,
     BUNDLE_INBOX_CHECKPOINT_SCHEMA,
+    BundleRuntimeBinding,
 )
 from meta_research.semantic_mcp import McpConnection, ResidentMcpBinding
 from meta_research.semantic_owner_gateway import (
@@ -126,6 +129,75 @@ def _plan_document() -> dict[str, object]:
         "bundle_disposition": "experiments_required",
         "source_bindings": {"accepted": True},
     }
+
+
+def test_bundle_successor_request_carries_owner_rejection_feedback() -> None:
+    plan = _plan_document()
+    question_binding = {"question_ref": "question:bundle-1"}
+    formal_plan_binding = {
+        "formal_plan_ref": "formal-plan:bundle-1",
+        "plan_document": plan,
+        "plan_document_hash": canonical_hash(plan),
+        "answer_contract_hash": "a" * 64,
+    }
+    context = {
+        "schema_ref": "meta-research/bundle-context-pack/v1",
+        "cycle_ref": "cycle:bundle-1",
+        "accepted_question_binding": question_binding,
+        "accepted_formal_plan_binding": formal_plan_binding,
+    }
+    request = BundleSkillRequest(
+        stage_request_ref="stage-request:bundle-1",
+        run_ref="bundle-run:1",
+        attempt_ref="bundle-attempt:2",
+        fence_ref="bundle-fence:2",
+        cycle_ref="cycle:bundle-1",
+        question_ref="question:bundle-1",
+        formal_plan_ref="formal-plan:bundle-1",
+        context_pack_ref="context-pack:bundle-1",
+        context_pack_hash=canonical_hash(context),
+        context_pack=context,
+        plan_document=plan,
+        root_session_ref="ar-session:bundle-1",
+        runtime_binding=BundleRuntimeBinding(
+            packaged_skill_bundle_hash="1" * 64,
+            instruction_set_hash="2" * 64,
+            model_ref="test-model",
+            harness_adapter_ref="test-harness",
+            mcp_bindings=(),
+            capability_bindings=(),
+            resource_bindings=(),
+        ),
+        inbox_checkpoint=_inbox_checkpoint(
+            run_ref="bundle-run:1",
+            attempt_ref="bundle-attempt:2",
+            fence_ref="bundle-fence:2",
+        ),
+        native_session_ref="provider-session:bundle-1",
+        predecessor_candidate_ref="bundle-submission:rejected",
+        owner_rejection_receipt_ref="rg-target-rejection-receipt:1",
+        owner_rejection_kind="domain",
+        owner_feedback=("Attach accepted Owner proofs to every candidate.",),
+    )
+
+    _validate_bundle_request(request)
+    prompt = _owner_rejection_prompt(request)
+    assert "同一 Root/native Session" in prompt
+    assert "bundle-submission:rejected" in prompt
+    assert "rg-target-rejection-receipt:1" in prompt
+    assert "Attach accepted Owner proofs" in prompt
+    completion_request = replace(request, owner_rejection_kind="completion")
+    _validate_bundle_request(completion_request)
+    assert "structured-completion rejection" in _owner_rejection_prompt(
+        completion_request
+    )
+
+    with pytest.raises(
+        BundleContractError, match="owner_feedback_lineage_incomplete"
+    ):
+        _validate_bundle_request(
+            replace(request, owner_rejection_receipt_ref=None)
+        )
 
 
 def _measurement_contract(label: str, cell: str) -> dict[str, object]:
@@ -679,6 +751,68 @@ def _fake_codex(path: Path) -> Path:
     path.write_text("#!/bin/sh\nprintf 'codex-bundle-test 1\\n'\n", encoding="utf-8")
     path.chmod(0o700)
     return path
+
+
+def test_completion_rejection_feedback_reaches_bundle_primary_prompt(
+    tmp_path: Path,
+) -> None:
+    plan = _plan_document()
+    context = {
+        "schema_ref": "meta-research/bundle-context-pack/v1",
+        "cycle_ref": "cycle:bundle-1",
+        "accepted_question_binding": {"question_ref": "question:bundle-1"},
+        "accepted_formal_plan_binding": {
+            "formal_plan_ref": "formal-plan:bundle-1",
+            "plan_document": plan,
+            "plan_document_hash": canonical_hash(plan),
+            "answer_contract_hash": "a" * 64,
+        },
+    }
+    context_hash = canonical_hash(context)
+    runner = _SequenceRunner(
+        [{"target_plan": _target_plan(plan, context_hash)}]
+    )
+    adapter = CodexBundleSkillAdapter(
+        tmp_path / "bundle-successor-provider",
+        executable=str(_fake_codex(tmp_path / "codex-successor")),
+        process_runner=runner,
+    )
+    adapter.bind_full_conformance_authority(_FullConformanceAuthority())
+    adapter.configure_resident_mcp_endpoint("http://semantic-mcp.invalid")
+    request = BundleSkillRequest(
+        stage_request_ref="stage-request:bundle-1",
+        run_ref="bundle-run:1",
+        attempt_ref="bundle-attempt:2",
+        fence_ref="bundle-fence:2",
+        cycle_ref="cycle:bundle-1",
+        question_ref="question:bundle-1",
+        formal_plan_ref="formal-plan:bundle-1",
+        context_pack_ref="context-pack:bundle-1",
+        context_pack_hash=context_hash,
+        context_pack=context,
+        plan_document=plan,
+        root_session_ref="ar-session:bundle-1",
+        runtime_binding=adapter.runtime_binding(),
+        inbox_checkpoint=_inbox_checkpoint(
+            run_ref="bundle-run:1",
+            attempt_ref="bundle-attempt:2",
+            fence_ref="bundle-fence:2",
+        ),
+        native_session_ref="codex-bundle-primary:1",
+        predecessor_candidate_ref="bundle-candidate:rejected",
+        owner_rejection_receipt_ref="receipt:bundle-completion-rejected",
+        owner_rejection_kind="completion",
+        owner_feedback=("修正 TargetPlan 的 reference closure。",),
+    )
+
+    adapter.execute(request)
+
+    assert len(runner.calls) == 1
+    prompt = runner.calls[0][1]
+    assert "owner_rejection_kind=completion" in prompt
+    assert "bundle-candidate:rejected" in prompt
+    assert "receipt:bundle-completion-rejected" in prompt
+    assert "修正 TargetPlan 的 reference closure" in prompt
 
 
 def test_production_adapter_freezes_skill_without_requiring_child_choreography(

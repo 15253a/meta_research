@@ -194,8 +194,8 @@ def _review(
 ) -> dict[str, object]:
     return {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "review_mode": "harness_child_agent",
-        "reviewer_agent_ref": "reasoning-autonomous-reviewer:1",
+        "review_mode": "advisory_unobserved",
+        "reviewer_agent_ref": None,
         "reviewed_draft_hash": canonical_hash(primary_draft),
         "findings": [
             {
@@ -212,7 +212,7 @@ def _review(
             }
         ],
         "final_output_hash": canonical_hash(checkpoint),
-        "independent": True,
+        "independent": False,
         "advisory_only": True,
     }
 
@@ -391,6 +391,47 @@ def test_reasoning_autonomous_checkpoint_is_current_durable_and_non_terminal(
                 review_hash=checkpoint.review_hash,
                 receipt=replace(checkpoint.receipt, payload_hash="1" * 64),
             )
+
+        runtime.owners.agent_runtime.begin_provider_unit(
+            unit_ref=current.review_invocation.invocation_ref,
+            operation_ref=current.review_invocation.operation_ref,
+            run_ref=current.run_ref,
+            attempt_ref=current.attempt_ref,
+            fence_ref=current.fence_ref,
+            unit_kind="reasoning_review",
+        )
+        rejection = (
+            runtime.owners.agent_runtime.reject_stage_completion_candidate(
+                unit_ref=current.review_invocation.invocation_ref,
+                run_ref=current.run_ref,
+                attempt_ref=current.attempt_ref,
+                fence_ref=current.fence_ref,
+                native_session_ref=primary.native_session_ref,
+                candidate={
+                    "phase": "autonomous-resume",
+                    "result": {"invalid_transition": True},
+                },
+                reason_code="reasoning_review_result_contract_invalid",
+                detail_code="reasoning_transition_invalid",
+                feedback=("Return a valid transition expression.",),
+            )
+        )
+        successor = runtime.owners.agent_runtime.query_reasoning_stage_run(
+            request.request_ref
+        )
+        assert successor is not None
+        assert successor.attempt_generation == 2
+        assert successor.attempt_ref == rejection.successor_attempt_ref
+        assert successor.native_session_ref == current.native_session_ref
+        assert successor.autonomous_checkpoint == checkpoint
+        assert successor.execution is None
+        assert successor.review_invocation.status == "prepared"
+        assert (
+            runtime.owners.agent_runtime.query_reasoning_autonomous_checkpoint(
+                checkpoint.checkpoint_ref
+            )
+            == checkpoint
+        )
     finally:
         runtime.close()
 

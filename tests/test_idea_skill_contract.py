@@ -415,6 +415,7 @@ def test_owner_rejection_requires_a_material_successor_with_exact_lineage() -> N
         native_session_ref="codex-primary:1",
         predecessor_submission_ref="submission:1",
         owner_rejection_receipt_ref="receipt:rg-rejection-1",
+        owner_rejection_kind="domain",
         owner_feedback=("候选只是复述 Question，必须增加可检验干预轴。",),
     )
 
@@ -547,6 +548,26 @@ class _SequenceRunner:
     ) -> subprocess.CompletedProcess[str]:
         del job_ref
         return self(argv, prompt, timeout)
+
+
+class _InvalidJsonRunner(_SequenceRunner):
+    def __call__(
+        self, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        completed = super().__call__(argv, prompt, timeout)
+        output_path = Path(argv[argv.index("--output-last-message") + 1])
+        output_path.write_text("{not-json", encoding="utf-8")
+        return completed
+
+
+class _NonFiniteJsonRunner(_SequenceRunner):
+    def __call__(
+        self, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        completed = super().__call__(argv, prompt, timeout)
+        output_path = Path(argv[argv.index("--output-last-message") + 1])
+        output_path.write_text('{"outcome":NaN}', encoding="utf-8")
+        return completed
 
 
 class _OversizedFeatureProbeRunner(_SequenceRunner):
@@ -1324,6 +1345,101 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
         "dispositions",
     }
     _assert_codex_schema_types(review_schema)
+
+
+def test_completion_rejection_feedback_reaches_both_idea_provider_turns(
+    tmp_path: Path,
+) -> None:
+    successor = _idea_set()
+    runner = _SequenceRunner(
+        [
+            {"outcome": successor},
+            _review_turn_output(final_outcome=successor),
+        ]
+    )
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "idea-successor-provider",
+        process_runner=runner,
+    )
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        submission_revision=2,
+        native_session_ref="codex-primary:1",
+        predecessor_submission_ref="idea-candidate:rejected",
+        owner_rejection_receipt_ref="receipt:idea-completion-rejected",
+        owner_rejection_kind="completion",
+        owner_feedback=("修正 final_outcome 的 evidence boundary 表达。",),
+    )
+
+    result = adapter.execute(request)
+    validate_idea_skill_result(request, result)
+
+    assert len(runner.calls) == 2
+    for _argv, prompt, _schema in runner.calls:
+        assert "owner_rejection_kind=completion" in prompt
+        assert "idea-candidate:rejected" in prompt
+        assert "receipt:idea-completion-rejected" in prompt
+        assert "修正 final_outcome 的 evidence boundary 表达" in prompt
+
+
+def test_invalid_json_is_preserved_as_a_rejected_completion_candidate(
+    tmp_path: Path,
+) -> None:
+    runner = _InvalidJsonRunner([{"outcome": _idea_set()}])
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "idea-invalid-json",
+        process_runner=runner,
+    )
+
+    with pytest.raises(IdeaSkillUnavailable) as caught:
+        adapter.generate_draft(
+            _request(
+                runtime_binding=adapter.runtime_binding(),
+                job_ref="idea-invalid-json-job",
+            )
+        )
+
+    error = caught.value
+    assert error.code == "idea_primary_result_contract_invalid"
+    assert error.rejected_native_session_ref == "codex-primary:1"
+    assert error.rejected_detail_code == "codex_output_invalid"
+    assert error.recovery_checkpoint is not None
+    assert error.rejected_candidate == {
+        "schema_ref": "meta-research/raw-provider-candidate/v1",
+        "encoding": "utf-8",
+        "content": "{not-json",
+        "content_hash": error.recovery_checkpoint["result_file_hash"],
+    }
+
+
+def test_non_finite_json_is_preserved_as_a_rejected_completion_candidate(
+    tmp_path: Path,
+) -> None:
+    runner = _NonFiniteJsonRunner([{"outcome": _idea_set()}])
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "idea-non-finite-json",
+        process_runner=runner,
+    )
+
+    with pytest.raises(IdeaSkillUnavailable) as caught:
+        adapter.generate_draft(
+            _request(
+                runtime_binding=adapter.runtime_binding(),
+                job_ref="idea-non-finite-json-job",
+            )
+        )
+
+    error = caught.value
+    assert error.code == "idea_primary_result_contract_invalid"
+    assert error.rejected_native_session_ref == "codex-primary:1"
+    assert error.rejected_detail_code == "codex_output_invalid"
+    assert error.recovery_checkpoint is not None
+    assert error.rejected_candidate == {
+        "schema_ref": "meta-research/raw-provider-candidate/v1",
+        "encoding": "utf-8",
+        "content": '{"outcome":NaN}',
+        "content_hash": error.recovery_checkpoint["result_file_hash"],
+    }
 
 
 def test_production_adapter_does_not_require_a_review_spawn_trace(

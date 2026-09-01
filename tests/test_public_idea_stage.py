@@ -8,7 +8,12 @@ from sqlalchemy import text
 
 from meta_research.composition import build_production_runtime
 from meta_research.idea_stage import _public_run
-from meta_research.idea_skill import IdeaSkillDraft, IdeaSkillRequest, IdeaSkillResult
+from meta_research.idea_skill import (
+    IdeaSkillDraft,
+    IdeaSkillRequest,
+    IdeaSkillResult,
+    IdeaSkillUnavailable,
+)
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.paths import prepare_data_root
@@ -61,6 +66,7 @@ class _DeterministicProbe:
 class _DeterministicIdeaSkill:
     def __init__(self) -> None:
         self.requests: list[IdeaSkillRequest] = []
+        self.review_requests: list[IdeaSkillRequest] = []
 
     def runtime_binding(self) -> IdeaRuntimeBinding:
         return IdeaRuntimeBinding(
@@ -114,14 +120,15 @@ class _DeterministicIdeaSkill:
     def review_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
+        self.review_requests.append(request)
         return IdeaSkillResult(
             reviewed_draft=draft.draft,
             final_outcome=draft.draft,
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="codex-child-reviewer-1",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind="test_deterministic",
         )
 
@@ -339,8 +346,7 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
         assert committed["run"]["native_session_ref"] == "codex-primary-1"
         assert committed["run"]["review"] == {
             "status": "completed",
-            "review_mode": "harness_child_agent",
-            "reviewer_agent_ref": "codex-child-reviewer-1",
+            "review_mode": "advisory_unobserved",
             "finding_count": 0,
             "disposition_count": 0,
         }
@@ -390,6 +396,128 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
             "finding_count": 0,
             "disposition_count": 0,
         }
+    finally:
+        runtime.close()
+
+
+class _CorrectedIdeaSkill(_DeterministicIdeaSkill):
+    """Return one completed but invalid candidate, then honor Owner feedback."""
+
+    def review_draft(
+        self, request: IdeaSkillRequest, draft: IdeaSkillDraft
+    ) -> IdeaSkillResult:
+        result = super().review_draft(request, draft)
+        if len(self.review_requests) == 1:
+            raise IdeaSkillUnavailable(
+                "idea_review_result_contract_invalid",
+                rejected_candidate={
+                    "findings": [],
+                    "final_outcome": result.final_outcome,
+                    "dispositions": [],
+                },
+                rejected_native_session_ref=result.primary_session_ref,
+                rejected_detail_code="codex_output_invalid",
+            )
+        return result
+
+
+def test_idea_completion_rejection_keeps_history_and_resumes_same_session(
+    tmp_path: Path,
+) -> None:
+    provider = _CorrectedIdeaSkill()
+    runtime = _runtime(tmp_path / "idea-completion-rejection", provider)
+    try:
+        _confirm_direct_quest(runtime)
+        started = runtime.idea_stage.start("idea-completion-rejection-start")
+        original = started["run"]
+
+        assert runtime.idea_stage.process_once()
+        assert runtime.idea_stage.process_once()
+        rejected = runtime.idea_stage.query_current()["run"]
+
+        assert rejected["attempt_generation"] == 2
+        assert rejected["attempt_ref"] != original["attempt_ref"]
+        assert rejected["root_session_ref"] == original["root_session_ref"]
+        assert rejected["native_session_ref"] == "codex-primary-1"
+        rejection = rejected["completion_rejection"]
+        assert rejection["status"] == "rejected"
+        assert rejection["attempt_disposition"] == (
+            "completion_rejected_replaced"
+        )
+        assert rejection["attempt_ref"] == original["attempt_ref"]
+        assert rejection["successor_attempt_ref"] == rejected["attempt_ref"]
+        assert rejection["reason"]["code"] == (
+            "idea_review_result_contract_invalid"
+        )
+        assert rejection["reason"]["detail"] == "codex_output_invalid"
+        assert rejection["candidate"]["phase"] == "review"
+        assert rejection["candidate"]["result"]["findings"] == []
+        assert rejection["feedback"]
+        assert rejection["provider_completion"]["status"] == "completed"
+        assert rejection["receipt"]["kind"] == "root_completion_rejected"
+
+        original_fact = (
+            runtime.owners.agent_runtime.query_stage_completion_rejection(
+                original["attempt_ref"]
+            )
+        )
+        assert original_fact is not None
+        assert original_fact.as_public_dict() == rejection
+
+        assert runtime.idea_stage.process_once()
+        revised_request = provider.review_requests[-1]
+        assert revised_request.owner_rejection_kind == "completion"
+        assert revised_request.predecessor_submission_ref == rejection[
+            "candidate_ref"
+        ]
+        assert revised_request.owner_rejection_receipt_ref == rejection[
+            "receipt"
+        ]["receipt_ref"]
+        assert list(revised_request.owner_feedback) == rejection["feedback"]
+
+        for _step in range(4):
+            assert runtime.idea_stage.process_once()
+        committed = runtime.idea_stage.query_current()
+        assert committed["run"]["status"] == "completed"
+        assert committed["stage_commit"]["status"] == "Completed"
+        assert (
+            runtime.owners.agent_runtime.query_stage_completion_rejection(
+                original["attempt_ref"]
+            )
+            == original_fact
+        )
+    finally:
+        runtime.close()
+
+
+class _IdentityDriftIdeaSkill(_DeterministicIdeaSkill):
+    def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
+        draft = super().generate_draft(request)
+        return replace(draft, primary_session_ref=request.root_session_ref)
+
+
+def test_idea_session_identity_failure_does_not_create_a_successor(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(
+        tmp_path / "idea-session-identity-failure",
+        _IdentityDriftIdeaSkill(),
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        started = runtime.idea_stage.start("idea-session-identity-start")["run"]
+
+        assert runtime.idea_stage.process_once() is False
+        current = runtime.idea_stage.query_current()["run"]
+        assert current["attempt_ref"] == started["attempt_ref"]
+        assert current["attempt_generation"] == 1
+        assert current["completion_rejection"] is None
+        assert (
+            runtime.owners.agent_runtime.query_stage_completion_rejection(
+                started["attempt_ref"]
+            )
+            is None
+        )
     finally:
         runtime.close()
 

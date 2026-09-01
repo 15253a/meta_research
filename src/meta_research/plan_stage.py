@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import cast
 
 from meta_research.feed import DurableFeed
@@ -41,6 +41,7 @@ from meta_research.plan_skill import (
     PlanSkillProvider,
     PlanSkillRequest,
     PlanSkillUnavailable,
+    RecoverablePlanSkillCandidateError,
     review_record,
     validate_plan_skill_draft,
     validate_plan_skill_result,
@@ -371,6 +372,7 @@ class PlanStageWorker:
     ) -> _CycleStep:
         predecessor = run.predecessor_execution
         rejection = run.rejection_receipt
+        completion_rejection = run.completion_rejection
         decision: FormalPlanDecision | None = None
         predecessor_hash: str | None = None
         if (predecessor is None) != (rejection is None):
@@ -392,11 +394,30 @@ class PlanStageWorker:
             ):
                 raise OwnerConflict("rejection_lineage_invalid")
             predecessor_hash = material_plan_hash(predecessor.outcome)
-        elif (
-            run.attempt_generation != 1
-            and run.technical_predecessor_attempt_ref is None
-        ) or (
-            (run.native_session_ref is None) != (run.primary_draft is None)
+        if completion_rejection is not None:
+            if (
+                run.technical_predecessor_attempt_ref
+                != completion_rejection.attempt_ref
+                or completion_rejection.run_ref != run.run_ref
+                or completion_rejection.root_session_ref != run.root_session_ref
+                or completion_rejection.successor_attempt_ref != run.attempt_ref
+                or completion_rejection.native_session_ref
+                != run.native_session_ref
+            ):
+                raise OwnerConflict("rejection_lineage_invalid")
+        if (
+            predecessor is None
+            and completion_rejection is None
+            and (
+                (
+                    run.attempt_generation != 1
+                    and run.technical_predecessor_attempt_ref is None
+                )
+                or (
+                    (run.native_session_ref is None)
+                    != (run.primary_draft is None)
+                )
+            )
         ):
             raise OwnerConflict("attempt_lineage_invalid")
 
@@ -437,12 +458,30 @@ class PlanStageWorker:
             runtime_binding=run.runtime_binding,
             native_session_ref=run.native_session_ref,
             predecessor_submission_ref=(
-                None if predecessor is None else predecessor.submission_ref
+                completion_rejection.candidate_ref
+                if completion_rejection is not None
+                else (
+                    None if predecessor is None else predecessor.submission_ref
+                )
             ),
             owner_rejection_receipt_ref=(
-                None if rejection is None else rejection.receipt_ref
+                completion_rejection.receipt.receipt_ref
+                if completion_rejection is not None
+                else (None if rejection is None else rejection.receipt_ref)
             ),
-            owner_feedback=() if decision is None else decision.feedback,
+            owner_rejection_kind=(
+                "domain"
+                if decision is not None
+                else ("completion" if completion_rejection is not None else None)
+            ),
+            owner_feedback=(
+                (() if decision is None else decision.feedback)
+                + (
+                    ()
+                    if completion_rejection is None
+                    else completion_rejection.feedback
+                )
+            ),
             job_ref=job_ref,
         )
         if run.primary_draft is None:
@@ -465,6 +504,28 @@ class PlanStageWorker:
                     draft = self._provider.generate_draft(skill_request)
                     draft_hash = validate_plan_skill_draft(skill_request, draft)
                 except PlanSkillUnavailable as error:
+                    if error.rejected_candidate is not None:
+                        if (
+                            error.rejected_native_session_ref is None
+                            or error.rejected_detail_code is None
+                        ):
+                            raise OwnerConflict(
+                                "stage_completion_rejection_invalid"
+                            )
+                        self._reject_completion_candidate(
+                            unit_ref=unit_ref,
+                            run=run,
+                            operation_name="primary",
+                            native_session_ref=error.rejected_native_session_ref,
+                            candidate=error.rejected_candidate,
+                            failure_code=error.code,
+                            detail_code=error.rejected_detail_code,
+                        )
+                        provider_safe = False
+                        self._transient_error = error.code
+                        return _CycleStep(
+                            True, provider_boundary_attempted=True
+                        )
                     if error.code == "codex_operation_reconciliation_pending":
                         provider_safe = False
                     elif error.recovery_checkpoint is not None:
@@ -479,32 +540,27 @@ class PlanStageWorker:
                         )
                     self._transient_error = error.code
                     return _CycleStep(False, provider_boundary_attempted=True)
-                except PlanSkillContractError as error:
+                except RecoverablePlanSkillCandidateError as error:
                     if draft is None:
                         self._transient_error = str(error)
                         return _CycleStep(
                             False, provider_boundary_attempted=True
                         )
                     failure_code = "plan_primary_result_contract_invalid"
-                    try:
-                        terminal = self._record_terminal_contract_failure(
-                            unit_ref=unit_ref,
-                            run=run,
-                            job_ref=job_ref,
-                            operation_name="primary",
-                            native_session_ref=draft.primary_session_ref,
-                            failure_code=failure_code,
-                            detail_code=str(error),
-                        )
-                    except PlanSkillUnavailable as checkpoint_error:
-                        provider_safe = False
-                        self._transient_error = checkpoint_error.code
-                        return _CycleStep(
-                            False, provider_boundary_attempted=True
-                        )
-                    if terminal:
-                        provider_safe = False
+                    self._reject_completion_candidate(
+                        unit_ref=unit_ref,
+                        run=run,
+                        operation_name="primary",
+                        native_session_ref=draft.primary_session_ref,
+                        candidate=asdict(draft),
+                        failure_code=failure_code,
+                        detail_code=str(error),
+                    )
+                    provider_safe = False
                     self._transient_error = failure_code
+                    return _CycleStep(True, provider_boundary_attempted=True)
+                except PlanSkillContractError as error:
+                    self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
                 checkpoint = self._agent_runtime.record_plan_primary_draft(
                     run_ref=run.run_ref,
@@ -560,6 +616,24 @@ class PlanStageWorker:
                     predecessor_material_plan_hash=predecessor_hash,
                 )
             except PlanSkillUnavailable as error:
+                if error.rejected_candidate is not None:
+                    if (
+                        error.rejected_native_session_ref is None
+                        or error.rejected_detail_code is None
+                    ):
+                        raise OwnerConflict("stage_completion_rejection_invalid")
+                    self._reject_completion_candidate(
+                        unit_ref=unit_ref,
+                        run=run,
+                        operation_name="review",
+                        native_session_ref=error.rejected_native_session_ref,
+                        candidate=error.rejected_candidate,
+                        failure_code=error.code,
+                        detail_code=error.rejected_detail_code,
+                    )
+                    provider_safe = False
+                    self._transient_error = error.code
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 if error.code == "codex_operation_reconciliation_pending":
                     provider_safe = False
                 elif error.recovery_checkpoint is not None:
@@ -574,28 +648,25 @@ class PlanStageWorker:
                     )
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
-            except PlanSkillContractError as error:
+            except RecoverablePlanSkillCandidateError as error:
                 if result is None:
                     self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
                 failure_code = "plan_review_result_contract_invalid"
-                try:
-                    terminal = self._record_terminal_contract_failure(
-                        unit_ref=unit_ref,
-                        run=run,
-                        job_ref=job_ref,
-                        operation_name="review",
-                        native_session_ref=result.primary_session_ref,
-                        failure_code=failure_code,
-                        detail_code=str(error),
-                    )
-                except PlanSkillUnavailable as checkpoint_error:
-                    provider_safe = False
-                    self._transient_error = checkpoint_error.code
-                    return _CycleStep(False, provider_boundary_attempted=True)
-                if terminal:
-                    provider_safe = False
+                self._reject_completion_candidate(
+                    unit_ref=unit_ref,
+                    run=run,
+                    operation_name="review",
+                    native_session_ref=result.primary_session_ref,
+                    candidate=asdict(result),
+                    failure_code=failure_code,
+                    detail_code=str(error),
+                )
+                provider_safe = False
                 self._transient_error = failure_code
+                return _CycleStep(True, provider_boundary_attempted=True)
+            except PlanSkillContractError as error:
+                self._transient_error = str(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
             review = review_record(
                 result,
@@ -639,44 +710,31 @@ class PlanStageWorker:
                     fence_ref=run.fence_ref,
                 )
 
-    def _record_terminal_contract_failure(
+    def _reject_completion_candidate(
         self,
         *,
         unit_ref: str,
         run: PlanStageRun,
-        job_ref: str,
         operation_name: str,
         native_session_ref: str,
+        candidate: dict[str, object],
         failure_code: str,
         detail_code: str,
-    ) -> bool:
-        checkpoint_factory = getattr(
-            self._provider,
-            "terminal_contract_failure_checkpoint",
-            None,
-        )
-        if not callable(checkpoint_factory):
-            return False
-        checkpoint = checkpoint_factory(
-            job_ref=job_ref,
-            operation_name=operation_name,
-            native_session_ref=native_session_ref,
-            failure_code=failure_code,
-            detail_code=detail_code,
-        )
-        if not isinstance(checkpoint, dict):
-            raise PlanSkillUnavailable(
-                "codex_contract_failure_checkpoint_invalid"
-            )
-        self._agent_runtime.record_stage_provider_hard_ceiling(
+    ) -> None:
+        self._agent_runtime.reject_stage_completion_candidate(
             unit_ref=unit_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
-            failure_code=failure_code,
-            provider_exit=checkpoint,
+            native_session_ref=native_session_ref,
+            candidate={"phase": operation_name, "result": candidate},
+            reason_code=failure_code,
+            detail_code=detail_code,
+            feedback=(
+                "Return a corrected structured completion that satisfies "
+                f"{detail_code}, then resubmit it in this Root Session.",
+            ),
         )
-        return True
 
     def _qualify(self, current: _CurrentCycle) -> _Qualification:
         successor = self._advancement_engine.query_reasoning_successor_context(

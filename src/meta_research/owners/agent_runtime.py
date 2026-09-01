@@ -304,6 +304,23 @@ _TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS = (
 TARGET_RUN_ADMISSION_RECEIPT_KIND = "target_run_admission"
 TARGET_LAUNCH_ADMISSION_RECEIPT_KIND = "target_launch_admission"
 RUN_COMPLETION_RECEIPT_KIND = "run_execution_completed"
+ROOT_COMPLETION_REJECTED_RECEIPT_KIND = "root_completion_rejected"
+ROOT_COMPLETION_REJECTION_SCHEMA = "meta-research/root-completion-rejection/v1"
+_NON_CANDIDATE_COMPLETION_DETAILS = frozenset(
+    {
+        "submission_revision_invalid",
+        "context_pack_hash_mismatch",
+        "reasoning_context_pack_hash_mismatch",
+        "native_session_not_provider_owned",
+        "root_native_session_changed",
+        "reasoning_skill_session_invalid",
+        "bundle_skill_session_invalid",
+        "owner_feedback_lineage_incomplete",
+        "owner_feedback_missing",
+        "owner_feedback_invalid",
+        "owner_feedback_without_rejection",
+    }
+)
 DEEPFETCH_EXECUTION_RECEIPT_KIND = "deepfetch_execution_completed"
 EXPERIMENT_EXECUTION_RECEIPT_KIND = "experiment_execution_completed"
 _BUNDLE_TARGET_EXECUTION_REQUEST_PREFIX = "bundle-target-"
@@ -714,6 +731,59 @@ class RunCompletion:
 
 
 @dataclass(frozen=True)
+class RootCompletionRejection:
+    rejection_ref: str
+    candidate_ref: str
+    request_ref: str
+    run_ref: str
+    stage: str
+    attempt_ref: str
+    fence_ref: str
+    successor_attempt_ref: str
+    root_session_ref: str
+    native_session_ref: str
+    provider_invocation_ref: str
+    provider_operation_ref: str
+    candidate: dict[str, object]
+    candidate_hash: str
+    reason_code: str
+    detail_code: str
+    feedback: tuple[str, ...]
+    known_facts: dict[str, object]
+    receipt: AcceptanceReceipt
+    rejected_at: float
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "schema_ref": ROOT_COMPLETION_REJECTION_SCHEMA,
+            "status": "rejected",
+            "attempt_disposition": "completion_rejected_replaced",
+            "rejection_ref": self.rejection_ref,
+            "candidate_ref": self.candidate_ref,
+            "request_ref": self.request_ref,
+            "run_ref": self.run_ref,
+            "stage": self.stage,
+            "attempt_ref": self.attempt_ref,
+            "fence_ref": self.fence_ref,
+            "successor_attempt_ref": self.successor_attempt_ref,
+            "root_session_ref": self.root_session_ref,
+            "native_session_ref": self.native_session_ref,
+            "provider_completion": {
+                "invocation_ref": self.provider_invocation_ref,
+                "operation_ref": self.provider_operation_ref,
+                "status": "completed",
+                "response_hash": self.candidate_hash,
+            },
+            "candidate": self.candidate,
+            "candidate_hash": self.candidate_hash,
+            "reason": {"code": self.reason_code, "detail": self.detail_code},
+            "feedback": list(self.feedback),
+            "known_facts": self.known_facts,
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class IdeaStageRun:
     request_ref: str
     run_ref: str
@@ -739,6 +809,7 @@ class IdeaStageRun:
     execution: AttemptExecution | None
     predecessor_execution: AttemptExecution | None
     technical_predecessor_attempt_ref: str | None
+    completion_rejection: RootCompletionRejection | None
     rejection_receipt: AcceptanceReceipt | None
     completion: RunCompletion | None
     failure_code: str | None
@@ -1092,6 +1163,24 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         failure_code: str,
         provider_exit: dict[str, object],
     ) -> None: ...
+
+    def reject_stage_completion_candidate(
+        self,
+        *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        candidate: dict[str, object],
+        reason_code: str,
+        detail_code: str,
+        feedback: tuple[str, ...],
+    ) -> RootCompletionRejection: ...
+
+    def query_stage_completion_rejection(
+        self, attempt_ref: str
+    ) -> RootCompletionRejection | None: ...
 
     def reconcile_pending_provider_cleanup(
         self,
@@ -8791,8 +8880,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         """Fence physical ceilings; route completed contract drift to correction."""
 
         recoverable_terminal = isinstance(provider_exit, dict) and (
-            provider_exit.get("schema_ref")
-            == "meta-research/provider-terminal-contract-failure/v1"
+            (
+                provider_exit.get("schema_ref")
+                == "meta-research/provider-terminal-contract-failure/v1"
+                and provider_exit.get("contract_failure_detail_code")
+                not in {
+                    "codex_native_session_missing",
+                    "codex_native_session_mismatch",
+                }
+            )
             or (
                 provider_exit.get("schema_ref")
                 == "meta-research/provider-hard-ceiling/v1"
@@ -9006,6 +9102,584 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         except RuntimeProtectionUnavailable as error:
             raise OwnerConflict(error.code) from error
+
+    def reject_stage_completion_candidate(
+        self,
+        *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        candidate: dict[str, object],
+        reason_code: str,
+        detail_code: str,
+        feedback: tuple[str, ...],
+    ) -> RootCompletionRejection:
+        """Append one semantic rejection and install its same-Session successor."""
+
+        if (
+            not unit_ref
+            or len(unit_ref) > 96
+            or not native_session_ref
+            or len(native_session_ref) > 256
+            or type(candidate) is not dict
+            or not candidate
+            or not reason_code
+            or len(reason_code) > 96
+            or not detail_code
+            or len(detail_code) > 128
+            or not isinstance(feedback, tuple)
+            or not feedback
+            or len(feedback) > 32
+            or any(
+                not isinstance(item, str)
+                or not item.strip()
+                or len(item) > 4096
+                for item in feedback
+            )
+        ):
+            raise OwnerConflict("stage_completion_rejection_invalid")
+        candidate_json = canonical_json(candidate)
+        candidate_hash = canonical_hash(candidate)
+        feedback_value = list(feedback)
+        feedback_json = canonical_json(feedback_value)
+        feedback_hash = canonical_hash(feedback_value)
+        now = time.time()
+        effect: RuntimeEffectIdentity | None = None
+        rejected_attempt_ref: str | None = None
+        with self._database.write() as connection:
+            control = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
+                    ":attempt_ref AND run_ref = :run_ref"
+                ),
+                {"attempt_ref": attempt_ref, "run_ref": run_ref},
+            ).first()
+            fence = connection.execute(
+                text(
+                    "SELECT * FROM ar_execution_fences WHERE fence_ref = "
+                    ":fence_ref AND attempt_ref = :attempt_ref"
+                ),
+                {"fence_ref": fence_ref, "attempt_ref": attempt_ref},
+            ).first()
+            unit = connection.execute(
+                text("SELECT * FROM ar_provider_units WHERE unit_ref = :unit_ref"),
+                {"unit_ref": unit_ref},
+            ).first()
+            session = (
+                None
+                if run is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_stage_sessions WHERE session_ref = "
+                        ":session_ref AND run_ref = :run_ref"
+                    ),
+                    {"session_ref": run.root_session_ref, "run_ref": run_ref},
+                ).first()
+            )
+            if (
+                control is None
+                or run is None
+                or attempt is None
+                or fence is None
+                or unit is None
+                or session is None
+                or run.stage not in FORMAL_STAGES
+                or control.run_kind != f"{run.stage}_stage"
+                or control.status != "running"
+                or control.attempt_ref != attempt_ref
+                or control.fence_ref != fence_ref
+                or run.current_attempt_ref != attempt_ref
+                or run.current_fence_ref != fence_ref
+                or run.status != "running"
+                or attempt.status != "running"
+                or attempt.fence_ref != fence_ref
+                or attempt.root_session_ref != session.session_ref
+                or fence.status != "current"
+                or unit.run_ref != run_ref
+                or unit.attempt_ref != attempt_ref
+                or unit.fence_ref != fence_ref
+                or unit.status != "active"
+                or _PROVIDER_UNIT_RUN_KINDS.get(unit.unit_kind)
+                != control.run_kind
+            ):
+                raise OwnerConflict("stage_completion_rejection_stale")
+            phase = str(unit.unit_kind).removeprefix(f"{run.stage}_")
+            if phase not in {"primary", "review"}:
+                raise OwnerConflict("stage_completion_rejection_invalid")
+            if reason_code != f"{run.stage}_{phase}_result_contract_invalid":
+                raise OwnerConflict("stage_completion_rejection_reason_invalid")
+            if detail_code in _NON_CANDIDATE_COMPLETION_DETAILS or detail_code.endswith(
+                ("_skill_request_invalid", "_request_binding_mismatch")
+            ):
+                raise OwnerConflict("stage_completion_rejection_detail_invalid")
+            invocation = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_provider_invocations WHERE "
+                    "invocation_ref = :invocation_ref AND run_ref = :run_ref AND "
+                    "attempt_ref = :attempt_ref AND fence_ref = :fence_ref"
+                ),
+                {
+                    "invocation_ref": unit_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                },
+            ).first()
+            if (
+                invocation is None
+                or invocation.phase != phase
+                or invocation.operation_ref != unit.operation_ref
+                or invocation.status != "prepared"
+                or invocation.response_hash is not None
+            ):
+                raise OwnerConflict("stage_completion_rejection_stale")
+
+            preserved_native_session_ref = session.native_session_ref
+            if native_session_ref == session.session_ref:
+                raise OwnerConflict(
+                    "stage_completion_rejection_native_session_invalid"
+                )
+            if preserved_native_session_ref is None:
+                conflicting_session = connection.execute(
+                    text(
+                        "SELECT session_ref FROM ar_stage_sessions WHERE "
+                        "native_session_ref = :native_session_ref AND session_ref "
+                        "!= :session_ref LIMIT 1"
+                    ),
+                    {
+                        "native_session_ref": native_session_ref,
+                        "session_ref": session.session_ref,
+                    },
+                ).first()
+                if conflicting_session is not None:
+                    raise OwnerConflict("native_session_conflict")
+                try:
+                    connection.execute(
+                        text(
+                            "UPDATE ar_stage_sessions SET native_session_ref = "
+                            ":native_session_ref, updated_at = :now WHERE "
+                            "session_ref = :session_ref"
+                        ),
+                        {
+                            "native_session_ref": native_session_ref,
+                            "now": now,
+                            "session_ref": session.session_ref,
+                        },
+                    )
+                except IntegrityError as error:
+                    raise OwnerConflict("native_session_conflict") from error
+                preserved_native_session_ref = native_session_ref
+            elif preserved_native_session_ref != native_session_ref:
+                raise OwnerConflict(
+                    "stage_completion_rejection_native_session_invalid"
+                )
+
+            candidate_ref = "root_completion_candidate_" + canonical_hash(
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "candidate_hash": candidate_hash,
+                }
+            )[:32]
+            known_facts = {
+                "request_ref": run.request_ref,
+                "context_pack_ref": run.context_pack_ref,
+                "context_pack_hash": run.context_pack_hash,
+                "runtime_binding_hash": run.runtime_binding_hash,
+                "attempt_generation": int(attempt.generation),
+                "phase": phase,
+                "primary_draft_hash": attempt.primary_draft_hash,
+                "candidate_native_session_ref": native_session_ref,
+            }
+            known_facts_json = canonical_json(known_facts)
+            known_facts_hash = canonical_hash(known_facts)
+            payload = {
+                "schema_ref": ROOT_COMPLETION_REJECTION_SCHEMA,
+                "candidate_ref": candidate_ref,
+                "request_ref": run.request_ref,
+                "run_ref": run_ref,
+                "stage": run.stage,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+                "root_session_ref": session.session_ref,
+                "native_session_ref": preserved_native_session_ref,
+                "provider_invocation_ref": invocation.invocation_ref,
+                "provider_operation_ref": invocation.operation_ref,
+                "candidate_hash": candidate_hash,
+                "reason_code": reason_code,
+                "detail_code": detail_code,
+                "feedback": feedback_value,
+                "known_facts": known_facts,
+            }
+            payload_json = canonical_json(payload)
+            payload_hash = canonical_hash(payload)
+            rejection_ref = new_ref("root_completion_rejection")
+            receipt_ref = new_ref("ar_root_completion_rejection_receipt")
+            receipt_bindings = {
+                "rejection_ref": rejection_ref,
+                "request_ref": run.request_ref,
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+                "candidate_ref": candidate_ref,
+                "candidate_hash": candidate_hash,
+                "reason_code": reason_code,
+                "detail_code": detail_code,
+                "feedback_hash": feedback_hash,
+                "known_facts_hash": known_facts_hash,
+                "payload_hash": payload_hash,
+            }
+            receipt_hash = _owner_receipt_hash(
+                ROOT_COMPLETION_REJECTED_RECEIPT_KIND,
+                candidate_ref,
+                receipt_bindings,
+            )
+            effect = _provider_runtime_effect(
+                unit_ref=str(unit.unit_ref),
+                operation_ref=str(unit.operation_ref),
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                claim_started_at=float(unit.started_at),
+            )
+            _complete_provider_invocation(
+                connection,
+                run,
+                attempt,
+                fence,
+                phase=phase,
+                response_hash=candidate_hash,
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_execution_fences SET status = 'rejected', "
+                    "closed_at = :now WHERE fence_ref = :fence_ref AND status = "
+                    "'current'"
+                ),
+                {"now": now, "fence_ref": fence_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_provider_units SET status = 'completed', "
+                    "completed_at = :now WHERE unit_ref = :unit_ref AND status = "
+                    "'active'"
+                ),
+                {"now": now, "unit_ref": unit_ref},
+            )
+            try:
+                record_runtime_boundary(
+                    connection,
+                    identity=effect,
+                    boundary="terminal",
+                    checkpoint_ref=None,
+                    owner_evidence_ref=rejection_ref,
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
+            replacement = self._replace_fenced_managed_attempt(
+                connection,
+                control,
+                now,
+                reuse_checkpoint=phase == "review",
+                reuse_operation_refs=False,
+                preserve_native_session=True,
+                replacement_reason_code="root_completion_rejected",
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO ar_stage_completion_rejections "
+                    "(rejection_ref, request_ref, run_ref, stage, attempt_ref, "
+                    "fence_ref, root_session_ref, provider_invocation_ref, "
+                    "provider_operation_ref, candidate_ref, candidate_json, "
+                    "candidate_hash, reason_code, detail_code, feedback_json, "
+                    "feedback_hash, known_facts_json, known_facts_hash, "
+                    "payload_json, payload_hash, receipt_ref, receipt_hash, "
+                    "rejected_at) VALUES (:rejection_ref, :request_ref, "
+                    ":run_ref, :stage, :attempt_ref, :fence_ref, "
+                    ":root_session_ref, :provider_invocation_ref, "
+                    ":provider_operation_ref, :candidate_ref, :candidate_json, "
+                    ":candidate_hash, :reason_code, :detail_code, "
+                    ":feedback_json, :feedback_hash, :known_facts_json, "
+                    ":known_facts_hash, :payload_json, :payload_hash, "
+                    ":receipt_ref, :receipt_hash, :rejected_at)"
+                ),
+                {
+                    "rejection_ref": rejection_ref,
+                    "request_ref": run.request_ref,
+                    "run_ref": run_ref,
+                    "stage": run.stage,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "root_session_ref": session.session_ref,
+                    "provider_invocation_ref": invocation.invocation_ref,
+                    "provider_operation_ref": invocation.operation_ref,
+                    "candidate_ref": candidate_ref,
+                    "candidate_json": candidate_json,
+                    "candidate_hash": candidate_hash,
+                    "reason_code": reason_code,
+                    "detail_code": detail_code,
+                    "feedback_json": feedback_json,
+                    "feedback_hash": feedback_hash,
+                    "known_facts_json": known_facts_json,
+                    "known_facts_hash": known_facts_hash,
+                    "payload_json": payload_json,
+                    "payload_hash": payload_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "rejected_at": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_run_controls SET status = 'running', attempt_ref = "
+                    ":attempt_ref, fence_ref = :fence_ref, control_revision = "
+                    "control_revision + 1, terminal_reason = NULL, "
+                    "cleanup_status = 'none', updated_at = :now WHERE run_ref = "
+                    ":run_ref"
+                ),
+                {
+                    "attempt_ref": replacement.attempt_ref,
+                    "fence_ref": replacement.fence_ref,
+                    "now": now,
+                    "run_ref": run_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.root_completion_rejected",
+                {
+                    "rejection_ref": rejection_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "successor_attempt_ref": replacement.attempt_ref,
+                    "candidate_ref": candidate_ref,
+                    "reason": {"code": reason_code, "detail": detail_code},
+                    "receipt_ref": receipt_ref,
+                },
+            )
+            rejected_attempt_ref = attempt_ref
+        assert effect is not None and rejected_attempt_ref is not None
+        if self._runtime_protection is None:
+            raise OwnerConflict("runtime_protection_unavailable")
+        try:
+            self._runtime_protection.finish(
+                effect.responsibility_ref,
+                boundary="terminal",
+            )
+        except RuntimeProtectionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+        rejected = self.query_stage_completion_rejection(rejected_attempt_ref)
+        if rejected is None:
+            raise OwnerConflict("stage_completion_rejection_missing_after_commit")
+        return rejected
+
+    def query_stage_completion_rejection(
+        self, attempt_ref: str
+    ) -> RootCompletionRejection | None:
+        if not attempt_ref or len(attempt_ref) > 96:
+            raise OwnerConflict("stage_completion_rejection_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_completion_rejections WHERE "
+                    "attempt_ref = :attempt_ref"
+                ),
+                {"attempt_ref": attempt_ref},
+            ).first()
+            if row is None:
+                return None
+            run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": row.run_ref},
+            ).first()
+            rejected_attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {"attempt_ref": row.attempt_ref},
+            ).first()
+            rejected_fence = connection.execute(
+                text(
+                    "SELECT * FROM ar_execution_fences WHERE fence_ref = "
+                    ":fence_ref"
+                ),
+                {"fence_ref": row.fence_ref},
+            ).first()
+            session = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_sessions WHERE session_ref = "
+                    ":session_ref"
+                ),
+                {"session_ref": row.root_session_ref},
+            ).first()
+            invocation = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_provider_invocations WHERE "
+                    "invocation_ref = :invocation_ref"
+                ),
+                {"invocation_ref": row.provider_invocation_ref},
+            ).first()
+            replacement = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_attempt_replacements WHERE "
+                    "retired_attempt_ref = :attempt_ref"
+                ),
+                {"attempt_ref": row.attempt_ref},
+            ).first()
+            successor = (
+                None
+                if replacement is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
+                        ":attempt_ref"
+                    ),
+                    {"attempt_ref": replacement.replacement_attempt_ref},
+                ).first()
+            )
+        try:
+            candidate = decoded_object(row.candidate_json)
+            known_facts = decoded_object(row.known_facts_json)
+            payload = decoded_object(row.payload_json)
+            feedback_value = json.loads(row.feedback_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OwnerConflict("stage_completion_rejection_integrity_invalid") from error
+        if (
+            run is None
+            or rejected_attempt is None
+            or rejected_fence is None
+            or session is None
+            or invocation is None
+            or replacement is None
+            or successor is None
+            or row.stage not in FORMAL_STAGES
+            or run.stage != row.stage
+            or run.request_ref != row.request_ref
+            or rejected_attempt.run_ref != row.run_ref
+            or rejected_attempt.root_session_ref != row.root_session_ref
+            or rejected_attempt.fence_ref != row.fence_ref
+            or rejected_attempt.status != "running"
+            or rejected_attempt.submission_ref is not None
+            or rejected_attempt.payload_json is not None
+            or rejected_attempt.execution_receipt_ref is not None
+            or rejected_fence.attempt_ref != row.attempt_ref
+            or rejected_fence.status != "rejected"
+            or session.run_ref != row.run_ref
+            or replacement.run_ref != row.run_ref
+            or replacement.reason_code != "root_completion_rejected"
+            or successor.run_ref != row.run_ref
+            or successor.root_session_ref != row.root_session_ref
+            or successor.predecessor_attempt_ref is not None
+            or int(successor.generation) != int(rejected_attempt.generation) + 1
+            or invocation.run_ref != row.run_ref
+            or invocation.attempt_ref != row.attempt_ref
+            or invocation.fence_ref != row.fence_ref
+            or invocation.operation_ref != row.provider_operation_ref
+            or invocation.status != "completed"
+            or invocation.response_hash != row.candidate_hash
+            or not isinstance(feedback_value, list)
+            or not feedback_value
+            or any(not isinstance(item, str) or not item for item in feedback_value)
+            or canonical_json(candidate) != row.candidate_json
+            or canonical_hash(candidate) != row.candidate_hash
+            or canonical_json(known_facts) != row.known_facts_json
+            or canonical_hash(known_facts) != row.known_facts_hash
+            or canonical_json(feedback_value) != row.feedback_json
+            or canonical_hash(feedback_value) != row.feedback_hash
+            or canonical_json(payload) != row.payload_json
+            or canonical_hash(payload) != row.payload_hash
+        ):
+            raise OwnerConflict("stage_completion_rejection_integrity_invalid")
+        native_session_ref = payload.get("native_session_ref")
+        expected_payload = {
+            "schema_ref": ROOT_COMPLETION_REJECTION_SCHEMA,
+            "candidate_ref": row.candidate_ref,
+            "request_ref": row.request_ref,
+            "run_ref": row.run_ref,
+            "stage": row.stage,
+            "attempt_ref": row.attempt_ref,
+            "fence_ref": row.fence_ref,
+            "root_session_ref": row.root_session_ref,
+            "native_session_ref": native_session_ref,
+            "provider_invocation_ref": row.provider_invocation_ref,
+            "provider_operation_ref": row.provider_operation_ref,
+            "candidate_hash": row.candidate_hash,
+            "reason_code": row.reason_code,
+            "detail_code": row.detail_code,
+            "feedback": feedback_value,
+            "known_facts": known_facts,
+        }
+        receipt_bindings = {
+            "rejection_ref": row.rejection_ref,
+            "request_ref": row.request_ref,
+            "run_ref": row.run_ref,
+            "attempt_ref": row.attempt_ref,
+            "fence_ref": row.fence_ref,
+            "candidate_ref": row.candidate_ref,
+            "candidate_hash": row.candidate_hash,
+            "reason_code": row.reason_code,
+            "detail_code": row.detail_code,
+            "feedback_hash": row.feedback_hash,
+            "known_facts_hash": row.known_facts_hash,
+            "payload_hash": row.payload_hash,
+        }
+        if (
+            payload != expected_payload
+            or not isinstance(native_session_ref, str)
+            or not native_session_ref
+            or row.receipt_hash
+            != _owner_receipt_hash(
+                ROOT_COMPLETION_REJECTED_RECEIPT_KIND,
+                row.candidate_ref,
+                receipt_bindings,
+            )
+        ):
+            raise OwnerConflict("stage_completion_rejection_integrity_invalid")
+        return RootCompletionRejection(
+            rejection_ref=row.rejection_ref,
+            candidate_ref=row.candidate_ref,
+            request_ref=row.request_ref,
+            run_ref=row.run_ref,
+            stage=row.stage,
+            attempt_ref=row.attempt_ref,
+            fence_ref=row.fence_ref,
+            successor_attempt_ref=successor.attempt_ref,
+            root_session_ref=row.root_session_ref,
+            native_session_ref=native_session_ref,
+            provider_invocation_ref=row.provider_invocation_ref,
+            provider_operation_ref=row.provider_operation_ref,
+            candidate=candidate,
+            candidate_hash=row.candidate_hash,
+            reason_code=row.reason_code,
+            detail_code=row.detail_code,
+            feedback=tuple(feedback_value),
+            known_facts=known_facts,
+            receipt=AcceptanceReceipt(
+                issuer=AR_OWNER,
+                kind=ROOT_COMPLETION_REJECTED_RECEIPT_KIND,
+                receipt_ref=row.receipt_ref,
+                subject_ref=row.candidate_ref,
+                payload_hash=row.receipt_hash,
+            ),
+            rejected_at=float(row.rejected_at),
+        )
 
     def _record_stage_provider_correction(
         self,
@@ -10740,14 +11414,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         generation = int(old_attempt.generation) + 1
         attempt_ref = new_ref(f"{run.stage}_attempt")
         fence_ref = new_ref(f"{run.stage}_fence")
+        # The immediate B -> C relation is already recorded by the technical
+        # replacement row.  Reusing B's unique domain predecessor pointer would
+        # incorrectly create a second semantic successor of A.
+        inherited_predecessor_attempt_ref = None
         connection.execute(
             text(
                 "INSERT INTO ar_stage_attempts (attempt_ref, run_ref, generation, "
                 "root_session_ref, fence_ref, predecessor_attempt_ref, status, "
                 "primary_draft_json, primary_draft_hash, primary_adapter_kind, "
                 "primary_recorded_at, created_at) VALUES (:attempt_ref, :run_ref, "
-                ":generation, :session_ref, :fence_ref, NULL, 'running', "
-                ":primary_draft_json, :primary_draft_hash, :primary_adapter_kind, "
+                ":generation, :session_ref, :fence_ref, "
+                ":predecessor_attempt_ref, 'running', :primary_draft_json, "
+                ":primary_draft_hash, :primary_adapter_kind, "
                 ":primary_recorded_at, :now)"
             ),
             {
@@ -10756,6 +11435,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 "generation": generation,
                 "session_ref": run.root_session_ref,
                 "fence_ref": fence_ref,
+                "predecessor_attempt_ref": inherited_predecessor_attempt_ref,
                 "primary_draft_json": (
                     old_attempt.primary_draft_json if reuse_checkpoint else None
                 ),
@@ -10796,7 +11476,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             context_pack_ref=run.context_pack_ref,
             context_pack_hash=run.context_pack_hash,
             runtime_binding_hash=run.runtime_binding_hash,
-            predecessor_attempt_ref=None,
+            predecessor_attempt_ref=inherited_predecessor_attempt_ref,
             prepared_at=now,
             stage=run.stage,
             operation_refs=operation_refs,
@@ -17153,18 +17833,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "attempt_ref": run.current_attempt_ref,
                 },
             ).first()
-            predecessor = None
-            if attempt is not None and attempt.predecessor_attempt_ref is not None:
-                predecessor = connection.execute(
-                    text(
-                        "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
-                        ":attempt_ref AND run_ref = :run_ref"
-                    ),
-                    {
-                        "attempt_ref": attempt.predecessor_attempt_ref,
-                        "run_ref": run.run_ref,
-                    },
-                ).first()
             technical_replacement = (
                 None
                 if attempt is None
@@ -17177,10 +17845,42 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     {"attempt_ref": attempt.attempt_ref, "run_ref": run.run_ref},
                 ).first()
             )
+            predecessor = (
+                None
+                if attempt is None
+                else _domain_predecessor_with_completion_lineage(
+                    connection,
+                    run.run_ref,
+                    attempt,
+                )
+            )
+        completion_rejection = (
+            None
+            if technical_replacement is None
+            else self.query_stage_completion_rejection(
+                str(technical_replacement.retired_attempt_ref)
+            )
+        )
+        if technical_replacement is not None and (
+            (
+                technical_replacement.reason_code == "root_completion_rejected"
+                and completion_rejection is None
+            )
+            or (
+                technical_replacement.reason_code != "root_completion_rejected"
+                and completion_rejection is not None
+            )
+        ):
+            raise OwnerConflict("stage_completion_rejection_integrity_invalid")
         if (
             session is None
             or attempt is None
             or fence is None
+            or (
+                attempt.predecessor_attempt_ref is None
+                and int(attempt.generation) != 1
+                and technical_replacement is None
+            )
             or (
                 attempt.root_session_ref != session.session_ref
                 or attempt.fence_ref != fence.fence_ref
@@ -17191,6 +17891,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         with self._database.read() as connection:
             primary_invocation, review_invocation = _provider_invocations(
                 connection, run, attempt, fence
+            )
+            autonomous_checkpoint = (
+                _reasoning_autonomous_checkpoint_with_completion_lineage(
+                    connection,
+                    run,
+                    attempt,
+                    session,
+                )
+                if expected_stage == "reasoning"
+                else _reasoning_autonomous_checkpoint(run, attempt, session)
             )
             exhaustion_review = (
                 connection.execute(
@@ -17226,7 +17936,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         execution = None
         if attempt.submission_ref is not None:
-            execution = _attempt_execution(run, attempt, session)
+            execution = _attempt_execution(
+                run,
+                _attempt_with_domain_predecessor(attempt, predecessor),
+                session,
+            )
             self._receipt_verifier.verify_attempt_execution_receipt(
                 request_ref=run.request_ref,
                 run_ref=run.run_ref,
@@ -17251,9 +17965,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         ):
             raise OwnerConflict("idea_provider_invocation_invalid")
-        autonomous_checkpoint = _reasoning_autonomous_checkpoint(
-            run, attempt, session
-        )
         if expected_stage != "reasoning" and autonomous_checkpoint is not None:
             raise OwnerConflict("stage_run_integrity_invalid")
         if execution is None:
@@ -17311,7 +18022,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 predecessor.status != "rejected"
                 or predecessor.run_ref != run.run_ref
                 or predecessor.root_session_ref != session.session_ref
-                or int(attempt.generation) != int(predecessor.generation) + 1
                 or predecessor.decision_receipt_ref is None
                 or predecessor.decision_receipt_subject_ref is None
                 or predecessor.decision_receipt_hash is None
@@ -17377,6 +18087,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 if technical_replacement is None
                 else technical_replacement.retired_attempt_ref
             ),
+            completion_rejection=completion_rejection,
             rejection_receipt=rejection_receipt,
             completion=completion,
             failure_code=(
@@ -18126,6 +18837,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if (
                 primary_draft.native_session_ref != native_session_ref
                 or not _stage_reviewed_draft_matches(
+                    connection,
                     preview_run,
                     preview_attempt,
                     preview_session,
@@ -18213,6 +18925,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if (
                 current_primary_draft.native_session_ref != native_session_ref
                 or not _stage_reviewed_draft_matches(
+                    connection,
                     run,
                     attempt,
                     session,
@@ -18894,7 +19607,32 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 return None
             if row.stage != expected_stage:
                 return None
-            executed = _attempt_execution(row, row, row)
+            if row.predecessor_attempt_ref is None and int(row.generation) != 1:
+                replacement = connection.execute(
+                    text(
+                        "SELECT retired_attempt_ref FROM "
+                        "ar_stage_attempt_replacements WHERE "
+                        "replacement_attempt_ref = :attempt_ref AND run_ref = "
+                        ":run_ref"
+                    ),
+                    {"attempt_ref": row.attempt_ref, "run_ref": row.run_ref},
+                ).first()
+                if replacement is None:
+                    raise OwnerConflict("attempt_successor_lineage_invalid")
+            domain_predecessor = _domain_predecessor_with_completion_lineage(
+                connection,
+                row.run_ref,
+                row,
+            )
+            execution_row = _attempt_with_domain_predecessor(
+                row,
+                domain_predecessor,
+            )
+            executed = _attempt_execution(
+                execution_row,
+                execution_row,
+                execution_row,
+            )
             _verify_provider_execution_chain(connection, row, executed)
         self._receipt_verifier.verify_attempt_execution_receipt(
             request_ref=row.request_ref,
@@ -22049,7 +22787,22 @@ class SQLiteAgentRuntimeReceiptVerifier:
                 {"receipt_ref": receipt.receipt_ref},
             ).first()
             if row is not None:
-                executed = _attempt_execution(row, row, row)
+                domain_predecessor = (
+                    _domain_predecessor_with_completion_lineage(
+                        connection,
+                        row.run_ref,
+                        row,
+                    )
+                )
+                execution_row = _attempt_with_domain_predecessor(
+                    row,
+                    domain_predecessor,
+                )
+                executed = _attempt_execution(
+                    execution_row,
+                    execution_row,
+                    execution_row,
+                )
                 _verify_provider_execution_chain(connection, row, executed)
         if row is None or (
             row.request_ref != request_ref
@@ -23875,10 +24628,7 @@ def _verify_execution_row(
     )
     lineage_invalid = (
         row.predecessor_attempt_ref is None
-        and (
-            int(row.generation) != 1
-            or any(value is not None for value in predecessor_values)
-        )
+        and any(value is not None for value in predecessor_values)
     ) or (
         row.predecessor_attempt_ref is not None
         and (
@@ -24127,6 +24877,68 @@ def _validate_reasoning_autonomous_checkpoint_material(
     )
 
 
+def _reasoning_autonomous_checkpoint_with_completion_lineage(
+    connection,
+    run,
+    attempt,
+    session,
+) -> ReasoningAutonomousCheckpoint | None:
+    cursor = attempt
+    seen: set[str] = set()
+    for _generation in range(int(attempt.generation)):
+        if cursor.attempt_ref in seen:
+            raise OwnerConflict(
+                "reasoning_autonomous_checkpoint_integrity_invalid"
+            )
+        seen.add(cursor.attempt_ref)
+        checkpoint = _reasoning_autonomous_checkpoint(run, cursor, session)
+        if checkpoint is not None:
+            return checkpoint
+        replacement = connection.execute(
+            text(
+                "SELECT * FROM ar_stage_attempt_replacements WHERE "
+                "replacement_attempt_ref = :attempt_ref AND run_ref = :run_ref"
+            ),
+            {"attempt_ref": cursor.attempt_ref, "run_ref": run.run_ref},
+        ).first()
+        if replacement is None or replacement.reason_code != (
+            "root_completion_rejected"
+        ):
+            return None
+        predecessor = connection.execute(
+            text(
+                "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
+                ":attempt_ref AND run_ref = :run_ref"
+            ),
+            {
+                "attempt_ref": replacement.retired_attempt_ref,
+                "run_ref": run.run_ref,
+            },
+        ).first()
+        rejection = connection.execute(
+            text(
+                "SELECT attempt_ref FROM ar_stage_completion_rejections WHERE "
+                "attempt_ref = :attempt_ref AND run_ref = :run_ref"
+            ),
+            {
+                "attempt_ref": replacement.retired_attempt_ref,
+                "run_ref": run.run_ref,
+            },
+        ).first()
+        if (
+            predecessor is None
+            or rejection is None
+            or cursor.root_session_ref != session.session_ref
+            or predecessor.root_session_ref != session.session_ref
+            or int(cursor.generation) != int(predecessor.generation) + 1
+        ):
+            raise OwnerConflict(
+                "reasoning_autonomous_checkpoint_integrity_invalid"
+            )
+        cursor = predecessor
+    raise OwnerConflict("reasoning_autonomous_checkpoint_integrity_invalid")
+
+
 def _reasoning_autonomous_checkpoint(
     run, attempt, session
 ) -> ReasoningAutonomousCheckpoint | None:
@@ -24262,6 +25074,7 @@ def _primary_draft(run, attempt, session) -> IdeaPrimaryDraft | None:
 
 
 def _stage_reviewed_draft_matches(
+    connection,
     run,
     attempt,
     session,
@@ -24281,7 +25094,12 @@ def _stage_reviewed_draft_matches(
         return True
     if run.stage != "reasoning":
         return False
-    checkpoint = _reasoning_autonomous_checkpoint(run, attempt, session)
+    checkpoint = _reasoning_autonomous_checkpoint_with_completion_lineage(
+        connection,
+        run,
+        attempt,
+        session,
+    )
     return bool(
         checkpoint is not None
         and checkpoint.primary_draft_hash == primary_draft.draft_hash
@@ -24652,6 +25470,97 @@ class _ExecutionRow:
             setattr(self, name, getattr(run, name))
 
 
+def _domain_predecessor_with_completion_lineage(
+    connection,
+    run_ref: str,
+    attempt,
+):
+    """Resolve A through A -> B(domain) -> C...(completion replacements)."""
+
+    current = attempt
+    visited: set[str] = set()
+    while current.predecessor_attempt_ref is None:
+        if int(current.generation) == 1:
+            return None
+        if current.attempt_ref in visited:
+            raise OwnerConflict("attempt_successor_lineage_invalid")
+        visited.add(current.attempt_ref)
+        replacement = connection.execute(
+            text(
+                "SELECT * FROM ar_stage_attempt_replacements WHERE "
+                "replacement_attempt_ref = :attempt_ref AND run_ref = :run_ref"
+            ),
+            {"attempt_ref": current.attempt_ref, "run_ref": run_ref},
+        ).first()
+        if replacement is None or replacement.reason_code != (
+            "root_completion_rejected"
+        ):
+            return None
+        retired = connection.execute(
+            text(
+                "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
+                ":attempt_ref AND run_ref = :run_ref"
+            ),
+            {
+                "attempt_ref": replacement.retired_attempt_ref,
+                "run_ref": run_ref,
+            },
+        ).first()
+        rejection = connection.execute(
+            text(
+                "SELECT rejection_ref FROM ar_stage_completion_rejections WHERE "
+                "attempt_ref = :attempt_ref AND run_ref = :run_ref"
+            ),
+            {
+                "attempt_ref": replacement.retired_attempt_ref,
+                "run_ref": run_ref,
+            },
+        ).first()
+        if (
+            retired is None
+            or rejection is None
+            or retired.root_session_ref != attempt.root_session_ref
+            or int(current.generation) != int(retired.generation) + 1
+        ):
+            raise OwnerConflict("attempt_successor_lineage_invalid")
+        current = retired
+
+    predecessor = connection.execute(
+        text(
+            "SELECT * FROM ar_stage_attempts WHERE attempt_ref = :attempt_ref "
+            "AND run_ref = :run_ref"
+        ),
+        {
+            "attempt_ref": current.predecessor_attempt_ref,
+            "run_ref": run_ref,
+        },
+    ).first()
+    if (
+        predecessor is None
+        or current.root_session_ref != attempt.root_session_ref
+        or predecessor.root_session_ref != attempt.root_session_ref
+        or int(current.generation) != int(predecessor.generation) + 1
+    ):
+        raise OwnerConflict("attempt_successor_lineage_invalid")
+    return predecessor
+
+
+def _attempt_with_domain_predecessor(attempt, predecessor):
+    if (
+        predecessor is None
+        or attempt.predecessor_attempt_ref == predecessor.attempt_ref
+    ):
+        return attempt
+    values = (
+        dict(attempt._mapping)
+        if hasattr(attempt, "_mapping")
+        else dict(vars(attempt))
+    )
+    return SimpleNamespace(
+        **{**values, "predecessor_attempt_ref": predecessor.attempt_ref}
+    )
+
+
 def _successor_execution_lineage(
     connection,
     run,
@@ -24669,31 +25578,59 @@ def _successor_execution_lineage(
         "predecessor_rejection_receipt_subject_ref": None,
         "predecessor_rejection_receipt_hash": None,
     }
-    if attempt.predecessor_attempt_ref is None:
-        if int(attempt.generation) != 1 or any(
+    predecessor = _domain_predecessor_with_completion_lineage(
+        connection,
+        run.run_ref,
+        attempt,
+    )
+    if predecessor is None:
+        stored_lineage = any(
             getattr(attempt, key) is not None
             for key in empty
             if key != "predecessor_attempt_ref"
-        ):
+        )
+        if stored_lineage:
             raise OwnerConflict("attempt_successor_lineage_invalid")
+        if int(attempt.generation) != 1:
+            replacement = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_attempt_replacements WHERE "
+                    "replacement_attempt_ref = :attempt_ref AND run_ref = "
+                    ":run_ref"
+                ),
+                {"attempt_ref": attempt.attempt_ref, "run_ref": run.run_ref},
+            ).first()
+            technical_predecessor = (
+                None
+                if replacement is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
+                        ":attempt_ref AND run_ref = :run_ref"
+                    ),
+                    {
+                        "attempt_ref": replacement.retired_attempt_ref,
+                        "run_ref": run.run_ref,
+                    },
+                ).first()
+            )
+            if (
+                replacement is None
+                or technical_predecessor is None
+                or technical_predecessor.root_session_ref != session.session_ref
+                or attempt.root_session_ref != session.session_ref
+                or int(attempt.generation)
+                != int(technical_predecessor.generation) + 1
+                or session.native_session_ref != native_session_ref
+            ):
+                raise OwnerConflict("attempt_successor_lineage_invalid")
         return empty, None, None
 
-    predecessor = connection.execute(
-        text(
-            "SELECT * FROM ar_stage_attempts WHERE attempt_ref = :attempt_ref "
-            "AND run_ref = :run_ref"
-        ),
-        {
-            "attempt_ref": attempt.predecessor_attempt_ref,
-            "run_ref": run.run_ref,
-        },
-    ).first()
-    if predecessor is None or (
+    if (
         predecessor.status != "rejected"
         or predecessor.run_ref != attempt.run_ref
         or predecessor.root_session_ref != attempt.root_session_ref
         or attempt.root_session_ref != session.session_ref
-        or int(attempt.generation) != int(predecessor.generation) + 1
         or session.native_session_ref != native_session_ref
         or predecessor.submission_ref is None
         or predecessor.decision_receipt_ref is None
@@ -24739,24 +25676,43 @@ def _verify_persisted_successor_lineage(
     row,
     outcome: dict[str, object],
 ) -> None:
-    if row.predecessor_attempt_ref is None:
-        return
     with database.read() as connection:
-        predecessor = connection.execute(
-            text(
-                "SELECT p.*, r.request_ref, r.cycle_ref, r.stage, r.epoch, "
-                "r.context_pack_ref, r.context_pack_hash, "
-                "r.runtime_binding_json, r.runtime_binding_hash, "
-                "r.request_receipt_ref, r.request_receipt_hash, "
-                "r.admission_hash, s.native_session_ref FROM "
-                "ar_stage_attempts p JOIN ar_stage_runs r ON r.run_ref = p.run_ref "
-                "JOIN ar_stage_sessions s ON s.session_ref = p.root_session_ref "
-                "WHERE p.attempt_ref = :attempt_ref"
-            ),
-            {"attempt_ref": row.predecessor_attempt_ref},
-        ).first()
+        predecessor_ref = _domain_predecessor_with_completion_lineage(
+            connection,
+            row.run_ref,
+            row,
+        )
+        predecessor = (
+            None
+            if predecessor_ref is None
+            else connection.execute(
+                text(
+                    "SELECT p.*, r.request_ref, r.cycle_ref, r.stage, r.epoch, "
+                    "r.context_pack_ref, r.context_pack_hash, "
+                    "r.runtime_binding_json, r.runtime_binding_hash, "
+                    "r.request_receipt_ref, r.request_receipt_hash, "
+                    "r.admission_hash, s.native_session_ref FROM "
+                    "ar_stage_attempts p JOIN ar_stage_runs r ON "
+                    "r.run_ref = p.run_ref JOIN ar_stage_sessions s ON "
+                    "s.session_ref = p.root_session_ref WHERE p.attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {"attempt_ref": predecessor_ref.attempt_ref},
+            ).first()
+        )
     if predecessor is None:
-        raise OwnerConflict("attempt_successor_lineage_invalid")
+        if any(
+            getattr(row, field) is not None
+            for field in (
+                "predecessor_outcome_hash",
+                "predecessor_material_outcome_hash",
+                "predecessor_rejection_receipt_ref",
+                "predecessor_rejection_receipt_subject_ref",
+                "predecessor_rejection_receipt_hash",
+            )
+        ):
+            raise OwnerConflict("attempt_successor_lineage_invalid")
+        return
     predecessor_outcome, _predecessor_draft, _predecessor_review = (
         _verify_execution_row(predecessor)
     )
@@ -24765,7 +25721,6 @@ def _verify_persisted_successor_lineage(
         or predecessor.run_ref != row.run_ref
         or predecessor.root_session_ref != row.root_session_ref
         or predecessor.native_session_ref != row.native_session_ref
-        or int(row.generation) != int(predecessor.generation) + 1
         or canonical_hash(predecessor_outcome) != row.predecessor_outcome_hash
         or _stage_material_hash(row.stage, predecessor_outcome)
         != row.predecessor_material_outcome_hash

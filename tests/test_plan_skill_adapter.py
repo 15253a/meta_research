@@ -296,6 +296,7 @@ def test_validator_accepts_exact_plan_and_owner_feedback_requires_material_chang
         native_session_ref="codex-plan-primary:1",
         predecessor_submission_ref="plan-submission:1",
         owner_rejection_receipt_ref="receipt:rg-plan-rejection-1",
+        owner_rejection_kind="domain",
         owner_feedback=("ExperimentBrief 必须明确跨设备比较。",),
     )
     with pytest.raises(
@@ -665,9 +666,18 @@ def test_durable_plan_primary_treats_collaboration_trace_as_diagnostic(
     assert no_replay.calls == []
 
 
-def test_owner_feedback_is_present_in_the_successor_prompt(tmp_path: Path) -> None:
+def test_owner_feedback_is_present_in_both_successor_prompts(tmp_path: Path) -> None:
     successor = _plan("按 RG 反馈增加明确的跨设备对照。")
-    runner = _SequenceRunner([{"plan": successor}])
+    runner = _SequenceRunner(
+        [
+            {"plan": successor},
+            {
+                "findings": [],
+                "final_plan": successor,
+                "dispositions": [],
+            },
+        ]
+    )
     adapter = CodexPlanSkillAdapter(
         tmp_path / "provider",
         executable=str(_fake_codex(tmp_path / "codex")),
@@ -679,12 +689,16 @@ def test_owner_feedback_is_present_in_the_successor_prompt(tmp_path: Path) -> No
         native_session_ref="codex-plan-primary:1",
         predecessor_submission_ref="plan-submission:1",
         owner_rejection_receipt_ref="receipt:rg-plan-rejection-1",
+        owner_rejection_kind="domain",
         owner_feedback=("ExperimentBrief 必须明确跨设备比较。",),
     )
 
-    draft = adapter.generate_draft(request)
+    result = adapter.execute(request)
 
-    assert draft.primary_session_ref == "codex-plan-primary:1"
-    assert "plan-submission:1" in runner.calls[0][1]
-    assert "receipt:rg-plan-rejection-1" in runner.calls[0][1]
-    assert "必须明确跨设备比较" in runner.calls[0][1]
+    assert result.primary_session_ref == "codex-plan-primary:1"
+    assert len(runner.calls) == 2
+    for _argv, prompt, _schema in runner.calls:
+        assert "owner_rejection_kind=domain" in prompt
+        assert "plan-submission:1" in prompt
+        assert "receipt:rg-plan-rejection-1" in prompt
+        assert "必须明确跨设备比较" in prompt

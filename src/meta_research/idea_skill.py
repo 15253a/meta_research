@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -219,12 +220,24 @@ class IdeaSkillUnavailable(RuntimeError):
         code: str,
         *,
         recovery_checkpoint: dict[str, object] | None = None,
+        rejected_candidate: dict[str, object] | None = None,
+        rejected_native_session_ref: str | None = None,
+        rejected_detail_code: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.recovery_checkpoint = (
             None if recovery_checkpoint is None else dict(recovery_checkpoint)
         )
+        self.rejected_candidate = (
+            None if rejected_candidate is None else dict(rejected_candidate)
+        )
+        self.rejected_native_session_ref = rejected_native_session_ref
+        self.rejected_detail_code = rejected_detail_code
+
+
+class RecoverableIdeaSkillCandidateError(IdeaSkillContractError):
+    """A completed Idea candidate failed its content/result contract."""
 
 
 def _validate_codex_output_schema_dialect(
@@ -502,6 +515,12 @@ def _schema_contains_json_object_transport(node: object) -> bool:
     return False
 
 
+def _reject_non_finite_json_constant(_value: str) -> object:
+    """Keep non-standard JSON numbers on the raw-candidate rejection path."""
+
+    raise ValueError("non_finite_json_constant")
+
+
 def _decode_canonical_json_object(
     value: object,
     schema: dict[str, object],
@@ -741,6 +760,7 @@ class IdeaSkillRequest:
     native_session_ref: str | None = None
     predecessor_submission_ref: str | None = None
     owner_rejection_receipt_ref: str | None = None
+    owner_rejection_kind: str | None = None
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
 
@@ -802,12 +822,15 @@ def validate_idea_skill_draft(
         result.primary_session_ref != request.native_session_ref
     ):
         raise IdeaSkillContractError("root_native_session_changed")
-    return validate_idea_outcome(
-        result.draft,
-        question_ref=request.question_ref,
-        context_pack_ref=request.context_pack_ref,
-        accepted_evidence_refs=accepted_evidence_refs(request.context_pack),
-    )
+    try:
+        return validate_idea_outcome(
+            result.draft,
+            question_ref=request.question_ref,
+            context_pack_ref=request.context_pack_ref,
+            accepted_evidence_refs=accepted_evidence_refs(request.context_pack),
+        )
+    except IdeaSkillContractError as error:
+        raise RecoverableIdeaSkillCandidateError(str(error)) from error
 
 
 def validate_idea_skill_result(
@@ -831,41 +854,51 @@ def validate_idea_skill_result(
         ("adapter_kind", result.adapter_kind),
     ):
         _require_text(value, label)
-    if (
-        result.review_mode != "advisory_unobserved"
-        or result.reviewer_agent_ref is not None
-    ):
-        raise IdeaSkillContractError("idea_review_mode_invalid")
     if request.native_session_ref is not None and (
         result.primary_session_ref != request.native_session_ref
     ):
         raise IdeaSkillContractError("root_native_session_changed")
+    if (
+        result.review_mode != "advisory_unobserved"
+        or result.reviewer_agent_ref is not None
+    ):
+        raise RecoverableIdeaSkillCandidateError("idea_review_mode_invalid")
 
     evidence_refs = accepted_evidence_refs(request.context_pack)
-    draft_hash = validate_idea_outcome(
-        result.reviewed_draft,
-        question_ref=request.question_ref,
-        context_pack_ref=request.context_pack_ref,
-        accepted_evidence_refs=evidence_refs,
-    )
-    outcome_hash = validate_idea_outcome(
-        result.final_outcome,
-        question_ref=request.question_ref,
-        context_pack_ref=request.context_pack_ref,
-        accepted_evidence_refs=evidence_refs,
-    )
+    try:
+        draft_hash = validate_idea_outcome(
+            result.reviewed_draft,
+            question_ref=request.question_ref,
+            context_pack_ref=request.context_pack_ref,
+            accepted_evidence_refs=evidence_refs,
+        )
+        outcome_hash = validate_idea_outcome(
+            result.final_outcome,
+            question_ref=request.question_ref,
+            context_pack_ref=request.context_pack_ref,
+            accepted_evidence_refs=evidence_refs,
+        )
+    except IdeaSkillContractError as error:
+        raise RecoverableIdeaSkillCandidateError(str(error)) from error
 
-    feedback_revision = request.predecessor_submission_ref is not None
-    if feedback_revision != (request.owner_rejection_receipt_ref is not None):
+    feedback_revision = request.owner_rejection_kind is not None
+    if request.owner_rejection_kind not in {None, "domain", "completion"}:
+        raise IdeaSkillContractError("owner_feedback_lineage_incomplete")
+    if feedback_revision != (request.predecessor_submission_ref is not None) or (
+        feedback_revision != (request.owner_rejection_receipt_ref is not None)
+    ):
         raise IdeaSkillContractError("owner_feedback_lineage_incomplete")
     if feedback_revision:
         if not request.owner_feedback:
             raise IdeaSkillContractError("owner_feedback_missing")
-        if predecessor_material_outcome_hash is None or (
-            predecessor_material_outcome_hash
+        if request.owner_rejection_kind == "domain" and (
+            predecessor_material_outcome_hash is None
+            or predecessor_material_outcome_hash
             == material_outcome_hash(result.final_outcome)
         ):
-            raise IdeaSkillContractError("owner_feedback_revision_not_material")
+            raise RecoverableIdeaSkillCandidateError(
+                "owner_feedback_revision_not_material"
+            )
     elif request.owner_feedback:
         raise IdeaSkillContractError("owner_feedback_without_rejection")
 
@@ -880,7 +913,12 @@ def validate_idea_skill_result(
         "independent": False,
         "advisory_only": True,
     }
-    review_hash = validate_advisory_review(review_payload, outcome_hash=outcome_hash)
+    try:
+        review_hash = validate_advisory_review(
+            review_payload, outcome_hash=outcome_hash
+        )
+    except IdeaSkillContractError as error:
+        raise RecoverableIdeaSkillCandidateError(str(error)) from error
     return draft_hash, outcome_hash, review_hash
 
 
@@ -906,6 +944,24 @@ def review_record(
 def _require_text(value: object, label: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise IdeaSkillContractError(f"{label}_invalid")
+
+
+def _idea_owner_rejection_prompt(request: IdeaSkillRequest) -> str:
+    if not request.owner_feedback:
+        return ""
+    revision_requirement = (
+        "必须实质改变 Outcome，"
+        if request.owner_rejection_kind == "domain"
+        else "必须修正被指出的 structured completion 问题，"
+    )
+    return (
+        "\n这是 Owner rejection 后在同一根 Session 中的修订。"
+        f"{revision_requirement}并逐条处理正式 feedback。\n"
+        f"owner_rejection_kind={request.owner_rejection_kind}\n"
+        f"predecessor_submission_ref={request.predecessor_submission_ref}\n"
+        f"owner_rejection_receipt_ref={request.owner_rejection_receipt_ref}\n"
+        f"owner_feedback={canonical_json(list(request.owner_feedback))}\n"
+    )
 
 
 class CodexIdeaSkillAdapter:
@@ -1588,50 +1644,85 @@ class CodexIdeaSkillAdapter:
                 for field in hash_fields
             ):
                 raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            result_path = directory / "last-message.json"
+            if result_path.stat().st_size > transport_limits.result_max_bytes:
+                raise IdeaSkillUnavailable("codex_output_too_large")
+            with result_path.open("rb") as source:
+                raw_result = source.read(transport_limits.result_max_bytes + 1)
+            if len(raw_result) > transport_limits.result_max_bytes:
+                raise IdeaSkillUnavailable("codex_output_too_large")
+            rejected_candidate: dict[str, object] | None = None
             try:
-                decoded = json.loads(
-                    _read_idea_result(
-                        directory / "last-message.json",
-                        result_max_bytes=transport_limits.result_max_bytes,
-                    )
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                detail_code = "codex_output_invalid"
+                result_text = raw_result.decode("utf-8")
+            except UnicodeDecodeError:
+                rejected_candidate = {
+                    "schema_ref": "meta-research/raw-provider-candidate/v1",
+                    "encoding": "base64",
+                    "content": base64.b64encode(raw_result).decode("ascii"),
+                    "content_hash": marker["result_file_hash"],
+                }
             else:
-                if not isinstance(decoded, dict):
-                    detail_code = "codex_output_invalid"
-                else:
-                    stdout = _read_spool_text(
-                        directory / "stdout.jsonl",
-                        transport_limits.stream_max_bytes,
+                try:
+                    decoded = json.loads(
+                        result_text,
+                        parse_constant=_reject_non_finite_json_constant,
                     )
-                    try:
-                        _verified_native_session(
-                            stdout,
-                            expected=native_session_ref,
-                        )
-                    except IdeaSkillUnavailable as error:
-                        if error.code not in {
-                            "codex_native_session_missing",
-                            "codex_native_session_mismatch",
-                        }:
-                            raise
-                        detail_code = error.code
-                    else:
-                        raise IdeaSkillUnavailable(
-                            "codex_operation_spool_invalid"
-                        )
+                except (json.JSONDecodeError, ValueError):
+                    rejected_candidate = {
+                        "schema_ref": "meta-research/raw-provider-candidate/v1",
+                        "encoding": "utf-8",
+                        "content": result_text,
+                        "content_hash": marker["result_file_hash"],
+                    }
+                else:
+                    if not isinstance(decoded, dict):
+                        rejected_candidate = {
+                            "schema_ref": "meta-research/raw-provider-candidate/v1",
+                            "encoding": "json",
+                            "content": decoded,
+                            "content_hash": marker["result_file_hash"],
+                        }
+            stdout = _read_spool_text(
+                directory / "stdout.jsonl",
+                transport_limits.stream_max_bytes,
+            )
+            try:
+                observed_session_ref = _verified_native_session(
+                    stdout,
+                    expected=native_session_ref,
+                )
+            except IdeaSkillUnavailable as error:
+                if error.code not in {
+                    "codex_native_session_missing",
+                    "codex_native_session_mismatch",
+                }:
+                    raise
+                detail_code = error.code
+                rejected_candidate = None
+                observed_session_ref = None
+            else:
+                if rejected_candidate is None:
+                    raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+                detail_code = "codex_output_invalid"
         except IdeaSkillUnavailable:
             raise
         except (OSError, ProviderSupervisorError) as error:
             raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
         failure_code = self._transport_contract_failure_code(operation_name)
+        checkpoint = _provider_terminal_contract_checkpoint(
+            marker,
+            failure_code,
+            detail_code,
+        )
         return IdeaSkillUnavailable(
             failure_code,
-            recovery_checkpoint=_provider_terminal_contract_checkpoint(
-                marker,
-                failure_code,
-                detail_code,
+            recovery_checkpoint=checkpoint,
+            rejected_candidate=rejected_candidate,
+            rejected_native_session_ref=(
+                observed_session_ref if rejected_candidate is not None else None
+            ),
+            rejected_detail_code=(
+                detail_code if rejected_candidate is not None else None
             ),
         )
 
@@ -1639,15 +1730,7 @@ class CodexIdeaSkillAdapter:
         if request.runtime_binding != self.runtime_binding():
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
         skill = _idea_skill_instructions()
-        lineage = ""
-        if request.owner_feedback:
-            lineage = (
-                "\n这是 RG rejection 后在同一根 Session 中的修订。必须实质改变 Outcome，"
-                "并逐条处理正式 feedback。\n"
-                f"predecessor_submission_ref={request.predecessor_submission_ref}\n"
-                f"owner_rejection_receipt_ref={request.owner_rejection_receipt_ref}\n"
-                f"owner_feedback={canonical_json(list(request.owner_feedback))}\n"
-            )
+        lineage = _idea_owner_rejection_prompt(request)
         primary_prompt = (
             f"{skill}\n\n"
             "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
@@ -1686,6 +1769,7 @@ class CodexIdeaSkillAdapter:
                 native_session_ref=primary_session,
                 failure_code="idea_primary_result_contract_invalid",
                 detail_code="codex_outcome_invalid",
+                rejected_candidate=primary_output,
             )
         return IdeaSkillDraft(
             draft=cast(dict[str, object], draft_value),
@@ -1701,6 +1785,7 @@ class CodexIdeaSkillAdapter:
         if request.native_session_ref != draft.primary_session_ref:
             raise IdeaSkillUnavailable("codex_primary_session_changed")
         skill = _idea_skill_instructions()
+        lineage = _idea_owner_rejection_prompt(request)
         reviewer_prompt = (
             f"{skill}\n\n"
             "本回合是同一个根 Idea Agent 的 Review phase。针对下方 exact frozen "
@@ -1711,7 +1796,8 @@ class CodexIdeaSkillAdapter:
             "not_adopted disposition，并在同一个 resumed turn 返回最终完整 Outcome。"
             "revised 必须实际改变 Outcome；没有 finding 时返回空 findings/dispositions。"
             "只返回 findings、final_outcome、dispositions。不得声称根 Agent 拥有 Owner "
-            "接纳权。\n"
+            "接纳权。"
+            f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"question_ref={request.question_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
@@ -1743,6 +1829,7 @@ class CodexIdeaSkillAdapter:
                 native_session_ref=draft.primary_session_ref,
                 failure_code="idea_review_result_contract_invalid",
                 detail_code="codex_review_invalid",
+                rejected_candidate=reviewed,
             )
         # The structured result remains contract-validated below.  The sealed
         # stdout/ledger and verifier remain available for diagnostics, but are
@@ -1779,6 +1866,7 @@ class CodexIdeaSkillAdapter:
         native_session_ref: str,
         failure_code: str,
         detail_code: str | None = None,
+        rejected_candidate: dict[str, object] | None = None,
     ) -> IdeaSkillUnavailable:
         checkpoint = None
         if job_ref is not None:
@@ -1792,6 +1880,15 @@ class CodexIdeaSkillAdapter:
         return IdeaSkillUnavailable(
             failure_code,
             recovery_checkpoint=checkpoint,
+            rejected_candidate=rejected_candidate,
+            rejected_native_session_ref=(
+                native_session_ref if rejected_candidate is not None else None
+            ),
+            rejected_detail_code=(
+                (detail_code or failure_code)
+                if rejected_candidate is not None
+                else None
+            ),
         )
 
     def _invoke(
@@ -2321,11 +2418,17 @@ class CodexIdeaSkillAdapter:
                 _read_idea_result(
                     result_path,
                     result_max_bytes=transport_limits.result_max_bytes,
-                )
+                ),
+                parse_constant=_reject_non_finite_json_constant,
             )
         except IdeaSkillUnavailable:
             raise
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (
+            OSError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
             raise IdeaSkillUnavailable("codex_output_invalid") from error
         if not isinstance(decoded, dict):
             raise IdeaSkillUnavailable("codex_output_invalid")
@@ -2951,9 +3054,15 @@ def _read_completed_operation(
                 _read_idea_result(
                     result_path,
                     result_max_bytes=transport_limits.result_max_bytes,
-                )
+                ),
+                parse_constant=_reject_non_finite_json_constant,
             )
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (
+            OSError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
             raise IdeaSkillUnavailable("codex_output_invalid") from error
         if not isinstance(decoded, dict):
             raise IdeaSkillUnavailable("codex_output_invalid")
@@ -2983,9 +3092,15 @@ def _read_completed_operation(
             _read_idea_result(
                 directory / "last-message.json",
                 result_max_bytes=transport_limits.result_max_bytes,
-            )
+            ),
+            parse_constant=_reject_non_finite_json_constant,
         )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
     if not isinstance(completion, dict) or not isinstance(persisted_result, dict):
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")

@@ -31,6 +31,7 @@ from meta_research.reasoning_skill import (
     _reasoning_primary_output_schema,
     _reasoning_review_response_schema,
     _reasoning_stage_output_schema,
+    _owner_rejection_prompt,
     _validate_request,
     validate_reasoning_skill_draft,
     validate_reasoning_skill_result,
@@ -222,6 +223,33 @@ def test_public_draft_seam_validates_one_closed_reasoning_output() -> None:
         canonical_hash(output["scientific_outcome"]),
         canonical_hash(output["next_cycle_proposal"]),
     )
+
+
+def test_reasoning_successor_request_carries_owner_rejection_feedback() -> None:
+    request = replace(
+        _request(),
+        native_session_ref="provider-session:1",
+        predecessor_candidate_ref="reasoning-submission:rejected",
+        owner_rejection_receipt_ref="rg-rejection-receipt:1",
+        owner_rejection_kind="domain",
+        owner_feedback=("Resolve the unsupported transition claim.",),
+    )
+
+    _validate_request(request)
+    prompt = _owner_rejection_prompt(request)
+    assert "同一 Root/native Session" in prompt
+    assert "reasoning-submission:rejected" in prompt
+    assert "rg-rejection-receipt:1" in prompt
+    assert "Resolve the unsupported transition claim." in prompt
+    completion_prompt = _owner_rejection_prompt(
+        replace(request, owner_rejection_kind="completion")
+    )
+    assert "structured-completion rejection" in completion_prompt
+
+    with pytest.raises(
+        ReasoningContractError, match="owner_feedback_lineage_incomplete"
+    ):
+        _validate_request(replace(request, owner_rejection_receipt_ref=None))
 
 
 @pytest.mark.parametrize("closure_size", [100, 550])
@@ -833,6 +861,49 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     }
 
 
+def test_completion_rejection_feedback_reaches_reasoning_primary_and_review(
+    tmp_path: Path,
+) -> None:
+    primary = _stage_output()
+    runner = _SequenceRunner(
+        [
+            primary,
+            {
+                "schema_ref": REASONING_REVIEW_SCHEMA_REF,
+                "findings": [],
+                "final_output": primary,
+                "dispositions": [],
+            },
+        ]
+    )
+    adapter = CodexReasoningSkillAdapter(
+        tmp_path / "reasoning-successor-provider",
+        executable=str(_fake_codex(tmp_path / "codex-successor")),
+        process_runner=runner,
+    )
+    adapter.bind_full_conformance_authority(_FullConformanceAuthority())
+    adapter.configure_resident_mcp_endpoint("http://semantic-mcp.invalid")
+    request = replace(
+        _request(),
+        runtime_binding=adapter.runtime_binding(),
+        native_session_ref="provider-session:1",
+        predecessor_candidate_ref="reasoning-candidate:rejected",
+        owner_rejection_receipt_ref="receipt:reasoning-completion-rejected",
+        owner_rejection_kind="completion",
+        owner_feedback=("修正 completion evidence refs 的精确绑定。",),
+    )
+
+    draft = adapter.generate_draft(request)
+    adapter.review_draft(request, draft)
+
+    assert len(runner.calls) == 2
+    for _argv, prompt, _schema in runner.calls:
+        assert "owner_rejection_kind=completion" in prompt
+        assert "reasoning-candidate:rejected" in prompt
+        assert "receipt:reasoning-completion-rejected" in prompt
+        assert "修正 completion evidence refs 的精确绑定" in prompt
+
+
 @pytest.mark.parametrize("autonomous", [False, True])
 def test_reasoning_result_does_not_require_internal_review_trace(
     tmp_path: Path,
@@ -926,6 +997,39 @@ def _autonomous_resume_fixture(
         "dispositions": list(expected.dispositions),
     }
     return checkpoint, creation_result, review
+
+
+def test_completion_rejection_feedback_reaches_reasoning_autonomous_resume(
+    tmp_path: Path,
+) -> None:
+    base_request = _request()
+    checkpoint, creation_result, review = _autonomous_resume_fixture(base_request)
+    runner = _SequenceRunner([review])
+    adapter = CodexReasoningSkillAdapter(
+        tmp_path / "reasoning-autonomous-successor-provider",
+        executable=str(_fake_codex(tmp_path / "codex-autonomous-successor")),
+        process_runner=runner,
+    )
+    adapter.bind_full_conformance_authority(_FullConformanceAuthority())
+    adapter.configure_resident_mcp_endpoint("http://semantic-mcp.invalid")
+    request = replace(
+        base_request,
+        runtime_binding=adapter.runtime_binding(),
+        native_session_ref="provider-session:1",
+        predecessor_candidate_ref="reasoning-candidate:rejected",
+        owner_rejection_receipt_ref="receipt:reasoning-completion-rejected",
+        owner_rejection_kind="completion",
+        owner_feedback=("修正 autonomous completion 的 transition 表达。",),
+    )
+
+    adapter.resume_after_autonomous_creation(request, checkpoint, creation_result)
+
+    assert len(runner.calls) == 1
+    prompt = runner.calls[0][1]
+    assert "owner_rejection_kind=completion" in prompt
+    assert "reasoning-candidate:rejected" in prompt
+    assert "receipt:reasoning-completion-rejected" in prompt
+    assert "修正 autonomous completion 的 transition 表达" in prompt
 
 
 @pytest.mark.parametrize(

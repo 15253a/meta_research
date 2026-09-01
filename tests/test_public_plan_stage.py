@@ -18,6 +18,7 @@ from meta_research.plan_skill import (
     PlanSkillDraft,
     PlanSkillRequest,
     PlanSkillResult,
+    PlanSkillUnavailable,
 )
 from meta_research.quest_drafting import (
     HostComputeDevice,
@@ -153,8 +154,8 @@ class _DeterministicIdeaSkill:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="idea-child-reviewer-1",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind="test_deterministic",
         )
 
@@ -299,8 +300,8 @@ class _DeterministicPlanSkill:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="plan-child-reviewer-1",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind="test_deterministic",
         )
 
@@ -492,8 +493,7 @@ def test_plan_stage_keeps_five_fact_layers_with_a_real_gap(
         assert committed["run"]["native_session_ref"] == "plan-primary-1"
         assert committed["run"]["review"] == {
             "status": "completed",
-            "review_mode": "harness_child_agent",
-            "reviewer_agent_ref": "plan-child-reviewer-1",
+            "review_mode": "advisory_unobserved",
             "finding_count": 0,
             "disposition_count": 0,
         }
@@ -595,10 +595,34 @@ def test_no_viable_candidate_routes_to_reasoning_without_plan_truth(
         runtime.close()
 
 
-def test_formal_plan_rejection_revises_in_the_same_native_session(
+class _DomainThenCompletionRejectedPlanSkill(_DeterministicPlanSkill):
+    def __init__(self) -> None:
+        super().__init__(no_gap=False, reject_once=True)
+        self.review_requests: list[PlanSkillRequest] = []
+        self.completion_rejected = False
+
+    def review_draft(
+        self, request: PlanSkillRequest, draft: PlanSkillDraft
+    ) -> PlanSkillResult:
+        self.review_requests.append(request)
+        result = super().review_draft(request, draft)
+        if request.owner_rejection_kind == "domain" and not (
+            self.completion_rejected
+        ):
+            self.completion_rejected = True
+            raise PlanSkillUnavailable(
+                "plan_review_result_contract_invalid",
+                rejected_candidate={"final_plan": result.final_plan},
+                rejected_native_session_ref=result.primary_session_ref,
+                rejected_detail_code="codex_output_invalid",
+            )
+        return result
+
+
+def test_domain_and_completion_rejections_compose_in_the_same_native_session(
     tmp_path: Path,
 ) -> None:
-    plan_skill = _DeterministicPlanSkill(no_gap=False, reject_once=True)
+    plan_skill = _DomainThenCompletionRejectedPlanSkill()
     runtime = _runtime(
         tmp_path / "plan-rejection",
         idea_skill=_DeterministicIdeaSkill(),
@@ -636,6 +660,35 @@ def test_formal_plan_rejection_revises_in_the_same_native_session(
         ]
         assert successor["plan_acceptance"]["status"] == "rejected"
 
+        assert runtime.plan_stage.process_once()
+        assert runtime.plan_stage.process_once()
+        combined = runtime.plan_stage.query_current()
+        assert combined["run"]["attempt_generation"] == 3
+        assert combined["run"]["root_session_ref"] == original_run[
+            "root_session_ref"
+        ]
+        assert combined["run"]["native_session_ref"] == original_run[
+            "native_session_ref"
+        ]
+        completion_rejection = combined["run"]["completion_rejection"]
+        assert completion_rejection["reason"] == {
+            "code": "plan_review_result_contract_invalid",
+            "detail": "codex_output_invalid",
+        }
+        assert combined["plan_acceptance"]["status"] == "rejected"
+
+        assert runtime.plan_stage.process_once()
+        combined_request = plan_skill.review_requests[-1]
+        assert combined_request.owner_rejection_kind == "domain"
+        assert combined_request.predecessor_submission_ref == (
+            completion_rejection["candidate_ref"]
+        )
+        assert combined_request.owner_rejection_receipt_ref == (
+            completion_rejection["receipt"]["receipt_ref"]
+        )
+        assert len(combined_request.owner_feedback) >= 2
+        assert "codex_output_invalid" in combined_request.owner_feedback[-1]
+
         for _step in range(12):
             current = runtime.plan_stage.query_current()
             if current["stage_commit"] is not None:
@@ -643,7 +696,17 @@ def test_formal_plan_rejection_revises_in_the_same_native_session(
             assert runtime.plan_stage.process_once()
         committed = runtime.plan_stage.query_current()
         assert committed["stage_commit"]["status"] == "Completed"
-        assert committed["run"]["attempt_generation"] == 2
+        assert committed["run"]["attempt_generation"] == 3
+        accepted_execution = (
+            runtime.owners.agent_runtime.query_plan_attempt_execution(
+                committed["run"]["submission_ref"]
+            )
+        )
+        assert accepted_execution is not None
+        assert accepted_execution.predecessor_attempt_ref == original_run[
+            "attempt_ref"
+        ]
+        assert accepted_execution.predecessor_rejection_receipt is not None
         assert len(plan_skill.requests) == 2
         correction = plan_skill.requests[1]
         assert correction.native_session_ref == original_run["native_session_ref"]

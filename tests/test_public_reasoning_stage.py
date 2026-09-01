@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,7 +9,11 @@ from meta_research.composition import build_production_runtime
 from meta_research.bundle_skill import BundleSkillDraft, BundleSkillRequest
 from meta_research.idea_skill import IdeaSkillDraft, IdeaSkillRequest
 from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
-from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.common import (
+    AcceptanceReceipt,
+    OwnerConflict,
+    canonical_hash,
+)
 from meta_research.paths import prepare_data_root
 from meta_research.plan_skill import PlanSkillDraft, PlanSkillRequest
 from meta_research.reasoning_contract import (
@@ -21,6 +26,7 @@ from meta_research.reasoning_skill import (
     ReasoningSkillRequest,
     ReasoningSkillResult,
 )
+from meta_research.reasoning_stage import _public_acceptance
 
 from test_public_first_question_deepfetch import (
     DeterministicDeepFetchProvider,
@@ -80,6 +86,44 @@ def _research_synthesis(request: ReasoningSkillRequest) -> dict[str, object]:
             "impact": "The frozen Goal gains bounded support.",
         },
     }
+
+
+def test_reasoning_rejection_projection_includes_actionable_feedback() -> None:
+    receipt = AcceptanceReceipt(
+        issuer="research_graph",
+        kind="reasoning_outcome_rejected",
+        receipt_ref="rg-reasoning-rejection-receipt:1",
+        subject_ref="reasoning-decision:1",
+        payload_hash="a" * 64,
+    )
+    projection = _public_acceptance(
+        SimpleNamespace(),
+        SimpleNamespace(
+            scientific_outcome={"disposition": "affirmed"},
+            content_ref="reasoning-content:1",
+            receipt=AcceptanceReceipt(
+                issuer="research_memory",
+                kind="reasoning_content_accepted",
+                receipt_ref="rm-reasoning-content-receipt:1",
+                subject_ref="reasoning-content:1",
+                payload_hash="b" * 64,
+            ),
+        ),
+        SimpleNamespace(
+            decision="rejected",
+            reason_code="reasoning_review_findings_unresolved",
+            feedback=("Resolve the unsupported transition claim.",),
+            receipt=receipt,
+            outcome_ref=None,
+        ),
+    )
+
+    assert projection["status"] == "rejected"
+    assert projection["rejection"] == {
+        "code": "reasoning_review_findings_unresolved",
+        "feedback": ["Resolve the unsupported transition claim."],
+    }
+    assert projection["domain"]["receipt"] == receipt.as_public_dict()
 
 
 class _DeterministicReasoningSkill:
