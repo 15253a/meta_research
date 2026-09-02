@@ -1,57 +1,28 @@
 from __future__ import annotations
 
-import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast
 
 from meta_research.experiment_contract import (
-    ExperimentIntent,
-    ExperimentIntentLike,
     PROTOCOL_EXPERIMENT_DEFINITION_SCHEMA,
     PROTOCOL_EXPERIMENT_INTENT_SCHEMA,
     ProtocolExperimentIntent,
 )
 from meta_research.owners.common import OwnerConflict, canonical_json
 
-if TYPE_CHECKING:
-    from meta_research.owners.research_graph import AcceptedTarget
-
-
-EXPERIMENT_RETRAIN_ADAPTER = "experiment_retrain"
-EXPERIMENT_REMEASURE_ADAPTER = "experiment_remeasure"
-EXPERIMENT_RETRAIN_SCHEMA_REF = (
-    "meta-research/target-execution/experiment-retrain/v1"
-)
-EXPERIMENT_REMEASURE_SCHEMA_REF = (
-    "meta-research/target-execution/experiment-remeasure/v1"
-)
 PROTOCOL_EVALUATION_ADAPTER = "protocol_evaluation"
 PROTOCOL_EVALUATION_SCHEMA_REF = (
     "meta-research/target-execution/protocol-evaluation/v2"
 )
 PROTOCOL_EVALUATION_REQUEST_MAX_BYTES = 8 * 1024 * 1024
-LEGACY_MICRO_EXPERIMENT_ADAPTER = "legacy_micro_experiment"
 EXPERIMENT_PROVIDER_CAPABILITY_CATALOG_SCHEMA = (
     "meta-research/experiment-provider-capability-catalog/v1"
-)
-MICRO_EXPERIMENT_DEFINITION_SCHEMA = (
-    "meta-research/micro-experiment-definition/v1"
 )
 
 
 class TargetExecutionContractError(ValueError):
     pass
-
-
-class ExperimentCoordinator(Protocol):
-    def start(
-        self,
-        intent: ExperimentIntentLike,
-        idempotency_key: str,
-        *,
-        require_idle: bool = False,
-    ) -> dict[str, object]: ...
 
 
 class TargetExecutionAdapter(Protocol):
@@ -68,147 +39,9 @@ class TargetExecutionAdapter(Protocol):
         quest_ref: str,
         target_ref: str,
         target_spec: dict[str, object],
-    ) -> ExperimentIntentLike: ...
+    ) -> ProtocolExperimentIntent: ...
 
     def json_schema(self) -> dict[str, object]: ...
-
-
-@dataclass(frozen=True)
-class TargetExecutionStart:
-    adapter_kind: str
-    target_run_ref: str
-    evaluation_attempt_ref: str
-    execution_request_ref: str
-    definition_hash: str
-    public_execution: dict[str, object]
-
-
-@dataclass(frozen=True)
-class _ExperimentRetrainAdapter:
-    adapter_kind: str = EXPERIMENT_RETRAIN_ADAPTER
-    schema_ref: str = EXPERIMENT_RETRAIN_SCHEMA_REF
-
-    def validate(self, execution: dict[str, object]) -> None:
-        request = _validate_envelope(execution, self.adapter_kind, self.schema_ref)
-        _exact_keys(
-            request,
-            {"hypothesis", "variant_parameter", "sample_count"},
-        )
-        _validate_common_request(request)
-
-    def intent(
-        self,
-        *,
-        quest_ref: str,
-        target_ref: str,
-        target_spec: dict[str, object],
-    ) -> ExperimentIntent:
-        execution = _execution(target_spec)
-        self.validate(execution)
-        request = cast(dict[str, object], execution["request"])
-        return ExperimentIntent(
-            execution_request_ref=f"bundle-target-{target_ref}",
-            quest_ref=quest_ref,
-            title=_target_title(target_spec),
-            hypothesis=cast(str, request["hypothesis"]),
-            variant_parameter=float(request["variant_parameter"]),
-            sample_count=cast(int, request["sample_count"]),
-            request_kind="retrain",
-        )
-
-    def json_schema(self) -> dict[str, object]:
-        return _execution_schema(
-            adapter_kind=self.adapter_kind,
-            schema_ref=self.schema_ref,
-            request_properties=_common_request_schema(),
-            required=("hypothesis", "variant_parameter", "sample_count"),
-        )
-
-
-@dataclass(frozen=True)
-class _ExperimentRemeasureAdapter:
-    adapter_kind: str = EXPERIMENT_REMEASURE_ADAPTER
-    schema_ref: str = EXPERIMENT_REMEASURE_SCHEMA_REF
-
-    def validate(self, execution: dict[str, object]) -> None:
-        request = _validate_envelope(execution, self.adapter_kind, self.schema_ref)
-        _exact_keys(
-            request,
-            {
-                "hypothesis",
-                "variant_parameter",
-                "sample_count",
-                "source_variant_run_ref",
-                "selected_checkpoint_role_refs",
-            },
-        )
-        _validate_common_request(request)
-        source_ref = request.get("source_variant_run_ref")
-        checkpoint_refs = request.get("selected_checkpoint_role_refs")
-        if (
-            not _bounded_text(source_ref, 96)
-            or not isinstance(checkpoint_refs, list)
-            or len(checkpoint_refs) > 32
-            or not all(_bounded_text(value, 96) for value in checkpoint_refs)
-            or len(checkpoint_refs) != len(set(checkpoint_refs))
-        ):
-            raise TargetExecutionContractError("target_execution_request_invalid")
-
-    def intent(
-        self,
-        *,
-        quest_ref: str,
-        target_ref: str,
-        target_spec: dict[str, object],
-    ) -> ExperimentIntent:
-        execution = _execution(target_spec)
-        self.validate(execution)
-        request = cast(dict[str, object], execution["request"])
-        return ExperimentIntent(
-            execution_request_ref=f"bundle-target-{target_ref}",
-            quest_ref=quest_ref,
-            title=_target_title(target_spec),
-            hypothesis=cast(str, request["hypothesis"]),
-            variant_parameter=float(request["variant_parameter"]),
-            sample_count=cast(int, request["sample_count"]),
-            request_kind="remeasure",
-            source_variant_run_ref=cast(str, request["source_variant_run_ref"]),
-            selected_checkpoint_role_refs=tuple(
-                cast(list[str], request["selected_checkpoint_role_refs"])
-            ),
-        )
-
-    def json_schema(self) -> dict[str, object]:
-        properties = {
-            **_common_request_schema(),
-            "source_variant_run_ref": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 96,
-            },
-            "selected_checkpoint_role_refs": {
-                "type": "array",
-                "maxItems": 32,
-                "uniqueItems": True,
-                "items": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 96,
-                },
-            },
-        }
-        return _execution_schema(
-            adapter_kind=self.adapter_kind,
-            schema_ref=self.schema_ref,
-            request_properties=properties,
-            required=(
-                "hypothesis",
-                "variant_parameter",
-                "sample_count",
-                "source_variant_run_ref",
-                "selected_checkpoint_role_refs",
-            ),
-        )
 
 
 @dataclass(frozen=True)
@@ -441,118 +274,15 @@ class _ProtocolEvaluationAdapter:
         )
 
 
-@dataclass(frozen=True)
-class _LegacyMicroExperimentAdapter:
-    """Read/execute compatibility for already-receipted TargetPlan v1 rows."""
-
-    adapter_kind: str = LEGACY_MICRO_EXPERIMENT_ADAPTER
-    schema_ref: str = "meta-research/target-plan/v1#micro_experiment"
-
-    def validate(self, execution: dict[str, object]) -> None:
-        raise TargetExecutionContractError("legacy_target_execution_is_read_only")
-
-    def intent(
-        self,
-        *,
-        quest_ref: str,
-        target_ref: str,
-        target_spec: dict[str, object],
-    ) -> ExperimentIntent:
-        if target_spec.get("target_type") != "micro_experiment":
-            raise TargetExecutionContractError("legacy_target_execution_invalid")
-        try:
-            intent = ExperimentIntent(
-                execution_request_ref=f"bundle-target-{target_ref}",
-                quest_ref=quest_ref,
-                title=cast(str, target_spec["title"]),
-                hypothesis=cast(str, target_spec["hypothesis"]),
-                variant_parameter=float(target_spec["variant_parameter"]),
-                sample_count=cast(int, target_spec["sample_count"]),
-            )
-            intent.validate()
-        except (KeyError, TypeError, ValueError, OwnerConflict) as error:
-            raise TargetExecutionContractError(
-                "legacy_target_execution_invalid"
-            ) from error
-        return intent
-
-    def json_schema(self) -> dict[str, object]:
-        raise TargetExecutionContractError("legacy_target_execution_is_read_only")
-
-
 _ADAPTERS: tuple[TargetExecutionAdapter, ...] = (
-    _ExperimentRetrainAdapter(),
-    _ExperimentRemeasureAdapter(),
     _ProtocolEvaluationAdapter(),
 )
 _ADAPTER_BY_KIND = {adapter.adapter_kind: adapter for adapter in _ADAPTERS}
-_LEGACY_ADAPTER = _LegacyMicroExperimentAdapter()
-
-
-class TargetExecutionCoordinator:
-    """Deep Bundle seam hiding adapter selection and execution result parsing."""
-
-    def __init__(self, experiment: ExperimentCoordinator) -> None:
-        self._experiment = experiment
-
-    def start(
-        self,
-        *,
-        quest_ref: str,
-        target: "AcceptedTarget",
-        idempotency_key: str,
-    ) -> TargetExecutionStart:
-        adapter = target_execution_adapter(target.spec)
-        execution = self._experiment.start(
-            adapter.intent(
-                quest_ref=quest_ref,
-                target_ref=target.target_ref,
-                target_spec=target.spec,
-            ),
-            idempotency_key,
-        )
-        identities = execution.get("identities")
-        runtime = execution.get("execution")
-        intent = execution.get("intent")
-        execution_request = execution.get("execution_request")
-        definition = (
-            execution_request.get("definition")
-            if isinstance(execution_request, dict)
-            else None
-        )
-        if (
-            not isinstance(identities, dict)
-            or not isinstance(runtime, dict)
-            or not isinstance(intent, dict)
-            or not isinstance(identities.get("evaluation_attempt_ref"), str)
-            or not isinstance(runtime.get("run_ref"), str)
-            or not isinstance(intent.get("execution_request_ref"), str)
-            or not isinstance(definition, dict)
-            or not isinstance(definition.get("content_hash"), str)
-        ):
-            raise OwnerConflict("target_run_admission_invalid")
-        return TargetExecutionStart(
-            adapter_kind=adapter.adapter_kind,
-            target_run_ref=cast(str, runtime["run_ref"]),
-            evaluation_attempt_ref=cast(
-                str, identities["evaluation_attempt_ref"]
-            ),
-            execution_request_ref=cast(str, intent["execution_request_ref"]),
-            definition_hash=cast(
-                str,
-                definition["content_hash"],
-            ),
-            public_execution=execution,
-        )
 
 
 def target_execution_adapter(
     target_spec: dict[str, object],
 ) -> TargetExecutionAdapter:
-    if "execution" not in target_spec:
-        if target_spec.get("target_type") == "micro_experiment":
-            return _LEGACY_ADAPTER
-        raise TargetExecutionContractError("target_execution_invalid")
     execution = _execution(target_spec)
     kind = execution.get("adapter_kind")
     adapter = _ADAPTER_BY_KIND.get(kind) if isinstance(kind, str) else None
@@ -571,7 +301,7 @@ def target_experiment_intent(
     quest_ref: str,
     target_ref: str,
     target_spec: dict[str, object],
-) -> ExperimentIntentLike:
+) -> ProtocolExperimentIntent:
     return target_execution_adapter(target_spec).intent(
         quest_ref=quest_ref,
         target_ref=target_ref,
@@ -611,23 +341,6 @@ def target_execution_json_schema(
         request_kinds = cast(tuple[str, ...], capability["request_kinds"])
         execution_adapter_kind = capability["execution_adapter_kind"]
         execution_schema_ref = capability["execution_schema_ref"]
-        if (
-            intent_schema_ref is None
-            and definition_schema_ref == MICRO_EXPERIMENT_DEFINITION_SCHEMA
-            and execution_adapter_kind is None
-            and execution_schema_ref is None
-        ):
-            if "retrain" in request_kinds:
-                variants.append(
-                    _ADAPTER_BY_KIND[
-                        EXPERIMENT_RETRAIN_ADAPTER
-                    ].json_schema()
-                )
-            if "remeasure" in request_kinds:
-                variants.append(
-                    _ADAPTER_BY_KIND[EXPERIMENT_REMEASURE_ADAPTER].json_schema()
-                )
-            continue
         if (
             intent_schema_ref == PROTOCOL_EXPERIMENT_INTENT_SCHEMA
             and definition_schema_ref == PROTOCOL_EXPERIMENT_DEFINITION_SCHEMA
@@ -793,22 +506,6 @@ def _validate_envelope(
     return cast(dict[str, object], request)
 
 
-def _validate_common_request(request: dict[str, object]) -> None:
-    hypothesis = request.get("hypothesis")
-    variant = request.get("variant_parameter")
-    sample_count = request.get("sample_count")
-    if (
-        not _bounded_text(hypothesis, 4000)
-        or not isinstance(variant, (int, float))
-        or isinstance(variant, bool)
-        or not math.isfinite(float(variant))
-        or not isinstance(sample_count, int)
-        or isinstance(sample_count, bool)
-        or not 4 <= sample_count <= 4096
-    ):
-        raise TargetExecutionContractError("target_execution_request_invalid")
-
-
 def _exact_keys(value: dict[str, object], expected: set[str]) -> None:
     if set(value) != expected:
         raise TargetExecutionContractError("target_execution_invalid")
@@ -816,14 +513,6 @@ def _exact_keys(value: dict[str, object], expected: set[str]) -> None:
 
 def _bounded_text(value: object, maximum: int) -> bool:
     return isinstance(value, str) and bool(value.strip()) and len(value) <= maximum
-
-
-def _common_request_schema() -> dict[str, object]:
-    return {
-        "hypothesis": {"type": "string", "minLength": 1, "maxLength": 4000},
-        "variant_parameter": {"type": "number"},
-        "sample_count": {"type": "integer", "minimum": 4, "maximum": 4096},
-    }
 
 
 def _execution_schema(

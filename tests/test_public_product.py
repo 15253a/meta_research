@@ -124,9 +124,18 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "quest_drafting_worker",
             "first_question_deepfetch_worker",
             "quest_reconciliation_worker",
-            "experiment_worker",
             "writing_worker",
         }
+        assert "experiment" not in snapshot
+        assert anonymous.get("/api/v1/experiments/current").status_code == 404
+        assert anonymous.post(
+            "/api/v1/experiments",
+            headers={
+                "Origin": base_url,
+                "X-CSRF-Token": exchanged.json()["csrf_token"],
+            },
+            json={},
+        ).status_code == 404
         assert snapshot["research_space"] == {
             "status": "empty",
             "quest_count": 0,
@@ -172,6 +181,8 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
         assert "/api/v1/events" in client_bundle.text
         assert "research_space" in client_bundle.text
         assert "readiness" in client_bundle.text
+        assert "/api/v1/experiments" not in client_bundle.text
+        assert "启动微型真实实验" not in client_bundle.text
         assert "localStorage" not in client_bundle.text
         assert bootstrap_token not in client_bundle.text
 

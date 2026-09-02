@@ -494,90 +494,11 @@ def test_bundle_report_rejects_handoff_subset_when_rg_has_sibling_commit(
         runtime.close()
 
 
-def test_formal_v3_rejects_legacy_experiment_commit_path_without_writes(
-    tmp_path: Path,
-) -> None:
-    data_root = tmp_path / "formal-v3-legacy-experiment-commit-fence"
-    runtime = _bundle_runtime(data_root)
-    try:
-        _prepare_bundle_request(runtime)
-        request = _current_bundle_request(runtime)
-        graph = None
-        for _step in range(8):
-            assert runtime.bundle_stage.process_once()
-            graph = runtime.owners.research_graph.query_target_graph(
-                request.request_ref
-            )
-            if graph is not None:
-                break
-        assert graph is not None and graph.targets
-        target = graph.targets[0]
-        measurement = _closure(
-            target.target_ref,
-            ("experiment-legacy-write-fence",),
-            "measurement-cell-legacy-write-fence",
-        )
-
-        with sqlite3.connect(data_root / "meta-research.sqlite3") as connection:
-            before = (
-                connection.execute(
-                    "SELECT revision, target_commit_count FROM "
-                    "research_graph_state WHERE singleton = 'owner'"
-                ).fetchone(),
-                connection.execute(
-                    "SELECT COUNT(*) FROM rg_target_commits"
-                ).fetchone(),
-            )
-
-        with pytest.raises(
-            OwnerConflict,
-            match="legacy_target_experiment_commit_write_forbidden",
-        ):
-            accept_legacy = (
-                runtime.owners.research_graph
-                .accept_target_commit_from_measurement_closure
-            )
-            accept_legacy(
-                target_ref=target.target_ref,
-                target_execution_closure_ref="legacy-experiment-closure",
-                target_execution_closure_receipt=AcceptanceReceipt(
-                    issuer="agent_runtime",
-                    kind="legacy_experiment_execution_closure",
-                    receipt_ref="legacy-experiment-closure-receipt",
-                    subject_ref="legacy-experiment-closure",
-                    payload_hash=canonical_hash(
-                        {"legacy": "experiment-closure"}
-                    ),
-                ),
-                implementation_revision_ref=(
-                    measurement.implementation_revision_ref
-                ),
-                implementation_provenance_refs=(
-                    measurement.implementation_provenance_refs
-                ),
-                held_fixed_bindings=measurement.held_fixed_bindings,
-                code_review=measurement.code_review,
-                result_review=measurement.result_review,
-                protocol_internal_parts=measurement.protocol_internal_parts,
-                protocol_aggregation_proof=(
-                    measurement.protocol_aggregation_proof
-                ),
-                result_content={"result_disposition": "positive"},
-            )
-
-        with sqlite3.connect(data_root / "meta-research.sqlite3") as connection:
-            after = (
-                connection.execute(
-                    "SELECT revision, target_commit_count FROM "
-                    "research_graph_state WHERE singleton = 'owner'"
-                ).fetchone(),
-                connection.execute(
-                    "SELECT COUNT(*) FROM rg_target_commits"
-                ).fetchone(),
-            )
-        assert after == before
-    finally:
-        runtime.close()
+def test_formal_v3_exposes_no_legacy_experiment_commit_write() -> None:
+    assert not hasattr(
+        SQLiteResearchGraph,
+        "accept_target_commit_from_measurement_closure",
+    )
 
 
 def test_bundle_report_rejects_legacy_or_non_exact_target_commit_closure(

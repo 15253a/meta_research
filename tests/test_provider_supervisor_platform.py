@@ -11,13 +11,6 @@ from pathlib import Path
 import pytest
 
 import meta_research.provider_supervisor as provider_supervisor_module
-from meta_research.experiment_provider_supervisor import (
-    REQUEST_SCHEMA as EXPERIMENT_REQUEST_SCHEMA,
-    ensure_transport_key as ensure_experiment_transport_key,
-    read_signed as read_experiment_signed,
-    supervise as supervise_experiment,
-    write_signed as write_experiment_signed,
-)
 from meta_research.provider_supervisor import (
     SUPERVISOR_EXIT_SCHEMA_V2,
     SUPERVISOR_REQUEST_SCHEMA_V2,
@@ -90,7 +83,7 @@ class _FakeWindowsFunction:
         return self._implementation(*args)
 
 
-def test_provider_supervisor_modules_import_without_fcntl() -> None:
+def test_provider_supervisor_imports_without_fcntl() -> None:
     script = """
 import builtins
 import os
@@ -104,11 +97,7 @@ for posix_only_name in ("fchmod", "getpgid", "getpgrp", "getuid", "killpg"):
     if hasattr(os, posix_only_name):
         delattr(os, posix_only_name)
 from meta_research.provider_supervisor import SupervisorFileLock
-from meta_research.experiment_provider_supervisor import supervise
-from meta_research.composition import build_production_runtime
 assert SupervisorFileLock.__name__ == "SupervisorFileLock"
-assert callable(supervise)
-assert callable(build_production_runtime)
 """
 
     completed = subprocess.run(
@@ -436,135 +425,6 @@ def test_windows_never_started_proof_uses_the_operation_lock_not_proc(
         platform_name="nt",
         supervisor_lock_held=lambda _path: False,
     )
-
-
-def test_experiment_supervisor_honors_sealed_stop_before_provider_spawn(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / "experiment"
-    operation = workspace / "provider-operations" / "operation"
-    operation.mkdir(parents=True)
-    key = ensure_experiment_transport_key(workspace)
-    invocation_hash = "c" * 64
-    request_path = operation / "supervisor-request.json"
-    spawned_marker = operation / "provider-was-spawned"
-    (operation / "stdin.json").write_text("{}", encoding="utf-8")
-    write_experiment_signed(
-        request_path,
-        {
-            "schema_ref": EXPERIMENT_REQUEST_SCHEMA,
-            "invocation_hash": invocation_hash,
-            "argv": [
-                sys.executable,
-                "-c",
-                (
-                    "from pathlib import Path; "
-                    f"Path({str(spawned_marker)!r}).touch()"
-                ),
-            ],
-            "wall_timeout_seconds": 1.0,
-            "stdout_max_bytes": 4096,
-            "stdout_max_records": 32,
-            "result_max_bytes": 4096,
-            "observation_max_count": 32,
-            "telemetry_cadence_seconds": 0.05,
-            "stdin_path": str(operation / "stdin.json"),
-            "stdout_path": str(operation / "stdout.bin"),
-            "observation_path": str(operation / "observations.jsonl"),
-            "started_path": str(operation / "provider-started.json"),
-            "ready_path": str(operation / "supervisor-ready.json"),
-            "receipt_path": str(operation / "supervisor-exit.json"),
-        },
-        key,
-    )
-    write_supervisor_stop_request(
-        operation / "supervisor-stop.json",
-        key=key,
-        invocation_hash=invocation_hash,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "meta_research.experiment_provider_supervisor",
-            str(request_path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-
-    receipt = read_experiment_signed(operation / "supervisor-exit.json", key)
-    assert (completed.returncode, completed.stderr) == (0, "")
-    assert receipt["termination_reason"] == "stopped"
-    assert not spawned_marker.exists()
-    assert not (operation / "provider-started.json").exists()
-
-
-def test_windows_experiment_waits_for_job_empty_before_terminal_receipt(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / "experiment-job"
-    operation = workspace / "provider-operations" / "operation"
-    operation.mkdir(parents=True)
-    key = ensure_experiment_transport_key(workspace)
-    invocation_hash = "d" * 64
-    request_path = operation / "supervisor-request.json"
-    receipt_path = operation / "supervisor-exit.json"
-    (operation / "stdin.json").write_text("{}", encoding="utf-8")
-    write_experiment_signed(
-        request_path,
-        {
-            "schema_ref": EXPERIMENT_REQUEST_SCHEMA,
-            "invocation_hash": invocation_hash,
-            "argv": ["provider"],
-            "wall_timeout_seconds": 1.0,
-            "stdout_max_bytes": 4096,
-            "stdout_max_records": 32,
-            "result_max_bytes": 4096,
-            "observation_max_count": 32,
-            "telemetry_cadence_seconds": 0.05,
-            "stdin_path": str(operation / "stdin.json"),
-            "stdout_path": str(operation / "stdout.bin"),
-            "observation_path": str(operation / "observations.jsonl"),
-            "started_path": str(operation / "provider-started.json"),
-            "ready_path": str(operation / "supervisor-ready.json"),
-            "receipt_path": str(receipt_path),
-        },
-        key,
-    )
-    job = _FakeWindowsJob()
-    receipt_absent_before_cancel: list[bool] = []
-
-    def cancel_after_root_exit() -> None:
-        if not job.spawned.wait(timeout=1):
-            return
-        receipt_absent_before_cancel.append(not receipt_path.exists())
-        write_supervisor_stop_request(
-            operation / "supervisor-stop.json",
-            key=key,
-            invocation_hash=invocation_hash,
-        )
-
-    canceller = threading.Thread(target=cancel_after_root_exit)
-    canceller.start()
-    try:
-        supervise_experiment(
-            request_path,
-            process_platform=ProviderProcessPlatform(platform_name="nt"),
-            provider_job_factory=lambda: job,
-        )
-    finally:
-        canceller.join(timeout=2)
-
-    receipt = read_experiment_signed(receipt_path, key)
-    assert receipt_absent_before_cancel == [True]
-    assert receipt["termination_reason"] == "stopped"
-    assert job.terminated
-    assert job.active_process_count() == 0
-    assert job.closed
 
 
 def test_windows_provider_waits_for_job_empty_before_terminal_receipt(

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import time
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -31,10 +29,6 @@ from meta_research.bundle_target_contract import (
     normalized_completion_contract_to_dict,
 )
 from meta_research.composition import build_production_runtime
-from meta_research.experiment_contract import (
-    ExperimentIntent,
-    ExperimentProviderUnavailable,
-)
 from meta_research.harness import HarnessProbeRequest
 from meta_research.owners.agent_runtime import BundleRuntimeBinding
 from meta_research.owners.agent_runtime_harness import TargetRootCompletionEvidence
@@ -65,10 +59,6 @@ from test_public_plan_stage import (
     _confirm_direct_quest,
     _finish_idea_stage,
     _runtime,
-)
-from test_public_experiment_measurement import (
-    _DeterministicExperimentProvider,
-    _experiment_write_counts,
 )
 from test_harness_full_conformance import (
     _FullConformanceAdapter,
@@ -707,34 +697,6 @@ class _ProtectedSealingBundleSkill(_DeterministicBundleSkill):
         return super().propose_target_batch(request)
 
 
-class _FailAfterFirstTargetProvider(_DeterministicExperimentProvider):
-    def execute(self, request, observe):
-        if self.execute_calls >= 1:
-            self.execute_calls += 1
-            self.requests.append(request)
-            raise ExperimentProviderUnavailable(
-                "experiment_provider_failed",
-                durable_outcome="terminal",
-            )
-        return super().execute(request, observe)
-
-
-class _DispositionExperimentProvider(_DeterministicExperimentProvider):
-    def __init__(self, disposition: str) -> None:
-        super().__init__()
-        self._disposition = disposition
-
-    def execute(self, request, observe):
-        result = super().execute(request, observe)
-        return replace(
-            result,
-            result_content={
-                **result.result_content,
-                "result_disposition": self._disposition,
-            },
-        )
-
-
 class _FixtureTargetCommitEvidenceAuthority:
     """Accepted upstream evidence fixture for the isolated no-gap branch."""
 
@@ -797,7 +759,6 @@ def _bundle_runtime(
     no_gap: bool = False,
     target_commit_evidence_authority=None,
     bundle_skill_provider=None,
-    experiment_provider=None,
     plan_skill_provider=None,
     harness_ready: bool = True,
     verify_target_candidate_proofs: bool = True,
@@ -816,7 +777,6 @@ def _bundle_runtime(
         ),
         bundle_skill_provider=(bundle_skill_provider or _DeterministicBundleSkill()),
         target_commit_evidence_authority=target_commit_evidence_authority,
-        experiment_provider=experiment_provider,
         harness_adapters=(
             _FullConformanceAdapter("codex"),
             _FullConformanceAdapter("claude"),
@@ -1164,43 +1124,6 @@ def test_bundle_ready_full_conformance_allows_provider_entry(tmp_path: Path) -> 
         assert provider.generate_calls == 1
     finally:
         runtime.close()
-
-
-def _accepted_result_content(runtime, evaluation_attempt_ref: str) -> dict[str, object]:
-    roles = runtime.owners.research_graph.query_experiment_asset_roles(
-        evaluation_attempt_ref
-    )
-    result_roles = [role for role in roles if role.role == "result_content"]
-    assert len(result_roles) == 1
-    materialized = runtime.owners.research_memory.materialize_asset(
-        result_roles[0].binding.version_ref
-    )
-    value = json.loads(materialized.content.decode("utf-8"))
-    assert isinstance(value, dict)
-    return value
-
-
-def _forged_legacy_target_experiment_intent(
-    *,
-    quest_ref: str,
-    target_ref: str,
-    request_kind: str = "retrain",
-    source_variant_run_ref: str | None = None,
-    selected_checkpoint_role_refs: tuple[str, ...] = (),
-) -> ExperimentIntent:
-    """Build the retired source wrapper solely to exercise production guards."""
-
-    return ExperimentIntent(
-        execution_request_ref=f"bundle-target-{target_ref}",
-        quest_ref=quest_ref,
-        title="forged legacy formal Target",
-        hypothesis="A formal Target must not enter standalone Experiment custody.",
-        variant_parameter=-0.25,
-        sample_count=8,
-        request_kind=request_kind,
-        source_variant_run_ref=source_variant_run_ref,
-        selected_checkpoint_role_refs=selected_checkpoint_role_refs,
-    )
 
 
 def _grant_request_capability(runtime, request: dict[str, object]) -> dict[str, object]:
@@ -1607,12 +1530,10 @@ def test_rolling_worker_waits_for_native_commit_without_legacy_execution(
     tmp_path: Path,
 ) -> None:
     bundle_skill = _RollingBundleSkill()
-    experiment_provider = _DeterministicExperimentProvider()
     runtime = _bundle_runtime(
         tmp_path / "bundle-worker-rolling-targets",
         plan_skill_provider=_TwoGapPlanSkill(),
         bundle_skill_provider=bundle_skill,
-        experiment_provider=experiment_provider,
     )
     try:
         _confirm_direct_quest(runtime)
@@ -1644,9 +1565,6 @@ def test_rolling_worker_waits_for_native_commit_without_legacy_execution(
             request_ref
         ) is None
         assert _legacy_target_write_counts(runtime) == before
-        assert experiment_provider.runtime_binding_calls == 0
-        assert experiment_provider.implementation_bundle_calls == 0
-        assert experiment_provider.execute_calls == 0
     finally:
         runtime.close()
 
@@ -1701,80 +1619,6 @@ def test_target_graph_must_match_the_exact_executed_target_plan(
         assert runtime.bundle_stage.process_once()
         assert runtime.bundle_stage.query_current()["target_graph"]["status"] == (
             "accepted"
-        )
-    finally:
-        runtime.close()
-
-
-def test_standalone_experiment_cannot_be_promoted_to_formal_target_authority(
-    tmp_path: Path,
-) -> None:
-    runtime = _bundle_runtime(tmp_path / "bundle-unrelated-target-run")
-    try:
-        _confirm_direct_quest(runtime)
-        _finish_idea_stage(runtime)
-        _finish_plan_stage(runtime)
-        for _step in range(10):
-            assert runtime.bundle_stage.process_once()
-            current = runtime.bundle_stage.query_current()
-            if current["target_graph"]["status"] == "accepted":
-                break
-        else:
-            raise AssertionError("Bundle did not accept TargetGraph")
-        graph = runtime.owners.research_graph.query_target_graph(
-            current["stage_run_request"]["request_ref"]
-        )
-        assert graph is not None
-        target = graph.targets[0]
-        unrelated = runtime.experiment.start(
-            ExperimentIntent(
-                execution_request_ref=f"unrelated-{target.target_ref}",
-                quest_ref=graph.quest_ref,
-                title="Unrelated accepted experiment",
-                hypothesis="This experiment does not implement the TargetSpec.",
-                variant_parameter=0.5,
-                sample_count=8,
-            ),
-            "bundle-unrelated-experiment",
-        )
-        identities = unrelated["identities"]
-        execution = unrelated["execution"]
-        intent = unrelated["intent"]
-        assert isinstance(identities, dict)
-        assert isinstance(execution, dict)
-        assert isinstance(intent, dict)
-        domain = runtime.owners.research_graph.query_experiment(
-            identities["evaluation_attempt_ref"]
-        )
-        assert domain is not None
-        assert runtime.owners.agent_runtime.query_experiment_run(
-            identities["evaluation_attempt_ref"]
-        ) is not None
-        before = _legacy_target_write_counts(runtime)
-        before_feed = runtime.feed.current_revision()
-        with pytest.raises(
-            OwnerConflict, match="legacy_target_run_admission_write_forbidden"
-        ):
-            runtime.owners.agent_runtime.admit_target_run(
-                target_ref=target.target_ref,
-                target_spec_hash=target.spec_hash,
-                graph_ref=graph.graph_ref,
-                stage_request_ref=graph.request_ref,
-                quest_ref=graph.quest_ref,
-                target_run_ref=execution["run_ref"],
-                evaluation_attempt_ref=identities["evaluation_attempt_ref"],
-                execution_request_ref=intent["execution_request_ref"],
-                definition_hash=domain.execution_request.definition_hash,
-                idempotency_key="bundle-unrelated-target-admission",
-            )
-        assert _legacy_target_write_counts(runtime) == before
-        assert runtime.feed.current_revision() == before_feed
-        assert runtime.owners.agent_runtime.query_target_run_admission(
-            target.target_ref
-        ) is None
-        assert (
-            runtime.owners.research_graph.query_target_run_binding(target.target_ref)
-            is None
         )
     finally:
         runtime.close()
@@ -2351,82 +2195,12 @@ def test_bundle_target_batch_restart_reconciles_committed_owner_proposal(
         restarted.close()
 
 
-def test_nonfrontier_formal_target_legacy_projection_fails_before_side_effect(
-    tmp_path: Path,
-) -> None:
-    runtime = _bundle_runtime(
-        tmp_path / "bundle-dependent-target-frontier",
-        bundle_skill_provider=_TwoTargetBundleSkill(),
-    )
-    try:
-        _confirm_direct_quest(runtime)
-        _finish_idea_stage(runtime)
-        _finish_plan_stage(runtime)
-        for _step in range(12):
-            assert runtime.bundle_stage.process_once()
-            current = runtime.bundle_stage.query_current()
-            if current["target_graph"]["status"] != "accepted":
-                continue
-            run = runtime.owners.agent_runtime.query_bundle_stage_run(
-                current["stage_run_request"]["request_ref"]
-            )
-            if (
-                run is not None
-                and runtime.owners.agent_runtime.query_bundle_dispatch_decisions(
-                    run.run_ref
-                )
-            ):
-                break
-        else:
-            raise AssertionError("Bundle did not dispatch its live frontier")
-
-        graph = runtime.owners.research_graph.query_target_graph(
-            current["stage_run_request"]["request_ref"]
-        )
-        assert graph is not None
-        predecessor, dependent = graph.targets
-        assert dependent.dependency_refs == (predecessor.target_ref,)
-        assert runtime.owners.research_graph.query_target_commits(graph.graph_ref) == ()
-        assert current["target_graph"]["frontier"] == [predecessor.target_ref]
-
-        intent = _forged_legacy_target_experiment_intent(
-            quest_ref=graph.quest_ref,
-            target_ref=dependent.target_ref,
-        )
-        assert intent.execution_request_ref == f"bundle-target-{dependent.target_ref}"
-        before = _experiment_write_counts(runtime)
-        before_feed = runtime.feed.current_revision()
-        with pytest.raises(
-            OwnerConflict, match="bundle_target_experiment_write_forbidden"
-        ):
-            runtime.experiment.start(
-                intent,
-                "bundle-dependent-target-preflight",
-            )
-        assert _experiment_write_counts(runtime) == before
-        assert runtime.feed.current_revision() == before_feed
-        assert (
-            runtime.owners.agent_runtime.query_target_run_admission(
-                dependent.target_ref
-            )
-            is None
-        )
-        assert (
-            runtime.owners.research_graph.query_target_run_binding(dependent.target_ref)
-            is None
-        )
-    finally:
-        runtime.close()
-
-
 def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
     tmp_path: Path,
 ) -> None:
-    provider = _DeterministicExperimentProvider()
     runtime = _bundle_runtime(
         tmp_path / "bundle-high-risk",
         bundle_skill_provider=_HighRiskBundleSkill(),
-        experiment_provider=provider,
     )
     try:
         _confirm_direct_quest(runtime)
@@ -2451,7 +2225,6 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         assert target["status"] == "blocked"
         assert target["blocker"] == {"code": "target_high_risk_authorization_required"}
         assert target["target_run_ref"] is None
-        assert provider.execute_calls == 0
         request = requests[0]
         assert request["target_assertion"]["target_ref"] == target["target_ref"]
         projection = runtime.owners.research_graph.query_target_candidate_projection(
@@ -2462,31 +2235,9 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
             projection.projection_digest
         )
 
-        graph = runtime.owners.research_graph.query_target_graph(
-            current["stage_run_request"]["request_ref"]
-        )
-        assert graph is not None
-        accepted_target = graph.targets[0]
-        compatibility_intent = _forged_legacy_target_experiment_intent(
-            quest_ref=graph.quest_ref,
-            target_ref=accepted_target.target_ref,
-        )
-        assert compatibility_intent.execution_request_ref.startswith("bundle-target-")
-        before_experiment = _experiment_write_counts(runtime)
-        before_feed = runtime.feed.current_revision()
-        with pytest.raises(
-            OwnerConflict, match="bundle_target_experiment_write_forbidden"
-        ):
-            runtime.experiment.start(
-                compatibility_intent,
-                "bundle-high-risk-unauthorized-preflight",
-            )
-        assert _experiment_write_counts(runtime) == before_experiment
-        assert runtime.feed.current_revision() == before_feed
         assert runtime.owners.agent_runtime.query_target_launch_ack(
-            accepted_target.target_ref
+            target["target_ref"]
         ) is None
-        assert provider.execute_calls == 0
 
         authorization = _grant_request_capability(runtime, request)
         for _step in range(12):
@@ -2531,9 +2282,6 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         assert runtime.owners.research_graph.query_target_run_binding(
             target["target_ref"]
         ) is None
-        assert provider.runtime_binding_calls == 0
-        assert provider.implementation_bundle_calls == 0
-        assert provider.execute_calls == 0
         assert runtime.owners.agent_runtime.query_target_launch_ack(
             target["target_ref"]
         ) == ack
@@ -2541,179 +2289,10 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         runtime.close()
 
 
-def test_live_formal_target_rejects_experiment_namespace_before_side_effect(
-    tmp_path: Path,
-) -> None:
-    provider = _DeterministicExperimentProvider()
-    runtime = _bundle_runtime(
-        tmp_path / "bundle-target-legacy-rejected",
-        experiment_provider=provider,
-    )
-    try:
-        _confirm_direct_quest(runtime)
-        _finish_idea_stage(runtime)
-        _finish_plan_stage(runtime)
-        for _step in range(12):
-            runtime.bundle_stage.process_once()
-            current = runtime.bundle_stage.query_current()
-            if current["target_graph"]["status"] == "accepted":
-                break
-        else:
-            raise AssertionError("Bundle did not accept its Target graph")
-
-        graph = runtime.owners.research_graph.query_target_graph(
-            current["stage_run_request"]["request_ref"]
-        )
-        assert graph is not None
-        target = graph.targets[0]
-        intent = _forged_legacy_target_experiment_intent(
-            quest_ref=graph.quest_ref,
-            target_ref=target.target_ref,
-        )
-        before = _experiment_write_counts(runtime)
-        before_feed = runtime.feed.current_revision()
-        with pytest.raises(
-            OwnerConflict, match="bundle_target_experiment_write_forbidden"
-        ):
-            runtime.experiment.start(intent, "legacy-live-target-start")
-        assert _experiment_write_counts(runtime) == before
-        assert runtime.feed.current_revision() == before_feed
-        assert runtime.owners.research_graph.query_target_commits(graph.graph_ref) == ()
-        assert provider.runtime_binding_calls == 0
-        assert provider.implementation_bundle_calls == 0
-        assert provider.execute_calls == 0
-    finally:
-        runtime.close()
-
-
-def test_standalone_remeasure_inputs_cannot_authorize_a_formal_target(
-    tmp_path: Path,
-) -> None:
-    provider = _DeterministicExperimentProvider()
-    skill = _RemeasureBundleSkill()
-    runtime = _bundle_runtime(
-        tmp_path / "bundle-target-remeasure",
-        bundle_skill_provider=skill,
-        experiment_provider=provider,
-    )
-    try:
-        quest = _confirm_direct_quest(runtime)
-        source = runtime.experiment.start(
-            ExperimentIntent(
-                execution_request_ref="bundle-remeasure-source",
-                quest_ref=quest["quest_ref"],
-                title="先形成一个可复用的 VariantRun",
-                hypothesis="复测应复用这次状态形成，而不是再次训练。",
-                variant_parameter=-0.25,
-                sample_count=8,
-            ),
-            "bundle-remeasure-source",
-        )
-        for _step in range(3):
-            assert runtime.experiment.process_once()
-        source_attempt_ref = source["identities"]["evaluation_attempt_ref"]
-        source_domain = runtime.owners.research_graph.query_experiment(
-            source_attempt_ref
-        )
-        assert source_domain is not None
-        assert source_domain.formal_measurement_status == "accepted"
-        source_roles = runtime.owners.research_graph.query_experiment_asset_roles(
-            source_attempt_ref
-        )
-        skill.source_variant_run_ref = source["identities"]["variant_run_ref"]
-        skill.checkpoint_role_refs = tuple(
-            role.role_ref for role in source_roles if role.role == "checkpoint_artifact"
-        )
-        assert skill.checkpoint_role_refs
-
-        _finish_idea_stage(runtime)
-        _finish_plan_stage(runtime)
-        for _step in range(12):
-            runtime.bundle_stage.process_once()
-            current = runtime.bundle_stage.query_current()
-            if current["target_graph"]["status"] == "accepted":
-                break
-        else:
-            raise AssertionError("Bundle did not accept the remeasurement Target")
-
-        graph = runtime.owners.research_graph.query_target_graph(
-            current["stage_run_request"]["request_ref"]
-        )
-        assert graph is not None
-        target = graph.targets[0]
-        intent = _forged_legacy_target_experiment_intent(
-            quest_ref=graph.quest_ref,
-            target_ref=target.target_ref,
-            request_kind="remeasure",
-            source_variant_run_ref=skill.source_variant_run_ref,
-            selected_checkpoint_role_refs=skill.checkpoint_role_refs,
-        )
-        assert isinstance(intent, ExperimentIntent)
-        assert intent.request_kind == "remeasure"
-        assert intent.source_variant_run_ref == skill.source_variant_run_ref
-        assert intent.selected_checkpoint_role_refs == skill.checkpoint_role_refs
-        provider_request_count = len(provider.requests)
-        before = _experiment_write_counts(runtime)
-        with pytest.raises(
-            OwnerConflict, match="bundle_target_experiment_write_forbidden"
-        ):
-            runtime.experiment.start(intent, "legacy-formal-remeasure-start")
-        assert _experiment_write_counts(runtime) == before
-        assert len(provider.requests) == provider_request_count
-        assert runtime.owners.research_graph.query_target_commits(graph.graph_ref) == ()
-    finally:
-        runtime.close()
-
-
-@pytest.mark.parametrize("disposition", ("nonsignificant", "denied", "uncertain"))
-def test_standalone_nonpositive_experiment_outcomes_remain_available(
-    tmp_path: Path,
-    disposition: str,
-) -> None:
-    runtime = _bundle_runtime(
-        tmp_path / f"bundle-disposition-{disposition}",
-        experiment_provider=_DispositionExperimentProvider(disposition),
-    )
-    try:
-        quest = _confirm_direct_quest(runtime)
-        started = runtime.experiment.start(
-            ExperimentIntent(
-                execution_request_ref=f"standalone-disposition-{disposition}",
-                quest_ref=quest["quest_ref"],
-                title=f"standalone {disposition}",
-                hypothesis="Standalone Experiment compatibility remains isolated.",
-                variant_parameter=-0.25,
-                sample_count=8,
-            ),
-            f"standalone-disposition-{disposition}",
-        )
-        for _step in range(3):
-            assert runtime.experiment.process_once()
-        attempt_ref = started["identities"]["evaluation_attempt_ref"]
-        domain = runtime.owners.research_graph.query_experiment(attempt_ref)
-        assert domain is not None
-        assert domain.formal_measurement_status == "accepted"
-        assert _accepted_result_content(runtime, attempt_ref)[
-            "result_disposition"
-        ] == disposition
-        with runtime._database.read() as connection:
-            assert int(
-                connection.execute(
-                    text("SELECT COUNT(*) FROM rg_target_commits")
-                ).scalar_one()
-            ) == 0
-    finally:
-        runtime.close()
-
-
 def test_bundle_cannot_stage_commit_while_native_target_is_pending(
     tmp_path: Path,
 ) -> None:
-    provider = _DeterministicExperimentProvider()
-    runtime = _bundle_runtime(
-        tmp_path / "bundle-native-target-pending",
-        experiment_provider=provider,
-    )
+    runtime = _bundle_runtime(tmp_path / "bundle-native-target-pending")
     try:
         _confirm_direct_quest(runtime)
         _finish_idea_stage(runtime)
@@ -2734,9 +2313,6 @@ def test_bundle_cannot_stage_commit_while_native_target_is_pending(
         assert current["target_commits"] == []
         assert current["stage_commit"] is None
         assert _legacy_target_write_counts(runtime) == before
-        assert provider.runtime_binding_calls == 0
-        assert provider.implementation_bundle_calls == 0
-        assert provider.execute_calls == 0
     finally:
         runtime.close()
 
@@ -2932,45 +2508,5 @@ def test_legacy_target_run_binding_is_unconditionally_read_only(
         assert runtime.owners.research_graph.query_target_run_binding(
             target.target_ref
         ) is None
-    finally:
-        runtime.close()
-
-
-def test_experiment_provider_failure_cannot_drive_formal_target_state(
-    tmp_path: Path,
-) -> None:
-    provider = _FailAfterFirstTargetProvider()
-    runtime = _bundle_runtime(
-        tmp_path / "bundle-partial-failure",
-        bundle_skill_provider=_TwoTargetBundleSkill(),
-        experiment_provider=provider,
-    )
-    try:
-        _confirm_direct_quest(runtime)
-        _finish_idea_stage(runtime)
-        _finish_plan_stage(runtime)
-        before = _legacy_target_write_counts(runtime)
-        for _step in range(20):
-            runtime.bundle_stage.process_once()
-            current = runtime.bundle_stage.query_current()
-            targets = current["target_graph"].get("targets", [])
-            if targets and runtime.owners.agent_runtime.query_target_launch_ack(
-                targets[0]["target_ref"]
-            ) is not None:
-                break
-        else:
-            raise AssertionError("Bundle did not admit its native frontier")
-
-        targets = current["target_graph"]["targets"]
-        assert len(targets) == 2
-        assert current["target_graph"]["frontier"] == [targets[0]["target_ref"]]
-        assert current["target_commits"] == []
-        assert current["baseline_pool"] == []
-        assert current["stage_commit"] is None
-        assert _legacy_target_write_counts(runtime) == before
-        assert provider.runtime_binding_calls == 0
-        assert provider.implementation_bundle_calls == 0
-        assert provider.execute_calls == 0
-        assert provider.requests == []
     finally:
         runtime.close()

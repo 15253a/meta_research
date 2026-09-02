@@ -28,11 +28,6 @@ from meta_research.deepfetch import (
     DeepFetchRunRequest,
 )
 from meta_research.feed import DurableFeed
-from meta_research.experiment import (
-    BuiltinMicroExperimentProvider,
-    ExperimentProvider,
-    ExperimentService,
-)
 from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
 from meta_research.harness import HarnessRuntime
 from meta_research.harness_control import DurableHarnessOperationCanceller
@@ -259,7 +254,6 @@ class ProductionRuntime:
     autonomous_creation: AutonomousCreationService
     quest_completion: QuestCompletionService
     deepfetch: FirstQuestionDeepFetchWorker
-    experiment: ExperimentService
     writing: WritingReportService
     harnesses: HarnessRuntime
     target_run_authorities: TargetRunAuthorities
@@ -476,7 +470,6 @@ def build_production_runtime(
     target_commit_evidence_authority: TargetCommitEvidenceAuthority | None = None,
     deepfetch_provider: DeepFetchProvider | None = None,
     acquisition_provider: AcquisitionProvider | None = None,
-    experiment_provider: ExperimentProvider | None = None,
     writing_skill_provider: WritingSkillProvider | None = None,
     writing_delivery_provider_registry: WritingDeliveryProviderRegistry | None = None,
     writing_renderer_registry: WritingRendererRegistry | None = None,
@@ -573,9 +566,6 @@ def build_production_runtime(
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
     )
-    experiment_provider = experiment_provider or BuiltinMicroExperimentProvider(
-        data_root.run / "experiment-provider"
-    )
     writing_skill_provider = writing_skill_provider or CodexWritingSkillAdapter(
         data_root.root / "writing-skill-provider",
         executable=codex_executable,
@@ -635,7 +625,6 @@ def build_production_runtime(
         deepfetch_request_verifier=deepfetch_request_receipts,
         acquisition_private_root=data_root.run / "acquisition-sessions",
         human_response_verifier=human_response_verifier,
-        experiment_binding_verifier=research_graph_receipts,
         bundle_report_evidence_verifier=research_graph_receipts,
         reasoning_outcome_verifier=research_graph_receipts,
         writing_delivery_provider_registry=writing_delivery_provider_registry,
@@ -686,10 +675,6 @@ def build_production_runtime(
     agent_runtime.bind_provider_quiescence_driver(
         deepfetch_provider,
         unit_kinds=("deepfetch",),
-    )
-    agent_runtime.bind_provider_quiescence_driver(
-        experiment_provider,
-        unit_kinds=("experiment",),
     )
     agent_runtime.bind_provider_quiescence_driver(
         writing_skill_provider,
@@ -1009,12 +994,6 @@ def build_production_runtime(
         research_memory,
         deepfetch_provider,
     )
-    experiment = ExperimentService(
-        research_graph,
-        agent_runtime,
-        research_memory,
-        experiment_provider,
-    )
     target_run_runtime = TargetRunRuntime(
         agent_runtime=owners.agent_runtime,
         research_graph=owners.research_graph,
@@ -1061,7 +1040,6 @@ def build_production_runtime(
         reasoning_stage=reasoning_stage,
         autonomous_creation=autonomous_creation,
         quest_completion=quest_completion,
-        experiment=experiment,
         writing=writing,
         harnesses=harnesses,
     )
@@ -1076,7 +1054,6 @@ def build_production_runtime(
         reasoning_skill_provider,
         deepfetch_provider,
         acquisition_provider,
-        experiment_provider,
         writing_skill_provider,
     ):
         if callable(getattr(provider, "request_stop", None)) and not any(
@@ -1096,7 +1073,6 @@ def build_production_runtime(
         autonomous_creation=autonomous_creation,
         quest_completion=quest_completion,
         deepfetch=deepfetch,
-        experiment=experiment,
         writing=writing,
         harnesses=harnesses,
         target_run_authorities=TargetRunAuthorities(

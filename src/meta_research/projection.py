@@ -20,7 +20,6 @@ from meta_research.owners.research_memory import (
 if TYPE_CHECKING:
     from meta_research.autonomous_creation import AutonomousCreationService
     from meta_research.bundle_stage import BundleStageWorker
-    from meta_research.experiment import ExperimentService
     from meta_research.harness import HarnessRuntime
     from meta_research.idea_stage import IdeaStageWorker
     from meta_research.plan_stage import PlanStageWorker
@@ -54,7 +53,6 @@ class PublicProjection:
         human_collaboration: HumanCollaborationInterface,
         idea_stage: IdeaStageWorker | None = None,
         plan_stage: PlanStageWorker | None = None,
-        experiment: ExperimentService | None = None,
         bundle_stage: BundleStageWorker | None = None,
         reasoning_stage: ReasoningStageWorker | None = None,
         autonomous_creation: AutonomousCreationService | None = None,
@@ -75,7 +73,6 @@ class PublicProjection:
         self._reasoning_stage = reasoning_stage
         self._autonomous_creation = autonomous_creation
         self._quest_completion = quest_completion
-        self._experiment = experiment
         self._writing = writing
         self._harnesses = harnesses
         self._interfaces = {
@@ -534,9 +531,6 @@ class PublicProjection:
                 if self._quest_completion is None
                 else self._quest_completion.query_current()
             )
-            current_experiment = (
-                None if self._experiment is None else self._experiment.query_current()
-            )
             current_question = _query_foreground_question(
                 self._research_graph,
                 self._research_memory,
@@ -854,10 +848,6 @@ class PublicProjection:
                 safe_runnable_basis,
             ),
             "research_control": research_control,
-            "experiment": {
-                "status": "idle" if current_experiment is None else "active",
-                "current": current_experiment,
-            },
             "writing": writing,
             "harnesses": harnesses,
             "runtime_observability": runtime_observability,

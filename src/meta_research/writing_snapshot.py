@@ -6,16 +6,12 @@ from meta_research.bundle_protocol import projection_plain_value
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.common import OwnerConflict, canonical_hash
-from meta_research.owners.research_graph import (
-    ResearchGraphInterface,
-    WritingExperimentTerminalCut,
-)
+from meta_research.owners.research_graph import ResearchGraphInterface
 from meta_research.owners.research_memory import ResearchMemoryInterface
 from meta_research.writing_contract import WRITING_RESEARCH_SNAPSHOT_SCHEMA
 
 
 _MAX_CONSISTENCY_ATTEMPTS = 3
-_MAX_SNAPSHOT_EXPERIMENTS = 4096
 
 
 class WritingResearchSnapshotReader:
@@ -34,26 +30,17 @@ class WritingResearchSnapshotReader:
         self._agent_runtime = agent_runtime
 
     def capture(self, quest_ref: str) -> dict[str, object]:
-        experiment_cut = (
-            self._research_graph.query_writing_experiment_terminal_cut(quest_ref)
-        )
         for _attempt in range(_MAX_CONSISTENCY_ATTEMPTS):
             owner_revisions = self._snapshot_metadata_revisions()
-            candidate = self._capture_once(
-                quest_ref, owner_revisions, experiment_cut
-            )
-            # Global Owner revisions also carry unrelated asset intake, live
-            # experiment admission, Target stdout, and checkpoint progress.
+            candidate = self._capture_once(quest_ref, owner_revisions)
+            # Global Owner revisions also carry unrelated asset intake, Target
+            # stdout, and checkpoint progress.
             # Re-read only the exact accepted facts consumed by Writing: a
             # meaningful Quest/Stage/Bundle fact already inside this cut
             # changes this value, while progress outside the frozen basis does
-            # not. A newly terminal Experiment belongs to the next Snapshot;
-            # this capture exact-rechecks only its one closed RG identity cut.
             # Cross-owner receipt checks inside _capture_once still reject
             # partial acceptance facts.
-            verified = self._capture_once(
-                quest_ref, owner_revisions, experiment_cut
-            )
+            verified = self._capture_once(quest_ref, owner_revisions)
             if verified == candidate:
                 return verified
         raise OwnerConflict("writing_snapshot_consistency_unavailable")
@@ -71,7 +58,6 @@ class WritingResearchSnapshotReader:
         self,
         quest_ref: str,
         owner_revisions: dict[str, int],
-        experiment_cut: WritingExperimentTerminalCut,
     ) -> dict[str, object]:
         quest = self._research_graph.query_quest_by_ref(quest_ref)
         if quest is None:
@@ -129,9 +115,7 @@ class WritingResearchSnapshotReader:
             },
             "questions": questions,
             "accepted_sources": sources,
-            "advancement": self._advancement_snapshot(
-                quest.initialization_id, experiment_cut
-            ),
+            "advancement": self._advancement_snapshot(quest.initialization_id),
             "owner_revisions": owner_revisions,
         }
         basis_hash = canonical_hash(payload)
@@ -144,15 +128,12 @@ class WritingResearchSnapshotReader:
     def _advancement_snapshot(
         self,
         initialization_id: str,
-        experiment_cut: WritingExperimentTerminalCut,
     ) -> dict[str, object]:
-        experiments = self._experiment_closure(experiment_cut)
         cycle = self._advancement_engine.query_initial_cycle(initialization_id)
         if cycle is None:
             return {
                 "cycle": None,
                 "stages": self._empty_stages(),
-                "experiments": experiments,
             }
 
         stages = self._empty_stages()
@@ -178,7 +159,6 @@ class WritingResearchSnapshotReader:
                 "receipt": cycle.receipt.as_public_dict(),
             },
             "stages": stages,
-            "experiments": experiments,
         }
 
     @staticmethod
@@ -523,68 +503,3 @@ class WritingResearchSnapshotReader:
             ),
             "receipt": commit.receipt.as_public_dict(),
         }
-
-    def _experiment_closure(
-        self, cut: WritingExperimentTerminalCut
-    ) -> list[dict[str, object]]:
-        if len(cut.facts) > _MAX_SNAPSHOT_EXPERIMENTS:
-            raise OwnerConflict("writing_snapshot_experiment_limit_exceeded")
-        result: list[dict[str, object]] = []
-        seen: set[str] = set()
-        for fact in cut.facts:
-            evaluation_attempt_ref = fact.evaluation_attempt_ref
-            if evaluation_attempt_ref in seen:
-                raise OwnerConflict("writing_experiment_cut_invalid")
-            seen.add(evaluation_attempt_ref)
-            admission = self._research_graph.query_experiment(
-                evaluation_attempt_ref
-            )
-            if (
-                admission is None
-                or admission.execution_request.quest_ref != cut.quest_ref
-                or admission.formal_measurement_status
-                != fact.formal_measurement_status
-                or admission.formal_rejection_code
-                != fact.formal_rejection_code
-                or fact.formal_measurement_status not in {"accepted", "rejected"}
-            ):
-                raise OwnerConflict("writing_experiment_result_invalid")
-            formal_result = self._research_graph.query_formal_metric_result(
-                evaluation_attempt_ref
-            )
-            if fact.formal_measurement_status == "accepted":
-                if (
-                    formal_result is None
-                    or formal_result.evaluation_attempt_ref
-                    != evaluation_attempt_ref
-                    or fact.formal_rejection_code is not None
-                ):
-                    raise OwnerConflict("writing_experiment_result_invalid")
-            elif (
-                formal_result is not None
-                or type(fact.formal_rejection_code) is not str
-                or not fact.formal_rejection_code
-            ):
-                raise OwnerConflict("writing_experiment_result_invalid")
-            result.append(
-                {
-                    "evaluation_attempt_ref": evaluation_attempt_ref,
-                    "execution_request": (
-                        admission.execution_request.as_public_dict()
-                    ),
-                    "formal_measurement_status": fact.formal_measurement_status,
-                    "formal_rejection_code": fact.formal_rejection_code,
-                    "formal_metric_result": (
-                        None
-                        if formal_result is None
-                        else formal_result.as_public_dict()
-                    ),
-                    "asset_roles": [
-                        role.as_public_dict()
-                        for role in self._research_graph.query_experiment_asset_roles(
-                            evaluation_attempt_ref
-                        )
-                    ],
-                }
-            )
-        return result

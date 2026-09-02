@@ -420,6 +420,7 @@ def test_target_root_observation_web_page_is_authenticated_bounded_and_redacted(
         configure_resident_mcp_endpoint=lambda _base_url: None
     )
     runtime = SimpleNamespace(
+        configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,
         target_run_runtime=configurable,
@@ -517,6 +518,7 @@ def test_long_target_root_output_emits_gaps_and_keeps_web_cursor_advancing(
         configure_resident_mcp_endpoint=lambda _base_url: None
     )
     runtime = SimpleNamespace(
+        configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,
         target_run_runtime=configurable,

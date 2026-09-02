@@ -19,10 +19,6 @@ from meta_research.owners.common import (
     OwnerConflict,
     canonical_hash,
 )
-from meta_research.owners.research_graph import (
-    WritingExperimentTerminalCut,
-    WritingExperimentTerminalFactRef,
-)
 from meta_research.owners.research_memory import (
     AssetIntakeRequest,
     AssetIntakeResult,
@@ -534,45 +530,6 @@ def test_report_intent_capture_ignores_continuous_target_observation_revisions(
         runtime.close()
 
 
-def test_report_intent_capture_ignores_unaccepted_experiment_admission_revisions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    runtime = _runtime(tmp_path / "writing-capture-live-admission-noise")
-    try:
-        quest = _confirm_direct_quest(runtime)
-        base_graph_snapshot = runtime.owners.research_graph.query_snapshot()
-        observed_revisions = 0
-
-        def live_admission_graph_snapshot():
-            nonlocal observed_revisions
-            observed_revisions += 1
-            return replace(
-                base_graph_snapshot,
-                revision=base_graph_snapshot.revision + observed_revisions,
-            )
-
-        monkeypatch.setattr(
-            runtime.owners.research_graph,
-            "query_snapshot",
-            live_admission_graph_snapshot,
-        )
-
-        drafted = runtime.writing.create_report_intent(
-            quest_ref=quest["quest_ref"],
-            title="实时实验接纳期间的冻结报告",
-            audience="研究负责人",
-            purpose="验证未形成正式 measurement 的 admission 不属于 Writing cut",
-            instructions="仅冻结 RG 正式接受或拒绝的实验结论。",
-            idempotency_key="writing-capture-live-admission-intent",
-        )
-
-        assert observed_revisions >= 1
-        assert drafted["snapshot"]["quest_ref"] == quest["quest_ref"]
-        assert drafted["snapshot"]["advancement"]["experiments"] == []
-    finally:
-        runtime.close()
-
-
 def test_snapshot_capture_retries_an_accepted_stage_fact_that_changes_inside_cut(
 ) -> None:
     def receipt(kind: str, subject_ref: str) -> AcceptanceReceipt:
@@ -602,8 +559,6 @@ def test_snapshot_capture_retries_an_accepted_stage_fact_that_changes_inside_cut
     )
 
     class _ResearchGraph:
-        terminal_cut_calls = 0
-
         def query_snapshot(self):
             return SimpleNamespace(revision=7)
 
@@ -625,47 +580,6 @@ def test_snapshot_capture_retries_an_accepted_stage_fact_that_changes_inside_cut
                 outcome_hash=outcome_hash,
                 receipt=receipt("idea_accepted", submission_ref),
             )
-
-        def query_writing_experiment_terminal_cut(self, candidate_ref: str):
-            assert candidate_ref == quest_ref
-            self.terminal_cut_calls += 1
-            facts = (
-                ()
-                if self.terminal_cut_calls == 1
-                else (
-                    WritingExperimentTerminalFactRef(
-                        evaluation_attempt_ref="evaluation-attempt:later-terminal",
-                        formal_measurement_status="rejected",
-                        formal_rejection_code="formal_measurement_later_terminal",
-                    ),
-                )
-            )
-            return WritingExperimentTerminalCut(quest_ref=quest_ref, facts=facts)
-
-        def query_experiment_admission_refs(self, **_values):
-            raise AssertionError("Writing must not scan live Experiment admissions")
-
-        def query_experiment(self, evaluation_attempt_ref: str):
-            assert evaluation_attempt_ref == "evaluation-attempt:later-terminal"
-            return SimpleNamespace(
-                execution_request=SimpleNamespace(
-                    quest_ref=quest_ref,
-                    as_public_dict=lambda: {
-                        "execution_request_ref": "experiment-request:later-terminal",
-                        "quest_ref": quest_ref,
-                    },
-                ),
-                formal_measurement_status="rejected",
-                formal_rejection_code="formal_measurement_later_terminal",
-            )
-
-        def query_formal_metric_result(self, evaluation_attempt_ref: str):
-            assert evaluation_attempt_ref == "evaluation-attempt:later-terminal"
-            return None
-
-        def query_experiment_asset_roles(self, evaluation_attempt_ref: str):
-            assert evaluation_attempt_ref == "evaluation-attempt:later-terminal"
-            return ()
 
     class _ResearchMemory:
         def query_snapshot(self):
@@ -729,11 +643,12 @@ def test_snapshot_capture_retries_an_accepted_stage_fact_that_changes_inside_cut
             )
 
     research_graph = _ResearchGraph()
+    agent_runtime = _AgentRuntime()
     reader = WritingResearchSnapshotReader(
         research_graph,
         _AdvancementEngine(),
         _ResearchMemory(),
-        _AgentRuntime(),
+        agent_runtime,
     )
 
     snapshot = reader.capture(quest_ref)
@@ -742,24 +657,7 @@ def test_snapshot_capture_retries_an_accepted_stage_fact_that_changes_inside_cut
     assert accepted["result"]["content_ref"] == "idea-content:B"
     assert accepted["result"]["outcome"] == {"accepted_generation": "B"}
     assert "idea-content:A" not in str(snapshot)
-    assert snapshot["advancement"]["experiments"] == []
-
-    next_snapshot = reader.capture(quest_ref)
-
-    assert next_snapshot["advancement"]["experiments"] == [
-        {
-            "evaluation_attempt_ref": "evaluation-attempt:later-terminal",
-            "execution_request": {
-                "execution_request_ref": "experiment-request:later-terminal",
-                "quest_ref": quest_ref,
-            },
-            "formal_measurement_status": "rejected",
-            "formal_rejection_code": "formal_measurement_later_terminal",
-            "formal_metric_result": None,
-            "asset_roles": [],
-        }
-    ]
-    assert research_graph.terminal_cut_calls == 2
+    assert agent_runtime.stage_reads == 4
 
 
 def test_writing_run_checkpoints_then_separates_execution_rm_rg_and_rendering(
@@ -2526,102 +2424,6 @@ def test_confirmation_ignores_unrelated_owner_revision_bookkeeping(
         runtime.close()
 
 
-def test_experiment_terminal_cut_past_256_has_no_silent_snapshot_truncation() -> None:
-    facts = tuple(
-        WritingExperimentTerminalFactRef(
-            evaluation_attempt_ref=f"evaluation_attempt:{index:04d}",
-            formal_measurement_status=("accepted" if index < 256 else "rejected"),
-            formal_rejection_code=(
-                None if index < 256 else "formal_measurement_out_of_scope"
-            ),
-        )
-        for index in range(257)
-    )
-    cut = WritingExperimentTerminalCut(
-        quest_ref="quest:exact-snapshot",
-        facts=facts,
-    )
-
-    class _ResearchGraph:
-        def query_experiment_admission_refs(self, **_values):
-            raise AssertionError("Writing must not scan live Experiment admissions")
-
-        def query_experiment(self, evaluation_attempt_ref: str):
-            index = int(evaluation_attempt_ref.rsplit(":", 1)[-1])
-            return SimpleNamespace(
-                execution_request=SimpleNamespace(
-                    quest_ref="quest:exact-snapshot",
-                    as_public_dict=lambda: {
-                        "quest_ref": "quest:exact-snapshot",
-                        "evaluation_attempt_ref": evaluation_attempt_ref,
-                    },
-                ),
-                formal_measurement_status=(
-                    "accepted"
-                    if index < 256
-                    else "rejected"
-                ),
-                formal_rejection_code=(
-                    "formal_measurement_out_of_scope"
-                    if index >= 256
-                    else None
-                ),
-            )
-
-        def query_formal_metric_result(self, evaluation_attempt_ref: str):
-            if int(evaluation_attempt_ref.rsplit(":", 1)[-1]) >= 256:
-                return None
-            return SimpleNamespace(
-                evaluation_attempt_ref=evaluation_attempt_ref,
-                as_public_dict=lambda: {
-                    "metric_result_ref": f"metric:{evaluation_attempt_ref}",
-                    "evaluation_attempt_ref": evaluation_attempt_ref,
-                    "metrics": {"score": 1.0},
-                    "receipt": {
-                        "issuer": "research_graph",
-                        "subject_ref": evaluation_attempt_ref,
-                    },
-                }
-            )
-
-        def query_experiment_asset_roles(
-            self, evaluation_attempt_ref: str
-        ) -> tuple[object, ...]:
-            del evaluation_attempt_ref
-            return ()
-
-    def forbid_live_experiment_run(_evaluation_attempt_ref: str):
-        raise AssertionError(
-            "live Agent Runtime experiment state is not Writing input"
-        )
-
-    reader = object.__new__(WritingResearchSnapshotReader)
-    reader._research_graph = _ResearchGraph()
-    reader._agent_runtime = SimpleNamespace(
-        query_experiment_run=forbid_live_experiment_run
-    )
-
-    closure = reader._experiment_closure(cut)
-
-    assert len(closure) == 257
-    assert closure[-1]["evaluation_attempt_ref"] == facts[256].evaluation_attempt_ref
-    assert closure[0]["formal_metric_result"] == {
-        "metric_result_ref": f"metric:{facts[0].evaluation_attempt_ref}",
-        "evaluation_attempt_ref": facts[0].evaluation_attempt_ref,
-        "metrics": {"score": 1.0},
-        "receipt": {
-            "issuer": "research_graph",
-            "subject_ref": facts[0].evaluation_attempt_ref,
-        },
-    }
-    assert closure[-1]["formal_measurement_status"] == "rejected"
-    assert closure[-1]["formal_rejection_code"] == (
-        "formal_measurement_out_of_scope"
-    )
-    assert closure[-1]["formal_metric_result"] is None
-    assert all("run" not in item for item in closure)
-
-
 def test_frozen_snapshot_captures_only_verified_accepted_bundle_facts(
     tmp_path: Path,
 ) -> None:
@@ -2810,9 +2612,6 @@ def test_frozen_snapshot_captures_only_verified_accepted_bundle_facts(
             def verify_bundle_report_receipt(self, **values):
                 self.verify_calls.append(values)
                 return verified_report
-
-            def query_experiment_run(self, _evaluation_attempt_ref: str):
-                return None
 
         fake_runtime = _AgentRuntime()
         reader = WritingResearchSnapshotReader(

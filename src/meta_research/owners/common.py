@@ -17,7 +17,6 @@ if TYPE_CHECKING:
         SemanticBarrier,
         TargetLaunchRequest,
     )
-    from meta_research.experiment_contract import ExperimentResultComponentManifest
     from meta_research.owners.research_graph import (
         EvidenceReuseLeaf,
         TargetLaunchVerification,
@@ -633,21 +632,6 @@ class AttemptExecutionReceiptVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> str: ...
 
-    def verify_target_run_admission_receipt(
-        self,
-        *,
-        target_ref: str,
-        target_spec_hash: str,
-        graph_ref: str,
-        stage_request_ref: str,
-        quest_ref: str,
-        target_run_ref: str,
-        evaluation_attempt_ref: str,
-        execution_request_ref: str,
-        definition_hash: str,
-        receipt: AcceptanceReceipt,
-    ) -> None: ...
-
     def verify_bundle_target_proposal_receipt(
         self,
         *,
@@ -674,17 +658,6 @@ class AttemptExecutionReceiptVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
-    def verify_experiment_execution_receipt(
-        self,
-        *,
-        run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
-        evaluation_attempt_ref: str,
-        result_hash: str,
-        receipt: AcceptanceReceipt,
-    ) -> "ExperimentResultComponentManifest": ...
-
     def verify_writing_execution_receipt(
         self,
         *,
@@ -701,28 +674,6 @@ class AttemptExecutionReceiptVerifier(Protocol):
         require_current: bool = False,
         require_authorized: bool = False,
     ) -> dict[str, object]: ...
-
-
-class ExperimentInputBindingVerifier(Protocol):
-    def verify_experiment_execution_request(
-        self,
-        *,
-        execution_request_ref: str,
-        quest_ref: str,
-        definition_hash: str,
-        implementation_binding: AcceptedAssetBinding,
-        receipt: AcceptanceReceipt,
-    ) -> None: ...
-
-    def verify_experiment_input_binding(
-        self,
-        *,
-        binding_ref: str,
-        subject_kind: str,
-        subject_ref: str,
-        inputs_hash: str,
-        receipt: AcceptanceReceipt,
-    ) -> None: ...
 
 
 class IdeaContentReceiptVerifier(Protocol):
@@ -941,19 +892,6 @@ class TargetGraphReceiptVerifier(Protocol):
         require_current: bool = False,
         require_complete: bool = False,
     ) -> dict[str, object]: ...
-
-    def verify_target_run_candidate(
-        self,
-        *,
-        target_ref: str,
-        target_spec_hash: str,
-        graph_ref: str,
-        stage_request_ref: str,
-        quest_ref: str,
-        evaluation_attempt_ref: str,
-        execution_request_ref: str,
-        definition_hash: str,
-    ) -> str: ...
 
     def verify_target_launch_request(
         self, request: "TargetLaunchRequest"

@@ -26,7 +26,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from meta_research.auth import AuthSession
 from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.composition import ProductionRuntime
-from meta_research.experiment import ExperimentIntent
 from meta_research.harness import (
     FullConformanceRequest,
     HarnessAdmissionError,
@@ -68,7 +67,6 @@ ASSET_ROUTE_WATCHDOG_SECONDS = 5.0
 PROVIDER_WORKER_WATCHDOG_SECONDS: None = None
 WRITING_DELIVERY_STALL_SECONDS = 910.0
 REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS = 30.0
-EXPERIMENT_WORKER_WATCHDOG_SECONDS = 30.0
 BACKGROUND_WORKER_STARTUP_GRACE_SECONDS = 0.1
 # ``BundleStage.transient_error`` predates the durable pause/wait contract and
 # carries both actual failures and normal no-progress states.  Keep this list
@@ -526,33 +524,6 @@ class CapabilityAuthorizationRequest(BaseModel):
     confirmation_receipt_ref: str = Field(min_length=1, max_length=64)
 
 
-class StartExperimentRequest(BaseModel):
-    """Web intent for one stable, Owner-authorized experiment request."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    execution_request_ref: str = Field(min_length=1, max_length=96)
-    quest_ref: str = Field(min_length=1, max_length=96)
-    title: str = Field(min_length=1, max_length=512)
-    hypothesis: str = Field(min_length=1, max_length=4000)
-    variant_parameter: float = Field(allow_inf_nan=False)
-    sample_count: int = Field(ge=4, le=4096)
-    wall_time_budget_seconds: float = Field(ge=1, le=24 * 60 * 60)
-    request_kind: Literal["retrain", "remeasure"] = "retrain"
-    source_variant_run_ref: str | None = Field(default=None, max_length=96)
-    selected_checkpoint_role_refs: list[str] = Field(
-        default_factory=list,
-        max_length=32,
-    )
-
-    def as_intent(self) -> ExperimentIntent:
-        value = self.model_dump()
-        value["selected_checkpoint_role_refs"] = tuple(
-            self.selected_checkpoint_role_refs
-        )
-        return ExperimentIntent(**value)
-
-
 class WritingIntentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -722,7 +693,6 @@ def create_app(
     autonomous_creation_task: asyncio.Task[None] | None = None
     quest_completion_task: asyncio.Task[None] | None = None
     target_run_task: asyncio.Task[None] | None = None
-    experiment_task: asyncio.Task[None] | None = None
     writing_task: asyncio.Task[None] | None = None
     research_asset_task: asyncio.Task[None] | None = None
     research_asset_verification_task: asyncio.Task[None] | None = None
@@ -736,7 +706,6 @@ def create_app(
     autonomous_creation_health = ReconciliationHealth()
     quest_completion_health = ReconciliationHealth()
     target_run_health = ReconciliationHealth()
-    experiment_health = ReconciliationHealth()
     writing_health = ReconciliationHealth()
     research_asset_health = ReconciliationHealth()
     research_asset_verification_health = ReconciliationHealth()
@@ -753,7 +722,7 @@ def create_app(
         nonlocal plan_stage_task, bundle_stage_task, reasoning_stage_task
         nonlocal autonomous_creation_task, quest_completion_task
         nonlocal target_run_task
-        nonlocal experiment_task, writing_task
+        nonlocal writing_task
         nonlocal research_asset_task, research_asset_verification_task
         harness_conformance_task = _start_background_worker(
             lambda: _process_harness_conformance(runtime, base_url)
@@ -828,13 +797,6 @@ def create_app(
                 worker_health_updates.publish,
             )
         )
-        experiment_task = _start_background_worker(
-            lambda: _process_experiments(
-                runtime,
-                experiment_health,
-                worker_health_updates.publish,
-            )
-        )
         writing_task = _start_background_worker(
             lambda: _process_writing(
                 runtime,
@@ -873,7 +835,6 @@ def create_app(
                     autonomous_creation_task,
                     quest_completion_task,
                     target_run_task,
-                    experiment_task,
                     writing_task,
                     research_asset_task,
                     research_asset_verification_task,
@@ -968,11 +929,6 @@ def create_app(
                 quest_completion_health,
             ),
             worker_check("target_run_worker", target_run_task, target_run_health),
-            worker_check(
-                "experiment_worker",
-                experiment_task,
-                experiment_health,
-            ),
             worker_check("writing_worker", writing_task, writing_health),
             worker_check(
                 "research_asset_intake_worker",
@@ -1184,7 +1140,6 @@ def create_app(
                 "asset_intake_not_found",
                 "asset_not_found",
                 "manual_question_creation_not_found",
-                "experiment_not_found",
                 "quest_initialization_not_found",
                 "writing_run_not_found",
             }
@@ -1286,9 +1241,6 @@ def create_app(
             research_asset_verification_task,
             research_asset_verification_health,
         )
-        experiment = worker_check(
-            "experiment_worker", experiment_task, experiment_health
-        )
         writing = worker_check("writing_worker", writing_task, writing_health)
         target_root = runtime.query_target_root_readiness()
         return {
@@ -1333,10 +1285,6 @@ def create_app(
             "target_runs": {
                 "status": target_runs["status"],
                 "last_error": target_run_health.last_error,
-            },
-            "experiment": {
-                "status": experiment["status"],
-                "last_error": experiment_health.last_error,
             },
             "writing": {
                 "status": writing["status"],
@@ -2586,50 +2534,6 @@ def create_app(
             },
         )
 
-    @app.post("/api/v1/experiments", status_code=201)
-    async def start_experiment(
-        request: Request,
-        experiment: StartExperimentRequest,
-    ) -> dict[str, object]:
-        idempotency_key = _idempotency_key(request)
-        return await _await_bounded_asset_io(
-            lambda: runtime.experiment.start(
-                experiment.as_intent(), idempotency_key, require_idle=True
-            ),
-            slots=asset_io_slots,
-            timeout_code="experiment_admission_io_timeout",
-        )
-
-    @app.get("/api/v1/experiments/current")
-    def query_current_experiment() -> dict[str, object]:
-        current = runtime.experiment.query_current()
-        return {
-            "status": "idle" if current is None else "active",
-            "current": current,
-        }
-
-    @app.get("/api/v1/experiments/{evaluation_attempt_ref}")
-    def query_experiment(evaluation_attempt_ref: str) -> dict[str, object]:
-        return runtime.experiment.query(evaluation_attempt_ref)
-
-    @app.get("/api/v1/experiments/{evaluation_attempt_ref}/events")
-    def query_experiment_events(
-        evaluation_attempt_ref: str,
-        after: int = Query(default=0, ge=0),
-        limit: int = Query(default=256, ge=1, le=512),
-    ) -> dict[str, object]:
-        items = runtime.experiment.query_events(
-            evaluation_attempt_ref,
-            after_sequence=after,
-            limit=limit,
-        )
-        return {
-            "items": list(items),
-            "after_sequence": after,
-            "limit": limit,
-            "next_after_sequence": (after if not items else items[-1]["sequence"]),
-        }
-
     @app.get("/api/v1/root-capability-diagnostics")
     def query_root_capability_diagnostics(
         root_kind: RootAgentKind | None = Query(default=None),
@@ -3024,46 +2928,6 @@ async def _process_first_question_deepfetch(
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("first-question DeepFetch attempt failed unexpectedly")
-            error_code = (
-                error.code if isinstance(error, OwnerConflict) else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 0.2)
-
-
-async def _process_experiments(
-    runtime: ProductionRuntime,
-    health: ReconciliationHealth,
-    on_health_change: Callable[[], None] | None = None,
-) -> None:
-    """Advance execution, RM assets, then atomic Formal Measurement."""
-
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.experiment.process_once,
-                health=health,
-                timeout_code="experiment_operation_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=EXPERIMENT_WORKER_WATCHDOG_SECONDS,
-            )
-        except Exception as error:
-            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
-                LOGGER.exception("experiment worker attempt failed unexpectedly")
             error_code = (
                 error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )

@@ -445,28 +445,6 @@ class AcceptedTargetExecutionInputBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class TargetProtectedExecutionBinding:
-    """Legacy Experiment-backed bridge; formal-v3 TargetRun must not create it."""
-
-    binding_ref: str
-    target_ref: str
-    ordinal: int
-    target_run_ref: str
-    target_attempt_ref: str
-    target_fence_ref: str
-    input_binding_ref: str
-    experiment_run_ref: str
-    experiment_attempt_ref: str
-    experiment_fence_ref: str
-    evaluation_attempt_ref: str
-    execution_request_ref: str
-    definition_hash: str
-    experiment_request_receipt: AcceptanceReceipt
-    receipt: AcceptanceReceipt
-    accepted_at: float
-
-
-@dataclass(frozen=True, slots=True)
 class TargetGenericExecutionBinding:
     """RG acceptance of one issuer-verified terminal generic operation.
 
@@ -626,62 +604,6 @@ class AcceptedTargetNativeExecutionClosure:
         return receipt_proof(self.receipt, subject_ref=self.target_attempt_ref)
 
 
-@dataclass(frozen=True, slots=True)
-class TargetResultManifestEntry:
-    role: str
-    ordinal: int
-    role_ref: str
-    subject_kind: str
-    subject_ref: str
-    asset_ref: str
-    version_ref: str
-    content_hash: str
-    manifest_hash: str
-    asset_receipt_ref: str
-    role_receipt_ref: str
-
-
-@dataclass(frozen=True, slots=True)
-class AcceptedTargetResultManifest:
-    manifest_ref: str
-    target_ref: str
-    target_run_ref: str
-    variant_run_ref: str
-    evaluation_attempt_ref: str
-    metric_result_ref: str
-    experiment_run_ref: str
-    experiment_attempt_ref: str
-    experiment_fence_ref: str
-    entries: tuple[TargetResultManifestEntry, ...]
-    payload_hash: str
-    receipt: AcceptanceReceipt
-    accepted_at: float
-
-
-@dataclass(frozen=True, slots=True)
-class AcceptedTargetExecutionClosure:
-    closure_ref: str
-    target_ref: str
-    target_run_ref: str
-    target_attempt_ref: str
-    target_fence_ref: str
-    protected_binding_ref: str
-    experiment_run_ref: str
-    experiment_attempt_ref: str
-    experiment_fence_ref: str
-    evaluation_attempt_ref: str
-    experiment_result_hash: str
-    result_manifest_ref: str
-    formal_metric_ref: str
-    result_review_ref: str
-    payload_hash: str
-    receipt: AcceptanceReceipt
-    accepted_at: float
-
-    def receipt_proof(self) -> ReceiptProof:
-        return receipt_proof(self.receipt, subject_ref=self.target_attempt_ref)
-
-
 def receipt_proof(
     receipt: AcceptanceReceipt,
     *,
@@ -708,12 +630,10 @@ __all__ = [
     "AcceptedTargetImplementationBundleUsage",
     "AcceptedTargetInputAssetProjection",
     "AcceptedTargetFormalPlanProjection",
-    "AcceptedTargetExecutionClosure",
     "AcceptedTargetGenericExecutionClosure",
     "AcceptedTargetGenericMeasurement",
     "AcceptedTargetGenericResultManifest",
     "AcceptedTargetExecutionInputBinding",
-    "AcceptedTargetResultManifest",
     "AcceptedTargetResultReview",
     "TargetHarnessAdmission",
     "TargetRunWorkspace",
@@ -725,8 +645,6 @@ __all__ = [
     "TargetCompletionHandoffError",
     "TARGET_COMPLETION_ARTIFACT_ROLES",
     "TARGET_COMPLETION_HANDOFF_SCHEMA",
-    "TargetProtectedExecutionBinding",
-    "TargetResultManifestEntry",
     "decode_target_completion_handoff",
     "receipt_proof",
     "validate_target_completion_handoff",

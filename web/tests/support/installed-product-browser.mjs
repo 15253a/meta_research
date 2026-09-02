@@ -61,15 +61,6 @@ async function assertNoHorizontalOverflow(page, description) {
   );
 }
 
-async function closeObserver(page) {
-  const observer = page.getByTestId("execution-observer");
-  if (await observer.getAttribute("data-open") !== "true") return;
-  await observer.getByRole("button", { name: "关闭当前实验观测窗" }).click();
-  await page.waitForFunction(() => (
-    document.querySelector("[data-testid=execution-observer]")?.getAttribute("data-open") === "false"
-  ));
-}
-
 const shellSignatures = [];
 
 try {
@@ -104,8 +95,6 @@ try {
       await visible(shell.getByRole("banner"), "Lumen header");
       await visible(shell.getByRole("navigation", { name: "主导航" }), "Lumen rail");
       await visible(page.getByRole("complementary", { name: "Quest Companion" }), "Quest Companion");
-      await closeObserver(page);
-
       const currentQuestion = page.getByTestId("current-question-card");
       await contains(currentQuestion, expected.quest_ref, "current Quest projection");
       await contains(currentQuestion, expected.question_ref, "current Question projection");
@@ -115,23 +104,6 @@ try {
         "four-Stage strip",
       );
       await assertNoHorizontalOverflow(page, `${viewport.width}px overview`);
-
-      const experimentEntry = currentQuestion.getByRole("button", {
-        name: "当前实验 · stdout",
-      });
-      await visible(experimentEntry, "current experiment stdout entry");
-      await experimentEntry.click();
-      const observer = page.getByTestId("execution-observer");
-      await page.waitForFunction(() => (
-        document.querySelector("[data-testid=execution-observer]")?.getAttribute("data-open") === "true"
-      ));
-      await contains(observer, expected.experiment_title, "current experiment observer");
-      await contains(observer, expected.execution_fence_key, "current Execution Fence");
-      await visible(
-        observer.getByRole("log", { name: /当前实验原始标准输出/ }),
-        "current experiment stdout",
-      );
-      await closeObserver(page);
 
       await page.getByRole("button", { name: "问题树", exact: true }).click();
       const tree = page.getByTestId("question-tree");
@@ -146,18 +118,6 @@ try {
         layout,
         `QuestionTree uses wrong ${viewport.width}px layout`,
       );
-
-      const treeExperimentEntry = tree.getByRole("button", {
-        name: "当前实验 · stdout",
-      });
-      await visible(treeExperimentEntry, "QuestionTree current experiment entry");
-      assert.equal(await treeExperimentEntry.isEnabled(), true, "QuestionTree current experiment entry is disabled");
-      await treeExperimentEntry.click();
-      await page.waitForFunction(() => (
-        document.querySelector("[data-testid=execution-observer]")?.getAttribute("data-open") === "true"
-      ));
-      await contains(observer, expected.execution_fence_key, "QuestionTree-reopened Execution Fence");
-      await closeObserver(page);
 
       await tree.getByRole("button", { name: "问题历史 ↗" }).click();
       const questionHistory = tree.getByRole("region", { name: "问题历史" });

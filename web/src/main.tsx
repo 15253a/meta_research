@@ -41,7 +41,6 @@ import {
   type BundleStageProjection,
   type BundleTargetCommitProjection,
   type BundleTargetProjection,
-  type ExperimentProjection,
   type IdeaQuestionSummary,
   type IdeaStageProjection,
   type ManualAcceptedMaterialBinding,
@@ -62,13 +61,6 @@ import {
   type ManualCreationMaterialDraft,
   type ManualQuestionCreationView,
 } from "./ManualCreation";
-import {
-  CurrentExperimentSummary,
-  ExecutionObserver,
-  ExperimentToolbarEntry,
-  useExecutionObserver,
-} from "./ExecutionObserver";
-import { ExperimentLauncher } from "./ExperimentLauncher";
 import {
   QuestCreationWorkbench,
   type QuestCompletionHandoff,
@@ -505,7 +497,6 @@ function questCreationReady(snapshot: PublicSnapshot | null): boolean {
         "plan_stage_worker",
         "bundle_stage_worker",
         "reasoning_stage_worker",
-        "experiment_worker",
         "writing_worker",
         "research_asset_intake_worker",
         "research_asset_verification_worker",
@@ -983,16 +974,19 @@ function researchEventCopy(eventType: string): string {
   if (eventType === "agent_runtime.target_root_observations_available") {
     return "实验任务产生了新的命令输出";
   }
-  if (eventType.includes("stage_run_admitted") || eventType.includes("experiment_started")) {
+  if (eventType.includes("stage_run_admitted")) {
     return "根 Agent 已开始一段真实工作";
   }
-  if (eventType.includes("attempt_executed") || eventType.includes("experiment_observed")) {
+  if (eventType.includes("attempt_executed")) {
     return "根 Agent 形成了新的可核验材料";
   }
   if (eventType.includes("asset_accepted") || eventType.includes("content_accepted")) {
     return "新的研究材料已经保存";
   }
-  if (eventType.includes("outcome_accepted") || eventType.includes("formal_measurement_accepted")) {
+  if (
+    eventType.includes("outcome_accepted")
+    || eventType === "research_graph.target_formal_measurement_accepted"
+  ) {
     return "新的研究结论已经通过核验";
   }
   if (eventType.includes("stage_committed") || eventType.includes("stage_run_completed")) {
@@ -1729,13 +1723,9 @@ function ReasoningStageHero({ reasoningStage, question }: {
 function CurrentQuestionCard({
   stage,
   question,
-  experiment,
-  onOpenExperiment,
 }: {
   stage: "Idea" | "Plan" | "Bundle" | "Reasoning";
   question: IdeaQuestionSummary;
-  experiment: ExperimentProjection | null;
-  onOpenExperiment: (trigger: HTMLElement) => void;
 }) {
   const questionRef = question.question_ref ?? "当前问题";
   const graphRevision = question.graph_revision;
@@ -1751,12 +1741,6 @@ function CurrentQuestionCard({
         <small>
           {graphRevision === undefined ? "已同步" : `已同步 · 版本 ${graphRevision}`}
         </small>
-        {experiment ? (
-          <ExperimentToolbarEntry
-            experiment={experiment}
-            onOpen={onOpenExperiment}
-          />
-        ) : null}
       </header>
       <div className="lumen-question-path" aria-label="当前研究问题与根 Agent 工作路径">
         <span className="quest"><small>研究空间</small><b>{question.quest_ref ?? "当前"}</b></span>
@@ -1934,18 +1918,10 @@ function IdeaDetail({ label, value }: { label: string; value?: string | number |
 function IdeaStageCard({
   ideaStage,
   healthBlocker,
-  experiment,
-  questRef,
-  onOpenExperiment,
-  onExperimentStarted,
   runtimeControl,
 }: {
   ideaStage: IdeaStageProjection;
   healthBlocker: IdeaStageHealthBlocker | null;
-  experiment: ExperimentProjection | null;
-  questRef: string | null;
-  onOpenExperiment: (trigger: HTMLElement) => void;
-  onExperimentStarted: (experiment: ExperimentProjection) => void;
   runtimeControl: ReactNode;
 }) {
   const phase = currentIdeaStageState(ideaStage);
@@ -1979,20 +1955,6 @@ function IdeaStageCard({
           </div>
           <code>{healthBlocker.code}</code>
         </div>
-      ) : null}
-      {experiment ? (
-        <CurrentExperimentSummary
-          experiment={experiment}
-          onOpen={onOpenExperiment}
-        />
-      ) : null}
-      {questRef ? (
-        <ExperimentLauncher
-          key={`${questRef}:${experiment?.identities.evaluation_attempt_ref ?? "first"}`}
-          questRef={questRef}
-          sourceExperiment={experiment}
-          onStarted={onExperimentStarted}
-        />
       ) : null}
       <details className="lumen-stage-technical">
         <summary>系统如何核验这段研究</summary>
@@ -3861,8 +3823,6 @@ function WorkspaceMain({
   targetRootObservationPointers,
   humanRequestModalOpen,
   retry,
-  onOpenExperiment,
-  onExperimentStarted,
 }: {
   snapshot: PublicSnapshot | null;
   state: ShellState;
@@ -3875,8 +3835,6 @@ function WorkspaceMain({
   targetRootObservationPointers: Record<string, TargetRootObservationPointer>;
   humanRequestModalOpen: boolean;
   retry: () => void;
-  onOpenExperiment: (trigger: HTMLElement) => void;
-  onExperimentStarted: (experiment: ExperimentProjection) => void;
 }) {
   const unavailable = uniqueCapabilities(snapshot);
   const stageSurface = snapshot?.research_space.status === "active"
@@ -3898,7 +3856,6 @@ function WorkspaceMain({
   const planHealthBlocker = planStageHealthBlocker(snapshot);
   const bundleHealthBlocker = bundleStageHealthBlocker(snapshot);
   const reasoningHealthBlocker = reasoningStageHealthBlocker(snapshot);
-  const experiment = snapshot?.experiment?.current ?? null;
   const runtimeControl = snapshot ? (
     <TelemetryAuthorizationCard
       collaboration={snapshot.human_collaboration}
@@ -3958,29 +3915,21 @@ function WorkspaceMain({
           <CurrentQuestionCard
             stage="Reasoning"
             question={question!}
-            experiment={experiment}
-            onOpenExperiment={onOpenExperiment}
           />
         ) : bundleStage ? (
           <CurrentQuestionCard
             stage="Bundle"
             question={question!}
-            experiment={experiment}
-            onOpenExperiment={onOpenExperiment}
           />
         ) : planStage ? (
           <CurrentQuestionCard
             stage="Plan"
             question={question!}
-            experiment={experiment}
-            onOpenExperiment={onOpenExperiment}
           />
         ) : ideaStage ? (
           <CurrentQuestionCard
             stage="Idea"
             question={question!}
-            experiment={experiment}
-            onOpenExperiment={onOpenExperiment}
           />
         ) : (
           <section className="lumen-card lumen-next-card" aria-labelledby="next-title">
@@ -4023,10 +3972,6 @@ function WorkspaceMain({
           <IdeaStageCard
             ideaStage={ideaStage}
             healthBlocker={ideaHealthBlocker}
-            experiment={experiment}
-            questRef={question?.quest_ref ?? null}
-            onOpenExperiment={onOpenExperiment}
-            onExperimentStarted={onExperimentStarted}
             runtimeControl={runtimeControl}
           />
         ) : (
@@ -4256,17 +4201,6 @@ function App() {
     [snapshot?.human_collaboration?.human_requests],
   );
   const humanRequestSurfaceOpen = humanRequestsOpen || currentOpenRequests.length > 0;
-  const executionObserver = useExecutionObserver(
-    snapshot?.experiment?.current ?? null,
-    Boolean(
-      creationMode ||
-      assetsOpen ||
-      writingOpen ||
-      manualPanel ||
-      humanRequestsOpen ||
-      currentOpenRequests.length,
-    ),
-  );
 
   const handleConnection = useCallback((next: boolean) => {
     setConnected(next);
@@ -4329,15 +4263,6 @@ function App() {
       if (reloadQueued.current && !signal?.aborted) void reload();
     }
   }, []);
-
-  const handleExperimentStarted = useCallback((experiment: ExperimentProjection) => {
-    executionObserver.recordStarted(experiment);
-    setSnapshot((current) => current ? {
-      ...current,
-      experiment: { status: "active", current: experiment },
-    } : current);
-    window.setTimeout(() => void reload(), 0);
-  }, [executionObserver.recordStarted, reload]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -4453,7 +4378,6 @@ function App() {
     const currentRequest = currentOpenRequests[0];
     if (!currentRequest) return;
     prepareHumanRequestReturn();
-    executionObserver.deferForPrioritySurface();
     setSelectedHumanRequestRef(currentRequest.request_ref);
     setHumanRequestRouteKind(null);
     window.history.replaceState(
@@ -4464,7 +4388,6 @@ function App() {
     setHumanRequestsOpen(true);
   }, [
     currentOpenRequests,
-    executionObserver.deferForPrioritySurface,
     humanRequestsOpen,
     prepareHumanRequestReturn,
   ]);
@@ -5011,8 +4934,6 @@ function App() {
           targetRootObservationPointers={targetRootObservationPointers}
           humanRequestModalOpen={humanRequestSurfaceOpen}
           retry={() => void reload()}
-          onOpenExperiment={executionObserver.open}
-          onExperimentStarted={handleExperimentStarted}
         />
         {questionTreeOpen && snapshot ? (
           <QuestionTree
@@ -5030,9 +4951,7 @@ function App() {
             controlsInert={manualPanel !== null}
             openingParentRef={manualOpeningParentRef}
             openError={manualOpenError}
-            currentExperiment={executionObserver.current}
             onClose={closeQuestionTree}
-            onOpenExperiment={executionObserver.open}
             onSelectionChange={selectQuestionTreeContext}
             onDiscussQuestion={discussQuestionWithCompanion}
             onCreateQuestion={openManualCreation}
@@ -5201,7 +5120,6 @@ function App() {
           }}
         />
       ) : null}
-      <ExecutionObserver controller={executionObserver} />
       <HumanRequestSurface
         open={humanRequestSurfaceOpen}
         blocking={currentOpenRequests.length > 0}

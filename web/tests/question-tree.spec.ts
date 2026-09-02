@@ -193,48 +193,6 @@ async function openQuestionTreeFixture(
       },
       commands: { status: "ready", items: [], authorizations: [] },
     },
-    experiment: {
-      status: "active",
-      current: {
-        intent: {
-          quest_ref: "quest_tree_1",
-          title: "Question tree experiment",
-        },
-        identities: {
-          evaluation_attempt_ref: "evaluation-attempt-tree-1",
-        },
-        execution: {
-          status: "executed",
-          managed_status: "completed",
-          run_ref: "run-tree-1",
-          attempt_ref: "attempt-tree-1",
-          attempt_generation: 1,
-          root_session_ref: "session-tree-1",
-          fence_ref: "fence-tree-1",
-          fence_status: "released",
-          events: [{
-            event_ref: "event-tree-stdout-1",
-            sequence: 1,
-            attempt_ref: "attempt-tree-1",
-            fence_ref: "fence-tree-1",
-            kind: "stdout",
-            payload: { stream: "stdout", line: "tree experiment ready" },
-            observed_at: 1_720_000_000,
-          }],
-          stdout_observation: {
-            mode: "complete",
-            complete: true,
-            truncated: false,
-            dropped: 0,
-            first_sequence: 1,
-            last_sequence: 1,
-            observed_at: 1_720_000_000,
-          },
-        },
-        assets: { status: "not_attempted" },
-        formal_measurement: { status: "not_attempted" },
-      },
-    },
   };
 
   await page.route("**/api/v1/snapshot", (route) => fulfill(route, snapshot));
@@ -411,12 +369,6 @@ async function openQuestionTreeFixture(
     );
   });
   await page.route("**/api/v1/events*", (route) => route.abort("connectionrefused"));
-  await page.addInitScript((fenceKey) => {
-    window.sessionStorage.setItem(
-      "meta-research:execution-observer:auto-presented-fence",
-      fenceKey,
-    );
-  }, "run-tree-1:g1:session-tree-1");
   await page.goto(product.baseUrl, { waitUntil: "domcontentloaded" });
   if (!options.skipInitialSummaryAssertions) {
     await expect(page.getByTestId("return-summary")).toContainText(
@@ -533,7 +485,7 @@ test("QuestionTree keeps canvas at 800/1440 and reflows the same keyboard tree i
   expect(geometry.pageWidth).toBeLessThanOrEqual(geometry.viewportWidth);
 });
 
-test("QuestionTree reopens the current Experiment observation and routes discussion without owner writes", async ({
+test("QuestionTree routes discussion without owner writes", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -549,15 +501,6 @@ test("QuestionTree reopens the current Experiment observation and routes discuss
     postedMessage = route.request().postDataJSON() as JsonRecord;
     await fulfill(route, { status: "queued" });
   });
-
-  const stdout = tree.getByRole("button", { name: "当前实验 · stdout" });
-  await expect(stdout).toBeEnabled();
-  await stdout.click();
-  const observer = page.getByTestId("execution-observer");
-  await expect(observer).toHaveAttribute("data-open", "true");
-  await expect(observer).toContainText("run-tree-1:g1:session-tree-1");
-  await observer.getByRole("button", { name: "关闭当前实验观测窗" }).click();
-  await expect(stdout).toBeFocused();
 
   const branch = tree.locator('[data-question-ref="question_tree_branch"]');
   await branch.click();

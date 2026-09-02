@@ -546,7 +546,7 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
         )
         if metric is None or metric.as_public_dict() != metric_document:
             raise OwnerConflict(error_code)
-        roles = self._research_graph.query_experiment_asset_roles(
+        roles = self._research_graph.query_target_measurement_asset_roles(
             commit.evaluation_attempt_ref
         )
         manifest = commit.closure.get("result_manifest")

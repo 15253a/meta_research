@@ -76,7 +76,6 @@ test("QuestionTree preserves the fixed canvas and Manual close-only boundaries",
   await expect(tree.getByLabel("可拖拽和缩放的 Quest 问题树画布")).toBeVisible();
   await expect(tree.getByLabel("问题树小地图")).toBeVisible();
   await expect(tree.getByRole("button", { name: "适配全图" })).toBeVisible();
-  await expect(tree.getByRole("button", { name: "当前实验 · stdout" })).toBeDisabled();
   await expect(tree.getByRole("button", { name: `剪裁 ${root.question_ref}` })).toBeEnabled();
 
   const canvasWorld = tree.locator(".question-tree-canvas-world");

@@ -13,7 +13,6 @@ import {
 import {
   fetchQuestionEvidence,
   fetchQuestionHistory,
-  type ExperimentProjection,
   type QuestionEvidenceView,
   type QuestionHistoryView,
   type QuestionTreeItem,
@@ -35,11 +34,9 @@ export type QuestionTreeProps = {
   controlsInert?: boolean;
   openingParentRef?: string | null;
   openError?: string | null;
-  currentExperiment?: ExperimentProjection | null;
   initialInspectorMode?: "evidence" | "history" | null;
   onInspectorModeChange?: (mode: "evidence" | "history" | null) => void;
   onClose: () => void;
-  onOpenExperiment?: (opener: HTMLButtonElement) => void;
   onSelectionChange?: (selected: QuestionTreeItem | null) => void;
   onDiscussQuestion?: (
     selected: QuestionTreeItem,
@@ -116,19 +113,6 @@ const WORLD_MIN_HEIGHT = 660;
 const MIN_SCALE = 0.42;
 const MAX_SCALE = 1.8;
 const OUTLINE_MEDIA_QUERY = "(max-width: 620px)";
-
-function currentExperimentHasFence(
-  experiment: ExperimentProjection | null | undefined,
-): boolean {
-  const execution = experiment?.execution;
-  return Boolean(
-    execution?.run_ref &&
-      typeof execution.attempt_generation === "number" &&
-      execution.root_session_ref &&
-      execution.fence_ref &&
-      Array.isArray(execution.events),
-  );
-}
 
 function isCurrentQuestion(item: QuestionTreeItem): boolean {
   const foreground = item.cycle_binding.foreground;
@@ -540,11 +524,9 @@ export function QuestionTree({
   controlsInert = false,
   openingParentRef = null,
   openError = null,
-  currentExperiment = null,
   initialInspectorMode = null,
   onInspectorModeChange,
   onClose,
-  onOpenExperiment,
   onSelectionChange,
   onDiscussQuestion,
   onCreateQuestion,
@@ -595,9 +577,6 @@ export function QuestionTree({
   const inspectorTargetBasis = inspectorTarget
     ? questionInspectorBasis(inspectorTarget)
     : null;
-  const experimentObservable = currentExperimentHasFence(currentExperiment) &&
-    Boolean(onOpenExperiment);
-
   const loadInspector = useCallback(async (
     mode: "evidence" | "history",
     question: QuestionTreeItem,
@@ -1000,20 +979,6 @@ export function QuestionTree({
           </div>
           <div className="question-tree-tools">
             <span className="projection">{projectionLabel}</span>
-            <button
-              type="button"
-              disabled={controlsInert || !experimentObservable}
-              title={experimentObservable
-                ? "重新打开当前 Experiment identity 的 stdout"
-                : onOpenExperiment
-                  ? "当前没有可观测 Experiment identity"
-                  : "capability_unavailable · current_experiment_observer"}
-              onClick={(event) => {
-                if (experimentObservable) onOpenExperiment?.(event.currentTarget);
-              }}
-            >
-              当前实验 · stdout
-            </button>
             <button
               type="button"
               disabled={!selected || !manualCreationReady || openingParentRef !== null}

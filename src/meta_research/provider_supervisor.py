@@ -919,7 +919,6 @@ def _terminate_or_verify_bound_provider_absent(
             not in {
                 "meta-research/codex-provider-started/v2",
                 "meta-research/provider-started/v2",
-                "meta-research/experiment-provider-phase/v2",
             }
             or ("phase" in marker and marker.get("phase") != "started")
             or marker.get("provider_operation_path") != str(request_path)

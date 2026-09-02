@@ -7,8 +7,6 @@ import subprocess
 import sys
 import time
 
-import pytest
-
 from meta_research.provider_supervisor import (
     request_supervisor_stop,
     supervisor_request_never_started,
@@ -16,18 +14,7 @@ from meta_research.provider_supervisor import (
 )
 
 
-@pytest.mark.parametrize(
-    ("schema_ref", "phase"),
-    [
-        ("meta-research/codex-provider-supervisor-ready/v1", None),
-        ("meta-research/experiment-provider-phase/v1", "ready"),
-    ],
-)
-def test_stop_accepts_both_signed_ready_marker_shapes(
-    tmp_path: Path,
-    schema_ref: str,
-    phase: str | None,
-) -> None:
+def test_stop_accepts_the_signed_provider_ready_marker(tmp_path: Path) -> None:
     operation = tmp_path / "provider-operations" / "operation" / "phase"
     operation.mkdir(parents=True)
     request_path = (operation / "supervisor-request.json").resolve()
@@ -63,13 +50,11 @@ def test_stop_accepts_both_signed_ready_marker_shapes(
                 raise AssertionError("test supervisor did not become ready")
             time.sleep(0.01)
         marker: dict[str, object] = {
-            "schema_ref": schema_ref,
+            "schema_ref": "meta-research/codex-provider-supervisor-ready/v1",
             "invocation_hash": "a" * 64,
             "supervisor_process_id": process.pid,
             "supervisor_process_group": os.getpgid(process.pid),
         }
-        if phase is not None:
-            marker["phase"] = phase
         write_transport_envelope(
             operation / "supervisor-ready.json",
             marker,
@@ -80,7 +65,7 @@ def test_stop_accepts_both_signed_ready_marker_shapes(
             operation,
             key=b"k" * 32,
             invocation_hash="a" * 64,
-            ready_schema=schema_ref,
+            ready_schema="meta-research/codex-provider-supervisor-ready/v1",
         )
         assert process.wait(timeout=2) == 0
     finally:

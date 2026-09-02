@@ -1199,127 +1199,6 @@ assert stage_commit["outcome_receipt"]["receipt_ref"] == (
     acceptance["domain"]["receipt"]["receipt_ref"]
 )
 
-first_experiment = request(
-    "POST",
-    "/api/v1/experiments",
-    {
-        "execution_request_ref": "installed-experiment-retrain",
-        "quest_ref": confirmed["quest_ref"],
-        "title": "Installed formal measurement retrain",
-        "hypothesis": "The frozen additive variant is measured independently.",
-        "variant_parameter": -0.25,
-        "sample_count": 16,
-        "request_kind": "retrain",
-        "source_variant_run_ref": None,
-        "selected_checkpoint_role_refs": [],
-    },
-    idempotency_key="installed-experiment-retrain",
-)
-assert isinstance(first_experiment, dict)
-first_attempt_ref = first_experiment["identities"]["evaluation_attempt_ref"]
-deadline = time.monotonic() + 20
-while True:
-    first_experiment = request(
-        "GET", f"/api/v1/experiments/{first_attempt_ref}"
-    )
-    assert isinstance(first_experiment, dict)
-    formal = first_experiment["formal_measurement"]
-    if formal["status"] == "accepted":
-        break
-    if first_experiment["execution"]["status"] == "failed":
-        raise AssertionError(
-            f"installed experiment execution failed: {first_experiment}"
-        )
-    if formal["status"] == "rejected" or time.monotonic() >= deadline:
-        raise AssertionError(
-            f"installed Formal Measurement did not settle: {first_experiment}"
-        )
-    time.sleep(0.05)
-
-identity_names = {
-    "baseline_ref",
-    "variant_ref",
-    "evaluation_protocol_ref",
-    "protocol_version_ref",
-    "evaluation_ref",
-    "variant_run_ref",
-    "evaluation_attempt_ref",
-}
-assert set(first_experiment["identities"]) == identity_names
-assert len(set(first_experiment["identities"].values())) == len(identity_names)
-assert first_experiment["execution"]["status"] == "executed"
-assert first_experiment["execution"]["attempt_generation"] == 1
-assert first_experiment["execution"]["stdout_observation"]["complete"] is True
-assert first_experiment["execution"]["stdout_observation"]["dropped"] == 0
-assert {event["kind"] for event in first_experiment["execution"]["events"]} >= {
-    "stdout",
-    "telemetry",
-}
-assert first_experiment["assets"]["status"] == "accepted"
-assert len(first_experiment["assets"]["checkpoint_artifacts"]) == 1
-for role_name in ("checkpoint_artifacts", "log_assets", "analysis_assets"):
-    for role in first_experiment["assets"][role_name]:
-        assert role["asset_receipt"]["issuer"] == "research_memory"
-        assert role["receipt"]["issuer"] == "research_graph"
-result_role = first_experiment["assets"]["result_content"]
-assert result_role["asset_receipt"]["issuer"] == "research_memory"
-assert result_role["receipt"]["issuer"] == "research_graph"
-metric = first_experiment["formal_measurement"]["metric_result"]
-assert metric["receipt"]["issuer"] == "research_graph"
-assert set(metric["metrics"]) >= {
-    "baseline_mean",
-    "variant_mean",
-    "mean_delta",
-}
-
-checkpoint_ref = first_experiment["assets"]["checkpoint_artifacts"][0]["role_ref"]
-second_experiment = request(
-    "POST",
-    "/api/v1/experiments",
-    {
-        "execution_request_ref": "installed-experiment-remeasure",
-        "quest_ref": confirmed["quest_ref"],
-        "title": "Installed formal measurement remeasure",
-        "hypothesis": "The accepted VariantRun can be measured again.",
-        "variant_parameter": -0.25,
-        "sample_count": 16,
-        "request_kind": "remeasure",
-        "source_variant_run_ref": first_experiment["identities"]["variant_run_ref"],
-        "selected_checkpoint_role_refs": [checkpoint_ref],
-    },
-    idempotency_key="installed-experiment-remeasure",
-)
-assert isinstance(second_experiment, dict)
-second_attempt_ref = second_experiment["identities"]["evaluation_attempt_ref"]
-deadline = time.monotonic() + 20
-while True:
-    second_experiment = request(
-        "GET", f"/api/v1/experiments/{second_attempt_ref}"
-    )
-    assert isinstance(second_experiment, dict)
-    formal = second_experiment["formal_measurement"]
-    if formal["status"] == "accepted":
-        break
-    if second_experiment["execution"]["status"] == "failed":
-        raise AssertionError(
-            f"installed remeasurement execution failed: {second_experiment}"
-        )
-    if formal["status"] == "rejected" or time.monotonic() >= deadline:
-        raise AssertionError(
-            f"installed remeasurement did not settle: {second_experiment}"
-        )
-    time.sleep(0.05)
-
-assert second_experiment["identities"]["variant_run_ref"] == (
-    first_experiment["identities"]["variant_run_ref"]
-)
-assert second_experiment["identities"]["evaluation_attempt_ref"] != first_attempt_ref
-assert second_experiment["frozen_inputs"]["evaluation_attempt"]["hash"] != (
-    first_experiment["frozen_inputs"]["evaluation_attempt"]["hash"]
-)
-assert second_experiment["formal_measurement"]["metric_result"]["receipt"][
-    "issuer"
-] == "research_graph"
 result_path.write_text(
     json.dumps(
         {
@@ -1334,10 +1213,6 @@ result_path.write_text(
             },
             "turns": confirmed["intent_session"]["turns"],
             "idea_stage": idea_stage,
-            "experiments": {
-                "first": first_experiment,
-                "second": second_experiment,
-            },
             "provider_call_count": len(calls),
         },
         separators=(",", ":"),
@@ -1436,16 +1311,7 @@ assert snapshot["idea_stage"] == success["idea_stage"]
 assert len(calls_path.read_text(encoding="utf-8").splitlines()) == (
     success["provider_call_count"]
 )
-for key in ("first", "second"):
-    expected_experiment = success["experiments"][key]
-    attempt_ref = expected_experiment["identities"]["evaluation_attempt_ref"]
-    assert request("GET", f"/api/v1/experiments/{attempt_ref}") == (
-        expected_experiment
-    )
-assert snapshot["experiment"] == {
-    "status": "active",
-    "current": success["experiments"]["second"],
-}
+assert "experiment" not in snapshot
 second = request(
     "POST",
     "/api/v1/quest-initializations",
@@ -1475,13 +1341,6 @@ assert len(calls_path.read_text(encoding="utf-8").splitlines()) == (
 )
 cookie_values = {cookie.name: cookie.value for cookie in cookies}
 assert set(cookie_values) >= {"meta_research_session", "meta_research_csrf"}
-current_experiment = success["experiments"]["second"]
-current_execution = current_experiment["execution"]
-execution_fence_key = (
-    f"{current_execution['run_ref']}:g"
-    f"{current_execution['attempt_generation']}:"
-    f"{current_execution['root_session_ref']}"
-)
 stage_candidates = [
     (label, settled.get(key))
     for label, key in (
@@ -1521,8 +1380,6 @@ browser_session_path.write_text(
                 "quest_ref": success["quest_ref"],
                 "question_ref": success["question_ref"],
                 "stage": current_stage,
-                "experiment_title": current_experiment["intent"]["title"],
-                "execution_fence_key": execution_fence_key,
             },
         },
         separators=(",", ":"),

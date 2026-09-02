@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from meta_research.bundle_completion import verify_accepted_closure
 from meta_research.bundle_protocol import (
@@ -11,8 +13,8 @@ from meta_research.bundle_protocol import (
     projection_plain_value,
 )
 from meta_research.owners.common import OwnerConflict
-from sqlalchemy import text
 from meta_research.target_run_finalizer import TargetRunFinalizer
+from meta_research.web import create_app
 from test_bundle_completion_contract import _closure, _plan
 from test_target_root_finalizer import _EvidenceReader, _root_finalizer_fixture
 
@@ -169,6 +171,38 @@ def test_research_graph_accepts_and_replays_one_issuer_verified_root_commit(
             receipts=(accepted.receipt,),
             head_receipt=graph.query_target_graph_head(graph_ref).receipt,
         )
+
+        base_url = "http://testserver"
+        client = TestClient(
+            create_app(runtime, base_url=base_url, control_key="test-control"),
+            base_url=base_url,
+        )
+        try:
+            exchange = client.post(
+                "/auth/bootstrap",
+                headers={"Origin": base_url},
+                json={"token": runtime.authentication.issue_bootstrap_token()},
+            )
+            assert exchange.status_code == 200
+            snapshot = client.get("/api/v1/snapshot")
+            assert snapshot.status_code == 200
+            public = snapshot.json()
+            public_commit = next(
+                item
+                for item in public["bundle_stage"]["target_commits"]
+                if item["commit_ref"] == accepted.target_commit_ref
+            )
+            assert public_commit["closure"]["schema_ref"] == (
+                "meta-research/target-root-commit-closure/v1"
+            )
+            accepted_measurement = public_commit["closure"][
+                "accepted_measurement"
+            ]
+            assert accepted_measurement["formal_measurement_accepted"] is True
+            assert accepted_measurement["metric_result_ref"]
+            assert "experiment" not in public
+        finally:
+            client.close()
 
         # The transition reader re-enters RM; a locally self-consistent RG row
         # cannot hide a later-corrupted issuer receipt.

@@ -11,6 +11,7 @@ from sqlalchemy import text
 import meta_research.target_run_finalizer as target_run_finalizer_module
 import meta_research.target_implementation_bundle as target_bundle_module
 from meta_research.bundle_protocol import TargetWorkHandle
+from meta_research.bundle_skill import bind_bundle_runtime_to_full_conformance
 from meta_research.feed import DurableFeed
 from meta_research.owners.common import (
     AcceptanceReceipt,
@@ -39,6 +40,7 @@ from meta_research.target_run_finalizer import (
 from meta_research.target_run_runtime_contract import (
     decode_target_completion_handoff,
 )
+from meta_research.semantic_owner_gateway import BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
 import test_public_bundle_stage as bundle_fixtures
 from test_target_launch_admission import _ready_launch
 
@@ -301,8 +303,42 @@ def _root_finalizer_fixture(tmp_path: Path):
     return runtime, lifecycle, memory, authority, handle, workspace, evidence
 
 
+class _CurrentBindingBundleSkill(bundle_fixtures._DeterministicBundleSkill):
+    """Keep the Target fixture on the current operation-local Bundle seam."""
+
+    def __init__(self) -> None:
+        self._authority = None
+
+    def bind_full_conformance_authority(self, authority) -> None:
+        self._authority = authority
+
+    def runtime_binding(self):
+        assert self._authority is not None
+        base = replace(
+            super().runtime_binding(),
+            harness_adapter_ref="codex-cli/test",
+        )
+        operation_binding = self._authority.require_operation_binding(
+            harness_family="codex",
+            required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+            required_capabilities=("semantic_mcp",),
+        )
+        return bind_bundle_runtime_to_full_conformance(
+            base,
+            operation_binding,
+            required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+        )
+
+    def review_draft(self, request, draft):
+        return replace(
+            super().review_draft(request, draft),
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
+        )
+
+
 def _current_bundle_runtime(path: Path):
-    """Use the current composition surface, not the legacy port test option."""
+    """Use current operation-local Bundle and Target admission."""
 
     drafting = bundle_fixtures._DeterministicDraftingAdapter()
     runtime = bundle_fixtures.build_production_runtime(
@@ -314,21 +350,15 @@ def _current_bundle_runtime(path: Path):
         plan_skill_provider=bundle_fixtures._DeterministicPlanSkill(
             no_gap=False
         ),
-        bundle_skill_provider=bundle_fixtures._DeterministicBundleSkill(),
+        bundle_skill_provider=_CurrentBindingBundleSkill(),
         harness_adapters=(
             bundle_fixtures._FullConformanceAdapter("codex"),
-            bundle_fixtures._FullConformanceAdapter("claude"),
         ),
+        power_inhibitor=bundle_fixtures._TogglePowerInhibitor(),
     )
     runtime.owners.research_graph._target_candidate_proof_verifier = (  # type: ignore[attr-defined]
         bundle_fixtures._AcceptingTargetCandidateProofVerifier()
     )
-    if runtime.harnesses.query_status()["status"] != "ready":
-        runtime.harnesses.start_full_conformance(bundle_fixtures._full_request())
-        for _turn in range(4):
-            assert runtime.harnesses.advance_full_conformance(
-                mcp_base_url="http://127.0.0.1:8765"
-            )
     return runtime
 
 
@@ -642,7 +672,8 @@ def test_invalid_result_candidate_is_rejected_before_rm_and_can_be_revised(
         assert rejected.pending_code == "target_root_result_document_invalid"
         assert rejected.rejection_feedback == (
             "The declared result document is not valid canonical JSON for the "
-            "Target result schema. Rewrite it and submit a new completion handoff."
+            "Target result schema. Rewrite outputs/result.json and complete another "
+            "root turn."
         )
         first_completion = lifecycle.query_completion(handle.target_ref)
         assert first_completion is not None
@@ -1265,7 +1296,7 @@ def test_prefreeze_rejection_store_unavailability_replays_exact_feedback(
         runtime.close()
 
 
-def test_finalizer_rejects_symlinked_declared_artifact_before_ar_or_rm(
+def test_finalizer_maps_symlinked_artifact_to_recoverable_rejection_before_rm(
     tmp_path: Path,
 ) -> None:
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = (
@@ -1283,14 +1314,20 @@ def test_finalizer_rejects_symlinked_declared_artifact_before_ar_or_rm(
         measurement_authority=runtime.owners.research_graph,
     )
     try:
-        with pytest.raises(
-            OwnerConflict, match="target_root_artifact_symlink_forbidden"
-        ):
-            finalizer.finalize(handle=handle, evidence=evidence)
-        assert lifecycle.query_completion(handle.target_ref) is None
+        rejected = finalizer.finalize(handle=handle, evidence=evidence)
+
+        assert rejected.status == "revision_required"
+        assert rejected.manifest_ref is None
+        assert rejected.pending_code == "target_root_artifact_symlink_forbidden"
+        assert rejected.rejection_issuer == "research_memory"
+        assert lifecycle.query(handle.target_ref).status == "running"  # type: ignore[union-attr]
+        assert memory.query_for_completion(rejected.completion_ref) is None
         with runtime._database.read() as connection:
             assert connection.execute(
                 text("SELECT COUNT(*) FROM rm_target_root_completion_manifests")
+            ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_commits")
             ).scalar_one() == 0
     finally:
         runtime.close()

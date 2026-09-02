@@ -3,9 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from meta_research.harness import HarnessAdmissionError
-from meta_research.owners.agent_runtime_harness import (
-    TARGET_ROOT_RECOVERY_READY_CODE,
-)
 from meta_research.target_run_runtime import TargetRunRuntime
 from test_target_run_owner import _records
 
@@ -109,7 +106,7 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
         root_calls: list[tuple[str, dict[str, str]]] = []
         evidence: object | None = None
 
-        def admit_target_run_from_current_conformance(self, **values):
+        def admit_target_run_from_current_binding(self, **values):
             assert values["target_ref"] == handle.target_ref
             target_agent.harness = SimpleNamespace(
                 target_run_ref=handle.target_run_ref,
@@ -184,8 +181,9 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
     assert all(
         "own the entire loop" in values["prompt"]
         and "repeat as many times" in values["prompt"]
-        and "spawn a focused child agent" in values["prompt"]
-        and "you remain responsible" in values["prompt"]
+        and "native multi-agent collaboration" in values["prompt"]
+        and "delegation is optional" in values["prompt"]
+        and "You remain responsible" in values["prompt"]
         and "/var/lib/meta-research/target-frozen-inputs/manifest.json"
         in values["prompt"]
         for _request_ref, values in harnesses.root_calls
@@ -433,13 +431,6 @@ def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() ->
         def recover_failed_target_root(self, request_ref: str):
             self.recovery_calls.append(request_ref)
             if len(self.recovery_calls) == 1:
-                target_agent.admission = SimpleNamespace(
-                    **{
-                        **vars(target_agent.admission),
-                        "status": "executed",
-                        "failure_code": "target_root_recovery_pending",
-                    }
-                )
                 raise HarnessAdmissionError(
                     "mcp_channel_temporarily_unavailable",
                     next_retry_at=123.0,
@@ -448,7 +439,7 @@ def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() ->
                 **{
                     **vars(target_agent.admission),
                     "status": "executed",
-                    "failure_code": TARGET_ROOT_RECOVERY_READY_CODE,
+                    "failure_code": None,
                 }
             )
             return SimpleNamespace(run=SimpleNamespace(status="executed"))
@@ -515,8 +506,8 @@ def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() ->
     assert finalizer.materialize_calls == 0
     assert finalizer.finalize_calls == []
 
-    assert target_agent.admission.status == "executed"
-    assert target_agent.admission.failure_code == "target_root_recovery_pending"
+    assert target_agent.admission.status == "failed"
+    assert target_agent.admission.failure_code == "provider_process_failed"
 
     assert runtime.process_once(handle.target_ref) is True
     assert runtime.query_status(handle.target_ref).phase == "harness_recovered"  # type: ignore[union-attr]
