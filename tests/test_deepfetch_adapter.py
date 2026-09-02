@@ -195,12 +195,14 @@ PROTOTYPE_ACQUIRE = {
     "action": "acquire",
     "acquisition_request": {
         "effect_id": "acq-v4-1",
-        "target": {
-            "paper_id": "doi:10.1000/example",
-            "title": "A verifiable paper",
-            "doi": "10.1000/example",
-            "source_urls": ["https://example.org/paper"],
-        },
+        "targets": [
+            {
+                "paper_id": "doi:10.1000/example",
+                "title": "A verifiable paper",
+                "doi": "10.1000/example",
+                "source_urls": ["https://example.org/paper"],
+            }
+        ],
     },
     "completion": None,
     "limitations": [],
@@ -878,16 +880,16 @@ class _DeepFetchResidentMcpAuthority:
             return _mcp_success(result)
 
         assert operation_id == "agent_runtime.acquisition.request"
-        target = arguments.get("target")
-        assert isinstance(target, dict)
-        paper_id = target.get("paper_id")
-        assert isinstance(paper_id, str)
+        targets = arguments.get("targets")
+        assert isinstance(targets, list)
+        assert targets
+        assert all(isinstance(target, dict) for target in targets)
         request_id = _fake_acquisition_request_id(phase, effect_id)
         self.calls.append(
             {
                 "phase": phase,
                 "effect_id": effect_id,
-                "target": copy.deepcopy(target),
+                "targets": copy.deepcopy(targets),
                 "request_id": request_id,
             }
         )
@@ -897,39 +899,51 @@ class _DeepFetchResidentMcpAuthority:
                 "effect_id": effect_id,
                 "request_id": request_id,
                 "status": "waiting_user",
-                "result": {
-                    "paper_id": paper_id,
-                    "status": "waiting_user",
-                    "failure": {
-                        "code": "institutional_login_required",
-                        "detail": "请在既有浏览器上下文中完成登录。",
-                    },
-                },
+                "results": [
+                    {
+                        "paper_id": target["paper_id"],
+                        "status": "waiting_user",
+                        "failure": {
+                            "code": "institutional_login_required",
+                            "detail": "请在既有浏览器上下文中完成登录。",
+                        },
+                    }
+                    for target in targets
+                ],
             }
             self.executions[identity] = waiting
             return _mcp_success(waiting)
         assert self.artifact_root is not None
         self.artifact_root.mkdir(parents=True, exist_ok=True)
-        artifact = self.artifact_root / (
-            hashlib.sha256(paper_id.encode()).hexdigest() + ".html"
-        )
-        artifact.write_bytes(self.content)
+        results: list[dict[str, object]] = []
+        artifacts: list[Path] = []
+        for target in targets:
+            paper_id = target.get("paper_id")
+            assert isinstance(paper_id, str)
+            artifact = self.artifact_root / (
+                hashlib.sha256(paper_id.encode()).hexdigest() + ".html"
+            )
+            artifact.write_bytes(self.content)
+            artifacts.append(artifact)
+            results.append(
+                {
+                    "paper_id": paper_id,
+                    "status": "obtained",
+                    "verified_path": str(artifact.resolve()),
+                    "format": "html",
+                    "content_sha256": hashlib.sha256(self.content).hexdigest(),
+                    "content_bytes": len(self.content),
+                }
+            )
         result = {
             "effect_id": effect_id,
             "request_id": request_id,
             "status": "obtained",
-            "result": {
-                "paper_id": paper_id,
-                "status": "obtained",
-                "verified_path": str(artifact.resolve()),
-                "format": "html",
-                "content_sha256": hashlib.sha256(self.content).hexdigest(),
-                "content_bytes": len(self.content),
-            },
+            "results": results,
         }
         self.executions[identity] = result
         if self.drift_after_commit:
-            artifact.write_bytes(TAMPERED_FULLTEXT)
+            artifacts[0].write_bytes(TAMPERED_FULLTEXT)
         return _mcp_success(result)
 
     @property
@@ -1749,7 +1763,7 @@ def test_codex_deepfetch_treats_selected_oa_as_the_primary_route(
     assert "跳过 institution/browser preflight" in prompt
     assert "不得描述为被迫、只能或降级到 OA" in prompt
     assert "Quest-scoped Acquisition" in prompt
-    assert "只含 effect_id 和一个 target 的 action=acquire" in prompt
+    assert "只含 effect_id 和 1 至 10 个 targets 的 action=acquire" in prompt
 
 
 def test_deepfetch_activity_tail_projects_live_events_without_provider_content(
@@ -2298,10 +2312,21 @@ def test_codex_deepfetch_rejects_oversized_fulltext_before_validator_reads_it(
         _execute(adapter)
 
 
-def test_codex_deepfetch_routes_one_target_through_the_common_acquisition_effect(
+def test_codex_deepfetch_routes_one_batch_through_the_common_acquisition_effect(
     tmp_path: Path,
 ) -> None:
-    runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
+    batch_acquire = copy.deepcopy(PROTOTYPE_ACQUIRE)
+    targets = batch_acquire["acquisition_request"]["targets"]
+    assert isinstance(targets, list)
+    targets.append(
+        {
+            "paper_id": "arxiv:2401.00002",
+            "title": "A second verifiable paper",
+            "arxiv_id": "2401.00002",
+            "source_urls": ["https://example.org/paper-2"],
+        }
+    )
+    runner = SequencedPrototypeRunner([batch_acquire, PROTOTYPE_FINAL])
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
     adapter = _bind_acquisition(
         CodexDeepFetchAdapter(
@@ -2318,7 +2343,11 @@ def test_codex_deepfetch_routes_one_target_through_the_common_acquisition_effect
     call = acquisition.calls[0]
     assert call["phase"] == "turn-1"
     assert call["effect_id"] == "acq-v4-1"
-    assert call["target"] == PROTOTYPE_ACQUIRE["acquisition_request"]["target"]
+    assert call["targets"] == targets
+    assert acquisition.query_calls == [
+        ("turn-1", "acq-v4-1"),
+        ("turn-1", "acq-v4-1"),
+    ]
     request_id = call["request_id"]
     assert isinstance(request_id, str)
     assert len(runner.calls) == 3
@@ -2329,13 +2358,14 @@ def test_codex_deepfetch_routes_one_target_through_the_common_acquisition_effect
     checkpoint_path = next(
         (tmp_path / "provider" / "runs").glob("*/private/protocol.json")
     )
-    proof = json.loads(checkpoint_path.read_text(encoding="utf-8"))[
+    proofs = json.loads(checkpoint_path.read_text(encoding="utf-8"))[
         "acquisition_item_proofs"
-    ][0]
-    assert proof == {
+    ]
+    assert len(proofs) == 2
+    assert proofs[0] == {
         "effect_id": "acq-v4-1",
         "phase": "turn-1",
-        "target_hash": canonical_hash(call["target"]),
+        "target_hash": canonical_hash(targets[0]),
         "request_id": request_id,
         "paper_id": "doi:10.1000/example",
         "status": "obtained",
@@ -2345,6 +2375,27 @@ def test_codex_deepfetch_routes_one_target_through_the_common_acquisition_effect
                 / "owner-artifacts"
                 / (
                     hashlib.sha256(b"doi:10.1000/example").hexdigest()
+                    + ".html"
+                )
+            ).resolve()
+        ),
+        "format": "html",
+        "sha256": hashlib.sha256(PROTOTYPE_FULLTEXT).hexdigest(),
+        "bytes": len(PROTOTYPE_FULLTEXT),
+    }
+    assert proofs[1] == {
+        "effect_id": "acq-v4-1",
+        "phase": "turn-1",
+        "target_hash": canonical_hash(targets[1]),
+        "request_id": request_id,
+        "paper_id": "arxiv:2401.00002",
+        "status": "obtained",
+        "path": str(
+            (
+                tmp_path
+                / "owner-artifacts"
+                / (
+                    hashlib.sha256(b"arxiv:2401.00002").hexdigest()
                     + ".html"
                 )
             ).resolve()
@@ -2391,10 +2442,12 @@ def test_deepfetch_acquisition_source_url_fits_the_common_effect_schema() -> Non
     output = copy.deepcopy(PROTOTYPE_ACQUIRE)
     request = output["acquisition_request"]
     assert isinstance(request, dict)
-    target = request["target"]
+    targets = request["targets"]
+    assert isinstance(targets, list)
+    target = targets[0]
     assert isinstance(target, dict)
     target["source_urls"] = ["https://example.org/" + "x" * 4_076]
-    assert _validated_v4_acquisition_effect(output)["target"] == target
+    assert _validated_v4_acquisition_effect(output)["targets"] == targets
 
     target["source_urls"] = ["https://example.org/" + "x" * 4_077]
 
@@ -2482,7 +2535,9 @@ def test_codex_deepfetch_binds_each_reader_fulltext_to_an_obtained_hosted_item(
     tmp_path: Path,
 ) -> None:
     unrelated_acquisition = copy.deepcopy(PROTOTYPE_ACQUIRE)
-    unrelated_paper = unrelated_acquisition["acquisition_request"]["target"]
+    unrelated_targets = unrelated_acquisition["acquisition_request"]["targets"]
+    assert isinstance(unrelated_targets, list)
+    unrelated_paper = unrelated_targets[0]
     unrelated_paper.update(
         {
             "paper_id": "doi:10.1000/unrelated",
@@ -2861,7 +2916,7 @@ def test_codex_deepfetch_replays_the_exact_pending_batch_after_user_login(
         "acq-v4-1",
         "acq-v4-1",
     ]
-    assert acquisition.calls[0]["target"] == acquisition.calls[1]["target"]
+    assert acquisition.calls[0]["targets"] == acquisition.calls[1]["targets"]
     assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["phase"] == (
         "finalized"
     )

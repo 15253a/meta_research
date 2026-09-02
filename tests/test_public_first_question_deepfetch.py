@@ -344,12 +344,20 @@ class CommonAcquisitionEffectRunner:
             "action": "acquire",
             "acquisition_request": {
                 "effect_id": "deepfetch-fulltext-1",
-                "target": {
-                    "paper_id": "doi:10.1000/example.one",
-                    "title": "Self-supervised denoising for fluorescence microscopy",
-                    "doi": "10.1000/example.one",
-                    "source_urls": ["https://example.org/papers/one"],
-                },
+                "targets": [
+                    {
+                        "paper_id": "doi:10.1000/example.one",
+                        "title": "Self-supervised denoising for fluorescence microscopy",
+                        "doi": "10.1000/example.one",
+                        "source_urls": ["https://example.org/papers/one"],
+                    },
+                    {
+                        "paper_id": "arxiv:2401.00002",
+                        "title": "A second microscopy paper",
+                        "arxiv_id": "2401.00002",
+                        "source_urls": ["https://example.org/papers/two"],
+                    },
+                ],
             },
             "completion": None,
             "limitations": [],
@@ -1313,8 +1321,9 @@ def test_codex_deepfetch_uses_the_resident_common_acquisition_effect(
         batch = acquisition_provider.batches[0]
         assert batch.session_ref == session.session_ref
         assert batch.route_policy == "oa_first_then_institution"
-        assert len(batch.papers) == 1
+        assert len(batch.papers) == 2
         assert batch.papers[0].paper_id == "doi:10.1000/example.one"
+        assert batch.papers[1].paper_id == "arxiv:2401.00002"
         assert batch.target_dir is not None
         assert Path(batch.target_dir).is_relative_to(
             runtime.data_root.run / "acquisition-sessions"
@@ -1329,7 +1338,7 @@ def test_codex_deepfetch_uses_the_resident_common_acquisition_effect(
         assert execution.results[0].content_bytes is not None
         assert set(runner.acquisition_reply["acquisition_request"]) == {
             "effect_id",
-            "target",
+            "targets",
         }
     finally:
         client.close()

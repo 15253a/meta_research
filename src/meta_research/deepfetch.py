@@ -1708,9 +1708,10 @@ class CodexDeepFetchAdapter:
             {
                 "effect_id": effect["effect_id"],
                 "phase": phase,
-                "target_hash": canonical_hash(effect["target"]),
+                "target_hash": canonical_hash(target),
             }
             for phase, effect in acquisition_effects
+            for target in cast(list[dict[str, object]], effect["targets"])
         )
         recorded_effects = tuple(
             {
@@ -1720,8 +1721,10 @@ class CodexDeepFetchAdapter:
             for proof in checkpoint.acquisition_item_proofs
         )
         recorded_request_ids = tuple(
-            cast(str, proof["request_id"])
-            for proof in checkpoint.acquisition_item_proofs
+            dict.fromkeys(
+                cast(str, proof["request_id"])
+                for proof in checkpoint.acquisition_item_proofs
+            )
         )
         if checkpoint.phase == "finalized":
             if (
@@ -1759,11 +1762,18 @@ class CodexDeepFetchAdapter:
             return checkpoint
 
         if checkpoint.phase == "pending_acquisition":
+            assert checkpoint.pending_acquisition is not None
+            pending_target_count = len(
+                cast(
+                    list[dict[str, object]],
+                    checkpoint.pending_acquisition["targets"],
+                )
+            )
             if (
                 not acquisition_effects
                 or checkpoint.pending_acquisition
                 != acquisition_effects[-1][1]
-                or observed_effects[:-1] != recorded_effects
+                or observed_effects[:-pending_target_count] != recorded_effects
                 or recorded_request_ids != checkpoint.acquisition_request_ids
             ):
                 raise ValueError("deepfetch reconciliation acquisition mismatch")
@@ -2223,11 +2233,17 @@ class CodexDeepFetchAdapter:
                         native_session_ref=checkpoint.native_session_ref,
                     )
                 try:
-                    item_proof = _semantic_acquisition_item_proof(
+                    targets = cast(
+                        list[dict[str, object]], effect["targets"]
+                    )
+                    item_proofs = _semantic_acquisition_item_proofs(
                         execution,
                         effect_id=cast(str, effect["effect_id"]),
                         phase=effect_phase,
-                        target=cast(dict[str, object], effect["target"]),
+                        target_hashes={
+                            cast(str, target["paper_id"]): canonical_hash(target)
+                            for target in targets
+                        },
                     )
                 except DeepFetchUnavailable as error:
                     # Acquisition already committed this immutable request.  A
@@ -2240,7 +2256,7 @@ class CodexDeepFetchAdapter:
                     ) from error
                 acquisition_ids = (
                     *checkpoint.acquisition_request_ids,
-                    cast(str, item_proof["request_id"]),
+                    cast(str, item_proofs[0]["request_id"]),
                 )
                 checkpoint = replace(
                     checkpoint,
@@ -2248,13 +2264,13 @@ class CodexDeepFetchAdapter:
                     acquisition_request_ids=acquisition_ids,
                     acquisition_item_proofs=(
                         *checkpoint.acquisition_item_proofs,
-                        item_proof,
+                        *item_proofs,
                     ),
                     pending_acquisition=None,
                     next_prompt=self._acquisition_result_prompt(
                         public_root,
                         execution,
-                        item_proof,
+                        item_proofs,
                     ),
                 )
                 _write_protocol_checkpoint(checkpoint_path, checkpoint)
@@ -2417,9 +2433,17 @@ class CodexDeepFetchAdapter:
             return ()
         proofs: list[dict[str, object]] = []
         try:
-            for recorded in recorded_proofs:
-                effect_id = cast(str, recorded["effect_id"])
-                phase = cast(str, recorded["phase"])
+            batches: dict[
+                tuple[str, str, str], list[dict[str, object]]
+            ] = {}
+            for proof in recorded_proofs:
+                identity = (
+                    cast(str, proof["effect_id"]),
+                    cast(str, proof["phase"]),
+                    cast(str, proof["request_id"]),
+                )
+                batches.setdefault(identity, []).append(proof)
+            for (effect_id, phase, request_id), recorded_batch in batches.items():
                 execution = self._call_acquisition_operation(
                     request,
                     operation_id=ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
@@ -2430,13 +2454,20 @@ class CodexDeepFetchAdapter:
                     raise DeepFetchUnavailable(
                         "deepfetch_acquisition_reattestation_required"
                     )
-                current = _semantic_acquisition_item_proof(
-                    execution,
-                    effect_id=effect_id,
-                    phase=phase,
-                    target_hash=cast(str, recorded["target_hash"]),
+                proofs.extend(
+                    _semantic_acquisition_item_proofs(
+                        execution,
+                        effect_id=effect_id,
+                        phase=phase,
+                        target_hashes={
+                            cast(str, proof["paper_id"]): cast(
+                                str, proof["target_hash"]
+                            )
+                            for proof in recorded_batch
+                        },
+                        expected_request_id=request_id,
+                    )
                 )
-                proofs.append(current)
         except DeepFetchUnavailable as error:
             raise DeepFetchUnavailable(
                 error.code,
@@ -2493,7 +2524,8 @@ class CodexDeepFetchAdapter:
             "Quest-scoped Acquisition、independent Readers、Synthesis 与 "
             "scripts/papers.py finalize 闭环；不得把它扁平化成单体 Web Search/Fetch "
             "回答。主 Agent 负责发现、选择、ledger 和 summary，Acquisition 只负责"
-            "合法获取；需要全文时返回只含 effect_id 和一个 target 的 action=acquire，"
+            "合法获取；需要全文时返回只含 effect_id 和 1 至 10 个 targets 的 "
+            "action=acquire，"
             "并且只把共同 Acquisition effect 返回为 obtained 的同一 paper_id "
             "交给 Reader。每份已注册全文必须用原生 spawn_agent 启动一个独立 Reader，"
             "并 wait 到终态。最终 workflow.reader_assignments 的 reader_agent_ref "
@@ -2567,12 +2599,12 @@ class CodexDeepFetchAdapter:
         self,
         public_root: Path,
         execution: dict[str, object],
-        item_proof: dict[str, object],
+        item_proofs: tuple[dict[str, object], ...],
     ) -> str:
         return (
             "继续同一 DeepFetch v4 main agent Session。以下是共同 Acquisition effect "
-            "对上一精确 target 返回的紧凑结果；把 request_id 当作只读 receipt，"
-            "继续 Radar/Ledger/Readers，必要时提出一个新的单 target effect，"
+            "对上一有限批次返回的紧凑结果；把 request_id 当作只读 receipt，"
+            "继续 Radar/Ledger/Readers，必要时提出一个新的有限批次 effect，"
             "最终运行固定 bundle 的 scripts/papers.py finalize。每个 Reader 的 "
             "reader_agent_ref 使用原生 spawn_agent 返回的 task_name。"
             "Reader 和 "
@@ -2583,9 +2615,9 @@ class CodexDeepFetchAdapter:
             f"public_output_root={public_root}\n"
             f"acquisition_request_id={execution['request_id']}\n"
             "acquisition_artifact_proofs="
-            f"{canonical_json([item_proof])}\n"
+            f"{canonical_json(list(item_proofs))}\n"
             "acquisition_result="
-            f"{canonical_json(execution['result'])}"
+            f"{canonical_json(execution['results'])}"
         )
 
     def _invoke(
@@ -3534,78 +3566,110 @@ def _acquisition_effect_from_checkpoint(
         ) from error
 
 
-def _semantic_acquisition_item_proof(
+def _semantic_acquisition_item_proofs(
     execution: dict[str, object],
     *,
     effect_id: str,
     phase: str,
-    target: dict[str, object] | None = None,
-    target_hash: str | None = None,
-) -> dict[str, object]:
-    result = execution.get("result")
+    target_hashes: dict[str, str],
+    expected_request_id: str | None = None,
+) -> tuple[dict[str, object], ...]:
+    results = execution.get("results")
     request_id = execution.get("request_id")
     status = execution.get("status")
     if (
-        set(execution) != {"effect_id", "request_id", "status", "result"}
+        set(execution) != {"effect_id", "request_id", "status", "results"}
         or execution.get("effect_id") != effect_id
         or not isinstance(request_id, str)
         or not request_id
-        or status not in {"obtained", "missing"}
-        or not isinstance(result, dict)
-        or result.get("status") != status
-        or not isinstance(result.get("paper_id"), str)
+        or expected_request_id is not None
+        and request_id != expected_request_id
+        or status not in {"obtained", "partial", "missing"}
+        or not isinstance(results, list)
+        or not results
+        or len(results) != len(target_hashes)
     ):
         raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
-    if target is not None:
-        if result["paper_id"] != target.get("paper_id"):
-            raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
-        target_hash = canonical_hash(target)
-    if not isinstance(target_hash, str) or len(target_hash) != 64:
+    paper_ids = [
+        result.get("paper_id") if isinstance(result, dict) else None
+        for result in results
+    ]
+    if paper_ids != list(target_hashes):
         raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
-    proof: dict[str, object] = {
-        "effect_id": effect_id,
-        "phase": phase,
-        "target_hash": target_hash,
-        "request_id": request_id,
-        "paper_id": result["paper_id"],
-        "status": status,
-        "path": None,
-        "format": None,
-        "sha256": None,
-        "bytes": None,
+    result_statuses = {
+        result.get("status") if isinstance(result, dict) else None
+        for result in results
     }
-    if status == "obtained":
-        if set(result) != {
-            "paper_id",
-            "status",
-            "verified_path",
-            "format",
-            "content_sha256",
-            "content_bytes",
-        }:
-            raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
-        path, artifact_format, observed_digest, observed_bytes = (
-            _read_hosted_acquisition_artifact(
-                result["verified_path"],
-                result["format"],
-            )
-        )
-        if (
-            observed_digest != result["content_sha256"]
-            or observed_bytes != result["content_bytes"]
-        ):
-            raise DeepFetchUnavailable("deepfetch_acquisition_artifact_drift")
-        proof.update(
-            {
-                "path": path,
-                "format": artifact_format,
-                "sha256": observed_digest,
-                "bytes": observed_bytes,
-            }
-        )
-    elif set(result) != {"paper_id", "status", "failure"}:
+    expected_status = (
+        "obtained"
+        if result_statuses == {"obtained"}
+        else "partial"
+        if "obtained" in result_statuses
+        else "missing"
+    )
+    if (
+        not result_statuses <= {"obtained", "missing"}
+        or status != expected_status
+    ):
         raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
-    return proof
+
+    proofs: list[dict[str, object]] = []
+    for result in results:
+        assert isinstance(result, dict)
+        paper_id = cast(str, result["paper_id"])
+        item_status = result.get("status")
+        target_hash = target_hashes[paper_id]
+        if not isinstance(target_hash, str) or len(target_hash) != 64:
+            raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
+        proof: dict[str, object] = {
+            "effect_id": effect_id,
+            "phase": phase,
+            "target_hash": target_hash,
+            "request_id": request_id,
+            "paper_id": paper_id,
+            "status": item_status,
+            "path": None,
+            "format": None,
+            "sha256": None,
+            "bytes": None,
+        }
+        if item_status == "obtained":
+            if set(result) != {
+                "paper_id",
+                "status",
+                "verified_path",
+                "format",
+                "content_sha256",
+                "content_bytes",
+            }:
+                raise DeepFetchUnavailable(
+                    "deepfetch_acquisition_result_invalid"
+                )
+            path, artifact_format, observed_digest, observed_bytes = (
+                _read_hosted_acquisition_artifact(
+                    result["verified_path"],
+                    result["format"],
+                )
+            )
+            if (
+                observed_digest != result["content_sha256"]
+                or observed_bytes != result["content_bytes"]
+            ):
+                raise DeepFetchUnavailable(
+                    "deepfetch_acquisition_artifact_drift"
+                )
+            proof.update(
+                {
+                    "path": path,
+                    "format": artifact_format,
+                    "sha256": observed_digest,
+                    "bytes": observed_bytes,
+                }
+            )
+        elif set(result) != {"paper_id", "status", "failure"}:
+            raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
+        proofs.append(proof)
+    return tuple(proofs)
 
 
 def _read_hosted_acquisition_artifact(
@@ -3876,65 +3940,78 @@ def _validated_v4_acquisition_effect(
     ):
         raise DeepFetchUnavailable("deepfetch_workflow_evidence_invalid")
     value = envelope.get("acquisition_request")
-    if not isinstance(value, dict) or set(value) != {"effect_id", "target"}:
+    if not isinstance(value, dict) or set(value) != {"effect_id", "targets"}:
         raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
     effect_id = value.get("effect_id")
-    target = value.get("target")
+    targets = value.get("targets")
     if (
         not isinstance(effect_id, str)
         or not effect_id
         or len(effect_id) > 128
-        or not isinstance(target, dict)
-        or not {"paper_id", "title", "source_urls"} <= set(target)
-        or not set(target) <= {
+        or not isinstance(targets, list)
+        or not 1 <= len(targets) <= 10
+    ):
+        raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
+    normalized_targets: list[dict[str, object]] = []
+    paper_ids: set[str] = set()
+    for target in targets:
+        if (
+            not isinstance(target, dict)
+            or not {"paper_id", "title", "source_urls"} <= set(target)
+            or not set(target) <= {
             "paper_id",
             "title",
             "doi",
             "arxiv_id",
             "source_urls",
-        }
-    ):
-        raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
-    paper_id = target.get("paper_id")
-    title = target.get("title")
-    doi = target.get("doi")
-    arxiv_id = target.get("arxiv_id")
-    urls = target.get("source_urls")
-    if (
-        not isinstance(paper_id, str)
-        or not paper_id
-        or len(paper_id) > 512
-        or not isinstance(title, str)
-        or not title.strip()
-        or len(title) > 2_000
-        or doi is not None
-        and (not isinstance(doi, str) or not doi or len(doi) > 512)
-        or arxiv_id is not None
-        and (
-            not isinstance(arxiv_id, str)
-            or not arxiv_id
-            or len(arxiv_id) > 512
-        )
-        or not isinstance(urls, list)
-        or len(urls) > 20
-        or any(not isinstance(url, str) or len(url) > 4_096 for url in urls)
-    ):
-        raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
-    normalized_target: dict[str, object] = {
-        "paper_id": paper_id,
-        "title": title,
-        "source_urls": [
-            _validated_public_url(
-                url, "deepfetch_acquisition_source_url_invalid"
+            }
+        ):
+            raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
+        paper_id = target.get("paper_id")
+        title = target.get("title")
+        doi = target.get("doi")
+        arxiv_id = target.get("arxiv_id")
+        urls = target.get("source_urls")
+        if (
+            not isinstance(paper_id, str)
+            or not paper_id
+            or paper_id in paper_ids
+            or len(paper_id) > 512
+            or not isinstance(title, str)
+            or not title.strip()
+            or len(title) > 2_000
+            or doi is not None
+            and (not isinstance(doi, str) or not doi or len(doi) > 512)
+            or arxiv_id is not None
+            and (
+                not isinstance(arxiv_id, str)
+                or not arxiv_id
+                or len(arxiv_id) > 512
             )
-            for url in urls
-        ],
-    }
-    if isinstance(doi, str):
-        normalized_target["doi"] = doi
-    if isinstance(arxiv_id, str):
-        normalized_target["arxiv_id"] = arxiv_id
-    return {"effect_id": effect_id, "target": normalized_target}
+            or not isinstance(urls, list)
+            or len(urls) > 20
+            or any(
+                not isinstance(url, str) or len(url) > 4_096 for url in urls
+            )
+        ):
+            raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
+        paper_ids.add(paper_id)
+        normalized_target: dict[str, object] = {
+            "paper_id": paper_id,
+            "title": title,
+            "source_urls": [
+                _validated_public_url(
+                    url, "deepfetch_acquisition_source_url_invalid"
+                )
+                for url in urls
+            ],
+        }
+        if isinstance(doi, str):
+            normalized_target["doi"] = doi
+        if isinstance(arxiv_id, str):
+            normalized_target["arxiv_id"] = arxiv_id
+        normalized_targets.append(normalized_target)
+    return {"effect_id": effect_id, "targets": normalized_targets}
 
 
 def _merge_web_evidence(
@@ -5196,9 +5273,14 @@ def _deepfetch_output_schema() -> dict[str, object]:
         "additionalProperties": False,
         "properties": {
             "effect_id": {"type": "string", "minLength": 1, "maxLength": 128},
-            "target": acquisition_target,
+            "targets": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 10,
+                "items": acquisition_target,
+            },
         },
-        "required": ["effect_id", "target"],
+        "required": ["effect_id", "targets"],
     }
     reader_assignment = {
         "type": "object",

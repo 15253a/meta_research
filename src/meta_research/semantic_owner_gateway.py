@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 from meta_research.acquisition import (
     ACQUISITION_ROUTE_POLICY,
     AcquisitionBatchExecution,
     AcquisitionBatchRequest,
+    AcquisitionItemResult,
     AcquisitionPaper,
     AcquisitionProvider,
     AcquisitionUnavailable,
+    aggregate_batch_status,
     freeze_acquisition_item_artifacts,
 )
 from meta_research.bundle_exhaustion import (
@@ -715,7 +717,7 @@ def _root_agent_acquisition_operations(
             semantic_operation_id=request_id,
             owning_module="agent_runtime",
             description=(
-                "Request one exact full-text target through the Quest's existing "
+                "Request one bounded full-text batch through the Quest's existing "
                 "Acquisition Session. Provider, route, Session and private storage "
                 "are selected by the server."
             ),
@@ -734,7 +736,7 @@ def _root_agent_acquisition_operations(
             semantic_operation_id=reconcile_id,
             owning_module="agent_runtime",
             description=(
-                "Read the recorded result for one exact Acquisition request after "
+                "Read the recorded result for one Acquisition batch request after "
                 "a lost acknowledgement; this operation never invokes a Provider."
             ),
             input_schema=_effect_input_schema(),
@@ -869,24 +871,29 @@ def _root_agent_acquisition_request(
     effect_key: str,
     arguments: dict[str, object],
 ) -> AcquisitionBatchRequest:
-    target = arguments.get("target")
-    if not isinstance(target, dict):
+    targets = arguments.get("targets")
+    if not isinstance(targets, list):
         raise SemanticMcpError("acquisition_target_invalid")
-    source_urls = target.get("source_urls")
-    if not isinstance(source_urls, list):
-        raise SemanticMcpError("acquisition_target_invalid")
-    return AcquisitionBatchRequest(
-        request_id=_root_agent_acquisition_request_id(effect_key),
-        route_policy=ACQUISITION_ROUTE_POLICY,
-        papers=(
+    papers: list[AcquisitionPaper] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            raise SemanticMcpError("acquisition_target_invalid")
+        source_urls = target.get("source_urls")
+        if not isinstance(source_urls, list):
+            raise SemanticMcpError("acquisition_target_invalid")
+        papers.append(
             AcquisitionPaper(
                 paper_id=cast(str, target["paper_id"]),
                 title=cast(str, target["title"]),
                 doi=cast(str | None, target.get("doi")),
                 arxiv_id=cast(str | None, target.get("arxiv_id")),
                 source_urls=tuple(cast(list[str], source_urls)),
-            ),
-        ),
+            )
+        )
+    return AcquisitionBatchRequest(
+        request_id=_root_agent_acquisition_request_id(effect_key),
+        route_policy=ACQUISITION_ROUTE_POLICY,
+        papers=tuple(papers),
         session_ref=session_ref,
     )
 
@@ -900,36 +907,53 @@ def _root_agent_acquisition_result(
     effect_id: str,
     execution: AcquisitionBatchExecution,
 ) -> dict[str, object]:
-    if len(execution.results) != 1 or execution.status == "partial":
-        raise SemanticMcpError("acquisition_single_target_result_invalid")
-    item = execution.results[0]
-    if item.status == "obtained":
-        try:
-            (item,) = freeze_acquisition_item_artifacts(
-                execution.request,
-                execution.results,
-            )
-        except AcquisitionUnavailable as error:
-            if error.code not in {
-                "acquisition_artifact_invalid",
-                "acquisition_artifact_drift",
-            }:
-                raise SemanticMcpError(error.code) from error
-            return {
-                "effect_id": effect_id,
-                "request_id": execution.request_id,
-                "status": "missing",
-                "result": {
-                    "paper_id": item.paper_id,
-                    "status": "missing",
-                    "failure": {
+    papers_by_id = {paper.paper_id: paper for paper in execution.request.papers}
+    verified_results: list[AcquisitionItemResult] = []
+    for item in execution.results:
+        if item.status == "obtained":
+            paper = papers_by_id.get(item.paper_id)
+            if paper is None:
+                raise SemanticMcpError("acquisition_result_identity_mismatch")
+            try:
+                (item,) = freeze_acquisition_item_artifacts(
+                    replace(execution.request, papers=(paper,)),
+                    (item,),
+                )
+            except AcquisitionUnavailable as error:
+                if error.code not in {
+                    "acquisition_artifact_invalid",
+                    "acquisition_artifact_drift",
+                }:
+                    raise SemanticMcpError(error.code) from error
+                item = replace(
+                    item,
+                    status="missing",
+                    path=None,
+                    format=None,
+                    failure={
                         "code": error.code,
                         "detail": (
                             "Owner 无法重新验证该全文文件；不会返回路径或重放 Provider。"
                         ),
                     },
-                },
-            }
+                    content_sha256=None,
+                    content_bytes=None,
+                )
+        verified_results.append(item)
+    return {
+        "effect_id": effect_id,
+        "request_id": execution.request_id,
+        "status": aggregate_batch_status(tuple(verified_results)),
+        "results": [
+            _root_agent_acquisition_item_result(item)
+            for item in verified_results
+        ],
+    }
+
+
+def _root_agent_acquisition_item_result(
+    item: AcquisitionItemResult,
+) -> dict[str, object]:
     result: dict[str, object] = {
         "paper_id": item.paper_id,
         "status": item.status,
@@ -954,12 +978,7 @@ def _root_agent_acquisition_result(
         if item.failure is None:
             raise SemanticMcpError("acquisition_failure_result_invalid")
         result["failure"] = item.failure
-    return {
-        "effect_id": effect_id,
-        "request_id": execution.request_id,
-        "status": item.status,
-        "result": result,
-    }
+    return result
 
 
 def _open_root_agent_human_request(
@@ -2381,22 +2400,27 @@ def _root_acquisition_request_input_schema() -> dict[str, object]:
     return _closed_object(
         {
             "effect_id": _string(max_length=128),
-            "target": _closed_object(
-                {
-                    "paper_id": _string(max_length=512),
-                    "title": _string(max_length=2000),
-                    "doi": _string(max_length=512),
-                    "arxiv_id": _string(max_length=512),
-                    "source_urls": {
-                        "type": "array",
-                        "maxItems": 20,
-                        "items": _string(max_length=4096),
+            "targets": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 10,
+                "items": _closed_object(
+                    {
+                        "paper_id": _string(max_length=512),
+                        "title": _string(max_length=2000),
+                        "doi": _string(max_length=512),
+                        "arxiv_id": _string(max_length=512),
+                        "source_urls": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "items": _string(max_length=4096),
+                        },
                     },
-                },
-                required=("paper_id", "title", "source_urls"),
-            ),
+                    required=("paper_id", "title", "source_urls"),
+                ),
+            },
         },
-        required=("effect_id", "target"),
+        required=("effect_id", "targets"),
     )
 
 
@@ -2406,28 +2430,39 @@ def _root_acquisition_output_schema() -> dict[str, object]:
             "effect_id": _string(max_length=128),
             "request_id": _string(max_length=128),
             "status": _string(
-                enum=("obtained", "waiting_user", "missing", "unknown_outcome")
+                enum=(
+                    "obtained",
+                    "partial",
+                    "waiting_user",
+                    "missing",
+                    "unknown_outcome",
+                )
             ),
-            "result": _closed_object(
-                {
-                    "paper_id": _string(max_length=512),
-                    "status": _string(
-                        enum=("obtained", "waiting_user", "missing")
-                    ),
-                    "verified_path": _string(max_length=4096),
-                    "format": _string(enum=("pdf", "html", "xml")),
-                    "content_sha256": _hash_schema(),
-                    "content_bytes": {"type": "integer"},
-                    "failure": _closed_object(
-                        {
-                            "code": _string(max_length=256),
-                            "detail": _string(max_length=4000),
-                        },
-                        required=("code", "detail"),
-                    ),
-                },
-                required=("paper_id", "status"),
-            ),
+            "results": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 10,
+                "items": _closed_object(
+                    {
+                        "paper_id": _string(max_length=512),
+                        "status": _string(
+                            enum=("obtained", "waiting_user", "missing")
+                        ),
+                        "verified_path": _string(max_length=4096),
+                        "format": _string(enum=("pdf", "html", "xml")),
+                        "content_sha256": _hash_schema(),
+                        "content_bytes": {"type": "integer"},
+                        "failure": _closed_object(
+                            {
+                                "code": _string(max_length=256),
+                                "detail": _string(max_length=4000),
+                            },
+                            required=("code", "detail"),
+                        ),
+                    },
+                    required=("paper_id", "status"),
+                ),
+            },
         },
         required=("effect_id", "request_id", "status"),
     )

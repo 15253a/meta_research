@@ -9,26 +9,28 @@ Own topic interpretation, multidimensional discovery, OpenAlex and Web Search ca
 ## Preflight and Acquisition
 
 The Quest-scoped Acquisition Root owns provider selection, access mode, lawful routing, browser
-state and private storage. DeepFetch submits one exact target through the common
+state and private storage. DeepFetch submits one bounded batch of 1 to 10 targets through the common
 `agent_runtime.acquisition.request` effect. The host reconciles the same `effect_id` before any
 request replay. A Reader may receive only the same `paper_id` returned as `obtained` with a verified
 path and content proof.
 
-Return this `action=acquire` envelope for one target:
+Return this `action=acquire` envelope for one bounded batch:
 
 ```json
 {
   "effect_id": "fulltext-openalex-W123",
-  "target": {
-    "paper_id": "openalex:W123",
-    "title": "Exact title",
-    "source_urls": []
-  }
+  "targets": [
+    {
+      "paper_id": "openalex:W123",
+      "title": "Exact title",
+      "source_urls": []
+    }
+  ]
 }
 ```
 
 Include DOI, arXiv ID and source URLs when Radar already has them. Acquisition treats them as hints,
-applies the Quest's accepted access configuration, and returns one typed result. `obtained` includes
+applies the Quest's accepted access configuration, and returns one typed result per target. `obtained` includes
 the verified path, format and content proof. `waiting_user` or `missing` includes only status and
 failure. When a real human obligation blocks the current task, use the common HumanRequest effect
 explicitly; a provider wait is only an Acquisition result.

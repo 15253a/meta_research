@@ -844,12 +844,14 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
         companion = channel_for("companion", "c")
         first_arguments = {
             "effect_id": "companion-fulltext-1",
-            "target": {
-                "paper_id": "paper:companion-fulltext-1",
-                "title": "One exact Companion full-text target",
-                "doi": "10.1000/companion-fulltext-1",
-                "source_urls": [],
-            },
+            "targets": [
+                {
+                    "paper_id": "paper:companion-fulltext-1",
+                    "title": "One Companion full-text target",
+                    "doi": "10.1000/companion-fulltext-1",
+                    "source_urls": [],
+                }
+            ],
         }
         first = call(
             companion.connection.token,
@@ -861,15 +863,16 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
         first_value = first["structuredContent"]
         assert first_value["effect_id"] == "companion-fulltext-1"
         assert first_value["status"] == "obtained"
-        assert set(first_value) == {"effect_id", "request_id", "status", "result"}
-        assert first_value["result"]["paper_id"] == (
+        assert set(first_value) == {"effect_id", "request_id", "status", "results"}
+        assert len(first_value["results"]) == 1
+        assert first_value["results"][0]["paper_id"] == (
             "paper:companion-fulltext-1"
         )
-        assert first_value["result"]["format"] == "html"
-        assert first_value["result"]["content_sha256"] == hashlib.sha256(
+        assert first_value["results"][0]["format"] == "html"
+        assert first_value["results"][0]["content_sha256"] == hashlib.sha256(
             provider.content
         ).hexdigest()
-        assert Path(first_value["result"]["verified_path"]).is_file()
+        assert Path(first_value["results"][0]["verified_path"]).is_file()
 
         # Treat the request response as transport-lost. Reconcile is read-only.
         reconciled = call(
@@ -888,18 +891,33 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
             {
                 "effect_id": "acquisition-fulltext-2",
-                "target": {
-                    "paper_id": "paper:acquisition-fulltext-2",
-                    "title": "One exact Acquisition full-text target",
-                    "arxiv_id": "2401.00002",
-                    "source_urls": ["https://example.test/fulltext-2"],
-                },
+                "targets": [
+                    {
+                        "paper_id": "paper:acquisition-fulltext-2a",
+                        "title": "First Acquisition full-text target",
+                        "arxiv_id": "2401.00002",
+                        "source_urls": ["https://example.test/fulltext-2a"],
+                    },
+                    {
+                        "paper_id": "paper:acquisition-fulltext-2b",
+                        "title": "Second Acquisition full-text target",
+                        "doi": "10.1000/acquisition-fulltext-2b",
+                        "source_urls": ["https://example.test/fulltext-2b"],
+                    },
+                ],
             },
         )
         assert second["isError"] is False
         assert second["structuredContent"]["status"] == "obtained"
+        assert [
+            item["paper_id"]
+            for item in second["structuredContent"]["results"]
+        ] == [
+            "paper:acquisition-fulltext-2a",
+            "paper:acquisition-fulltext-2b",
+        ]
         assert len(provider.batches) == 2
-        assert all(len(batch.papers) == 1 for batch in provider.batches)
+        assert [len(batch.papers) for batch in provider.batches] == [1, 2]
         assert all(batch.session_ref == session_ref for batch in provider.batches)
 
         forged_route = call(
@@ -908,11 +926,13 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
             {
                 "effect_id": "forged-route",
-                "target": {
-                    "paper_id": "paper:forged-route",
-                    "title": "Caller must not select routing",
-                    "source_urls": [],
-                },
+                "targets": [
+                    {
+                        "paper_id": "paper:forged-route",
+                        "title": "Caller must not select routing",
+                        "source_urls": [],
+                    }
+                ],
                 "provider": "caller-selected",
                 "session_ref": "caller-selected",
                 "route_policy": "caller-selected",
@@ -931,14 +951,16 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
             {
                 "effect_id": "too-many-source-urls",
-                "target": {
-                    "paper_id": "paper:too-many-source-urls",
-                    "title": "Bound the provider work for one target",
-                    "source_urls": [
-                        f"https://example.test/source-{index}"
-                        for index in range(21)
-                    ],
-                },
+                "targets": [
+                    {
+                        "paper_id": "paper:too-many-source-urls",
+                        "title": "Bound the provider work for one target",
+                        "source_urls": [
+                            f"https://example.test/source-{index}"
+                            for index in range(21)
+                        ],
+                    }
+                ],
             },
         )
         assert too_many_sources["isError"] is True
@@ -947,7 +969,7 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
         )
         assert len(provider.batches) == 2
 
-        Path(first_value["result"]["verified_path"]).write_bytes(
+        Path(first_value["results"][0]["verified_path"]).write_bytes(
             b"drifted-after-owner-proof"
         )
         drifted = call(
@@ -958,16 +980,18 @@ def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
         )
         assert drifted["isError"] is False
         assert drifted["structuredContent"]["status"] == "missing"
-        assert drifted["structuredContent"]["result"] == {
-            "paper_id": "paper:companion-fulltext-1",
-            "status": "missing",
-            "failure": {
-                "code": "acquisition_artifact_drift",
-                "detail": (
-                    "Owner 无法重新验证该全文文件；不会返回路径或重放 Provider。"
-                ),
-            },
-        }
+        assert drifted["structuredContent"]["results"] == [
+            {
+                "paper_id": "paper:companion-fulltext-1",
+                "status": "missing",
+                "failure": {
+                    "code": "acquisition_artifact_drift",
+                    "detail": (
+                        "Owner 无法重新验证该全文文件；不会返回路径或重放 Provider。"
+                    ),
+                },
+            }
+        ]
         replay_after_drift = call(
             companion.connection.token,
             6,
@@ -1031,11 +1055,13 @@ def test_common_acquisition_effect_resumes_only_after_its_human_waiter(
         )
         arguments = {
             "effect_id": "human-resume-fulltext",
-            "target": {
-                "paper_id": "paper:human-resume-fulltext",
-                "title": "Resume one exact Acquisition request",
-                "source_urls": [],
-            },
+            "targets": [
+                {
+                    "paper_id": "paper:human-resume-fulltext",
+                    "title": "Resume one Acquisition request",
+                    "source_urls": [],
+                }
+            ],
         }
 
         def call(request_id: int, operation_id: str, values):
@@ -1062,6 +1088,9 @@ def test_common_acquisition_effect_resumes_only_after_its_human_waiter(
             arguments,
         )
         assert waiting["status"] == "waiting_user"
+        assert [item["status"] for item in waiting["results"]] == [
+            "waiting_user"
+        ]
         assert call(
             2,
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
@@ -1084,6 +1113,7 @@ def test_common_acquisition_effect_resumes_only_after_its_human_waiter(
             arguments,
         )
         assert settled["status"] == "missing"
+        assert [item["status"] for item in settled["results"]] == ["missing"]
         assert len(provider.batches) == 1
         assert len(provider.reconciliations) == 1
         assert call(
