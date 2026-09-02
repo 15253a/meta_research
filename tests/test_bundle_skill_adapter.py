@@ -740,6 +740,8 @@ class _FullConformanceAuthority:
                 health_receipt_ref="mcp-health:test",
                 connection_grant_ref=f"mcp-grant:{generation}",
                 operation_bindings=operation_bindings,
+                root_kind="bundle",
+                phase=phase,
             ),
         )
 

@@ -100,9 +100,12 @@ _PSEUDO_VALUES = {"unknown", "not_applicable", "not applicable", "n/a", "na"}
 class DraftingUnavailable(RuntimeError):
     """A real drafting provider could not produce an auditable result."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *, native_session_ref: str | None = None
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.native_session_ref = native_session_ref
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,7 @@ class IntentTurnRequest:
     creation_context_kind: str = "quest_initialization"
     creation_context_ref: str | None = None
     context_generation: int | None = None
+    root_runtime_scope: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)

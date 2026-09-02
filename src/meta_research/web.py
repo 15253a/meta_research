@@ -703,6 +703,7 @@ class WritingDeliveryIntentRequest(BaseModel):
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
+    runtime.configure_resident_mcp_endpoint(base_url)
     runtime.bundle_stage.configure_resident_mcp_endpoint(base_url)
     runtime.reasoning_stage.configure_resident_mcp_endpoint(base_url)
     runtime.target_run_runtime.configure_resident_mcp_endpoint(base_url)

@@ -40,6 +40,7 @@ from meta_research.runtime_protection import (
     InhibitorLease,
     RuntimeProtectionUnavailable,
 )
+from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.writing_contract import (
     WritingRuntimeBinding,
     validate_writing_claim_inventory,
@@ -183,6 +184,90 @@ class _DeterministicWritingSkill(WritingSkillProvider):
             reviewer_agent_ref="writing-reviewer-1",
             review_task_hash=writing_review_task_hash(request, draft),
             adapter_kind=draft.adapter_kind,
+        )
+
+
+class _HumanRequestWritingSkill(_DeterministicWritingSkill):
+    def __init__(self, *, phase: str) -> None:
+        super().__init__()
+        self.phase = phase
+        self.owner = None
+        self.human_request: dict[str, object] | None = None
+        self.finished_jobs: list[str] = []
+
+    def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
+        draft = super().generate_draft(request)
+        if self.phase == "writing-primary" and self.human_request is None:
+            self._open_human_request(request)
+        return draft
+
+    def review_draft(
+        self, request: WritingSkillRequest, draft: WritingSkillDraft
+    ) -> WritingSkillResult:
+        result = replace(
+            super().review_draft(request, draft),
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
+        )
+        if self.phase == "writing-review" and self.human_request is None:
+            self._open_human_request(request)
+        return result
+
+    def finish_job(self, job_ref: str) -> None:
+        self.finished_jobs.append(job_ref)
+
+    def _open_human_request(self, request: WritingSkillRequest) -> None:
+        assert self.owner is not None
+        managed = self.owner.query_managed_run(request.run_ref)
+        writing_run = self.owner.query_writing_report(request.run_ref)
+        assert managed is not None
+        assert writing_run is not None
+        generation = writing_run.attempt_generation
+        binding = {
+            "quest_ref": writing_run.quest_ref,
+            "task_ref": request.run_ref,
+            "root_session_ref": request.root_session_ref,
+            "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+            "attempt_ref": request.attempt_ref,
+            "generation": generation,
+            "request_owner": "agent_runtime",
+            "root_kind": "writing",
+            "phase": self.phase,
+            "fence_ref": request.fence_ref,
+            "runtime_binding_hash": canonical_hash(
+                request.runtime_binding.as_dict()
+            ),
+        }
+        target = {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": "writing",
+                "run_ref": request.run_ref,
+                "attempt_ref": request.attempt_ref,
+                "root_session_ref": request.root_session_ref,
+                "fence_ref": request.fence_ref,
+                "waiter_generation": generation,
+            },
+            "condition": {"operator_choice": "continue_without_optional_input"},
+        }
+        self.human_request = self.owner.open_human_request_effect(
+            effect_key=f"mcp-effect:writing-provider-human-wait:{self.phase}",
+            effect_id=f"writing-provider-human-wait-{self.phase}",
+            operation_binding=binding,
+            predecessor_request_ref=None,
+            request_kind="offline_action",
+            obligation="Choose whether this exact Writing task should continue.",
+            business_purpose="Resume only this exact Writing task.",
+            target_assertion=target,
+            acceptance_conditions=("The operator supplies a disposition.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{request.run_ref}",
+                "generation": generation,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=writing_run.quest_ref,
         )
 
 
@@ -1473,6 +1558,101 @@ def _admit_report(
         preview_hash=preview["preview_hash"],
         idempotency_key=f"{prefix}-confirm",
     )
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ("writing-primary", "writing-review"),
+    ids=("primary", "review"),
+)
+def test_human_request_park_finishes_the_current_writing_job(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    provider = _HumanRequestWritingSkill(phase=phase)
+    runtime = _runtime(tmp_path / f"writing-human-request-finish-{phase}", provider)
+    provider.owner = runtime.owners.agent_runtime
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            str(quest["quest_ref"]),
+            f"writing-human-request-finish-{phase}",
+        )
+        run_ref = admitted["run"]["run_ref"]
+
+        assert runtime.writing.process_once()
+        if phase == "writing-review":
+            assert runtime.writing.process_once()
+
+        managed = runtime.owners.agent_runtime.query_managed_run(run_ref)
+        assert managed is not None and managed["status"] == "suspended"
+        assert provider.human_request is not None
+        active_request = (
+            provider.draft_requests[0]
+            if phase == "writing-primary"
+            else provider.review_requests[0]
+        )
+        assert provider.finished_jobs == [active_request.job_ref]
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ("writing-primary", "writing-review"),
+    ids=("primary-checkpoint", "review-record"),
+)
+def test_writing_record_suspension_finishes_the_current_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    provider = _HumanRequestWritingSkill(phase=phase)
+    runtime = _runtime(
+        tmp_path / f"writing-human-request-record-race-{phase}", provider
+    )
+    provider.owner = runtime.owners.agent_runtime
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            str(quest["quest_ref"]),
+            f"writing-human-request-record-race-{phase}",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        owner = runtime.owners.agent_runtime
+        if phase == "writing-review":
+            assert runtime.writing.process_once()
+        park = owner.park_root_provider_session_for_human_request
+        park_calls = 0
+
+        def miss_the_pre_record_check_once(**values: object) -> bool:
+            nonlocal park_calls
+            park_calls += 1
+            if park_calls == 1:
+                return False
+            return park(**values)
+
+        monkeypatch.setattr(
+            owner,
+            "park_root_provider_session_for_human_request",
+            miss_the_pre_record_check_once,
+        )
+
+        assert runtime.writing.process_once()
+
+        managed = owner.query_managed_run(run_ref)
+        assert managed is not None and managed["status"] == "suspended"
+        assert park_calls == 2
+        active_request = (
+            provider.draft_requests[0]
+            if phase == "writing-primary"
+            else provider.review_requests[0]
+        )
+        assert provider.finished_jobs == [active_request.job_ref]
+    finally:
+        runtime.close()
 
 
 def test_long_pause_does_not_consume_an_implicit_wall_clock_budget(

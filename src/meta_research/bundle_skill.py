@@ -1257,8 +1257,16 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         if request.runtime_binding != self.runtime_binding():
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         lineage = _owner_rejection_prompt(request)
+        human_resume = (
+            ""
+            if request.native_session_ref is None
+            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
+            "human_request.open.reconcile，读取 resolution 后再判断"
+            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
+        )
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
+            f"{human_resume}"
             "本回合仅执行 Primary draft phase。根据内容复杂度可选使用 "
             "collaboration；child 仅能返回 advisory material，不获得 Owner "
             "authority，也不以 child 数量、拓扑、顺序或本回合未使用 "

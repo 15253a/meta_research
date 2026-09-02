@@ -604,7 +604,14 @@ class PublicProjection:
                     [
                         collaboration_scope,
                         "runtime:telemetry",
-                        *(str(item["request_ref"]) for item in human_requests),
+                        *(
+                            scope_ref
+                            for item in human_requests
+                            for scope_ref in (
+                                str(item["request_ref"]),
+                                f"human_request:{item['request_ref']}",
+                            )
+                        ),
                     ]
                 )
             )

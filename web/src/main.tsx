@@ -886,7 +886,7 @@ function acceptedChangeSummary(snapshot: PublicSnapshot): string {
 function currentBlockerSummary(snapshot: PublicSnapshot): string {
   const currentRequest = currentOpenHumanRequests(snapshot)[0];
   if (currentRequest) {
-    return `HumanRequest · ${currentRequest.kind} · ${currentRequest.request_ref}`;
+    return currentRequest.obligation;
   }
   const unavailable = snapshot.readiness.checks.find((check) => check.status !== "ready");
   if (unavailable) {
@@ -897,7 +897,7 @@ function currentBlockerSummary(snapshot: PublicSnapshot): string {
 
 function nextStepSummary(snapshot: PublicSnapshot): string {
   if (currentOpenHumanRequests(snapshot).length) {
-    return "处理当前 HumanRequest；不依赖它的研究仍可在后台继续";
+    return "请处理当前待办；不依赖它的研究仍可在后台继续";
   }
   const stage = currentStageSurface(snapshot);
   if (!stage) return "从当前已接纳 Question 继续";
@@ -906,7 +906,7 @@ function nextStepSummary(snapshot: PublicSnapshot): string {
   if (stage.projection.run) {
     return `等待 ${stage.kind} 的执行、内容接纳、领域接纳与推进各自完成`;
   }
-  return `等待 ${stage.kind} 的公开 Owner 请求与 receipt`;
+  return `等待 ${stage.kind} 当前步骤形成可确认结果`;
 }
 
 function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
@@ -933,17 +933,17 @@ function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
       <article>
         <small>关键变化 · accepted state</small>
         <b>{acceptedChangeSummary(snapshot)}</b>
-        <span>只报告 Owner receipt 可追溯的当前事实</span>
+        <span>只报告已经确认的当前事实</span>
       </article>
       <article>
-        <small>当前阻塞 · typed</small>
+        <small>当前阻塞</small>
         <b>{currentBlockerSummary(snapshot)}</b>
         <span>局部等待与 Quest-wide wait 不合并</span>
       </article>
       <article>
-        <small>下一步 · AE / Owner</small>
+        <small>下一步</small>
         <b>{nextStepSummary(snapshot)}</b>
-        <span>Web 只解释公开 Projection，不代替 Owner 推进</span>
+        <span>页面只解释已经确认的状态，不替研究流程作决定</span>
       </article>
     </section>
   );
@@ -4421,7 +4421,7 @@ function App() {
     humanRequestReturnUrlRef.current = null;
     window.requestAnimationFrame(() => {
       if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
-      else document.querySelector<HTMLButtonElement>("[aria-label='HumanRequest']")?.focus();
+      else document.querySelector<HTMLButtonElement>("[aria-label='需要你']")?.focus();
     });
   };
 

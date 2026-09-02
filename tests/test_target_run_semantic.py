@@ -117,6 +117,8 @@ def _issue(gateway: SemanticMcpGateway, *, capability_hash: str = "c" * 64):
         fence_ref="target-fence:1",
         capability_binding_hash=capability_hash,
         operation_ids=TARGET_RUN_SEMANTIC_OPERATION_IDS,
+        root_kind="target",
+        phase="target_root_lifecycle",
     )
     return connection
 

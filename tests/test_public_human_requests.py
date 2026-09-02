@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
 
 from meta_research.composition import build_production_runtime
-from meta_research.owners.common import OwnerConflict
+from meta_research.owners.common import OwnerConflict, canonical_json
+from meta_research.owners import agent_runtime as agent_runtime_module
 from meta_research.owners import human_requests as human_requests_module
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
     IntentTurnResult,
     ProposalDraftResult,
 )
+from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+from meta_research.owners.research_memory import AssetIntakeRequest
 
 
 class _DeterministicDraftingProvider:
@@ -798,6 +802,46 @@ def test_owner_human_request_facts_reject_credentials_before_persistence(
                 idempotency_key="password=hunter2",
             )
         assert owner.query_human_request(request["request_ref"])["responses"] == []
+        with pytest.raises(
+            OwnerConflict, match="human_response_secret_forbidden"
+        ):
+            runtime.owners.human_collaboration.respond_to_human_request(
+                request["request_ref"],
+                decision="provided",
+                facts={"api_token": "ghp_examplecredential"},
+                note="Use the submitted credential.",
+                idempotency_key="secret-response-rejection",
+            )
+        rejected = owner.query_human_request(request["request_ref"])
+        assert rejected is not None
+        assert rejected["responses"] == []
+        [rejection] = rejected["response_rejections"]
+        assert rejection["request_ref"] == request["request_ref"]
+        assert rejection["reason_code"] == "human_response_secret_forbidden"
+        assert rejection["receipt"]["issuer"] == "human_collaboration"
+        assert rejection["receipt"]["kind"] == "human_response_rejection"
+        assert "ghp_examplecredential" not in canonical_json(rejection)
+        with pytest.raises(
+            OwnerConflict, match="human_response_secret_forbidden"
+        ):
+            runtime.owners.human_collaboration.respond_to_human_request(
+                request["request_ref"],
+                decision="provided",
+                facts={"api_token": "ghp_examplecredential"},
+                note="Use the submitted credential.",
+                idempotency_key="secret-response-rejection",
+            )
+        assert owner.query_human_request(request["request_ref"])[
+            "response_rejections"
+        ] == [rejection]
+        with pytest.raises(OwnerConflict, match="idempotency_conflict"):
+            runtime.owners.human_collaboration.respond_to_human_request(
+                request["request_ref"],
+                decision="provided",
+                facts={"route_status": "ready"},
+                note="The exact route is ready.",
+                idempotency_key="secret-response-rejection",
+            )
         response = runtime.owners.human_collaboration.respond_to_human_request(
             request["request_ref"],
             decision="provided",
@@ -805,6 +849,14 @@ def test_owner_human_request_facts_reject_credentials_before_persistence(
             note="The exact route is ready.",
             idempotency_key="secret-evaluation-response",
         )
+        with pytest.raises(OwnerConflict, match="idempotency_conflict"):
+            runtime.owners.human_collaboration.respond_to_human_request(
+                request["request_ref"],
+                decision="provided",
+                facts={"api_token": "ghp_examplecredential"},
+                note="Use the submitted credential.",
+                idempotency_key="secret-evaluation-response",
+            )
         with pytest.raises(OwnerConflict, match="human_request_secret_forbidden"):
             owner.evaluate_human_request(
                 request["request_ref"],
@@ -814,5 +866,1034 @@ def test_owner_human_request_facts_reject_credentials_before_persistence(
                 accepted_evidence_refs=("safe-evidence-ref",),
                 idempotency_key="secret-evaluation",
             )
+    finally:
+        runtime.close()
+
+
+def _root_effect_binding(
+    *, generation: int = 3, task_index: int = 1
+) -> dict[str, object]:
+    return {
+        "quest_ref": "quest_root_human_request_1",
+        "task_ref": f"deepfetch_run_root_human_request_{task_index}",
+        "root_session_ref": (
+            f"deepfetch_session_root_human_request_{task_index}"
+        ),
+        "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+        "attempt_ref": f"deepfetch_attempt_root_human_request_{task_index}",
+        "generation": generation,
+        "request_owner": "agent_runtime",
+        "root_kind": "deepfetch",
+        "phase": "primary",
+        "fence_ref": f"deepfetch_fence_root_human_request_{task_index}",
+        "runtime_binding_hash": "a" * 64,
+    }
+
+
+def _open_root_human_request_effect(
+    owner,
+    *,
+    effect_key: str,
+    effect_id: str,
+    generation: int = 3,
+    task_index: int = 1,
+    predecessor_request_ref: str | None = None,
+) -> dict[str, object]:
+    binding = _root_effect_binding(
+        generation=generation, task_index=task_index
+    )
+    target = {
+        "schema_ref": "meta-research/root-agent-human-request-target/v1",
+        "root": {
+            "run_kind": "deepfetch",
+            "run_ref": binding["task_ref"],
+            "attempt_ref": binding["attempt_ref"],
+            "root_session_ref": binding["root_session_ref"],
+            "fence_ref": binding["fence_ref"],
+            "waiter_generation": generation,
+        },
+        "condition": {"route": "literature_access"},
+    }
+    return owner.open_human_request_effect(
+        effect_key=effect_key,
+        effect_id=effect_id,
+        operation_binding=binding,
+        predecessor_request_ref=predecessor_request_ref,
+        request_kind="library_reconnect",
+        obligation="Restore a usable literature route for this exact task.",
+        business_purpose="Resume the exact blocked Root task.",
+        target_assertion=target,
+        acceptance_conditions=("A safe current route is selected.",),
+        direct_waiter={
+            "waiter_ref": f"root_run:{binding['task_ref']}",
+            "generation": generation,
+            "target_assertion": target,
+            "wait_scope": "local",
+            "other_blockers": [],
+        },
+        quest_ref=str(binding["quest_ref"]),
+    )
+
+
+def _allow_current_root_human_request_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    owner,
+    *,
+    task_index: int = 1,
+    waiter_generation: int = 3,
+) -> None:
+    binding = _root_effect_binding(task_index=task_index)
+
+    def verify_scope(**values: object) -> dict[str, object]:
+        assert values == {
+            "root_kind": "deepfetch",
+            "run_ref": binding["task_ref"],
+            "attempt_ref": binding["attempt_ref"],
+            "root_session_ref": binding["root_session_ref"],
+            "fence_ref": binding["fence_ref"],
+            "runtime_binding_hash": binding["runtime_binding_hash"],
+            "allowed_statuses": values["allowed_statuses"],
+        }
+        assert values["allowed_statuses"] in {
+            frozenset({"running"}),
+            frozenset({"suspended"}),
+        }
+        return {
+            "run_kind": "deepfetch",
+            "quest_ref": binding["quest_ref"],
+            "waiter_ref": f"root_run:{binding['task_ref']}",
+            "waiter_generation": waiter_generation,
+        }
+
+    monkeypatch.setattr(owner, "_verify_root_agent_runtime_scope", verify_scope)
+
+
+def _grant_capability_authorization(
+    human,
+    *,
+    scope_ref: str,
+    requirement: dict[str, object],
+    key: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    drafted = human.create_command_draft(
+        scope_ref,
+        {
+            "command_kind": "capability_authorization",
+            "payload": {
+                "capability": requirement["capability"],
+                "decision": "granted",
+                "scope": requirement["scope"],
+            },
+        },
+        f"{key}-draft",
+    )
+    preview = human.preview_command(
+        drafted["intent_id"],
+        drafted["draft_revision"],
+        drafted["draft_hash"],
+        f"{key}-preview",
+    )["impact_preview"]
+    confirmation = human.confirm_command(
+        drafted["intent_id"],
+        drafted["draft_revision"],
+        drafted["draft_hash"],
+        preview["preview_ref"],
+        preview["preview_hash"],
+        f"{key}-confirm",
+    )
+    authorization = human.decide_capability_authorization(
+        scope_ref,
+        {
+            "capability": requirement["capability"],
+            "decision": "granted",
+            "scope": requirement["scope"],
+            "confirmation_receipt_ref": confirmation["confirmation_receipt"][
+                "receipt_ref"
+            ],
+        },
+        f"{key}-authorize",
+    )
+    return confirmation, authorization
+
+
+def _seed_root_human_request_task(runtime, *, task_index: int = 1) -> None:
+    binding = _root_effect_binding(task_index=task_index)
+    with runtime._database.write() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO ar_run_controls (run_ref, run_kind, quest_ref, "
+                "cycle_ref, epoch, status, attempt_ref, root_session_ref, "
+                "fence_ref, control_revision, safe_point_ref, terminal_reason, "
+                "cleanup_status, updated_at) VALUES (:run_ref, 'deepfetch', "
+                ":quest_ref, NULL, NULL, 'running', :attempt_ref, "
+                ":root_session_ref, :fence_ref, 1, NULL, NULL, 'none', :now)"
+            ),
+            {**binding, "run_ref": binding["task_ref"], "now": time.time()},
+        )
+
+
+@pytest.mark.parametrize("root_kind", ("acquisition", "companion"))
+def test_external_root_task_scope_drives_exact_human_request_lifecycle(
+    tmp_path,
+    root_kind: str,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / f"external-root-scope-{root_kind}")
+    )
+    owner = runtime.owners.agent_runtime
+    scope = {
+        "quest_ref": f"quest_external_root_{root_kind}",
+        "run_ref": f"{root_kind}_task_external_root_1",
+        "attempt_ref": f"{root_kind}_attempt_external_root_1",
+        "root_session_ref": f"{root_kind}_session_external_root_1",
+        "fence_ref": f"{root_kind}_fence_external_root_1",
+        "runtime_binding_hash": "b" * 64,
+        "generation": 2,
+    }
+    binding = {
+        "quest_ref": scope["quest_ref"],
+        "task_ref": scope["run_ref"],
+        "root_session_ref": scope["root_session_ref"],
+        "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+        "attempt_ref": scope["attempt_ref"],
+        "generation": scope["generation"],
+        "request_owner": "agent_runtime",
+        "root_kind": root_kind,
+        "phase": "primary",
+        "fence_ref": scope["fence_ref"],
+        "runtime_binding_hash": scope["runtime_binding_hash"],
+    }
+    target = {
+        "schema_ref": "meta-research/root-agent-human-request-target/v1",
+        "root": {
+            "run_kind": root_kind,
+            "run_ref": scope["run_ref"],
+            "attempt_ref": scope["attempt_ref"],
+            "root_session_ref": scope["root_session_ref"],
+            "fence_ref": scope["fence_ref"],
+            "waiter_generation": scope["generation"],
+        },
+        "condition": {"operator_choice": "continue_without_optional_input"},
+    }
+    try:
+        registered = owner.register_external_root_task_scope(
+            root_kind=root_kind,
+            root_runtime_scope=scope,
+        )
+        assert owner.register_external_root_task_scope(
+            root_kind=root_kind,
+            root_runtime_scope=scope,
+        ) == registered
+        assert owner.verify_root_agent_runtime_scope(
+            root_kind=root_kind,
+            run_ref=str(scope["run_ref"]),
+            attempt_ref=str(scope["attempt_ref"]),
+            root_session_ref=str(scope["root_session_ref"]),
+            fence_ref=str(scope["fence_ref"]),
+            runtime_binding_hash=str(scope["runtime_binding_hash"]),
+        ) == {
+            "run_kind": root_kind,
+            "quest_ref": scope["quest_ref"],
+            "waiter_ref": f"root_run:{scope['run_ref']}",
+            "waiter_generation": scope["generation"],
+        }
+        human_request = owner.open_human_request_effect(
+            effect_key=f"mcp-effect:{root_kind}-external-root",
+            effect_id=f"{root_kind}-external-root",
+            operation_binding=binding,
+            predecessor_request_ref=None,
+            request_kind="offline_action",
+            obligation="Choose how this exact external Root task should continue.",
+            business_purpose="Resume the exact suspended Root task.",
+            target_assertion=target,
+            acceptance_conditions=("The operator supplies a disposition.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{scope['run_ref']}",
+                "generation": scope["generation"],
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=str(scope["quest_ref"]),
+        )
+        suspended = owner.query_managed_run(str(scope["run_ref"]))
+        assert suspended is not None and suspended["status"] == "suspended"
+        with pytest.raises(
+            OwnerConflict, match="external_root_task_scope_suspended"
+        ):
+            owner.complete_external_root_task_scope(
+                root_kind=root_kind,
+                root_runtime_scope=scope,
+            )
+        assert owner.verify_root_agent_human_request_reconcile_scope(
+            root_kind=root_kind,
+            run_ref=str(scope["run_ref"]),
+            attempt_ref=str(scope["attempt_ref"]),
+            root_session_ref=str(scope["root_session_ref"]),
+            fence_ref=str(scope["fence_ref"]),
+            runtime_binding_hash=str(scope["runtime_binding_hash"]),
+        )["waiter_generation"] == scope["generation"]
+
+        runtime.owners.human_collaboration.respond_to_human_request(
+            str(human_request["request_ref"]),
+            decision="deferred",
+            facts={},
+            note="Continue without the optional input.",
+            idempotency_key=f"{root_kind}-external-root-response",
+        )
+        disposed = owner.query_human_request(str(human_request["request_ref"]))
+        assert disposed is not None
+        assert disposed["status"] == "unsatisfied"
+        assert disposed["direct_waiters"][0]["status"] == "consumed"
+        resumed = owner.query_managed_run(str(scope["run_ref"]))
+        assert resumed is not None and resumed["status"] == "running"
+
+        completed = owner.complete_external_root_task_scope(
+            root_kind=root_kind,
+            root_runtime_scope=scope,
+        )
+        assert completed["status"] == "completed"
+        assert owner.complete_external_root_task_scope(
+            root_kind=root_kind,
+            root_runtime_scope=scope,
+        ) == completed
+    finally:
+        runtime.close()
+
+
+def test_external_root_successor_resumes_on_next_physical_attempt(
+    tmp_path,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "external-root-successor-next-attempt")
+    )
+    owner = runtime.owners.agent_runtime
+    human = runtime.owners.human_collaboration
+    first_scope: dict[str, object] = {
+        "quest_ref": "quest_external_root_successor",
+        "run_ref": "companion_task_external_root_successor",
+        "attempt_ref": "companion_attempt_external_root_successor_1",
+        "root_session_ref": "companion_session_external_root_successor",
+        "fence_ref": "companion_fence_external_root_successor_1",
+        "runtime_binding_hash": "d" * 64,
+        "generation": 1,
+    }
+
+    def open_request(
+        scope: dict[str, object],
+        *,
+        effect_suffix: str,
+        predecessor_request_ref: str | None,
+    ) -> dict[str, object]:
+        binding = {
+            "quest_ref": scope["quest_ref"],
+            "task_ref": scope["run_ref"],
+            "root_session_ref": scope["root_session_ref"],
+            "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+            "attempt_ref": scope["attempt_ref"],
+            "generation": scope["generation"],
+            "request_owner": "agent_runtime",
+            "root_kind": "companion",
+            "phase": "reply",
+            "fence_ref": scope["fence_ref"],
+            "runtime_binding_hash": scope["runtime_binding_hash"],
+        }
+        target = {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": "companion",
+                "run_ref": scope["run_ref"],
+                "attempt_ref": scope["attempt_ref"],
+                "root_session_ref": scope["root_session_ref"],
+                "fence_ref": scope["fence_ref"],
+                "waiter_generation": scope["generation"],
+            },
+            "condition": {"operator_choice": "continue_without_optional_input"},
+        }
+        return owner.open_human_request_effect(
+            effect_key=f"mcp-effect:external-root-successor-{effect_suffix}",
+            effect_id=f"external-root-successor-{effect_suffix}",
+            operation_binding=binding,
+            predecessor_request_ref=predecessor_request_ref,
+            request_kind="offline_action",
+            obligation="Choose how this exact Companion task should continue.",
+            business_purpose="Resume the exact suspended Companion task.",
+            target_assertion=target,
+            acceptance_conditions=("The operator supplies a disposition.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{scope['run_ref']}",
+                "generation": scope["generation"],
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=str(scope["quest_ref"]),
+        )
+
+    try:
+        owner.register_external_root_task_scope(
+            root_kind="companion",
+            root_runtime_scope=first_scope,
+        )
+        predecessor = open_request(
+            first_scope,
+            effect_suffix="first",
+            predecessor_request_ref=None,
+        )
+        human.respond_to_human_request(
+            str(predecessor["request_ref"]),
+            decision="deferred",
+            facts={},
+            note="Continue without this optional input.",
+            idempotency_key="external-root-successor-first-response",
+        )
+
+        intermediate_scope = {
+            **first_scope,
+            "attempt_ref": "companion_attempt_external_root_successor_2",
+            "fence_ref": "companion_fence_external_root_successor_2",
+            "generation": 2,
+        }
+        owner.register_external_root_task_scope(
+            root_kind="companion",
+            root_runtime_scope=intermediate_scope,
+        )
+        owner.complete_external_root_task_scope(
+            root_kind="companion",
+            root_runtime_scope=intermediate_scope,
+        )
+        next_scope = {
+            **first_scope,
+            "attempt_ref": "companion_attempt_external_root_successor_3",
+            "fence_ref": "companion_fence_external_root_successor_3",
+            "generation": 3,
+        }
+        owner.register_external_root_task_scope(
+            root_kind="companion",
+            root_runtime_scope=next_scope,
+        )
+        successor = open_request(
+            next_scope,
+            effect_suffix="second",
+            predecessor_request_ref=str(predecessor["request_ref"]),
+        )
+        human.respond_to_human_request(
+            str(successor["request_ref"]),
+            decision="deferred",
+            facts={},
+            note="Continue without this optional input again.",
+            idempotency_key="external-root-successor-second-response",
+        )
+
+        current = owner.query_human_request(str(successor["request_ref"]))
+        assert current is not None
+        assert current["status"] == "unsatisfied"
+        assert current["direct_waiters"][0]["status"] == "consumed"
+        managed = owner.query_managed_run(str(next_scope["run_ref"]))
+        assert managed is not None and managed["status"] == "running"
+    finally:
+        runtime.close()
+
+
+def test_external_root_task_scope_rejects_missing_quest_and_identity_drift(
+    tmp_path,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "external-root-scope-invalid")
+    )
+    owner = runtime.owners.agent_runtime
+    scope = {
+        "quest_ref": "quest_external_root_invalid",
+        "run_ref": "acquisition_task_external_root_invalid",
+        "attempt_ref": "acquisition_attempt_external_root_invalid",
+        "root_session_ref": "acquisition_session_external_root_invalid",
+        "fence_ref": "acquisition_fence_external_root_invalid",
+        "runtime_binding_hash": "c" * 64,
+        "generation": 1,
+    }
+    try:
+        with pytest.raises(OwnerConflict, match="external_root_task_scope_invalid"):
+            owner.register_external_root_task_scope(
+                root_kind="acquisition",
+                root_runtime_scope={**scope, "quest_ref": None},
+            )
+        owner.register_external_root_task_scope(
+            root_kind="acquisition",
+            root_runtime_scope=scope,
+        )
+        with pytest.raises(OwnerConflict, match="external_root_task_scope_conflict"):
+            owner.register_external_root_task_scope(
+                root_kind="acquisition",
+                root_runtime_scope={**scope, "fence_ref": "stale-fence"},
+            )
+    finally:
+        runtime.close()
+
+
+def test_root_human_request_open_effect_is_frozen_and_not_contract_reused(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "root-human-request-open-effect")
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _seed_root_human_request_task(runtime, task_index=2)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    try:
+        first = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-human-open-1",
+            effect_id="root-human-open-1",
+        )
+        replay = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-human-open-1",
+            effect_id="root-human-open-1",
+        )
+        _allow_current_root_human_request_scope(
+            monkeypatch, owner, task_index=2
+        )
+        second = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-human-open-2",
+            effect_id="root-human-open-2",
+            task_index=2,
+        )
+
+        assert replay["request_ref"] == first["request_ref"]
+        assert replay["open_receipt"] == first["open_receipt"]
+        assert replay["open_effect"] == first["open_effect"]
+        assert second["request_ref"] != first["request_ref"]
+        assert len(first["direct_waiters"]) == 1
+        assert len(second["direct_waiters"]) == 1
+        assert first["request_owner"] == "agent_runtime"
+        assert first["operation"] == ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0]
+        assert first["generation"] == 3
+        assert first["open_effect"]["effect_id"] == "root-human-open-1"
+        assert first["open_effect"]["yield"]["status"] == "yielded"
+
+        reconciled = owner.reconcile_human_request_effect(
+            "mcp-effect:root-human-open-1"
+        )
+        assert reconciled["request_ref"] == first["request_ref"]
+        assert reconciled["open_receipt"] == first["open_receipt"]
+        with pytest.raises(OwnerConflict, match="effect_not_found"):
+            owner.reconcile_human_request_effect("mcp-effect:missing")
+    finally:
+        runtime.close()
+
+
+def test_root_human_request_provided_releases_and_resumes_exactly_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "root-human-request-provided")
+    runtime = build_production_runtime(data_root)
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    try:
+        request = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-human-provided",
+            effect_id="root-human-provided",
+        )
+        assert owner.query_managed_run(
+            str(request["open_effect"]["operation_binding"]["task_ref"])
+        )["status"] == "suspended"
+        response = runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"route": "oa_only"},
+            note="Continue with lawful open-access sources.",
+            idempotency_key="root-human-provided-response",
+        )
+        current = owner.query_human_request(request["request_ref"])
+        assert current is not None
+        assert current["responses"] == [response]
+        assert current["disposition"]["decision"] == "satisfied"
+        assert current["direct_waiters"][0]["status"] == "consumed"
+        validation = current["direct_waiters"][0]["resume_validation"]
+        assert validation["status"] == "released"
+        assert validation["started_work"] is True
+        consumption = validation["consumption"]
+        assert consumption["work_ref"] == request["open_effect"][
+            "operation_binding"
+        ]["task_ref"]
+        assert owner.query_managed_run(str(consumption["work_ref"]))[
+            "status"
+        ] == "running"
+
+        replay = runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"route": "oa_only"},
+            note="Continue with lawful open-access sources.",
+            idempotency_key="root-human-provided-response",
+        )
+        replayed = owner.query_human_request(request["request_ref"])
+        assert replay == response
+        assert replayed is not None
+        assert (
+            replayed["direct_waiters"][0]["resume_validation"]["consumption"]
+            == consumption
+        )
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("decision", ("declined", "deferred"))
+def test_root_human_request_unsatisfied_still_releases_exact_waiter(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / f"root-human-request-{decision}")
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    try:
+        request = _open_root_human_request_effect(
+            owner,
+            effect_key=f"mcp-effect:root-human-{decision}",
+            effect_id=f"root-human-{decision}",
+        )
+        runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision=decision,
+            facts={},
+            note="Use an alternative route.",
+            idempotency_key=f"root-human-{decision}-response",
+        )
+
+        current = owner.query_human_request(request["request_ref"])
+        assert current is not None
+        assert current["status"] == "unsatisfied"
+        assert current["evaluation"]["decision"] == "unsatisfied"
+        assert current["disposition"]["decision"] == "unsatisfied"
+        assert current["direct_waiters"][0]["status"] == "consumed"
+        assert (
+            current["direct_waiters"][0]["resume_validation"]["status"]
+            == "released"
+        )
+    finally:
+        runtime.close()
+
+
+def test_root_human_request_invalid_provided_response_does_not_release(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "root-human-request-invalid-proof")
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    try:
+        request = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-human-invalid-proof",
+            effect_id="root-human-invalid-proof",
+        )
+        runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"route": "institutional_browser_reconnected"},
+            note="No exact preflight proof was supplied.",
+            idempotency_key="root-human-invalid-proof-response",
+        )
+
+        current = owner.query_human_request(request["request_ref"])
+        assert current is not None
+        assert current["status"] == "open"
+        assert current["disposition"] is None
+        assert current["evaluation"]["decision"] == "needs_input"
+        assert current["direct_waiters"][0]["status"] == "blocked"
+        assert owner.query_managed_run(
+            str(request["open_effect"]["operation_binding"]["task_ref"])
+        )["status"] == "suspended"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("request_kind", "fact_prefix"),
+    (
+        ("external_material_api_access", "material"),
+        ("offline_action", "result"),
+    ),
+)
+@pytest.mark.parametrize(
+    "case",
+    ("exact", "missing_version", "wrong_source", "wrong_content", "wrong_receipt"),
+)
+def test_root_human_request_accepted_asset_proof_uses_public_flat_facts(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_kind: str,
+    fact_prefix: str,
+    case: str,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(
+            tmp_path / f"root-human-asset-{request_kind}-{case}"
+        )
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    intake = runtime.owners.research_memory.submit_asset_intake(
+        AssetIntakeRequest(
+            source_kind="file",
+            custody_mode="managed",
+            display_name="operator-result.txt",
+            media_type="text/plain",
+            content=b"accepted operator result",
+            provenance={"source": "human_request_test"},
+            asynchronous=False,
+        ),
+        idempotency_key=f"root-human-asset-{request_kind}-{case}",
+    )
+    assert intake.asset is not None
+    asset = intake.asset
+    binding = _root_effect_binding()
+    target = {
+        "schema_ref": "meta-research/root-agent-human-request-target/v1",
+        "root": {
+            "run_kind": "deepfetch",
+            "run_ref": binding["task_ref"],
+            "attempt_ref": binding["attempt_ref"],
+            "root_session_ref": binding["root_session_ref"],
+            "fence_ref": binding["fence_ref"],
+            "waiter_generation": binding["generation"],
+        },
+        "condition": {"accepted_asset": fact_prefix},
+    }
+    try:
+        request = owner.open_human_request_effect(
+            effect_key=f"mcp-effect:root-human-asset-{request_kind}-{case}",
+            effect_id=f"root-human-asset-{request_kind}-{case}",
+            operation_binding=binding,
+            predecessor_request_ref=None,
+            request_kind=request_kind,
+            obligation="Provide one exact accepted asset.",
+            business_purpose="Resume the exact blocked Root task.",
+            target_assertion=target,
+            acceptance_conditions=("The accepted asset binding is exact.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{binding['task_ref']}",
+                "generation": binding["generation"],
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=str(binding["quest_ref"]),
+        )
+        facts: dict[str, object] = {
+            f"{fact_prefix}_source_ref": asset.memory_ref,
+            f"{fact_prefix}_version_ref": asset.version_ref,
+            f"{fact_prefix}_content_hash": asset.content_hash,
+            f"{fact_prefix}_manifest_hash": asset.manifest_hash,
+            f"{fact_prefix}_acceptance_receipt_ref": asset.receipt.receipt_ref,
+        }
+        if case == "missing_version":
+            facts[f"{fact_prefix}_version_ref"] = "asset_version_missing"
+        elif case == "wrong_source":
+            facts[f"{fact_prefix}_source_ref"] = "research_asset_missing"
+        elif case == "wrong_content":
+            facts[f"{fact_prefix}_content_hash"] = "f" * 64
+        elif case == "wrong_receipt":
+            facts[f"{fact_prefix}_acceptance_receipt_ref"] = "receipt_missing"
+        runtime.owners.human_collaboration.respond_to_human_request(
+            str(request["request_ref"]),
+            decision="provided",
+            facts=facts,
+            note="Use this exact accepted asset.",
+            idempotency_key=f"root-human-asset-response-{request_kind}-{case}",
+        )
+
+        current = owner.query_human_request(str(request["request_ref"]))
+        assert current is not None
+        if case == "exact":
+            assert current["status"] == "satisfied"
+            assert current["direct_waiters"][0]["status"] == "consumed"
+            assert current["evaluation"]["accepted_evidence_refs"] == [
+                asset.receipt.receipt_ref
+            ]
+        else:
+            assert current["status"] == "open"
+            assert current["evaluation"]["decision"] == "needs_input"
+            assert current["direct_waiters"][0]["status"] == "blocked"
+            assert owner.query_managed_run(str(binding["task_ref"]))[
+                "status"
+            ] == "suspended"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("exact", "decision_only", "confirmation_receipt", "wrong_scope_receipt"),
+)
+def test_root_human_request_capability_proof_requires_exact_independent_receipt(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / f"root-human-capability-{case}")
+    )
+    owner = runtime.owners.agent_runtime
+    human = runtime.owners.human_collaboration
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    binding = _root_effect_binding()
+    effect_id = "root-human-capability"
+    required_authorization = {
+        "capability": "external_publish",
+        "scope": {
+            "schema_ref": "meta-research/root-human-request-capability-scope/v1",
+            "human_request_effect_id": effect_id,
+            "quest_ref": binding["quest_ref"],
+            "task_ref": binding["task_ref"],
+            "root_session_ref": binding["root_session_ref"],
+            "operation_id": binding["operation_id"],
+            "attempt_ref": binding["attempt_ref"],
+            "generation": binding["generation"],
+            "destination": "https://publisher.example.invalid/exact-target",
+            "duration": "single_effect",
+            "exclusions": ["credential_export", "unrelated_targets"],
+        },
+    }
+    confirmation, authorization = _grant_capability_authorization(
+        human,
+        scope_ref=f"quest:{binding['quest_ref']}",
+        requirement=required_authorization,
+        key=f"root-human-capability-{case}",
+    )
+    wrong_authorization = None
+    if case == "wrong_scope_receipt":
+        wrong_requirement = {
+            **required_authorization,
+            "scope": {
+                **required_authorization["scope"],
+                "destination": "https://publisher.example.invalid/other-target",
+            },
+        }
+        _wrong_confirmation, wrong_authorization = _grant_capability_authorization(
+            human,
+            scope_ref=f"quest:{binding['quest_ref']}",
+            requirement=wrong_requirement,
+            key="root-human-capability-wrong-scope",
+        )
+    target = {
+        "schema_ref": "meta-research/root-agent-human-request-target/v1",
+        "root": {
+            "run_kind": "deepfetch",
+            "run_ref": binding["task_ref"],
+            "attempt_ref": binding["attempt_ref"],
+            "root_session_ref": binding["root_session_ref"],
+            "fence_ref": binding["fence_ref"],
+            "waiter_generation": binding["generation"],
+        },
+        "condition": {"capability": "external_publish"},
+    }
+    try:
+        request = owner.open_human_request_effect(
+            effect_key=f"mcp-effect:root-human-capability-{case}",
+            effect_id=effect_id,
+            operation_binding=binding,
+            predecessor_request_ref=None,
+            request_kind="capability_authorization",
+            obligation="Authorize this exact external publish capability.",
+            business_purpose="Resume only this exact blocked Root operation.",
+            target_assertion=target,
+            acceptance_conditions=("An exact independent grant is current.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{binding['task_ref']}",
+                "generation": binding["generation"],
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=str(binding["quest_ref"]),
+            required_authorization=required_authorization,
+        )
+        if case == "exact":
+            facts = {
+                "authorization_receipt_ref": authorization["receipt_ref"]
+            }
+        elif case == "decision_only":
+            facts = {"authorization_decision": "granted"}
+        elif case == "confirmation_receipt":
+            facts = {
+                "authorization_receipt_ref": confirmation[
+                    "confirmation_receipt"
+                ]["receipt_ref"]
+            }
+        else:
+            assert wrong_authorization is not None
+            facts = {
+                "authorization_receipt_ref": wrong_authorization["receipt_ref"]
+            }
+        human.respond_to_human_request(
+            str(request["request_ref"]),
+            decision="provided",
+            facts=facts,
+            note="Use only the exact independently committed authorization.",
+            idempotency_key=f"root-human-capability-response-{case}",
+        )
+
+        current = owner.query_human_request(str(request["request_ref"]))
+        assert current is not None
+        if case == "exact":
+            assert current["status"] == "satisfied"
+            assert current["direct_waiters"][0]["status"] == "consumed"
+            assert current["evaluation"]["accepted_evidence_refs"] == [
+                authorization["receipt_ref"]
+            ]
+        else:
+            assert current["status"] == "open"
+            assert current["evaluation"]["decision"] == "needs_input"
+            assert current["direct_waiters"][0]["status"] == "blocked"
+            assert owner.query_managed_run(str(binding["task_ref"]))[
+                "status"
+            ] == "suspended"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("exact", "missing_session", "not_ready", "slot_held"),
+)
+def test_root_human_request_institution_preflight_proof_is_owner_derived(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / f"root-human-institution-{case}")
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    session_ref = "acquisition_session_root_human_request_1"
+    generation = 7
+    session = SimpleNamespace(
+        session_ref=session_ref,
+        status="waiting_user" if case == "not_ready" else "ready",
+        slot_held=case == "slot_held",
+        mode="oa_then_institution",
+        browser_context_ref="browser_context_root_human_request_1",
+        preflight_generation=generation,
+    )
+
+    def query_session(**values: object):
+        assert values == {"quest_ref": "quest_root_human_request_1"}
+        return None if case == "missing_session" else session
+
+    monkeypatch.setattr(owner, "query_acquisition_session", query_session)
+    try:
+        request = _open_root_human_request_effect(
+            owner,
+            effect_key=f"mcp-effect:root-human-institution-{case}",
+            effect_id=f"root-human-institution-{case}",
+        )
+        preflight_ref = agent_runtime_module._acquisition_preflight_runtime_effect(
+            session_ref=session_ref,
+            generation=generation,
+        ).operation_ref
+        runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"route": "institutional_browser_reconnected"},
+            note="I reconnected the institution browser.",
+            idempotency_key=f"root-human-institution-{case}-response",
+        )
+
+        current = owner.query_human_request(request["request_ref"])
+        assert current is not None
+        if case == "exact":
+            assert current["status"] == "satisfied"
+            assert current["evaluation"]["accepted_evidence_refs"] == [
+                preflight_ref
+            ]
+            assert current["direct_waiters"][0]["status"] == "consumed"
+            assert owner.query_managed_run(
+                str(request["open_effect"]["operation_binding"]["task_ref"])
+            )["status"] == "running"
+        else:
+            assert current["status"] == "open"
+            assert current["evaluation"]["decision"] == "needs_input"
+            assert current["disposition"] is None
+            assert current["direct_waiters"][0]["status"] == "blocked"
+    finally:
+        runtime.close()
+
+
+def test_root_human_request_successor_has_new_effect_waiter_and_lineage(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "root-human-request-successor")
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    try:
+        predecessor = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-human-predecessor",
+            effect_id="root-human-predecessor",
+        )
+        runtime.owners.human_collaboration.respond_to_human_request(
+            predecessor["request_ref"],
+            decision="deferred",
+            facts={},
+            note="Continue without this route for now.",
+            idempotency_key="root-human-predecessor-response",
+        )
+        successor = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-human-successor",
+            effect_id="root-human-successor",
+            generation=4,
+            predecessor_request_ref=str(predecessor["request_ref"]),
+        )
+        assert owner.query_managed_run(
+            str(successor["open_effect"]["operation_binding"]["task_ref"])
+        )["status"] == "suspended"
+
+        old = owner.query_human_request(predecessor["request_ref"])
+        assert old is not None
+        assert successor["predecessor_request_ref"] == predecessor["request_ref"]
+        assert successor["lineage"] == {
+            "predecessor_request_ref": predecessor["request_ref"],
+            "successor_request_ref": None,
+        }
+        assert old["successor_request_ref"] == successor["request_ref"]
+        assert old["lineage"]["successor_request_ref"] == successor[
+            "request_ref"
+        ]
+        assert successor["request_ref"] != predecessor["request_ref"]
+        assert successor["open_receipt"] != predecessor["open_receipt"]
+        assert successor["generation"] == 4
+        assert successor["direct_waiters"][0]["generation"] == 4
+        stale = owner.validate_human_request_waiter(
+            successor["request_ref"],
+            waiter_ref=predecessor["direct_waiters"][0]["waiter_ref"],
+            generation=3,
+            target_assertion=predecessor["target_assertion"],
+            other_blockers=(),
+            idempotency_key="old-receipt-cannot-release-successor",
+        )
+        assert stale["status"] == "blocked"
+        assert stale["reason"] == {"code": "satisfied_disposition_required"}
     finally:
         runtime.close()

@@ -60,6 +60,7 @@ from meta_research.runtime_protection import (
     InhibitorLease,
     RuntimeProtectionUnavailable,
 )
+from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.web import create_app
 
 
@@ -233,6 +234,83 @@ class DeterministicManualDeepFetchProvider:
                 "trace_hash": "8" * 64,
             },
         )
+
+
+class HumanRequestManualDeepFetchProvider(DeterministicManualDeepFetchProvider):
+    def __init__(self, *, invalid_first_result: bool = False) -> None:
+        super().__init__()
+        self.owner = None
+        self.human_request: dict[str, object] | None = None
+        self.invalid_first_result = invalid_first_result
+
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        if self.human_request is None:
+            assert self.owner is not None
+            quest_ref = request.scope["quest_ref"]
+            binding = {
+                "quest_ref": quest_ref,
+                "task_ref": request.run_ref,
+                "root_session_ref": request.root_session_ref,
+                "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                "attempt_ref": request.attempt_ref,
+                "generation": request.attempt_generation,
+                "request_owner": "agent_runtime",
+                "root_kind": "deepfetch",
+                "phase": "turn-1",
+                "fence_ref": request.fence_ref,
+                "runtime_binding_hash": canonical_hash(
+                    request.runtime_binding.as_dict()
+                ),
+            }
+            target = {
+                "schema_ref": "meta-research/root-agent-human-request-target/v1",
+                "root": {
+                    "run_kind": "deepfetch",
+                    "run_ref": request.run_ref,
+                    "attempt_ref": request.attempt_ref,
+                    "root_session_ref": request.root_session_ref,
+                    "fence_ref": request.fence_ref,
+                    "waiter_generation": request.attempt_generation,
+                },
+                "condition": {
+                    "operator_choice": "continue_without_optional_input"
+                },
+            }
+            self.human_request = self.owner.open_human_request_effect(
+                effect_key="mcp-effect:manual-deepfetch-yield",
+                effect_id="manual-deepfetch-yield",
+                operation_binding=binding,
+                predecessor_request_ref=None,
+                request_kind="offline_action",
+                obligation="Choose whether this exact DeepFetch should continue.",
+                business_purpose="Resume only this exact Quest-bound DeepFetch.",
+                target_assertion=target,
+                acceptance_conditions=(
+                    "The operator records an exact disposition.",
+                ),
+                direct_waiter={
+                    "waiter_ref": f"root_run:{request.run_ref}",
+                    "generation": request.attempt_generation,
+                    "target_assertion": target,
+                    "wait_scope": "local",
+                    "other_blockers": [],
+                },
+                quest_ref=quest_ref,
+            )
+        result = super().execute(request)
+        if self.invalid_first_result and len(self.requests) == 1:
+            return DeepFetchResult(
+                completion=result.completion,
+                summary="",
+                papers=result.papers,
+                fulltexts=result.fulltexts,
+                limitations=result.limitations,
+                native_session_ref=result.native_session_ref,
+                adapter_kind=result.adapter_kind,
+                web_evidence=result.web_evidence,
+                papers_ledger=result.papers_ledger,
+            )
+        return result
 
 
 class DeterministicAcquisitionProvider:
@@ -1444,6 +1522,98 @@ def test_manual_deepfetch_reuses_the_quest_session_and_returns_an_rm_receipt(
         )
         assert acquisition is not None
         assert acquisition.session_ref == authorized.acquisition_session_ref
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("invalid_first_result", [False, True])
+def test_manual_deepfetch_resumes_same_managed_run_after_human_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_first_result: bool,
+) -> None:
+    provider = HumanRequestManualDeepFetchProvider(
+        invalid_first_result=invalid_first_result
+    )
+    runtime = _build_runtime(
+        tmp_path / "manual-deepfetch-root-human-request",
+        deepfetch_provider=provider,
+        acquisition_provider=DeterministicAcquisitionProvider(),
+    )
+    owner = runtime.owners.agent_runtime
+    provider.owner = owner
+    try:
+        quest_ref, parent_question_ref = _accept_root_question(
+            runtime, "manual-deepfetch-root-human-request"
+        )
+        human = runtime.owners.human_collaboration
+        seeded = _open_and_confirm_seed(
+            human,
+            quest_ref=quest_ref,
+            parent_question_ref=parent_question_ref,
+            key_prefix="manual-deepfetch-root-human-request",
+            deepfetch_preference="use",
+        )
+        queued = human.start_manual_creation_deepfetch(
+            seeded["context_ref"],
+            expected_seed_ref=seeded["seed"]["ref"],
+            expected_seed_hash=seeded["seed"]["hash"],
+            idempotency_key="manual-deepfetch-root-human-request-start",
+        )
+        request_ref = queued["research_path"]["deepfetch"]["request_ref"]
+
+        assert runtime.deepfetch.process_once()
+        assert provider.human_request is not None
+        human_request_ref = provider.human_request["request_ref"]
+        first_run = owner.query_deepfetch_run(request_ref)
+        assert first_run is not None and first_run.status == "running"
+        assert first_run.attempt_generation == 1
+        assert first_run.failure_code == "human_request_wait"
+        suspended = owner.query_managed_run(first_run.run_ref)
+        assert suspended is not None and suspended["status"] == "suspended"
+
+        human.respond_to_human_request(
+            human_request_ref,
+            decision="deferred",
+            facts={},
+            note="Continue without the optional input.",
+            idempotency_key="manual-deepfetch-root-human-request-response",
+        )
+        disposed = owner.query_human_request(human_request_ref)
+        assert disposed is not None and disposed["status"] == "unsatisfied"
+        assert disposed["direct_waiters"][0]["status"] == "consumed"
+        resumed = owner.query_managed_run(first_run.run_ref)
+        assert resumed is not None and resumed["status"] == "running"
+
+        observed_errors: list[str] = []
+        execute_deepfetch = owner.execute_deepfetch
+
+        def observe_execute(request, selected_provider):
+            try:
+                return execute_deepfetch(request, selected_provider)
+            except OwnerConflict as error:
+                observed_errors.append(error.code)
+                raise
+
+        monkeypatch.setattr(owner, "execute_deepfetch", observe_execute)
+        progressed = runtime.deepfetch.process_once()
+
+        assert "deepfetch_run_busy" not in observed_errors
+        assert progressed
+        completed = owner.query_deepfetch_run(request_ref)
+        assert completed is not None and completed.status == "executed"
+        assert completed.run_ref == first_run.run_ref
+        assert completed.root_session_ref == first_run.root_session_ref
+        assert completed.attempt_generation == 2
+        assert completed.provider_operation_generation == 2
+        assert len(provider.requests) == 2
+        assert provider.requests[1].human_request_resume == {
+            "effect_id": provider.human_request["open_effect"]["effect_id"],
+            "request_ref": human_request_ref,
+            "phase": "turn-1",
+        }
+        researched = human.query_manual_question_creation(seeded["context_ref"])
+        assert researched["research_path"]["status"] == "ready"
     finally:
         runtime.close()
 

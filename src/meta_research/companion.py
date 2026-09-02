@@ -197,15 +197,22 @@ class CodexCompanionAdapter(
             f"user_message={request.message}"
         )
         try:
-            raw, native_session_ref, _stdout = self._invoke(
-                operation_name="companion-turn",
-                prompt=prompt,
-                schema=_reply_schema(include_agent_proposal=companion),
-                native_session_ref=request.native_session_ref,
-                job_ref=request.job_ref,
+            raw, native_session_ref, _stdout = (
+                self._invoke_optional_root_task_operation(
+                    operation_name="companion-turn",
+                    prompt=prompt,
+                    schema=_reply_schema(include_agent_proposal=companion),
+                    native_session_ref=request.native_session_ref,
+                    job_ref=request.job_ref,
+                    root_runtime_scope=getattr(
+                        request, "root_runtime_scope", None
+                    ),
+                )
             )
         except IdeaSkillUnavailable as error:
-            raise DraftingUnavailable(error.code) from error
+            raise DraftingUnavailable(
+                error.code, native_session_ref=error.native_session_ref
+            ) from error
         reply = raw.get("reply")
         expected_keys = {"reply", "agent_proposal"} if companion else {"reply"}
         if (
@@ -215,7 +222,10 @@ class CodexCompanionAdapter(
             or len(reply.strip()) > INTENT_REPLY_MAX_LENGTH
             or native_session_ref is None
         ):
-            raise DraftingUnavailable("codex_intent_reply_invalid")
+            raise DraftingUnavailable(
+                "codex_intent_reply_invalid",
+                native_session_ref=native_session_ref,
+            )
         try:
             agent_proposal = (
                 _validated_agent_proposal(raw.get("agent_proposal"))
@@ -223,7 +233,10 @@ class CodexCompanionAdapter(
                 else None
             )
         except (TypeError, ValueError) as error:
-            raise DraftingUnavailable("codex_agent_proposal_invalid") from error
+            raise DraftingUnavailable(
+                "codex_agent_proposal_invalid",
+                native_session_ref=native_session_ref,
+            ) from error
         return IntentTurnResult(
             reply=reply.strip(),
             native_session_ref=native_session_ref,

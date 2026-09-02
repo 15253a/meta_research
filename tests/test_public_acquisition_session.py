@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -30,12 +29,12 @@ from meta_research.deepfetch import (
 )
 from meta_research.paths import prepare_data_root
 from meta_research.owners.common import OwnerConflict
-from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.quest_drafting import HostComputeDevice, HostComputeSnapshot
 from meta_research.runtime_protection import (
     InhibitorLease,
     RuntimeProtectionUnavailable,
 )
+from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.web import create_app
 
 
@@ -134,6 +133,159 @@ class ObtainingAcquisitionProvider(RecordingAcquisitionProvider):
             )
             for item in request.papers
         )
+
+
+class HumanRequestAcquisitionProvider(RecordingAcquisitionProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.owner = None
+        self.human_request: dict[str, object] | None = None
+        self.reconciliations: list[AcquisitionBatchRequest] = []
+
+    @staticmethod
+    def _missing(
+        request: AcquisitionBatchRequest,
+    ) -> tuple[AcquisitionItemResult, ...]:
+        return tuple(
+            AcquisitionItemResult(
+                paper_id=item.paper_id,
+                status="missing",
+                path=None,
+                format=None,
+                failure={
+                    "code": "oa_fulltext_not_found",
+                    "detail": "The exact lawful route was exhausted.",
+                },
+            )
+            for item in request.papers
+        )
+
+    def acquire(self, request: AcquisitionBatchRequest):
+        self.batches.append(request)
+        assert self.owner is not None
+        scope = request.root_runtime_scope
+        assert scope is not None
+        generation = int(scope["generation"])
+        target = {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": "acquisition",
+                "run_ref": scope["run_ref"],
+                "attempt_ref": scope["attempt_ref"],
+                "root_session_ref": scope["root_session_ref"],
+                "fence_ref": scope["fence_ref"],
+                "waiter_generation": generation,
+            },
+            "condition": {"operator_choice": "continue_without_optional_input"},
+        }
+        binding = {
+            "quest_ref": scope["quest_ref"],
+            "task_ref": scope["run_ref"],
+            "root_session_ref": scope["root_session_ref"],
+            "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+            "attempt_ref": scope["attempt_ref"],
+            "generation": generation,
+            "request_owner": "agent_runtime",
+            "root_kind": "acquisition",
+            "phase": "batch",
+            "fence_ref": scope["fence_ref"],
+            "runtime_binding_hash": scope["runtime_binding_hash"],
+        }
+        self.human_request = self.owner.open_human_request_effect(
+            effect_key="mcp-effect:"
+            + acquisition_hash(
+                {
+                    "operation_binding": binding,
+                    "effect_id": "acquisition-needs-operator-choice",
+                }
+            ),
+            effect_id="acquisition-needs-operator-choice",
+            operation_binding=binding,
+            predecessor_request_ref=None,
+            request_kind="offline_action",
+            obligation="Choose whether this exact Acquisition task should continue.",
+            business_purpose="Resume only this exact Quest-bound acquisition task.",
+            target_assertion=target,
+            acceptance_conditions=("The operator records an exact disposition.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{scope['run_ref']}",
+                "generation": generation,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=str(scope["quest_ref"]),
+        )
+        return self._missing(request)
+
+    def reconcile(self, request: AcquisitionBatchRequest):
+        self.reconciliations.append(request)
+        return self._missing(request)
+
+
+class LibraryReconnectHumanRequestAcquisitionProvider(
+    RecordingAcquisitionProvider
+):
+    def __init__(self) -> None:
+        super().__init__()
+        self.owner = None
+        self.human_request: dict[str, object] | None = None
+
+    def acquire(self, request: AcquisitionBatchRequest):
+        assert self.owner is not None
+        scope = request.root_runtime_scope
+        assert scope is not None
+        generation = int(scope["generation"])
+        binding = {
+            "quest_ref": scope["quest_ref"],
+            "task_ref": scope["run_ref"],
+            "root_session_ref": scope["root_session_ref"],
+            "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+            "attempt_ref": scope["attempt_ref"],
+            "generation": generation,
+            "request_owner": "agent_runtime",
+            "root_kind": "acquisition",
+            "phase": "batch",
+            "fence_ref": scope["fence_ref"],
+            "runtime_binding_hash": scope["runtime_binding_hash"],
+        }
+        target = {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": "acquisition",
+                "run_ref": scope["run_ref"],
+                "attempt_ref": scope["attempt_ref"],
+                "root_session_ref": scope["root_session_ref"],
+                "fence_ref": scope["fence_ref"],
+                "waiter_generation": generation,
+            },
+            "condition": {
+                "route": "literature_access",
+                "session_ref": "ui-stale-session-must-not-be-trusted",
+            },
+        }
+        self.human_request = self.owner.open_human_request_effect(
+            effect_key="mcp-effect:root-library-reconnect-repreflight",
+            effect_id="root-library-reconnect-repreflight",
+            operation_binding=binding,
+            predecessor_request_ref=None,
+            request_kind="library_reconnect",
+            obligation="Restore the institution route for this exact task.",
+            business_purpose="Resume the exact Quest-bound acquisition task.",
+            target_assertion=target,
+            acceptance_conditions=(
+                "The current Quest acquisition preflight is ready.",
+            ),
+            direct_waiter={
+                "waiter_ref": f"root_run:{scope['run_ref']}",
+                "generation": generation,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=str(scope["quest_ref"]),
+        )
+        return super().acquire(request)
 
 
 @pytest.mark.parametrize("request_id", ["/tmp/x", "../x", "a/b"])
@@ -427,6 +579,165 @@ class CrashAfterConsumedWaiterProvider(RecordingAcquisitionProvider):
         )
 
 
+def test_provider_waiting_user_does_not_create_a_human_request(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "provider-waiting-no-human-request"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _, _, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="provider-waiting-no-human-request",
+        )
+        before = runtime.owners.agent_runtime.query_human_requests()
+        execution = runtime.owners.agent_runtime.acquire_literature(
+            session_ref,
+            AcquisitionBatchRequest(
+                request_id="provider-waiting-no-human-request",
+                route_policy="oa_first_then_institution",
+                papers=(
+                    AcquisitionPaper(
+                        paper_id="paper:waiting",
+                        title="Needs a human-selected next action",
+                        doi=None,
+                        arxiv_id=None,
+                        source_urls=(),
+                    ),
+                ),
+            ),
+            provider,
+        )
+
+        assert execution.status == "waiting_user"
+        assert runtime.owners.agent_runtime.query_human_requests() == before == ()
+    finally:
+        client.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize("restart_after_response", (False, True))
+def test_explicit_root_library_reconnect_repreflights_quest_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restart_after_response: bool,
+) -> None:
+    provider = LibraryReconnectHumanRequestAcquisitionProvider()
+    data_root = prepare_data_root(
+        tmp_path / f"root-library-reconnect-{restart_after_response}"
+    )
+    runtime = build_production_runtime(
+        data_root,
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    provider.owner = runtime.owners.agent_runtime
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="root-library-reconnect-repreflight",
+        )
+        quest_ref = "quest_root_library_reconnect_repreflight"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="root-library-reconnect-repreflight-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:waiting",
+                    title="Institution login is required",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        waiting = owner.acquire_literature(session_ref, request, provider)
+        assert waiting.status == "waiting_user"
+        assert len(provider.preflights) == 1
+        [provider_request] = provider.batches
+        scope = provider_request.root_runtime_scope
+        assert scope is not None
+        assert provider.human_request is not None
+        human_request = provider.human_request
+        assert human_request["open_effect"]["operation_binding"][
+            "quest_ref"
+        ] == quest_ref
+        assert owner.query_managed_run(str(scope["run_ref"]))[
+            "status"
+        ] == "suspended"
+
+        if restart_after_response:
+            def crash_after_response_commit(_request_ref: str) -> None:
+                raise KeyboardInterrupt("crash before acquisition re-preflight")
+
+            monkeypatch.setattr(
+                runtime.owners.human_collaboration,
+                "_reconcile_issuing_owner_human_request",
+                crash_after_response_commit,
+            )
+            with pytest.raises(KeyboardInterrupt):
+                runtime.owners.human_collaboration.respond_to_human_request(
+                    str(human_request["request_ref"]),
+                    decision="provided",
+                    facts={"route": "institutional_browser_reconnected"},
+                    note="The institution browser is reconnected.",
+                    idempotency_key="root-library-reconnect-repreflight-response",
+                )
+            assert len(provider.preflights) == 1
+            runtime.close()
+            runtime = build_production_runtime(
+                data_root,
+                acquisition_provider=provider,
+                host_compute_probe=NoCompute(),
+            )
+            owner = runtime.owners.agent_runtime
+        else:
+            runtime.owners.human_collaboration.respond_to_human_request(
+                str(human_request["request_ref"]),
+                decision="provided",
+                facts={"route": "institutional_browser_reconnected"},
+                note="The institution browser is reconnected.",
+                idempotency_key="root-library-reconnect-repreflight-response",
+            )
+
+        assert len(provider.preflights) == 2
+        refreshed = owner.query_acquisition_session(quest_ref=quest_ref)
+        assert refreshed is not None
+        assert refreshed.session_ref == session_ref
+        assert refreshed.status == "ready"
+        current = owner.query_human_request(str(human_request["request_ref"]))
+        assert current is not None
+        assert len(current["responses"]) == 1
+        assert current["responses"][0]["decision"] == "provided"
+        assert current["status"] == "satisfied"
+        assert current["direct_waiters"][0]["status"] == "consumed"
+        assert owner.query_managed_run(str(scope["run_ref"]))[
+            "status"
+        ] == "running"
+        replayed = runtime.owners.human_collaboration.respond_to_human_request(
+            str(human_request["request_ref"]),
+            decision="provided",
+            facts={"route": "institutional_browser_reconnected"},
+            note="The institution browser is reconnected.",
+            idempotency_key="root-library-reconnect-repreflight-response",
+        )
+        assert replayed == current["responses"][0]
+        assert len(provider.preflights) == 2
+    finally:
+        client.close()
+        runtime.close()
+
+
 class CrashAfterOaResumeProvider(RecordingAcquisitionProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -599,44 +910,6 @@ def _open_ready_acquisition(
     )
 
 
-def _respond_to_acquisition_human_request(
-    runtime,
-    *,
-    session_ref: str,
-    request_id: str,
-    key: str,
-) -> dict[str, object]:
-    requests = [
-        item
-        for item in runtime.owners.agent_runtime.query_human_requests()
-        if item["status"] == "open"
-        and item["kind"] == "library_reconnect"
-        and item["target_assertion"].get("session_ref") == session_ref
-        and item["target_assertion"].get("acquisition_request_id") == request_id
-    ]
-    assert len(requests) == 1
-    runtime.owners.human_collaboration.respond_to_human_request(
-        requests[0]["request_ref"],
-        decision="provided",
-        facts={"route": "institutional_browser_reconnected"},
-        note="The existing controlled browser login was restored.",
-        idempotency_key=f"{key}-response",
-    )
-    return requests[0]
-
-
-def _current_acquisition_human_request(runtime, session_ref: str, request_id: str):
-    requests = [
-        item
-        for item in runtime.owners.agent_runtime.query_human_requests()
-        if item["kind"] == "library_reconnect"
-        and item["target_assertion"].get("session_ref") == session_ref
-        and item["target_assertion"].get("acquisition_request_id") == request_id
-    ]
-    assert len(requests) == 1
-    return requests[0]
-
-
 def _current_acquisition_human_requests(runtime, session_ref: str, request_id: str):
     return [
         item
@@ -647,42 +920,17 @@ def _current_acquisition_human_requests(runtime, session_ref: str, request_id: s
     ]
 
 
-def _respond_with_accepted_material(
-    runtime,
-    human_request: dict[str, object],
-    *,
-    paper_id: str,
-    key: str,
-    content: bytes,
+def _assert_waiting_without_automatic_human_request(
+    runtime, *, session_ref: str, request_id: str
 ) -> None:
-    intake = runtime.owners.research_memory.submit_asset_intake(
-        AssetIntakeRequest(
-            source_kind="file",
-            custody_mode="managed",
-            display_name=f"{key}.pdf",
-            media_type="application/pdf",
-            content=content,
-            provenance={"human_request_ref": human_request["request_ref"]},
-            asynchronous=False,
-        ),
-        idempotency_key=f"{key}-intake",
+    assert runtime.owners.agent_runtime.query_human_requests() == ()
+    session = runtime.owners.agent_runtime.query_acquisition_session(
+        session_ref=session_ref
     )
-    assert intake.asset is not None
-    asset = intake.asset
-    runtime.owners.human_collaboration.respond_to_human_request(
-        human_request["request_ref"],
-        decision="provided",
-        facts={
-            "acquisition_paper_id": paper_id,
-            "material_source_ref": asset.memory_ref,
-            "material_version_ref": asset.version_ref,
-            "material_content_hash": asset.content_hash,
-            "material_manifest_hash": asset.manifest_hash,
-            "material_acceptance_receipt_ref": asset.receipt.receipt_ref,
-        },
-        note="Use this accepted copy for the exact blocked item.",
-        idempotency_key=f"{key}-response",
-    )
+    assert session is not None
+    assert session.status == "waiting_user"
+    assert session.current_request_id == request_id
+    assert session.slot_held is False
 
 
 def test_owner_rejects_path_unsafe_request_ids_before_target_or_provider(
@@ -910,10 +1158,15 @@ def test_completed_acquisition_execution_is_queryable_without_provider_replay(
     )
     client, write_headers = _authenticated_client(runtime)
     try:
-        _initialization_id, _saved, session_ref = _open_ready_acquisition(
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
             client,
             write_headers,
             prefix="query-completed-acquisition",
+        )
+        quest_ref = "quest_query_completed_acquisition"
+        runtime.owners.agent_runtime.bind_acquisition_session_to_quest(
+            initialization_id,
+            quest_ref,
         )
         request = AcquisitionBatchRequest(
             request_id="query-completed-acquisition-batch",
@@ -947,6 +1200,135 @@ def test_completed_acquisition_execution_is_queryable_without_provider_replay(
         assert [batch.request_id for batch in provider.batches] == [
             request.request_id
         ]
+        root_scope = provider.batches[0].root_runtime_scope
+        assert root_scope is not None
+        assert root_scope["quest_ref"] == quest_ref
+        assert root_scope["run_ref"] == request.request_id
+        assert root_scope["root_session_ref"] == session_ref
+        assert root_scope["generation"] == 1
+        managed = runtime.owners.agent_runtime.query_managed_run(
+            str(root_scope["run_ref"])
+        )
+        assert managed is not None and managed["status"] == "completed"
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_quest_bound_acquisition_human_request_resumes_same_task_next_attempt(
+    tmp_path: Path,
+) -> None:
+    provider = HumanRequestAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "acquisition-root-human-request"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    provider.owner = runtime.owners.agent_runtime
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="acquisition-root-human-request",
+        )
+        quest_ref = "quest_acquisition_root_human_request"
+        runtime.owners.agent_runtime.bind_acquisition_session_to_quest(
+            initialization_id,
+            quest_ref,
+        )
+        request = AcquisitionBatchRequest(
+            request_id="acquisition-root-human-request-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:root-human-request",
+                    title="Root HumanRequest lifecycle",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        waiting = runtime.owners.agent_runtime.acquire_literature(
+            session_ref,
+            request,
+            provider,
+        )
+        assert waiting.status == "waiting_user"
+        [first_provider_request] = provider.batches
+        first_scope = first_provider_request.root_runtime_scope
+        assert first_scope is not None
+        assert first_scope["run_ref"] == request.request_id
+        assert first_scope["root_session_ref"] == session_ref
+        assert first_scope["generation"] == 1
+        suspended = runtime.owners.agent_runtime.query_managed_run(
+            str(first_scope["run_ref"])
+        )
+        assert suspended is not None and suspended["status"] == "suspended"
+
+        replayed_waiting = runtime.owners.agent_runtime.acquire_literature(
+            session_ref,
+            request,
+            provider,
+        )
+        assert replayed_waiting == waiting
+        assert len(provider.batches) == 1
+        assert provider.reconciliations == []
+        unchanged_session = runtime.owners.agent_runtime.query_acquisition_session(
+            session_ref=session_ref
+        )
+        assert unchanged_session is not None
+        assert unchanged_session.status == "waiting_user"
+        assert unchanged_session.slot_held is False
+        assert unchanged_session.current_request_id == request.request_id
+        unchanged_scope = runtime.owners.agent_runtime.query_managed_run(
+            str(first_scope["run_ref"])
+        )
+        assert unchanged_scope is not None
+        assert unchanged_scope["status"] == "suspended"
+        assert unchanged_scope["attempt_generation"] == 1
+
+        assert provider.human_request is not None
+        request_ref = str(provider.human_request["request_ref"])
+        runtime.owners.human_collaboration.respond_to_human_request(
+            request_ref,
+            decision="deferred",
+            facts={},
+            note="Continue this exact task without the optional input.",
+            idempotency_key="acquisition-root-human-request-response",
+        )
+        resumed = runtime.owners.agent_runtime.query_managed_run(
+            str(first_scope["run_ref"])
+        )
+        assert resumed is not None and resumed["status"] == "running"
+
+        settled = runtime.owners.agent_runtime.acquire_literature(
+            session_ref,
+            request,
+            provider,
+        )
+        assert settled.status == "missing"
+        [reconcile_request] = provider.reconciliations
+        next_scope = reconcile_request.root_runtime_scope
+        assert next_scope is not None
+        assert next_scope["run_ref"] == first_scope["run_ref"]
+        assert next_scope["root_session_ref"] == first_scope["root_session_ref"]
+        assert next_scope["runtime_binding_hash"] == first_scope[
+            "runtime_binding_hash"
+        ]
+        assert next_scope["generation"] == 2
+        assert next_scope["attempt_ref"] != first_scope["attempt_ref"]
+        assert next_scope["fence_ref"] != first_scope["fence_ref"]
+        completed = runtime.owners.agent_runtime.query_managed_run(
+            str(next_scope["run_ref"])
+        )
+        assert completed is not None and completed["status"] == "completed"
+        disposition = runtime.owners.agent_runtime.query_human_request(request_ref)
+        assert disposition is not None
+        assert disposition["status"] == "unsatisfied"
+        assert disposition["direct_waiters"][0]["status"] == "consumed"
     finally:
         client.close()
         runtime.close()
@@ -1117,7 +1499,7 @@ def test_terminal_acquisition_commit_freezes_artifact_digest_and_size(
         runtime.close()
 
 
-def test_quest_acquisition_session_reuses_identity_batches_and_browser_after_restart(
+def test_quest_acquisition_session_waits_without_automatic_human_request(
     tmp_path: Path,
 ) -> None:
     provider = RecordingAcquisitionProvider()
@@ -1220,84 +1602,21 @@ def test_quest_acquisition_session_reuses_identity_batches_and_browser_after_res
         )
         assert second_batch.status == "waiting_user"
         assert second_batch.request_id == "acq-waiting"
-        with pytest.raises(
-            OwnerConflict, match="acquisition_human_request_not_released"
-        ):
-            runtime.owners.agent_runtime.acquire_literature(
-                session_ref,
-                replace(second_batch.request, request_id="acq-waiting"),
-                provider,
-            )
-        assert [batch.request_id for batch in provider.batches] == [
-            "acq-one",
-            "acq-waiting",
-        ]
-        _respond_to_acquisition_human_request(
+        _assert_waiting_without_automatic_human_request(
             runtime,
             session_ref=session_ref,
-            request_id="acq-waiting",
-            key="restore-waiting-library",
+            request_id=second_batch.request_id,
         )
-        restored = client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
-            headers=_write_headers(write_headers, "restore-waiting-library"),
-            json={
-                "expected_draft_revision": saved["quest_draft"]["revision"],
-                "expected_draft_hash": saved["quest_draft"]["hash"],
-            },
-        )
-        restored.raise_for_status()
-        assert restored.json()["acquisition_session"]["status"] == "ready"
-        resumed = runtime.owners.agent_runtime.acquire_literature(
-            session_ref,
-            replace(second_batch.request, request_id="acq-waiting"),
-            provider,
-        )
-        assert resumed.status == "missing"
-        assert resumed.request_id == "acq-waiting"
         assert [batch.request_id for batch in provider.batches] == [
             "acq-one",
             "acq-waiting",
-            "acq-waiting",
         ]
-        assert all(
-            batch.route_policy == "oa_first_then_institution"
-            for batch in provider.batches
-        )
-        assert all(
-            batch.session_ref == session_ref
-            and batch.browser_context_ref == "browser-context-authenticated-1"
-            for batch in provider.batches
-        )
-        assert runtime.owners.agent_runtime.query_snapshot().facts[
-            "acquisition_active_slot_count"
-        ] == 0
     finally:
         client.close()
         runtime.close()
 
-    restarted = build_production_runtime(
-        data_root,
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
-    try:
-        recovered = restarted.owners.agent_runtime.query_acquisition_session(
-            initialization_id=initialization_id
-        )
-        assert recovered is not None
-        assert recovered.session_ref == session_ref
-        assert recovered.browser_context_ref == "browser-context-authenticated-1"
-        assert recovered.slot_held is False
-        assert recovered.request_count == 2
-        assert restarted.owners.agent_runtime.query_snapshot().facts[
-            "acquisition_active_slot_count"
-        ] == 0
-    finally:
-        restarted.close()
 
-
-def test_waiting_batch_retries_only_the_affected_item(
+def test_mixed_waiting_batch_keeps_obtained_item_without_automatic_human_request(
     tmp_path: Path,
 ) -> None:
     provider = PartialAcquisitionProvider()
@@ -1308,7 +1627,7 @@ def test_waiting_batch_retries_only_the_affected_item(
     )
     client, write_headers = _authenticated_client(runtime)
     try:
-        initialization_id, saved, session_ref = _open_ready_acquisition(
+        _, _, session_ref = _open_ready_acquisition(
             client, write_headers, prefix="partial"
         )
         request = AcquisitionBatchRequest(
@@ -1335,43 +1654,20 @@ def test_waiting_batch_retries_only_the_affected_item(
             session_ref, request, provider
         )
         assert first.status == "waiting_user"
-
-        _respond_to_acquisition_human_request(
-            runtime,
-            session_ref=session_ref,
-            request_id="partial-batch",
-            key="partial-restore",
-        )
-
-        restored = client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
-            headers=_write_headers(write_headers, "partial-restore"),
-            json={
-                "expected_draft_revision": saved["quest_draft"]["revision"],
-                "expected_draft_hash": saved["quest_draft"]["hash"],
-            },
-        )
-        restored.raise_for_status()
-        resumed = runtime.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-
-        assert resumed.status == "obtained"
-        assert [paper.paper_id for paper in provider.batches[0].papers] == [
-            "paper:obtained",
-            "paper:waiting",
+        assert [item.status for item in first.results] == [
+            "obtained",
+            "waiting_user",
         ]
-        assert [paper.paper_id for paper in provider.batches[1].papers] == [
-            "paper:waiting"
-        ]
-        assert resumed.results[0] == first.results[0]
-        assert resumed.results[1].status == "obtained"
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
+        )
+        assert len(provider.batches) == 1
     finally:
         client.close()
         runtime.close()
 
 
-def test_mixed_legacy_wait_resume_freezes_proof_for_previous_obtained_item(
+def test_mixed_wait_freezes_proof_without_automatic_human_request(
     tmp_path: Path,
 ) -> None:
     provider = PartialAcquisitionProvider()
@@ -1382,7 +1678,7 @@ def test_mixed_legacy_wait_resume_freezes_proof_for_previous_obtained_item(
         host_compute_probe=NoCompute(),
     )
     client, write_headers = _authenticated_client(runtime)
-    initialization_id, saved, session_ref = _open_ready_acquisition(
+    _, _, session_ref = _open_ready_acquisition(
         client, write_headers, prefix="mixed-legacy-obtained-proof"
     )
     request = AcquisitionBatchRequest(
@@ -1410,103 +1706,23 @@ def test_mixed_legacy_wait_resume_freezes_proof_for_previous_obtained_item(
             session_ref, request, provider
         )
         assert first.status == "waiting_user"
-        human_request = _current_acquisition_human_request(
-            runtime, session_ref, request.request_id
-        )
-        legacy_results = [
-            {
-                "paper_id": "paper:obtained",
-                "status": "obtained",
-                "path": first.results[0].path,
-                "format": "pdf",
-                "failure": None,
-            },
-            {
-                "paper_id": "paper:waiting",
-                "status": "waiting_user",
-                "path": None,
-                "format": None,
-                "failure": {
-                    "code": "institutional_login_required",
-                    "detail": "请恢复机构登录。",
-                },
-            },
+        assert [item.status for item in first.results] == [
+            "obtained",
+            "waiting_user",
         ]
-        with runtime.owners.agent_runtime._database.write() as connection:
-            connection.execute(
-                text(
-                    "UPDATE ar_acquisition_requests SET results_json = :results_json, "
-                    "results_hash = :results_hash WHERE request_id = :request_id"
-                ),
-                {
-                    "results_json": acquisition_json(legacy_results),
-                    "results_hash": acquisition_hash(legacy_results),
-                    "request_id": request.request_id,
-                },
-            )
+        assert first.results[0].content_sha256 == hashlib.sha256(
+            b"%PDF-1.4\nfixture acquisition artifact\n"
+        ).hexdigest()
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
+        )
+        assert len(provider.batches) == 1
     finally:
         client.close()
         runtime.close()
 
-    restarted = build_production_runtime(
-        data_root,
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
-    restarted_client, restarted_headers = _authenticated_client(restarted)
-    try:
-        response = restarted_client.post(
-            f"/api/v1/human-requests/{human_request['request_ref']}/responses",
-            headers=_write_headers(
-                restarted_headers, "mixed-legacy-obtained-proof-response"
-            ),
-            json={
-                "decision": "provided",
-                "facts": {"route": "institutional_browser_reconnected"},
-                "note": "The existing controlled browser login was restored.",
-            },
-        )
-        assert response.status_code == 201
-        restored = restarted_client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
-            headers=_write_headers(
-                restarted_headers, "mixed-legacy-obtained-proof-preflight"
-            ),
-            json={
-                "expected_draft_revision": saved["quest_draft"]["revision"],
-                "expected_draft_hash": saved["quest_draft"]["hash"],
-            },
-        )
-        restored.raise_for_status()
 
-        resumed = restarted.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-
-        assert resumed.status == "obtained"
-        assert resumed.results[0].content_sha256 == hashlib.sha256(
-            b"%PDF-1.4\nfixture acquisition artifact\n"
-        ).hexdigest()
-        assert resumed.results[0].content_bytes == 38
-        queried = restarted.owners.agent_runtime.query_acquisition_execution(
-            session_ref, request.request_id
-        )
-        assert queried == resumed
-        consumed = restarted.owners.agent_runtime.query_human_request(
-            human_request["request_ref"]
-        )
-        assert consumed is not None
-        assert consumed["revision"] == human_request["revision"]
-        assert consumed["direct_waiters"][0]["status"] == "consumed"
-        assert [paper.paper_id for paper in provider.batches[1].papers] == [
-            "paper:waiting"
-        ]
-    finally:
-        restarted_client.close()
-        restarted.close()
-
-
-def test_mixed_wait_resume_terminalizes_previous_obtained_artifact_drift(
+def test_mixed_wait_keeps_technical_state_without_automatic_human_request(
     tmp_path: Path,
 ) -> None:
     provider = PartialAcquisitionProvider()
@@ -1517,7 +1733,7 @@ def test_mixed_wait_resume_terminalizes_previous_obtained_artifact_drift(
     )
     client, write_headers = _authenticated_client(runtime)
     try:
-        initialization_id, saved, session_ref = _open_ready_acquisition(
+        _, _, session_ref = _open_ready_acquisition(
             client, write_headers, prefix="mixed-obtained-artifact-drift"
         )
         request = AcquisitionBatchRequest(
@@ -1549,53 +1765,10 @@ def test_mixed_wait_resume_terminalizes_previous_obtained_artifact_drift(
         ).hexdigest()
         assert first.results[0].path is not None
         Path(first.results[0].path).write_bytes(b"mutated after Owner proof")
-
-        _respond_to_acquisition_human_request(
-            runtime,
-            session_ref=session_ref,
-            request_id=request.request_id,
-            key="mixed-obtained-artifact-drift",
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-        restored = client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
-            headers=_write_headers(
-                write_headers, "mixed-obtained-artifact-drift-preflight"
-            ),
-            json={
-                "expected_draft_revision": saved["quest_draft"]["revision"],
-                "expected_draft_hash": saved["quest_draft"]["hash"],
-            },
-        )
-        restored.raise_for_status()
-
-        resumed = runtime.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-
-        assert resumed.status == "partial"
-        assert resumed.results[0] == AcquisitionItemResult(
-            paper_id="paper:obtained",
-            status="missing",
-            path=None,
-            format=None,
-            failure={
-                "code": "acquisition_artifact_drift",
-                "detail": (
-                    "Acquisition artifact bytes 与 Owner 已冻结 proof 不一致；"
-                    "拒绝重新签名且不会自动重放 Provider。"
-                ),
-            },
-        )
-        assert resumed.results[1].status == "obtained"
-        assert resumed.results[1].content_sha256 is not None
-        assert runtime.owners.agent_runtime.query_acquisition_execution(
-            session_ref, request.request_id
-        ) == resumed
-        replay = runtime.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert replay == resumed
-        assert len(provider.batches) == 2
+        assert len(provider.batches) == 1
     finally:
         client.close()
         runtime.close()
@@ -1689,7 +1862,7 @@ def test_reconciled_invalid_artifact_is_terminal_and_never_replayed(
         runtime.close()
 
 
-def test_upgrade_preserves_legacy_waiting_item_hash_for_public_reconnect(
+def test_upgrade_era_wait_does_not_open_an_automatic_human_request(
     tmp_path: Path,
 ) -> None:
     provider = RecordingAcquisitionProvider()
@@ -1700,7 +1873,7 @@ def test_upgrade_preserves_legacy_waiting_item_hash_for_public_reconnect(
         host_compute_probe=NoCompute(),
     )
     client, write_headers = _authenticated_client(runtime)
-    initialization_id, saved, session_ref = _open_ready_acquisition(
+    _, _, session_ref = _open_ready_acquisition(
         client, write_headers, prefix="legacy-waiting-item-hash"
     )
     request = AcquisitionBatchRequest(
@@ -1721,124 +1894,13 @@ def test_upgrade_preserves_legacy_waiting_item_hash_for_public_reconnect(
             session_ref, request, provider
         )
         assert first.status == "waiting_user"
-        human_request = _current_acquisition_human_request(
-            runtime, session_ref, request.request_id
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-
-        # Freeze the exact persisted shape emitted before artifact proofs were
-        # introduced: five item fields in results_json, and the HumanRequest
-        # target bound to that five-field canonical item hash.
-        legacy_result = {
-            "paper_id": "paper:waiting",
-            "status": "waiting_user",
-            "path": None,
-            "format": None,
-            "failure": {
-                "code": "institutional_login_required",
-                "detail": "请在既有受控浏览器中恢复图书馆登录。",
-            },
-        }
-        legacy_results = [legacy_result]
-        legacy_target = {
-            **human_request["target_assertion"],
-            "acquisition_item_hash": acquisition_hash(legacy_result),
-        }
-        legacy_contract = {
-            "quest_ref": human_request["quest_ref"],
-            "kind": human_request["kind"],
-            "obligation": human_request["obligation"],
-            "business_purpose": human_request["business_purpose"],
-            "target_assertion": legacy_target,
-            "acceptance_conditions": human_request["acceptance_conditions"],
-            "required_authorization": human_request["required_authorization"],
-            "expires_at": human_request["expires_at"],
-        }
-        with runtime.owners.agent_runtime._database.write() as connection:
-            connection.execute(
-                text(
-                    "UPDATE ar_acquisition_requests SET results_json = :results_json, "
-                    "results_hash = :results_hash WHERE request_id = :request_id"
-                ),
-                {
-                    "results_json": acquisition_json(legacy_results),
-                    "results_hash": acquisition_hash(legacy_results),
-                    "request_id": request.request_id,
-                },
-            )
-            connection.execute(
-                text(
-                    "UPDATE owner_human_requests SET target_assertion_json = "
-                    ":target_json, target_assertion_hash = :target_hash, "
-                    "identity_hash = :identity_hash WHERE request_ref = :request_ref"
-                ),
-                {
-                    "target_json": acquisition_json(legacy_target),
-                    "target_hash": acquisition_hash(legacy_target),
-                    "identity_hash": acquisition_hash(legacy_contract),
-                    "request_ref": human_request["request_ref"],
-                },
-            )
-            connection.execute(
-                text(
-                    "UPDATE owner_human_request_waiters SET target_assertion_json = "
-                    ":target_json, target_assertion_hash = :target_hash WHERE "
-                    "request_ref = :request_ref"
-                ),
-                {
-                    "target_json": acquisition_json(legacy_target),
-                    "target_hash": acquisition_hash(legacy_target),
-                    "request_ref": human_request["request_ref"],
-                },
-            )
+        assert len(provider.batches) == 1
     finally:
         client.close()
         runtime.close()
-
-    restarted = build_production_runtime(
-        data_root,
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
-    restarted_client, restarted_headers = _authenticated_client(restarted)
-    try:
-        response = restarted_client.post(
-            f"/api/v1/human-requests/{human_request['request_ref']}/responses",
-            headers=_write_headers(
-                restarted_headers, "legacy-waiting-item-hash-response"
-            ),
-            json={
-                "decision": "provided",
-                "facts": {"route": "institutional_browser_reconnected"},
-                "note": "The existing controlled browser login was restored.",
-            },
-        )
-        assert response.status_code == 201
-
-        restored = restarted_client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
-            headers=_write_headers(
-                restarted_headers, "legacy-waiting-item-hash-preflight"
-            ),
-            json={
-                "expected_draft_revision": saved["quest_draft"]["revision"],
-                "expected_draft_hash": saved["quest_draft"]["hash"],
-            },
-        )
-        restored.raise_for_status()
-        resumed = restarted.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert resumed.status == "missing"
-        assert len(provider.batches) == 2
-        current = restarted.owners.agent_runtime.query_human_request(
-            human_request["request_ref"]
-        )
-        assert current is not None
-        assert current["revision"] == human_request["revision"]
-        assert current["direct_waiters"][0]["status"] == "consumed"
-    finally:
-        restarted_client.close()
-        restarted.close()
 
 
 def test_acquisition_session_claim_is_single_slot_cas(
@@ -2313,7 +2375,7 @@ def test_technical_reconciliation_without_provider_support_never_opens_a_human_r
         replay.close()
 
 
-def test_restart_after_waiter_consumption_reconciles_without_new_human_request(
+def test_waiting_acquisition_has_no_automatic_human_request_before_recovery(
     tmp_path: Path,
 ) -> None:
     provider = CrashAfterConsumedWaiterProvider()
@@ -2324,7 +2386,7 @@ def test_restart_after_waiter_consumption_reconciles_without_new_human_request(
         host_compute_probe=NoCompute(),
     )
     client, write_headers = _authenticated_client(runtime)
-    initialization_id, saved, session_ref = _open_ready_acquisition(
+    _, _, session_ref = _open_ready_acquisition(
         client, write_headers, prefix="consumed-crash"
     )
     request = AcquisitionBatchRequest(
@@ -2345,60 +2407,17 @@ def test_restart_after_waiter_consumption_reconciles_without_new_human_request(
             session_ref, request, provider
         )
         assert first.status == "waiting_user"
-        original = _respond_to_acquisition_human_request(
-            runtime,
-            session_ref=session_ref,
-            request_id=request.request_id,
-            key="consumed-crash-login",
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-        restored = client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
-            headers=_write_headers(write_headers, "consumed-crash-preflight"),
-            json={
-                "expected_draft_revision": saved["quest_draft"]["revision"],
-                "expected_draft_hash": saved["quest_draft"]["hash"],
-            },
-        )
-        restored.raise_for_status()
-
-        with pytest.raises(KeyboardInterrupt):
-            runtime.owners.agent_runtime.acquire_literature(
-                session_ref, request, provider
-            )
-        consumed = runtime.owners.agent_runtime.query_human_request(
-            original["request_ref"]
-        )
-        assert consumed is not None
-        assert consumed["direct_waiters"][0]["status"] == "consumed"
-        assert consumed["direct_waiters"][0]["resume_validation"][
-            "started_work"
-        ] is True
+        assert provider.acquire_calls == 1
+        assert provider.reconcile_calls == []
     finally:
         client.close()
         runtime.close()
 
-    restarted = build_production_runtime(
-        data_root,
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
-    try:
-        before = restarted.owners.agent_runtime.query_human_requests()
-        assert [item["request_ref"] for item in before] == [original["request_ref"]]
-        recovered = restarted.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert recovered.status == "missing"
-        assert provider.acquire_calls == 2
-        assert len(provider.reconcile_calls) == 1
-        after = restarted.owners.agent_runtime.query_human_requests()
-        assert [item["request_ref"] for item in after] == [original["request_ref"]]
-        assert after[0]["direct_waiters"][0]["status"] == "consumed"
-    finally:
-        restarted.close()
 
-
-def test_oa_only_response_is_an_ar_owned_narrow_route_and_resumes_without_relogin(
+def test_oa_capable_wait_does_not_open_an_automatic_human_request(
     tmp_path: Path,
 ) -> None:
     provider = RecordingAcquisitionProvider()
@@ -2428,48 +2447,16 @@ def test_oa_only_response_is_an_ar_owned_narrow_route_and_resumes_without_relogi
         assert runtime.owners.agent_runtime.acquire_literature(
             session_ref, request, provider
         ).status == "waiting_user"
-        human_request = _current_acquisition_human_request(
-            runtime, session_ref, request.request_id
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-        response = runtime.owners.human_collaboration.respond_to_human_request(
-            human_request["request_ref"],
-            decision="provided",
-            facts={"route": "oa_only"},
-            note="Continue with openly accessible sources only.",
-            idempotency_key="oa-route-response",
-        )
-        current = runtime.owners.agent_runtime.query_human_request(
-            human_request["request_ref"]
-        )
-        assert current is not None
-        assert current["status"] == "satisfied"
-        assert current["evaluation"]["response_refs"] == [
-            response["response_ref"]
-        ]
-        assert current["evaluation"]["reason"] == {
-            "code": "oa_only_route_selected"
-        }
-        assert current["disposition"]["decision"] == "satisfied"
-        assert current["direct_waiters"][0]["status"] == "released"
-
-        resumed = runtime.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert resumed.status == "missing"
-        assert len(provider.batches) == 2
-        assert provider.batches[1].session_mode == "oa_only"
-        assert provider.batches[1].browser_context_ref is None
-        consumed = runtime.owners.agent_runtime.query_human_request(
-            human_request["request_ref"]
-        )
-        assert consumed is not None
-        assert consumed["direct_waiters"][0]["status"] == "consumed"
+        assert len(provider.batches) == 1
     finally:
         client.close()
         runtime.close()
 
 
-def test_acquisition_config_drift_requires_a_new_exact_human_response(
+def test_waiting_acquisition_config_stays_technical_without_auto_human_request(
     tmp_path: Path,
 ) -> None:
     provider = RecordingAcquisitionProvider()
@@ -2479,7 +2466,7 @@ def test_acquisition_config_drift_requires_a_new_exact_human_response(
         host_compute_probe=NoCompute(),
     )
     client, write_headers = _authenticated_client(runtime)
-    initialization_id, saved, session_ref = _open_ready_acquisition(
+    _, _, session_ref = _open_ready_acquisition(
         client, write_headers, prefix="oa-route-config-drift"
     )
     request = AcquisitionBatchRequest(
@@ -2499,95 +2486,21 @@ def test_acquisition_config_drift_requires_a_new_exact_human_response(
         assert runtime.owners.agent_runtime.acquire_literature(
             session_ref, request, provider
         ).status == "waiting_user"
-        original = _current_acquisition_human_request(
-            runtime, session_ref, request.request_id
-        )
-        runtime.owners.human_collaboration.respond_to_human_request(
-            original["request_ref"],
-            decision="provided",
-            facts={"route": "oa_only"},
-            note="Use OA only for the current exact configuration.",
-            idempotency_key="oa-route-config-drift-first-response",
-        )
-        released = runtime.owners.agent_runtime.query_human_request(
-            original["request_ref"]
-        )
-        assert released is not None
-        assert released["direct_waiters"][0]["status"] == "released"
-
-        current_creation = client.get(
-            f"/api/v1/quest-initializations/{initialization_id}"
-        ).json()
-        changed_draft = dict(current_creation["quest_draft"]["value"])
-        changed_draft["literature"] = {
-            **changed_draft["literature"],
-            "library_entry_url": "https://library.example.edu/changed-entry",
-        }
-        changed_response = client.put(
-            f"/api/v1/quest-initializations/{initialization_id}/draft",
-            headers=_write_headers(write_headers, "oa-route-config-drift-resave"),
-            json={
-                "expected_draft_revision": current_creation["quest_draft"][
-                    "revision"
-                ],
-                "expected_draft_hash": current_creation["quest_draft"]["hash"],
-                "draft": changed_draft,
-            },
-        )
-        assert changed_response.status_code == 200, changed_response.json()
-        changed = changed_response.json()
-        reprobed = client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
-            headers=_write_headers(
-                write_headers, "oa-route-config-drift-repreflight"
-            ),
-            json={
-                "expected_draft_revision": changed["quest_draft"]["revision"],
-                "expected_draft_hash": changed["quest_draft"]["hash"],
-            },
-        )
-        assert reprobed.status_code == 200, reprobed.json()
-        current_session = runtime.owners.agent_runtime.query_acquisition_session(
+        session = runtime.owners.agent_runtime.query_acquisition_session(
             session_ref=session_ref
         )
-        assert current_session is not None
-        new_config_hash = current_session.config_hash
-
-        with pytest.raises(
-            OwnerConflict, match="acquisition_human_request_not_released"
-        ):
-            runtime.owners.agent_runtime.acquire_literature(
-                session_ref, request, provider
-            )
-        requests = [
-            item
-            for item in runtime.owners.agent_runtime.query_human_requests()
-            if item["target_assertion"].get("acquisition_request_id")
-            == request.request_id
-        ]
-        assert len(requests) == 2
-        successor = next(item for item in requests if item["status"] == "open")
-        assert successor["target_assertion"]["config_hash"] == new_config_hash
-        assert original["request_ref"] != successor["request_ref"]
-
-        runtime.owners.human_collaboration.respond_to_human_request(
-            successor["request_ref"],
-            decision="provided",
-            facts={"route": "oa_only"},
-            note="Use OA only for this new exact configuration.",
-            idempotency_key="oa-route-config-drift-second-response",
+        assert session is not None
+        assert session.config_hash
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-        resumed = runtime.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert resumed.status == "missing"
-        assert provider.batches[-1].session_mode == "oa_only"
+        assert len(provider.batches) == 1
     finally:
         client.close()
         runtime.close()
 
 
-def test_accepted_material_response_is_verified_by_rm_and_satisfies_exact_waiter(
+def test_material_capable_wait_does_not_open_an_automatic_human_request(
     tmp_path: Path,
 ) -> None:
     provider = RecordingAcquisitionProvider()
@@ -2617,76 +2530,16 @@ def test_accepted_material_response_is_verified_by_rm_and_satisfies_exact_waiter
         assert runtime.owners.agent_runtime.acquire_literature(
             session_ref, request, provider
         ).status == "waiting_user"
-        human_request = _current_acquisition_human_request(
-            runtime, session_ref, request.request_id
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-        intake = runtime.owners.research_memory.submit_asset_intake(
-            AssetIntakeRequest(
-                source_kind="file",
-                custody_mode="managed",
-                display_name="lawful-copy.pdf",
-                media_type="application/pdf",
-                content=b"%PDF-1.7\naccepted lawful copy\n",
-                provenance={
-                    "submitted_via": "human_request_response",
-                    "human_request_ref": human_request["request_ref"],
-                },
-                asynchronous=False,
-            ),
-            idempotency_key="provided-material-intake",
-        )
-        assert intake.status == "accepted"
-        assert intake.asset is not None
-        asset = intake.asset
-        response = runtime.owners.human_collaboration.respond_to_human_request(
-            human_request["request_ref"],
-            decision="provided",
-            facts={
-                "acquisition_paper_id": "paper:waiting",
-                "material_source_ref": asset.memory_ref,
-                "material_version_ref": asset.version_ref,
-                "material_content_hash": asset.content_hash,
-                "material_manifest_hash": asset.manifest_hash,
-                "material_acceptance_receipt_ref": asset.receipt.receipt_ref,
-            },
-            note="Use this accepted copy for the exact blocked item.",
-            idempotency_key="provided-material-response",
-        )
-        current = runtime.owners.agent_runtime.query_human_request(
-            human_request["request_ref"]
-        )
-        assert current is not None
-        assert current["status"] == "satisfied"
-        assert current["evaluation"]["response_refs"] == [
-            response["response_ref"]
-        ]
-        assert current["evaluation"]["reason"] == {
-            "code": "accepted_material_bound"
-        }
-        assert current["direct_waiters"][0]["status"] == "released"
-
-        resumed = runtime.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert resumed.status == "obtained"
         assert len(provider.batches) == 1
-        result = resumed.results[0]
-        assert result.paper_id == "paper:waiting"
-        assert result.status == "obtained"
-        assert result.format == "pdf"
-        assert result.path is not None
-        assert Path(result.path).read_bytes() == b"%PDF-1.7\naccepted lawful copy\n"
-        consumed = runtime.owners.agent_runtime.query_human_request(
-            human_request["request_ref"]
-        )
-        assert consumed is not None
-        assert consumed["direct_waiters"][0]["status"] == "consumed"
     finally:
         client.close()
         runtime.close()
 
 
-def test_two_waiting_items_resume_independently_with_exact_material_and_restart(
+def test_two_waiting_items_do_not_open_automatic_human_requests(
     tmp_path: Path,
 ) -> None:
     provider = AllWaitingAcquisitionProvider()
@@ -2728,103 +2581,21 @@ def test_two_waiting_items_resume_independently_with_exact_material_and_restart(
         human_requests = _current_acquisition_human_requests(
             runtime, session_ref, request.request_id
         )
-        assert {
-            item["target_assertion"]["acquisition_paper_id"]
-            for item in human_requests
-        } == {"paper:first", "paper:second"}
-        assert all(len(item["direct_waiters"]) == 1 for item in human_requests)
-        first_request = next(
-            item
-            for item in human_requests
-            if item["target_assertion"]["acquisition_paper_id"] == "paper:first"
+        assert human_requests == []
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-        second_request = next(
-            item
-            for item in human_requests
-            if item["target_assertion"]["acquisition_paper_id"] == "paper:second"
-        )
-        _respond_with_accepted_material(
-            runtime,
-            first_request,
-            paper_id="paper:first",
-            key="provided-material-first",
-            content=b"%PDF-1.7\nfirst exact copy\n",
-        )
-        before_resume = _current_acquisition_human_requests(
-            runtime, session_ref, request.request_id
-        )
-        assert next(
-            item
-            for item in before_resume
-            if item["request_ref"] == first_request["request_ref"]
-        )["direct_waiters"][0]["status"] == "released"
-        assert next(
-            item
-            for item in before_resume
-            if item["request_ref"] == second_request["request_ref"]
-        )["direct_waiters"][0]["status"] == "blocked"
-
-        partial = runtime.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert partial.status == "waiting_user"
-        assert [item.status for item in partial.results] == [
-            "obtained",
+        assert [item.status for item in first.results] == [
+            "waiting_user",
             "waiting_user",
         ]
         assert len(provider.batches) == 1
-        after_partial = _current_acquisition_human_requests(
-            runtime, session_ref, request.request_id
-        )
-        assert next(
-            item
-            for item in after_partial
-            if item["request_ref"] == first_request["request_ref"]
-        )["direct_waiters"][0]["status"] == "consumed"
-        remaining = next(
-            item
-            for item in after_partial
-            if item["target_assertion"]["acquisition_paper_id"] == "paper:second"
-            and item["status"] == "open"
-        )
-        remaining_ref = remaining["request_ref"]
     finally:
         client.close()
         runtime.close()
 
-    restarted = build_production_runtime(
-        data_root,
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
-    try:
-        remaining = restarted.owners.agent_runtime.query_human_request(remaining_ref)
-        assert remaining is not None
-        assert remaining["direct_waiters"][0]["status"] == "blocked"
-        _respond_with_accepted_material(
-            restarted,
-            remaining,
-            paper_id="paper:second",
-            key="provided-material-second",
-            content=b"%PDF-1.7\nsecond exact copy\n",
-        )
-        completed = restarted.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert completed.status == "obtained"
-        assert len(provider.batches) == 1
-        assert [Path(item.path).read_bytes() for item in completed.results] == [
-            b"%PDF-1.7\nfirst exact copy\n",
-            b"%PDF-1.7\nsecond exact copy\n",
-        ]
-        consumed = restarted.owners.agent_runtime.query_human_request(remaining_ref)
-        assert consumed is not None
-        assert consumed["direct_waiters"][0]["status"] == "consumed"
-    finally:
-        restarted.close()
 
-
-def test_oa_only_resume_route_survives_unknown_outcome_and_restart(
+def test_oa_recovery_wait_does_not_open_an_automatic_human_request(
     tmp_path: Path,
 ) -> None:
     provider = CrashAfterOaResumeProvider()
@@ -2855,62 +2626,19 @@ def test_oa_only_resume_route_survives_unknown_outcome_and_restart(
         assert runtime.owners.agent_runtime.acquire_literature(
             session_ref, request, provider
         ).status == "waiting_user"
-        human_request = _current_acquisition_human_request(
-            runtime, session_ref, request.request_id
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-        runtime.owners.human_collaboration.respond_to_human_request(
-            human_request["request_ref"],
-            decision="provided",
-            facts={"route": "oa_only"},
-            note="Continue with OA only.",
-            idempotency_key="oa-route-crash-response",
-        )
-        with pytest.raises(KeyboardInterrupt):
-            runtime.owners.agent_runtime.acquire_literature(
-                session_ref, request, provider
-            )
-        with runtime._database.read() as connection:
-            route = connection.execute(
-                text(
-                    "SELECT effective_mode, route_json FROM "
-                    "ar_acquisition_resume_routes WHERE request_id = :request_id"
-                ),
-                {"request_id": request.request_id},
-            ).one()
-        assert route.effective_mode == "oa_only"
-        assert '"route":"oa_only"' in route.route_json
+        assert provider.acquire_calls == 1
+        assert provider.reconcile_calls == []
     finally:
         client.close()
         runtime.close()
 
-    restarted = build_production_runtime(
-        data_root,
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
-    try:
-        assert restarted.owners.agent_runtime.query_human_requests()[0][
-            "direct_waiters"
-        ][0]["status"] == "consumed"
-        recovered = restarted.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert recovered.status == "missing"
-        assert provider.acquire_calls == 2
-        assert len(provider.reconcile_calls) == 1
-        assert provider.reconcile_calls[0].session_mode == "oa_only"
-        assert provider.reconcile_calls[0].browser_context_ref is None
-        assert len(restarted.owners.agent_runtime.query_human_requests()) == 1
-    finally:
-        restarted.close()
 
-
-def test_accepted_material_route_recovers_after_consumption_without_provider_replay(
+def test_material_recovery_wait_does_not_open_an_automatic_human_request(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import meta_research.owners.agent_runtime as agent_runtime_module
-
     provider = RecordingAcquisitionProvider()
     data_root = prepare_data_root(tmp_path / "material-route-crash")
     runtime = build_production_runtime(
@@ -2935,82 +2663,17 @@ def test_accepted_material_route_recovers_after_consumption_without_provider_rep
             ),
         ),
     )
-    original_validate = agent_runtime_module.validate_item_results
-    crash_once = True
-
-    def crash_after_consumption(batch_request, results):
-        nonlocal crash_once
-        if crash_once and any(item.status == "obtained" for item in results):
-            crash_once = False
-            raise KeyboardInterrupt("crash before accepted material finalization")
-        return original_validate(batch_request, results)
-
     try:
         assert runtime.owners.agent_runtime.acquire_literature(
             session_ref, request, provider
         ).status == "waiting_user"
-        human_request = _current_acquisition_human_request(
-            runtime, session_ref, request.request_id
+        _assert_waiting_without_automatic_human_request(
+            runtime, session_ref=session_ref, request_id=request.request_id
         )
-        intake = runtime.owners.research_memory.submit_asset_intake(
-            AssetIntakeRequest(
-                source_kind="file",
-                custody_mode="managed",
-                display_name="recovery-copy.pdf",
-                media_type="application/pdf",
-                content=b"%PDF-1.7\nrecovery copy\n",
-                provenance={"human_request_ref": human_request["request_ref"]},
-                asynchronous=False,
-            ),
-            idempotency_key="material-route-crash-intake",
-        )
-        assert intake.asset is not None
-        asset = intake.asset
-        runtime.owners.human_collaboration.respond_to_human_request(
-            human_request["request_ref"],
-            decision="provided",
-            facts={
-                "acquisition_paper_id": "paper:waiting",
-                "material_source_ref": asset.memory_ref,
-                "material_version_ref": asset.version_ref,
-                "material_content_hash": asset.content_hash,
-                "material_manifest_hash": asset.manifest_hash,
-                "material_acceptance_receipt_ref": asset.receipt.receipt_ref,
-            },
-            note="Use the accepted exact copy.",
-            idempotency_key="material-route-crash-response",
-        )
-        monkeypatch.setattr(
-            agent_runtime_module, "validate_item_results", crash_after_consumption
-        )
-        with pytest.raises(KeyboardInterrupt):
-            runtime.owners.agent_runtime.acquire_literature(
-                session_ref, request, provider
-            )
+        assert len(provider.batches) == 1
     finally:
         client.close()
         runtime.close()
-
-    restarted = build_production_runtime(
-        data_root,
-        acquisition_provider=provider,
-        host_compute_probe=NoCompute(),
-    )
-    try:
-        recovered = restarted.owners.agent_runtime.acquire_literature(
-            session_ref, request, provider
-        )
-        assert recovered.status == "obtained"
-        assert len(provider.batches) == 1
-        assert recovered.results[0].path is not None
-        assert Path(recovered.results[0].path).read_bytes() == (
-            b"%PDF-1.7\nrecovery copy\n"
-        )
-        requests = restarted.owners.agent_runtime.query_human_requests()
-        assert len(requests) == 1
-        assert requests[0]["direct_waiters"][0]["status"] == "consumed"
-    finally:
-        restarted.close()
 
 
 def test_deepfetch_requires_a_current_ready_acquisition_session(
@@ -3113,7 +2776,7 @@ def test_deepfetch_requires_a_current_ready_acquisition_session(
         runtime.close()
 
 
-def test_deepfetch_waits_for_login_then_replays_the_same_hosted_batch(
+def test_deepfetch_waits_without_an_automatic_acquisition_human_request(
     tmp_path: Path,
 ) -> None:
     acquisition_provider = RecordingAcquisitionProvider()
@@ -3212,89 +2875,11 @@ def test_deepfetch_waits_for_login_then_replays_the_same_hosted_batch(
         collaboration = client.get("/api/v1/snapshot").json()[
             "human_collaboration"
         ]
-        library_requests = [
-            item
-            for item in collaboration["human_requests"]["items"]
-            if item["issuer"] == "agent_runtime"
-            and item["kind"] == "library_reconnect"
-            and item["target_assertion"].get("session_ref") == session_ref
-            and item["target_assertion"].get("acquisition_request_id")
-            == "deepfetch-exact-batch-1"
-        ]
-        assert len(library_requests) == 1
-        library_request = library_requests[0]
-        assert library_request["status"] == "open"
-        assert library_request["evaluation"] is None
-        assert library_request["disposition"] is None
-        assert library_request["direct_waiters"][0]["status"] == "blocked"
-
-        responded = client.post(
-            "/api/v1/human-requests/"
-            f"{library_request['request_ref']}/responses",
-            headers=_write_headers(write_headers, "waiting-login-response"),
-            json={
-                "decision": "provided",
-                "facts": {"route": "institutional_browser_reconnected"},
-                "note": "The existing controlled browser login was restored.",
-            },
-        )
-        responded.raise_for_status()
-        responded_only = runtime.owners.agent_runtime.query_human_request(
-            library_request["request_ref"]
-        )
-        assert responded_only is not None
-        assert len(responded_only["responses"]) == 1
-        assert responded_only["evaluation"]["decision"] == "satisfied"
-        assert responded_only["disposition"]["decision"] == "satisfied"
-        assert responded_only["direct_waiters"][0]["status"] == "released"
-
-        resumed_session = runtime.owners.agent_runtime.query_acquisition_session(
-            session_ref=session_ref
-        )
-        assert resumed_session is not None
-        assert resumed_session.session_ref == session_ref
-        assert resumed_session.status == "ready"
-
-        released = runtime.owners.agent_runtime.query_human_request(
-            library_request["request_ref"]
-        )
-        assert released is not None
-        assert released["evaluation"]["decision"] == "satisfied"
-        assert released["disposition"]["decision"] == "satisfied"
-        assert released["direct_waiters"][0]["status"] == "released"
-
-        assert runtime.deepfetch.process_once() is True
-        consumed = runtime.owners.agent_runtime.query_human_request(
-            library_request["request_ref"]
-        )
-        assert consumed is not None
-        consumed_waiter = consumed["direct_waiters"][0]
-        assert consumed_waiter["status"] == "consumed"
-        assert consumed_waiter["resume_validation"]["started_work"] is True
-        assert consumed_waiter["resume_validation"]["consumption"][
-            "work_ref"
-        ].startswith("acquisition_item:")
-        assert consumed_waiter["resume_validation"]["consumption"]["receipt"][
-            "kind"
-        ] == "human_request_resume_consumption"
-        completed = client.get(
-            f"/api/v1/quest-initializations/{initialization_id}"
-        ).json()
-        assert completed["deepfetch"]["status"] == "succeeded"
-        assert completed["deepfetch"]["failure"] is None
-        assert [batch.request_id for batch in acquisition_provider.batches] == [
-            "deepfetch-exact-batch-1",
-            "deepfetch-exact-batch-1",
-        ]
-        assert acquisition_provider.batches[0].identity_payload() == (
-            acquisition_provider.batches[1].identity_payload()
-        )
-        assert len(deepfetch_provider.requests) == 2
-        assert deepfetch_provider.requests[1].native_session_ref == (
-            "native-acquisition-recovery-1"
-        )
-        assert deepfetch_provider.requests[0].job_ref == (
-            deepfetch_provider.requests[1].job_ref
+        assert collaboration["human_requests"]["items"] == []
+        _assert_waiting_without_automatic_human_request(
+            runtime,
+            session_ref=session_ref,
+            request_id="deepfetch-exact-batch-1",
         )
     finally:
         client.close()

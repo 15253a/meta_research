@@ -8,12 +8,13 @@ from typing import Callable, Literal
 
 from meta_research import __version__
 from meta_research.owners.common import canonical_hash, new_ref
+from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS = (
-    "agent_runtime.human_request.open",
-    "agent_runtime.human_request.open.reconcile",
+    "human_request.open",
+    "human_request.open.reconcile",
 )
 
 
@@ -30,15 +31,42 @@ class SemanticCallContext:
     root_session_ref: str
     fence_ref: str
     capability_binding_hash: str
+    root_kind: RootAgentKind | None
+    phase: str
+    operation_id: str
 
     def effect_key(self, effect_id: str) -> str:
+        if not effect_id or len(effect_id) > 128:
+            raise SemanticMcpError("semantic_effect_id_invalid")
+        operation_id = self.operation_id
+        for suffix in (".reconcile", ".observe", ".submit"):
+            operation_id = operation_id.removesuffix(suffix)
+        return "mcp-effect:" + canonical_hash(
+            {
+                "run_ref": self.run_ref,
+                "attempt_ref": self.attempt_ref,
+                "root_session_ref": self.root_session_ref,
+                "fence_ref": self.fence_ref,
+                "capability_binding_hash": self.capability_binding_hash,
+                "root_kind": self.root_kind,
+                "phase": self.phase,
+                "operation_id": operation_id,
+                "effect_id": effect_id,
+            }
+        )
+
+    def human_request_effect_key(self, effect_id: str) -> str:
+        """Bind one HumanRequest effect to the logical task across recovery Attempts."""
+
         if not effect_id or len(effect_id) > 128:
             raise SemanticMcpError("semantic_effect_id_invalid")
         return "mcp-effect:" + canonical_hash(
             {
                 "run_ref": self.run_ref,
-                "attempt_ref": self.attempt_ref,
-                "fence_ref": self.fence_ref,
+                "root_session_ref": self.root_session_ref,
+                "root_kind": self.root_kind,
+                "phase": self.phase,
+                "operation_family": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
                 "effect_id": effect_id,
             }
         )
@@ -95,6 +123,8 @@ class ResidentMcpBinding:
     health_receipt_ref: str
     connection_grant_ref: str
     operation_bindings: tuple[dict[str, object], ...]
+    root_kind: RootAgentKind | None
+    phase: str
     deployment_profile: str = "local_resident_streamable_http"
     transport: str = "streamable_http"
     protocol_version: str = MCP_PROTOCOL_VERSION
@@ -111,6 +141,8 @@ class ResidentMcpBinding:
             "health_receipt_ref": self.health_receipt_ref,
             "operation_bindings": list(self.operation_bindings),
             "connection_grant_ref": self.connection_grant_ref,
+            "root_kind": self.root_kind,
+            "phase": self.phase,
         }
 
 
@@ -123,6 +155,8 @@ class _ChannelGrant:
     fence_ref: str
     capability_binding_hash: str
     operation_ids: tuple[str, ...]
+    root_kind: RootAgentKind | None
+    phase: str
 
 
 class SemanticMcpGateway:
@@ -197,6 +231,8 @@ class SemanticMcpGateway:
         fence_ref: str,
         capability_binding_hash: str,
         operation_ids: tuple[str, ...],
+        root_kind: RootAgentKind | None,
+        phase: str,
     ) -> tuple[McpConnection, ResidentMcpBinding]:
         if (
             not run_ref
@@ -206,6 +242,10 @@ class SemanticMcpGateway:
             or len(capability_binding_hash) != 64
             or not operation_ids
             or len(operation_ids) != len(set(operation_ids))
+            or (root_kind is not None and root_kind not in ROOT_AGENT_KINDS)
+            or not isinstance(phase, str)
+            or not phase
+            or len(phase) > 128
         ):
             raise SemanticMcpError("mcp_channel_scope_invalid")
         self.required_bindings(operation_ids)
@@ -219,6 +259,8 @@ class SemanticMcpGateway:
             fence_ref=fence_ref,
             capability_binding_hash=capability_binding_hash,
             operation_ids=operation_ids,
+            root_kind=root_kind,
+            phase=phase,
         )
         self._grants[_token_hash(token)] = grant
         bindings = tuple(self._operations[item].binding() for item in operation_ids)
@@ -232,6 +274,8 @@ class SemanticMcpGateway:
                 health_receipt_ref=self._health_receipt_ref,
                 connection_grant_ref=grant_ref,
                 operation_bindings=bindings,
+                root_kind=root_kind,
+                phase=phase,
             ),
         )
 
@@ -317,6 +361,9 @@ class SemanticMcpGateway:
                 root_session_ref=grant.root_session_ref,
                 fence_ref=grant.fence_ref,
                 capability_binding_hash=grant.capability_binding_hash,
+                root_kind=grant.root_kind,
+                phase=grant.phase,
+                operation_id=operation_id,
             )
             result = operation.handler(context, arguments)
         except SemanticMcpError as error:

@@ -394,6 +394,75 @@ def test_snapshot_survives_more_than_101_current_terminal_human_requests(
         runtime.close()
 
 
+def test_snapshot_restores_prefixed_human_request_authorization_progress(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "human-request-command-projection")
+    human = runtime.owners.human_collaboration
+    try:
+        request = _open_request(
+            runtime.owners.advancement_engine,
+            request_kind="capability_authorization",
+            waiter_ref="stage-transition-prefixed-command",
+            wait_scope="local",
+            other_blockers=(),
+            idempotency_key="web-open-prefixed-command",
+        )
+        requirement = request["required_authorization"]
+        scope_ref = f"human_request:{request['request_ref']}"
+        command = human.create_command_draft(
+            scope_ref,
+            {
+                "command_kind": "capability_authorization",
+                "payload": {
+                    "capability": requirement["capability"],
+                    "decision": "granted",
+                    "scope": requirement["scope"],
+                },
+            },
+            "prefixed-command-draft",
+        )
+        preview = human.preview_command(
+            command["intent_id"],
+            command["draft_revision"],
+            command["draft_hash"],
+            "prefixed-command-preview",
+        )["impact_preview"]
+        confirmed = human.confirm_command(
+            command["intent_id"],
+            command["draft_revision"],
+            command["draft_hash"],
+            preview["preview_ref"],
+            preview["preview_hash"],
+            "prefixed-command-confirmation",
+        )
+        authorization = human.decide_capability_authorization(
+            scope_ref,
+            {
+                "capability": requirement["capability"],
+                "decision": "granted",
+                "scope": requirement["scope"],
+                "confirmation_receipt_ref": confirmed[
+                    "confirmation_receipt"
+                ]["receipt_ref"],
+            },
+            "prefixed-command-authorization",
+        )
+
+        collaboration = runtime.projection.query_snapshot()[
+            "human_collaboration"
+        ]
+        assert [
+            item["intent_id"] for item in collaboration["commands"]["items"]
+        ] == [command["intent_id"]]
+        assert [
+            item["authorization_ref"]
+            for item in collaboration["commands"]["authorizations"]
+        ] == [authorization["authorization_ref"]]
+    finally:
+        runtime.close()
+
+
 def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
     tmp_path: Path,
 ) -> None:

@@ -2185,6 +2185,27 @@ export type HumanRequestImpactPreview = {
   stale_conditions?: string[];
 };
 
+export type HumanRequestOperationBinding = {
+  quest_ref: string | null;
+  task_ref: string;
+  root_session_ref: string;
+  operation_id: string;
+  attempt_ref: string;
+  generation: number;
+  request_owner: string;
+  [key: string]: unknown;
+};
+
+export type HumanRequestOpenEffect = {
+  effect_id: string;
+  operation_binding: HumanRequestOperationBinding;
+  waiter_ref?: string;
+  receipt: AssetReceipt & { status?: string };
+  task_yield?: Record<string, unknown> | null;
+  yield?: Record<string, unknown> | null;
+  [key: string]: unknown;
+};
+
 export type HumanRequestItem = {
   request_ref: string;
   request_id: string;
@@ -2196,7 +2217,14 @@ export type HumanRequestItem = {
     | "external_material_api_access"
     | "offline_action"
     | "capability_authorization";
-  status: "open" | "satisfied" | "declined" | "withdrawn" | "expired" | "superseded";
+  status:
+    | "open"
+    | "satisfied"
+    | "unsatisfied"
+    | "declined"
+    | "withdrawn"
+    | "expired"
+    | "superseded";
   obligation: string;
   business_purpose?: string;
   target_assertion?: Record<string, unknown>;
@@ -2205,8 +2233,12 @@ export type HumanRequestItem = {
   impact_preview?: HumanRequestImpactPreview | null;
   direct_waiters?: HumanRequestWaiter[];
   responses?: Array<Record<string, unknown>>;
+  response_rejections?: Array<Record<string, unknown>>;
   evaluation?: Record<string, unknown> | null;
   disposition?: Record<string, unknown> | null;
+  open_effect?: HumanRequestOpenEffect | null;
+  predecessor_request_ref?: string | null;
+  successor_request_ref?: string | null;
 };
 
 export type HumanRequestResponseBody = {

@@ -96,6 +96,7 @@ class AcquisitionBatchRequest:
     browser_context_ref: str | None = None
     provider_state_dir: str = ""
     target_dir: str = ""
+    root_runtime_scope: dict[str, object] | None = None
 
     def bind_to_session(
         self,

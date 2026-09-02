@@ -266,7 +266,16 @@ class ProductionRuntime:
     _database: Database
     _telemetry_exporter_factory: Callable[[str], TelemetryExporter]
     _provider_lifecycles: tuple[object, ...] = ()
+    _resident_mcp_providers: tuple[object, ...] = ()
     _stop_requested: bool = False
+
+    def configure_resident_mcp_endpoint(self, base_url: str) -> None:
+        for provider in self._resident_mcp_providers:
+            configure = getattr(
+                provider, "configure_resident_mcp_endpoint", None
+            )
+            if callable(configure):
+                configure(base_url)
 
     def request_stop(self) -> None:
         if self._stop_requested:
@@ -895,6 +904,10 @@ def build_production_runtime(
     owners.research_graph.bind_target_execution_closure_verifier(
         target_run_agent
     )
+    # Human Responses commit independently of their issuing Owner disposition.
+    # Replay only after every proof/scope verifier has been bound.
+    owners.agent_runtime.recover_root_human_requests()
+    owners.human_collaboration.recover_root_library_reconnect_responses()
     semantic_gateway = create_semantic_owner_gateway(
         research_graph=owners.research_graph,
         advancement_engine=owners.advancement_engine,
@@ -962,6 +975,24 @@ def build_production_runtime(
     )
     if callable(bind_reasoning_conformance):
         bind_reasoning_conformance(harnesses)
+    resident_mcp_providers: list[object] = []
+    for provider in (
+        proposal_drafter,
+        intent_drafting_provider,
+        idea_skill_provider,
+        plan_skill_provider,
+        deepfetch_provider,
+        acquisition_provider,
+        writing_skill_provider,
+    ):
+        if any(provider is bound for bound in resident_mcp_providers):
+            continue
+        bind_resident_mcp = getattr(
+            provider, "bind_resident_mcp_authority", None
+        )
+        if callable(bind_resident_mcp):
+            bind_resident_mcp(harnesses)
+            resident_mcp_providers.append(provider)
     verify_bundle_exhaustion_trace = getattr(
         bundle_skill_provider,
         "verify_bundle_exhaustion_review_trace",
@@ -1116,6 +1147,7 @@ def build_production_runtime(
             or (lambda endpoint: OtlpHttpTelemetryExporter(endpoint=endpoint))
         ),
         _provider_lifecycles=tuple(provider_lifecycles),
+        _resident_mcp_providers=tuple(resident_mcp_providers),
     )
     runtime.reconcile_telemetry_authorization()
     return runtime

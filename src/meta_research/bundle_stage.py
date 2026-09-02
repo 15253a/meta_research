@@ -2293,8 +2293,23 @@ class BundleStageWorker:
             if run.primary_draft is None
             else run.review_invocation
         )
-        job_ref = invocation.operation_ref
-        unit_ref = invocation.invocation_ref
+        phase = "primary" if run.primary_draft is None else "review"
+        base_job_ref = invocation.operation_ref
+        job_ref = self._agent_runtime.root_provider_continuation_job_ref(
+            root_kind="bundle",
+            phase=phase,
+            run_ref=run.run_ref,
+            root_session_ref=run.root_session_ref,
+            base_job_ref=base_job_ref,
+        )
+        unit_ref = (
+            invocation.invocation_ref
+            if job_ref == base_job_ref
+            else "provider_unit_"
+            + canonical_hash(
+                {"invocation_ref": invocation.invocation_ref, "job_ref": job_ref}
+            )[:64]
+        )
         predecessor_rejections = (
             self._agent_runtime.query_bundle_exhaustion_rejected_submissions(
                 run_ref=run.run_ref,
@@ -2353,6 +2368,21 @@ class BundleStageWorker:
                     draft = self._provider.generate_draft(skill_request)
                     draft_hash = validate_bundle_skill_draft(skill_request, draft)
                 except BundleSkillUnavailable as error:
+                    if (
+                        error.native_session_ref is not None
+                        and self._agent_runtime.park_root_provider_session_for_human_request(
+                            root_kind="bundle",
+                            phase="primary",
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            native_session_ref=error.native_session_ref,
+                            runtime_binding_hash=run.runtime_binding_hash,
+                        )
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return True
                     if error.rejected_candidate is not None:
                         if (
                             error.rejected_native_session_ref is None
@@ -2391,6 +2421,18 @@ class BundleStageWorker:
                     if draft is None:
                         self._transient_error = str(error)
                         return False
+                    if self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="bundle",
+                        phase="primary",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=draft.primary_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return True
                     failure_code = "bundle_primary_result_contract_invalid"
                     self._reject_completion_candidate(
                         unit_ref=unit_ref,
@@ -2407,18 +2449,25 @@ class BundleStageWorker:
                 except BundleSkillContractError as error:
                     self._transient_error = str(error)
                     return False
-                checkpoint = self._agent_runtime.record_bundle_primary_draft(
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    native_session_ref=draft.primary_session_ref,
-                    runtime_binding=run.runtime_binding,
-                    draft=draft.draft,
-                    adapter_kind=draft.adapter_kind,
-                    idempotency_key=_operation_key(
-                        "bundle-primary", run.run_ref, run.attempt_ref, draft_hash
-                    ),
-                )
+                try:
+                    checkpoint = self._agent_runtime.record_bundle_primary_draft(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=draft.primary_session_ref,
+                        runtime_binding=run.runtime_binding,
+                        draft=draft.draft,
+                        adapter_kind=draft.adapter_kind,
+                        idempotency_key=_operation_key(
+                            "bundle-primary", run.run_ref, run.attempt_ref, draft_hash
+                        ),
+                    )
+                except OwnerConflict as error:
+                    if error.code != "runtime_run_suspended":
+                        raise
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return True
                 if checkpoint.draft_hash != draft_hash:
                     raise OwnerConflict("bundle_primary_draft_hash_mismatch")
                 self._transient_error = None
@@ -2466,6 +2515,24 @@ class BundleStageWorker:
                         result,
                     )
                 except BundleSkillUnavailable as error:
+                    review_session_ref = (
+                        error.native_session_ref or run.native_session_ref
+                    )
+                    if (
+                        review_session_ref is not None
+                        and self._agent_runtime.park_root_provider_session_for_human_request(
+                            root_kind="bundle",
+                            phase="review",
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            native_session_ref=review_session_ref,
+                            runtime_binding_hash=run.runtime_binding_hash,
+                        )
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return True
                     if error.rejected_candidate is not None:
                         if (
                             error.rejected_native_session_ref is None
@@ -2504,6 +2571,18 @@ class BundleStageWorker:
                     if result is None:
                         self._transient_error = str(error)
                         return False
+                    if self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="bundle",
+                        phase="review",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=result.primary_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return True
                     failure_code = "bundle_review_result_contract_invalid"
                     self._reject_completion_candidate(
                         unit_ref=unit_ref,
@@ -2520,6 +2599,18 @@ class BundleStageWorker:
                 except BundleSkillContractError as error:
                     self._transient_error = str(error)
                     return False
+                if self._agent_runtime.park_root_provider_session_for_human_request(
+                    root_kind="bundle",
+                    phase="review",
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=result.primary_session_ref,
+                    runtime_binding_hash=run.runtime_binding_hash,
+                ):
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return True
                 self._accept_exhaustion_review(
                     request=request,
                     run=run,
@@ -2666,7 +2757,7 @@ class BundleStageWorker:
         if (
             run.attempt_generation != 1
             and run.technical_predecessor_attempt_ref is None
-        ) or ((run.native_session_ref is None) != (run.primary_draft is None)):
+        ) or (run.primary_draft is not None and run.native_session_ref is None):
             raise OwnerConflict("attempt_lineage_invalid")
         return None, None, None, ()
 
@@ -2942,15 +3033,17 @@ class BundleStageWorker:
             return False
         return True
 
-    def _finish_bundle_jobs(self, run: BundleStageRun) -> None:
+    def _finish_provider_job(self, job_ref: str) -> None:
         finish_job = getattr(self._provider, "finish_job", None)
-        if not callable(finish_job):
-            return
+        if callable(finish_job):
+            finish_job(job_ref)
+
+    def _finish_bundle_jobs(self, run: BundleStageRun) -> None:
         for job_ref in {
             run.primary_invocation.operation_ref,
             run.review_invocation.operation_ref,
         }:
-            finish_job(job_ref)
+            self._finish_provider_job(job_ref)
 
     def _discover_current_cycle(self) -> _CurrentCycle | None:
         active: list[_CurrentCycle] = []

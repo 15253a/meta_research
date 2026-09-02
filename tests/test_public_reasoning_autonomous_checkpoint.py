@@ -21,6 +21,9 @@ from meta_research.reasoning_contract import (
     REASONING_REVIEW_SCHEMA_REF,
     SCIENTIFIC_OUTCOME_SCHEMA_REF,
 )
+from meta_research.semantic_owner_gateway import (
+    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+)
 
 from test_public_plan_stage import (
     _DeterministicIdeaSkill,
@@ -432,6 +435,155 @@ def test_reasoning_autonomous_checkpoint_is_current_durable_and_non_terminal(
             )
             == checkpoint
         )
+    finally:
+        runtime.close()
+
+
+def test_reasoning_autonomous_resume_parks_the_exact_human_request_session(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(
+        tmp_path / "reasoning-autonomous-human-request",
+        idea_skill=_DeterministicIdeaSkill(no_viable=True),
+        plan_skill=_DeterministicPlanSkill(no_gap=False),
+    )
+    owner = runtime.owners.agent_runtime
+    try:
+        quest = _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        question = runtime.owners.research_graph.query_question_by_ref(
+            str(quest["question_ref"])
+        )
+        assert question is not None
+        request = runtime.owners.advancement_engine.ensure_reasoning_stage_request(
+            cycle_ref=str(quest["cycle_ref"]),
+            accepted_question=question.as_binding(),
+            idempotency_key="reasoning-autonomous-human-request",
+        )
+        binding = _runtime_binding()
+        run = owner.admit_reasoning_stage(
+            request,
+            "reasoning-autonomous-human-request-admit",
+            runtime_binding=binding,
+        )
+        primary_checkpoint = _checkpoint(
+            request,
+            question_title="Compare the cross-domain limit.",
+        )
+        reviewed_checkpoint = _checkpoint(
+            request,
+            question_title="Bound the cross-domain preservation limit.",
+        )
+        primary = owner.record_reasoning_primary_draft(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            native_session_ref="native-reasoning-human-request:1",
+            runtime_binding=binding,
+            draft=primary_checkpoint,
+            adapter_kind="test_deterministic",
+            idempotency_key="reasoning-autonomous-human-request-primary",
+        )
+        owner.record_reasoning_autonomous_checkpoint(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            native_session_ref=primary.native_session_ref,
+            runtime_binding=binding,
+            checkpoint=reviewed_checkpoint,
+            review=_review(primary_checkpoint, reviewed_checkpoint),
+            idempotency_key="reasoning-autonomous-human-request-checkpoint",
+        )
+        current = owner.query_reasoning_stage_run(request.request_ref)
+        assert current is not None
+        invocation = current.review_invocation
+        owner.begin_provider_unit(
+            unit_ref=invocation.invocation_ref,
+            operation_ref=invocation.operation_ref,
+            run_ref=current.run_ref,
+            attempt_ref=current.attempt_ref,
+            fence_ref=current.fence_ref,
+            unit_kind="reasoning_review",
+        )
+        operation_binding = {
+            "quest_ref": request.accepted_question.quest_ref,
+            "task_ref": current.run_ref,
+            "root_session_ref": current.root_session_ref,
+            "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+            "attempt_ref": current.attempt_ref,
+            "generation": current.attempt_generation,
+            "request_owner": "agent_runtime",
+            "root_kind": "reasoning",
+            "phase": "autonomous-resume",
+            "fence_ref": current.fence_ref,
+            "runtime_binding_hash": current.runtime_binding_hash,
+        }
+        target = {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": "reasoning",
+                "run_ref": current.run_ref,
+                "attempt_ref": current.attempt_ref,
+                "root_session_ref": current.root_session_ref,
+                "fence_ref": current.fence_ref,
+                "waiter_generation": current.attempt_generation,
+            },
+            "condition": {
+                "operator_choice": "continue_without_optional_input"
+            },
+        }
+        opened = owner.open_human_request_effect(
+            effect_key="mcp-effect:reasoning-autonomous-human-request",
+            effect_id="reasoning-autonomous-human-request",
+            operation_binding=operation_binding,
+            predecessor_request_ref=None,
+            request_kind="offline_action",
+            obligation="Choose whether this reasoning run should continue.",
+            business_purpose="Resume only this exact autonomous reasoning run.",
+            target_assertion=target,
+            acceptance_conditions=("The operator records a disposition.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{current.run_ref}",
+                "generation": current.attempt_generation,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=request.accepted_question.quest_ref,
+        )
+
+        assert owner.park_root_provider_session_for_human_request(
+            root_kind="reasoning",
+            phase="autonomous-resume",
+            run_ref=current.run_ref,
+            attempt_ref=current.attempt_ref,
+            fence_ref=current.fence_ref,
+            native_session_ref=primary.native_session_ref,
+            runtime_binding_hash=current.runtime_binding_hash,
+        )
+        parked = owner.query_reasoning_stage_run(request.request_ref)
+        assert parked is not None
+        assert parked.native_session_ref == primary.native_session_ref
+        assert parked.execution is None
+        assert owner.query_managed_run(current.run_ref)["status"] == "suspended"
+
+        runtime.owners.human_collaboration.respond_to_human_request(
+            str(opened["request_ref"]),
+            decision="deferred",
+            facts={},
+            note="Continue without this optional input.",
+            idempotency_key="reasoning-autonomous-human-request-response",
+        )
+        continuation_job_ref = owner.root_provider_continuation_job_ref(
+            root_kind="reasoning",
+            phase="autonomous-resume",
+            run_ref=current.run_ref,
+            root_session_ref=current.root_session_ref,
+            base_job_ref=invocation.operation_ref,
+        )
+        assert continuation_job_ref != invocation.operation_ref
+        assert continuation_job_ref.startswith("root_hr_continuation_")
+        assert owner.query_managed_run(current.run_ref)["status"] == "running"
     finally:
         runtime.close()
 

@@ -1104,8 +1104,8 @@ export function QuestionTree({
                     {!controlsInert && relatedHumanRequestCount(item) ? (
                       <i
                         className="question-node-human-request"
-                        aria-label={`关联 ${relatedHumanRequestCount(item)} 个 HumanRequest`}
-                        title={`关联 ${relatedHumanRequestCount(item)} 个 HumanRequest`}
+                        aria-label={`关联 ${relatedHumanRequestCount(item)} 个需人工处理事项`}
+                        title={`关联 ${relatedHumanRequestCount(item)} 个需人工处理事项`}
                       />
                     ) : null}
                     <button
@@ -1185,9 +1185,9 @@ export function QuestionTree({
             <span><i aria-hidden="true" /> 实线：RG 父子拓扑</span>
             <span><i className="selected" aria-hidden="true" /> 紫色光晕：本地选中</span>
             {controlsInert ? (
-              <span><i className="human" aria-hidden="true" /> 珊瑚点：Projection 未提供关联 HumanRequest</span>
+              <span><i className="human" aria-hidden="true" /> 珊瑚点：当前未显示关联的人工处理事项</span>
             ) : (
-              <span><i className="human" aria-hidden="true" /> 珊瑚点：Projection 提供的关联 HumanRequest</span>
+              <span><i className="human" aria-hidden="true" /> 珊瑚点：关联的人工处理事项</span>
             )}
             <span>{controlsInert
               ? "悬停节点：左侧剪裁（typed disabled）· 右侧新建子问题"

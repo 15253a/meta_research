@@ -17,6 +17,7 @@ from typing import Protocol, cast
 from meta_research.codex_runtime import CODEX_REASONING_EFFORT_BINDING
 from meta_research.idea_skill import (
     CodexIdeaSkillAdapter,
+    IdeaSkillUnavailable,
     PROVIDER_RESULT_MAX_BYTES,
     PROVIDER_STREAM_MAX_BYTES,
     _DISABLED_CODEX_FEATURES,
@@ -77,9 +78,10 @@ _LEGACY_REPORT_LOAD_LOCK = threading.Lock()
 class WritingSkillUnavailable(RuntimeError):
     """The production Writing Skill Adapter could not return a valid result."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, native_session_ref: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.native_session_ref = native_session_ref
 
 
 @dataclass(frozen=True)
@@ -278,9 +280,16 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
 
     def runtime_binding(self, document_type: str = "report") -> WritingRuntimeBinding:
         resources = _writing_skill_resources(document_type)
+        try:
+            resident_mcp_facts = self._resident_mcp_runtime_facts()
+        except IdeaSkillUnavailable as error:
+            raise WritingSkillUnavailable(error.code) from error
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_hash = _file_sha256(Path(__file__).resolve())
         shared_adapter_source_hash = _shared_codex_adapter_source_hash()
+        resident_mcp_source_hash = _file_sha256(
+            Path(__file__).with_name("root_resident_mcp.py").resolve()
+        )
         supervisor_hash = _file_sha256(
             Path(__file__).with_name("provider_supervisor.py").resolve()
         )
@@ -300,12 +309,13 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                     "skill_instructions": _writing_skill_instructions(document_type),
                     "adapter_source_hash": adapter_hash,
                     "shared_adapter_source_hash": shared_adapter_source_hash,
+                    "resident_mcp_source_hash": resident_mcp_source_hash,
                     "supervisor_source_hash": supervisor_hash,
                 }
             ),
             model_ref=self._model_ref,
             harness_adapter_ref=harness_ref,
-            mcp_bindings=(),
+            mcp_bindings=resident_mcp_facts.mcp_bindings,
             capability_bindings=merge_root_capability_bindings(
                 (
                     "approval-policy-never",
@@ -313,7 +323,11 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                     "environment-inheritance-none",
                     "filesystem-read-root-confined",
                     "user-config-loaded",
-                    "mcp-config-empty",
+                    *(
+                        ("mcp-config-empty",)
+                        if not resident_mcp_facts.mcp_bindings
+                        else resident_mcp_facts.capability_bindings
+                    ),
                     "native-session-resume",
                     "structured-output-json-schema",
                     "trusted-local-quest-authorization",
@@ -334,6 +348,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 f"adapter-source:meta_research.writing_skill@sha256:{adapter_hash}",
                 "adapter-source:meta_research.idea_skill@sha256:"
                 f"{shared_adapter_source_hash}",
+                "adapter-source:meta_research.root_resident_mcp@sha256:"
+                f"{resident_mcp_source_hash}",
                 "adapter-source:meta_research.provider_supervisor@sha256:"
                 f"{supervisor_hash}",
                 "disabled-codex-features:" + ",".join(_DISABLED_CODEX_FEATURES),
@@ -358,7 +374,8 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 "writing-run-limits:"
                 "revisions=unbounded;accumulated-output=unbounded;"
                 f"artifact-output={WRITING_MAX_OUTPUT_BYTES}",
-            ),
+            )
+            + resident_mcp_facts.resource_bindings,
         )
 
     def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
@@ -394,8 +411,16 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 f"feedback={canonical_json(list(request.feedback))}\n"
             )
         )
+        human_resume = (
+            ""
+            if request.native_session_ref is None
+            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
+            "human_request.open.reconcile，读取 resolution 后再判断"
+            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
+        )
         prompt = (
             f"{_writing_skill_instructions(request.document_type)}\n\n"
+            f"{human_resume}"
             f"你是 {request.document_type} Writing 根 Agent。只返回 markdown 与 citations。引用必须绑定"
             "冻结 Snapshot accepted_sources 中的 version_ref；不得生成 receipt，不得"
             "发布、发送、提交外部系统或推进 Quest Stage。"
@@ -405,29 +430,45 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             "accepted_source_manifest="
             f"{canonical_json(source_manifest)}"
         )
+        session_ref: str | None = None
         try:
-            output, session_ref, _stdout = self._invoke(
+            output, session_ref, _stdout = self._invoke_root_operation(
                 operation_name="writing-primary",
                 prompt=prompt,
                 schema=_draft_schema(),
                 native_session_ref=request.native_session_ref,
                 job_ref=request.job_ref,
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                runtime_binding=request.runtime_binding.as_dict(),
                 sandbox_read_root=source_root,
             )
+            if not isinstance(session_ref, str) or not session_ref:
+                raise WritingSkillUnavailable("writing_native_session_missing")
+            draft = WritingSkillDraft(
+                markdown=cast(str, output.get("markdown")),
+                citations=_citations(output.get("citations")),
+                primary_session_ref=session_ref,
+                adapter_kind="codex_cli",
+            )
+            validate_writing_skill_draft(request, draft)
         except Exception as error:
             if isinstance(error, WritingSkillUnavailable):
                 raise
             code = getattr(error, "code", "writing_provider_unavailable")
-            raise WritingSkillUnavailable(str(code)) from error
-        if not isinstance(session_ref, str) or not session_ref:
-            raise WritingSkillUnavailable("writing_native_session_missing")
-        draft = WritingSkillDraft(
-            markdown=cast(str, output.get("markdown")),
-            citations=_citations(output.get("citations")),
-            primary_session_ref=session_ref,
-            adapter_kind="codex_cli",
-        )
-        validate_writing_skill_draft(request, draft)
+            raise WritingSkillUnavailable(
+                str(code),
+                native_session_ref=(
+                    getattr(error, "native_session_ref", None)
+                    or (
+                        session_ref
+                        if isinstance(session_ref, str) and session_ref
+                        else None
+                    )
+                ),
+            ) from error
         return draft
 
     def _legacy_report_adapter_for(
@@ -521,17 +562,25 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             f"{advisory_prompt}"
         )
         try:
-            output, session_ref, _stdout = self._invoke(
+            output, session_ref, _stdout = self._invoke_root_operation(
                 operation_name="writing-review",
                 prompt=prompt,
                 schema=_review_schema(),
                 native_session_ref=draft.primary_session_ref,
                 job_ref=request.job_ref,
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                runtime_binding=request.runtime_binding.as_dict(),
                 sandbox_read_root=source_root,
             )
         except Exception as error:
             code = getattr(error, "code", "writing_provider_unavailable")
-            raise WritingSkillUnavailable(str(code)) from error
+            raise WritingSkillUnavailable(
+                str(code),
+                native_session_ref=getattr(error, "native_session_ref", None),
+            ) from error
         if session_ref != draft.primary_session_ref:
             raise WritingSkillUnavailable("writing_native_session_changed")
         result = WritingSkillResult(

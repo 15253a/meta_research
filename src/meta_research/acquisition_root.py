@@ -28,6 +28,7 @@ from meta_research.root_capabilities import merge_root_capability_bindings
 from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticRecorder,
 )
+from meta_research.root_resident_mcp import RootResidentMcpAuthority
 
 
 _ROOT_SESSION_RECEIPT_SCHEMA = "meta-research/acquisition-root-session/v1"
@@ -72,20 +73,36 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
     def runtime_binding(self) -> AcquisitionRuntimeBinding:
         delegate = self._delegate.runtime_binding()
         delegate_hash = canonical_hash(delegate.as_dict())
+        root_binding_hash = canonical_hash(self._root.runtime_binding().as_dict())
         return AcquisitionRuntimeBinding(
             provider_ref=(
                 "meta_research.acquisition_root.CodexAcquisitionRootAdapter"
             ),
-            provider_version="v2+delegate-sha256:" + delegate_hash,
+            provider_version=(
+                "v3+delegate-sha256:"
+                + delegate_hash
+                + "+root-sha256:"
+                + root_binding_hash
+            ),
             capability_bindings=merge_root_capability_bindings(
                 (
                     "acquisition-root-session-durable",
+                    "acquisition-codex-root-binding:sha256:"
+                    + root_binding_hash,
                     "nature-downloader-effect-adapter:sha256:" + delegate_hash,
                     *delegate.capability_bindings,
                 ),
                 "acquisition",
             ),
         )
+
+    def bind_resident_mcp_authority(
+        self, authority: RootResidentMcpAuthority
+    ) -> None:
+        self._root.bind_resident_mcp_authority(authority)
+
+    def configure_resident_mcp_endpoint(self, base_url: str) -> None:
+        self._root.configure_resident_mcp_endpoint(base_url)
 
     def preflight(
         self, request: AcquisitionPreflightRequest
@@ -104,6 +121,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                 "evidence": result.evidence,
             },
             allow_human_request=result.status == "waiting_user",
+            root_runtime_scope=None,
         )
         evidence = dict(result.evidence)
         evidence["acquisition_root"] = {
@@ -136,6 +154,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             allow_human_request=any(
                 item.status == "waiting_user" for item in results
             ),
+            root_runtime_scope=getattr(request, "root_runtime_scope", None),
         )
         return results
 
@@ -154,6 +173,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                 "results": [item.as_dict() for item in results],
             },
             allow_human_request=False,
+            root_runtime_scope=getattr(request, "root_runtime_scope", None),
         )
         return results
 
@@ -176,6 +196,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         phase: str,
         observed: dict[str, object],
         allow_human_request: bool,
+        root_runtime_scope: object,
     ) -> dict[str, object]:
         previous_native_session_ref = self._latest_native_session_ref(session_ref)
         human_request_schema: dict[str, object] = {
@@ -223,12 +244,15 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             f"observation={canonical_json(observed)}"
         )
         try:
-            raw, native_session_ref, _stdout = self._root._invoke(
-                operation_name="acquisition-root-turn",
-                prompt=prompt,
-                schema=schema,
-                native_session_ref=previous_native_session_ref,
-                job_ref=job_ref,
+            raw, native_session_ref, _stdout = (
+                self._root._invoke_optional_root_task_operation(
+                    operation_name="acquisition-root-turn",
+                    prompt=prompt,
+                    schema=schema,
+                    native_session_ref=previous_native_session_ref,
+                    job_ref=job_ref,
+                    root_runtime_scope=root_runtime_scope,
+                )
             )
         except IdeaSkillUnavailable as error:
             raise AcquisitionUnavailable(error.code) from error

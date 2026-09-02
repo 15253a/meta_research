@@ -30,6 +30,7 @@ from meta_research.deepfetch import (
     canonical_hash,
     validate_deepfetch_result,
 )
+from meta_research.harness import FullConformanceBinding, ResidentMcpChannel
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict
 from meta_research.provider_supervisor import (
     ensure_transport_key,
@@ -42,6 +43,10 @@ from meta_research.quest_drafting import (
 )
 from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticStore,
+)
+from meta_research.semantic_mcp import McpConnection, ResidentMcpBinding
+from meta_research.semantic_owner_gateway import (
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
 )
 
 RESULT = {
@@ -767,6 +772,77 @@ class SequencedPrototypeRunner(PrototypeRecordingRunner):
         return super().__call__(argv, prompt, timeout)
 
 
+class ResidentRecordingRunner(RecordingRunner):
+    def __init__(self, output: dict[str, object]) -> None:
+        super().__init__(output)
+        self.environments: list[dict[str, str]] = []
+
+    def __call__(
+        self,
+        argv: list[str],
+        prompt: str,
+        timeout: float | None,
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        assert environment is not None
+        self.environments.append(environment)
+        return super().__call__(argv, prompt, timeout)
+
+
+class _DeepFetchResidentMcpAuthority:
+    def __init__(self) -> None:
+        self.operation_ids = ROOT_AGENT_SEMANTIC_OPERATION_IDS["deepfetch"]
+        self.operation_bindings = tuple(
+            {"semantic_operation_id": operation_id}
+            for operation_id in self.operation_ids
+        )
+        self.issued: list[dict[str, object]] = []
+        self.revoked: list[ResidentMcpChannel] = []
+
+    def require_operation_binding(self, **values: object) -> FullConformanceBinding:
+        assert values == {
+            "harness_family": "codex",
+            "required_operation_ids": self.operation_ids,
+            "required_capabilities": ("semantic_mcp",),
+        }
+        return FullConformanceBinding(
+            contract_ref="meta-research/harness-operation-binding/v1",
+            contract_hash="7" * 64,
+            conformance_ref="operation-binding:deepfetch",
+            semantic_mcp_catalog_hash="8" * 64,
+            semantic_mcp_operation_bindings_hash=canonical_hash(
+                list(self.operation_bindings)
+            ),
+            required_families=("codex",),
+            required_capabilities=("semantic_mcp",),
+            required_operation_ids=self.operation_ids,
+            profile_receipts=(),
+        )
+
+    def issue_resident_mcp_channel(self, **scope: object) -> ResidentMcpChannel:
+        self.issued.append(scope)
+        phase = scope["phase"]
+        assert isinstance(phase, str)
+        grant_ref = f"mcp-grant:deepfetch:{phase}"
+        return ResidentMcpChannel(
+            connection=McpConnection(token="deepfetch-token", grant_ref=grant_ref),
+            binding=ResidentMcpBinding(
+                server_instance_ref="semantic-mcp:deepfetch",
+                endpoint_ref="/mcp",
+                catalog_revision=1,
+                catalog_hash="8" * 64,
+                health_receipt_ref="mcp-health:deepfetch",
+                connection_grant_ref=grant_ref,
+                operation_bindings=self.operation_bindings,
+                root_kind="deepfetch",
+                phase=phase,
+            ),
+        )
+
+    def revoke_resident_mcp_channel(self, channel: ResidentMcpChannel) -> None:
+        self.revoked.append(channel)
+
+
 class MalformedReaderTraceRunner(SequencedPrototypeRunner):
     def __call__(
         self, argv: list[str], prompt: str, timeout: float
@@ -1413,6 +1489,46 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
     assert len(acquisition.calls) == 1
     assert set((tmp_path / "provider").glob("runs/*/public/*"))
     assert result.web_evidence is not None
+
+
+def test_deepfetch_turns_use_and_revoke_exact_operation_tree_channels(
+    tmp_path: Path,
+) -> None:
+    runner = ResidentRecordingRunner(PROTOTYPE_EMPTY_FINAL)
+    authority = _DeepFetchResidentMcpAuthority()
+    adapter = CodexDeepFetchAdapter(
+        tmp_path / "resident-provider",
+        model_ref="gpt-test",
+        process_runner=runner,
+    )
+    adapter.bind_resident_mcp_authority(authority)
+    adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
+
+    result = _execute(adapter)
+
+    assert result.completion == "honest_empty"
+    assert [scope["phase"] for scope in authority.issued] == [
+        "turn-0",
+        "turn-1",
+    ]
+    assert all(
+        scope["root_kind"] == "deepfetch"
+        and scope["subject_policy"] == "operation_tree"
+        and scope["operation_ids"]
+        == ROOT_AGENT_SEMANTIC_OPERATION_IDS["deepfetch"]
+        for scope in authority.issued
+    )
+    assert len(authority.revoked) == 2
+    assert len(runner.environments) == 2
+    assert all(
+        environment["META_RESEARCH_MCP_TOKEN"] == "deepfetch-token"
+        for environment in runner.environments
+    )
+    assert all(
+        'mcp_servers.meta_research.url="http://127.0.0.1:8766/mcp"'
+        in argv
+        for argv, _prompt, _timeout in runner.calls
+    )
     assert result.web_evidence["prototype"]["prototype_commit"] == (
         PROTOTYPE_COMMIT
     )

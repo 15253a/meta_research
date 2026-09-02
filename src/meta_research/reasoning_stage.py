@@ -372,8 +372,23 @@ class ReasoningStageWorker:
             if run.primary_draft is None
             else run.review_invocation
         )
-        job_ref = invocation.operation_ref
-        unit_ref = invocation.invocation_ref
+        phase = "primary" if run.primary_draft is None else "review"
+        base_job_ref = invocation.operation_ref
+        job_ref = self._agent_runtime.root_provider_continuation_job_ref(
+            root_kind="reasoning",
+            phase=phase,
+            run_ref=run.run_ref,
+            root_session_ref=run.root_session_ref,
+            base_job_ref=base_job_ref,
+        )
+        unit_ref = (
+            invocation.invocation_ref
+            if job_ref == base_job_ref
+            else "provider_unit_"
+            + canonical_hash(
+                {"invocation_ref": invocation.invocation_ref, "job_ref": job_ref}
+            )[:64]
+        )
         skill_request = self._skill_request(request, run, job_ref=job_ref)
 
         if run.primary_draft is None:
@@ -398,6 +413,21 @@ class ReasoningStageWorker:
                         validate_reasoning_skill_draft(skill_request, draft)
                     )
                 except ReasoningSkillUnavailable as error:
+                    if (
+                        error.native_session_ref is not None
+                        and self._agent_runtime.park_root_provider_session_for_human_request(
+                            root_kind="reasoning",
+                            phase="primary",
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            native_session_ref=error.native_session_ref,
+                            runtime_binding_hash=run.runtime_binding_hash,
+                        )
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return _CycleStep(True, provider_boundary_attempted=True)
                     if error.rejected_candidate is not None:
                         if (
                             error.rejected_native_session_ref is None
@@ -440,6 +470,18 @@ class ReasoningStageWorker:
                         return _CycleStep(
                             False, provider_boundary_attempted=True
                         )
+                    if self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="reasoning",
+                        phase="primary",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=draft.primary_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return _CycleStep(True, provider_boundary_attempted=True)
                     failure_code = "reasoning_primary_result_contract_invalid"
                     self._reject_completion_candidate(
                         unit_ref=unit_ref,
@@ -456,21 +498,28 @@ class ReasoningStageWorker:
                 except ReasoningSkillContractError as error:
                     self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
-                checkpoint = self._agent_runtime.record_reasoning_primary_draft(
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    native_session_ref=draft.primary_session_ref,
-                    runtime_binding=run.runtime_binding,
-                    draft=draft.draft,
-                    adapter_kind=draft.adapter_kind,
-                    idempotency_key=_operation_key(
-                        "reasoning-primary",
-                        run.run_ref,
-                        run.attempt_ref,
-                        draft_hash,
-                    ),
-                )
+                try:
+                    checkpoint = self._agent_runtime.record_reasoning_primary_draft(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=draft.primary_session_ref,
+                        runtime_binding=run.runtime_binding,
+                        draft=draft.draft,
+                        adapter_kind=draft.adapter_kind,
+                        idempotency_key=_operation_key(
+                            "reasoning-primary",
+                            run.run_ref,
+                            run.attempt_ref,
+                            draft_hash,
+                        ),
+                    )
+                except OwnerConflict as error:
+                    if error.code != "runtime_run_suspended":
+                        raise
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 if checkpoint.draft_hash != draft_hash:
                     raise OwnerConflict("reasoning_primary_draft_hash_mismatch")
                 self._transient_error = None
@@ -516,6 +565,20 @@ class ReasoningStageWorker:
                     ) = validate_reasoning_autonomous_checkpoint_result(
                         skill_request, draft, result
                     )
+                    if self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="reasoning",
+                        phase="review",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=result.primary_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return _CycleStep(
+                            True, provider_boundary_attempted=True
+                        )
                     recorded = (
                         self._agent_runtime.record_reasoning_autonomous_checkpoint(
                             run_ref=run.run_ref,
@@ -549,6 +612,24 @@ class ReasoningStageWorker:
                     review_hash,
                 ) = validate_reasoning_skill_result(skill_request, result)
             except ReasoningSkillUnavailable as error:
+                review_session_ref = (
+                    error.native_session_ref or run.native_session_ref
+                )
+                if (
+                    review_session_ref is not None
+                    and self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="reasoning",
+                        phase="review",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=review_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    )
+                ):
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 if error.rejected_candidate is not None:
                     if (
                         error.rejected_native_session_ref is None
@@ -585,6 +666,18 @@ class ReasoningStageWorker:
                 if result is None:
                     self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
+                if self._agent_runtime.park_root_provider_session_for_human_request(
+                    root_kind="reasoning",
+                    phase="review",
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=result.primary_session_ref,
+                    runtime_binding_hash=run.runtime_binding_hash,
+                ):
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 failure_code = "reasoning_review_result_contract_invalid"
                 self._reject_completion_candidate(
                     unit_ref=unit_ref,
@@ -601,6 +694,18 @@ class ReasoningStageWorker:
             except ReasoningSkillContractError as error:
                 self._transient_error = str(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
+            if self._agent_runtime.park_root_provider_session_for_human_request(
+                root_kind="reasoning",
+                phase="review",
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                native_session_ref=result.primary_session_ref,
+                runtime_binding_hash=run.runtime_binding_hash,
+            ):
+                self._finish_provider_job(job_ref)
+                self._transient_error = None
+                return _CycleStep(True, provider_boundary_attempted=True)
             review = result.review_document()
             submission_ref = "reasoning_submission_" + canonical_hash(
                 {
@@ -748,7 +853,7 @@ class ReasoningStageWorker:
         if (
             run.attempt_generation != 1
             and run.technical_predecessor_attempt_ref is None
-        ) or ((run.native_session_ref is None) != (run.primary_draft is None)):
+        ) or (run.primary_draft is not None and run.native_session_ref is None):
             raise OwnerConflict("attempt_lineage_invalid")
         return None, None, None, ()
 
@@ -770,8 +875,22 @@ class ReasoningStageWorker:
             self._transient_error = "reasoning_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
         invocation = run.review_invocation
-        unit_ref = invocation.invocation_ref
-        job_ref = invocation.operation_ref
+        base_job_ref = invocation.operation_ref
+        job_ref = self._agent_runtime.root_provider_continuation_job_ref(
+            root_kind="reasoning",
+            phase="autonomous-resume",
+            run_ref=run.run_ref,
+            root_session_ref=run.root_session_ref,
+            base_job_ref=base_job_ref,
+        )
+        unit_ref = (
+            invocation.invocation_ref
+            if job_ref == base_job_ref
+            else "provider_unit_"
+            + canonical_hash(
+                {"invocation_ref": invocation.invocation_ref, "job_ref": job_ref}
+            )[:64]
+        )
         skill_request = self._skill_request(request, run, job_ref=job_ref)
         try:
             self._agent_runtime.begin_provider_unit(
@@ -807,6 +926,24 @@ class ReasoningStageWorker:
                     result,
                 )
             except ReasoningSkillUnavailable as error:
+                review_session_ref = (
+                    error.native_session_ref or run.native_session_ref
+                )
+                if (
+                    review_session_ref is not None
+                    and self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="reasoning",
+                        phase="autonomous-resume",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=review_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    )
+                ):
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 if error.rejected_candidate is not None:
                     if (
                         error.rejected_native_session_ref is None
@@ -843,6 +980,18 @@ class ReasoningStageWorker:
                 if result is None:
                     self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
+                if self._agent_runtime.park_root_provider_session_for_human_request(
+                    root_kind="reasoning",
+                    phase="autonomous-resume",
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=result.primary_session_ref,
+                    runtime_binding_hash=run.runtime_binding_hash,
+                ):
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 failure_code = "reasoning_review_result_contract_invalid"
                 self._reject_completion_candidate(
                     unit_ref=unit_ref,
@@ -859,6 +1008,18 @@ class ReasoningStageWorker:
             except ReasoningSkillContractError as error:
                 self._transient_error = str(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
+            if self._agent_runtime.park_root_provider_session_for_human_request(
+                root_kind="reasoning",
+                phase="autonomous-resume",
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                native_session_ref=result.primary_session_ref,
+                runtime_binding_hash=run.runtime_binding_hash,
+            ):
+                self._finish_provider_job(job_ref)
+                self._transient_error = None
+                return _CycleStep(True, provider_boundary_attempted=True)
             submission_ref = "reasoning_submission_" + canonical_hash(
                 {
                     "request_ref": request.request_ref,
@@ -901,6 +1062,11 @@ class ReasoningStageWorker:
                     attempt_ref=run.attempt_ref,
                     fence_ref=run.fence_ref,
                 )
+
+    def _finish_provider_job(self, job_ref: str) -> None:
+        finish_job = getattr(self._provider, "finish_job", None)
+        if callable(finish_job):
+            finish_job(job_ref)
 
     def _reject_completion_candidate(
         self,

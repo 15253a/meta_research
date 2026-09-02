@@ -756,7 +756,18 @@ class WritingReportService:
                 command = self._human_collaboration.query_command(run.intent_id)
                 payload = self._writing_payload(command)
                 content_revision = self._content_revision(run)
-                job_ref = self._writing_job_ref(run, content_revision)
+                phase = (
+                    "writing-primary"
+                    if run.checkpoint is None
+                    else "writing-review"
+                )
+                job_ref = self._agent_runtime.root_provider_continuation_job_ref(
+                    root_kind="writing",
+                    phase=phase,
+                    run_ref=run.run_ref,
+                    root_session_ref=run.root_session_ref,
+                    base_job_ref=self._writing_job_ref(run, content_revision),
+                )
                 request = None
                 if run.execution is None:
                     request = WritingSkillRequest(
@@ -787,9 +798,22 @@ class WritingReportService:
                 unit_ref: str | None = None
                 provider_safe = True
                 try:
-                    unit_ref = self._begin_provider_unit(run, "writing_primary")
+                    unit_ref = self._begin_provider_unit(
+                        run, "writing_primary", provider_job_ref=job_ref
+                    )
                     draft = self._provider.generate_draft(request)
                     validate_writing_skill_draft(request, draft)
+                    if self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="writing",
+                        phase="writing-primary",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=draft.primary_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    ):
+                        self._finish_provider_job(job_ref)
+                        return True
                     self._agent_runtime.record_writing_checkpoint(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
@@ -804,12 +828,36 @@ class WritingReportService:
                     )
                 except (WritingSkillUnavailable, OwnerConflict) as error:
                     provider_safe = error.code != _PROVIDER_RECONCILIATION_PENDING
+                    native_session_ref = getattr(error, "native_session_ref", None)
+                    if (
+                        isinstance(native_session_ref, str)
+                        and self._agent_runtime.park_root_provider_session_for_human_request(
+                            root_kind="writing",
+                            phase="writing-primary",
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            native_session_ref=native_session_ref,
+                            runtime_binding_hash=run.runtime_binding_hash,
+                        )
+                    ):
+                        self._finish_provider_job(job_ref)
+                        return True
+                    if (
+                        isinstance(error, OwnerConflict)
+                        and error.code == "runtime_run_suspended"
+                    ):
+                        self._finish_provider_job(job_ref)
+                        return True
                     if self._agent_runtime.provider_quiescence_requested(run.run_ref):
                         return True
                     if not provider_safe:
                         raise
                     if not self._defer_provider_start_if_protection_wait(
-                        run, "writing_primary", error
+                        run,
+                        "writing_primary",
+                        error,
+                        provider_job_ref=job_ref,
                     ):
                         if self._is_provider_contract_correction(error.code):
                             if unit_ref is not None:
@@ -841,11 +889,24 @@ class WritingReportService:
                 unit_ref = None
                 provider_safe = True
                 try:
-                    unit_ref = self._begin_provider_unit(run, "writing_review")
+                    unit_ref = self._begin_provider_unit(
+                        run, "writing_review", provider_job_ref=job_ref
+                    )
                     result = self._provider.review_draft(resumed_request, draft)
                     final_hash, citations_hash, review_hash = (
                         validate_writing_skill_result(resumed_request, draft, result)
                     )
+                    if self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="writing",
+                        phase="writing-review",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=result.primary_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    ):
+                        self._finish_provider_job(job_ref)
+                        return True
                     review = {
                         "review_mode": result.review_mode,
                         "reviewer_agent_ref": result.reviewer_agent_ref,
@@ -872,12 +933,39 @@ class WritingReportService:
                     )
                 except (WritingSkillUnavailable, OwnerConflict) as error:
                     provider_safe = error.code != _PROVIDER_RECONCILIATION_PENDING
+                    review_session_ref = (
+                        getattr(error, "native_session_ref", None)
+                        or run.native_session_ref
+                    )
+                    if (
+                        review_session_ref is not None
+                        and self._agent_runtime.park_root_provider_session_for_human_request(
+                            root_kind="writing",
+                            phase="writing-review",
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            native_session_ref=review_session_ref,
+                            runtime_binding_hash=run.runtime_binding_hash,
+                        )
+                    ):
+                        self._finish_provider_job(job_ref)
+                        return True
+                    if (
+                        isinstance(error, OwnerConflict)
+                        and error.code == "runtime_run_suspended"
+                    ):
+                        self._finish_provider_job(job_ref)
+                        return True
                     if self._agent_runtime.provider_quiescence_requested(run.run_ref):
                         return True
                     if not provider_safe:
                         raise
                     if not self._defer_provider_start_if_protection_wait(
-                        run, "writing_review", error
+                        run,
+                        "writing_review",
+                        error,
+                        provider_job_ref=job_ref,
                     ):
                         if self._is_provider_contract_correction(error.code):
                             if unit_ref is not None:
@@ -892,9 +980,7 @@ class WritingReportService:
                 finally:
                     if unit_ref is not None and provider_safe:
                         self._acknowledge_provider_unit(run, unit_ref)
-                finish_job = getattr(self._provider, "finish_job", None)
-                if callable(finish_job):
-                    finish_job(job_ref)
+                self._finish_provider_job(job_ref)
                 return True
             try:
                 delivery = self._query_deliverable(run)
@@ -2325,20 +2411,39 @@ class WritingReportService:
         return run.provider_job_ref
 
     @staticmethod
-    def _provider_unit_ref(run: WritingRun, unit_kind: str) -> str:
+    def _provider_unit_ref(
+        run: WritingRun,
+        unit_kind: str,
+        *,
+        provider_job_ref: str | None = None,
+    ) -> str:
         return "provider_unit_" + canonical_hash(
             {
-                "provider_job_ref": run.provider_job_ref,
+                "provider_job_ref": provider_job_ref or run.provider_job_ref,
                 "attempt_ref": run.attempt_ref,
                 "unit_kind": unit_kind,
             }
         )[:64]
 
-    def _begin_provider_unit(self, run: WritingRun, unit_kind: str) -> str:
-        unit_ref = self._provider_unit_ref(run, unit_kind)
+    def _finish_provider_job(self, job_ref: str) -> None:
+        finish_job = getattr(self._provider, "finish_job", None)
+        if callable(finish_job):
+            finish_job(job_ref)
+
+    def _begin_provider_unit(
+        self,
+        run: WritingRun,
+        unit_kind: str,
+        *,
+        provider_job_ref: str | None = None,
+    ) -> str:
+        operation_ref = provider_job_ref or run.provider_job_ref
+        unit_ref = self._provider_unit_ref(
+            run, unit_kind, provider_job_ref=operation_ref
+        )
         self._agent_runtime.begin_provider_unit(
             unit_ref=unit_ref,
-            operation_ref=run.provider_job_ref,
+            operation_ref=operation_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
@@ -2351,6 +2456,8 @@ class WritingReportService:
         run: WritingRun,
         unit_kind: str,
         error: WritingSkillUnavailable | OwnerConflict,
+        *,
+        provider_job_ref: str | None = None,
     ) -> bool:
         if not (
             isinstance(error, OwnerConflict)
@@ -2358,7 +2465,9 @@ class WritingReportService:
         ):
             return False
         self._agent_runtime.record_writing_provider_not_started(
-            unit_ref=self._provider_unit_ref(run, unit_kind),
+            unit_ref=self._provider_unit_ref(
+                run, unit_kind, provider_job_ref=provider_job_ref
+            ),
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,

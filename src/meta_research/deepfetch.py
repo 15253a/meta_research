@@ -70,6 +70,13 @@ from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticRecorder,
     root_operation_diagnostic_ref,
 )
+from meta_research.root_resident_mcp import (
+    RootResidentMcpAccess,
+    RootResidentMcpAuthority,
+    RootResidentMcpChannels,
+    RootResidentMcpError,
+    semantic_mcp_environment,
+)
 
 if TYPE_CHECKING:
     from meta_research.owners.common import AcceptanceReceipt
@@ -444,6 +451,7 @@ class DeepFetchProviderRequest:
     fence_ref: str
     native_session_ref: str | None = None
     job_ref: str | None = None
+    human_request_resume: dict[str, str] | None = None
     # Reconciliation is a read-only compatibility path for a durable operation
     # admitted under a persisted predecessor binding.  Providers must not start
     # or resume an external effect while this flag is set.
@@ -783,6 +791,21 @@ class CodexDeepFetchAdapter:
         self._root_operation_diagnostic_recorder: (
             RootOperationDiagnosticRecorder | None
         ) = None
+        self._root_resident_mcp = RootResidentMcpChannels("deepfetch")
+
+    def bind_resident_mcp_authority(
+        self, authority: RootResidentMcpAuthority
+    ) -> None:
+        try:
+            self._root_resident_mcp.bind_authority(authority)
+        except RootResidentMcpError as error:
+            raise DeepFetchUnavailable(error.code) from error
+
+    def configure_resident_mcp_endpoint(self, base_url: str) -> None:
+        try:
+            self._root_resident_mcp.configure_endpoint(base_url)
+        except RootResidentMcpError as error:
+            raise DeepFetchUnavailable(error.code) from error
 
     def bind_root_operation_diagnostics_recorder(
         self, recorder: RootOperationDiagnosticRecorder
@@ -790,9 +813,15 @@ class CodexDeepFetchAdapter:
         self._root_operation_diagnostic_recorder = recorder
 
     def request_stop(self) -> None:
-        request_stop = getattr(self._runner, "request_stop", None)
-        if callable(request_stop):
-            request_stop()
+        try:
+            request_stop = getattr(self._runner, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
+        finally:
+            try:
+                self._root_resident_mcp.release_all()
+            except RootResidentMcpError as error:
+                raise DeepFetchUnavailable(error.code) from error
 
     def _root_capability_diagnostics(
         self, *, entry_path: RootCapabilityEntryPath
@@ -876,10 +905,18 @@ class CodexDeepFetchAdapter:
                 cancel_job(provider_job_ref)
 
     def finish_job(self, job_ref: str) -> None:
-        finish_job = getattr(self._runner, "finish_job", None)
-        if callable(finish_job):
-            for provider_job_ref in self._registered_provider_jobs(job_ref):
-                finish_job(provider_job_ref)
+        try:
+            finish_job = getattr(self._runner, "finish_job", None)
+            if callable(finish_job):
+                for provider_job_ref in self._registered_provider_jobs(job_ref):
+                    finish_job(provider_job_ref)
+        finally:
+            try:
+                self._root_resident_mcp.release_job(
+                    job_ref, include_children=True
+                )
+            except RootResidentMcpError as error:
+                raise DeepFetchUnavailable(error.code) from error
 
     def recent_activity_events(
         self,
@@ -1075,6 +1112,12 @@ class CodexDeepFetchAdapter:
                         )
         except (OSError, ProviderSupervisorError, DeepFetchUnavailable):
             return False
+        try:
+            self._root_resident_mcp.release_job(
+                job_ref, include_children=True
+            )
+        except RootResidentMcpError as error:
+            raise DeepFetchUnavailable(error.code) from error
         return True
 
     def _provider_operation_root(
@@ -1378,6 +1421,10 @@ class CodexDeepFetchAdapter:
         return callable(getattr(self._runner, "run_durable_job", None))
 
     def runtime_binding(self) -> DeepFetchRuntimeBinding:
+        try:
+            resident_mcp_facts = self._root_resident_mcp.runtime_facts()
+        except RootResidentMcpError as error:
+            raise DeepFetchUnavailable(error.code) from error
         return DeepFetchRuntimeBinding(
             provider_ref="meta_research.deepfetch.CodexDeepFetchAdapter",
             provider_version=DEEPFETCH_PROTOTYPE_COMMIT,
@@ -1402,6 +1449,8 @@ class CodexDeepFetchAdapter:
                     "structured-output-json-schema",
                     "web-evidence-gate:v1",
                     "workspace-write-public-artifacts",
+                    *resident_mcp_facts.mcp_bindings,
+                    *resident_mcp_facts.capability_bindings,
                 ),
                 "deepfetch",
             ),
@@ -1444,11 +1493,20 @@ class CodexDeepFetchAdapter:
         checkpoint_path = private_root / "protocol.json"
         identity_hash = _deepfetch_protocol_identity(request)
         try:
+            initial_prompt = (
+                self._human_request_resume_prompt(
+                    request,
+                    public_root=public_root,
+                    private_root=private_root,
+                )
+                if request.human_request_resume is not None
+                else self._web_evidence_gate_prompt(request)
+            )
             checkpoint = _load_or_create_protocol_checkpoint(
                 checkpoint_path,
                 identity_hash=identity_hash,
                 native_session_ref=request.native_session_ref,
-                initial_prompt=self._web_evidence_gate_prompt(request),
+                initial_prompt=initial_prompt,
             )
             return self._execute_protocol(
                 request,
@@ -2246,6 +2304,7 @@ class CodexDeepFetchAdapter:
             raw, native_session_ref, turn_evidence = self._invoke(
                 turn_request,
                 checkpoint.next_prompt,
+                phase=f"turn-{turn_number}",
                 output_schema=(
                     _deepfetch_web_evidence_gate_output_schema()
                     if web_gate
@@ -2492,6 +2551,36 @@ class CodexDeepFetchAdapter:
             f"{canonical_json(list(request.accepted_material_bindings))}"
         )
 
+    def _human_request_resume_prompt(
+        self,
+        request: DeepFetchProviderRequest,
+        *,
+        public_root: Path,
+        private_root: Path,
+    ) -> str:
+        resume = request.human_request_resume
+        if (
+            not isinstance(resume, dict)
+            or not isinstance(resume.get("effect_id"), str)
+            or not isinstance(resume.get("request_ref"), str)
+        ):
+            raise DeepFetchUnavailable("deepfetch_human_request_resume_invalid")
+        return (
+            "human_request_resume=v1\n"
+            "这是同一逻辑 DeepFetch Session 在人工回应后的恢复 Attempt。先调用 "
+            "human_request.open.reconcile，使用下列 exact effect_id，"
+            "读取 resolution 后再判断回应是否足够；不得把旧 open receipt 当作新"
+            " waiter 的授权。随后继续当前研究任务，必要时可显式提出 successor "
+            "HumanRequest。\n"
+            f"human_request_effect_id={resume['effect_id']}\n"
+            f"human_request_ref={resume['request_ref']}\n"
+            + self._initial_prompt(
+                request,
+                public_root=public_root,
+                private_root=private_root,
+            )
+        )
+
     def _web_evidence_gate_prompt(
         self,
         request: DeepFetchProviderRequest,
@@ -2541,8 +2630,72 @@ class CodexDeepFetchAdapter:
         request: DeepFetchProviderRequest,
         prompt: str,
         *,
+        phase: str,
         output_schema: dict[str, object] | None = None,
         timeout_seconds: float | None = None,
+    ) -> tuple[dict[str, object], str, dict[str, object]]:
+        if not self._root_resident_mcp.enabled:
+            return self._invoke_with_access(
+                request,
+                prompt,
+                output_schema=output_schema,
+                timeout_seconds=timeout_seconds,
+                access=None,
+            )
+        try:
+            channel_phase = (
+                request.human_request_resume["phase"]
+                if request.human_request_resume is not None
+                else phase
+            )
+            channel_key, access = self._root_resident_mcp.acquire(
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                capability_binding_hash=canonical_hash(
+                    request.runtime_binding.as_dict()
+                ),
+                phase=channel_phase,
+                job_ref=request.job_ref,
+            )
+        except RootResidentMcpError as error:
+            raise DeepFetchUnavailable(error.code) from error
+        try:
+            result = self._invoke_with_access(
+                request,
+                prompt,
+                output_schema=output_schema,
+                timeout_seconds=timeout_seconds,
+                access=access,
+            )
+        except DeepFetchUnavailable as error:
+            if error.durable_outcome != "pending":
+                try:
+                    self._root_resident_mcp.release(channel_key)
+                except RootResidentMcpError as release_error:
+                    raise DeepFetchUnavailable(release_error.code) from error
+            raise
+        except Exception:
+            try:
+                self._root_resident_mcp.release(channel_key)
+            except RootResidentMcpError as error:
+                raise DeepFetchUnavailable(error.code) from error
+            raise
+        try:
+            self._root_resident_mcp.release(channel_key)
+        except RootResidentMcpError as error:
+            raise DeepFetchUnavailable(error.code) from error
+        return result
+
+    def _invoke_with_access(
+        self,
+        request: DeepFetchProviderRequest,
+        prompt: str,
+        *,
+        output_schema: dict[str, object] | None,
+        timeout_seconds: float | None,
+        access: RootResidentMcpAccess | None,
     ) -> tuple[dict[str, object], str, dict[str, object]]:
         schema = output_schema or _deepfetch_output_schema()
         if request.job_ref is not None and callable(
@@ -2553,6 +2706,7 @@ class CodexDeepFetchAdapter:
                 prompt,
                 output_schema=schema,
                 timeout_seconds=timeout_seconds,
+                access=access,
             )
         root_job_ref = request.job_ref or f"{request.run_ref}:direct"
         agent_workspace = self._agent_workspace_for(
@@ -2582,10 +2736,36 @@ class CodexDeepFetchAdapter:
                 "exec",
                 "--skip-git-repo-check",
                 "--strict-config",
+                *(
+                    (
+                        "--config",
+                        "mcp_servers={}",
+                        "--config",
+                        f'mcp_servers.meta_research.url="{access.url}"',
+                        "--config",
+                        "mcp_servers.meta_research.bearer_token_env_var="
+                        '"META_RESEARCH_MCP_TOKEN"',
+                        "--config",
+                        "mcp_servers.meta_research.required=true",
+                        "--config",
+                        "mcp_servers.meta_research."
+                        'default_tools_approval_mode="approve"',
+                    )
+                    if access is not None
+                    else ()
+                ),
                 "--config",
                 'approval_policy="never"',
                 "--config",
                 CODEX_REASONING_EFFORT_CONFIG,
+                *(
+                    (
+                        "--config",
+                        'shell_environment_policy.inherit="none"',
+                    )
+                    if access is not None
+                    else ()
+                ),
                 *capability_profile.codex_arguments(),
                 "--sandbox",
                 self._sandbox_mode,
@@ -2604,13 +2784,34 @@ class CodexDeepFetchAdapter:
             else:
                 argv.extend(["resume", request.native_session_ref, "-"])
             try:
+                environment = (
+                    semantic_mcp_environment(access.token)
+                    if access is not None
+                    else None
+                )
                 run_job = getattr(self._runner, "run_job", None)
                 if request.job_ref is not None and callable(run_job):
-                    completed = run_job(
-                        request.job_ref, argv, prompt, timeout_seconds
+                    completed = (
+                        run_job(
+                            request.job_ref,
+                            argv,
+                            prompt,
+                            timeout_seconds,
+                            environment,
+                        )
+                        if environment is not None
+                        else run_job(
+                            request.job_ref, argv, prompt, timeout_seconds
+                        )
                     )
                 else:
-                    completed = self._runner(argv, prompt, timeout_seconds)
+                    completed = (
+                        self._runner(
+                            argv, prompt, timeout_seconds, environment
+                        )
+                        if environment is not None
+                        else self._runner(argv, prompt, timeout_seconds)
+                    )
             except _ProcessStopped as error:
                 raise DeepFetchUnavailable("deepfetch_provider_stopped") from error
             except FileNotFoundError as error:
@@ -2674,6 +2875,7 @@ class CodexDeepFetchAdapter:
         *,
         output_schema: dict[str, object],
         timeout_seconds: float | None,
+        access: RootResidentMcpAccess | None = None,
     ) -> tuple[dict[str, object], str, dict[str, object]]:
         """Reconcile one logical provider operation across daemon Attempts."""
 
@@ -2704,6 +2906,7 @@ class CodexDeepFetchAdapter:
                 timeout_seconds=timeout_seconds,
                 native_session_ref=native_session_ref,
                 transport_key=transport_key,
+                access=access,
             )
             trace_parts.append(outcome[2])
             if outcome[0] == "completed":
@@ -2743,6 +2946,7 @@ class CodexDeepFetchAdapter:
         timeout_seconds: float | None,
         native_session_ref: str | None,
         transport_key: bytes,
+        access: RootResidentMcpAccess | None = None,
     ) -> tuple[str, dict[str, object] | None, str, str | None]:
         directory.mkdir(parents=True, exist_ok=True)
         schema = output_schema
@@ -2769,6 +2973,13 @@ class CodexDeepFetchAdapter:
             "root_capability_profile": capability_profile.as_dict(),
             "root_capability_profile_hash": capability_profile.digest,
         }
+        if access is not None:
+            invocation.update(
+                {
+                    "mcp_url": access.url,
+                    "mcp_scope_binding_hash": access.scope_binding_hash,
+                }
+            )
         invocation_hash = canonical_hash(invocation)
         invocation_path = directory / "invocation.json"
         envelope = {
@@ -2814,14 +3025,19 @@ class CodexDeepFetchAdapter:
                     "deepfetch_provider_reconciliation_pending",
                     durable_outcome="pending",
                 )
-            argv = self._durable_argv(
-                job_ref=job_ref,
-                runtime_binding_hash=canonical_hash(
+            durable_argv_kwargs = {
+                "job_ref": job_ref,
+                "runtime_binding_hash": canonical_hash(
                     request.runtime_binding.as_dict()
                 ),
-                schema_path=schema_path,
-                result_path=result_path,
-                native_session_ref=native_session_ref,
+                "schema_path": schema_path,
+                "result_path": result_path,
+                "native_session_ref": native_session_ref,
+            }
+            argv = (
+                self._durable_argv(**durable_argv_kwargs, mcp_url=access.url)
+                if access is not None
+                else self._durable_argv(**durable_argv_kwargs)
             )
             supervisor_request_path = directory / "supervisor-request.json"
             try:
@@ -2856,6 +3072,11 @@ class CodexDeepFetchAdapter:
                     directory / "pid.json",
                     supervisor_request_path,
                 )
+                if access is not None:
+                    durable_arguments = (
+                        *durable_arguments,
+                        semantic_mcp_environment(access.token),
+                    )
                 if isinstance(self._runner, _CancellableProcessRunner):
                     durable_job(
                         *durable_arguments,
@@ -2907,6 +3128,7 @@ class CodexDeepFetchAdapter:
         schema_path: Path,
         result_path: Path,
         native_session_ref: str | None,
+        mcp_url: str | None = None,
     ) -> list[str]:
         agent_workspace = self._agent_workspace_for(
             job_ref, runtime_binding_hash
@@ -2917,10 +3139,36 @@ class CodexDeepFetchAdapter:
             "exec",
             "--skip-git-repo-check",
             "--strict-config",
+            *(
+                (
+                    "--config",
+                    "mcp_servers={}",
+                    "--config",
+                    f'mcp_servers.meta_research.url="{mcp_url}"',
+                    "--config",
+                    "mcp_servers.meta_research.bearer_token_env_var="
+                    '"META_RESEARCH_MCP_TOKEN"',
+                    "--config",
+                    "mcp_servers.meta_research.required=true",
+                    "--config",
+                    "mcp_servers.meta_research."
+                    'default_tools_approval_mode="approve"',
+                )
+                if mcp_url is not None
+                else ()
+            ),
             "--config",
             'approval_policy="never"',
             "--config",
             CODEX_REASONING_EFFORT_CONFIG,
+            *(
+                (
+                    "--config",
+                    'shell_environment_policy.inherit="none"',
+                )
+                if mcp_url is not None
+                else ()
+            ),
             *capability_profile.codex_arguments(),
             "--sandbox",
             self._sandbox_mode,

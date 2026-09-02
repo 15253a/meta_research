@@ -66,29 +66,29 @@ const requestCopy: Record<HumanRequestItem["kind"], {
   library_reconnect: {
     list: "图书馆访问",
     title: "处理图书馆访问阻塞",
-    eyebrow: "HumanRequest · access recovery",
-    draftLabel: "在图书馆恢复 Draft Session 中发消息",
+    eyebrow: "需要你恢复访问",
+    draftLabel: "就图书馆恢复事项发消息",
     draftPlaceholder: "询问当前状态，或说明你希望怎样处理……",
   },
   external_material_api_access: {
     list: "外部材料或 API",
     title: "完成外部材料或 API 申请",
-    eyebrow: "HumanRequest · external handoff",
-    draftLabel: "在外部材料 Draft Session 中发消息",
+    eyebrow: "需要你完成外部申请",
+    draftLabel: "就外部材料事项发消息",
     draftPlaceholder: "询问为什么需要材料，或讨论替代路线……",
   },
   offline_action: {
     list: "线下操作",
     title: "完成线下操作",
-    eyebrow: "HumanRequest · offline action",
-    draftLabel: "在线下操作 Draft Session 中发消息",
+    eyebrow: "需要你完成线下操作",
+    draftLabel: "就线下操作事项发消息",
     draftPlaceholder: "询问步骤、安全边界，或说明现场限制……",
   },
   capability_authorization: {
     list: "低频权限",
     title: "决定低频能力授权",
-    eyebrow: "HumanRequest · capability authorization",
-    draftLabel: "在权限请求 Draft Session 中发消息",
+    eyebrow: "需要你决定是否授权",
+    draftLabel: "就权限事项发消息",
     draftPlaceholder: "询问风险，或讨论更窄的授权范围……",
   },
 };
@@ -162,8 +162,20 @@ function questIdentity(scopeRef: string): string {
 
 function scopeLabel(request: HumanRequestItem): string {
   return request.direct_waiters?.some((waiter) => waiter.wait_scope === "quest")
-    ? "QUEST WAIT"
-    : "LOCAL WAIT";
+    ? "影响整个研究"
+    : "只影响相关任务";
+}
+
+function requestStatusLabel(status: HumanRequestItem["status"]): string {
+  return {
+    open: "待处理",
+    satisfied: "已满足",
+    unsatisfied: "已回应，未满足",
+    declined: "已拒绝",
+    withdrawn: "已撤回",
+    expired: "已过期",
+    superseded: "已有后续事项",
+  }[status];
 }
 
 export function QuestCompanion({
@@ -305,7 +317,7 @@ export function QuestCompanion({
         ) : null}
         {attention ? (
           <article className="lumen-human-attention">
-            <small>NEEDS YOU · {scopeLabel(attention)}</small>
+            <small>需要你 · {scopeLabel(attention)}</small>
             <b>{requestCopy[attention.kind].list}需要你处理</b>
             <p>{attention.obligation}</p>
             <button type="button" onClick={() => onOpenRequest(attention.request_ref)}>
@@ -1201,7 +1213,7 @@ function ImpactPreview({ preview }: { preview: HumanRequestImpactPreview }) {
   ) : null;
   return (
     <details className="hc-impact-preview">
-      <summary>查看 Owner Impact Preview</summary>
+      <summary>查看影响说明</summary>
       <dl>
         {row("会改变", preview.will_change)}
         {row("不会改变", preview.will_not_change)}
@@ -1375,7 +1387,7 @@ export function HumanRequestSurface({
       className="hc-backdrop"
       data-open="true"
       data-blocking={blocking ? "true" : "false"}
-      aria-label={blocking ? "需要你处理的 HumanRequest" : "HumanRequest"}
+      aria-label="需要你处理的事项"
       tabIndex={-1}
       onCancel={(event) => {
         event.preventDefault();
@@ -1442,12 +1454,12 @@ function HumanRequestList({
       <header className="hc-head">
         <span className="hc-symbol" aria-hidden="true">!</span>
         <div>
-          <small>{blocking ? "NEEDS YOU · CURRENT REQUESTS" : "HUMAN WAITING PROJECTION"}</small>
-          <h2>HumanRequest</h2>
-          <p>每个请求只阻塞直接 waiter；人的回应仍需 Owner 验收。</p>
+          <small>{blocking ? "当前需要你处理" : "处理记录"}</small>
+          <h2>需要你处理的事项</h2>
+          <p>这里列出需要你决定或完成的事情；只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
         </div>
         {!blocking ? (
-          <button type="button" className="hc-close" onClick={onClose} aria-label="关闭 HumanRequest">×</button>
+          <button type="button" className="hc-close" onClick={onClose} aria-label="关闭需要你处理的事项">×</button>
         ) : null}
       </header>
       <main className="hc-list">
@@ -1456,7 +1468,7 @@ function HumanRequestList({
           if (!sameKind.length) return null;
           return (
             <section className="hc-kind-group" key={kind}>
-              <header><b>{requestCopy[kind].list}</b><small>{sameKind.length} current / history</small></header>
+              <header><b>{requestCopy[kind].list}</b><small>{sameKind.length} 项</small></header>
               {sameKind.map((item) => (
                 <button
                   type="button"
@@ -1465,16 +1477,16 @@ function HumanRequestList({
                   onClick={() => onSelect(item.request_ref)}
                   aria-label={`${requestCopy[kind].list} · ${item.obligation}`}
                 >
-                  <span><b>{item.obligation}</b><small>{item.business_purpose}</small></span>
-                  <i className={item.status === "open" ? "current" : ""}>{item.status}</i>
+                  <span><b>{item.obligation}</b><small>{scopeLabel(item)}</small></span>
+                  <i className={item.status === "open" ? "current" : ""}>{requestStatusLabel(item.status)}</i>
                 </button>
               ))}
             </section>
           );
         }) : (
           <section className="hc-list-empty">
-            <b>当前没有 HumanRequest</b>
-            <p>Conversation、ReadQuery 或技术不可用不会伪装成人的待办。</p>
+            <b>当前没有需要你处理的事项</b>
+            <p>研究过程中的等待或错误不会自动变成你的待办。</p>
           </section>
         )}
       </main>
@@ -1524,19 +1536,19 @@ function HumanRequestView({
         <div>
           <small>
             {blocking
-              ? `NEEDS YOU · ${queuePosition} / ${queueSize} · ${copy.eyebrow}`
+              ? `当前待办 · ${queuePosition} / ${queueSize} · ${copy.eyebrow}`
               : `${copy.eyebrow} · ${scopeLabel(request)}`}
           </small>
           <h2>{copy.title}</h2>
           <p>{request.obligation}</p>
         </div>
         {blocking ? (
-          <nav className="hc-queue-nav" aria-label="当前 HumanRequest 队列">
+          <nav className="hc-queue-nav" aria-label="当前待办队列">
             <button
               type="button"
               disabled={!hasPrevious}
               onClick={onPrevious}
-              aria-label="查看上一个 HumanRequest"
+              aria-label="查看上一个待办"
             >
               ← 上一个
             </button>
@@ -1545,7 +1557,7 @@ function HumanRequestView({
               type="button"
               disabled={!hasNext}
               onClick={onNext}
-              aria-label="查看下一个 HumanRequest"
+              aria-label="查看下一个待办"
             >
               下一个 →
             </button>
@@ -1553,7 +1565,7 @@ function HumanRequestView({
         ) : (
           <div className="hc-head-actions">
             <button type="button" onClick={onBack}>返回请求列表</button>
-            <button type="button" className="hc-close" onClick={onClose} aria-label="关闭 HumanRequest">×</button>
+            <button type="button" className="hc-close" onClick={onClose} aria-label="关闭需要你处理的事项">×</button>
           </div>
         )}
       </header>
@@ -1561,16 +1573,21 @@ function HumanRequestView({
         <main className="hc-request-core">
           {request.kind !== "library_reconnect" ? (
             <section className={`hc-waiting ${safeWork ? "local" : "quest"}`}>
-              <small>Human Waiting Projection</small>
+              <small>对研究的影响</small>
               <b>{safeWork ? "只等待直接依赖，其他工作继续" : "当前没有安全且有意义的工作可继续"}</b>
               <p>
                 {safeWork
-                  ? `${waiter?.waiter_ref ?? "当前 waiter"} 保持局部等待；这份 Projection 没有恢复权。`
-                  : "请求窗口只呈现人的待办；Owner 仍需逐 waiter 验证 currentness、授权、receipt 与其他 blocker。"}
+                  ? "这件事只暂停与它直接相关的任务，其他研究仍可继续。"
+                  : "提交回应后，系统会核对当前任务和所需材料；只有核对通过且没有其他阻碍，相关工作才会继续。"}
               </p>
             </section>
           ) : null}
-          <RequestForm request={request} onChanged={onChanged} />
+          <RequestForm
+            request={request}
+            commands={collaboration?.commands.items ?? []}
+            authorizations={collaboration?.commands.authorizations ?? []}
+            onChanged={onChanged}
+          />
           <RequestDetails request={request} otherBlockers={waiting?.other_blockers ?? []} />
         </main>
         <IntentDraftingSession
@@ -1592,9 +1609,26 @@ function RequestDetails({
 }) {
   const evaluation = request.evaluation?.decision;
   const disposition = request.disposition?.decision;
+  const openEffect = request.open_effect ?? undefined;
+  const operation = openEffect?.operation_binding;
+  const taskYield = openEffect?.task_yield ?? openEffect?.yield ?? undefined;
+  const openWaiter = openEffect?.waiter_ref
+    ?? documentText(taskYield, "waiter_ref");
+  const taskYieldStatus = documentText(taskYield, "status", "state");
+  const taskYieldTask = documentText(taskYield, "task_ref", "run_ref");
+  const taskYieldSession = documentText(
+    taskYield,
+    "session_ref",
+    "root_session_ref",
+  );
   const responseReceipts = request.responses?.map((response) => {
     const receipt = isRecord(response.receipt) ? response.receipt : undefined;
     return firstDefined(response, "receipt_ref", "response_receipt_ref")
+      ?? firstDefined(receipt ?? {}, "receipt_ref");
+  }).filter((value): value is string => typeof value === "string") ?? [];
+  const rejectionReceipts = request.response_rejections?.map((rejection) => {
+    const receipt = isRecord(rejection.receipt) ? rejection.receipt : undefined;
+    return firstDefined(rejection, "receipt_ref")
       ?? firstDefined(receipt ?? {}, "receipt_ref");
   }).filter((value): value is string => typeof value === "string") ?? [];
   const evaluationReceipt = isRecord(request.evaluation?.receipt)
@@ -1608,13 +1642,48 @@ function RequestDetails({
       <summary>查看请求身份、验收与恢复票据</summary>
       <dl>
         <Detail label="Request identity" value={`${request.request_ref} · current revision ${request.revision}`} />
-        <Detail label="Owner" value={request.issuer} />
+        <Detail
+          label="Issuer / request owner"
+          value={`${request.issuer} · ${operation?.request_owner ?? request.issuer}`}
+        />
+        <Detail label="Open effect" value={openEffect?.effect_id} />
+        <Detail
+          label="Operation"
+          value={operation
+            ? `${operation.operation_id} · ${operation.task_ref}`
+            : undefined}
+        />
+        <Detail
+          label="Attempt / generation"
+          value={operation
+            ? `${operation.attempt_ref} · generation ${operation.generation}`
+            : undefined}
+        />
+        <Detail
+          label="Quest / Root Session"
+          value={operation
+            ? `${operation.quest_ref ?? "none"} · ${operation.root_session_ref}`
+            : undefined}
+        />
+        <Detail label="Open waiter" value={openWaiter} />
+        <Detail label="Open receipt" value={openEffect?.receipt.receipt_ref} />
+        <Detail
+          label="Task yield"
+          value={taskYieldStatus || taskYieldTask || taskYieldSession
+            ? [taskYieldStatus, taskYieldTask, taskYieldSession]
+              .filter((item): item is string => Boolean(item))
+              .join(" · ")
+            : undefined}
+        />
+        <Detail label="Predecessor request" value={request.predecessor_request_ref ?? undefined} />
+        <Detail label="Successor request" value={request.successor_request_ref ?? undefined} />
         <Detail label="Business purpose" value={request.business_purpose} />
         <Detail label="TargetAssertion" value={stringify(request.target_assertion)} />
         <Detail label="Acceptance" value={request.acceptance_conditions?.join("；")} />
         <Detail label="Required authorization" value={stringify(request.required_authorization)} />
         <Detail label="Human responses" value={String(request.responses?.length ?? 0)} />
         <Detail label="Response receipts" value={responseReceipts.join("；") || "none"} />
+        <Detail label="Rejected response receipts" value={rejectionReceipts.join("；") || "none"} />
         <Detail label="Owner Evaluation" value={typeof evaluation === "string" ? evaluation : "pending"} />
         <Detail label="Evaluation receipt" value={typeof evaluationReceipt === "string" ? evaluationReceipt : undefined} />
         <Detail label="Disposition" value={typeof disposition === "string" ? disposition : "pending"} />
@@ -1708,20 +1777,20 @@ function IntentDraftingSession({
   };
 
   return (
-    <aside className="hc-request-draft" aria-label={`${requestCopy[request.kind].list} Drafting Session`}>
+    <aside className="hc-request-draft" aria-label={`${requestCopy[request.kind].list}相关交流`}>
       <header>
         <span className="hc-draft-orb" aria-hidden="true" />
-        <div><small>INTENT DRAFTING SESSION</small><b>询问与协商</b><span>request context</span></div>
+        <div><small>询问与协商</small><b>和研究助手聊一聊</b><span>只讨论当前事项</span></div>
       </header>
       <div className="hc-draft-transcript" aria-live="polite">
         {!scoped.length ? (
           <article>
-            <small>COMPANION · REQUEST CONTEXT</small>
+            <small>当前事项</small>
             <p>{request.obligation} 你可以询问状态、验收边界或讨论替代路线。</p>
           </article>
         ) : scoped.map((message, index) => (
           <article className={message.role === "user" ? "me" : ""} key={message.message_ref ?? index}>
-            <small>{message.role === "user" ? "YOU · CONVERSATION" : "COMPANION · EXPLANATION"}</small>
+            <small>{message.role === "user" ? "你" : "研究助手"}</small>
             <p>{messageText(message)}</p>
           </article>
         ))}
@@ -1741,14 +1810,14 @@ function IntentDraftingSession({
             <button
               type="submit"
               disabled={sending || !draft.trim()}
-              aria-label="发送 Draft Session 消息"
+              aria-label="发送消息"
             >↑</button>
           </span>
         </label>
         <small>{error ? `发送失败 · ${error}` : `${draft.length} 字 · Enter 发送 · Shift+Enter 换行`}</small>
       </form>
-      <div className="hc-draft-status">Drafting Session 不会提交、满足或拒绝左侧 HumanRequest。</div>
-      <div className="hc-draft-boundary">聊天帮助解释状态和形成草案；只有左侧明确提交才形成 HumanRequestResponse。</div>
+      <div className="hc-draft-status">这里的交流不会提交回应，也不会改变当前事项的处理状态。</div>
+      <div className="hc-draft-boundary">聊天可以帮助理解情况；只有左侧明确提交，才会记录你的回应。</div>
     </aside>
   );
 }
@@ -1823,8 +1892,10 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-function RequestForm({ request, onChanged }: {
+function RequestForm({ request, commands, authorizations, onChanged }: {
   request: HumanRequestItem;
+  commands: HumanCommand[];
+  authorizations: HumanCapabilityAuthorization[];
   onChanged: () => void;
 }) {
   const [note, setNote] = useState("");
@@ -1936,8 +2007,8 @@ function RequestForm({ request, onChanged }: {
   if (request.status !== "open") {
     return (
       <div className="hc-response-boundary" role="status">
-        <b>这个 revision 已终结 · {request.status}</b><br />
-        历史回应与 receipt 可在详情中查看；终态请求不能重新提交或恢复。
+        <b>这件事已处理 · {requestStatusLabel(request.status)}</b><br />
+        处理记录可在详情中查看；如果出现后续待办，可在那里补充。
       </div>
     );
   }
@@ -1955,7 +2026,7 @@ function RequestForm({ request, onChanged }: {
         <span aria-hidden="true">✓</span>
         <div>
           <h3>回应已提交</h3>
-          <p>Owner Evaluation 尚未完成；表单已退出且不能重复提交，当前 waiter 也不会自动恢复。</p>
+          <p>系统正在核对回应；表单已关闭。只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
         </div>
       </section>
     );
@@ -1973,14 +2044,23 @@ function RequestForm({ request, onChanged }: {
         <OfflineForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending} />
       ) : null}
       {request.kind === "capability_authorization" ? (
-        <PermissionForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending} />
+        <PermissionForm
+          request={request}
+          commands={commands}
+          authorizations={authorizations}
+          note={note}
+          setNote={setNote}
+          submit={submit}
+          disabled={pending}
+          onChanged={onChanged}
+        />
       ) : null}
       {error || request.kind !== "library_reconnect" ? (
       <div className="hc-response-boundary" role="status">
         {error ? (
           <><b>回应没有记录</b><br />{error}</>
         ) : (
-          <><b>回应 ≠ 已满足 ≠ 已恢复</b><br />Owner 会验证精确 revision、证据、授权与 currentness。</>
+          <><b>提交回应不会立即代表条件已经满足</b><br />系统会核对当前任务、材料和授权；只有核对通过且没有其他阻碍，相关工作才会继续。</>
         )}
       </div>
       ) : null}
@@ -2012,7 +2092,7 @@ function OptionalNote({
   return (
     <label className="hc-optional-note">
       <span><b>有自己的处理想法？只填这里也可以</b><em>备注 · 可选</em></span>
-      <p>不需要先完成其他字段；Owner 会依据实际内容判断是否还需补充。</p>
+      <p>不需要先完成其他字段；核对时会判断是否还需补充。</p>
       <textarea value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />
     </label>
   );
@@ -2058,13 +2138,13 @@ function LibraryForm({
       </RequestIntro>
       <section className="hc-library-options" aria-label="图书馆访问恢复选项">
         <button type="button" disabled={disabled} onClick={() => void submit({ route: "institutional_browser_reconnected" })}>
-          <i>推荐 · RETEST</i><b>我已重连</b><small>只提交重连声明；Runtime 会重新测试当前路线。</small>
+          <i>推荐 · 重新检查</i><b>我已重连</b><small>提交后会重新检查当前访问路线。</small>
         </button>
         <button type="button" disabled={disabled} onClick={() => setMode("oa")}>
-          <i>OA 替代 · RESPONSE</i><b>跳过，之后只用 OA</b><small>选择更窄的获取路线；无需额外 Capability Authorization。</small>
+          <i>OA 替代</i><b>跳过，之后只用 OA</b><small>选择更窄的获取路线；无需申请额外权限。</small>
         </button>
         <button type="button" disabled={disabled} onClick={() => setMode("material")}>
-          <i>提供全文 · MATERIAL</i><b>手动上传该文献</b><small>提交文件或本地路径，等待 Research Memory 接纳。</small>
+          <i>提供全文</i><b>手动上传该文献</b><small>提交文件或本地路径，等待系统核对。</small>
         </button>
       </section>
       <div className="hc-secret-note" role="note">
@@ -2074,9 +2154,9 @@ function LibraryForm({
       {mode === "oa" ? (
         <section className="hc-choice-panel">
           <h4>提交 OA-only 路线回应？</h4>
-          <p>这仍是 HumanRequestResponse；Acquisition Runtime 会验证更窄的 OA 路线，无需建立新的授权。</p>
+          <p>提交后系统会核对这条更窄的 OA 路线，不会建立新的授权。</p>
           {request.impact_preview ? <ImpactPreview preview={request.impact_preview} /> : (
-            <p className="hc-preview-missing">Owner Impact Preview 尚未提供，因此这里不会伪造确认或授权。</p>
+            <p className="hc-preview-missing">影响说明尚未提供，因此这里只记录你的选择，不会自动授权。</p>
           )}
           <button type="button" disabled={disabled} onClick={() => void submit({ route: "oa_only" })}>提交 OA 路线回应</button>
         </section>
@@ -2103,10 +2183,10 @@ function LibraryForm({
               placeholder="例如 /data/papers/source.pdf"
             />
           </label>
-          <p>文件或本地路径会先交给 Research Memory；只有 Asset Accepted receipt 形成后，才会提交这个回应。</p>
+          <p>文件或本地路径会先安全保存并核对；核对通过后才会提交这个回应。</p>
           {!acquisitionPaperId ? (
             <p className="hc-preview-missing">
-              当前请求缺少 Owner 签发的 acquisition_paper_id，不能提交未绑定到精确获取项的全文。
+              当前事项没有绑定到具体文献，暂时无法提交这份全文。
             </p>
           ) : null}
           <button type="button" disabled={disabled || !acquisitionPaperId} onClick={() => void submit(
@@ -2133,7 +2213,7 @@ function LibraryForm({
         </label>
         <footer>
           <small>这会提交回应，不会直接判定请求已满足。</small>
-          <button type="button" disabled={disabled} onClick={() => void submit({})}>提交这条想法</button>
+          <button type="button" disabled={disabled} onClick={() => void submit({}, "deferred")}>提交这条想法</button>
         </footer>
       </section>
     </>
@@ -2196,7 +2276,7 @@ function ExternalForm({
             />
           </label>
         </div>
-        <p className="hc-asset-boundary">文件或路径会先由 Research Memory 接纳；只有真实 Asset Accepted receipt 会随回应交回。</p>
+        <p className="hc-asset-boundary">文件或路径会先安全保存并核对；核对通过后才会随回应交回。</p>
       </section>
       <OptionalNote value={note} onChange={setNote} placeholder="例如：审批周期太长，建议改用公开替代数据。" />
       <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit(
@@ -2257,7 +2337,7 @@ function OfflineForm({
               下载实验说明.md ↓
             </a>
           ) : (
-            <small className="hc-protocol-unavailable">Owner 未提供可下载协议</small>
+            <small className="hc-protocol-unavailable">暂无可下载协议</small>
           )}
         </header>
         <ol className="hc-short-steps">
@@ -2317,30 +2397,117 @@ function OfflineForm({
 
 function PermissionForm({
   request,
+  commands,
+  authorizations,
   note,
   setNote,
   submit,
   disabled,
+  onChanged,
 }: {
   request: HumanRequestItem;
+  commands: HumanCommand[];
+  authorizations: HumanCapabilityAuthorization[];
   note: string;
   setNote: (value: string) => void;
   submit: SubmitResponse;
   disabled: boolean;
+  onChanged: () => void;
 }) {
   const [decision, setDecision] = useState<"denied" | "allow_once" | null>(null);
+  const [recordedCommand, setRecordedCommand] = useState<HumanCommand | null>(null);
+  const [recordedAuthorization, setRecordedAuthorization] = useState<HumanCapabilityAuthorization | null>(null);
+  const [authorizationPending, setAuthorizationPending] = useState(false);
+  const [authorizationError, setAuthorizationError] = useState<string | null>(null);
+  const [reviewedPreviewRef, setReviewedPreviewRef] = useState<string | null>(null);
   const authorization = request.required_authorization ?? {};
+  const authorizationScope = isRecord(authorization.scope)
+    ? authorization.scope
+    : {};
+  const capability = typeof authorization.capability === "string"
+    ? authorization.capability
+    : "";
+  const commandScopeRef = `human_request:${request.request_ref}`;
+  const projectedCommand = [...commands].reverse().find((item) =>
+    item.scope_ref === commandScopeRef
+      && item.draft.command_kind === "capability_authorization"
+      && item.draft.payload.capability === capability
+      && item.draft.payload.decision === "granted"
+      && stringify(item.draft.payload.scope) === stringify(authorizationScope),
+  ) ?? null;
+  const command = projectedCommand ?? recordedCommand;
+  const projectedAuthorization = authorizations.find((item) =>
+    item.confirmation_receipt_ref === command?.confirmation_receipt?.receipt_ref
+      && item.decision === "granted"
+      && item.is_current !== false
+      && stringify(item.requirement) === stringify(authorization),
+  ) ?? null;
+  const authorizationReceipt = projectedAuthorization ?? recordedAuthorization;
+  const preview = command?.impact_preview;
+  const currentPreview = preview?.status === "current"
+    && preview.draft_revision === command?.draft_revision
+    && preview.draft_hash === command?.draft_hash;
+
+  useEffect(() => {
+    setDecision(null);
+    setRecordedCommand(null);
+    setRecordedAuthorization(null);
+    setAuthorizationPending(false);
+    setAuthorizationError(null);
+    setReviewedPreviewRef(null);
+  }, [request.request_ref]);
+
+  const runAuthorizationStep = async (
+    operation: () => Promise<HumanCommand | HumanCapabilityAuthorization>,
+  ) => {
+    if (authorizationPending || disabled) return;
+    setAuthorizationPending(true);
+    setAuthorizationError(null);
+    try {
+      const result = await operation();
+      if ("intent_id" in result) {
+        if (
+          result.scope_ref !== commandScopeRef
+          || result.draft.command_kind !== "capability_authorization"
+          || result.draft.payload.capability !== capability
+          || result.draft.payload.decision !== "granted"
+          || stringify(result.draft.payload.scope)
+            !== stringify(authorizationScope)
+        ) {
+          throw new Error("capability_authorization_command_invalid");
+        }
+        setRecordedCommand(result);
+      } else {
+        if (
+          result.decision !== "granted"
+          || result.is_current === false
+          || stringify(result.requirement) !== stringify(authorization)
+          || result.confirmation_receipt_ref
+            !== command?.confirmation_receipt?.receipt_ref
+        ) {
+          throw new Error("capability_authorization_invalid");
+        }
+        setRecordedAuthorization(result);
+      }
+      onChanged();
+    } catch (caught) {
+      setAuthorizationError(reasonCode(caught));
+    } finally {
+      setAuthorizationPending(false);
+    }
+  };
+
   const summary = [
     ["允许什么", firstDefined(authorization, "capability", "method", "action")],
-    ["访问哪里", firstDefined(authorization, "destination", "scope", "target")],
-    ["持续多久", firstDefined(authorization, "duration", "expires_at", "valid_for")],
-    ["明确不允许", firstDefined(authorization, "exclusions", "forbidden", "not_allowed")],
+    ["访问哪里", firstDefined(authorizationScope, "destination", "target")],
+    ["持续多久", firstDefined(authorizationScope, "duration", "expires_at", "valid_for")],
+    ["明确不允许", firstDefined(authorizationScope, "exclusions", "forbidden", "not_allowed")],
   ] as const;
   return (
     <>
       <RequestIntro>
         <h3>决定是否允许精确、低频的能力扩张。</h3>
-        <p>普通可逆本地研究已经由 Quest broad authorization 覆盖；这里仅处理超出既有范围的动作。</p>
+        <p>日常、可撤销的本地研究已在现有范围内；这里仅处理超出范围的动作。</p>
       </RequestIntro>
       <section className="hc-permission-brief">
         {summary.map(([label, value]) => (
@@ -2348,17 +2515,97 @@ function PermissionForm({
         ))}
       </section>
       {request.impact_preview ? <ImpactPreview preview={request.impact_preview} /> : (
-        <p className="hc-preview-missing">Owner Impact Preview 尚未提供；提交只记录回应，不会被前端当成已执行。</p>
+        <p className="hc-preview-missing">影响说明尚未提供；提交只记录回应，不代表动作已经执行。</p>
       )}
       <div className="hc-permission-actions">
         <button type="button" aria-pressed={decision === "denied"} onClick={() => setDecision("denied")}>拒绝这次访问</button>
-        <button type="button" className="allow" aria-pressed={decision === "allow_once"} onClick={() => setDecision("allow_once")}>仅允许本次 Run</button>
+        <button type="button" className="allow" aria-pressed={decision === "allow_once"} onClick={() => setDecision("allow_once")}>仅允许本次任务</button>
       </div>
       <OptionalNote value={note} onChange={setNote} placeholder="例如：仅允许 /metadata，并限制最多下载 10 MB。" />
-      <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit(
-        decision ? { authorization_decision: decision } : {},
-        decision === "denied" ? "declined" : "provided",
-      )}>提交回应</button>
+      {decision === "allow_once" ? (
+        <section className="lumen-command" data-command-status={command?.status ?? "required"}>
+          <small>本次精确授权</small>
+          {!command ? (
+            <button
+              type="button"
+              disabled={disabled || authorizationPending || !capability}
+              onClick={() => void runAuthorizationStep(() => createHumanCommand(
+                commandScopeRef,
+                {
+                  command_kind: "capability_authorization",
+                  payload: {
+                    capability,
+                    decision: "granted",
+                    scope: authorizationScope,
+                  },
+                },
+              ))}
+            >建立授权草案</button>
+          ) : null}
+          {command && !currentPreview && !command.confirmation_receipt ? (
+            <button
+              type="button"
+              disabled={disabled || authorizationPending}
+              onClick={() => void runAuthorizationStep(() => previewHumanCommand(command))}
+            >生成并核对影响说明</button>
+          ) : null}
+          {command && currentPreview && preview && !command.confirmation_receipt ? (
+            <>
+              <details onToggle={(event) => {
+                if (event.currentTarget.open) {
+                  setReviewedPreviewRef(preview.preview_ref);
+                }
+              }}>
+                <summary>查看本次授权会发生什么</summary>
+                <div className="lumen-owner-previews">
+                  {preview.owner_previews.map((owner) => (
+                    <section key={owner.digest}>
+                      <b>会发生</b><p>{owner.will_happen.join("；")}</p>
+                      <b>不会发生</b><p>{owner.will_not_happen.join("；")}</p>
+                      <b>风险与失效条件</b><p>{[...owner.risks, ...owner.stale_conditions].join("；")}</p>
+                    </section>
+                  ))}
+                </div>
+              </details>
+              <button
+                type="button"
+                disabled={disabled || authorizationPending || reviewedPreviewRef !== preview.preview_ref}
+                onClick={() => void runAuthorizationStep(() => confirmHumanCommand(command))}
+              >确认当前草案与影响说明</button>
+            </>
+          ) : null}
+          {command?.confirmation_receipt && !authorizationReceipt ? (
+            <button
+              type="button"
+              disabled={disabled || authorizationPending}
+              onClick={() => void runAuthorizationStep(() => authorizeHumanCommand(command))}
+            >签发仅限本次任务的授权</button>
+          ) : null}
+          {authorizationReceipt ? (
+            <p role="status">本次授权已记录；提交回应后，系统还会独立核对并决定是否继续任务。</p>
+          ) : null}
+          {authorizationError ? <em role="alert">授权步骤失败 · {authorizationError}</em> : null}
+        </section>
+      ) : null}
+      {decision === "denied" ? (
+        <button
+          className="hc-submit"
+          type="button"
+          disabled={disabled}
+          onClick={() => void submit({}, "declined")}
+        >提交拒绝</button>
+      ) : null}
+      {decision === "allow_once" && authorizationReceipt ? (
+        <button
+          className="hc-submit"
+          type="button"
+          disabled={disabled || authorizationPending}
+          onClick={() => void submit(
+            { authorization_receipt_ref: authorizationReceipt.receipt_ref },
+            "provided",
+          )}
+        >提交授权回应</button>
+      ) : null}
     </>
   );
 }

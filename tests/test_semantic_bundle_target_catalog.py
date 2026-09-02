@@ -382,6 +382,8 @@ def _issue(gateway, operation_ids):
         fence_ref="bundle-fence:1",
         capability_binding_hash="a" * 64,
         operation_ids=operation_ids,
+        root_kind="bundle",
+        phase="primary",
     )
     return connection
 

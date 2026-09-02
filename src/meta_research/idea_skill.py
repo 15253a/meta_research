@@ -77,6 +77,12 @@ from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticRecorder,
     root_operation_diagnostic_ref,
 )
+from meta_research.root_resident_mcp import (
+    RootResidentMcpAuthority,
+    RootResidentMcpChannels,
+    RootResidentMcpError,
+    RootResidentMcpRuntimeFacts,
+)
 from meta_research.quest_drafting import (
     CODEX_DRAFTING_LOCKED_VERSION,
     PROVIDER_RESULT_MAX_BYTES,
@@ -223,6 +229,7 @@ class IdeaSkillUnavailable(RuntimeError):
         rejected_candidate: dict[str, object] | None = None,
         rejected_native_session_ref: str | None = None,
         rejected_detail_code: str | None = None,
+        native_session_ref: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
@@ -234,6 +241,7 @@ class IdeaSkillUnavailable(RuntimeError):
         )
         self.rejected_native_session_ref = rejected_native_session_ref
         self.rejected_detail_code = rejected_detail_code
+        self.native_session_ref = native_session_ref or rejected_native_session_ref
 
 
 class RecoverableIdeaSkillCandidateError(IdeaSkillContractError):
@@ -763,6 +771,9 @@ class IdeaSkillRequest:
     owner_rejection_kind: str | None = None
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
+    run_ref: str | None = None
+    attempt_ref: str | None = None
+    fence_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1033,6 +1044,29 @@ class CodexIdeaSkillAdapter:
         self._root_operation_diagnostic_recorder: (
             RootOperationDiagnosticRecorder | None
         ) = None
+        self._root_resident_mcp = RootResidentMcpChannels(
+            self._root_agent_kind
+        )
+
+    def bind_resident_mcp_authority(
+        self, authority: RootResidentMcpAuthority
+    ) -> None:
+        try:
+            self._root_resident_mcp.bind_authority(authority)
+        except RootResidentMcpError as error:
+            raise IdeaSkillUnavailable(error.code) from error
+
+    def configure_resident_mcp_endpoint(self, base_url: str) -> None:
+        try:
+            self._root_resident_mcp.configure_endpoint(base_url)
+        except RootResidentMcpError as error:
+            raise IdeaSkillUnavailable(error.code) from error
+
+    def _resident_mcp_runtime_facts(self) -> RootResidentMcpRuntimeFacts:
+        try:
+            return self._root_resident_mcp.runtime_facts()
+        except RootResidentMcpError as error:
+            raise IdeaSkillUnavailable(error.code) from error
 
     def bind_root_operation_diagnostics_recorder(
         self, recorder: RootOperationDiagnosticRecorder
@@ -1259,9 +1293,15 @@ class CodexIdeaSkillAdapter:
             ) from error
 
     def request_stop(self) -> None:
-        request_stop = getattr(self._runner, "request_stop", None)
-        if callable(request_stop):
-            request_stop()
+        try:
+            request_stop = getattr(self._runner, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
+        finally:
+            try:
+                self._root_resident_mcp.release_all()
+            except RootResidentMcpError as error:
+                raise IdeaSkillUnavailable(error.code) from error
 
     def cancel_job(self, job_ref: str) -> None:
         self._request_durable_job_stop(job_ref)
@@ -1303,9 +1343,15 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
 
     def finish_job(self, job_ref: str) -> None:
-        finish_job = getattr(self._runner, "finish_job", None)
-        if callable(finish_job):
-            finish_job(job_ref)
+        try:
+            finish_job = getattr(self._runner, "finish_job", None)
+            if callable(finish_job):
+                finish_job(job_ref)
+        finally:
+            try:
+                self._root_resident_mcp.release_job(job_ref)
+            except RootResidentMcpError as error:
+                raise IdeaSkillUnavailable(error.code) from error
 
     def reconcile_cancelled_job(self, job_ref: str) -> bool:
         """Stop and verify every durable phase belonging to a terminal Run."""
@@ -1317,6 +1363,10 @@ class CodexIdeaSkillAdapter:
             / canonical_hash({"job_ref": job_ref})
         )
         if not operation_root.exists():
+            try:
+                self._root_resident_mcp.release_job(job_ref)
+            except RootResidentMcpError as error:
+                raise IdeaSkillUnavailable(error.code) from error
             return True
         try:
             _key_path, key = self._transport_key()
@@ -1407,12 +1457,20 @@ class CodexIdeaSkillAdapter:
                 )
         except (OSError, ProviderSupervisorError, IdeaSkillUnavailable):
             return False
+        try:
+            self._root_resident_mcp.release_job(job_ref)
+        except RootResidentMcpError as error:
+            raise IdeaSkillUnavailable(error.code) from error
         return True
 
     def runtime_binding(self) -> IdeaRuntimeBinding:
         resources = _idea_skill_resources()
+        resident_mcp_facts = self._resident_mcp_runtime_facts()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_source_hash = _file_sha256(Path(__file__).resolve())
+        resident_mcp_source_hash = _file_sha256(
+            Path(__file__).with_name("root_resident_mcp.py").resolve()
+        )
         supervisor_source_hash = _file_sha256(
             Path(__file__).with_name("provider_supervisor.py").resolve()
         )
@@ -1436,18 +1494,23 @@ class CodexIdeaSkillAdapter:
                 {
                     "skill_instructions": _idea_skill_instructions(),
                     "adapter_source_hash": adapter_source_hash,
+                    "resident_mcp_source_hash": resident_mcp_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
                 }
             ),
             model_ref=self._model_ref,
             harness_adapter_ref=harness_ref,
-            mcp_bindings=(),
+            mcp_bindings=resident_mcp_facts.mcp_bindings,
             capability_bindings=merge_root_capability_bindings(
                 (
                     "approval-policy-never",
                     "filesystem-danger-full-access",
                     "user-config-loaded",
-                    "mcp-config-empty",
+                    *(
+                        ("mcp-config-empty",)
+                        if not resident_mcp_facts.mcp_bindings
+                        else resident_mcp_facts.capability_bindings
+                    ),
                     "native-session-resume",
                     "structured-output-json-schema",
                     "trusted-local-quest-authorization",
@@ -1467,6 +1530,8 @@ class CodexIdeaSkillAdapter:
             + (
                 f"adapter-source:meta_research.idea_skill@sha256:"
                 f"{adapter_source_hash}",
+                "adapter-source:meta_research.root_resident_mcp@sha256:"
+                f"{resident_mcp_source_hash}",
                 f"adapter-source:meta_research.provider_supervisor@sha256:"
                 f"{supervisor_source_hash}",
                 "disabled-codex-features:"
@@ -1484,7 +1549,8 @@ class CodexIdeaSkillAdapter:
                 "sandbox-policy:danger-full-access",
                 "transport-seal-key:sha256:"
                 + transport_key_hash(transport_key),
-            ),
+            )
+            + resident_mcp_facts.resource_bindings,
         )
 
     def _transport_key(self) -> tuple[Path, bytes]:
@@ -1718,6 +1784,7 @@ class CodexIdeaSkillAdapter:
             failure_code,
             recovery_checkpoint=checkpoint,
             rejected_candidate=rejected_candidate,
+            native_session_ref=native_session_ref,
             rejected_native_session_ref=(
                 observed_session_ref if rejected_candidate is not None else None
             ),
@@ -1731,8 +1798,16 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
         skill = _idea_skill_instructions()
         lineage = _idea_owner_rejection_prompt(request)
+        human_resume = (
+            ""
+            if request.native_session_ref is None
+            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
+            "human_request.open.reconcile，读取 resolution 后再判断"
+            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
+        )
         primary_prompt = (
             f"{skill}\n\n"
+            f"{human_resume}"
             "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
             "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是 Idea 主 Agent。只返回 {\"outcome\": ...}，其中 outcome 是一个完整 "
@@ -1747,7 +1822,8 @@ class CodexIdeaSkillAdapter:
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"context_pack={canonical_json(request.context_pack)}"
         )
-        primary_output, primary_session, _primary_stdout = self._invoke(
+        primary_output, primary_session, _primary_stdout = (
+            self._invoke_root_operation(
             operation_name="primary",
             prompt=primary_prompt,
             schema=_outcome_envelope_schema(
@@ -1755,6 +1831,12 @@ class CodexIdeaSkillAdapter:
             ),
             native_session_ref=request.native_session_ref,
             job_ref=request.job_ref,
+            run_ref=request.run_ref,
+            attempt_ref=request.attempt_ref,
+            root_session_ref=request.root_session_ref,
+            fence_ref=request.fence_ref,
+            runtime_binding=request.runtime_binding.as_dict(),
+            )
         )
         if primary_session is None:
             raise IdeaSkillUnavailable("codex_primary_session_missing")
@@ -1804,7 +1886,7 @@ class CodexIdeaSkillAdapter:
             f"question={canonical_json(request.accepted_question_content)}\n"
             f"reviewed_draft={canonical_json(draft.draft)}"
         )
-        reviewed, resumed_session, _review_stdout = self._invoke(
+        reviewed, resumed_session, _review_stdout = self._invoke_root_operation(
             operation_name="review",
             prompt=reviewer_prompt,
             schema=_review_finalization_schema(
@@ -1812,6 +1894,11 @@ class CodexIdeaSkillAdapter:
             ),
             native_session_ref=draft.primary_session_ref,
             job_ref=request.job_ref,
+            run_ref=request.run_ref,
+            attempt_ref=request.attempt_ref,
+            root_session_ref=request.root_session_ref,
+            fence_ref=request.fence_ref,
+            runtime_binding=request.runtime_binding.as_dict(),
         )
         if resumed_session != draft.primary_session_ref:
             raise IdeaSkillUnavailable("codex_primary_session_changed")
@@ -1881,6 +1968,7 @@ class CodexIdeaSkillAdapter:
             failure_code,
             recovery_checkpoint=checkpoint,
             rejected_candidate=rejected_candidate,
+            native_session_ref=native_session_ref,
             rejected_native_session_ref=(
                 native_session_ref if rejected_candidate is not None else None
             ),
@@ -1889,6 +1977,143 @@ class CodexIdeaSkillAdapter:
                 if rejected_candidate is not None
                 else None
             ),
+        )
+
+    def _invoke_root_operation(
+        self,
+        *,
+        operation_name: str,
+        prompt: str,
+        schema: dict[str, object],
+        native_session_ref: str | None,
+        job_ref: str | None,
+        run_ref: str | None,
+        attempt_ref: str | None,
+        root_session_ref: str,
+        fence_ref: str | None,
+        runtime_binding: dict[str, object] | None = None,
+        runtime_binding_hash: str | None = None,
+        sandbox_read_root: Path | None = None,
+    ) -> tuple[dict[str, object], str | None, str]:
+        if not self._root_resident_mcp.enabled:
+            return self._invoke(
+                operation_name=operation_name,
+                prompt=prompt,
+                schema=schema,
+                native_session_ref=native_session_ref,
+                job_ref=job_ref,
+                sandbox_read_root=sandbox_read_root,
+            )
+        if run_ref is None or attempt_ref is None or fence_ref is None:
+            raise IdeaSkillUnavailable("semantic_mcp_scope_invalid")
+        if runtime_binding_hash is None:
+            if runtime_binding is None:
+                raise IdeaSkillUnavailable("semantic_mcp_scope_invalid")
+            runtime_binding_hash = canonical_hash(runtime_binding)
+        try:
+            channel_key, access = self._root_resident_mcp.acquire(
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                root_session_ref=root_session_ref,
+                fence_ref=fence_ref,
+                capability_binding_hash=runtime_binding_hash,
+                phase=operation_name,
+                job_ref=job_ref,
+            )
+        except RootResidentMcpError as error:
+            raise IdeaSkillUnavailable(error.code) from error
+        try:
+            result = self._invoke(
+                operation_name=operation_name,
+                prompt=prompt,
+                schema=schema,
+                native_session_ref=native_session_ref,
+                job_ref=job_ref,
+                mcp_url=access.url,
+                mcp_token=access.token,
+                mcp_scope_binding_hash=access.scope_binding_hash,
+                semantic_mcp_protected_environment=True,
+                authorized_operation_ids=access.operation_ids,
+                sandbox_read_root=sandbox_read_root,
+            )
+        except IdeaSkillUnavailable as error:
+            if error.code != "codex_operation_reconciliation_pending":
+                try:
+                    self._root_resident_mcp.release(channel_key)
+                except RootResidentMcpError as release_error:
+                    raise IdeaSkillUnavailable(release_error.code) from error
+            raise
+        except Exception:
+            try:
+                self._root_resident_mcp.release(channel_key)
+            except RootResidentMcpError as error:
+                raise IdeaSkillUnavailable(error.code) from error
+            raise
+        try:
+            self._root_resident_mcp.release(channel_key)
+        except RootResidentMcpError as error:
+            raise IdeaSkillUnavailable(error.code) from error
+        return result
+
+    def _invoke_optional_root_task_operation(
+        self,
+        *,
+        operation_name: str,
+        prompt: str,
+        schema: dict[str, object],
+        native_session_ref: str | None,
+        job_ref: str | None,
+        root_runtime_scope: object,
+        sandbox_read_root: Path | None = None,
+    ) -> tuple[dict[str, object], str | None, str]:
+        """Use a server-derived external Root scope when one is present."""
+
+        if root_runtime_scope is None:
+            return self._invoke(
+                operation_name=operation_name,
+                prompt=prompt,
+                schema=schema,
+                native_session_ref=native_session_ref,
+                job_ref=job_ref,
+                sandbox_read_root=sandbox_read_root,
+            )
+        required_fields = {
+            "quest_ref",
+            "run_ref",
+            "attempt_ref",
+            "root_session_ref",
+            "fence_ref",
+            "runtime_binding_hash",
+            "generation",
+        }
+        if (
+            not isinstance(root_runtime_scope, dict)
+            or set(root_runtime_scope) != required_fields
+            or any(
+                not isinstance(root_runtime_scope.get(field), str)
+                or not root_runtime_scope[field]
+                for field in required_fields - {"generation"}
+            )
+            or not isinstance(root_runtime_scope.get("generation"), int)
+            or isinstance(root_runtime_scope.get("generation"), bool)
+            or cast(int, root_runtime_scope["generation"]) < 1
+            or len(cast(str, root_runtime_scope["runtime_binding_hash"])) != 64
+        ):
+            raise IdeaSkillUnavailable("semantic_mcp_scope_invalid")
+        return self._invoke_root_operation(
+            operation_name=operation_name,
+            prompt=prompt,
+            schema=schema,
+            native_session_ref=native_session_ref,
+            job_ref=job_ref,
+            run_ref=cast(str, root_runtime_scope["run_ref"]),
+            attempt_ref=cast(str, root_runtime_scope["attempt_ref"]),
+            root_session_ref=cast(str, root_runtime_scope["root_session_ref"]),
+            fence_ref=cast(str, root_runtime_scope["fence_ref"]),
+            runtime_binding_hash=cast(
+                str, root_runtime_scope["runtime_binding_hash"]
+            ),
+            sandbox_read_root=sandbox_read_root,
         )
 
     def _invoke(
@@ -2386,33 +2611,49 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable("codex_cli_timeout") from error
         except OSError as error:
             raise IdeaSkillUnavailable("codex_cli_io_unavailable") from error
+        failed_native_session_ref = _recover_failed_native_session(
+            completed.stdout,
+            expected=native_session_ref,
+        )
         if _text_exceeds_limit(
             completed.stdout, transport_limits.stream_max_bytes
         ) or _text_exceeds_limit(
             completed.stderr, transport_limits.stream_max_bytes
         ):
-            raise IdeaSkillUnavailable("codex_output_too_large")
+            raise IdeaSkillUnavailable(
+                "codex_output_too_large",
+                native_session_ref=failed_native_session_ref,
+            )
         if stdout_path is not None and not stdout_path.exists():
             _write_durable(stdout_path, completed.stdout)
         effective_returncode = completed.returncode
-        if invocation_hash is not None:
-            if not supervised:
-                _write_local_exit_receipt(
+        try:
+            if invocation_hash is not None:
+                if not supervised:
+                    _write_local_exit_receipt(
+                        directory,
+                        invocation_hash=invocation_hash,
+                        returncode=completed.returncode,
+                        input_bytes=len(prompt.encode("utf-8")),
+                    )
+                exit_marker = _write_exit_marker(
                     directory,
                     invocation_hash=invocation_hash,
-                    returncode=completed.returncode,
-                    input_bytes=len(prompt.encode("utf-8")),
                 )
-            exit_marker = _write_exit_marker(
-                directory,
-                invocation_hash=invocation_hash,
-            )
-            effective_returncode = cast(int, exit_marker["returncode"])
-            hard_ceiling = _provider_hard_ceiling_error(exit_marker)
-            if hard_ceiling is not None:
-                raise hard_ceiling
+                effective_returncode = cast(int, exit_marker["returncode"])
+                hard_ceiling = _provider_hard_ceiling_error(exit_marker)
+                if hard_ceiling is not None:
+                    raise hard_ceiling
+        except IdeaSkillUnavailable as error:
+            raise _with_failed_native_session(
+                error,
+                native_session_ref=failed_native_session_ref,
+            ) from error
         if effective_returncode != 0:
-            raise IdeaSkillUnavailable("codex_cli_failed")
+            raise IdeaSkillUnavailable(
+                "codex_cli_failed",
+                native_session_ref=failed_native_session_ref,
+            )
         try:
             decoded = json.loads(
                 _read_idea_result(
@@ -2421,17 +2662,26 @@ class CodexIdeaSkillAdapter:
                 ),
                 parse_constant=_reject_non_finite_json_constant,
             )
-        except IdeaSkillUnavailable:
-            raise
+        except IdeaSkillUnavailable as error:
+            raise _with_failed_native_session(
+                error,
+                native_session_ref=failed_native_session_ref,
+            ) from error
         except (
             OSError,
             UnicodeDecodeError,
             ValueError,
             json.JSONDecodeError,
         ) as error:
-            raise IdeaSkillUnavailable("codex_output_invalid") from error
+            raise IdeaSkillUnavailable(
+                "codex_output_invalid",
+                native_session_ref=failed_native_session_ref,
+            ) from error
         if not isinstance(decoded, dict):
-            raise IdeaSkillUnavailable("codex_output_invalid")
+            raise IdeaSkillUnavailable(
+                "codex_output_invalid",
+                native_session_ref=failed_native_session_ref,
+            )
         return (
             cast(dict[str, object], decoded),
             _verified_native_session(
@@ -2852,6 +3102,38 @@ def _verified_native_session(stdout: str, *, expected: str | None) -> str:
     return observed
 
 
+def _recover_failed_native_session(
+    stdout: str,
+    *,
+    expected: str | None,
+) -> str | None:
+    """Recover only an unambiguous root Session from a failed provider turn."""
+
+    if not isinstance(stdout, str):
+        return None
+    try:
+        return _verified_native_session(stdout, expected=expected)
+    except IdeaSkillUnavailable:
+        return None
+
+
+def _with_failed_native_session(
+    error: IdeaSkillUnavailable,
+    *,
+    native_session_ref: str | None,
+) -> IdeaSkillUnavailable:
+    if native_session_ref is None or error.native_session_ref is not None:
+        return error
+    return IdeaSkillUnavailable(
+        error.code,
+        recovery_checkpoint=error.recovery_checkpoint,
+        rejected_candidate=error.rejected_candidate,
+        rejected_native_session_ref=error.rejected_native_session_ref,
+        rejected_detail_code=error.rejected_detail_code,
+        native_session_ref=native_session_ref,
+    )
+
+
 def _verify_primary_phase_trace(stdout: str) -> None:
     """Reject review collaboration that ran before the draft was frozen."""
 
@@ -3036,10 +3318,34 @@ def _read_completed_operation(
     native_session_ref: str | None,
     transport_limits: ProviderTransportLimits,
 ) -> tuple[dict[str, object], str | None, str]:
-    exit_marker = _verified_success_exit(
-        directory,
-        invocation_hash=invocation_hash,
-    )
+    try:
+        exit_marker = _verified_success_exit(
+            directory,
+            invocation_hash=invocation_hash,
+        )
+    except IdeaSkillUnavailable as error:
+        if error.recovery_checkpoint is None:
+            raise
+        recovered_session = None
+        try:
+            failed_stdout = _read_spool_text(
+                directory / "stdout.jsonl",
+                transport_limits.stream_max_bytes,
+            )
+        except (OSError, UnicodeDecodeError, IdeaSkillUnavailable):
+            pass
+        else:
+            recovered_session = _recover_failed_native_session(
+                failed_stdout,
+                expected=native_session_ref,
+            )
+        enriched = _with_failed_native_session(
+            error,
+            native_session_ref=recovered_session,
+        )
+        if enriched is error:
+            raise
+        raise enriched from error
     completion_path = directory / "completed.json"
     if not completion_path.exists():
         stdout_path = directory / "stdout.jsonl"

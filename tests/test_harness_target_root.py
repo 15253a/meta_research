@@ -40,7 +40,11 @@ from meta_research.runtime_protection import (
     RuntimeProtection,
     RuntimeProtectionUnavailable,
 )
-from meta_research.root_capabilities import root_capability_profile
+from meta_research.root_capabilities import (
+    ROOT_AGENT_KINDS,
+    RootAgentKind,
+    root_capability_profile,
+)
 from meta_research.semantic_mcp import (
     McpConnection,
     ResidentMcpBinding,
@@ -49,6 +53,7 @@ from meta_research.semantic_mcp import (
 from meta_research.semantic_owner_gateway import (
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
     REASONING_ROOT_SEMANTIC_OPERATION_IDS,
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
     TARGET_ROOT_SEMANTIC_OPERATION_IDS,
 )
 from meta_research.target_run_runtime_contract import (
@@ -250,6 +255,8 @@ class _Gateway:
         fence_ref: str,
         capability_binding_hash: str,
         operation_ids: tuple[str, ...],
+        root_kind: RootAgentKind | None,
+        phase: str,
     ) -> tuple[McpConnection, ResidentMcpBinding]:
         del run_ref, attempt_ref, root_session_ref, fence_ref
         del capability_binding_hash
@@ -267,6 +274,8 @@ class _Gateway:
                 health_receipt_ref="mcp-health:test",
                 connection_grant_ref=grant_ref,
                 operation_bindings=self.required_bindings(operation_ids),
+                root_kind=root_kind,
+                phase=phase,
             ),
         )
 
@@ -360,16 +369,24 @@ class _DiagnosticRecorder:
 class _ResidentScopeVerifier:
     def __init__(self) -> None:
         self.current = True
+        self.reconcile_current = False
+        self.root_kinds: list[RootAgentKind] = []
+        self.reconcile_root_kinds: list[RootAgentKind] = []
 
-    def verify_bundle_runtime_scope(self, **_scope: object) -> None:
+    def verify_root_agent_runtime_scope(
+        self, *, root_kind: RootAgentKind, **_scope: object
+    ) -> None:
+        self.root_kinds.append(root_kind)
         if not self.current:
             raise RuntimeError("resident_scope_stale")
         return None
 
-    def verify_reasoning_runtime_scope(self, **_scope: object) -> None:
-        if not self.current:
-            raise RuntimeError("resident_scope_stale")
-        return None
+    def verify_root_agent_human_request_reconcile_scope(
+        self, *, root_kind: RootAgentKind, **_scope: object
+    ) -> None:
+        self.reconcile_root_kinds.append(root_kind)
+        if not self.reconcile_current:
+            raise RuntimeError("resident_reconcile_scope_stale")
 
 
 class _Owner:
@@ -709,6 +726,89 @@ def test_resident_root_channel_rejects_catalog_selected_by_the_caller(
         for item in channel.binding.operation_bindings
     ) == BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
 
+    with pytest.raises(
+        HarnessAdmissionError, match="mcp_channel_scope_invalid"
+    ):
+        runtime.issue_resident_mcp_channel(
+            **{**scope, "subject_policy": "review_tree"},
+            operation_ids=("human_request.open",),
+        )
+
+
+@pytest.mark.parametrize("root_kind", ROOT_AGENT_KINDS)
+def test_each_root_operation_tree_lists_its_server_selected_catalog_and_one_recovery(
+    tmp_path: Path,
+    root_kind: RootAgentKind,
+) -> None:
+    runtime, owner, _adapter = _runtime(tmp_path)
+    verifier = _ResidentScopeVerifier()
+    runtime.bind_resident_mcp_scope_verifier(verifier)
+    expected_operation_ids = ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind]
+
+    channel = runtime.issue_resident_mcp_channel(
+        run_ref=owner.run.run_ref,
+        attempt_ref=owner.run.attempt_ref,
+        root_session_ref=owner.run.root_session_ref,
+        fence_ref=owner.run.fence_ref,
+        capability_binding_hash=owner.run.capability_binding_hash,
+        operation_ids=expected_operation_ids,
+        root_kind=root_kind,
+        phase="primary",
+        subject_policy="operation_tree",
+    )
+    status, payload, _session_id = runtime.dispatch_mcp_http(
+        channel.connection.token,
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        mcp_session_id="authenticated-agent-session",
+    )
+
+    assert status == 200
+    assert payload is not None
+    assert tuple(
+        item["name"] for item in payload["result"]["tools"]
+    ) == expected_operation_ids
+    assert channel.binding.root_kind == root_kind
+    assert channel.binding.phase == "primary"
+    expected_verifications = [root_kind, root_kind]
+
+    # One representative recovery proves that the catalog is selected again
+    # from root_kind after Attempt/Fence rotation, without constructing a
+    # kind-by-identity authorization matrix.
+    if root_kind == "acquisition":
+        runtime.revoke_resident_mcp_channel(channel)
+        recovered = runtime.issue_resident_mcp_channel(
+            run_ref=owner.run.run_ref,
+            attempt_ref="acquisition-attempt:recovery",
+            root_session_ref=owner.run.root_session_ref,
+            fence_ref="acquisition-fence:recovery",
+            capability_binding_hash=owner.run.capability_binding_hash,
+            operation_ids=expected_operation_ids,
+            root_kind=root_kind,
+            phase="recovery",
+            subject_policy="operation_tree",
+        )
+        recovered_status, recovered_payload, _ = runtime.dispatch_mcp_http(
+            recovered.connection.token,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {},
+            },
+            mcp_session_id="recovered-agent-session",
+        )
+
+        assert recovered_status == 200
+        assert recovered_payload is not None
+        assert tuple(
+            item["name"] for item in recovered_payload["result"]["tools"]
+        ) == expected_operation_ids
+        assert recovered.binding.phase == "recovery"
+        assert recovered.connection.token != channel.connection.token
+        expected_verifications.extend((root_kind, root_kind))
+
+    assert verifier.root_kinds == expected_verifications
+
 
 def test_operation_tree_channel_allows_root_reconnect_and_child_clients(
     tmp_path: Path,
@@ -810,6 +910,146 @@ def test_operation_tree_channel_allows_root_reconnect_and_child_clients(
     assert root[1] == BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
     assert reconnect[1] == root[1]
     assert child[1] == root[1]
+
+
+def test_suspended_root_keeps_bearer_only_for_mcp_and_lost_ack_reconcile(
+    tmp_path: Path,
+) -> None:
+    runtime, owner, _adapter = _runtime(tmp_path)
+    verifier = _ResidentScopeVerifier()
+    runtime.bind_resident_mcp_scope_verifier(verifier)
+    channel = runtime.issue_resident_mcp_channel(
+        run_ref=owner.run.run_ref,
+        attempt_ref=owner.run.attempt_ref,
+        root_session_ref=owner.run.root_session_ref,
+        fence_ref=owner.run.fence_ref,
+        capability_binding_hash=owner.run.capability_binding_hash,
+        operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+        root_kind="bundle",
+        phase="primary",
+        subject_policy="operation_tree",
+    )
+    token = channel.connection.token
+    ordinary_operation = next(
+        operation_id
+        for operation_id in BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+        if not operation_id.startswith("human_request.")
+    )
+
+    verifier.current = False
+    verifier.reconcile_current = True
+    denied, _payload, _ = runtime.dispatch_mcp_http(
+        token,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": ordinary_operation, "arguments": {}},
+        },
+        mcp_session_id="suspended-root",
+    )
+    assert denied == 401
+    assert verifier.reconcile_root_kinds == []
+
+    listed, _payload, _ = runtime.dispatch_mcp_http(
+        token,
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        mcp_session_id="suspended-root",
+    )
+    assert listed == 200
+    assert verifier.reconcile_root_kinds == ["bundle"]
+
+    reconciled, _payload, _ = runtime.dispatch_mcp_http(
+        token,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "human_request.open.reconcile",
+                "arguments": {},
+            },
+        },
+        mcp_session_id="suspended-root",
+    )
+    assert reconciled == 200
+    assert verifier.reconcile_root_kinds == ["bundle", "bundle"]
+
+    verifier.current = True
+    resumed, _payload, _ = runtime.dispatch_mcp_http(
+        token,
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": ordinary_operation, "arguments": {}},
+        },
+        mcp_session_id="resumed-root",
+    )
+    assert resumed == 200
+
+
+def test_suspended_root_can_reissue_exact_reconcile_channel_after_restart(
+    tmp_path: Path,
+) -> None:
+    runtime, owner, _adapter = _runtime(tmp_path)
+    verifier = _ResidentScopeVerifier()
+    verifier.current = False
+    verifier.reconcile_current = True
+    runtime.bind_resident_mcp_scope_verifier(verifier)
+
+    channel = runtime.issue_resident_mcp_channel(
+        run_ref=owner.run.run_ref,
+        attempt_ref=owner.run.attempt_ref,
+        root_session_ref=owner.run.root_session_ref,
+        fence_ref=owner.run.fence_ref,
+        capability_binding_hash=owner.run.capability_binding_hash,
+        operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+        root_kind="bundle",
+        phase="primary",
+        subject_policy="operation_tree",
+    )
+    ordinary_operation = next(
+        operation_id
+        for operation_id in BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
+        if not operation_id.startswith("human_request.")
+    )
+
+    denied, _payload, _ = runtime.dispatch_mcp_http(
+        channel.connection.token,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": ordinary_operation, "arguments": {}},
+        },
+        mcp_session_id="restarted-root",
+    )
+    assert denied == 401
+
+    listed, _payload, _ = runtime.dispatch_mcp_http(
+        channel.connection.token,
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        mcp_session_id="restarted-root",
+    )
+    assert listed == 200
+
+    reconciled, _payload, _ = runtime.dispatch_mcp_http(
+        channel.connection.token,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "human_request.open.reconcile",
+                "arguments": {},
+            },
+        },
+        mcp_session_id="restarted-root",
+    )
+    assert reconciled == 200
+    assert verifier.root_kinds == ["bundle"] * 4
+    assert verifier.reconcile_root_kinds == ["bundle", "bundle", "bundle"]
 
 
 def test_operation_tree_bearers_keep_exact_catalog_and_revocation_boundaries(

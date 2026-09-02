@@ -7,9 +7,12 @@ import json
 from pathlib import Path
 import subprocess
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from meta_research.idea_skill import IdeaSkillUnavailable
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.writing_contract import (
     WRITING_PAPER_INTENT_SCHEMA,
@@ -26,6 +29,9 @@ from meta_research.writing_skill import (
     WritingSourceMaterial,
     writing_review_task_hash,
 )
+from meta_research.semantic_owner_gateway import (
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
+)
 
 
 _SOURCE = b"rare morphology remains visible\n"
@@ -41,11 +47,17 @@ class _SequenceRunner:
         self._outputs = iter(outputs)
         self._context_canary_seen = context_canary_seen
         self.calls: list[tuple[list[str], str, dict[str, object]]] = []
+        self.environments: list[dict[str, str] | None] = []
 
     def __call__(
-        self, argv: list[str], prompt: str, timeout: float
+        self,
+        argv: list[str],
+        prompt: str,
+        timeout: float,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         del timeout
+        self.environments.append(environment)
         schema_path = Path(argv[argv.index("--output-schema") + 1])
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         output_path = Path(argv[argv.index("--output-last-message") + 1])
@@ -461,6 +473,118 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
     assert not staged.is_relative_to(
         tmp_path / "provider" / "research-workspace"
     )
+
+
+def test_writing_primary_turn_uses_its_exact_resident_operation_tree(
+    tmp_path: Path,
+) -> None:
+    operation_ids = ROOT_AGENT_SEMANTIC_OPERATION_IDS["writing"]
+    operation_bindings = tuple(
+        {"semantic_operation_id": operation_id}
+        for operation_id in operation_ids
+    )
+    conformance = SimpleNamespace(
+        contract_ref="meta-research/harness-operation-binding/v1",
+        contract_hash="5" * 64,
+        conformance_ref="operation-binding:writing",
+        semantic_mcp_catalog_hash="6" * 64,
+        semantic_mcp_operation_bindings_hash=canonical_hash(
+            list(operation_bindings)
+        ),
+        required_families=("codex",),
+        required_capabilities=("semantic_mcp",),
+        required_operation_ids=operation_ids,
+        profile_receipts=(),
+        as_dict=lambda: {"root_kind": "writing", "catalog": "6" * 64},
+    )
+    channel = SimpleNamespace(
+        connection=SimpleNamespace(
+            token="writing-token", grant_ref="writing-grant"
+        ),
+        binding=SimpleNamespace(
+            endpoint_ref="/mcp",
+            catalog_hash="6" * 64,
+            connection_grant_ref="writing-grant",
+            operation_bindings=operation_bindings,
+            root_kind="writing",
+            phase="writing-primary",
+        ),
+    )
+    authority = Mock()
+    authority.require_operation_binding.return_value = conformance
+    authority.issue_resident_mcp_channel.return_value = channel
+    runner = _SequenceRunner([_draft_output()])
+    adapter = CodexWritingSkillAdapter(
+        tmp_path / "resident-writing",
+        executable=str(_fake_codex(tmp_path / "resident-codex")),
+        process_runner=runner,
+    )
+    adapter.bind_resident_mcp_authority(authority)
+    adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
+    request = _request(adapter)
+
+    adapter.generate_draft(request)
+
+    scope = authority.issue_resident_mcp_channel.call_args.kwargs
+    assert scope["root_kind"] == "writing"
+    assert scope["subject_policy"] == "operation_tree"
+    assert scope["operation_ids"] == operation_ids
+    authority.revoke_resident_mcp_channel.assert_called_once_with(channel)
+    assert runner.environments[0] is not None
+    assert (
+        runner.environments[0]["META_RESEARCH_MCP_TOKEN"]
+        == "writing-token"
+    )
+
+
+def test_writing_provider_error_preserves_the_opened_native_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = CodexWritingSkillAdapter(
+        tmp_path / "provider",
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=_SequenceRunner([]),
+    )
+
+    def _raise_after_open(**_kwargs: object) -> object:
+        raise IdeaSkillUnavailable(
+            "codex_cli_stopped",
+            native_session_ref="native-writing-opened",
+        )
+
+    monkeypatch.setattr(adapter, "_invoke_root_operation", _raise_after_open)
+
+    with pytest.raises(WritingSkillUnavailable) as raised:
+        adapter.generate_draft(_request(adapter))
+
+    assert raised.value.code == "codex_cli_stopped"
+    assert raised.value.native_session_ref == "native-writing-opened"
+
+
+def test_writing_invalid_result_preserves_the_opened_native_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = CodexWritingSkillAdapter(
+        tmp_path / "provider",
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=_SequenceRunner([]),
+    )
+    invalid_output = {**_draft_output(), "markdown": ""}
+
+    def _return_invalid_after_open(**_kwargs: object) -> object:
+        return invalid_output, "native-writing-opened", ""
+
+    monkeypatch.setattr(
+        adapter, "_invoke_root_operation", _return_invalid_after_open
+    )
+
+    with pytest.raises(WritingSkillUnavailable) as raised:
+        adapter.generate_draft(_request(adapter))
+
+    assert raised.value.code == "writing_markdown_invalid"
+    assert raised.value.native_session_ref == "native-writing-opened"
 
 
 def test_report_review_task_hash_uses_the_root_advisory_identity(

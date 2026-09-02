@@ -130,11 +130,13 @@ class HarnessAdapterUnavailable(RuntimeError):
         *,
         durable_outcome: Literal["terminal", "unknown"] = "terminal",
         transport_receipt: dict[str, object] | None = None,
+        native_session_ref: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.durable_outcome = durable_outcome
         self.transport_receipt = transport_receipt
+        self.native_session_ref = native_session_ref
 
 
 class HarnessRunnerOutcomeUnknown(RuntimeError):
@@ -376,6 +378,7 @@ class _NativeCliHarnessAdapter:
             raise HarnessAdapterUnavailable(
                 "provider_io_unavailable", durable_outcome="unknown"
             ) from error
+        events = _parse_jsonl(completed.stdout)
         if completed.returncode != 0:
             receipt = getattr(completed, "meta_research_transport_receipt", None)
             reason = (
@@ -403,32 +406,56 @@ class _NativeCliHarnessAdapter:
                     if signed_code is not None
                     else None
                 ),
+                native_session_ref=_verified_failed_native_session_ref(
+                    family=self.family,
+                    events=events,
+                    expected_native_session_ref=invocation.native_session_ref,
+                ),
             )
-        events = _parse_jsonl(completed.stdout)
         if not events:
             raise HarnessAdapterUnavailable("provider_stream_invalid")
-        evidence = _evidence_from_events(
-            family=self.family,
-            provider_version=provider_version,
-            events=events,
-            expected_native_session_ref=invocation.native_session_ref,
-            evidence_scope_ref=evidence_scope_ref,
-            observation_scope=observation_scope,
-            transport_receipt=getattr(
-                completed, "meta_research_transport_receipt", None
-            ),
-            codex_child_ledger_reader=self._codex_child_ledger_reader,
-            expected_working_directory=(
-                invocation.working_directory
-                if invocation.working_directory is not None
-                else str(self._workspace.resolve())
-            ),
-        )
+        try:
+            evidence = _evidence_from_events(
+                family=self.family,
+                provider_version=provider_version,
+                events=events,
+                expected_native_session_ref=invocation.native_session_ref,
+                evidence_scope_ref=evidence_scope_ref,
+                observation_scope=observation_scope,
+                transport_receipt=getattr(
+                    completed, "meta_research_transport_receipt", None
+                ),
+                codex_child_ledger_reader=self._codex_child_ledger_reader,
+                expected_working_directory=(
+                    invocation.working_directory
+                    if invocation.working_directory is not None
+                    else str(self._workspace.resolve())
+                ),
+            )
+        except HarnessAdapterUnavailable as error:
+            raise HarnessAdapterUnavailable(
+                error.code,
+                durable_outcome=error.durable_outcome,
+                transport_receipt=error.transport_receipt,
+                native_session_ref=(
+                    error.native_session_ref
+                    or _verified_failed_native_session_ref(
+                        family=self.family,
+                        events=events,
+                        expected_native_session_ref=(
+                            invocation.native_session_ref
+                        ),
+                    )
+                ),
+            ) from error
         root_diagnostics: dict[str, object] | None = None
         if invocation.root_kind is not None:
             capabilities = evidence.profile.get("capabilities")
             if not isinstance(capabilities, dict):
-                raise HarnessAdapterUnavailable("harness_profile_invalid")
+                raise HarnessAdapterUnavailable(
+                    "harness_profile_invalid",
+                    native_session_ref=evidence.native_session_ref,
+                )
             used_capabilities: list[str] = []
             usage_evidence_refs: dict[str, tuple[str, ...]] = {}
             for capability in ROOT_CAPABILITY_FLOOR:
@@ -1367,6 +1394,42 @@ def _parse_jsonl(value: str) -> tuple[dict[str, object], ...]:
         if isinstance(event, dict):
             events.append(cast(dict[str, object], event))
     return tuple(events)
+
+
+def _verified_failed_native_session_ref(
+    *,
+    family: HarnessFamily,
+    events: tuple[dict[str, object], ...],
+    expected_native_session_ref: str | None,
+) -> str | None:
+    """Recover only the provider's unambiguous root Session start fact."""
+
+    root_refs: set[str] = set()
+    for event in events:
+        native_ref = None
+        if family == "codex" and event.get("type") == "thread.started":
+            native_ref = event.get("thread_id")
+        elif (
+            family == "claude"
+            and event.get("type") == "system"
+            and event.get("subtype") == "init"
+        ):
+            native_ref = event.get("session_id")
+        if (
+            isinstance(native_ref, str)
+            and native_ref
+            and len(native_ref) <= 160
+        ):
+            root_refs.add(native_ref)
+    if len(root_refs) != 1:
+        return None
+    native_session_ref = next(iter(root_refs))
+    if (
+        expected_native_session_ref is not None
+        and native_session_ref != expected_native_session_ref
+    ):
+        return None
+    return native_session_ref
 
 
 class _CodexHomeChildLedgerReader:

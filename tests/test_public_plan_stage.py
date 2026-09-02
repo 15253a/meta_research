@@ -309,6 +309,36 @@ class _DeterministicPlanSkill:
         return self.review_draft(request, self.generate_draft(request))
 
 
+class _OperationBoundPlanSkill(_DeterministicPlanSkill):
+    def runtime_binding(self) -> PlanRuntimeBinding:
+        return PlanRuntimeBinding(
+            packaged_skill_bundle_hash=canonical_hash(
+                {"skill": "plan-operation-bound"}
+            ),
+            instruction_set_hash=canonical_hash(
+                {"instructions": "plan-operation-bound"}
+            ),
+            model_ref="test-model-v1",
+            harness_adapter_ref="codex-cli/test-operation-bound",
+            mcp_bindings=(
+                "harness-operation-binding:semantic-mcp-catalog@sha256:"
+                + "1" * 64,
+                "harness-operation-binding:semantic-mcp-operation-bindings@sha256:"
+                + "2" * 64,
+            ),
+            capability_bindings=(
+                "harness-operation-binding-v1",
+                "semantic-mcp-resident",
+            ),
+            resource_bindings=(
+                "harness-artifact:operation-binding-contract:plan@sha256:"
+                + "3" * 64,
+                "harness-artifact:operation-binding-set:plan@sha256:"
+                + "4" * 64,
+            ),
+        )
+
+
 def _runtime(
     path: Path,
     *,
@@ -546,6 +576,34 @@ def test_plan_stage_keeps_five_fact_layers_with_a_real_gap(
             "rare-morphology-comparison"
         ]
         assert len(plan_skill.documents[-1]["experiment_briefs"]) == 1
+    finally:
+        runtime.close()
+
+
+def test_plan_owner_admits_the_exact_resident_operation_binding(
+    tmp_path: Path,
+) -> None:
+    plan_skill = _OperationBoundPlanSkill(no_gap=False)
+    runtime = _runtime(
+        tmp_path / "plan-operation-bound-admission",
+        idea_skill=_DeterministicIdeaSkill(),
+        plan_skill=plan_skill,
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+
+        for _boundary in range(3):
+            assert runtime.plan_stage.process_once()
+            current = runtime.plan_stage.query_current()
+            if current["run"] is not None:
+                break
+        else:
+            raise AssertionError("Plan operation binding was not admitted")
+
+        assert current["run"]["runtime_binding"] == (
+            plan_skill.runtime_binding().as_dict()
+        )
     finally:
         runtime.close()
 

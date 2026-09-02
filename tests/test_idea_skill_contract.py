@@ -23,12 +23,18 @@ from meta_research.idea_skill import (
     _provider_hard_ceiling_error,
     validate_idea_skill_result,
 )
+from meta_research.harness import FullConformanceBinding, ResidentMcpChannel
 from meta_research.idea_contract import (
     material_outcome_hash,
     validate_advisory_review,
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash
+from meta_research.root_resident_mcp import RootResidentMcpChannels
+from meta_research.semantic_mcp import McpConnection, ResidentMcpBinding
+from meta_research.semantic_owner_gateway import (
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
+)
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     read_transport_envelope,
@@ -456,11 +462,17 @@ class _SequenceRunner:
         self._observed_reviewer_agent_ref = observed_reviewer_agent_ref
         self._emit_primary_review_trace = emit_primary_review_trace
         self.calls: list[tuple[list[str], str, dict[str, object]]] = []
+        self.environments: list[dict[str, str] | None] = []
 
     def __call__(
-        self, argv: list[str], prompt: str, timeout: float
+        self,
+        argv: list[str],
+        prompt: str,
+        timeout: float,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         del timeout
+        self.environments.append(environment)
         schema_path = Path(argv[argv.index("--output-schema") + 1])
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         output_path = Path(argv[argv.index("--output-last-message") + 1])
@@ -548,6 +560,97 @@ class _SequenceRunner:
     ) -> subprocess.CompletedProcess[str]:
         del job_ref
         return self(argv, prompt, timeout)
+
+
+class _IdeaResidentMcpAuthority:
+    def __init__(self) -> None:
+        self.operation_ids = ROOT_AGENT_SEMANTIC_OPERATION_IDS["idea"]
+        self.operation_bindings = tuple(
+            {"semantic_operation_id": operation_id}
+            for operation_id in self.operation_ids
+        )
+        self.catalog_hash = "9" * 64
+        self.issued: list[dict[str, object]] = []
+        self.revoked: list[ResidentMcpChannel] = []
+
+    def require_operation_binding(
+        self,
+        *,
+        harness_family: str,
+        required_operation_ids: tuple[str, ...],
+        required_capabilities: tuple[str, ...],
+    ) -> FullConformanceBinding:
+        assert harness_family == "codex"
+        assert required_operation_ids == self.operation_ids
+        assert required_capabilities == ("semantic_mcp",)
+        return FullConformanceBinding(
+            contract_ref="meta-research/harness-operation-binding/v1",
+            contract_hash="8" * 64,
+            conformance_ref="operation-binding:idea",
+            semantic_mcp_catalog_hash=self.catalog_hash,
+            semantic_mcp_operation_bindings_hash=canonical_hash(
+                list(self.operation_bindings)
+            ),
+            required_families=("codex",),
+            required_capabilities=("semantic_mcp",),
+            required_operation_ids=self.operation_ids,
+            profile_receipts=(),
+        )
+
+    def issue_resident_mcp_channel(self, **scope: object) -> ResidentMcpChannel:
+        self.issued.append(scope)
+        phase = scope["phase"]
+        assert isinstance(phase, str)
+        return ResidentMcpChannel(
+            connection=McpConnection(
+                token="idea-resident-secret", grant_ref="mcp-grant:idea"
+            ),
+            binding=ResidentMcpBinding(
+                server_instance_ref="semantic-mcp:idea",
+                endpoint_ref="/mcp",
+                catalog_revision=1,
+                catalog_hash=self.catalog_hash,
+                health_receipt_ref="mcp-health:idea",
+                connection_grant_ref="mcp-grant:idea",
+                operation_bindings=self.operation_bindings,
+                root_kind="idea",
+                phase=phase,
+            ),
+        )
+
+    def revoke_resident_mcp_channel(self, channel: ResidentMcpChannel) -> None:
+        self.revoked.append(channel)
+
+
+def test_resident_channel_cache_key_includes_the_exact_attempt_scope() -> None:
+    authority = _IdeaResidentMcpAuthority()
+    channels = RootResidentMcpChannels("idea")
+    channels.bind_authority(authority)
+    channels.configure_endpoint("http://127.0.0.1:8766")
+
+    first_key, _first = channels.acquire(
+        run_ref="idea-run:scope",
+        attempt_ref="idea-attempt:1",
+        root_session_ref="idea-root-session:scope",
+        fence_ref="idea-fence:1",
+        capability_binding_hash="1" * 64,
+        phase="primary",
+        job_ref="idea-job:scope",
+    )
+    successor_key, _successor = channels.acquire(
+        run_ref="idea-run:scope",
+        attempt_ref="idea-attempt:2",
+        root_session_ref="idea-root-session:scope",
+        fence_ref="idea-fence:2",
+        capability_binding_hash="2" * 64,
+        phase="primary",
+        job_ref="idea-job:scope",
+    )
+
+    assert first_key != successor_key
+    assert len(authority.issued) == 2
+    channels.release_job("idea-job:scope")
+    assert len(authority.revoked) == 2
 
 
 class _InvalidJsonRunner(_SequenceRunner):
@@ -1118,6 +1221,29 @@ class _ExitFailureRunner:
         return self(argv, prompt, timeout)
 
 
+class _ConflictingExitFailureRunner(_ExitFailureRunner):
+    def __call__(
+        self, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        completed = super().__call__(argv, prompt, timeout)
+        return subprocess.CompletedProcess(
+            completed.args,
+            completed.returncode,
+            stdout="\n".join(
+                (
+                    completed.stdout,
+                    json.dumps(
+                        {
+                            "type": "thread.started",
+                            "thread_id": "conflicting-failed-primary",
+                        }
+                    ),
+                )
+            ),
+            stderr=completed.stderr,
+        )
+
+
 class _DetachedSupervisorRunner:
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
@@ -1345,6 +1471,57 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
         "dispositions",
     }
     _assert_codex_schema_types(review_schema)
+
+
+def test_idea_root_invocation_uses_and_revokes_its_operation_tree_channel(
+    tmp_path: Path,
+) -> None:
+    runner = _SequenceRunner([{"outcome": _idea_set()}])
+    authority = _IdeaResidentMcpAuthority()
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "idea-resident-mcp", process_runner=runner
+    )
+    adapter.bind_resident_mcp_authority(authority)
+    adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
+    request = _request(
+        run_ref="idea-run:1",
+        attempt_ref="idea-attempt:1",
+        fence_ref="idea-fence:1",
+        runtime_binding=adapter.runtime_binding(),
+    )
+
+    draft = adapter.generate_draft(request)
+
+    assert draft.primary_session_ref == "codex-primary:1"
+    assert authority.issued == [
+        {
+            "root_kind": "idea",
+            "phase": "primary",
+            "subject_policy": "operation_tree",
+            "run_ref": "idea-run:1",
+            "attempt_ref": "idea-attempt:1",
+            "root_session_ref": "run-session:1",
+            "fence_ref": "idea-fence:1",
+            "capability_binding_hash": canonical_hash(
+                request.runtime_binding.as_dict()
+            ),
+            "operation_ids": ROOT_AGENT_SEMANTIC_OPERATION_IDS["idea"],
+        }
+    ]
+    assert len(authority.revoked) == 1
+    assert runner.environments == [
+        {
+            "META_RESEARCH_MCP_TOKEN": "idea-resident-secret",
+            "NO_PROXY": "127.0.0.1,localhost,::1",
+            "no_proxy": "127.0.0.1,localhost,::1",
+        }
+    ]
+    argv = runner.calls[0][0]
+    assert 'mcp_servers.meta_research.url="http://127.0.0.1:8766/mcp"' in argv
+    assert tuple(
+        binding["semantic_operation_id"]
+        for binding in authority.revoked[0].binding.operation_bindings
+    ) == ROOT_AGENT_SEMANTIC_OPERATION_IDS["idea"]
 
 
 def test_completion_rejection_feedback_reaches_both_idea_provider_turns(
@@ -1589,6 +1766,36 @@ def test_durable_primary_ignores_internal_review_trace_on_replay(
 
     assert recovered.draft == first_draft.draft
     assert no_replay.calls == []
+
+
+def test_human_request_continuation_uses_a_new_durable_operation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "human-request-continuation"
+    revised = _idea_set("沿同一原生会话吸收人工回应后继续")
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, {"outcome": revised}],
+        thread_ids=["codex-primary:1", "codex-primary:1"],
+    )
+    adapter = CodexIdeaSkillAdapter(workspace, process_runner=runner)
+    first_request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        job_ref="idea-primary-operation:human-request",
+    )
+
+    first_draft = adapter.generate_draft(first_request)
+    continued = adapter.generate_draft(
+        replace(
+            first_request,
+            job_ref="root_hr_continuation_" + "1" * 64,
+            native_session_ref=first_draft.primary_session_ref,
+        )
+    )
+
+    assert continued.primary_session_ref == first_draft.primary_session_ref
+    assert continued.draft == revised
+    assert len(runner.calls) == 2
+    assert runner.calls[1][0][-3:] == ["resume", "codex-primary:1", "-"]
 
 
 def test_durable_review_without_spawn_trace_replays_public_result(
@@ -1915,6 +2122,7 @@ def test_durable_provider_operation_never_promotes_a_failed_exit(
         first.generate_draft(request)
     assert failed.value.recovery_checkpoint is not None
     assert failed.value.recovery_checkpoint["termination_reason"] == "completed"
+    assert failed.value.native_session_ref == "failed-primary"
     assert failed_runner.calls == 1
     assert next(workspace.glob("provider-operations/*/primary/exit.json")).is_file()
     assert not list(workspace.glob("provider-operations/*/primary/completed.json"))
@@ -1929,6 +2137,7 @@ def test_durable_provider_operation_never_promotes_a_failed_exit(
     ) as replayed:
         restarted.generate_draft(request)
     assert replayed.value.recovery_checkpoint == failed.value.recovery_checkpoint
+    assert replayed.value.native_session_ref == "failed-primary"
     assert forbidden_replay.calls == []
 
     exit_path = next(workspace.glob("provider-operations/*/primary/exit.json"))
@@ -1941,8 +2150,42 @@ def test_durable_provider_operation_never_promotes_a_failed_exit(
     with pytest.raises(
         IdeaSkillUnavailable,
         match="codex_operation_spool_invalid",
-    ):
+    ) as tampered:
         restarted.generate_draft(request)
+    assert tampered.value.native_session_ref is None
+    assert forbidden_replay.calls == []
+
+
+def test_failed_exit_does_not_recover_conflicting_native_sessions(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "failed-exit-conflicting-sessions"
+    adapter = CodexIdeaSkillAdapter(
+        workspace,
+        process_runner=_ConflictingExitFailureRunner(),
+    )
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        job_ref="idea-primary-operation:failed-exit-conflicting-sessions",
+    )
+
+    with pytest.raises(
+        IdeaSkillUnavailable, match="codex_operation_failed"
+    ) as failed:
+        adapter.generate_draft(request)
+
+    assert failed.value.native_session_ref is None
+
+    forbidden_replay = _SequenceRunner([{"outcome": _idea_set()}])
+    restarted = CodexIdeaSkillAdapter(
+        workspace,
+        process_runner=forbidden_replay,
+    )
+    with pytest.raises(
+        IdeaSkillUnavailable, match="codex_operation_failed"
+    ) as replayed:
+        restarted.generate_draft(request)
+    assert replayed.value.native_session_ref is None
     assert forbidden_replay.calls == []
 
 

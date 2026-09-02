@@ -543,6 +543,8 @@ class _FullConformanceAuthority:
                     _operation_binding(operation_id)
                     for operation_id in operation_ids
                 ),
+                root_kind="reasoning",
+                phase=phase,
             ),
         )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -8,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from meta_research.composition import build_production_runtime
 from meta_research.idea_skill import (
+    CodexIdeaSkillAdapter,
     IdeaSkillDraft,
     IdeaSkillRequest,
     IdeaSkillResult,
@@ -25,6 +28,11 @@ from meta_research.quest_drafting import (
     ProposalDraftResult,
 )
 from meta_research.web import create_app
+from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+from test_harness_full_conformance import (
+    _FullConformanceAdapter,
+    _full_request,
+)
 
 
 _QUESTION = {
@@ -141,10 +149,8 @@ class _IdeaProvider:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=(
-                f"codex-child-reviewer-{request.submission_revision}"
-            ),
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
 
@@ -176,6 +182,280 @@ class _ReviewRecoveringIdeaProvider(_IdeaProvider):
         if self.review_calls == 1:
             raise IdeaSkillUnavailable("codex_review_timeout")
         return super().review_draft(request, draft)
+
+
+class _HumanRequestIdeaProvider(_IdeaProvider):
+    def __init__(
+        self,
+        *,
+        invalid_first: bool = False,
+        phase: str = "primary",
+    ) -> None:
+        super().__init__()
+        self.invalid_first = invalid_first
+        self.phase = phase
+        self.owner = None
+        self.human_request: dict[str, object] | None = None
+        self.review_requests: list[IdeaSkillRequest] = []
+        self.finished_jobs: list[str] = []
+
+    def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
+        draft = super().generate_draft(request)
+        if self.phase != "primary" or self.human_request is not None:
+            return draft
+        self._open_human_request(request, phase="primary")
+        if self.invalid_first:
+            return IdeaSkillDraft(
+                draft={**draft.draft, "question_ref": "question:wrong"},
+                primary_session_ref=draft.primary_session_ref,
+                adapter_kind=draft.adapter_kind,
+            )
+        return draft
+
+    def review_draft(
+        self, request: IdeaSkillRequest, draft: IdeaSkillDraft
+    ) -> IdeaSkillResult:
+        self.review_requests.append(request)
+        result = super().review_draft(request, draft)
+        if self.phase == "review" and self.human_request is None:
+            self._open_human_request(request, phase="review")
+        return result
+
+    def finish_job(self, job_ref: str) -> None:
+        self.finished_jobs.append(job_ref)
+
+    def _open_human_request(
+        self, request: IdeaSkillRequest, *, phase: str
+    ) -> None:
+        assert self.owner is not None
+        managed = self.owner.query_managed_run(request.run_ref)
+        assert managed is not None
+        generation = request.submission_revision
+        binding = {
+            "quest_ref": managed["quest_ref"],
+            "task_ref": request.run_ref,
+            "root_session_ref": request.root_session_ref,
+            "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+            "attempt_ref": request.attempt_ref,
+            "generation": generation,
+            "request_owner": "agent_runtime",
+            "root_kind": "idea",
+            "phase": phase,
+            "fence_ref": request.fence_ref,
+            "runtime_binding_hash": canonical_hash(
+                request.runtime_binding.as_dict()
+            ),
+        }
+        target = {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": "idea",
+                "run_ref": request.run_ref,
+                "attempt_ref": request.attempt_ref,
+                "root_session_ref": request.root_session_ref,
+                "fence_ref": request.fence_ref,
+                "waiter_generation": generation,
+            },
+            "condition": {"operator_choice": "continue_without_optional_input"},
+        }
+        self.human_request = self.owner.open_human_request_effect(
+            effect_key=f"mcp-effect:idea-provider-human-wait:{phase}",
+            effect_id=f"idea-provider-human-wait-{phase}",
+            operation_binding=binding,
+            predecessor_request_ref=None,
+            request_kind="offline_action",
+            obligation="Choose whether this exact Idea task should continue.",
+            business_purpose="Resume only this exact Idea task.",
+            target_assertion=target,
+            acceptance_conditions=("The operator supplies a disposition.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{request.run_ref}",
+                "generation": generation,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=str(managed["quest_ref"]),
+        )
+
+
+class _NonzeroHumanRequestIdeaRunner:
+    """Real Codex adapter seam using the authenticated resident MCP channel."""
+
+    native_session_ref = "codex-idea-human-request-session"
+    effect_id = "idea-provider-human-request-nonzero"
+
+    def __init__(self) -> None:
+        self.runtime = None
+        self.provider_calls: list[tuple[list[str], str, dict[str, str]]] = []
+        self.request_ref: str | None = None
+        self.resolution: dict[str, object] | None = None
+
+    def run_command(
+        self, argv: list[str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout
+        assert argv[-2:] == ["features", "list"]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def __call__(
+        self,
+        argv: list[str],
+        prompt: str,
+        timeout: float | None,
+        environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        assert timeout is None or timeout > 0
+        assert self.runtime is not None
+        self.provider_calls.append((list(argv), prompt, dict(environment)))
+        token = environment["META_RESEARCH_MCP_TOKEN"]
+        if len(self.provider_calls) == 1:
+            opened = self._tool_call(
+                token,
+                operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                arguments={
+                    "effect_id": self.effect_id,
+                    "request_kind": "offline_action",
+                    "obligation": "Choose whether this Idea should continue.",
+                    "business_purpose": "Resume this exact Idea root task.",
+                    "condition": {
+                        "impact": "Only this Idea task is paused.",
+                        "safe_response": "Defer without providing secrets.",
+                    },
+                    "acceptance_conditions": [
+                        "The response is bound to this exact request."
+                    ],
+                },
+                request_id=1,
+            )
+            self.request_ref = str(opened["request_ref"])
+        else:
+            reconciled = self._tool_call(
+                token,
+                operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
+                arguments={"effect_id": self.effect_id},
+                request_id=2,
+            )
+            resolution = reconciled.get("resolution")
+            assert isinstance(resolution, dict)
+            self.resolution = resolution
+            question_ref = self._prompt_value(prompt, "question_ref")
+            context_pack_ref = self._prompt_value(prompt, "context_pack_ref")
+            output_path = Path(
+                argv[argv.index("--output-last-message") + 1]
+            )
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "outcome": {
+                            "kind": "IdeaSet",
+                            "question_ref": question_ref,
+                            "context_pack_ref": context_pack_ref,
+                            "candidates": [
+                                {
+                                    "candidate_key": "human-response-continuation",
+                                    "direction": "以跨增强拓扑一致性约束自监督去噪。",
+                                    "rationale": "拓扑约束可能比像素重建更保留稀有结构。",
+                                    "assumptions": [
+                                        "受控增强下稀有形态拓扑稳定。"
+                                    ],
+                                    "risks": ["约束可能保留传感器伪影。"],
+                                    "evidence_boundary": {
+                                        "accepted_evidence_refs": [],
+                                        "supported": "Question 限定了低照度形态保真。",
+                                        "inferred": "拓扑一致性可能提高稀有结构保真。",
+                                        "unknown": "跨设备稳健性仍未知。",
+                                    },
+                                    "falsification_hint": {
+                                        "test": "比较稀有形态召回率与伪影率。",
+                                        "would_refute": "召回未提高或伪影显著增加。",
+                                    },
+                                    "material_difference": {
+                                        "from_history": "不复用已接纳 Idea。",
+                                        "from_peers": "以拓扑而非像素误差组织机制。",
+                                        "plan_commitment_change": "Plan 比较拓扑干预轴与基线。",
+                                    },
+                                }
+                            ],
+                            "recommendation": None,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        stream = "\n".join(
+            json.dumps(event)
+            for event in (
+                {
+                    "type": "thread.started",
+                    "thread_id": self.native_session_ref,
+                },
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "meta_research",
+                    },
+                },
+                {"type": "turn.completed"},
+            )
+        )
+        first_call = len(self.provider_calls) == 1
+        return subprocess.CompletedProcess(
+            argv,
+            17 if first_call else 0,
+            stream + "\n",
+            "provider exited after opening HumanRequest" if first_call else "",
+        )
+
+    def run_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        prompt: str,
+        timeout: float | None,
+        environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del job_ref
+        return self(argv, prompt, timeout, environment)
+
+    def _tool_call(
+        self,
+        token: str,
+        *,
+        operation_id: str,
+        arguments: dict[str, object],
+        request_id: int,
+    ) -> dict[str, object]:
+        status, payload, _session_id = self.runtime.harnesses.dispatch_mcp_http(
+            token,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": operation_id, "arguments": arguments},
+            },
+            mcp_session_id=self.native_session_ref,
+        )
+        assert status == 200
+        assert payload is not None
+        result = payload["result"]
+        assert isinstance(result, dict) and result["isError"] is False
+        structured = result["structuredContent"]
+        assert isinstance(structured, dict)
+        return structured
+
+    @staticmethod
+    def _prompt_value(prompt: str, field: str) -> str:
+        prefix = f"{field}="
+        value = next(
+            line.removeprefix(prefix)
+            for line in prompt.splitlines()
+            if line.startswith(prefix)
+        )
+        assert value
+        return value
 
 
 class _PerRequestRecoveringIdeaProvider(_IdeaProvider):
@@ -437,7 +717,6 @@ def test_reviewer_failure_resumes_the_durably_bound_primary_session(
         assert len(provider.requests) == 1
     finally:
         runtime.close()
-
     runtime = _runtime(data_root, provider)
     try:
         assert not runtime.idea_stage.process_once()
@@ -471,6 +750,212 @@ def test_reviewer_failure_resumes_the_durably_bound_primary_session(
         )
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_first",
+    (False, True),
+    ids=("valid-return", "invalid-candidate-return"),
+)
+def test_human_request_resumes_idea_in_same_native_session_with_new_job(
+    tmp_path: Path,
+    invalid_first: bool,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "idea-human-request-continuation")
+    provider = _HumanRequestIdeaProvider(invalid_first=invalid_first)
+    runtime = _runtime(data_root, provider)
+    provider.owner = runtime.owners.agent_runtime
+    try:
+        completed = _confirm_question(runtime, "human-request-continuation")
+        runtime.idea_stage.start("human-request-continuation-start")
+
+        assert runtime.idea_stage.process_once()
+        request = runtime.owners.advancement_engine.query_idea_stage_request(
+            completed["cycle_ref"]
+        )
+        assert request is not None
+        parked = runtime.owners.agent_runtime.query_idea_stage_run(
+            request.request_ref
+        )
+        assert parked is not None
+        assert parked.primary_draft is None
+        assert parked.native_session_ref is not None
+        assert provider.human_request is not None
+        assert provider.finished_jobs == [provider.requests[0].job_ref]
+        assert runtime.owners.agent_runtime.query_managed_run(parked.run_ref)[
+            "status"
+        ] == "suspended"
+
+        runtime.owners.human_collaboration.respond_to_human_request(
+            str(provider.human_request["request_ref"]),
+            decision="deferred",
+            facts={},
+            note="Continue without this optional input.",
+            idempotency_key="idea-human-request-deferred",
+        )
+        assert runtime.owners.agent_runtime.query_managed_run(parked.run_ref)[
+            "status"
+        ] == "running"
+
+        assert runtime.idea_stage.process_once()
+        assert len(provider.requests) == 2
+        first, resumed = provider.requests
+        assert resumed.native_session_ref == parked.native_session_ref
+        assert resumed.job_ref != first.job_ref
+        assert str(resumed.job_ref).startswith("root_hr_continuation_")
+        continued = runtime.owners.agent_runtime.query_idea_stage_run(
+            request.request_ref
+        )
+        assert continued is not None and continued.primary_draft is not None
+        assert continued.native_session_ref == parked.native_session_ref
+    finally:
+        runtime.close()
+
+
+def test_real_idea_nonzero_after_human_request_resumes_same_session(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "real-idea-human-request-nonzero")
+    drafting = _DraftingProvider()
+    setup_runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=drafting,
+        intent_drafting_provider=drafting,
+        host_compute_probe=_ComputeProbe(),
+        idea_skill_provider=_IdeaProvider(),
+        harness_adapters=(
+            _FullConformanceAdapter("codex"),
+            _FullConformanceAdapter("claude"),
+        ),
+        startup_power_probe=False,
+        startup_harness_diagnostics=False,
+    )
+    setup_runtime.harnesses.start_full_conformance(_full_request())
+    for _turn in range(4):
+        if setup_runtime.harnesses.query_status()["status"] == "ready":
+            break
+        assert setup_runtime.harnesses.advance_full_conformance(
+            mcp_base_url="http://127.0.0.1:8999"
+        )
+    assert setup_runtime.harnesses.query_status()["status"] == "ready"
+    completed = _confirm_question(setup_runtime, "real-provider-nonzero")
+    setup_runtime.close()
+
+    runner = _NonzeroHumanRequestIdeaRunner()
+    adapter = CodexIdeaSkillAdapter(
+        data_root.run / "idea-human-request-provider",
+        process_runner=runner,
+    )
+    runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=drafting,
+        intent_drafting_provider=drafting,
+        host_compute_probe=_ComputeProbe(),
+        idea_skill_provider=adapter,
+        harness_adapters=(
+            _FullConformanceAdapter("codex"),
+            _FullConformanceAdapter("claude"),
+        ),
+        startup_power_probe=False,
+        startup_harness_diagnostics=False,
+    )
+    runner.runtime = runtime
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
+    try:
+        runtime.idea_stage.start("real-idea-human-request-nonzero-start")
+
+        assert runtime.idea_stage.process_once()
+        request = runtime.owners.advancement_engine.query_idea_stage_request(
+            completed["cycle_ref"]
+        )
+        assert request is not None
+        parked = runtime.owners.agent_runtime.query_idea_stage_run(
+            request.request_ref
+        )
+        assert parked is not None
+        assert parked.primary_draft is None
+        assert parked.native_session_ref == runner.native_session_ref
+        assert runtime.owners.agent_runtime.query_managed_run(parked.run_ref)[
+            "status"
+        ] == "suspended"
+        assert runner.request_ref is not None
+
+        response = runtime.owners.human_collaboration.respond_to_human_request(
+            runner.request_ref,
+            decision="deferred",
+            facts={},
+            note="Continue without optional human input.",
+            idempotency_key="real-idea-human-request-deferred",
+        )
+        assert runtime.idea_stage.process_once()
+
+        continued = runtime.owners.agent_runtime.query_idea_stage_run(
+            request.request_ref
+        )
+        assert continued is not None and continued.primary_draft is not None
+        assert continued.native_session_ref == runner.native_session_ref
+        assert len(runner.provider_calls) == 2
+        first_argv = runner.provider_calls[0][0]
+        resumed_argv = runner.provider_calls[1][0]
+        resumed_prompt = runner.provider_calls[1][1]
+        assert first_argv[-1] == "-"
+        assert resumed_argv[-3:] == [
+            "resume",
+            runner.native_session_ref,
+            "-",
+        ]
+        assert "human_request.open.reconcile" in resumed_prompt
+        assert "agent_runtime.human_request.open.reconcile" not in resumed_prompt
+        assert runner.resolution is not None
+        assert runner.resolution["response_ref"] == response["response_ref"]
+        assert runner.resolution["decision"] == "deferred"
+        first_jobs = tuple(
+            path.parent.parent.name
+            for path in (
+                data_root.run / "idea-human-request-provider" / "provider-operations"
+            ).glob("*/primary/invocation.json")
+        )
+        assert len(first_jobs) == 2
+    finally:
+        runtime.close()
+
+
+def test_human_request_park_finishes_the_current_idea_review_job(
+    tmp_path: Path,
+) -> None:
+    provider = _HumanRequestIdeaProvider(phase="review")
+    runtime = _runtime(
+        prepare_data_root(tmp_path / "idea-review-human-request-finish"),
+        provider,
+    )
+    provider.owner = runtime.owners.agent_runtime
+    try:
+        completed = _confirm_question(runtime, "idea-review-human-request-finish")
+        runtime.idea_stage.start("idea-review-human-request-finish-start")
+
+        assert runtime.idea_stage.process_once()
+        request = runtime.owners.advancement_engine.query_idea_stage_request(
+            completed["cycle_ref"]
+        )
+        assert request is not None
+        checkpointed = runtime.owners.agent_runtime.query_idea_stage_run(
+            request.request_ref
+        )
+        assert checkpointed is not None and checkpointed.primary_draft is not None
+
+        assert runtime.idea_stage.process_once()
+        parked = runtime.owners.agent_runtime.query_idea_stage_run(
+            request.request_ref
+        )
+        assert parked is not None and parked.native_session_ref is not None
+        assert runtime.owners.agent_runtime.query_managed_run(parked.run_ref)[
+            "status"
+        ] == "suspended"
+        assert len(provider.review_requests) == 1
+        assert provider.finished_jobs == [provider.review_requests[0].job_ref]
+    finally:
+        runtime.close()
+
 
 def test_rejection_restart_reuses_native_session_and_rejects_old_fence(
     tmp_path: Path,

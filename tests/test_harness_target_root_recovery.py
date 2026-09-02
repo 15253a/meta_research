@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
+import subprocess
 
 import pytest
 from sqlalchemy import text
 
 from meta_research.bundle_protocol import projection_plain_value
+from meta_research.composition import build_production_runtime
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
-from meta_research.harness import HarnessAdmissionError, HarnessRuntime, TargetHarnessRequest
+from meta_research.harness import (
+    TARGET_ROOT_LIFECYCLE_PHASE,
+    HarnessAdmissionError,
+    HarnessRuntime,
+    TargetHarnessRequest,
+)
+from meta_research.harness_adapters import (
+    HARNESS_CAPABILITIES,
+    CodexHarnessAdapter,
+)
 from meta_research.migration import upgrade_database
 from meta_research.owners.agent_runtime_harness import (
     TARGET_ROOT_RECOVERY_READY_CODE,
@@ -18,10 +30,19 @@ from meta_research.owners.agent_runtime_harness import (
     SQLiteAgentRuntimeHarness,
 )
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.semantic_owner_gateway import TARGET_RUN_SEMANTIC_OPERATION_IDS
-from meta_research.semantic_mcp import SemanticMcpError
-from meta_research.harness_adapters import HARNESS_CAPABILITIES
-from test_harness_target_root import _Gateway, _TargetRootAdapter
+from meta_research.paths import prepare_data_root
+from meta_research.semantic_owner_gateway import TARGET_ROOT_SEMANTIC_OPERATION_IDS
+from meta_research.semantic_mcp import (
+    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+    SemanticMcpError,
+)
+from test_harness_target_root import (
+    _Gateway,
+    _TargetRootAdapter,
+)
+import test_public_bundle_stage as bundle_fixtures
+from test_root_human_request_lifecycle import _OperationBoundBundleSkill
+from test_target_root_finalizer import _admit_independent_target_root
 from test_target_run_owner import _records, _seed_admitted_launch
 
 
@@ -31,6 +52,159 @@ class _Clock:
 
     def time(self) -> float:
         return self.now
+
+
+class _TargetHumanRequestRunner:
+    """Codex process seam that uses the authenticated resident MCP channel."""
+
+    def __init__(
+        self,
+        *,
+        fail_first_after_open: bool = False,
+        conflicting_session_after_open: bool = False,
+    ) -> None:
+        self.runtime = None
+        self.fail_first_after_open = fail_first_after_open
+        self.conflicting_session_after_open = conflicting_session_after_open
+        self.provider_calls: list[tuple[list[str], str, dict[str, str]]] = []
+        self.request_ref: str | None = None
+        self.resolution: dict[str, object] | None = None
+
+    def __call__(
+        self,
+        argv: list[str],
+        prompt: str,
+        timeout: float | None,
+        environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        assert timeout is None or timeout > 0
+        if "--version" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "codex-cli 0.147.0\n", ""
+            )
+        if argv[-2:] == ["features", "list"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "\n".join(
+                    f"{name} stable true"
+                    for name in (
+                        "hooks",
+                        "multi_agent",
+                        "plugins",
+                        "remote_plugin",
+                        "shell_tool",
+                        "skill_search",
+                        "unified_exec",
+                    )
+                )
+                + "\n",
+                "",
+            )
+
+        assert self.runtime is not None
+        self.provider_calls.append((list(argv), prompt, dict(environment)))
+        token = environment["META_RESEARCH_MCP_TOKEN"]
+        if len(self.provider_calls) == 1:
+            result = self._tool_call(
+                token,
+                operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                arguments={
+                    "effect_id": "target-provider-human-request",
+                    "request_kind": "offline_action",
+                    "obligation": "Choose the safe offline action for this Target.",
+                    "business_purpose": "Resume this exact Target root task.",
+                    "condition": {
+                        "impact": "Only this Target task is paused.",
+                        "safe_response": "Decline or defer without secrets.",
+                    },
+                    "acceptance_conditions": [
+                        "The response is bound to this exact request."
+                    ],
+                },
+                request_id=1,
+            )
+            self.request_ref = str(result["request_ref"])
+        else:
+            result = self._tool_call(
+                token,
+                operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
+                arguments={"effect_id": "target-provider-human-request"},
+                request_id=2,
+            )
+            resolution = result.get("resolution")
+            assert isinstance(resolution, dict)
+            self.resolution = resolution
+
+        stream = [
+            {
+                "type": "thread.started",
+                "thread_id": "codex-target-human-request-session",
+            },
+        ]
+        if self.conflicting_session_after_open and len(self.provider_calls) == 1:
+            stream.append(
+                {
+                    "type": "thread.started",
+                    "thread_id": "codex-target-conflicting-session",
+                }
+            )
+        stream.extend(
+            (
+            {
+                "type": "item.completed",
+                "item": {"type": "mcp_tool_call", "server": "meta_research"},
+            },
+            {"type": "turn.completed"},
+            )
+        )
+        failed_after_open = (
+            self.fail_first_after_open and len(self.provider_calls) == 1
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            1 if failed_after_open else 0,
+            "\n".join(json.dumps(item) for item in stream) + "\n",
+            "provider exited after opening HumanRequest" if failed_after_open else "",
+        )
+
+    def _tool_call(
+        self,
+        token: str,
+        *,
+        operation_id: str,
+        arguments: dict[str, object],
+        request_id: int,
+    ) -> dict[str, object]:
+        status, payload, _session_id = self.runtime.harnesses.dispatch_mcp_http(
+            token,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": operation_id, "arguments": arguments},
+            },
+            mcp_session_id="codex-target-human-request-session",
+        )
+        assert status == 200
+        assert payload is not None
+        result = payload["result"]
+        assert isinstance(result, dict)
+        assert result["isError"] is False
+        structured = result["structuredContent"]
+        assert isinstance(structured, dict)
+        return structured
+
+
+class _OperationBoundAdvisoryBundleSkill(_OperationBoundBundleSkill):
+    """Current deterministic Bundle seam with no fabricated child review."""
+
+    def review_draft(self, request, draft):
+        return replace(
+            super().review_draft(request, draft),
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
+        )
 
 
 @pytest.fixture
@@ -56,7 +230,7 @@ def _owner_with_failed_admission(
         harness_family="codex",
         model_ref="gpt-target-root",
         auth_profile_ref="harness-profile:target-root",
-        required_operation_ids=TARGET_RUN_SEMANTIC_OPERATION_IDS,
+        required_operation_ids=TARGET_ROOT_SEMANTIC_OPERATION_IDS,
         required_capabilities=HARNESS_CAPABILITIES,
         target_ref=handle.target_ref,
         target_run_ref=handle.target_run_ref,
@@ -167,7 +341,7 @@ def _owner_with_active_root(
         harness_family="codex",
         model_ref="gpt-target-root",
         auth_profile_ref="harness-profile:target-root",
-        required_operation_ids=TARGET_RUN_SEMANTIC_OPERATION_IDS,
+        required_operation_ids=TARGET_ROOT_SEMANTIC_OPERATION_IDS,
         required_capabilities=HARNESS_CAPABILITIES,
         target_ref=base_handle.target_ref,
         target_run_ref=base_handle.target_run_ref,
@@ -251,6 +425,346 @@ def _owner_with_active_root(
             },
         )
     return database, owner, request, handle
+
+
+def test_recovery_preserves_human_request_suspension_without_session_checkpoint(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "suspended-target-restart")
+    database, _owner, request, _handle = _owner_with_active_root(
+        data_root.database
+    )
+    database.close()
+    runtime = build_production_runtime(data_root)
+    agent_runtime = runtime.owners.agent_runtime
+    harness_owner = agent_runtime.harness_runs
+    run = harness_owner.query_run(request.request_ref)
+    assert run is not None
+    operation_ref = f"{run.run_ref}:harness_turn:1"
+    harness_owner.start_operation(
+        run_ref=run.run_ref,
+        operation_ref=operation_ref,
+        generation=1,
+        invocation_hash="9" * 64,
+        resume=False,
+    )
+    binding = {
+        "quest_ref": "quest_1",
+        "task_ref": run.run_ref,
+        "root_session_ref": run.root_session_ref,
+        "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+        "attempt_ref": run.attempt_ref,
+        "generation": run.attempt_generation,
+        "request_owner": "agent_runtime",
+        "root_kind": "target",
+        "phase": TARGET_ROOT_LIFECYCLE_PHASE,
+        "fence_ref": run.fence_ref,
+        "runtime_binding_hash": run.capability_binding_hash,
+    }
+    target = {
+        "schema_ref": "meta-research/root-agent-human-request-target/v1",
+        "root": {
+            "run_kind": "target",
+            "run_ref": run.run_ref,
+            "attempt_ref": run.attempt_ref,
+            "root_session_ref": run.root_session_ref,
+            "fence_ref": run.fence_ref,
+            "waiter_generation": run.attempt_generation,
+        },
+        "condition": {"route": "literature_access"},
+    }
+    try:
+        human_request = agent_runtime.open_human_request_effect(
+            effect_key="mcp-effect:target-restart-human-request",
+            effect_id="target-restart-human-request",
+            operation_binding=binding,
+            predecessor_request_ref=None,
+            request_kind="library_reconnect",
+            obligation="Select a safe literature route for this Target task.",
+            business_purpose="Resume the exact suspended Target task.",
+            target_assertion=target,
+            acceptance_conditions=("A safe current route is selected.",),
+            direct_waiter={
+                "waiter_ref": f"root_run:{run.run_ref}",
+                "generation": run.attempt_generation,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref="quest_1",
+        )
+        assert harness_owner.query_run(request.request_ref).status == "suspended"
+
+        restarted_database = Database(data_root.database)
+        restarted_owner = SQLiteAgentRuntimeHarness(
+            restarted_database,
+            DurableFeed(restarted_database),
+        )
+        try:
+            recovered = restarted_owner.query_run(request.request_ref)
+            recovered_operation = restarted_owner.latest_operation(run.run_ref)
+            assert recovered is not None and recovered.status == "suspended"
+            assert recovered_operation is not None
+            assert recovered_operation.status == "unknown_outcome"
+        finally:
+            restarted_database.close()
+
+        runtime.owners.human_collaboration.respond_to_human_request(
+            str(human_request["request_ref"]),
+            decision="provided",
+            facts={"route": "oa_only"},
+            note="Continue with lawful open-access sources.",
+            idempotency_key="target-restart-human-response",
+        )
+        disposed = agent_runtime.query_human_request(
+            str(human_request["request_ref"])
+        )
+        assert disposed is not None
+        assert disposed["status"] == "open"
+        assert disposed["direct_waiters"][0]["status"] == "blocked"
+        assert harness_owner.query_run(request.request_ref).status == "suspended"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "fail_first_after_open",
+        "restart_after_response",
+        "conflicting_session_after_open",
+        "resumable",
+    ),
+    (
+        (False, False, False, True),
+        (False, True, False, True),
+        (True, True, False, True),
+        (False, False, True, False),
+    ),
+    ids=(
+        "normal-same-process",
+        "normal-restart",
+        "nonzero-after-open-restart",
+        "conflicting-session-after-open",
+    ),
+)
+def test_target_provider_return_checkpoints_session_then_resumes_once(
+    tmp_path: Path,
+    fail_first_after_open: bool,
+    restart_after_response: bool,
+    conflicting_session_after_open: bool,
+    resumable: bool,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "target-provider-human-request")
+    runner = _TargetHumanRequestRunner(
+        fail_first_after_open=fail_first_after_open,
+        conflicting_session_after_open=conflicting_session_after_open,
+    )
+    codex_workspace = data_root.run / "target-human-request-harness"
+    drafting = bundle_fixtures._DeterministicDraftingAdapter()
+    bundle_provider = _OperationBoundAdvisoryBundleSkill()
+    setup_runtime = build_production_runtime(
+        data_root,
+        proposal_drafter=drafting,
+        intent_drafting_provider=drafting,
+        host_compute_probe=bundle_fixtures._DeterministicProbe(),
+        idea_skill_provider=bundle_fixtures._DeterministicIdeaSkill(),
+        plan_skill_provider=bundle_fixtures._DeterministicPlanSkill(
+            no_gap=False
+        ),
+        bundle_skill_provider=bundle_provider,
+        harness_adapters=(
+            bundle_fixtures._FullConformanceAdapter("codex"),
+            bundle_fixtures._FullConformanceAdapter("claude"),
+        ),
+        power_inhibitor=bundle_fixtures._TogglePowerInhibitor(),
+        startup_power_probe=False,
+        startup_harness_diagnostics=False,
+    )
+    bundle_provider.bind(setup_runtime.harnesses)
+    setup_runtime.owners.research_graph._target_candidate_proof_verifier = (  # type: ignore[attr-defined]
+        bundle_fixtures._AcceptingTargetCandidateProofVerifier()
+    )
+    setup_runtime.harnesses.start_full_conformance(
+        bundle_fixtures._full_request()
+    )
+    for _turn in range(4):
+        if setup_runtime.harnesses.query_status()["status"] == "ready":
+            break
+        assert setup_runtime.harnesses.advance_full_conformance(
+            mcp_base_url="http://127.0.0.1:8999"
+        )
+    assert setup_runtime.harnesses.query_status()["status"] == "ready"
+    _target, _candidate, _formal_plan, admission, _handle = (
+        _admit_independent_target_root(setup_runtime)
+    )
+    request_ref = admission.run.request_ref
+    target_run_ref = admission.run.run_ref
+    setup_runtime.close()
+
+    runtime = build_production_runtime(
+        data_root,
+        harness_adapters=(
+            CodexHarnessAdapter(
+                codex_workspace,
+                runner=runner,
+                target_root_timeout_seconds=30 * 24 * 60 * 60,
+            ),
+            bundle_fixtures._FullConformanceAdapter("claude"),
+        ),
+        power_inhibitor=bundle_fixtures._TogglePowerInhibitor(),
+        startup_power_probe=False,
+        startup_harness_diagnostics=False,
+    )
+    runner.runtime = runtime
+    prompt = "Continue the exact Target root task through completion."
+    first_flow_completed = False
+    try:
+        with pytest.raises(HarnessAdmissionError, match="runtime_run_suspended"):
+            runtime.harnesses.run_or_resume_target_root(
+                request_ref,
+                prompt=prompt,
+                mcp_base_url="http://127.0.0.1:8999",
+            )
+
+        suspended = runtime.owners.agent_runtime.harness_runs.query_run(
+            request_ref
+        )
+        first_operation = (
+            runtime.owners.agent_runtime.harness_runs.latest_operation(
+                target_run_ref
+            )
+        )
+        assert suspended is not None
+        assert suspended.status == "suspended"
+        assert suspended.native_session_ref == (
+            "codex-target-human-request-session" if resumable else None
+        )
+        assert suspended.failure_code == (
+            "human_request_wait" if resumable else None
+        )
+        assert first_operation is not None
+        assert (first_operation.status, first_operation.outcome_code) == (
+            ("executed", "human_request_wait")
+            if resumable
+            else ("running", None)
+        )
+        assert (
+            runtime.owners.agent_runtime.harness_runs.query_profile(
+                target_run_ref
+            )
+            is None
+        )
+        assert runner.request_ref is not None
+
+        response = runtime.owners.human_collaboration.respond_to_human_request(
+            runner.request_ref,
+            decision="deferred",
+            facts={"safe_route": "continue_without_offline_action"},
+            note="Continue with the safe in-process alternative.",
+            idempotency_key="target-provider-human-response",
+        )
+        resumed = runtime.owners.agent_runtime.harness_runs.query_run(
+            request_ref
+        )
+        assert resumed is not None
+        if not resumable:
+            assert resumed.status == "suspended"
+            waiting = runtime.owners.agent_runtime.query_human_request(
+                runner.request_ref
+            )
+            assert waiting is not None and waiting["status"] == "open"
+            assert waiting["direct_waiters"][0]["status"] == "blocked"
+            assert len(runner.provider_calls) == 1
+            return
+        assert resumed.status == "running"
+        first_flow_completed = True
+    finally:
+        if restart_after_response or not first_flow_completed:
+            runtime.close()
+
+    restarted = (
+        build_production_runtime(
+            data_root,
+            harness_adapters=(
+                CodexHarnessAdapter(
+                    codex_workspace,
+                    runner=runner,
+                    target_root_timeout_seconds=30 * 24 * 60 * 60,
+                ),
+                bundle_fixtures._FullConformanceAdapter("claude"),
+            ),
+            power_inhibitor=bundle_fixtures._TogglePowerInhibitor(),
+            startup_power_probe=False,
+            startup_harness_diagnostics=False,
+        )
+        if restart_after_response
+        else runtime
+    )
+    runner.runtime = restarted
+    try:
+        completed = restarted.harnesses.run_or_resume_target_root(
+            request_ref,
+            prompt=prompt,
+            mcp_base_url="http://127.0.0.1:8999",
+        )
+        replayed_response = (
+            restarted.owners.human_collaboration.respond_to_human_request(
+                runner.request_ref,
+                decision="deferred",
+                facts={"safe_route": "continue_without_offline_action"},
+                note="Continue with the safe in-process alternative.",
+                idempotency_key="target-provider-human-response",
+            )
+        )
+
+        operations = tuple(
+            operation
+            for operation in restarted.owners.agent_runtime.harness_runs.query_status_records()[
+                1
+            ]
+            if operation.run_ref == target_run_ref
+        )
+        assert completed.status == "executed"
+        assert completed.native_session_ref == (
+            "codex-target-human-request-session"
+        )
+        assert replayed_response == response
+        assert len(runner.provider_calls) == 2
+        first_argv, _first_prompt, first_environment = runner.provider_calls[0]
+        second_argv, second_prompt, second_environment = runner.provider_calls[1]
+        assert first_argv[-1] == "-"
+        assert second_argv[-3:] == [
+            "resume",
+            "codex-target-human-request-session",
+            "-",
+        ]
+        assert "HumanRequest" in second_prompt
+        assert first_environment["META_RESEARCH_PROVIDER_OPERATION_REF"] != (
+            second_environment["META_RESEARCH_PROVIDER_OPERATION_REF"]
+        )
+        assert [item.generation for item in reversed(operations)] == [1, 2]
+        assert [item.status for item in reversed(operations)] == [
+            "executed",
+            "executed",
+        ]
+        assert runner.resolution == {
+            "response_ref": response["response_ref"],
+            "decision": "deferred",
+            "facts": {"safe_route": "continue_without_offline_action"},
+            "note": "Continue with the safe in-process alternative.",
+            "disposition": "unsatisfied",
+            "reason_code": "human_deferred_exact_obligation",
+            "accepted_evidence_refs": [],
+        }
+        profile = restarted.owners.agent_runtime.harness_runs.query_profile(
+            target_run_ref
+        )
+        assert profile is not None
+        assert profile["provider_operation_refs"] == [
+            second_environment["META_RESEARCH_PROVIDER_OPERATION_REF"]
+        ]
+    finally:
+        restarted.close()
 
 
 def test_owner_reopens_failed_target_admission_once_without_rotating_identity(

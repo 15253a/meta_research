@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Callable
 from typing import Protocol, cast
 
 from sqlalchemy import text
@@ -27,9 +28,16 @@ HUMAN_REQUEST_KINDS = {
     "offline_action",
     "capability_authorization",
 }
-HUMAN_EVALUATIONS = {"satisfied", "needs_input", "declined", "stale"}
+HUMAN_EVALUATIONS = {
+    "satisfied",
+    "unsatisfied",
+    "needs_input",
+    "declined",
+    "stale",
+}
 HUMAN_DISPOSITIONS = {
     "satisfied",
+    "unsatisfied",
     "declined",
     "withdrawn",
     "expired",
@@ -37,6 +45,8 @@ HUMAN_DISPOSITIONS = {
 }
 HUMAN_RESPONSE_DECISIONS = {"provided", "declined", "deferred"}
 HUMAN_REQUEST_RECEIPT_SCHEMA = "meta-research/human-request-disposition/v1"
+HUMAN_REQUEST_OPEN_RECEIPT_SCHEMA = "meta-research/human-request-open/v1"
+HUMAN_REQUEST_YIELD_SCHEMA = "meta-research/human-request-task-yield/v1"
 HUMAN_REQUEST_RESUME_CONSUMPTION_RECEIPT_SCHEMA = (
     "meta-research/human-request-resume-consumption/v1"
 )
@@ -53,6 +63,10 @@ class HumanResponseVerifier(Protocol):
     """Narrow HC authority consumed by blocked Owners."""
 
     def query_human_responses(
+        self, request_ref: str
+    ) -> tuple[dict[str, object], ...]: ...
+
+    def query_human_response_rejections(
         self, request_ref: str
     ) -> tuple[dict[str, object], ...]: ...
 
@@ -115,6 +129,24 @@ class HumanRequestOwnerInterface(Protocol):
         expires_at: float | None = None,
     ) -> dict[str, object]: ...
 
+    def open_human_request_effect(
+        self,
+        *,
+        effect_key: str,
+        effect_id: str,
+        operation_binding: dict[str, object],
+        predecessor_request_ref: str | None,
+        request_kind: str,
+        obligation: str,
+        business_purpose: str,
+        target_assertion: dict[str, object],
+        acceptance_conditions: tuple[str, ...],
+        direct_waiter: dict[str, object],
+        quest_ref: str | None = None,
+        required_authorization: dict[str, object] | None = None,
+        expires_at: float | None = None,
+    ) -> dict[str, object]: ...
+
     def revise_human_request(
         self,
         request_ref: str,
@@ -167,6 +199,10 @@ class HumanRequestOwnerInterface(Protocol):
         self, idempotency_key: str
     ) -> dict[str, object] | None: ...
 
+    def reconcile_human_request_effect(
+        self, effect_key: str
+    ) -> dict[str, object]: ...
+
 
 
 class HumanRequestOwnerMixin:
@@ -181,15 +217,31 @@ class HumanRequestOwnerMixin:
         issuer: str,
         response_verifier: HumanResponseVerifier | None,
     ) -> None:
+        yield_operation = getattr(
+            self, "_yield_operation_for_human_request", None
+        )
         self._human_request_owner = SQLiteHumanRequestOwner(
             database,
             feed,
             issuer,
             response_verifier,
+            (
+                cast(
+                    Callable[
+                        [Connection, dict[str, object], str], None
+                    ],
+                    yield_operation,
+                )
+                if callable(yield_operation)
+                else None
+            ),
         )
 
     def open_human_request(self, **values) -> dict[str, object]:
         return self._human_request_owner.open_human_request(**values)
+
+    def open_human_request_effect(self, **values) -> dict[str, object]:
+        return self._human_request_owner.open_human_request_effect(**values)
 
     def revise_human_request(self, request_ref: str, **values) -> dict[str, object]:
         return self._human_request_owner.revise_human_request(request_ref, **values)
@@ -226,6 +278,11 @@ class HumanRequestOwnerMixin:
             idempotency_key
         )
 
+    def reconcile_human_request_effect(
+        self, effect_key: str
+    ) -> dict[str, object]:
+        return self._human_request_owner.reconcile_human_request_effect(effect_key)
+
 
 
 class SQLiteHumanRequestOwner:
@@ -237,6 +294,9 @@ class SQLiteHumanRequestOwner:
         feed: DurableFeed,
         issuer: str,
         response_verifier: HumanResponseVerifier | None,
+        yield_operation: (
+            Callable[[Connection, dict[str, object], str], None] | None
+        ) = None,
     ) -> None:
         try:
             self._state_table = _OWNER_STATE_TABLES[issuer]
@@ -246,6 +306,7 @@ class SQLiteHumanRequestOwner:
         self._feed = feed
         self._issuer = issuer
         self._response_verifier = response_verifier
+        self._yield_operation = yield_operation
 
     def open_human_request(
         self,
@@ -351,6 +412,188 @@ class SQLiteHumanRequestOwner:
             raise OwnerConflict("human_request_not_found")
         return result
 
+    def open_human_request_effect(
+        self,
+        *,
+        effect_key: str,
+        effect_id: str,
+        operation_binding: dict[str, object],
+        predecessor_request_ref: str | None,
+        request_kind: str,
+        obligation: str,
+        business_purpose: str,
+        target_assertion: dict[str, object],
+        acceptance_conditions: tuple[str, ...],
+        direct_waiter: dict[str, object],
+        quest_ref: str | None = None,
+        required_authorization: dict[str, object] | None = None,
+        expires_at: float | None = None,
+    ) -> dict[str, object]:
+        """Open one operation-bound effect without contract-level request reuse."""
+
+        _validate_idempotency_key(effect_key)
+        effect_id = _bounded_text(effect_id, "human_request_effect_id_invalid", 128)
+        predecessor_request_ref = (
+            None
+            if predecessor_request_ref is None
+            else _bounded_text(
+                predecessor_request_ref,
+                "human_request_predecessor_invalid",
+                96,
+            )
+        )
+        contract = _validate_contract(
+            request_kind=request_kind,
+            obligation=obligation,
+            business_purpose=business_purpose,
+            target_assertion=target_assertion,
+            acceptance_conditions=acceptance_conditions,
+            quest_ref=quest_ref,
+            required_authorization=required_authorization,
+            expires_at=expires_at,
+        )
+        waiter = _validate_waiter(direct_waiter)
+        binding = _validate_operation_binding(
+            operation_binding,
+            issuer=self._issuer,
+            generation=cast(int, waiter["generation"]),
+            quest_ref=quest_ref,
+        )
+        command = {
+            "command": "open_human_request_effect",
+            "effect_id": effect_id,
+            "operation_binding": binding,
+            "predecessor_request_ref": predecessor_request_ref,
+            "contract": contract,
+            "direct_waiter": waiter,
+        }
+        request_hash = canonical_hash(command)
+        with self._database.write() as connection:
+            replay = _command_replay(
+                connection,
+                self._issuer,
+                effect_key,
+                "open_effect",
+                request_hash,
+            )
+            if replay is not None:
+                request_ref = replay
+                effect = _open_effect_row(
+                    connection,
+                    issuer=self._issuer,
+                    effect_key=effect_key,
+                )
+                if effect is None or effect.request_ref != request_ref:
+                    raise OwnerConflict("human_request_open_effect_invalid")
+            else:
+                if predecessor_request_ref is not None:
+                    _verify_effect_successor_predecessor(
+                        connection,
+                        issuer=self._issuer,
+                        response_verifier=self._response_verifier,
+                        predecessor_request_ref=predecessor_request_ref,
+                        operation_binding=binding,
+                        generation=cast(int, waiter["generation"]),
+                        quest_ref=quest_ref,
+                    )
+                now = time.time()
+                request_id = new_ref("human_request")
+                request_ref = f"{request_id}:r1"
+                _insert_request(
+                    connection,
+                    issuer=self._issuer,
+                    request_id=request_id,
+                    request_ref=request_ref,
+                    revision=1,
+                    contract=contract,
+                    identity_hash=canonical_hash(contract),
+                    predecessor_request_ref=predecessor_request_ref,
+                    now=now,
+                )
+                if not _insert_waiter(
+                    connection,
+                    request_ref=request_ref,
+                    waiter=waiter,
+                    now=now,
+                ):
+                    raise OwnerConflict("human_request_waiter_conflict")
+                if self._yield_operation is None:
+                    raise OwnerConflict("human_request_operation_yield_unavailable")
+                self._yield_operation(connection, binding, request_ref)
+                yield_fact = _operation_yield_fact(
+                    request_ref=request_ref,
+                    waiter=waiter,
+                    operation_binding=binding,
+                )
+                receipt_ref = new_ref("owner_receipt")
+                receipt_hash = _open_effect_receipt_hash(
+                    issuer=self._issuer,
+                    effect_id=effect_id,
+                    request_ref=request_ref,
+                    waiter_ref=cast(str, waiter["waiter_ref"]),
+                    generation=cast(int, waiter["generation"]),
+                    operation_binding_hash=canonical_hash(binding),
+                    yield_fact_hash=canonical_hash(yield_fact),
+                    predecessor_request_ref=predecessor_request_ref,
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO owner_human_request_open_effects (issuer, "
+                        "effect_key, effect_id, request_ref, waiter_ref, generation, "
+                        "operation_binding_json, operation_binding_hash, "
+                        "yield_fact_json, yield_fact_hash, receipt_ref, receipt_hash, "
+                        "created_at) VALUES (:issuer, :effect_key, :effect_id, "
+                        ":request_ref, :waiter_ref, :generation, :binding_json, "
+                        ":binding_hash, :yield_json, :yield_hash, :receipt_ref, "
+                        ":receipt_hash, :now)"
+                    ),
+                    {
+                        "issuer": self._issuer,
+                        "effect_key": effect_key,
+                        "effect_id": effect_id,
+                        "request_ref": request_ref,
+                        "waiter_ref": waiter["waiter_ref"],
+                        "generation": waiter["generation"],
+                        "binding_json": canonical_json(binding),
+                        "binding_hash": canonical_hash(binding),
+                        "yield_json": canonical_json(yield_fact),
+                        "yield_hash": canonical_hash(yield_fact),
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                    },
+                )
+                _record_command(
+                    connection,
+                    self._issuer,
+                    effect_key,
+                    "open_effect",
+                    request_hash,
+                    request_ref,
+                )
+                connection.execute(
+                    text(
+                        f"UPDATE {self._state_table} SET revision = revision + 1, "
+                        "human_request_count = human_request_count + 1 WHERE "
+                        "singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    f"{self._issuer}.human_request_effect_opened",
+                    {
+                        "request_ref": request_ref,
+                        "effect_id": effect_id,
+                        "waiter_ref": waiter["waiter_ref"],
+                        "generation": waiter["generation"],
+                        "predecessor_request_ref": predecessor_request_ref,
+                    },
+                )
+        result = self.query_human_request(request_ref)
+        if result is None or result.get("open_effect") is None:
+            raise OwnerConflict("human_request_open_effect_invalid")
+        return result
+
     def consume_released_waiter(
         self,
         connection: Connection,
@@ -427,9 +670,9 @@ class SQLiteHumanRequestOwner:
             {"request_ref": request_ref, "waiter_ref": waiter_ref},
         ).first()
         if (
-            request.status != "satisfied"
+            request.status not in {"satisfied", "unsatisfied"}
             or not bool(request.is_current)
-            or disposition.decision != "satisfied"
+            or disposition.decision != request.status
             or waiter is None
             or waiter.status != "released"
             or int(waiter.generation) != generation
@@ -609,6 +852,7 @@ class SQLiteHumanRequestOwner:
                     revision=successor_revision,
                     contract=contract,
                     identity_hash=canonical_hash(contract),
+                    predecessor_request_ref=request_ref,
                     now=now,
                 )
                 for waiter in waiters:
@@ -693,6 +937,10 @@ class SQLiteHumanRequestOwner:
             item["decision"] == "declined" for item in responses
         ):
             raise OwnerConflict("human_request_decline_response_required")
+        if decision == "unsatisfied" and not any(
+            item["decision"] in {"declined", "deferred"} for item in responses
+        ):
+            raise OwnerConflict("human_request_unsatisfied_response_required")
         command_hash = canonical_hash(
             {
                 "command": "evaluate_human_request",
@@ -760,7 +1008,7 @@ class SQLiteHumanRequestOwner:
                         "now": now,
                     },
                 )
-                if decision in {"satisfied", "declined"}:
+                if decision in {"satisfied", "unsatisfied", "declined"}:
                     _insert_disposition(
                         connection,
                         issuer=self._issuer,
@@ -904,8 +1152,8 @@ class SQLiteHumanRequestOwner:
                 status = "released"
                 if (
                     disposition is None
-                    or disposition.decision != "satisfied"
-                    or request.status != "satisfied"
+                    or disposition.decision not in {"satisfied", "unsatisfied"}
+                    or request.status != disposition.decision
                     or not bool(request.is_current)
                 ):
                     status = "blocked"
@@ -928,7 +1176,7 @@ class SQLiteHumanRequestOwner:
                         if request.required_authorization_json is None
                         else decoded_object(request.required_authorization_json)
                     )
-                    if requirement is not None:
+                    if requirement is not None and request.status == "satisfied":
                         if authorization_receipt_ref is None:
                             status = "blocked"
                             reason_code = "authorization_receipt_required"
@@ -1078,12 +1326,33 @@ class SQLiteHumanRequestOwner:
                 ),
                 {"request_ref": request_ref},
             ).all()
+            open_effect = connection.execute(
+                text(
+                    "SELECT * FROM owner_human_request_open_effects WHERE "
+                    "issuer = :issuer AND request_ref = :request_ref"
+                ),
+                {"issuer": self._issuer, "request_ref": request_ref},
+            ).first()
+            successor_ref = connection.execute(
+                text(
+                    "SELECT request_ref FROM owner_human_requests WHERE issuer = "
+                    ":issuer AND predecessor_request_ref = :request_ref"
+                ),
+                {"issuer": self._issuer, "request_ref": request_ref},
+            ).scalar_one_or_none()
         latest_validations = {item.waiter_ref: item for item in validations}
         latest_consumptions = {item.waiter_ref: item for item in consumptions}
         responses = (
             ()
             if self._response_verifier is None
             else self._response_verifier.query_human_responses(request_ref)
+        )
+        response_rejections = (
+            ()
+            if self._response_verifier is None
+            else self._response_verifier.query_human_response_rejections(
+                request_ref
+            )
         )
         return _public_request(
             row,
@@ -1093,6 +1362,9 @@ class SQLiteHumanRequestOwner:
             latest_validations,
             latest_consumptions,
             responses,
+            response_rejections,
+            open_effect=open_effect,
+            successor_request_ref=successor_ref,
         )
 
     def query_human_requests(
@@ -1148,6 +1420,25 @@ class SQLiteHumanRequestOwner:
         request = self.query_human_request(cast(str, row.result_ref))
         if request is None:
             raise OwnerConflict("human_request_artifact_invalid")
+        return request
+
+    def reconcile_human_request_effect(
+        self, effect_key: str
+    ) -> dict[str, object]:
+        """Read the immutable matching open effect without replaying its command."""
+
+        _validate_idempotency_key(effect_key)
+        with self._database.read() as connection:
+            row = _open_effect_row(
+                connection,
+                issuer=self._issuer,
+                effect_key=effect_key,
+            )
+        if row is None:
+            raise OwnerConflict("effect_not_found")
+        request = self.query_human_request(cast(str, row.request_ref))
+        if request is None or request.get("open_effect") is None:
+            raise OwnerConflict("human_request_open_effect_invalid")
         return request
 
     def _materialize_expiration_if_due(self, request_ref: str) -> None:
@@ -1321,6 +1612,194 @@ def _validate_waiter(value: dict[str, object]) -> dict[str, object]:
     return waiter
 
 
+def _validate_operation_binding(
+    value: dict[str, object],
+    *,
+    issuer: str,
+    generation: int,
+    quest_ref: str | None,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise OwnerConflict("human_request_operation_binding_invalid")
+    try:
+        binding = decoded_object(canonical_json(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("human_request_operation_binding_invalid") from error
+    required_text = (
+        "quest_ref",
+        "task_ref",
+        "root_session_ref",
+        "operation_id",
+        "attempt_ref",
+        "request_owner",
+    )
+    if (
+        any(
+            not isinstance(binding.get(name), str)
+            or not cast(str, binding[name]).strip()
+            or len(cast(str, binding[name])) > 256
+            for name in required_text
+        )
+        or not isinstance(binding.get("generation"), int)
+        or isinstance(binding.get("generation"), bool)
+        or binding.get("generation") != generation
+        or binding.get("request_owner") != issuer
+        or binding.get("quest_ref") != quest_ref
+        or contains_secret(binding)
+    ):
+        raise OwnerConflict("human_request_operation_binding_invalid")
+    return binding
+
+
+def _operation_yield_fact(
+    *,
+    request_ref: str,
+    waiter: dict[str, object],
+    operation_binding: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema_ref": HUMAN_REQUEST_YIELD_SCHEMA,
+        "status": "yielded",
+        "request_ref": request_ref,
+        "task_ref": operation_binding["task_ref"],
+        "root_session_ref": operation_binding["root_session_ref"],
+        "operation_id": operation_binding["operation_id"],
+        "attempt_ref": operation_binding["attempt_ref"],
+        "generation": operation_binding["generation"],
+        "request_owner": operation_binding["request_owner"],
+        "waiter_ref": waiter["waiter_ref"],
+    }
+
+
+def _open_effect_receipt_hash(
+    *,
+    issuer: str,
+    effect_id: str,
+    request_ref: str,
+    waiter_ref: str,
+    generation: int,
+    operation_binding_hash: str,
+    yield_fact_hash: str,
+    predecessor_request_ref: str | None,
+) -> str:
+    return canonical_hash(
+        {
+            "schema_ref": HUMAN_REQUEST_OPEN_RECEIPT_SCHEMA,
+            "issuer": issuer,
+            "effect_id": effect_id,
+            "request_ref": request_ref,
+            "waiter_ref": waiter_ref,
+            "generation": generation,
+            "operation_binding_hash": operation_binding_hash,
+            "yield_fact_hash": yield_fact_hash,
+            "predecessor_request_ref": predecessor_request_ref,
+        }
+    )
+
+
+def _open_effect_row(
+    connection,
+    *,
+    issuer: str,
+    effect_key: str,
+):
+    return connection.execute(
+        text(
+            "SELECT * FROM owner_human_request_open_effects WHERE issuer = "
+            ":issuer AND effect_key = :effect_key"
+        ),
+        {"issuer": issuer, "effect_key": effect_key},
+    ).first()
+
+
+def _verify_effect_successor_predecessor(
+    connection,
+    *,
+    issuer: str,
+    response_verifier: HumanResponseVerifier | None,
+    predecessor_request_ref: str,
+    operation_binding: dict[str, object],
+    generation: int,
+    quest_ref: str | None,
+) -> None:
+    predecessor = _request_row(connection, issuer, predecessor_request_ref)
+    disposition = connection.execute(
+        text(
+            "SELECT * FROM owner_human_request_dispositions WHERE request_ref = "
+            ":request_ref"
+        ),
+        {"request_ref": predecessor_request_ref},
+    ).first()
+    if predecessor is None:
+        raise OwnerConflict("human_request_predecessor_not_found")
+    _verify_request_state_integrity(connection, predecessor, disposition)
+    if (
+        predecessor.status not in {"satisfied", "unsatisfied"}
+        or disposition is None
+    ):
+        raise OwnerConflict("human_request_predecessor_not_terminal")
+    _verify_disposition_integrity(
+        connection,
+        issuer=issuer,
+        request=predecessor,
+        disposition=disposition,
+        response_verifier=response_verifier,
+    )
+    predecessor_effect = connection.execute(
+        text(
+            "SELECT * FROM owner_human_request_open_effects WHERE issuer = "
+            ":issuer AND request_ref = :request_ref"
+        ),
+        {"issuer": issuer, "request_ref": predecessor_request_ref},
+    ).first()
+    predecessor_waiters = connection.execute(
+        text(
+            "SELECT * FROM owner_human_request_waiters WHERE request_ref = "
+            ":request_ref"
+        ),
+        {"request_ref": predecessor_request_ref},
+    ).all()
+    successor = connection.execute(
+        text(
+            "SELECT request_ref FROM owner_human_requests WHERE issuer = :issuer "
+            "AND predecessor_request_ref = :request_ref"
+        ),
+        {"issuer": issuer, "request_ref": predecessor_request_ref},
+    ).first()
+    try:
+        predecessor_binding = (
+            None
+            if predecessor_effect is None
+            else decoded_object(predecessor_effect.operation_binding_json)
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("human_request_predecessor_invalid") from error
+    if (
+        predecessor_effect is None
+        or canonical_hash(predecessor_binding)
+        != predecessor_effect.operation_binding_hash
+        or predecessor_effect.request_ref != predecessor_request_ref
+        or len(predecessor_waiters) != 1
+        or predecessor_waiters[0].waiter_ref != predecessor_effect.waiter_ref
+        or predecessor_waiters[0].status != "consumed"
+        or int(predecessor_waiters[0].generation)
+        != int(predecessor_effect.generation)
+        or generation <= int(predecessor_effect.generation)
+        or predecessor.quest_ref != quest_ref
+        or predecessor_binding.get("quest_ref") != operation_binding["quest_ref"]
+        or predecessor_binding.get("task_ref") != operation_binding["task_ref"]
+        or predecessor_binding.get("root_session_ref")
+        != operation_binding["root_session_ref"]
+        or predecessor_binding.get("operation_id")
+        != operation_binding["operation_id"]
+        or predecessor_binding.get("request_owner")
+        != operation_binding["request_owner"]
+    ):
+        raise OwnerConflict("human_request_predecessor_invalid")
+    if successor is not None:
+        raise OwnerConflict("human_request_successor_exists")
+
+
 def _insert_request(
     connection,
     *,
@@ -1330,6 +1809,7 @@ def _insert_request(
     revision: int,
     contract: dict[str, object],
     identity_hash: str,
+    predecessor_request_ref: str | None = None,
     now: float,
 ) -> None:
     target = cast(dict[str, object], contract["target_assertion"])
@@ -1344,11 +1824,13 @@ def _insert_request(
             "target_assertion_json, target_assertion_hash, "
             "acceptance_conditions_json, acceptance_conditions_hash, "
             "required_authorization_json, required_authorization_hash, expires_at, "
-            "identity_hash, status, is_current, created_at, updated_at) VALUES "
+            "identity_hash, predecessor_request_ref, status, is_current, created_at, "
+            "updated_at) VALUES "
             "(:request_ref, :issuer, :request_id, :revision, :quest_ref, :kind, "
             ":obligation, :business_purpose, :target_json, :target_hash, "
             ":conditions_json, :conditions_hash, :authorization_json, "
-            ":authorization_hash, :expires_at, :identity_hash, 'open', 1, :now, :now)"
+            ":authorization_hash, :expires_at, :identity_hash, :predecessor_request_ref, "
+            "'open', 1, :now, :now)"
         ),
         {
             "request_ref": request_ref,
@@ -1371,6 +1853,7 @@ def _insert_request(
             ),
             "expires_at": contract["expires_at"],
             "identity_hash": identity_hash,
+            "predecessor_request_ref": predecessor_request_ref,
             "now": now,
         },
     )
@@ -1499,7 +1982,7 @@ def _verify_disposition_integrity(
     )
     if disposition.receipt_hash != expected_receipt_hash:
         raise OwnerConflict("human_request_disposition_invalid")
-    if disposition.decision not in {"satisfied", "declined"}:
+    if disposition.decision not in {"satisfied", "unsatisfied", "declined"}:
         if disposition.evaluation_ref is not None:
             raise OwnerConflict("human_request_disposition_invalid")
         return
@@ -1562,6 +2045,13 @@ def _verify_disposition_integrity(
             disposition.decision == "declined"
             and not any(item.get("decision") == "declined" for item in responses)
         )
+        or (
+            disposition.decision == "unsatisfied"
+            and not any(
+                item.get("decision") in {"declined", "deferred"}
+                for item in responses
+            )
+        )
     ):
         raise OwnerConflict("human_request_evaluation_invalid")
 
@@ -1614,7 +2104,7 @@ def verify_human_request_response_target(
         raise OwnerConflict("human_request_not_current")
     # Reuse the Owner's artifact verifier so a structurally current but corrupt
     # request can never become the basis of a Human Collaboration receipt.
-    _public_request(row, (), None, None, {}, {}, ())
+    _public_request(row, (), None, None, {}, {}, (), ())
 
 
 def _verify_request_state_integrity(connection: Connection, row, disposition) -> None:
@@ -1647,6 +2137,66 @@ def _verify_request_state_integrity(connection: Connection, row, disposition) ->
         raise OwnerConflict("human_request_artifact_invalid")
 
 
+def _public_open_effect(open_effect, *, row, waiters) -> dict[str, object]:
+    try:
+        binding = decoded_object(open_effect.operation_binding_json)
+        yield_fact = decoded_object(open_effect.yield_fact_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("human_request_open_effect_invalid") from error
+    matching_waiters = [
+        waiter
+        for waiter in waiters
+        if waiter["waiter_ref"] == open_effect.waiter_ref
+        and waiter["generation"] == int(open_effect.generation)
+    ]
+    expected_yield = _operation_yield_fact(
+        request_ref=row.request_ref,
+        waiter={
+            "waiter_ref": open_effect.waiter_ref,
+            "generation": int(open_effect.generation),
+        },
+        operation_binding=binding,
+    )
+    expected_receipt_hash = _open_effect_receipt_hash(
+        issuer=row.issuer,
+        effect_id=open_effect.effect_id,
+        request_ref=row.request_ref,
+        waiter_ref=open_effect.waiter_ref,
+        generation=int(open_effect.generation),
+        operation_binding_hash=open_effect.operation_binding_hash,
+        yield_fact_hash=open_effect.yield_fact_hash,
+        predecessor_request_ref=getattr(row, "predecessor_request_ref", None),
+    )
+    if (
+        open_effect.issuer != row.issuer
+        or canonical_hash(binding) != open_effect.operation_binding_hash
+        or canonical_hash(yield_fact) != open_effect.yield_fact_hash
+        or yield_fact != expected_yield
+        or binding.get("request_owner") != row.issuer
+        or binding.get("generation") != int(open_effect.generation)
+        or len(matching_waiters) != 1
+        or open_effect.receipt_hash != expected_receipt_hash
+        or contains_secret(binding)
+        or contains_secret(yield_fact)
+    ):
+        raise OwnerConflict("human_request_open_effect_invalid")
+    receipt = AcceptanceReceipt(
+        issuer=row.issuer,
+        kind="human_request_open",
+        receipt_ref=open_effect.receipt_ref,
+        subject_ref=row.request_ref,
+        payload_hash=open_effect.receipt_hash,
+    ).as_public_dict()
+    return {
+        "schema_ref": HUMAN_REQUEST_OPEN_RECEIPT_SCHEMA,
+        "effect_id": open_effect.effect_id,
+        "operation_binding": binding,
+        "yield": yield_fact,
+        "receipt": receipt,
+        "created_at": float(open_effect.created_at),
+    }
+
+
 def _public_request(
     row,
     waiters,
@@ -1655,6 +2205,10 @@ def _public_request(
     validations,
     consumptions,
     responses: tuple[dict[str, object], ...],
+    response_rejections: tuple[dict[str, object], ...],
+    *,
+    open_effect=None,
+    successor_request_ref: str | None = None,
 ) -> dict[str, object]:
     target = decoded_object(row.target_assertion_json)
     conditions = json.loads(row.acceptance_conditions_json)
@@ -1788,11 +2342,28 @@ def _public_request(
             ).as_public_dict(),
             "created_at": float(disposition.created_at),
         }
+    public_open_effect = (
+        None
+        if open_effect is None
+        else _public_open_effect(open_effect, row=row, waiters=public_waiters)
+    )
+    operation_binding = (
+        None
+        if public_open_effect is None
+        else cast(dict[str, object], public_open_effect["operation_binding"])
+    )
+    predecessor_request_ref = getattr(row, "predecessor_request_ref", None)
     return {
         "request_ref": row.request_ref,
         "issuer": row.issuer,
         "request_id": row.request_id,
         "revision": int(row.revision),
+        "predecessor_request_ref": predecessor_request_ref,
+        "successor_request_ref": successor_request_ref,
+        "lineage": {
+            "predecessor_request_ref": predecessor_request_ref,
+            "successor_request_ref": successor_request_ref,
+        },
         "quest_ref": row.quest_ref,
         "kind": row.kind,
         "obligation": row.obligation,
@@ -1805,8 +2376,30 @@ def _public_request(
         "current": bool(row.is_current),
         "direct_waiters": public_waiters,
         "responses": list(responses),
+        "response_rejections": list(response_rejections),
         "evaluation": public_evaluation,
         "disposition": public_disposition,
+        "open_effect": public_open_effect,
+        "open_receipt": (
+            None
+            if public_open_effect is None
+            else public_open_effect["receipt"]
+        ),
+        "operation": (
+            None
+            if operation_binding is None
+            else operation_binding["operation_id"]
+        ),
+        "generation": (
+            None
+            if operation_binding is None
+            else operation_binding["generation"]
+        ),
+        "request_owner": (
+            row.issuer
+            if operation_binding is None
+            else operation_binding["request_owner"]
+        ),
         "created_at": float(row.created_at),
         "updated_at": float(row.updated_at),
     }

@@ -112,6 +112,7 @@ from meta_research.acquisition import (
 from meta_research.deepfetch import (
     DeepFetchProvider,
     DeepFetchProviderRequest,
+    DeepFetchResult,
     DeepFetchRunRequest,
     DeepFetchRuntimeBinding,
     DeepFetchUnavailable,
@@ -163,6 +164,7 @@ from meta_research.owners.agent_runtime_harness import (
     AgentRuntimeHarnessInterface,
     AgentRuntimeTargetSuccessorReservation,
     SQLiteAgentRuntimeHarness,
+    TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE,
 )
 from meta_research.owners.common import (
     AcceptedAssetBinding,
@@ -1048,9 +1050,45 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
 
     def query_managed_runs(self, quest_ref: str) -> tuple[dict[str, object], ...]: ...
 
+    def register_external_root_task_scope(
+        self,
+        *,
+        root_kind: RootAgentKind,
+        root_runtime_scope: dict[str, object],
+    ) -> dict[str, object]: ...
+
+    def complete_external_root_task_scope(
+        self,
+        *,
+        root_kind: RootAgentKind,
+        root_runtime_scope: dict[str, object],
+    ) -> dict[str, object]: ...
+
+    def verify_root_agent_runtime_scope(
+        self,
+        *,
+        root_kind: RootAgentKind,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> dict[str, object]: ...
+
     def verify_root_agent_human_request_scope(
         self,
         *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> dict[str, object]: ...
+
+    def verify_root_agent_human_request_reconcile_scope(
+        self,
+        *,
+        root_kind: RootAgentKind,
         run_ref: str,
         attempt_ref: str,
         root_session_ref: str,
@@ -1153,6 +1191,28 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         fence_ref: str | None,
     ) -> None: ...
 
+    def park_root_provider_session_for_human_request(
+        self,
+        *,
+        root_kind: str,
+        phase: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding_hash: str,
+    ) -> bool: ...
+
+    def root_provider_continuation_job_ref(
+        self,
+        *,
+        root_kind: str,
+        phase: str,
+        run_ref: str,
+        root_session_ref: str,
+        base_job_ref: str,
+    ) -> str: ...
+
     def record_stage_provider_hard_ceiling(
         self,
         *,
@@ -1244,6 +1304,12 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     ) -> None: ...
 
     def reconcile_human_request(self, request_ref: str) -> dict[str, object] | None: ...
+
+    def reconcile_root_human_request(
+        self, request_ref: str
+    ) -> dict[str, object] | None: ...
+
+    def recover_root_human_requests(self) -> None: ...
 
     def acquire_literature(
         self,
@@ -2391,7 +2457,14 @@ def _acquisition_runtime_effect(
         owner_scope="agent_runtime",
         root_run_ref=session_ref,
         attempt_ref=f"acquisition_attempt_{attempt_count}",
-        fence_ref=None,
+        fence_ref="acquisition_fence_"
+        + canonical_hash(
+            {
+                "session_ref": session_ref,
+                "request_id": request_id,
+                "attempt_count": attempt_count,
+            }
+        ),
         operation_ref=request_id,
         effect_kind="acquisition",
     )
@@ -2417,10 +2490,34 @@ def _acquisition_preflight_runtime_effect(
         owner_scope="agent_runtime",
         root_run_ref=session_ref,
         attempt_ref=f"acquisition_preflight_{generation}",
-        fence_ref=None,
+        fence_ref="acq_preflight_fence_"
+        + canonical_hash(
+            {"session_ref": session_ref, "generation": generation}
+        ),
         operation_ref=operation_ref,
         effect_kind="acquisition",
     )
+
+
+def _acquisition_root_runtime_scope(
+    *,
+    quest_ref: str,
+    session_ref: str,
+    runtime_binding_hash: str,
+    generation: int,
+    effect: RuntimeEffectIdentity,
+) -> dict[str, object]:
+    if effect.attempt_ref is None or effect.fence_ref is None:
+        raise OwnerConflict("external_root_task_scope_invalid")
+    return {
+        "quest_ref": quest_ref,
+        "run_ref": effect.operation_ref,
+        "attempt_ref": effect.attempt_ref,
+        "root_session_ref": session_ref,
+        "fence_ref": effect.fence_ref,
+        "runtime_binding_hash": runtime_binding_hash,
+        "generation": generation,
+    }
 
 
 def _host_compute_runtime_effect(
@@ -6486,10 +6583,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         {"unit_ref": unit.unit_ref},
                     )
                     continue
-                if unit.status == "revocation_pending":
-                    # A previous daemon already revoked this Fence.  Repeating
-                    # replacement would create an unbounded Attempt chain while
-                    # the same detached provider operation is still unknown.
+                if unit.status == "revocation_pending" and not (
+                    control is not None
+                    and control.status == "running"
+                    and _is_formal_stage_run_kind(control.run_kind)
+                    and control.attempt_ref == unit.attempt_ref
+                    and control.fence_ref == unit.fence_ref
+                ):
+                    # A previous daemon already revoked this Fence.  Only the
+                    # exact still-current Attempt may receive its one replacement;
+                    # a changed control proves that handoff already happened.
                     continue
                 if (
                     control is not None
@@ -7177,6 +7280,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             or not markdown.strip()
         ):
             raise OwnerConflict("writing_checkpoint_invalid")
+        runtime_binding_hash = canonical_hash(runtime_binding.as_dict())
+        if self.park_root_provider_session_for_human_request(
+            root_kind="writing",
+            phase="writing-primary",
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            native_session_ref=native_session_ref,
+            runtime_binding_hash=runtime_binding_hash,
+        ):
+            raise OwnerConflict("runtime_run_suspended")
         markdown_hash = _writing_markdown_hash(markdown)
         citations_hash = canonical_hash(list(citations))
         output_bytes = len(markdown.encode("utf-8")) + len(
@@ -7191,7 +7305,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 "native_session_ref": native_session_ref,
                 "markdown_hash": markdown_hash,
                 "citations_hash": citations_hash,
-                "runtime_binding_hash": canonical_hash(runtime_binding.as_dict()),
+                "runtime_binding_hash": runtime_binding_hash,
             }
         )
         with self._database.write() as connection:
@@ -8379,7 +8493,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         return self._snapshot.query_snapshot()
 
     def query_managed_run(self, run_ref: str) -> dict[str, object] | None:
-        if not isinstance(run_ref, str) or not run_ref or len(run_ref) > 96:
+        if not isinstance(run_ref, str) or not run_ref or len(run_ref) > 256:
             raise OwnerConflict("run_ref_invalid")
         with self._database.read() as connection:
             row = connection.execute(
@@ -8410,6 +8524,161 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         return values
 
+    def register_external_root_task_scope(
+        self,
+        *,
+        root_kind: RootAgentKind,
+        root_runtime_scope: dict[str, object],
+    ) -> dict[str, object]:
+        """Register one server-derived Acquisition or Companion provider task."""
+
+        scope = _validated_external_root_task_scope(
+            root_kind=root_kind,
+            root_runtime_scope=root_runtime_scope,
+        )
+        now = time.time()
+        with self._database.fenced_write() as connection:
+            existing = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": scope["run_ref"]},
+            ).first()
+            if existing is not None:
+                try:
+                    _assert_external_root_task_scope_row(
+                        existing,
+                        root_kind=root_kind,
+                        scope=scope,
+                    )
+                except OwnerConflict:
+                    if not _external_root_task_scope_can_advance(
+                        existing,
+                        root_kind=root_kind,
+                        scope=scope,
+                    ):
+                        raise
+                    advanced = connection.execute(
+                        text(
+                            "UPDATE ar_run_controls SET status = 'running', "
+                            "attempt_ref = :attempt_ref, fence_ref = :fence_ref, "
+                            "attempt_generation = :generation, control_revision = "
+                            "control_revision + 1, safe_point_ref = NULL, "
+                            "terminal_reason = NULL, updated_at = :now WHERE "
+                            "run_ref = :run_ref AND run_kind = :run_kind AND "
+                            "status IN ('running', 'completed') AND "
+                            "attempt_generation = :prior_generation"
+                        ),
+                        {
+                            **scope,
+                            "run_kind": root_kind,
+                            "prior_generation": int(scope["generation"]) - 1,
+                            "now": now,
+                        },
+                    )
+                    if int(advanced.rowcount or 0) != 1:
+                        raise OwnerConflict("external_root_task_scope_conflict")
+                    self._feed.record(
+                        connection,
+                        "agent_runtime.external_root_task_advanced",
+                        {
+                            "root_kind": root_kind,
+                            "root_runtime_scope": scope,
+                        },
+                    )
+                    existing = connection.execute(
+                        text(
+                            "SELECT * FROM ar_run_controls WHERE run_ref = "
+                            ":run_ref"
+                        ),
+                        {"run_ref": scope["run_ref"]},
+                    ).one()
+                return _external_root_task_scope_document(existing)
+            connection.execute(
+                text(
+                    "INSERT INTO ar_run_controls (run_ref, run_kind, quest_ref, "
+                    "cycle_ref, epoch, status, attempt_ref, root_session_ref, "
+                    "fence_ref, control_revision, safe_point_ref, terminal_reason, "
+                    "cleanup_status, runtime_binding_hash, attempt_generation, "
+                    "updated_at) VALUES (:run_ref, :run_kind, :quest_ref, NULL, "
+                    "NULL, 'running', :attempt_ref, :root_session_ref, :fence_ref, "
+                    "1, NULL, NULL, 'none', :runtime_binding_hash, :generation, "
+                    ":now)"
+                ),
+                {**scope, "run_kind": root_kind, "now": now},
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.external_root_task_registered",
+                {
+                    "root_kind": root_kind,
+                    "root_runtime_scope": scope,
+                },
+            )
+            row = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": scope["run_ref"]},
+            ).one()
+        return _external_root_task_scope_document(row)
+
+    def complete_external_root_task_scope(
+        self,
+        *,
+        root_kind: RootAgentKind,
+        root_runtime_scope: dict[str, object],
+    ) -> dict[str, object]:
+        """Complete an exact external Root task, never bypassing an HR wait."""
+
+        scope = _validated_external_root_task_scope(
+            root_kind=root_kind,
+            root_runtime_scope=root_runtime_scope,
+        )
+        now = time.time()
+        with self._database.fenced_write() as connection:
+            row = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": scope["run_ref"]},
+            ).first()
+            if row is None:
+                raise OwnerConflict("external_root_task_scope_not_found")
+            _assert_external_root_task_scope_row(
+                row,
+                root_kind=root_kind,
+                scope=scope,
+            )
+            if row.status == "suspended":
+                raise OwnerConflict("external_root_task_scope_suspended")
+            if row.status == "completed":
+                return _external_root_task_scope_document(row)
+            if row.status != "running":
+                raise OwnerConflict("external_root_task_scope_state_conflict")
+            updated = connection.execute(
+                text(
+                    "UPDATE ar_run_controls SET status = 'completed', "
+                    "control_revision = control_revision + 1, safe_point_ref = "
+                    "NULL, terminal_reason = NULL, updated_at = :now WHERE "
+                    "run_ref = :run_ref AND status = 'running' AND run_kind = "
+                    ":run_kind AND attempt_ref = :attempt_ref AND "
+                    "root_session_ref = :root_session_ref AND fence_ref = "
+                    ":fence_ref AND runtime_binding_hash = "
+                    ":runtime_binding_hash AND attempt_generation = :generation"
+                ),
+                {**scope, "run_kind": root_kind, "now": now},
+            )
+            if int(updated.rowcount or 0) != 1:
+                raise OwnerConflict("external_root_task_scope_state_conflict")
+            self._feed.record(
+                connection,
+                "agent_runtime.external_root_task_completed",
+                {
+                    "root_kind": root_kind,
+                    "root_runtime_scope": scope,
+                },
+            )
+            completed = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": scope["run_ref"]},
+            ).one()
+        return _external_root_task_scope_document(completed)
+
     def verify_root_agent_human_request_scope(
         self,
         *,
@@ -8420,6 +8689,73 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         runtime_binding_hash: str,
     ) -> dict[str, object]:
         """Derive one current root wait identity without trusting Agent-supplied refs."""
+
+        return self._verify_root_agent_runtime_scope(
+            root_kind=None,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            root_session_ref=root_session_ref,
+            fence_ref=fence_ref,
+            runtime_binding_hash=runtime_binding_hash,
+            allowed_statuses=frozenset({"running"}),
+        )
+
+    def verify_root_agent_runtime_scope(
+        self,
+        *,
+        root_kind: RootAgentKind,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> dict[str, object]:
+        """Verify an authenticated channel against one current Root runtime."""
+
+        return self._verify_root_agent_runtime_scope(
+            root_kind=root_kind,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            root_session_ref=root_session_ref,
+            fence_ref=fence_ref,
+            runtime_binding_hash=runtime_binding_hash,
+            allowed_statuses=frozenset({"running"}),
+        )
+
+    def verify_root_agent_human_request_reconcile_scope(
+        self,
+        *,
+        root_kind: RootAgentKind,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+    ) -> dict[str, object]:
+        """Authorize only lost-ACK reconciliation for this exact Root task."""
+
+        return self._verify_root_agent_runtime_scope(
+            root_kind=root_kind,
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            root_session_ref=root_session_ref,
+            fence_ref=fence_ref,
+            runtime_binding_hash=runtime_binding_hash,
+            allowed_statuses=frozenset({"running", "suspended"}),
+        )
+
+    def _verify_root_agent_runtime_scope(
+        self,
+        *,
+        root_kind: RootAgentKind | None,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        runtime_binding_hash: str,
+        allowed_statuses: frozenset[str],
+    ) -> dict[str, object]:
+        """Verify a Root identity, optionally while its exact task is suspended."""
 
         if not _is_sha256(runtime_binding_hash):
             raise OwnerConflict("root_agent_human_request_scope_invalid")
@@ -8449,7 +8785,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "root_agent_human_request_effect_unauthorized"
                 )
             if (
-                target.run_status != "running"
+                target.run_status not in allowed_statuses
                 or target.launch_status not in {"admitted", "active"}
                 or target.launch_target_run_ref != run_ref
                 or target.launch_target_ref != target.target_ref
@@ -8464,6 +8800,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 or not target.target_ref
                 or not isinstance(target.quest_ref, str)
                 or not target.quest_ref
+                or root_kind not in {None, "target"}
             ):
                 raise OwnerConflict("root_agent_human_request_scope_stale")
             return {
@@ -8474,7 +8811,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 "waiter_generation": int(target.generation),
             }
         if (
-            managed.get("status") != "running"
+            managed.get("status") not in allowed_statuses
             or managed.get("attempt_ref") != attempt_ref
             or managed.get("root_session_ref") != root_session_ref
             or managed.get("fence_ref") != fence_ref
@@ -8520,9 +8857,31 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 "ar_writing_attempts AS attempts ON attempts.attempt_ref = "
                 "runs.attempt_ref WHERE runs.run_ref = :run_ref"
             )
+        elif run_kind in {"acquisition", "companion"}:
+            generation = managed.get("attempt_generation")
+            quest_ref = managed.get("quest_ref")
+            if (
+                root_kind not in {None, run_kind}
+                or managed.get("runtime_binding_hash") != runtime_binding_hash
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 1
+                or not isinstance(quest_ref, str)
+                or not quest_ref
+            ):
+                raise OwnerConflict("root_agent_human_request_scope_stale")
+            return {
+                "run_kind": run_kind,
+                "quest_ref": quest_ref,
+                "waiter_ref": f"root_run:{run_ref}",
+                "waiter_generation": generation,
+            }
         else:
             # Experiment and generic Harness probes are not product root Agents.
             raise OwnerConflict("root_agent_human_request_effect_unauthorized")
+        public_root_kind = stage if stage is not None else run_kind
+        if root_kind is not None and public_root_kind != root_kind:
+            raise OwnerConflict("root_agent_human_request_scope_stale")
         with self._database.read() as connection:
             source = connection.execute(
                 text(source_query), {"run_ref": run_ref}
@@ -8549,6 +8908,312 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             "waiter_ref": f"root_run:{run_ref}",
             "waiter_generation": int(source.generation),
         }
+
+    def _yield_operation_for_human_request(
+        self,
+        connection,
+        operation_binding: dict[str, object],
+        request_ref: str,
+    ) -> None:
+        """Atomically suspend the exact Root task frozen by an open effect."""
+
+        root_kind = operation_binding.get("root_kind")
+        if root_kind not in {
+            "idea",
+            "plan",
+            "bundle",
+            "reasoning",
+            "target",
+            "deepfetch",
+            "writing",
+            "acquisition",
+            "companion",
+        }:
+            raise OwnerConflict("root_agent_human_request_effect_unauthorized")
+        required_refs = (
+            "task_ref",
+            "attempt_ref",
+            "root_session_ref",
+            "fence_ref",
+            "runtime_binding_hash",
+        )
+        if any(
+            not isinstance(operation_binding.get(name), str)
+            or not operation_binding[name]
+            for name in required_refs
+        ):
+            raise OwnerConflict("root_human_request_operation_binding_invalid")
+        scope = self._verify_root_agent_runtime_scope(
+            root_kind=cast(RootAgentKind, root_kind),
+            run_ref=cast(str, operation_binding["task_ref"]),
+            attempt_ref=cast(str, operation_binding["attempt_ref"]),
+            root_session_ref=cast(str, operation_binding["root_session_ref"]),
+            fence_ref=cast(str, operation_binding["fence_ref"]),
+            runtime_binding_hash=cast(
+                str, operation_binding["runtime_binding_hash"]
+            ),
+            allowed_statuses=frozenset({"running"}),
+        )
+        request_row = connection.execute(
+            text(
+                "SELECT predecessor_request_ref FROM owner_human_requests WHERE "
+                "request_ref = :request_ref AND issuer = :issuer"
+            ),
+            {"request_ref": request_ref, "issuer": AR_OWNER},
+        ).first()
+        if request_row is None:
+            raise OwnerConflict("root_human_request_operation_binding_invalid")
+        expected_generation = int(scope["waiter_generation"])
+        if request_row.predecessor_request_ref is not None:
+            predecessor_effect = connection.execute(
+                text(
+                    "SELECT generation FROM owner_human_request_open_effects WHERE "
+                    "issuer = :issuer AND request_ref = :request_ref"
+                ),
+                {
+                    "issuer": AR_OWNER,
+                    "request_ref": request_row.predecessor_request_ref,
+                },
+            ).first()
+            if predecessor_effect is None:
+                raise OwnerConflict("human_request_predecessor_invalid")
+            expected_generation = max(
+                expected_generation, int(predecessor_effect.generation) + 1
+            )
+        if (
+            scope.get("quest_ref") != operation_binding.get("quest_ref")
+            or operation_binding.get("generation") != expected_generation
+            or operation_binding.get("request_owner") != AR_OWNER
+        ):
+            raise OwnerConflict("root_human_request_scope_stale")
+
+        now = time.time()
+        task_ref = cast(str, operation_binding["task_ref"])
+        control = connection.execute(
+            text("SELECT run_ref FROM ar_run_controls WHERE run_ref = :run_ref"),
+            {"run_ref": task_ref},
+        ).first()
+        if control is not None:
+            updated = connection.execute(
+                text(
+                    "UPDATE ar_run_controls SET status = 'suspended', "
+                    "control_revision = control_revision + 1, safe_point_ref = "
+                    "NULL, terminal_reason = 'human_request_wait', updated_at = "
+                    ":now WHERE run_ref = :run_ref AND status = 'running' AND "
+                    "attempt_ref = :attempt_ref AND root_session_ref = "
+                    ":root_session_ref AND fence_ref = :fence_ref"
+                ),
+                {
+                    "now": now,
+                    "run_ref": task_ref,
+                    "attempt_ref": operation_binding["attempt_ref"],
+                    "root_session_ref": operation_binding["root_session_ref"],
+                    "fence_ref": operation_binding["fence_ref"],
+                },
+            )
+        else:
+            updated = connection.execute(
+                text(
+                    "UPDATE ar_harness_runs SET status = 'suspended', updated_at = "
+                    ":now WHERE run_ref = :run_ref AND status = 'running' AND "
+                    "attempt_ref = :attempt_ref AND root_session_ref = "
+                    ":root_session_ref AND fence_ref = :fence_ref AND "
+                    "capability_binding_hash = :runtime_binding_hash"
+                ),
+                {
+                    "now": now,
+                    "run_ref": task_ref,
+                    "attempt_ref": operation_binding["attempt_ref"],
+                    "root_session_ref": operation_binding["root_session_ref"],
+                    "fence_ref": operation_binding["fence_ref"],
+                    "runtime_binding_hash": operation_binding[
+                        "runtime_binding_hash"
+                    ],
+                },
+            )
+        if int(updated.rowcount or 0) != 1:
+            raise OwnerConflict("root_human_request_scope_stale")
+        self._feed.record(
+            connection,
+            "agent_runtime.human_request_task_suspended",
+            {
+                "request_ref": request_ref,
+                "task_ref": task_ref,
+                "attempt_ref": operation_binding["attempt_ref"],
+                "root_session_ref": operation_binding["root_session_ref"],
+                "fence_ref": operation_binding["fence_ref"],
+                "generation": operation_binding["generation"],
+            },
+        )
+
+    def _resume_operation_after_human_request(
+        self,
+        connection,
+        *,
+        operation_binding: dict[str, object],
+        request_ref: str,
+    ) -> None:
+        """Resume exactly the task whose released waiter was just consumed."""
+
+        task_ref = cast(str, operation_binding["task_ref"])
+        now = time.time()
+        control = connection.execute(
+            text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+            {"run_ref": task_ref},
+        ).first()
+        if control is not None:
+            updated = connection.execute(
+                text(
+                    "UPDATE ar_run_controls SET status = 'running', "
+                    "control_revision = control_revision + 1, safe_point_ref = "
+                    "NULL, terminal_reason = NULL, updated_at = :now WHERE "
+                    "run_ref = :run_ref AND status = 'suspended' AND attempt_ref "
+                    "= :attempt_ref AND root_session_ref = :root_session_ref AND "
+                    "fence_ref = :fence_ref"
+                ),
+                {
+                    "now": now,
+                    "run_ref": task_ref,
+                    "attempt_ref": operation_binding["attempt_ref"],
+                    "root_session_ref": operation_binding["root_session_ref"],
+                    "fence_ref": operation_binding["fence_ref"],
+                },
+            )
+        else:
+            updated = connection.execute(
+                text(
+                    "UPDATE ar_harness_runs SET status = 'running', updated_at = "
+                    ":now WHERE run_ref = :run_ref AND status = 'suspended' AND "
+                    "attempt_ref = :attempt_ref AND root_session_ref = "
+                    ":root_session_ref AND fence_ref = :fence_ref AND "
+                    "capability_binding_hash = :runtime_binding_hash"
+                ),
+                {
+                    "now": now,
+                    "run_ref": task_ref,
+                    "attempt_ref": operation_binding["attempt_ref"],
+                    "root_session_ref": operation_binding["root_session_ref"],
+                    "fence_ref": operation_binding["fence_ref"],
+                    "runtime_binding_hash": operation_binding[
+                        "runtime_binding_hash"
+                    ],
+                },
+            )
+        if int(updated.rowcount or 0) != 1:
+            raise OwnerConflict("root_human_request_scope_stale")
+        root_kind = operation_binding.get("root_kind")
+        if control is not None and root_kind in FORMAL_STAGES:
+            interrupted_unit = connection.execute(
+                text(
+                    "SELECT units.unit_ref FROM ar_provider_units AS units JOIN "
+                    "ar_fence_revocations AS revocations ON revocations.fence_ref = "
+                    "units.fence_ref AND revocations.run_ref = units.run_ref WHERE "
+                    "units.run_ref = :run_ref AND units.attempt_ref = :attempt_ref "
+                    "AND units.fence_ref = :fence_ref AND units.status = "
+                    "'revocation_pending' LIMIT 1"
+                ),
+                {
+                    "run_ref": task_ref,
+                    "attempt_ref": operation_binding["attempt_ref"],
+                    "fence_ref": operation_binding["fence_ref"],
+                },
+            ).first()
+            if interrupted_unit is not None:
+                connection.execute(
+                    text(
+                        "UPDATE ar_execution_fences SET status = 'rejected', "
+                        "closed_at = COALESCE(closed_at, :now) WHERE fence_ref = "
+                        ":fence_ref AND status IN ('current', 'submitted')"
+                    ),
+                    {"now": now, "fence_ref": operation_binding["fence_ref"]},
+                )
+                replacement = self._replace_fenced_managed_attempt(
+                    connection,
+                    control,
+                    now,
+                    reuse_checkpoint=True,
+                    reuse_operation_refs=True,
+                    preserve_native_session=True,
+                    replacement_reason_code="human_request_resume_after_restart",
+                )
+                replaced = connection.execute(
+                    text(
+                        "UPDATE ar_run_controls SET attempt_ref = :attempt_ref, "
+                        "fence_ref = :fence_ref, control_revision = "
+                        "control_revision + 1, updated_at = :now WHERE run_ref = "
+                        ":run_ref AND status = 'running' AND attempt_ref = "
+                        ":old_attempt_ref AND fence_ref = :old_fence_ref"
+                    ),
+                    {
+                        "attempt_ref": replacement.attempt_ref,
+                        "fence_ref": replacement.fence_ref,
+                        "old_attempt_ref": operation_binding["attempt_ref"],
+                        "old_fence_ref": operation_binding["fence_ref"],
+                        "run_ref": task_ref,
+                        "now": now,
+                    },
+                )
+                if int(replaced.rowcount or 0) != 1:
+                    raise OwnerConflict("root_human_request_scope_stale")
+        if operation_binding.get("root_kind") == "deepfetch":
+            run = connection.execute(
+                text("SELECT * FROM ar_deepfetch_runs WHERE run_ref = :run_ref"),
+                {"run_ref": task_ref},
+            ).first()
+            if run is not None and run.failure_code == "human_request_wait":
+                attempt = connection.execute(
+                    text(
+                        "SELECT * FROM ar_deepfetch_attempts WHERE attempt_ref = "
+                        ":attempt_ref AND run_ref = :run_ref"
+                    ),
+                    {
+                        "run_ref": task_ref,
+                        "attempt_ref": operation_binding["attempt_ref"],
+                    },
+                ).first()
+                if (
+                    attempt is None
+                    or run.status != "running"
+                    or run.current_attempt_ref != operation_binding["attempt_ref"]
+                    or int(run.attempt_generation)
+                    != operation_binding["generation"]
+                    or attempt.status != "running"
+                    or attempt.fence_ref != operation_binding["fence_ref"]
+                ):
+                    raise OwnerConflict("deepfetch_human_request_resume_invalid")
+                connection.execute(
+                    text(
+                        "UPDATE ar_deepfetch_attempts SET status = 'superseded', "
+                        "failure_code = 'human_request_wait', completed_at = :now "
+                        "WHERE attempt_ref = :attempt_ref AND status = 'running'"
+                    ),
+                    {"attempt_ref": operation_binding["attempt_ref"], "now": now},
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_deepfetch_runs SET status = 'admitted', "
+                        "current_attempt_ref = NULL, updated_at = :now WHERE run_ref = "
+                        ":run_ref AND status = 'running' AND current_attempt_ref = "
+                        ":attempt_ref"
+                    ),
+                    {
+                        "run_ref": task_ref,
+                        "attempt_ref": operation_binding["attempt_ref"],
+                        "now": now,
+                    },
+                )
+        self._feed.record(
+            connection,
+            "agent_runtime.human_request_task_resumed",
+            {
+                "request_ref": request_ref,
+                "task_ref": task_ref,
+                "attempt_ref": operation_binding["attempt_ref"],
+                "root_session_ref": operation_binding["root_session_ref"],
+                "fence_ref": operation_binding["fence_ref"],
+                "generation": operation_binding["generation"],
+            },
+        )
 
     def query_runtime_observability(self) -> dict[str, object]:
         if self._runtime_protection is None:
@@ -12979,8 +13644,488 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise OwnerConflict("acquisition_material_binding_invalid")
         return materialized, _store_provided_material(target_dir, route, materialized)
 
+    def reconcile_root_human_request(
+        self, request_ref: str
+    ) -> dict[str, object] | None:
+        """Dispose and resume one operation-scoped HumanRequest idempotently."""
+
+        request = self.query_human_request(request_ref)
+        if (
+            request is None
+            or request.get("issuer") != AR_OWNER
+            or not isinstance(request.get("open_effect"), dict)
+        ):
+            return request
+        waiters = request.get("direct_waiters")
+        if (
+            not isinstance(waiters, list)
+            or len(waiters) != 1
+            or not isinstance(waiters[0], dict)
+        ):
+            raise OwnerConflict("root_human_request_waiter_invalid")
+        waiter = cast(dict[str, object], waiters[0])
+        if waiter.get("status") == "consumed":
+            open_effect = cast(dict[str, object], request["open_effect"])
+            consumed_binding = open_effect.get("operation_binding")
+            if isinstance(consumed_binding, dict):
+                self._recover_writing_after_human_request(consumed_binding)
+            return request
+
+        binding = self._verify_root_human_request_operation_binding(request, waiter)
+        if not self._root_human_request_resume_checkpoint_ready(binding):
+            return request
+        if request.get("status") == "open":
+            responses = request.get("responses")
+            if not isinstance(responses, list) or not responses:
+                return request
+            response = responses[-1]
+            if not isinstance(response, dict):
+                raise OwnerConflict("human_response_receipt_invalid")
+            response_ref = response.get("response_ref")
+            response_decision = response.get("decision")
+            if not isinstance(response_ref, str):
+                raise OwnerConflict("human_response_receipt_invalid")
+            if response_decision in {"declined", "deferred"}:
+                request = self.evaluate_human_request(
+                    request_ref,
+                    response_refs=(response_ref,),
+                    decision="unsatisfied",
+                    reason_code=f"human_{response_decision}_exact_obligation",
+                    accepted_evidence_refs=(),
+                    idempotency_key="ar-root-hr-unsatisfied:"
+                    + canonical_hash(
+                        {
+                            "request_ref": request_ref,
+                            "response_ref": response_ref,
+                            "decision": response_decision,
+                        }
+                    ),
+                )
+            elif response_decision == "provided":
+                proof = self._root_human_request_provided_proof(request, response)
+                if proof is None:
+                    return self.evaluate_human_request(
+                        request_ref,
+                        response_refs=(response_ref,),
+                        decision="needs_input",
+                        reason_code="human_request_basic_proof_invalid",
+                        accepted_evidence_refs=(),
+                        idempotency_key="ar-root-hr-proof-invalid:"
+                        + canonical_hash(
+                            {
+                                "request_ref": request_ref,
+                                "response_ref": response_ref,
+                            }
+                        ),
+                    )
+                reason_code, evidence_refs, _authorization_receipt_ref = proof
+                request = self.evaluate_human_request(
+                    request_ref,
+                    response_refs=(response_ref,),
+                    decision="satisfied",
+                    reason_code=reason_code,
+                    accepted_evidence_refs=evidence_refs,
+                    idempotency_key="ar-root-hr-satisfied:"
+                    + canonical_hash(
+                        {
+                            "request_ref": request_ref,
+                            "response_ref": response_ref,
+                            "reason_code": reason_code,
+                            "evidence_refs": evidence_refs,
+                        }
+                    ),
+                )
+            else:
+                raise OwnerConflict("human_response_receipt_invalid")
+
+        if request.get("status") not in {"satisfied", "unsatisfied"}:
+            return request
+        waiters = cast(list[dict[str, object]], request["direct_waiters"])
+        waiter = waiters[0]
+        authorization_receipt_ref = None
+        if request["status"] == "satisfied":
+            evaluation = request.get("evaluation")
+            responses = cast(list[dict[str, object]], request.get("responses", []))
+            if isinstance(evaluation, dict):
+                evaluated_refs = evaluation.get("response_refs")
+                selected = next(
+                    (
+                        response
+                        for response in reversed(responses)
+                        if isinstance(evaluated_refs, list)
+                        and response.get("response_ref") in evaluated_refs
+                    ),
+                    None,
+                )
+                if selected is not None:
+                    proof = self._root_human_request_provided_proof(request, selected)
+                    authorization_receipt_ref = (
+                        None if proof is None else proof[2]
+                    )
+        if waiter.get("status") == "blocked":
+            validation = self.validate_human_request_waiter(
+                request_ref,
+                waiter_ref=cast(str, waiter["waiter_ref"]),
+                generation=cast(int, waiter["generation"]),
+                target_assertion=cast(dict[str, object], waiter["target_assertion"]),
+                other_blockers=(),
+                authorization_receipt_ref=authorization_receipt_ref,
+                idempotency_key="ar-root-hr-release:"
+                + canonical_hash(
+                    {
+                        "request_ref": request_ref,
+                        "waiter_ref": waiter["waiter_ref"],
+                        "generation": waiter["generation"],
+                        "disposition": request["status"],
+                    }
+                ),
+            )
+            if validation.get("status") != "released":
+                return self.query_human_request(request_ref)
+            request = cast(
+                dict[str, object], self.query_human_request(request_ref)
+            )
+            waiter = cast(list[dict[str, object]], request["direct_waiters"])[0]
+        if waiter.get("status") == "released":
+            work_ref = cast(str, binding["task_ref"])
+            work_hash = canonical_hash(
+                {
+                    "kind": "human_request_resume",
+                    "request_ref": request_ref,
+                    "disposition": request["status"],
+                    "operation_binding": binding,
+                    "resumed_status": "running",
+                }
+            )
+            with self._database.write() as connection:
+                self._consume_human_request_waiter(
+                    connection,
+                    request_ref=request_ref,
+                    waiter_ref=cast(str, waiter["waiter_ref"]),
+                    generation=cast(int, waiter["generation"]),
+                    work_ref=work_ref,
+                    work_hash=work_hash,
+                )
+                self._resume_operation_after_human_request(
+                    connection,
+                    operation_binding=binding,
+                    request_ref=request_ref,
+                )
+            self._recover_writing_after_human_request(binding)
+        return self.query_human_request(request_ref)
+
+    def _root_human_request_resume_checkpoint_ready(
+        self, operation_binding: dict[str, object]
+    ) -> bool:
+        """Require Target's exact native Session checkpoint before release."""
+
+        if operation_binding.get("root_kind") != "target":
+            return True
+        run_ref = cast(str, operation_binding["task_ref"])
+        with self._database.read() as connection:
+            run = connection.execute(
+                text("SELECT * FROM ar_harness_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            operation = connection.execute(
+                text(
+                    "SELECT * FROM ar_harness_provider_operations WHERE "
+                    "run_ref = :run_ref ORDER BY generation DESC LIMIT 1"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+        return bool(
+            run is not None
+            and operation is not None
+            and run.status == "suspended"
+            and run.attempt_ref == operation_binding["attempt_ref"]
+            and run.root_session_ref == operation_binding["root_session_ref"]
+            and run.fence_ref == operation_binding["fence_ref"]
+            and run.capability_binding_hash
+            == operation_binding["runtime_binding_hash"]
+            and isinstance(run.native_session_ref, str)
+            and bool(run.native_session_ref)
+            and run.failure_code == TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE
+            and operation.status == "executed"
+            and operation.outcome_code == TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE
+        )
+
+    def _recover_writing_after_human_request(
+        self, operation_binding: dict[str, object]
+    ) -> None:
+        """Rotate only a Writing Fence proven dead while its HR was open."""
+
+        if operation_binding.get("root_kind") != "writing":
+            return
+        required = ("task_ref", "attempt_ref", "fence_ref")
+        if any(
+            not isinstance(operation_binding.get(name), str)
+            or not operation_binding.get(name)
+            for name in required
+        ):
+            raise OwnerConflict("root_human_request_operation_binding_invalid")
+        with self._database.read() as connection:
+            interrupted = connection.execute(
+                text(
+                    "SELECT units.unit_ref FROM ar_provider_units AS units JOIN "
+                    "ar_run_controls AS controls ON controls.run_ref = units.run_ref "
+                    "JOIN ar_fence_revocations AS revocations ON "
+                    "revocations.fence_ref = units.fence_ref AND "
+                    "revocations.run_ref = units.run_ref WHERE units.run_ref = "
+                    ":run_ref AND units.attempt_ref = :attempt_ref AND "
+                    "units.fence_ref = :fence_ref AND units.status = "
+                    "'revocation_pending' AND controls.status = 'running' AND "
+                    "controls.attempt_ref = units.attempt_ref AND "
+                    "controls.fence_ref = units.fence_ref LIMIT 1"
+                ),
+                {
+                    "run_ref": operation_binding["task_ref"],
+                    "attempt_ref": operation_binding["attempt_ref"],
+                    "fence_ref": operation_binding["fence_ref"],
+                },
+            ).first()
+        if interrupted is not None:
+            self._recover_interrupted_writing(
+                run_ref=cast(str, operation_binding["task_ref"])
+            )
+
+    def recover_root_human_requests(self) -> None:
+        """Replay durable Responses whose operation-scoped lifecycle is incomplete."""
+
+        with self._database.read() as connection:
+            request_refs = tuple(
+                str(row.request_ref)
+                for row in connection.execute(
+                    text(
+                        "SELECT DISTINCT effects.request_ref FROM "
+                        "owner_human_request_open_effects AS effects JOIN "
+                        "owner_human_requests AS requests ON requests.request_ref = "
+                        "effects.request_ref JOIN hc_human_request_responses AS "
+                        "responses ON responses.request_ref = effects.request_ref JOIN "
+                        "owner_human_request_waiters AS waiters ON "
+                        "waiters.request_ref = effects.request_ref AND "
+                        "waiters.waiter_ref = effects.waiter_ref WHERE effects.issuer = "
+                        ":issuer AND requests.issuer = :issuer AND waiters.status != "
+                        "'consumed' ORDER BY requests.created_at, effects.request_ref"
+                    ),
+                    {"issuer": AR_OWNER},
+                ).all()
+            )
+        for request_ref in request_refs:
+            self.reconcile_root_human_request(request_ref)
+        if request_refs:
+            # Startup may already have fenced the provider unit that owned the
+            # suspended Attempt.  Once its exact waiter resumes the control, use
+            # the existing recovery seam to install one physical successor.
+            self._recover_interrupted_provider_units()
+
+    def _verify_root_human_request_operation_binding(
+        self,
+        request: dict[str, object],
+        waiter: dict[str, object],
+    ) -> dict[str, object]:
+        open_effect = cast(dict[str, object], request["open_effect"])
+        binding = open_effect.get("operation_binding")
+        if not isinstance(binding, dict):
+            raise OwnerConflict("root_human_request_operation_binding_invalid")
+        required = {
+            "task_ref",
+            "attempt_ref",
+            "root_session_ref",
+            "fence_ref",
+            "runtime_binding_hash",
+        }
+        if any(
+            not isinstance(binding.get(name), str) or not binding.get(name)
+            for name in required
+        ):
+            raise OwnerConflict("root_human_request_operation_binding_invalid")
+        root_kind = binding.get("root_kind")
+        if root_kind not in {
+            "idea",
+            "plan",
+            "bundle",
+            "reasoning",
+            "target",
+            "deepfetch",
+            "writing",
+            "acquisition",
+            "companion",
+        }:
+            raise OwnerConflict("root_human_request_operation_binding_invalid")
+        scope = self._verify_root_agent_runtime_scope(
+            root_kind=cast(RootAgentKind, root_kind),
+            run_ref=cast(str, binding["task_ref"]),
+            attempt_ref=cast(str, binding["attempt_ref"]),
+            root_session_ref=cast(str, binding["root_session_ref"]),
+            fence_ref=cast(str, binding["fence_ref"]),
+            runtime_binding_hash=cast(str, binding["runtime_binding_hash"]),
+            allowed_statuses=frozenset({"suspended"}),
+        )
+        expected_generation = scope.get("waiter_generation")
+        predecessor_ref = request.get("predecessor_request_ref")
+        if predecessor_ref is not None:
+            if not isinstance(predecessor_ref, str):
+                raise OwnerConflict("root_human_request_scope_stale")
+            predecessor = self.query_human_request(predecessor_ref)
+            predecessor_effect = (
+                None
+                if predecessor is None
+                else predecessor.get("open_effect")
+            )
+            predecessor_binding = (
+                None
+                if not isinstance(predecessor_effect, dict)
+                else predecessor_effect.get("operation_binding")
+            )
+            predecessor_generation = (
+                None if predecessor is None else predecessor.get("generation")
+            )
+            if (
+                not isinstance(predecessor_binding, dict)
+                or not isinstance(predecessor_generation, int)
+                or any(
+                    predecessor_binding.get(name) != binding.get(name)
+                    for name in (
+                        "quest_ref",
+                        "task_ref",
+                        "root_session_ref",
+                        "operation_id",
+                        "request_owner",
+                    )
+                )
+            ):
+                raise OwnerConflict("root_human_request_scope_stale")
+            if not isinstance(expected_generation, int):
+                raise OwnerConflict("root_human_request_scope_stale")
+            expected_generation = max(
+                expected_generation, predecessor_generation + 1
+            )
+        if (
+            scope.get("quest_ref") != binding.get("quest_ref")
+            or scope.get("waiter_ref") != waiter.get("waiter_ref")
+            or expected_generation != waiter.get("generation")
+            or binding.get("generation") != waiter.get("generation")
+            or binding.get("request_owner") != AR_OWNER
+            or request.get("quest_ref") != binding.get("quest_ref")
+        ):
+            raise OwnerConflict("root_human_request_scope_stale")
+        return binding
+
+    def _root_human_request_provided_proof(
+        self,
+        request: dict[str, object],
+        response: dict[str, object],
+    ) -> tuple[str, tuple[str, ...], str | None] | None:
+        facts = response.get("facts")
+        response_ref = response.get("response_ref")
+        if not isinstance(facts, dict) or not isinstance(response_ref, str):
+            return None
+        kind = request.get("kind")
+        if kind == "library_reconnect":
+            if facts.get("route") == "oa_only":
+                evidence_ref = "human_request_route:" + canonical_hash(
+                    {
+                        "request_ref": request["request_ref"],
+                        "response_ref": response_ref,
+                        "route": "oa_only",
+                    }
+                )
+                return "oa_only_route_selected", (evidence_ref,), None
+            open_effect = request.get("open_effect")
+            operation_binding = (
+                None
+                if not isinstance(open_effect, dict)
+                else open_effect.get("operation_binding")
+            )
+            quest_ref = (
+                None
+                if not isinstance(operation_binding, dict)
+                else operation_binding.get("quest_ref")
+            )
+            if (
+                facts.get("route") != "institutional_browser_reconnected"
+                or not isinstance(quest_ref, str)
+            ):
+                return None
+            session = self.query_acquisition_session(quest_ref=quest_ref)
+            if session is None:
+                return None
+            preflight_ref = _acquisition_preflight_runtime_effect(
+                session_ref=session.session_ref,
+                generation=session.preflight_generation,
+            ).operation_ref
+            if (
+                session.status != "ready"
+                or session.slot_held
+                or session.mode != "oa_then_institution"
+                or session.browser_context_ref is None
+            ):
+                return None
+            return (
+                "institution_preflight_verified",
+                (preflight_ref,),
+                None,
+            )
+        if kind in {"external_material_api_access", "offline_action"}:
+            resolver = self._research_material_resolver
+            if resolver is None:
+                return None
+            prefix = (
+                "material"
+                if kind == "external_material_api_access"
+                else "result"
+            )
+            version_ref = facts.get(f"{prefix}_version_ref")
+            if not isinstance(version_ref, str) or not version_ref:
+                return None
+            asset = resolver.query_asset_version(version_ref)
+            if asset is None or getattr(asset, "as_binding", lambda: None)() is None:
+                return None
+            accepted = asset.as_binding().as_dict()
+            receipt = accepted.get("receipt")
+            receipt_ref = (
+                receipt.get("receipt_ref") if isinstance(receipt, dict) else None
+            )
+            if (
+                not isinstance(receipt_ref, str)
+                or facts.get(f"{prefix}_source_ref")
+                != getattr(asset, "memory_ref", None)
+                or facts.get(f"{prefix}_version_ref")
+                != accepted.get("version_ref")
+                or facts.get(f"{prefix}_content_hash")
+                != accepted.get("content_hash")
+                or facts.get(f"{prefix}_manifest_hash")
+                != accepted.get("manifest_hash")
+                or facts.get(f"{prefix}_acceptance_receipt_ref")
+                != receipt_ref
+            ):
+                return None
+            return "accepted_asset_binding_verified", (receipt_ref,), None
+        if kind == "capability_authorization":
+            requirement = request.get("required_authorization")
+            receipt_ref = facts.get("authorization_receipt_ref")
+            verifier = self._authorization_verifier
+            if (
+                not isinstance(requirement, dict)
+                or not isinstance(receipt_ref, str)
+                or verifier is None
+            ):
+                return None
+            try:
+                verifier.verify_capability_authorization(
+                    requirement=requirement,
+                    receipt_ref=receipt_ref,
+                )
+            except OwnerConflict:
+                return None
+            return "capability_authorization_verified", (receipt_ref,), receipt_ref
+        return None
+
     def reconcile_human_request(self, request_ref: str) -> dict[str, object] | None:
         request = self.query_human_request(request_ref)
+        if request is not None and isinstance(request.get("open_effect"), dict):
+            return self.reconcile_root_human_request(request_ref)
         if (
             request is None
             or request.get("issuer") != AR_OWNER
@@ -13360,6 +14505,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "requests.request_json, requests.request_hash, "
                     "requests.results_json, requests.results_hash, "
                     "sessions.quest_ref, sessions.config_hash, "
+                    "sessions.runtime_binding_hash, "
                     "sessions.preflight_generation, sessions.status AS "
                     "session_status, sessions.reason_code AS session_reason_code "
                     "FROM ar_acquisition_requests "
@@ -13372,15 +14518,92 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ).first()
         if waiting is not None and waiting.request_hash != request_hash:
             raise OwnerConflict("acquisition_request_identity_conflict")
-        target_dir = _acquisition_request_target_dir(
-            self._acquisition_private_root,
-            session_ref,
-            request.request_id,
-            # An existing request already owns this directory. Polling its
-            # typed wait is therefore a verification-only filesystem read;
-            # only a genuinely new request may create custody here.
-            create=waiting is None,
-        )
+        if waiting is not None and waiting.status in {
+            "obtained",
+            "partial",
+            "missing",
+        }:
+            if waiting.runtime_binding_hash != runtime_binding_hash:
+                raise OwnerConflict("acquisition_runtime_binding_drift")
+            terminal_effect = _acquisition_runtime_effect(
+                session_ref=session_ref,
+                request_id=request.request_id,
+                attempt_count=int(waiting.attempt_count),
+            )
+            self._finish_recorded_acquisition_boundary(terminal_effect)
+            managed = self.query_managed_run(request.request_id)
+            if (
+                managed is not None
+                and isinstance(waiting.quest_ref, str)
+                and waiting.quest_ref
+            ):
+                terminal_scope = _acquisition_root_runtime_scope(
+                    quest_ref=waiting.quest_ref,
+                    session_ref=session_ref,
+                    runtime_binding_hash=runtime_binding_hash,
+                    generation=int(waiting.attempt_count),
+                    effect=terminal_effect,
+                )
+                self.complete_external_root_task_scope(
+                    root_kind="acquisition",
+                    root_runtime_scope=terminal_scope,
+                )
+            with self._database.read() as connection:
+                request_row = connection.execute(
+                    text(
+                        "SELECT * FROM ar_acquisition_requests WHERE request_id = "
+                        ":request_id AND session_ref = :session_ref"
+                    ),
+                    {"request_id": request.request_id, "session_ref": session_ref},
+                ).one()
+                session_row = connection.execute(
+                    text(
+                        "SELECT * FROM ar_acquisition_sessions WHERE session_ref = "
+                        ":session_ref"
+                    ),
+                    {"session_ref": session_ref},
+                ).one()
+            return _acquisition_execution_from_row(
+                request_row,
+                session_row,
+                self._acquisition_private_root,
+            )
+        if (
+            waiting is not None
+            and waiting.status == "waiting_user"
+            and isinstance(waiting.quest_ref, str)
+            and waiting.quest_ref
+        ):
+            suspended = self.query_managed_run(request.request_id)
+            if suspended is not None and suspended.get("status") == "suspended":
+                suspended_scope = _acquisition_root_runtime_scope(
+                    quest_ref=waiting.quest_ref,
+                    session_ref=session_ref,
+                    runtime_binding_hash=runtime_binding_hash,
+                    generation=int(waiting.attempt_count),
+                    effect=_acquisition_runtime_effect(
+                        session_ref=session_ref,
+                        request_id=request.request_id,
+                        attempt_count=int(waiting.attempt_count),
+                    ),
+                )
+                self.verify_root_agent_human_request_reconcile_scope(
+                    root_kind="acquisition",
+                    run_ref=cast(str, suspended_scope["run_ref"]),
+                    attempt_ref=cast(str, suspended_scope["attempt_ref"]),
+                    root_session_ref=cast(
+                        str, suspended_scope["root_session_ref"]
+                    ),
+                    fence_ref=cast(str, suspended_scope["fence_ref"]),
+                    runtime_binding_hash=cast(
+                        str, suspended_scope["runtime_binding_hash"]
+                    ),
+                )
+                return self._waiting_acquisition_execution(
+                    session_ref=session_ref,
+                    request_id=request.request_id,
+                    request_hash=request_hash,
+                )
         if waiting is not None:
             self._finish_recorded_acquisition_boundary(
                 _acquisition_runtime_effect(
@@ -13403,6 +14626,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 waiting.results_json,
                 waiting.results_hash,
             )
+        )
+        target_dir = _acquisition_request_target_dir(
+            self._acquisition_private_root,
+            session_ref,
+            request.request_id,
+            # A new request creates its custody before the provider call. A
+            # recovered technical reconciliation may represent a crash after
+            # the durable DB claim but before that first mkdir; completing that
+            # exact claim is also allowed to create the same bounded directory.
+            create=waiting is None or technical_reconciliation,
         )
         if technical_reconciliation:
             resume_route = self._query_acquisition_resume_route(
@@ -13763,11 +14996,28 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             for paper in provider_request.papers
             if new_request or paper.paper_id in affected_ids
         )
-        attempt_request = replace(provider_request, papers=affected_papers)
         protection_effect = _acquisition_runtime_effect(
             session_ref=session_ref,
             request_id=request.request_id,
             attempt_count=attempt_count,
+        )
+        root_runtime_scope: dict[str, object] | None = None
+        if isinstance(session_row.quest_ref, str) and session_row.quest_ref:
+            root_runtime_scope = _acquisition_root_runtime_scope(
+                quest_ref=str(session_row.quest_ref),
+                session_ref=session_ref,
+                runtime_binding_hash=runtime_binding_hash,
+                generation=attempt_count,
+                effect=protection_effect,
+            )
+            self.register_external_root_task_scope(
+                root_kind="acquisition",
+                root_runtime_scope=root_runtime_scope,
+            )
+        attempt_request = replace(
+            provider_request,
+            papers=affected_papers,
+            root_runtime_scope=root_runtime_scope,
         )
         if self._runtime_protection is not None:
             try:
@@ -13859,6 +15109,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 # envelope.  Its original responsibility stays held.
                 outcome_resolved = False
             status = aggregate_batch_status(results)
+            if root_runtime_scope is not None and operation_terminal:
+                self.verify_root_agent_runtime_scope(
+                    root_kind="acquisition",
+                    run_ref=cast(str, root_runtime_scope["run_ref"]),
+                    attempt_ref=cast(str, root_runtime_scope["attempt_ref"]),
+                    root_session_ref=cast(
+                        str, root_runtime_scope["root_session_ref"]
+                    ),
+                    fence_ref=cast(str, root_runtime_scope["fence_ref"]),
+                    runtime_binding_hash=cast(
+                        str, root_runtime_scope["runtime_binding_hash"]
+                    ),
+                )
         except Exception:
             outcome_resolved = False
             operation_terminal = False
@@ -14070,6 +15333,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     boundary=predecessor_boundary,
                     checkpoint_ref=predecessor_checkpoint_ref,
                 )
+        if root_runtime_scope is not None and operation_terminal:
+            self.complete_external_root_task_scope(
+                root_kind="acquisition",
+                root_runtime_scope=root_runtime_scope,
+            )
         return AcquisitionBatchExecution(
             request_id=request.request_id,
             session_ref=session_ref,
@@ -14419,6 +15687,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             fence_ref,
             native_ref,
             provider_operation_ref,
+            human_request_resume,
         ) = self._start_deepfetch_attempt(
             request=request,
             request_hash=request_hash,
@@ -14454,6 +15723,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             fence_ref=fence_ref,
             native_session_ref=native_ref,
             job_ref=job_ref,
+            human_request_resume=human_request_resume,
             reconcile_only=reconcile_only,
         )
         try:
@@ -14479,6 +15749,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         with self._deepfetch_provider_lock:
             self._deepfetch_providers[request.request_ref] = provider
         provider_safe = True
+        result: DeepFetchResult | None = None
+        result_payload: dict[str, object] | None = None
         try:
             result = provider.execute(provider_request)
             result_payload, result_hash = validate_deepfetch_result(
@@ -14495,6 +15767,29 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 result_hash=result_hash,
             )
         except DeepFetchUnavailable as error:
+            native_session_ref = error.native_session_ref
+            if native_session_ref is None and isinstance(result, DeepFetchResult):
+                observed_native_session_ref = result.native_session_ref
+                if (
+                    isinstance(observed_native_session_ref, str)
+                    and observed_native_session_ref
+                    and len(observed_native_session_ref) <= 512
+                    and observed_native_session_ref != provider_request.root_session_ref
+                    and (
+                        provider_request.native_session_ref is None
+                        or observed_native_session_ref
+                        == provider_request.native_session_ref
+                    )
+                ):
+                    native_session_ref = observed_native_session_ref
+            if self._park_deepfetch_attempt_for_human_request(
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                generation=generation,
+                fence_ref=fence_ref,
+                native_session_ref=native_session_ref,
+            ):
+                raise OwnerConflict("runtime_run_suspended") from error
             if error.code == "deepfetch_provider_reconciliation_pending":
                 provider_safe = False
             if (
@@ -14513,7 +15808,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     generation=generation,
                     fence_ref=fence_ref,
                     reason_code=error.code,
-                    native_session_ref=error.native_session_ref,
+                    native_session_ref=native_session_ref,
                 )
                 if effective_code != error.code:
                     raise DeepFetchUnavailable(effective_code) from error
@@ -14535,12 +15830,24 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                             or error.durable_outcome == "terminal"
                         )
                     ),
-                    native_session_ref=error.native_session_ref,
+                    native_session_ref=native_session_ref,
                 )
             raise
         except OwnerConflict as error:
+            native_session_ref = (
+                None
+                if result_payload is None
+                else cast(str, result_payload.get("native_session_ref"))
+            )
+            if self._park_deepfetch_attempt_for_human_request(
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                generation=generation,
+                fence_ref=fence_ref,
+                native_session_ref=native_session_ref,
+            ):
+                raise OwnerConflict("runtime_run_suspended") from error
             if error.code in {
-                "runtime_run_suspended",
                 "runtime_fence_revoked",
                 "runtime_reconciliation_required",
                 "terminal_run_cannot_reopen",
@@ -14561,7 +15868,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 native_session_ref=None,
             )
             raise
-        except BaseException:
+        except BaseException as error:
+            if self._park_deepfetch_attempt_for_human_request(
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                generation=generation,
+                fence_ref=fence_ref,
+                native_session_ref=None,
+            ):
+                raise OwnerConflict("runtime_run_suspended") from error
             if not self.provider_quiescence_requested(run_ref):
                 self._fail_deepfetch_attempt(
                     run_ref=run_ref,
@@ -14588,6 +15903,501 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             finish_job = getattr(provider, "finish_job", None)
             if provider_safe and not reconcile_only and callable(finish_job):
                 finish_job(job_ref)
+
+    def _park_deepfetch_attempt_for_human_request(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        generation: int,
+        fence_ref: str,
+        native_session_ref: str | None,
+    ) -> bool:
+        """Park one late provider result behind its exact HumanRequest waiter."""
+
+        now = time.time()
+        with self._database.write() as connection:
+            control = connection.execute(
+                text(
+                    "SELECT status, attempt_ref, fence_ref, terminal_reason FROM "
+                    "ar_run_controls WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            run = connection.execute(
+                text("SELECT * FROM ar_deepfetch_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_deepfetch_attempts WHERE attempt_ref = "
+                    ":attempt_ref AND run_ref = :run_ref"
+                ),
+                {"attempt_ref": attempt_ref, "run_ref": run_ref},
+            ).first()
+            session = connection.execute(
+                text(
+                    "SELECT * FROM ar_deepfetch_sessions WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            if (
+                control is None
+                or run is None
+                or attempt is None
+                or session is None
+                or control.status != "suspended"
+                or control.attempt_ref != attempt_ref
+                or control.fence_ref != fence_ref
+                or control.terminal_reason != "human_request_wait"
+                or run.status != "running"
+                or run.current_attempt_ref != attempt_ref
+                or int(run.attempt_generation) != generation
+                or attempt.status != "running"
+                or attempt.fence_ref != fence_ref
+                or session.status != "open"
+                or (
+                    native_session_ref is not None
+                    and session.native_session_ref not in {None, native_session_ref}
+                )
+            ):
+                return False
+            matching_effects = self._deepfetch_human_request_resume_effects(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                generation=generation,
+                fence_ref=fence_ref,
+                root_session_ref=str(session.root_session_ref),
+                runtime_binding_hash=str(run.runtime_binding_hash),
+                waiter_status="blocked",
+            )
+            if len(matching_effects) != 1:
+                raise OwnerConflict("deepfetch_human_request_wait_invalid")
+            if native_session_ref is not None:
+                connection.execute(
+                    text(
+                        "UPDATE ar_deepfetch_sessions SET native_session_ref = "
+                        ":native_session_ref, updated_at = :now WHERE run_ref = "
+                        ":run_ref"
+                    ),
+                    {
+                        "run_ref": run_ref,
+                        "native_session_ref": native_session_ref,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_deepfetch_attempts SET native_session_ref = "
+                        ":native_session_ref WHERE attempt_ref = :attempt_ref AND "
+                        "status = 'running'"
+                    ),
+                    {
+                        "attempt_ref": attempt_ref,
+                        "native_session_ref": native_session_ref,
+                    },
+                )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_runs SET failure_code = "
+                    "'human_request_wait', updated_at = :now WHERE run_ref = "
+                    ":run_ref AND status = 'running' AND current_attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {"run_ref": run_ref, "attempt_ref": attempt_ref, "now": now},
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.deepfetch_human_request_parked",
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "attempt_generation": generation,
+                    "request_ref": matching_effects[0]["request_ref"],
+                },
+            )
+            return True
+
+    def _deepfetch_human_request_resume_effects(
+        self,
+        connection,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        generation: int,
+        fence_ref: str,
+        root_session_ref: str,
+        runtime_binding_hash: str,
+        waiter_status: str,
+    ) -> tuple[dict[str, str], ...]:
+        rows = connection.execute(
+            text(
+                "SELECT effects.*, waiters.status AS waiter_status, "
+                "requests.status AS request_status FROM "
+                "owner_human_request_open_effects AS effects JOIN "
+                "owner_human_request_waiters AS waiters ON waiters.request_ref = "
+                "effects.request_ref AND waiters.waiter_ref = effects.waiter_ref "
+                "JOIN owner_human_requests AS requests ON requests.request_ref = "
+                "effects.request_ref WHERE effects.issuer = :issuer AND "
+                "effects.generation = :generation ORDER BY effects.created_at"
+            ),
+            {"issuer": AR_OWNER, "generation": generation},
+        ).all()
+        matches: list[dict[str, str]] = []
+        for row in rows:
+            try:
+                binding = decoded_object(str(row.operation_binding_json))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(binding, dict)
+                or canonical_hash(binding) != row.operation_binding_hash
+                or row.waiter_status != waiter_status
+                or binding.get("root_kind") != "deepfetch"
+                or binding.get("task_ref") != run_ref
+                or binding.get("attempt_ref") != attempt_ref
+                or binding.get("generation") != generation
+                or binding.get("fence_ref") != fence_ref
+                or binding.get("root_session_ref") != root_session_ref
+                or binding.get("runtime_binding_hash") != runtime_binding_hash
+                or not isinstance(binding.get("phase"), str)
+                or not binding.get("phase")
+            ):
+                continue
+            matches.append(
+                {
+                    "effect_id": str(row.effect_id),
+                    "request_ref": str(row.request_ref),
+                    "phase": str(binding.get("phase")),
+                }
+            )
+        return tuple(matches)
+
+    def root_provider_continuation_job_ref(
+        self,
+        *,
+        root_kind: str,
+        phase: str,
+        run_ref: str,
+        root_session_ref: str,
+        base_job_ref: str,
+    ) -> str:
+        """Use a new durable invocation after an exact HR waiter resumed."""
+
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT effects.*, consumptions.consumption_ref FROM "
+                    "owner_human_request_open_effects AS effects JOIN "
+                    "owner_human_request_resume_consumptions AS consumptions ON "
+                    "consumptions.request_ref = effects.request_ref AND "
+                    "consumptions.waiter_ref = effects.waiter_ref AND "
+                    "consumptions.generation = effects.generation WHERE "
+                    "effects.issuer = :issuer ORDER BY consumptions.created_at DESC"
+                ),
+                {"issuer": AR_OWNER},
+            ).all()
+        for row in rows:
+            try:
+                binding = decoded_object(str(row.operation_binding_json))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(binding, dict)
+                and canonical_hash(binding) == row.operation_binding_hash
+                and binding.get("root_kind") == root_kind
+                and binding.get("phase") == phase
+                and binding.get("task_ref") == run_ref
+                and binding.get("root_session_ref") == root_session_ref
+                and binding.get("request_owner") == AR_OWNER
+            ):
+                return "root_hr_continuation_" + canonical_hash(
+                    {
+                        "base_job_ref": base_job_ref,
+                        "request_ref": row.request_ref,
+                        "consumption_ref": row.consumption_ref,
+                    }
+                )
+        return base_job_ref
+
+    def park_root_provider_session_for_human_request(
+        self,
+        *,
+        root_kind: str,
+        phase: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding_hash: str,
+    ) -> bool:
+        """Keep only a native Session checkpoint after an explicit HR yield."""
+
+        if root_kind not in FORMAL_STAGES | {"writing"}:
+            return False
+        now = time.time()
+        with self._database.write() as connection:
+            control = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            if (
+                control is None
+                or control.status != "suspended"
+                or control.terminal_reason != "human_request_wait"
+                or control.attempt_ref != attempt_ref
+                or control.fence_ref != fence_ref
+            ):
+                return False
+            rows = connection.execute(
+                text(
+                    "SELECT effects.request_ref, effects.waiter_ref, "
+                    "effects.generation, effects.operation_binding_json, "
+                    "effects.operation_binding_hash FROM "
+                    "owner_human_request_open_effects AS effects JOIN "
+                    "owner_human_request_waiters AS waiters ON "
+                    "waiters.request_ref = effects.request_ref AND "
+                    "waiters.waiter_ref = effects.waiter_ref JOIN "
+                    "owner_human_requests AS requests ON requests.request_ref = "
+                    "effects.request_ref WHERE effects.issuer = :issuer AND "
+                    "requests.issuer = :issuer AND requests.is_current = 1 AND "
+                    "waiters.status = 'blocked' ORDER BY effects.created_at"
+                ),
+                {"issuer": AR_OWNER},
+            ).all()
+            matches: list[object] = []
+            for row in rows:
+                try:
+                    binding = decoded_object(str(row.operation_binding_json))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(binding, dict)
+                    and canonical_hash(binding) == row.operation_binding_hash
+                    and row.waiter_ref == f"root_run:{run_ref}"
+                    and binding.get("root_kind") == root_kind
+                    and binding.get("phase") == phase
+                    and binding.get("task_ref") == run_ref
+                    and binding.get("attempt_ref") == attempt_ref
+                    and binding.get("root_session_ref")
+                    == control.root_session_ref
+                    and binding.get("fence_ref") == fence_ref
+                    and binding.get("runtime_binding_hash")
+                    == runtime_binding_hash
+                    and binding.get("generation") == row.generation
+                    and binding.get("request_owner") == AR_OWNER
+                ):
+                    matches.append(row)
+            if len(matches) != 1:
+                return False
+
+            if root_kind == "writing":
+                if phase not in {"writing-primary", "writing-review"}:
+                    return False
+                run = connection.execute(
+                    text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
+                    {"run_ref": run_ref},
+                ).first()
+                attempt = connection.execute(
+                    text(
+                        "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
+                        ":attempt_ref AND run_ref = :run_ref"
+                    ),
+                    {"attempt_ref": attempt_ref, "run_ref": run_ref},
+                ).first()
+                checkpoint = connection.execute(
+                    text(
+                        "SELECT checkpoint_ref FROM ar_writing_checkpoints WHERE "
+                        "attempt_ref = :attempt_ref"
+                    ),
+                    {"attempt_ref": attempt_ref},
+                ).first()
+                execution = connection.execute(
+                    text(
+                        "SELECT execution_ref FROM ar_writing_executions WHERE "
+                        "attempt_ref = :attempt_ref"
+                    ),
+                    {"attempt_ref": attempt_ref},
+                ).first()
+                unit = connection.execute(
+                    text(
+                        "SELECT * FROM ar_provider_units WHERE run_ref = :run_ref "
+                        "AND attempt_ref = :attempt_ref AND fence_ref = "
+                        ":fence_ref AND unit_kind = :unit_kind AND status = 'active'"
+                    ),
+                    {
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "unit_kind": phase.replace("-", "_"),
+                    },
+                ).first()
+                primary_pending = phase == "writing-primary" and checkpoint is None
+                review_pending = phase == "writing-review" and checkpoint is not None
+                if (
+                    run is None
+                    or attempt is None
+                    or execution is not None
+                    or unit is None
+                    or not (primary_pending or review_pending)
+                    or control.run_kind != "writing"
+                    or run.status != "active"
+                    or run.attempt_ref != attempt_ref
+                    or run.root_session_ref != control.root_session_ref
+                    or run.fence_ref != fence_ref
+                    or run.runtime_binding_hash != runtime_binding_hash
+                    or run.native_session_ref not in {None, native_session_ref}
+                    or attempt.status not in {"admitted", "running"}
+                    or attempt.root_session_ref != run.root_session_ref
+                    or attempt.fence_ref != fence_ref
+                    or attempt.native_session_ref not in {None, native_session_ref}
+                    or (
+                        unit.operation_ref != attempt.provider_job_ref
+                        and not _is_root_human_request_continuation_ref(
+                            unit.operation_ref
+                        )
+                    )
+                ):
+                    return False
+                connection.execute(
+                    text(
+                        "UPDATE ar_writing_runs SET native_session_ref = "
+                        ":native_session_ref, updated_at = :now WHERE run_ref = "
+                        ":run_ref"
+                    ),
+                    {
+                        "native_session_ref": native_session_ref,
+                        "now": now,
+                        "run_ref": run_ref,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_writing_attempts SET native_session_ref = "
+                        ":native_session_ref, status = 'running', started_at = "
+                        "COALESCE(started_at, :now) WHERE attempt_ref = "
+                        ":attempt_ref"
+                    ),
+                    {
+                        "native_session_ref": native_session_ref,
+                        "now": now,
+                        "attempt_ref": attempt_ref,
+                    },
+                )
+            else:
+                autonomous_resume = (
+                    root_kind == "reasoning" and phase == "autonomous-resume"
+                )
+                if phase not in {"primary", "review"} and not autonomous_resume:
+                    return False
+                provider_phase = "review" if autonomous_resume else phase
+                run, attempt, session, fence = _load_stage_fence(
+                    connection, run_ref, attempt_ref, fence_ref
+                )
+                invocation = connection.execute(
+                    text(
+                        "SELECT * FROM ar_stage_provider_invocations WHERE "
+                        "attempt_ref = :attempt_ref AND phase = :phase"
+                    ),
+                    {"attempt_ref": attempt_ref, "phase": provider_phase},
+                ).first()
+                unit = connection.execute(
+                    text(
+                        "SELECT * FROM ar_provider_units WHERE run_ref = :run_ref "
+                        "AND attempt_ref = :attempt_ref AND fence_ref = :fence_ref "
+                        "AND unit_kind = :unit_kind AND status = 'active'"
+                    ),
+                    {
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "unit_kind": f"{root_kind}_{provider_phase}",
+                    },
+                ).first()
+                primary_pending = (
+                    phase == "primary" and attempt.primary_draft_json is None
+                )
+                review_pending = (
+                    phase == "review"
+                    and attempt.primary_draft_json is not None
+                    and attempt.submission_ref is None
+                )
+                autonomous_resume_pending = (
+                    autonomous_resume
+                    and attempt.submission_ref is None
+                    and _reasoning_autonomous_checkpoint(run, attempt, session)
+                    is not None
+                )
+                if (
+                    control.run_kind != f"{root_kind}_stage"
+                    or run.stage != root_kind
+                    or run.status != "running"
+                    or run.current_attempt_ref != attempt_ref
+                    or run.current_fence_ref != fence_ref
+                    or run.runtime_binding_hash != runtime_binding_hash
+                    or attempt.status != "running"
+                    or not (
+                        primary_pending
+                        or review_pending
+                        or autonomous_resume_pending
+                    )
+                    or fence.status != "current"
+                    or session.status != "active"
+                    or session.native_session_ref not in {None, native_session_ref}
+                    or invocation is None
+                    or invocation.status != "prepared"
+                    or invocation.response_hash is not None
+                    or unit is None
+                    or (
+                        unit.operation_ref != invocation.operation_ref
+                        and not _is_root_human_request_continuation_ref(
+                            unit.operation_ref
+                        )
+                    )
+                    or unit.unit_kind != f"{root_kind}_{provider_phase}"
+                    or unit.status != "active"
+                ):
+                    return False
+                try:
+                    connection.execute(
+                        text(
+                            "UPDATE ar_stage_sessions SET native_session_ref = "
+                            ":native_session_ref, updated_at = :now WHERE "
+                            "session_ref = :session_ref"
+                        ),
+                        {
+                            "native_session_ref": native_session_ref,
+                            "now": now,
+                            "session_ref": session.session_ref,
+                        },
+                    )
+                except IntegrityError as error:
+                    raise OwnerConflict("native_session_conflict") from error
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.root_human_request_session_parked",
+                {
+                    "root_kind": root_kind,
+                    "phase": phase,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "request_ref": matches[0].request_ref,
+                },
+            )
+            return True
 
     def _defer_deepfetch_protection_wait(
         self,
@@ -14932,7 +16742,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         runtime_binding_json: str,
         runtime_binding_hash: str,
         reconcile_only: bool = False,
-    ) -> tuple[str, str, str, int, str, str | None, str]:
+    ) -> tuple[
+        str,
+        str,
+        str,
+        int,
+        str,
+        str | None,
+        str,
+        dict[str, str] | None,
+    ]:
         now = time.time()
         with self._database.write() as connection:
             # Acquire SQLite's writer reservation before checking HC liveness.
@@ -14989,6 +16808,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 and run is not None
                 and bool(run.provider_operation_retry_permitted)
             )
+            human_request_resume: dict[str, str] | None = None
             binding_transition: dict[str, object] | None = None
             if run is not None:
                 if (
@@ -15095,7 +16915,45 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 provider_operation_generation = int(run.provider_operation_generation)
                 provider_operation_ref = str(run.provider_operation_ref)
                 reconciliation_attempt_count = int(run.reconciliation_attempt_count)
-                if new_provider_execution:
+                if (
+                    run.status == "admitted"
+                    and run.failure_code == "human_request_wait"
+                ):
+                    prior_attempt = connection.execute(
+                        text(
+                            "SELECT * FROM ar_deepfetch_attempts WHERE run_ref = "
+                            ":run_ref AND generation = :generation"
+                        ),
+                        {
+                            "run_ref": run_ref,
+                            "generation": int(run.attempt_generation),
+                        },
+                    ).one()
+                    session_row = connection.execute(
+                        text(
+                            "SELECT * FROM ar_deepfetch_sessions WHERE run_ref = "
+                            ":run_ref"
+                        ),
+                        {"run_ref": run_ref},
+                    ).one()
+                    effects = self._deepfetch_human_request_resume_effects(
+                        connection,
+                        run_ref=run_ref,
+                        attempt_ref=str(prior_attempt.attempt_ref),
+                        generation=int(prior_attempt.generation),
+                        fence_ref=str(prior_attempt.fence_ref),
+                        root_session_ref=str(session_row.root_session_ref),
+                        runtime_binding_hash=str(run.runtime_binding_hash),
+                        waiter_status="consumed",
+                    )
+                    if (
+                        prior_attempt.status != "superseded"
+                        or prior_attempt.failure_code != "human_request_wait"
+                        or len(effects) != 1
+                    ):
+                        raise OwnerConflict("deepfetch_human_request_resume_invalid")
+                    human_request_resume = effects[0]
+                if new_provider_execution or human_request_resume is not None:
                     provider_operation_generation += 1
                     provider_operation_ref = typed_provider_operation_ref(
                         run_ref,
@@ -15158,6 +17016,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 root_session_ref = new_ref("deepfetch_session")
                 native_session_ref = None
                 generation = 1
+                human_request_resume = None
                 connection.execute(
                     text(
                         "INSERT INTO ar_deepfetch_runs (run_ref, request_ref, "
@@ -15373,6 +17232,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             fence_ref,
             native_session_ref,
             provider_operation_ref,
+            human_request_resume,
         )
 
     def _complete_deepfetch_attempt(
@@ -18457,6 +20317,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         runtime_binding, _binding_json, runtime_binding_hash = (
             _validated_runtime_binding(runtime_binding, stage=expected_stage)
         )
+        if self.park_root_provider_session_for_human_request(
+            root_kind=expected_stage,
+            phase="primary",
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            native_session_ref=native_session_ref,
+            runtime_binding_hash=runtime_binding_hash,
+        ):
+            raise OwnerConflict("runtime_run_suspended")
         draft_json = canonical_json(draft)
         draft_hash = canonical_hash(draft)
         provider_response_hash = _primary_provider_response_hash(
@@ -20480,7 +22350,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "run.attempt_ref JOIN ar_run_controls AS control ON "
                     "control.run_ref = run.run_ref AND control.run_kind = 'writing' "
                     "WHERE run.status = 'active' AND attempt.status IN "
-                    "('admitted', 'running') AND control.cleanup_status != 'pending' "
+                    "('admitted', 'running') AND control.status IN "
+                    "('running', 'reconciliation_required') AND "
+                    "control.cleanup_status != 'pending' "
                     "AND (NOT EXISTS (SELECT 1 FROM "
                     "ar_provider_units pending WHERE pending.run_ref = run.run_ref "
                     "AND pending.status = 'revocation_pending') OR EXISTS (SELECT 1 "
@@ -26461,7 +28333,7 @@ def _validated_runtime_binding(
         if resource.startswith("harness-artifact:operation-binding-")
     )
     operation_binding_valid = (
-        stage in {"bundle", "reasoning"}
+        stage in FORMAL_STAGES
         and binding.harness_adapter_ref.startswith("codex-cli/")
         and "harness-operation-binding-v1" in binding.capability_bindings
         and "harness-full-conformance-v1" not in binding.capability_bindings
@@ -26572,23 +28444,22 @@ def _validated_runtime_binding(
             and legacy_full_conformance_valid
         )
     )
+    idea_or_plan_binding_valid = stage in {"idea", "plan"} and (
+        operation_binding_valid
+        or (
+            not binding.mcp_bindings
+            and "harness-full-conformance-v1"
+            not in binding.capability_bindings
+            and "harness-operation-binding-v1"
+            not in binding.capability_bindings
+            and not full_conformance_resources
+            and not operation_binding_resources
+        )
+    )
     if (
         (stage == "bundle" and not bundle_binding_valid)
         or (stage == "reasoning" and not reasoning_binding_valid)
-        or (stage not in {"bundle", "reasoning"} and binding.mcp_bindings)
-        or (
-            stage not in {"bundle", "reasoning"}
-            and (
-                "harness-full-conformance-v1"
-                in binding.capability_bindings
-                or "harness-operation-binding-v1"
-                in binding.capability_bindings
-            )
-        )
-        or (
-            stage not in {"bundle", "reasoning"}
-            and (full_conformance_resources or operation_binding_resources)
-        )
+        or (stage in {"idea", "plan"} and not idea_or_plan_binding_valid)
         or any(
             capability
             not in (
@@ -30245,11 +32116,133 @@ def _managed_run_document(
         "safe_point_ref": row.safe_point_ref,
         "terminal_reason": row.terminal_reason,
         "cleanup_status": row.cleanup_status,
+        "runtime_binding_hash": row.runtime_binding_hash,
+        "attempt_generation": (
+            None
+            if row.attempt_generation is None
+            else int(row.attempt_generation)
+        ),
         "updated_at": float(row.updated_at),
     }
     if safe_point is not None:
         value["safe_point"] = safe_point
     return value
+
+
+def _is_root_human_request_continuation_ref(value: object) -> bool:
+    prefix = "root_hr_continuation_"
+    return (
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and len(value) == len(prefix) + 64
+        and all(character in "0123456789abcdef" for character in value[len(prefix) :])
+    )
+
+
+def _validated_external_root_task_scope(
+    *,
+    root_kind: RootAgentKind,
+    root_runtime_scope: dict[str, object],
+) -> dict[str, object]:
+    required = {
+        "quest_ref",
+        "run_ref",
+        "attempt_ref",
+        "root_session_ref",
+        "fence_ref",
+        "runtime_binding_hash",
+        "generation",
+    }
+    if (
+        root_kind not in {"acquisition", "companion"}
+        or not isinstance(root_runtime_scope, dict)
+        or set(root_runtime_scope) != required
+    ):
+        raise OwnerConflict("external_root_task_scope_invalid")
+    for name in ("quest_ref", "attempt_ref", "root_session_ref", "fence_ref"):
+        value = root_runtime_scope.get(name)
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > 96
+        ):
+            raise OwnerConflict("external_root_task_scope_invalid")
+    run_ref = root_runtime_scope.get("run_ref")
+    if (
+        not isinstance(run_ref, str)
+        or not run_ref.strip()
+        or len(run_ref) > 256
+    ):
+        raise OwnerConflict("external_root_task_scope_invalid")
+    generation = root_runtime_scope.get("generation")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+    ):
+        raise OwnerConflict("external_root_task_scope_invalid")
+    if not _is_sha256(root_runtime_scope.get("runtime_binding_hash")):
+        raise OwnerConflict("external_root_task_scope_invalid")
+    return dict(root_runtime_scope)
+
+
+def _assert_external_root_task_scope_row(
+    row,
+    *,
+    root_kind: RootAgentKind,
+    scope: dict[str, object],
+) -> None:
+    if (
+        row.run_kind != root_kind
+        or row.quest_ref != scope["quest_ref"]
+        or row.attempt_ref != scope["attempt_ref"]
+        or row.root_session_ref != scope["root_session_ref"]
+        or row.fence_ref != scope["fence_ref"]
+        or row.runtime_binding_hash != scope["runtime_binding_hash"]
+        or row.attempt_generation != scope["generation"]
+        or row.cycle_ref is not None
+        or row.epoch is not None
+    ):
+        raise OwnerConflict("external_root_task_scope_conflict")
+
+
+def _external_root_task_scope_can_advance(
+    row,
+    *,
+    root_kind: RootAgentKind,
+    scope: dict[str, object],
+) -> bool:
+    """Allow only the Owner-claimed next physical Attempt of one logical job."""
+
+    return (
+        row.run_kind == root_kind
+        and row.quest_ref == scope["quest_ref"]
+        and row.root_session_ref == scope["root_session_ref"]
+        and row.runtime_binding_hash == scope["runtime_binding_hash"]
+        and row.cycle_ref is None
+        and row.epoch is None
+        and row.status in {"running", "completed"}
+        and isinstance(row.attempt_generation, int)
+        and not isinstance(row.attempt_generation, bool)
+        and scope["generation"] == int(row.attempt_generation) + 1
+    )
+
+
+def _external_root_task_scope_document(row) -> dict[str, object]:
+    return {
+        "root_kind": str(row.run_kind),
+        "root_runtime_scope": {
+            "quest_ref": str(row.quest_ref),
+            "run_ref": str(row.run_ref),
+            "attempt_ref": str(row.attempt_ref),
+            "root_session_ref": str(row.root_session_ref),
+            "fence_ref": str(row.fence_ref),
+            "runtime_binding_hash": str(row.runtime_binding_hash),
+            "generation": int(row.attempt_generation),
+        },
+        "status": str(row.status),
+        "control_revision": int(row.control_revision),
+    }
 
 
 def _validated_stage_provider_hard_ceiling(

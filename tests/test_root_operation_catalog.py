@@ -11,6 +11,7 @@ from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.semantic_owner_gateway import (
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
     REASONING_ROOT_SEMANTIC_OPERATION_IDS,
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
     TARGET_ROOT_SEMANTIC_OPERATION_IDS,
 )
 
@@ -18,8 +19,8 @@ from meta_research.semantic_owner_gateway import (
 COMMON_OPERATION_IDS = (
     "agent_runtime.acquisition.request",
     "agent_runtime.acquisition.request.reconcile",
-    "agent_runtime.human_request.open",
-    "agent_runtime.human_request.open.reconcile",
+    "human_request.open",
+    "human_request.open.reconcile",
 )
 
 
@@ -77,16 +78,21 @@ def test_catalog_rejects_duplicate_or_overlapping_grants() -> None:
         )
 
 
-def test_live_role_catalogs_use_only_currently_registered_common_operations() -> None:
-    live_catalogs = {
-        "bundle": BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
-        "target": TARGET_ROOT_SEMANTIC_OPERATION_IDS,
-        "reasoning": REASONING_ROOT_SEMANTIC_OPERATION_IDS,
-    }
-
-    for root_kind, catalog in live_catalogs.items():
+def test_all_root_catalogs_use_the_registered_human_request_operations() -> None:
+    assert tuple(ROOT_AGENT_SEMANTIC_OPERATION_IDS) == ROOT_AGENT_KINDS
+    for root_kind, catalog in ROOT_AGENT_SEMANTIC_OPERATION_IDS.items():
         assert catalog == root_operation_catalog(
             root_kind,
             common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
         )
         assert not any("acquisition.request" in item for item in catalog)
+
+    assert BUNDLE_ROOT_SEMANTIC_OPERATION_IDS == ROOT_AGENT_SEMANTIC_OPERATION_IDS[
+        "bundle"
+    ]
+    assert TARGET_ROOT_SEMANTIC_OPERATION_IDS == ROOT_AGENT_SEMANTIC_OPERATION_IDS[
+        "target"
+    ]
+    assert REASONING_ROOT_SEMANTIC_OPERATION_IDS == (
+        ROOT_AGENT_SEMANTIC_OPERATION_IDS["reasoning"]
+    )

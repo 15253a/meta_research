@@ -125,6 +125,9 @@ _PREVIEW_REFRESH_RETRY_SECONDS = 60.0
 _PREVIEW_REFRESH_CACHE_LIMIT = 256
 MAX_ACCEPTED_MATERIAL_BINDINGS = 100
 HUMAN_RESPONSE_RECEIPT_SCHEMA = "meta-research/human-request-response/v1"
+HUMAN_RESPONSE_REJECTION_RECEIPT_SCHEMA = (
+    "meta-research/human-request-response-rejection/v1"
+)
 _MANAGED_RUN_STATUSES = {
     "running",
     "suspended",
@@ -234,6 +237,8 @@ class HumanCollaborationInterface(Protocol):
         note: str,
         idempotency_key: str,
     ) -> dict[str, object]: ...
+
+    def recover_root_library_reconnect_responses(self) -> None: ...
 
     def send_companion_message(
         self,
@@ -878,6 +883,19 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
                 {"request_ref": request_ref},
             ).all()
         return tuple(_public_human_response(row) for row in rows)
+
+    def query_human_response_rejections(
+        self, request_ref: str
+    ) -> tuple[dict[str, object], ...]:
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM hc_human_request_response_rejections WHERE "
+                    "request_ref = :request_ref ORDER BY created_at, rejection_ref"
+                ),
+                {"request_ref": request_ref},
+            ).all()
+        return tuple(_public_human_response_rejection(row) for row in rows)
 
     def verify_human_response(
         self, *, request_ref: str, response_ref: str
@@ -1661,6 +1679,7 @@ class SQLiteHumanCollaboration:
             control_preview_resolver=self._resolve_control_preview,
             writing_snapshot_validator=validate_frozen_writing_snapshot,
             runtime_protection=runtime_protection,
+            agent_runtime=agent_runtime,
         )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._preview_refresh_lock = threading.Lock()
@@ -1932,15 +1951,34 @@ class SQLiteHumanCollaboration:
         for owner in owners:
             request = owner.query_human_request(scope_ref)
             if request is not None:
+                candidate_quest_ref = request.get("quest_ref")
+                quest_ref = (
+                    candidate_quest_ref
+                    if isinstance(candidate_quest_ref, str)
+                    and candidate_quest_ref
+                    and self._research_graph.query_quest_by_ref(
+                        candidate_quest_ref
+                    )
+                    is not None
+                    else None
+                )
                 return {
                     "schema_ref": "meta-research/companion-context/v1",
                     "scope_ref": scope_ref,
                     "context_kind": "human_request",
+                    "quest_ref": quest_ref,
                     "human_request": _companion_human_request_context(request),
                 }
-        quest_ref = (
+        candidate_quest_ref = (
             scope_ref.removeprefix("quest:")
             if scope_ref.startswith("quest:")
+            else None
+        )
+        quest_ref = (
+            candidate_quest_ref
+            if candidate_quest_ref is not None
+            and self._research_graph.query_quest_by_ref(candidate_quest_ref)
+            is not None
             else None
         )
         requests = (
@@ -3504,14 +3542,19 @@ class SQLiteHumanCollaboration:
         if not isinstance(note, str) or len(note) > 4000:
             raise OwnerConflict("human_response_note_invalid")
         note = note.strip()
-        if contains_secret(facts) or contains_secret(note):
-            raise OwnerConflict("human_response_secret_forbidden")
         if (
             not idempotency_key
             or len(idempotency_key) > 128
             or contains_secret(idempotency_key)
         ):
             raise OwnerConflict("idempotency_key_invalid")
+        if contains_secret(facts) or contains_secret(note):
+            request = self._query_issuing_owner_request(request_ref)
+            self._record_human_response_rejection(
+                request,
+                idempotency_key=idempotency_key,
+            )
+            raise OwnerConflict("human_response_secret_forbidden")
         command = {
             "command": "respond_to_human_request",
             "request_ref": request_ref,
@@ -3520,6 +3563,12 @@ class SQLiteHumanCollaboration:
             "note": note,
         }
         command_hash = canonical_hash(command)
+        rejection_idempotency_hash = canonical_hash(
+            {
+                "kind": "human_response_rejection",
+                "idempotency_key": idempotency_key,
+            }
+        )
         with self._database.read() as connection:
             replay = connection.execute(
                 text(
@@ -3528,6 +3577,16 @@ class SQLiteHumanCollaboration:
                 ),
                 {"idempotency_key": idempotency_key},
             ).first()
+            rejected = connection.execute(
+                text(
+                    "SELECT rejection_ref FROM "
+                    "hc_human_request_response_rejections WHERE "
+                    "idempotency_hash = :idempotency_hash"
+                ),
+                {"idempotency_hash": rejection_idempotency_hash},
+            ).first()
+        if rejected is not None:
+            raise OwnerConflict("idempotency_conflict")
         if replay is not None:
             if replay.command_hash != command_hash:
                 raise OwnerConflict("idempotency_conflict")
@@ -3541,6 +3600,16 @@ class SQLiteHumanCollaboration:
         if not request["current"] or request["status"] != "open":
             raise OwnerConflict("human_request_not_current")
         with self._database.write() as connection:
+            rejected = connection.execute(
+                text(
+                    "SELECT rejection_ref FROM "
+                    "hc_human_request_response_rejections WHERE "
+                    "idempotency_hash = :idempotency_hash"
+                ),
+                {"idempotency_hash": rejection_idempotency_hash},
+            ).first()
+            if rejected is not None:
+                raise OwnerConflict("idempotency_conflict")
             replay = connection.execute(
                 text(
                     "SELECT * FROM hc_human_request_responses WHERE "
@@ -3626,6 +3695,108 @@ class SQLiteHumanCollaboration:
         self._reconcile_issuing_owner_human_request(request_ref)
         return response
 
+    def _record_human_response_rejection(
+        self,
+        request: dict[str, object],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        """Persist only a sanitized receipt for a rejected secret-bearing input."""
+
+        request_identity = {
+            "request_ref": request["request_ref"],
+            "issuer": request["issuer"],
+            "request_id": request["request_id"],
+            "request_revision": request["revision"],
+        }
+        request_identity_hash = canonical_hash(request_identity)
+        idempotency_hash = canonical_hash(
+            {
+                "kind": "human_response_rejection",
+                "idempotency_key": idempotency_key,
+            }
+        )
+        with self._database.write() as connection:
+            accepted = connection.execute(
+                text(
+                    "SELECT response_ref FROM hc_human_request_responses WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if accepted is not None:
+                raise OwnerConflict("idempotency_conflict")
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM hc_human_request_response_rejections WHERE "
+                    "idempotency_hash = :idempotency_hash"
+                ),
+                {"idempotency_hash": idempotency_hash},
+            ).first()
+            if existing is not None:
+                if (
+                    existing.request_ref != request["request_ref"]
+                    or existing.issuer != request["issuer"]
+                    or existing.request_id != request["request_id"]
+                    or int(existing.request_revision) != int(request["revision"])
+                    or existing.request_identity_hash != request_identity_hash
+                ):
+                    raise OwnerConflict("idempotency_conflict")
+                return _public_human_response_rejection(existing)
+            rejection_ref = new_ref("human_response_rejection")
+            receipt_ref = new_ref("hc_receipt")
+            payload = {
+                "schema_ref": HUMAN_RESPONSE_REJECTION_RECEIPT_SCHEMA,
+                "rejection_ref": rejection_ref,
+                **request_identity,
+                "reason_code": "human_response_secret_forbidden",
+                "request_identity_hash": request_identity_hash,
+                "idempotency_hash": idempotency_hash,
+            }
+            receipt_hash = canonical_hash(payload)
+            now = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO hc_human_request_response_rejections "
+                    "(rejection_ref, request_ref, issuer, request_id, "
+                    "request_revision, reason_code, request_identity_hash, "
+                    "idempotency_hash, receipt_ref, receipt_hash, created_at) "
+                    "VALUES (:rejection_ref, :request_ref, :issuer, :request_id, "
+                    ":request_revision, :reason_code, :request_identity_hash, "
+                    ":idempotency_hash, :receipt_ref, :receipt_hash, :created_at)"
+                ),
+                {
+                    **payload,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "created_at": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE human_collaboration_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "human_collaboration.human_response_rejected",
+                {
+                    "rejection_ref": rejection_ref,
+                    "request_ref": request["request_ref"],
+                    "issuer": request["issuer"],
+                    "reason_code": "human_response_secret_forbidden",
+                },
+            )
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_human_request_response_rejections WHERE "
+                    "rejection_ref = :rejection_ref"
+                ),
+                {"rejection_ref": rejection_ref},
+            ).one()
+        return _public_human_response_rejection(row)
+
     def _query_issuing_owner_request(self, request_ref: str) -> dict[str, object]:
         for owner in (
             self._research_graph,
@@ -3653,13 +3824,31 @@ class SQLiteHumanCollaboration:
                 reconcile(request_ref)
             target = request.get("target_assertion")
             responses = request.get("responses")
-            if (
-                owner is self._agent_runtime
-                and isinstance(target, dict)
+            open_effect = request.get("open_effect")
+            operation_binding = (
+                None
+                if not isinstance(open_effect, dict)
+                else open_effect.get("operation_binding")
+            )
+            legacy_acquisition_target = bool(
+                isinstance(target, dict)
                 and target.get("schema_ref")
                 == "meta-research/acquisition-human-request-target/v1"
                 and target.get("operation") == "resume_acquisition_item"
                 and isinstance(target.get("session_ref"), str)
+            )
+            root_acquisition_target = bool(
+                isinstance(target, dict)
+                and target.get("schema_ref")
+                == "meta-research/root-agent-human-request-target/v1"
+                and isinstance(operation_binding, dict)
+                and isinstance(operation_binding.get("quest_ref"), str)
+                and operation_binding.get("quest_ref") == request.get("quest_ref")
+            )
+            if (
+                owner is self._agent_runtime
+                and request.get("kind") == "library_reconnect"
+                and (legacy_acquisition_target or root_acquisition_target)
                 and isinstance(responses, list)
                 and any(
                     isinstance(response, dict)
@@ -3670,10 +3859,23 @@ class SQLiteHumanCollaboration:
                     for response in responses
                 )
             ):
-                session = self._agent_runtime.query_acquisition_session(
-                    session_ref=cast(str, target["session_ref"])
+                session = (
+                    self._agent_runtime.query_acquisition_session(
+                        session_ref=cast(str, target["session_ref"])
+                    )
+                    if legacy_acquisition_target
+                    else self._agent_runtime.query_acquisition_session(
+                        quest_ref=cast(str, operation_binding["quest_ref"])
+                    )
                 )
-                if session is not None and session.status == "waiting_user":
+                if (
+                    session is not None
+                    and session.status == "waiting_user"
+                    and isinstance(
+                        getattr(session, "initialization_id", None), str
+                    )
+                    and getattr(session, "initialization_id", None)
+                ):
                     creation = self.query_quest_creation(session.initialization_id)
                     draft = cast(dict[str, object], creation["quest_draft"])
                     draft_value = cast(dict[str, object], draft["value"])
@@ -3691,8 +3893,34 @@ class SQLiteHumanCollaboration:
                         },
                         provider=self._acquisition_provider,
                     )
+                    if root_acquisition_target and callable(reconcile):
+                        reconcile(request_ref)
             return
         raise OwnerConflict("human_request_not_found")
+
+    def recover_root_library_reconnect_responses(self) -> None:
+        """Replay committed Responses that still need the HC preflight bridge."""
+
+        with self._database.read() as connection:
+            request_refs = tuple(
+                str(row.request_ref)
+                for row in connection.execute(
+                    text(
+                        "SELECT DISTINCT request_ref FROM "
+                        "hc_human_request_responses ORDER BY request_ref"
+                    )
+                ).all()
+            )
+        for request_ref in request_refs:
+            request = self._agent_runtime.query_human_request(request_ref)
+            if (
+                request is not None
+                and request.get("current") is True
+                and request.get("status") == "open"
+                and request.get("kind") == "library_reconnect"
+                and isinstance(request.get("open_effect"), dict)
+            ):
+                self._reconcile_issuing_owner_human_request(request_ref)
 
     def _verify_material_bindings(self, draft: dict[str, object]) -> None:
         for binding in _accepted_material_bindings(draft):
@@ -9985,6 +10213,41 @@ def _public_human_response(row) -> dict[str, object]:
             kind="human_request_response",
             receipt_ref=row.receipt_ref,
             subject_ref=row.response_ref,
+            payload_hash=row.receipt_hash,
+        ).as_public_dict(),
+        "created_at": float(row.created_at),
+    }
+
+
+def _public_human_response_rejection(row) -> dict[str, object]:
+    request_identity = {
+        "request_ref": row.request_ref,
+        "issuer": row.issuer,
+        "request_id": row.request_id,
+        "request_revision": int(row.request_revision),
+    }
+    payload = {
+        "schema_ref": HUMAN_RESPONSE_REJECTION_RECEIPT_SCHEMA,
+        "rejection_ref": row.rejection_ref,
+        **request_identity,
+        "reason_code": row.reason_code,
+        "request_identity_hash": row.request_identity_hash,
+        "idempotency_hash": row.idempotency_hash,
+    }
+    if (
+        row.reason_code != "human_response_secret_forbidden"
+        or canonical_hash(request_identity) != row.request_identity_hash
+        or canonical_hash(payload) != row.receipt_hash
+    ):
+        raise OwnerConflict("human_response_rejection_receipt_invalid")
+    return {
+        **payload,
+        "receipt_ref": row.receipt_ref,
+        "receipt": AcceptanceReceipt(
+            issuer=HC_OWNER,
+            kind="human_response_rejection",
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.rejection_ref,
             payload_hash=row.receipt_hash,
         ).as_public_dict(),
         "created_at": float(row.created_at),

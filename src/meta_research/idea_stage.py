@@ -441,8 +441,8 @@ class IdeaStageWorker:
                     and run.technical_predecessor_attempt_ref is None
                 )
                 or (
-                    (run.native_session_ref is None)
-                    != (run.primary_draft is None)
+                    run.primary_draft is not None
+                    and run.native_session_ref is None
                 )
             )
         ):
@@ -464,8 +464,23 @@ class IdeaStageWorker:
             if run.primary_draft is None
             else run.review_invocation
         )
-        job_ref = invocation.operation_ref
-        unit_ref = invocation.invocation_ref
+        phase = "primary" if run.primary_draft is None else "review"
+        base_job_ref = invocation.operation_ref
+        job_ref = self._agent_runtime.root_provider_continuation_job_ref(
+            root_kind="idea",
+            phase=phase,
+            run_ref=run.run_ref,
+            root_session_ref=run.root_session_ref,
+            base_job_ref=base_job_ref,
+        )
+        unit_ref = (
+            invocation.invocation_ref
+            if job_ref == base_job_ref
+            else "provider_unit_"
+            + canonical_hash(
+                {"invocation_ref": invocation.invocation_ref, "job_ref": job_ref}
+            )[:64]
+        )
         skill_request = IdeaSkillRequest(
             stage_request_ref=request.request_ref,
             question_ref=current.question.question_ref,
@@ -503,6 +518,9 @@ class IdeaStageWorker:
                 )
             ),
             job_ref=job_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
         )
         if run.primary_draft is None:
             try:
@@ -524,6 +542,21 @@ class IdeaStageWorker:
                     draft = self._provider.generate_draft(skill_request)
                     draft_hash = validate_idea_skill_draft(skill_request, draft)
                 except IdeaSkillUnavailable as error:
+                    if (
+                        error.native_session_ref is not None
+                        and self._agent_runtime.park_root_provider_session_for_human_request(
+                            root_kind="idea",
+                            phase="primary",
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            native_session_ref=error.native_session_ref,
+                            runtime_binding_hash=run.runtime_binding_hash,
+                        )
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return _CycleStep(True, provider_boundary_attempted=True)
                     if error.rejected_candidate is not None:
                         if (
                             error.rejected_native_session_ref is None
@@ -566,6 +599,18 @@ class IdeaStageWorker:
                         return _CycleStep(
                             False, provider_boundary_attempted=True
                         )
+                    if self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="idea",
+                        phase="primary",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=draft.primary_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    ):
+                        self._finish_provider_job(job_ref)
+                        self._transient_error = None
+                        return _CycleStep(True, provider_boundary_attempted=True)
                     failure_code = "idea_primary_result_contract_invalid"
                     self._reject_completion_candidate(
                         unit_ref=unit_ref,
@@ -582,18 +627,25 @@ class IdeaStageWorker:
                 except IdeaSkillContractError as error:
                     self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
-                checkpoint = self._agent_runtime.record_idea_primary_draft(
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    native_session_ref=draft.primary_session_ref,
-                    runtime_binding=run.runtime_binding,
-                    draft=draft.draft,
-                    adapter_kind=draft.adapter_kind,
-                    idempotency_key=_operation_key(
-                        "idea-primary", run.run_ref, run.attempt_ref, draft_hash
-                    ),
-                )
+                try:
+                    checkpoint = self._agent_runtime.record_idea_primary_draft(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=draft.primary_session_ref,
+                        runtime_binding=run.runtime_binding,
+                        draft=draft.draft,
+                        adapter_kind=draft.adapter_kind,
+                        idempotency_key=_operation_key(
+                            "idea-primary", run.run_ref, run.attempt_ref, draft_hash
+                        ),
+                    )
+                except OwnerConflict as error:
+                    if error.code != "runtime_run_suspended":
+                        raise
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 if checkpoint.draft_hash != draft_hash:
                     raise OwnerConflict("idea_primary_draft_hash_mismatch")
                 self._transient_error = None
@@ -636,6 +688,24 @@ class IdeaStageWorker:
                     predecessor_material_outcome_hash=predecessor_hash,
                 )
             except IdeaSkillUnavailable as error:
+                review_session_ref = (
+                    error.native_session_ref or run.native_session_ref
+                )
+                if (
+                    review_session_ref is not None
+                    and self._agent_runtime.park_root_provider_session_for_human_request(
+                        root_kind="idea",
+                        phase="review",
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=review_session_ref,
+                        runtime_binding_hash=run.runtime_binding_hash,
+                    )
+                ):
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 if error.rejected_candidate is not None:
                     if (
                         error.rejected_native_session_ref is None
@@ -672,6 +742,18 @@ class IdeaStageWorker:
                 if result is None:
                     self._transient_error = str(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
+                if self._agent_runtime.park_root_provider_session_for_human_request(
+                    root_kind="idea",
+                    phase="review",
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=result.primary_session_ref,
+                    runtime_binding_hash=run.runtime_binding_hash,
+                ):
+                    self._finish_provider_job(job_ref)
+                    self._transient_error = None
+                    return _CycleStep(True, provider_boundary_attempted=True)
                 failure_code = "idea_review_result_contract_invalid"
                 self._reject_completion_candidate(
                     unit_ref=unit_ref,
@@ -688,6 +770,18 @@ class IdeaStageWorker:
             except IdeaSkillContractError as error:
                 self._transient_error = str(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
+            if self._agent_runtime.park_root_provider_session_for_human_request(
+                root_kind="idea",
+                phase="review",
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                native_session_ref=result.primary_session_ref,
+                runtime_binding_hash=run.runtime_binding_hash,
+            ):
+                self._finish_provider_job(job_ref)
+                self._transient_error = None
+                return _CycleStep(True, provider_boundary_attempted=True)
             review = review_record(
                 result,
                 draft_hash=draft_hash,
@@ -729,6 +823,11 @@ class IdeaStageWorker:
                     attempt_ref=run.attempt_ref,
                     fence_ref=run.fence_ref,
                 )
+
+    def _finish_provider_job(self, job_ref: str) -> None:
+        finish_job = getattr(self._provider, "finish_job", None)
+        if callable(finish_job):
+            finish_job(job_ref)
 
     def _reject_completion_candidate(
         self,

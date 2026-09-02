@@ -6,6 +6,8 @@ from importlib.resources import files
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -23,6 +25,9 @@ from meta_research.plan_skill import (
     _review_finalization_schema,
     _validate_request,
     validate_plan_skill_result,
+)
+from meta_research.semantic_owner_gateway import (
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
 )
 
 
@@ -359,11 +364,17 @@ class _SequenceRunner:
         self._emit_review_trace = emit_review_trace
         self._emit_primary_review_trace = emit_primary_review_trace
         self.calls: list[tuple[list[str], str, dict[str, object]]] = []
+        self.environments: list[dict[str, str] | None] = []
 
     def __call__(
-        self, argv: list[str], prompt: str, timeout: float
+        self,
+        argv: list[str],
+        prompt: str,
+        timeout: float,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         del timeout
+        self.environments.append(environment)
         schema_path = Path(argv[argv.index("--output-schema") + 1])
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         output_path = Path(argv[argv.index("--output-last-message") + 1])
@@ -484,6 +495,68 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     assert review_argv[-3:] == ["resume", "codex-plan-primary:1", "-"]
     assert "ExperimentBrief" in review_prompt
     assert "final_plan" in review_schema["properties"]
+
+
+def test_plan_primary_turn_uses_its_exact_resident_operation_tree(
+    tmp_path: Path,
+) -> None:
+    operation_ids = ROOT_AGENT_SEMANTIC_OPERATION_IDS["plan"]
+    operation_bindings = tuple(
+        {"semantic_operation_id": operation_id}
+        for operation_id in operation_ids
+    )
+    conformance = SimpleNamespace(
+        contract_ref="meta-research/harness-operation-binding/v1",
+        contract_hash="3" * 64,
+        conformance_ref="operation-binding:plan",
+        semantic_mcp_catalog_hash="4" * 64,
+        semantic_mcp_operation_bindings_hash=canonical_hash(
+            list(operation_bindings)
+        ),
+        required_families=("codex",),
+        required_capabilities=("semantic_mcp",),
+        required_operation_ids=operation_ids,
+        profile_receipts=(),
+        as_dict=lambda: {"root_kind": "plan", "catalog": "4" * 64},
+    )
+    channel = SimpleNamespace(
+        connection=SimpleNamespace(token="plan-token", grant_ref="plan-grant"),
+        binding=SimpleNamespace(
+            endpoint_ref="/mcp",
+            catalog_hash="4" * 64,
+            connection_grant_ref="plan-grant",
+            operation_bindings=operation_bindings,
+            root_kind="plan",
+            phase="primary",
+        ),
+    )
+    authority = Mock()
+    authority.require_operation_binding.return_value = conformance
+    authority.issue_resident_mcp_channel.return_value = channel
+    runner = _SequenceRunner([{"plan": _plan()}])
+    adapter = CodexPlanSkillAdapter(
+        tmp_path / "resident-plan",
+        executable=str(_fake_codex(tmp_path / "resident-codex")),
+        process_runner=runner,
+    )
+    adapter.bind_resident_mcp_authority(authority)
+    adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
+    request = _request(
+        run_ref="plan-run:1",
+        attempt_ref="plan-attempt:1",
+        fence_ref="plan-fence:1",
+        runtime_binding=adapter.runtime_binding(),
+    )
+
+    adapter.generate_draft(request)
+
+    scope = authority.issue_resident_mcp_channel.call_args.kwargs
+    assert scope["root_kind"] == "plan"
+    assert scope["subject_policy"] == "operation_tree"
+    assert scope["operation_ids"] == operation_ids
+    authority.revoke_resident_mcp_channel.assert_called_once_with(channel)
+    assert runner.environments[0] is not None
+    assert runner.environments[0]["META_RESEARCH_MCP_TOKEN"] == "plan-token"
 
 
 def test_production_adapter_derives_answer_contract_hash_after_each_turn(

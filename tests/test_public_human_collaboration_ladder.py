@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 from sqlalchemy import text
 
+from meta_research.companion import CodexCompanionAdapter
 from meta_research.composition import build_production_runtime
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
@@ -20,6 +21,7 @@ from meta_research.owners.human_collaboration_ladder import (
 )
 from meta_research.quest_drafting import (
     CodexDraftingAdapter,
+    DraftingUnavailable,
     HostComputeDevice,
     HostComputeSnapshot,
     IntentTurnRequest,
@@ -30,6 +32,7 @@ from meta_research.runtime_protection import (
     InhibitorLease,
     RuntimeProtectionUnavailable,
 )
+from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 
 
 _QUESTION = {
@@ -72,6 +75,101 @@ class _LifecycleDraftingProvider(_DeterministicDraftingProvider):
 
     def finish_job(self, job_ref: str) -> None:
         self.finished_jobs.append(job_ref)
+
+
+class _CompanionRuntimeBinding:
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_ref": "meta-research/test-companion-runtime-binding/v1",
+            "provider_ref": "test/companion",
+            "provider_version": "1",
+        }
+
+
+class _HumanRequestLifecycleDraftingProvider(_LifecycleDraftingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.owner = None
+        self.human_request: dict[str, object] | None = None
+        self.reconciled_human_request: dict[str, object] | None = None
+
+    def runtime_binding(self) -> _CompanionRuntimeBinding:
+        return _CompanionRuntimeBinding()
+
+    def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
+        self.intent_requests.append(request)
+        assert self.owner is not None
+        scope = request.root_runtime_scope
+        assert scope is not None
+        generation = cast(int, scope["generation"])
+        target = {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": "companion",
+                "run_ref": scope["run_ref"],
+                "attempt_ref": scope["attempt_ref"],
+                "root_session_ref": scope["root_session_ref"],
+                "fence_ref": scope["fence_ref"],
+                "waiter_generation": generation,
+            },
+            "condition": {"operator_choice": "continue_without_optional_input"},
+        }
+        binding = {
+            "quest_ref": scope["quest_ref"],
+            "task_ref": scope["run_ref"],
+            "root_session_ref": scope["root_session_ref"],
+            "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+            "attempt_ref": scope["attempt_ref"],
+            "generation": generation,
+            "request_owner": "agent_runtime",
+            "root_kind": "companion",
+            "phase": "companion-turn",
+            "fence_ref": scope["fence_ref"],
+            "runtime_binding_hash": scope["runtime_binding_hash"],
+        }
+        effect_key = "mcp-effect:" + canonical_hash(
+            {
+                "operation_binding": binding,
+                "effect_id": "companion-needs-operator-choice",
+            }
+        )
+        if self.human_request is None:
+            self.human_request = self.owner.open_human_request_effect(
+                effect_key=effect_key,
+                effect_id="companion-needs-operator-choice",
+                operation_binding=binding,
+                predecessor_request_ref=None,
+                request_kind="offline_action",
+                obligation=(
+                    "Choose whether this exact Companion turn should continue."
+                ),
+                business_purpose=(
+                    "Resume only this exact Quest-bound Companion turn."
+                ),
+                target_assertion=target,
+                acceptance_conditions=(
+                    "The operator records an exact disposition.",
+                ),
+                direct_waiter={
+                    "waiter_ref": f"root_run:{scope['run_ref']}",
+                    "generation": generation,
+                    "target_assertion": target,
+                    "wait_scope": "local",
+                    "other_blockers": [],
+                },
+                quest_ref=cast(str, scope["quest_ref"]),
+            )
+        else:
+            self.reconciled_human_request = (
+                self.owner.reconcile_human_request_effect(effect_key)
+            )
+        return IntentTurnResult(
+            reply=f"assistant:{request.message}",
+            native_session_ref=(
+                request.native_session_ref or "native_companion_session"
+            ),
+            adapter_kind="deterministic_test_adapter",
+        )
 
 
 class _TogglePowerInhibitor:
@@ -169,6 +267,94 @@ class _UnknownOutcomeCompanionJobRunner:
         raise OSError("provider transport ended after submission")
 
 
+class _ResidentHumanRequestCompanionRunner:
+    def __init__(self) -> None:
+        self.harnesses = None
+        self.calls: list[tuple[str, list[str]]] = []
+        self.finished_jobs: list[str] = []
+        self.opened: dict[str, object] | None = None
+        self.reconciled: dict[str, object] | None = None
+
+    def run_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        prompt: str,
+        timeout: float | None,
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        del prompt, timeout
+        assert self.harnesses is not None
+        assert environment is not None
+        token = environment["META_RESEARCH_MCP_TOKEN"]
+        effect_id = "companion-spool-human-request"
+        if self.opened is None:
+            operation_id = ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0]
+            arguments = {
+                "effect_id": effect_id,
+                "request_kind": "offline_action",
+                "obligation": "Choose how this exact Companion turn continues.",
+                "business_purpose": "Resume only this Companion Session.",
+                "condition": {
+                    "impact": "Only this Companion turn is paused.",
+                    "safe_response": "Defer and continue safely.",
+                },
+                "acceptance_conditions": [
+                    "The response is bound to this exact waiter."
+                ],
+            }
+        else:
+            operation_id = ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1]
+            arguments = {"effect_id": effect_id}
+        status, payload = self.harnesses.dispatch_mcp(
+            token,
+            {
+                "jsonrpc": "2.0",
+                "id": len(self.calls) + 1,
+                "method": "tools/call",
+                "params": {"name": operation_id, "arguments": arguments},
+            },
+        )
+        assert status == 200
+        assert payload is not None
+        result = payload["result"]
+        assert result["isError"] is False
+        structured = result["structuredContent"]
+        assert isinstance(structured, dict)
+        if self.opened is None:
+            self.opened = structured
+            reply = "Waiting for the exact human response."
+        else:
+            self.reconciled = structured
+            reply = "Continued after reading the exact human response."
+        self.calls.append((job_ref, list(argv)))
+        output_path = Path(argv[argv.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps({"reply": reply, "agent_proposal": None}),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "native-companion-human-request",
+                }
+            ),
+            stderr="",
+        )
+
+    def finish_job(self, job_ref: str) -> None:
+        self.finished_jobs.append(job_ref)
+
+
+def _fake_codex(path: Path) -> Path:
+    path.write_text("#!/bin/sh\nprintf 'codex-test 1\\n'\n", encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
 def _drafting_spool_files(workspace: Path, name: str) -> list[Path]:
     return [
         *workspace.glob(f"provider-operations/*/drafting/{name}"),
@@ -188,6 +374,56 @@ def _runtime(
         intent_drafting_provider=provider,
         host_compute_probe=_DeterministicProbe(),
         power_inhibitor=power_inhibitor,
+    )
+
+
+def _runtime_with_companion_adapter(
+    path: Path, adapter: CodexCompanionAdapter
+):
+    return build_production_runtime(
+        prepare_data_root(path),
+        proposal_drafter=_DeterministicDraftingProvider(),
+        intent_drafting_provider=adapter,
+        host_compute_probe=_DeterministicProbe(),
+        power_inhibitor=_TogglePowerInhibitor(available=True),
+        startup_power_probe=False,
+        startup_harness_diagnostics=False,
+    )
+
+
+def test_companion_post_invoke_validation_preserves_native_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = CodexCompanionAdapter(
+        tmp_path / "invalid-companion-result",
+        executable=str(_fake_codex(tmp_path / "companion-codex")),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_invoke_optional_root_task_operation",
+        lambda **_kwargs: (
+            {"reply": "", "agent_proposal": None},
+            "native-companion-invalid-result",
+            "",
+        ),
+    )
+
+    with pytest.raises(DraftingUnavailable) as raised:
+        adapter.reply(
+            IntentTurnRequest(
+                initialization_id="quest:companion-invalid-result",
+                draft_revision=0,
+                draft_hash="1" * 64,
+                draft={"interaction_kind": "conversation"},
+                message="Continue after validation.",
+                native_session_ref=None,
+            )
+        )
+
+    assert raised.value.code == "codex_intent_reply_invalid"
+    assert raised.value.native_session_ref == (
+        "native-companion-invalid-result"
     )
 
 
@@ -991,6 +1227,452 @@ def test_companion_terminal_owner_commit_finishes_exact_runtime_responsibility(
         assert receipt.owner_evidence_ref.startswith("companion_terminal_")
     finally:
         runtime.close()
+
+
+def test_quest_bound_companion_turn_yields_and_resumes_through_exact_owner_scope(
+    tmp_path: Path,
+) -> None:
+    provider = _HumanRequestLifecycleDraftingProvider()
+    runtime = _runtime(tmp_path / "companion-root-human-request", provider)
+    human = runtime.owners.human_collaboration
+    owner = runtime.owners.agent_runtime
+    provider.owner = owner
+    try:
+        confirmed = _confirm_direct_quest(runtime)
+        assert human.reconcile_once()
+        creation = human.query_quest_creation(confirmed["initialization_id"])
+        quest_ref = cast(str, creation["quest_ref"])
+        scope_ref = f"quest:{quest_ref}"
+        queued = human.send_companion_message(
+            scope_ref,
+            "Yield this exact Companion turn for one optional human choice.",
+            "companion-root-human-request-message",
+        )
+
+        assert not human.process_drafting_once()
+        [first_request] = provider.intent_requests
+        root_scope = first_request.root_runtime_scope
+        assert root_scope is not None
+        assert set(root_scope) == {
+            "quest_ref",
+            "run_ref",
+            "attempt_ref",
+            "root_session_ref",
+            "fence_ref",
+            "runtime_binding_hash",
+            "generation",
+        }
+        assert root_scope["quest_ref"] == quest_ref
+        assert root_scope["run_ref"] == queued["interaction_ref"]
+        assert root_scope["generation"] == 1
+        suspended = owner.query_managed_run(cast(str, root_scope["run_ref"]))
+        assert suspended is not None and suspended["status"] == "suspended"
+        [waiting] = human.query_companion(scope_ref)["turns"]
+        assert waiting["assistant_status"] == "processing"
+        assert waiting["assistant_content"] is None
+        assert provider.finished_jobs.count(queued["interaction_ref"]) == 1
+
+        assert provider.human_request is not None
+        request_ref = cast(str, provider.human_request["request_ref"])
+        human.respond_to_human_request(
+            request_ref,
+            decision="deferred",
+            facts={},
+            note="Continue without the optional input.",
+            idempotency_key="companion-root-human-request-response",
+        )
+        resumed = owner.query_managed_run(cast(str, root_scope["run_ref"]))
+        assert resumed is not None and resumed["status"] == "running"
+
+        assert human.process_drafting_once()
+        assert len(provider.intent_requests) == 2
+        assert provider.intent_requests[1].native_session_ref == (
+            "native_companion_session"
+        )
+        assert provider.intent_requests[1].job_ref != first_request.job_ref
+        assert provider.intent_requests[1].draft["human_request_resume"][
+            "status"
+        ] == "response_committed"
+        assert provider.intent_requests[1].root_runtime_scope == root_scope
+        assert provider.reconciled_human_request is not None
+        assert provider.reconciled_human_request["responses"][-1][
+            "decision"
+        ] == "deferred"
+        requests = owner.query_human_requests(quest_ref=quest_ref)
+        assert [item["request_ref"] for item in requests] == [request_ref]
+        settled = owner.query_managed_run(cast(str, root_scope["run_ref"]))
+        assert settled is not None and settled["status"] == "completed"
+        replay = owner.complete_external_root_task_scope(
+            root_kind="companion",
+            root_runtime_scope=root_scope,
+        )
+        assert replay["status"] == "completed"
+        assert replay["root_runtime_scope"] == root_scope
+        [completed] = human.query_companion(scope_ref)["turns"]
+        assert completed["assistant_status"] == "completed"
+        assert provider.finished_jobs.count(queued["interaction_ref"]) == 1
+        assert provider.finished_jobs.count(
+            cast(str, provider.intent_requests[1].job_ref)
+        ) == 1
+    finally:
+        runtime.close()
+
+
+def test_quest_bound_request_context_preserves_companion_root_scope(
+    tmp_path: Path,
+) -> None:
+    provider = _HumanRequestLifecycleDraftingProvider()
+    runtime = _runtime(tmp_path / "companion-request-root-scope", provider)
+    human = runtime.owners.human_collaboration
+    owner = runtime.owners.agent_runtime
+    provider.owner = owner
+    try:
+        confirmed = _confirm_direct_quest(runtime)
+        assert human.reconcile_once()
+        creation = human.query_quest_creation(confirmed["initialization_id"])
+        quest_ref = cast(str, creation["quest_ref"])
+        request = owner.open_human_request(
+            request_kind="offline_action",
+            obligation="Review the exact Quest-bound operator choice.",
+            business_purpose="Keep the related Companion turn in this Quest.",
+            target_assertion={"quest_ref": quest_ref},
+            acceptance_conditions=("The operator records a decision.",),
+            direct_waiter={
+                "waiter_ref": "companion_request_context_waiter",
+                "generation": 1,
+                "target_assertion": {"quest_ref": quest_ref},
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            idempotency_key="companion-request-root-scope-open",
+            quest_ref=quest_ref,
+        )
+        queued = human.send_companion_message(
+            cast(str, request["request_ref"]),
+            "Help me evaluate this exact request.",
+            "companion-request-root-scope-message",
+        )
+
+        assert not human.process_drafting_once()
+        [first_request] = provider.intent_requests
+        assert first_request.draft["current_context"]["quest_ref"] == quest_ref
+        root_scope = first_request.root_runtime_scope
+        assert root_scope is not None
+        assert root_scope["quest_ref"] == quest_ref
+        assert root_scope["run_ref"] == queued["interaction_ref"]
+
+        assert provider.human_request is not None
+        human.respond_to_human_request(
+            cast(str, provider.human_request["request_ref"]),
+            decision="deferred",
+            facts={},
+            note="Continue after reviewing the request context.",
+            idempotency_key="companion-request-root-scope-response",
+        )
+        assert human.process_drafting_once()
+        assert len(provider.intent_requests) == 2
+        assert provider.intent_requests[1].root_runtime_scope == root_scope
+        assert provider.intent_requests[1].native_session_ref == (
+            "native_companion_session"
+        )
+    finally:
+        runtime.close()
+
+
+def test_companion_completion_recovery_finishes_the_continuation_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_path = tmp_path / "companion-continuation-completion-crash"
+    provider = _HumanRequestLifecycleDraftingProvider()
+    runtime = _runtime(data_path, provider)
+    human = runtime.owners.human_collaboration
+    owner = runtime.owners.agent_runtime
+    provider.owner = owner
+    try:
+        confirmed = _confirm_direct_quest(runtime)
+        assert human.reconcile_once()
+        creation = human.query_quest_creation(confirmed["initialization_id"])
+        scope_ref = f"quest:{cast(str, creation['quest_ref'])}"
+        queued = human.send_companion_message(
+            scope_ref,
+            "Keep this continuation across the completion crash.",
+            "companion-continuation-completion-crash-message",
+        )
+        assert not human.process_drafting_once()
+        assert provider.human_request is not None
+        human.respond_to_human_request(
+            cast(str, provider.human_request["request_ref"]),
+            decision="deferred",
+            facts={},
+            note="Continue after the exact response.",
+            idempotency_key="companion-continuation-completion-response",
+        )
+
+        def _crash_before_scope_completion(**_kwargs: object) -> object:
+            raise RuntimeError("simulated continuation completion crash")
+
+        monkeypatch.setattr(
+            owner,
+            "complete_external_root_task_scope",
+            _crash_before_scope_completion,
+        )
+        with pytest.raises(
+            RuntimeError, match="simulated continuation completion crash"
+        ):
+            human.process_drafting_once()
+        continuation_job_ref = cast(str, provider.intent_requests[1].job_ref)
+        assert continuation_job_ref.startswith("companion_continuation_")
+        assert provider.finished_jobs[-1] == queued["interaction_ref"]
+        assert continuation_job_ref not in provider.finished_jobs
+    finally:
+        runtime.close()
+
+    recovered_provider = _LifecycleDraftingProvider()
+    restarted = _runtime(data_path, recovered_provider)
+    try:
+        assert restarted.owners.human_collaboration.process_drafting_once()
+        assert recovered_provider.intent_requests == []
+        assert recovered_provider.finished_jobs == [continuation_job_ref]
+        assert not restarted.owners.human_collaboration.process_drafting_once()
+    finally:
+        restarted.close()
+
+
+def test_codex_companion_resumes_human_request_in_one_new_durable_operation(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "companion-codex-human-request-data"
+    provider_workspace = tmp_path / "companion-codex-human-request-provider"
+    executable = str(_fake_codex(tmp_path / "companion-codex"))
+    runner = _ResidentHumanRequestCompanionRunner()
+    first_adapter = CodexCompanionAdapter(
+        provider_workspace,
+        executable=executable,
+        process_runner=runner,  # type: ignore[arg-type]
+    )
+    runtime = _runtime_with_companion_adapter(data_path, first_adapter)
+    runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
+    runner.harnesses = runtime.harnesses
+    human = runtime.owners.human_collaboration
+    try:
+        confirmed = _confirm_direct_quest(runtime)
+        assert human.reconcile_once()
+        creation = human.query_quest_creation(confirmed["initialization_id"])
+        quest_ref = cast(str, creation["quest_ref"])
+        scope_ref = f"quest:{quest_ref}"
+        queued = human.send_companion_message(
+            scope_ref,
+            "Pause once, then continue in this exact Companion Session.",
+            "companion-codex-human-request-message",
+        )
+
+        assert not human.process_drafting_once()
+        assert runner.opened is not None
+        assert len(runner.calls) == 1
+        first_job_ref, first_argv = runner.calls[0]
+        assert first_job_ref == queued["interaction_ref"]
+        assert "resume" not in first_argv
+        [waiting] = human.query_companion(scope_ref)["turns"]
+        assert waiting["assistant_status"] == "processing"
+        assert waiting["assistant_content"] is None
+        request_ref = cast(str, runner.opened["request_ref"])
+        human.respond_to_human_request(
+            request_ref,
+            decision="deferred",
+            facts={"safe_route": "continue_without_optional_input"},
+            note="Continue in the same Companion Session.",
+            idempotency_key="companion-codex-human-request-response",
+        )
+        assert human.process_drafting_once()
+        assert len(runner.calls) == 2
+        continuation_job_ref, continuation_argv = runner.calls[1]
+        assert continuation_job_ref != first_job_ref
+        assert continuation_job_ref.startswith("companion_continuation_")
+        resume_index = continuation_argv.index("resume")
+        assert continuation_argv[resume_index + 1] == (
+            "native-companion-human-request"
+        )
+        assert runner.reconciled is not None
+        resolution = runner.reconciled["resolution"]
+        assert isinstance(resolution, dict)
+        assert isinstance(resolution["response_ref"], str)
+        assert {
+            key: value
+            for key, value in resolution.items()
+            if key != "response_ref"
+        } == {
+            "decision": "deferred",
+            "facts": {"safe_route": "continue_without_optional_input"},
+            "note": "Continue in the same Companion Session.",
+            "disposition": "unsatisfied",
+            "reason_code": "human_deferred_exact_obligation",
+            "accepted_evidence_refs": [],
+        }
+        [completed] = human.query_companion(scope_ref)["turns"]
+        assert completed["assistant_status"] == "completed"
+        assert completed["assistant_content"] == (
+            "Continued after reading the exact human response."
+        )
+        assert runner.finished_jobs == [first_job_ref, continuation_job_ref]
+        assert not human.process_drafting_once()
+        assert len(runner.calls) == 2
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("scope_committed_before_crash", [True, False])
+def test_quest_bound_companion_completion_crash_does_not_repeat_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope_committed_before_crash: bool,
+) -> None:
+    data_path = tmp_path / (
+        "companion-root-completion-crash-"
+        f"{scope_committed_before_crash}"
+    )
+    first_provider = _LifecycleDraftingProvider()
+    monkeypatch.setattr(
+        first_provider,
+        "runtime_binding",
+        lambda: _CompanionRuntimeBinding(),
+        raising=False,
+    )
+    runtime = _runtime(data_path, first_provider)
+    human = runtime.owners.human_collaboration
+    owner = runtime.owners.agent_runtime
+    try:
+        confirmed = _confirm_direct_quest(runtime)
+        assert human.reconcile_once()
+        creation = human.query_quest_creation(confirmed["initialization_id"])
+        quest_ref = cast(str, creation["quest_ref"])
+        scope_ref = f"quest:{quest_ref}"
+        queued = human.send_companion_message(
+            scope_ref,
+            "Keep this exact Companion result across a completion crash.",
+            "companion-root-completion-crash-message",
+        )
+        complete_scope = owner.complete_external_root_task_scope
+
+        def complete_scope_then_crash(*, root_kind, root_runtime_scope):
+            if scope_committed_before_crash:
+                complete_scope(
+                    root_kind=root_kind,
+                    root_runtime_scope=root_runtime_scope,
+                )
+            raise RuntimeError("simulated crash after Companion scope completion")
+
+        monkeypatch.setattr(
+            owner,
+            "complete_external_root_task_scope",
+            complete_scope_then_crash,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="simulated crash after Companion scope completion",
+        ):
+            human.process_drafting_once()
+        assert len(first_provider.intent_requests) == 1
+        assert first_provider.intent_requests[0].job_ref == queued["interaction_ref"]
+    finally:
+        runtime.close()
+
+    restarted_provider = _LifecycleDraftingProvider()
+    monkeypatch.setattr(
+        restarted_provider,
+        "runtime_binding",
+        lambda: _CompanionRuntimeBinding(),
+        raising=False,
+    )
+    restarted = _runtime(data_path, restarted_provider)
+    try:
+        human = restarted.owners.human_collaboration
+        [completed] = human.query_companion(scope_ref)["turns"]
+        assert completed["interaction_ref"] == queued["interaction_ref"]
+        assert completed["assistant_status"] == "completed"
+        assert completed["assistant_content"] == (
+            "assistant:Keep this exact Companion result across a completion crash."
+        )
+        assert human.process_drafting_once() is (
+            not scope_committed_before_crash
+        )
+        assert not human.process_drafting_once()
+        assert restarted_provider.intent_requests == []
+        managed = restarted.owners.agent_runtime.query_managed_run(
+            queued["interaction_ref"]
+        )
+        assert managed is not None and managed["status"] == "completed"
+        assert restarted.query_runtime_observability()["responsibilities"] == []
+    finally:
+        restarted.close()
+
+
+def test_companion_deferred_response_recovers_issuing_owner_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_path = tmp_path / "companion-root-response-crash-recovery"
+    provider = _HumanRequestLifecycleDraftingProvider()
+    runtime = _runtime(data_path, provider)
+    human = runtime.owners.human_collaboration
+    owner = runtime.owners.agent_runtime
+    provider.owner = owner
+    try:
+        confirmed = _confirm_direct_quest(runtime)
+        assert human.reconcile_once()
+        creation = human.query_quest_creation(confirmed["initialization_id"])
+        quest_ref = cast(str, creation["quest_ref"])
+        scope_ref = f"quest:{quest_ref}"
+        human.send_companion_message(
+            scope_ref,
+            "Yield this Companion turn across one response ACK-loss window.",
+            "companion-root-response-crash-message",
+        )
+
+        assert not human.process_drafting_once()
+        [first_request] = provider.intent_requests
+        root_scope = first_request.root_runtime_scope
+        assert root_scope is not None
+        assert provider.human_request is not None
+        request_ref = cast(str, provider.human_request["request_ref"])
+
+        monkeypatch.setattr(
+            human,
+            "_reconcile_issuing_owner_human_request",
+            lambda _request_ref: None,
+        )
+        response = human.respond_to_human_request(
+            request_ref,
+            decision="deferred",
+            facts={},
+            note="Continue without the optional input after restart.",
+            idempotency_key="companion-root-response-crash-response",
+        )
+        persisted = owner.query_human_request(request_ref)
+        assert persisted is not None and persisted["status"] == "open"
+        assert [item["response_ref"] for item in persisted["responses"]] == [
+            response["response_ref"]
+        ]
+        suspended = owner.query_managed_run(cast(str, root_scope["run_ref"]))
+        assert suspended is not None and suspended["status"] == "suspended"
+    finally:
+        runtime.close()
+
+    recovered_provider = _HumanRequestLifecycleDraftingProvider()
+    restarted = _runtime(data_path, recovered_provider)
+    recovered_provider.owner = restarted.owners.agent_runtime
+    try:
+        recovered = restarted.owners.agent_runtime.query_human_request(
+            request_ref
+        )
+        assert recovered is not None and recovered["status"] == "unsatisfied"
+        [waiter] = recovered["direct_waiters"]
+        assert waiter["status"] == "consumed"
+        managed = restarted.owners.agent_runtime.query_managed_run(
+            cast(str, root_scope["run_ref"])
+        )
+        assert managed is not None and managed["status"] == "running"
+    finally:
+        restarted.close()
 
 
 def test_companion_acquire_failure_is_terminal_no_effect_with_provider_zero_call(

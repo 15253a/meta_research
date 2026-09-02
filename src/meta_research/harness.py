@@ -31,6 +31,7 @@ from meta_research.owners.agent_runtime_harness import (
     AgentRuntimeHarnessRetryLater,
     AgentRuntimeHarnessRun,
     AgentRuntimeTargetChildSession,
+    TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE,
     TargetRootCompletionEvidence,
     TargetRootObservationPage,
     target_provider_ceiling_recovery_ref,
@@ -46,7 +47,11 @@ from meta_research.runtime_protection import (
     RuntimeProtection,
     RuntimeProtectionUnavailable,
 )
-from meta_research.root_capabilities import root_capability_profile
+from meta_research.root_capabilities import (
+    ROOT_AGENT_KINDS,
+    RootAgentKind,
+    root_capability_profile,
+)
 from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticRecorder,
     root_operation_diagnostic_ref,
@@ -61,6 +66,7 @@ from meta_research.semantic_mcp import (
 from meta_research.semantic_owner_gateway import (
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
     REASONING_ROOT_SEMANTIC_OPERATION_IDS,
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
     TARGET_ROOT_SEMANTIC_OPERATION_IDS,
 )
 from meta_research.target_raw_output import (
@@ -193,6 +199,14 @@ Perform one bounded shell operation and one Semantic MCP
 research_graph.snapshot.read call, then return normally with streamed provider
 evidence. Do not start a replacement Session and do not self-report capability.
 """
+_TARGET_ROOT_HUMAN_REQUEST_CONTINUATION = """\
+
+An exact HumanRequest waiter for this Target root has been released. Continue
+in this same native Session. First call human_request.open.reconcile for the
+existing effect and read its persisted resolution; then decide whether that
+response is sufficient for the blocked work. Do not replace the Session or
+open a successor request unless the persisted resolution is insufficient.
+"""
 
 
 class HarnessAdmissionError(RuntimeError):
@@ -203,9 +217,10 @@ class HarnessAdmissionError(RuntimeError):
 
 
 class ResidentMcpScopeVerifier(Protocol):
-    def verify_bundle_runtime_scope(
+    def verify_root_agent_runtime_scope(
         self,
         *,
+        root_kind: RootAgentKind,
         run_ref: str,
         attempt_ref: str,
         root_session_ref: str,
@@ -213,9 +228,10 @@ class ResidentMcpScopeVerifier(Protocol):
         runtime_binding_hash: str,
     ) -> None: ...
 
-    def verify_reasoning_runtime_scope(
+    def verify_root_agent_human_request_reconcile_scope(
         self,
         *,
+        root_kind: RootAgentKind,
         run_ref: str,
         attempt_ref: str,
         root_session_ref: str,
@@ -359,7 +375,7 @@ class _ResidentMcpScope:
     fence_ref: str
     capability_binding_hash: str
     operation_ids: tuple[str, ...]
-    root_kind: Literal["bundle", "reasoning"]
+    root_kind: RootAgentKind
     phase: str
     subject_policy: Literal["operation_tree", "review_tree"]
 
@@ -715,7 +731,7 @@ class HarnessRuntime:
             self._finish_runtime_effect(
                 effect,
                 outcome_code=(
-                    "executed"
+                    (operation.outcome_code or "executed")
                     if operation.status == "executed"
                     else operation.outcome_code or "harness_operation_failed"
                 ),
@@ -758,7 +774,7 @@ class HarnessRuntime:
         fence_ref: str,
         capability_binding_hash: str,
         operation_ids: tuple[str, ...],
-        root_kind: Literal["bundle", "reasoning"],
+        root_kind: RootAgentKind,
         phase: str,
         subject_policy: Literal["operation_tree", "review_tree"],
     ) -> ResidentMcpChannel:
@@ -773,14 +789,11 @@ class HarnessRuntime:
         verifier = self._resident_scope_verifier
         if verifier is None:
             raise HarnessAdmissionError("mcp_scope_verifier_unavailable")
-        expected_operation_ids = (
-            REASONING_ROOT_SEMANTIC_OPERATION_IDS
-            if root_kind == "reasoning"
-            else BUNDLE_ROOT_SEMANTIC_OPERATION_IDS
-        )
+        if root_kind not in ROOT_AGENT_KINDS:
+            raise HarnessAdmissionError("mcp_channel_scope_invalid")
+        expected_operation_ids = ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind]
         if (
-            root_kind not in {"bundle", "reasoning"}
-            or not isinstance(phase, str)
+            not isinstance(phase, str)
             or not phase
             or len(phase) > 128
             or subject_policy not in {"operation_tree", "review_tree"}
@@ -802,12 +815,8 @@ class HarnessRuntime:
         ):
             raise HarnessAdmissionError("mcp_channel_scope_invalid")
         try:
-            verify_scope = (
-                verifier.verify_reasoning_runtime_scope
-                if root_kind == "reasoning"
-                else verifier.verify_bundle_runtime_scope
-            )
-            verify_scope(
+            verifier.verify_root_agent_runtime_scope(
+                root_kind=root_kind,
                 run_ref=run_ref,
                 attempt_ref=attempt_ref,
                 root_session_ref=root_session_ref,
@@ -815,8 +824,32 @@ class HarnessRuntime:
                 runtime_binding_hash=capability_binding_hash,
             )
         except Exception as error:
-            code = getattr(error, "code", "mcp_channel_scope_invalid")
-            raise HarnessAdmissionError(str(code)) from error
+            reconcile_verifier = getattr(
+                verifier,
+                "verify_root_agent_human_request_reconcile_scope",
+                None,
+            )
+            if subject_policy != "operation_tree" or not callable(
+                reconcile_verifier
+            ):
+                code = getattr(error, "code", "mcp_channel_scope_invalid")
+                raise HarnessAdmissionError(str(code)) from error
+            try:
+                reconcile_verifier(
+                    root_kind=root_kind,
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    root_session_ref=root_session_ref,
+                    fence_ref=fence_ref,
+                    runtime_binding_hash=capability_binding_hash,
+                )
+            except Exception as reconcile_error:
+                code = getattr(
+                    reconcile_error,
+                    "code",
+                    "mcp_channel_scope_invalid",
+                )
+                raise HarnessAdmissionError(str(code)) from reconcile_error
         try:
             connection, binding = self._gateway.issue_channel(
                 run_ref=run_ref,
@@ -825,6 +858,8 @@ class HarnessRuntime:
                 fence_ref=fence_ref,
                 capability_binding_hash=capability_binding_hash,
                 operation_ids=operation_ids,
+                root_kind=root_kind,
+                phase=phase,
             )
         except SemanticMcpError as error:
             raise HarnessAdmissionError(error.code) from error
@@ -1168,6 +1203,18 @@ class HarnessRuntime:
                 fence_ref=reserved.fence_ref,
                 capability_binding_hash=capability_binding_hash,
                 operation_ids=request.required_operation_ids,
+                root_kind=(
+                    "target" if isinstance(request, TargetHarnessRequest) else None
+                ),
+                phase=(
+                    TARGET_ROOT_LIFECYCLE_PHASE
+                    if isinstance(request, TargetHarnessRequest)
+                    else (
+                        "full_conformance"
+                        if isinstance(request, ConformanceHarnessRequest)
+                        else "harness_probe"
+                    )
+                ),
             )
         except SemanticMcpError as error:
             retry = self._owner.fail_admission(reserved.run_ref, error.code)
@@ -1281,6 +1328,18 @@ class HarnessRuntime:
                 fence_ref=record.fence_ref,
                 capability_binding_hash=record.capability_binding_hash,
                 operation_ids=request.required_operation_ids,
+                root_kind=(
+                    "target" if isinstance(request, TargetHarnessRequest) else None
+                ),
+                phase=(
+                    TARGET_ROOT_LIFECYCLE_PHASE
+                    if isinstance(request, TargetHarnessRequest)
+                    else (
+                        "full_conformance"
+                        if isinstance(request, ConformanceHarnessRequest)
+                        else "harness_probe"
+                    )
+                ),
             )
         except SemanticMcpError as error:
             raise HarnessAdmissionError(error.code) from error
@@ -1377,19 +1436,42 @@ class HarnessRuntime:
         if record is None:
             raise HarnessAdmissionError("target_harness_run_not_found")
 
+        human_request_continuation = False
         if record.status == "running":
-            if operation is None or operation.status != "unknown_outcome":
-                raise HarnessAdmissionError("target_root_lifecycle_unavailable")
-            return self._reconcile_probe_turn(
-                request_ref,
-                prompt=prompt,
-                mcp_base_url=mcp_base_url,
-                required_capabilities=_target_root_lifecycle_capabilities(
-                    resume=record.native_session_ref is not None
-                ),
+            continuation_generation = (
+                self._target_root_human_request_continuation_generation(
+                    record.run_ref
+                )
             )
-
-        if record.status in {"admitting", "admitted"}:
+            if (
+                operation is not None
+                and operation.status == "executed"
+                and operation.outcome_code
+                == TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE
+                and continuation_generation == operation.generation + 1
+            ):
+                human_request_continuation = True
+                resume = True
+            elif operation is None or operation.status != "unknown_outcome":
+                raise HarnessAdmissionError("target_root_lifecycle_unavailable")
+            else:
+                human_request_continuation = (
+                    continuation_generation == operation.generation
+                )
+                return self._reconcile_probe_turn(
+                    request_ref,
+                    prompt=(
+                        _target_root_human_request_continuation_prompt(prompt)
+                        if human_request_continuation
+                        else prompt
+                    ),
+                    mcp_base_url=mcp_base_url,
+                    required_capabilities=_target_root_lifecycle_capabilities(
+                        resume=record.native_session_ref is not None
+                    ),
+                    human_request_continuation=human_request_continuation,
+                )
+        elif record.status in {"admitting", "admitted"}:
             resume = False
         elif record.status == "executed":
             resume = True
@@ -1402,19 +1484,29 @@ class HarnessRuntime:
         try:
             return self._execute_probe_turn(
                 request_ref,
-                prompt=prompt,
+                prompt=(
+                    _target_root_human_request_continuation_prompt(prompt)
+                    if human_request_continuation
+                    else prompt
+                ),
                 mcp_base_url=mcp_base_url,
                 resume=resume,
                 required_capabilities=required_capabilities,
+                human_request_continuation=human_request_continuation,
             )
         except HarnessAdmissionError as error:
             if error.code != "provider_outcome_unknown":
                 raise
         return self._reconcile_probe_turn(
             request_ref,
-            prompt=prompt,
+            prompt=(
+                _target_root_human_request_continuation_prompt(prompt)
+                if human_request_continuation
+                else prompt
+            ),
             mcp_base_url=mcp_base_url,
             required_capabilities=required_capabilities,
+            human_request_continuation=human_request_continuation,
         )
 
     def recover_failed_target_root(self, request_ref: str) -> HarnessAdmission:
@@ -1904,6 +1996,7 @@ class HarnessRuntime:
         mcp_base_url: str,
         resume: bool,
         required_capabilities: tuple[str, ...] | None = None,
+        human_request_continuation: bool = False,
     ) -> HarnessProbeRun:
         if (
             not prompt
@@ -1913,11 +2006,14 @@ class HarnessRuntime:
         ):
             raise HarnessAdmissionError("harness_probe_execution_invalid")
         admission = self._admissions_by_request.get(request_ref)
-        if admission is None:
+        if admission is None or human_request_continuation:
             admission = self.resume_probe(request_ref)
         if resume:
+            expected_status = (
+                "running" if human_request_continuation else "executed"
+            )
             if (
-                admission.run.status != "executed"
+                admission.run.status != expected_status
                 or admission.run.native_session_ref is None
             ):
                 raise HarnessAdmissionError("native_session_resume_unavailable")
@@ -1972,6 +2068,7 @@ class HarnessRuntime:
             required_capabilities=required_capabilities,
             workspace_ref=workspace_ref,
             working_directory=working_directory,
+            human_request_continuation=human_request_continuation,
         )
 
     def reconcile_probe_turn(
@@ -2010,6 +2107,7 @@ class HarnessRuntime:
         prompt: str,
         mcp_base_url: str,
         required_capabilities: tuple[str, ...] | None,
+        human_request_continuation: bool = False,
     ) -> HarnessProbeRun:
         if (
             not prompt
@@ -2065,6 +2163,7 @@ class HarnessRuntime:
             required_capabilities=required_capabilities,
             workspace_ref=workspace_ref,
             working_directory=working_directory,
+            human_request_continuation=human_request_continuation,
         )
 
     def _invoke_provider_turn(
@@ -2081,6 +2180,7 @@ class HarnessRuntime:
         required_capabilities: tuple[str, ...] | None = None,
         workspace_ref: str | None = None,
         working_directory: Path | None = None,
+        human_request_continuation: bool = False,
     ) -> HarnessProbeRun:
         adapter = self._adapters[request.harness_family]
         entry_path = (
@@ -2175,6 +2275,40 @@ class HarnessRuntime:
                 )
             )
         except HarnessAdapterUnavailable as error:
+            parked = (
+                self._checkpoint_target_root_human_request_session(
+                    admission,
+                    operation_ref=operation_ref,
+                    native_session_ref=error.native_session_ref,
+                )
+                if isinstance(request, TargetHarnessRequest)
+                and error.native_session_ref is not None
+                and error.code not in _PROVIDER_CEILING_CODES
+                else None
+            )
+            if parked is not None:
+                if self._runtime_protection is not None:
+                    self._finish_runtime_effect(
+                        protection_effect,
+                        outcome_code=TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE,
+                        native_session_ref=parked.native_session_ref,
+                        predecessor_effects=predecessor_effects,
+                    )
+                raise HarnessAdmissionError("runtime_run_suspended") from error
+            if (
+                isinstance(request, TargetHarnessRequest)
+                and error.native_session_ref is None
+                and error.code not in _PROVIDER_CEILING_CODES
+                and self._target_root_operation_is_suspended(
+                    admission,
+                    operation_ref=operation_ref,
+                )
+            ):
+                # Without a verified provider Session there is nothing safe to
+                # checkpoint or resume.  Keep the exact HumanRequest wait as
+                # the Owner fact instead of rewriting it into a provider
+                # failure.
+                raise HarnessAdmissionError("runtime_run_suspended") from error
             code = error.code
             terminal_ceiling = (
                 error.durable_outcome == "terminal"
@@ -2233,6 +2367,21 @@ class HarnessRuntime:
                     None if retry is None else retry.next_retry_at
                 ),
             ) from error
+        if isinstance(request, TargetHarnessRequest):
+            parked = self._checkpoint_target_root_human_request_session(
+                admission,
+                operation_ref=operation_ref,
+                native_session_ref=result.native_session_ref,
+            )
+            if parked is not None:
+                if self._runtime_protection is not None:
+                    self._finish_runtime_effect(
+                        protection_effect,
+                        outcome_code=TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE,
+                        native_session_ref=parked.native_session_ref,
+                        predecessor_effects=predecessor_effects,
+                    )
+                raise HarnessAdmissionError("runtime_run_suspended")
         subagent_evidence = [
             {**item, "provider_operation_ref": operation_ref}
             for item in result.profile.get("subagent_evidence", [])
@@ -2335,6 +2484,7 @@ class HarnessRuntime:
             turn_profile,
             operation_ref=operation_ref,
             resumed=resume,
+            allow_unprofiled_resume=human_request_continuation,
         )
         if isinstance(request, TargetHarnessRequest):
             diagnostics = result.profile.get("root_capability_diagnostics")
@@ -2852,12 +3002,8 @@ class HarnessRuntime:
                 current = False
             else:
                 try:
-                    verify_scope = (
-                        verifier.verify_reasoning_runtime_scope
-                        if resident_scope.root_kind == "reasoning"
-                        else verifier.verify_bundle_runtime_scope
-                    )
-                    verify_scope(
+                    verifier.verify_root_agent_runtime_scope(
+                        root_kind=resident_scope.root_kind,
                         run_ref=resident_scope.run_ref,
                         attempt_ref=resident_scope.attempt_ref,
                         root_session_ref=resident_scope.root_session_ref,
@@ -2871,8 +3017,36 @@ class HarnessRuntime:
                 else:
                     current = True
             if not current:
-                self._gateway.revoke_channel(token)
-                self._resident_channel_scopes.pop(token_hash, None)
+                if _resident_reconcile_dispatch_allowed(message):
+                    reconcile_verifier = getattr(
+                        verifier,
+                        "verify_root_agent_human_request_reconcile_scope",
+                        None,
+                    )
+                    if callable(reconcile_verifier):
+                        try:
+                            reconcile_verifier(
+                                root_kind=resident_scope.root_kind,
+                                run_ref=resident_scope.run_ref,
+                                attempt_ref=resident_scope.attempt_ref,
+                                root_session_ref=(
+                                    resident_scope.root_session_ref
+                                ),
+                                fence_ref=resident_scope.fence_ref,
+                                runtime_binding_hash=(
+                                    resident_scope.capability_binding_hash
+                                ),
+                            )
+                        except Exception:
+                            current = False
+                        else:
+                            current = True
+                    if not current:
+                        self._gateway.revoke_channel(token)
+                        self._resident_channel_scopes.pop(token_hash, None)
+                # A suspended task may only reconcile its exact open effect or
+                # complete MCP connection/discovery. Other tools are denied,
+                # but retaining the bearer lets the resumed task continue.
         if not current:
             return 401, {
                 "error": {
@@ -3069,6 +3243,21 @@ class HarnessRuntime:
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error
 
+    def _target_root_human_request_continuation_generation(
+        self, run_ref: str
+    ) -> int | None:
+        query = getattr(
+            self._owner,
+            "target_root_human_request_continuation_generation",
+            None,
+        )
+        if not callable(query):
+            return None
+        try:
+            return query(run_ref)
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+
     def _profile_for_run(self, run_ref: str) -> dict[str, object] | None:
         try:
             return self._owner.query_profile(run_ref)
@@ -3220,6 +3409,72 @@ class HarnessRuntime:
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error
 
+    def _checkpoint_target_root_human_request_session(
+        self,
+        admission: HarnessAdmission,
+        *,
+        operation_ref: str,
+        native_session_ref: str,
+    ) -> HarnessProbeRun | None:
+        checkpoint = getattr(
+            self._owner,
+            "checkpoint_target_root_human_request_session",
+            None,
+        )
+        if not callable(checkpoint):
+            return None
+        try:
+            record = checkpoint(
+                operation_ref=operation_ref,
+                run_ref=admission.run.run_ref,
+                native_session_ref=native_session_ref,
+            )
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+        if record is None:
+            return None
+        run = _probe_run_from_owner(record, admission.run.mcp_binding)
+        checkpointed = HarnessAdmission(
+            run=run,
+            connection=admission.connection,
+        )
+        self._admissions_by_request[record.request_ref] = checkpointed
+        self._admissions[record.idempotency_key] = (
+            record.request_hash,
+            checkpointed,
+        )
+        reconcile_waiting_responses = getattr(
+            self._resident_scope_verifier,
+            "recover_root_human_requests",
+            None,
+        )
+        if callable(reconcile_waiting_responses):
+            reconcile_waiting_responses()
+        return run
+
+    def _target_root_operation_is_suspended(
+        self,
+        admission: HarnessAdmission,
+        *,
+        operation_ref: str,
+    ) -> bool:
+        try:
+            record = self._owner.query_run(admission.run.request_ref)
+            operation = self._owner.latest_operation(admission.run.run_ref)
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+        return (
+            record is not None
+            and record.run_ref == admission.run.run_ref
+            and record.attempt_ref == admission.run.attempt_ref
+            and record.root_session_ref == admission.run.root_session_ref
+            and record.fence_ref == admission.run.fence_ref
+            and record.status == "suspended"
+            and operation is not None
+            and operation.operation_ref == operation_ref
+            and operation.status == "running"
+        )
+
     def _request_for_run(self, run_ref: str) -> HarnessProbeRequest:
         try:
             value = self._owner.query_request(run_ref)
@@ -3307,12 +3562,13 @@ def _merge_capability_profiles(
     *,
     operation_ref: str,
     resumed: bool,
+    allow_unprofiled_resume: bool = False,
 ) -> dict[str, object]:
     current_capabilities = current.get("capabilities")
     if not isinstance(current_capabilities, dict):
         raise HarnessAdmissionError("harness_profile_invalid")
     if previous is None:
-        if resumed:
+        if resumed and not allow_unprofiled_resume:
             raise HarnessAdmissionError("native_session_resume_unavailable")
         return current
 
@@ -3523,6 +3779,25 @@ def _channel_scope(
     }
 
 
+def _resident_reconcile_dispatch_allowed(message: object) -> bool:
+    if not isinstance(message, dict):
+        return False
+    method = message.get("method")
+    if method in {
+        "initialize",
+        "notifications/initialized",
+        "ping",
+        "tools/list",
+    }:
+        return True
+    params = message.get("params")
+    return (
+        method == "tools/call"
+        and isinstance(params, dict)
+        and params.get("name") == "human_request.open.reconcile"
+    )
+
+
 def _token_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -3590,6 +3865,10 @@ def _target_root_lifecycle_capabilities(*, resume: bool) -> tuple[str, ...]:
         "native_session",
     )
     return (*required, "resume") if resume else required
+
+
+def _target_root_human_request_continuation_prompt(prompt: str) -> str:
+    return prompt.rstrip() + _TARGET_ROOT_HUMAN_REQUEST_CONTINUATION
 
 
 def _capability_is_available(

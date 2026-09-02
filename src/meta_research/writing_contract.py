@@ -77,13 +77,19 @@ _WRITING_SAFE_CAPABILITIES = {
     "global-config-ignored",
     "user-config-loaded",
     "harness-child-agent-review",
+    "harness-operation-binding-v1",
     "mcp-config-empty",
     "native-session-resume",
+    "semantic-mcp-resident",
     "shell-tool-enabled",
     "structured-output-json-schema",
     "trusted-local-quest-authorization",
     "external-research-disabled",
 }
+_WRITING_SAFE_MCP_PREFIXES = (
+    "harness-operation-binding:semantic-mcp-catalog@sha256:",
+    "harness-operation-binding:semantic-mcp-operation-bindings@sha256:",
+)
 _WRITING_SAFE_RESOURCE_PREFIXES = (
     "adapter-source:",
     "codex-config:",
@@ -279,7 +285,10 @@ class WritingRuntimeBinding:
             ):
                 raise OwnerConflict("writing_runtime_binding_invalid")
         if (
-            self.mcp_bindings
+            any(
+                not value.startswith(_WRITING_SAFE_MCP_PREFIXES)
+                for value in self.mcp_bindings
+            )
             or any(
                 value
                 not in (

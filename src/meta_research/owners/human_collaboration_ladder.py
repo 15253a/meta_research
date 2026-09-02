@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Callable, cast
+from typing import Callable, Protocol, cast
 
 from sqlalchemy import text
 
@@ -90,10 +90,39 @@ _HARD_COMMAND_KINDS = {
 _MAX_PENDING_COMPANION_TURNS = 64
 
 
+class ExternalRootTaskScopeOwner(Protocol):
+    def register_external_root_task_scope(
+        self,
+        *,
+        root_kind: str,
+        root_runtime_scope: dict[str, object],
+    ) -> dict[str, object]: ...
+
+    def complete_external_root_task_scope(
+        self,
+        *,
+        root_kind: str,
+        root_runtime_scope: dict[str, object],
+    ) -> dict[str, object]: ...
+
+
 def _companion_operation_ref(interaction_ref: str) -> str:
     """Return the logical provider job shared by every recovery Attempt."""
 
     return interaction_ref
+
+
+def _companion_continuation_job_ref(
+    interaction_ref: str, control_revision: int
+) -> str:
+    """Derive one durable provider operation after an exact Owner resume."""
+
+    return "companion_continuation_" + canonical_hash(
+        {
+            "interaction_ref": interaction_ref,
+            "control_revision": control_revision,
+        }
+    )
 
 
 def _companion_runtime_effect(
@@ -121,7 +150,15 @@ def _companion_runtime_effect(
         owner_scope="human_collaboration",
         root_run_ref=scope_ref,
         attempt_ref=f"companion_attempt_{attempt_count}",
-        fence_ref=None,
+        fence_ref="companion_fence_"
+        + canonical_hash(
+            {
+                "scope_ref": scope_ref,
+                "interaction_ref": interaction_ref,
+                "attempt_count": attempt_count,
+                "job_ref": job_ref,
+            }
+        ),
         operation_ref=job_ref,
         effect_kind=(
             "runtime_reconciliation" if reconciling else "drafting_claim"
@@ -246,6 +283,7 @@ class SQLiteHumanCollaborationLadder:
             Callable[[dict[str, object]], None] | None
         ) = None,
         runtime_protection: RuntimeProtection | None = None,
+        agent_runtime: ExternalRootTaskScopeOwner | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -257,11 +295,18 @@ class SQLiteHumanCollaborationLadder:
             writing_delivery_binding_validator
         )
         self._runtime_protection = runtime_protection
+        self._agent_runtime = agent_runtime
         with self._database.write() as connection:
             recovered = connection.execute(
                 text(
                     "UPDATE hc_companion_turns SET assistant_status = 'queued', "
-                    "updated_at = :now WHERE assistant_status = 'processing'"
+                    "updated_at = :now WHERE assistant_status = 'processing' "
+                    "AND NOT EXISTS (SELECT 1 FROM ar_run_controls AS controls "
+                    "WHERE controls.run_ref = hc_companion_turns.interaction_ref "
+                    "AND controls.run_kind = 'companion' AND controls.status IN "
+                    "('running', 'suspended', 'completed') AND "
+                    "controls.attempt_generation = "
+                    "hc_companion_turns.attempt_count)"
                 ),
                 {"now": time.time()},
             )
@@ -448,13 +493,20 @@ class SQLiteHumanCollaborationLadder:
         return self._query_turn(interaction_ref)
 
     def process_drafting_once(self) -> bool:
+        if self._recover_completed_companion_root_scope():
+            return True
         with self._database.write() as connection:
             row = connection.execute(
                 text(
                     "SELECT turns.*, sessions.scope_ref, sessions.native_session_ref "
                     "FROM hc_companion_turns AS turns JOIN hc_companion_sessions AS "
                     "sessions ON sessions.session_ref = turns.session_ref WHERE "
-                    "turns.assistant_status = 'queued' ORDER BY turns.created_at LIMIT 1"
+                    "turns.assistant_status = 'queued' OR (turns.assistant_status "
+                    "= 'processing' AND EXISTS (SELECT 1 FROM ar_run_controls AS "
+                    "controls WHERE controls.run_ref = turns.interaction_ref AND "
+                    "controls.run_kind = 'companion' AND controls.status IN "
+                    "('running', 'completed') AND controls.attempt_generation = "
+                    "turns.attempt_count)) ORDER BY turns.created_at LIMIT 1"
                 )
             ).first()
             if row is None:
@@ -462,16 +514,27 @@ class SQLiteHumanCollaborationLadder:
             updated = connection.execute(
                 text(
                     "UPDATE hc_companion_turns SET assistant_status = 'processing', "
-                    "attempt_count = attempt_count + 1, reason_code = NULL, "
-                    "updated_at = :now WHERE "
-                    "interaction_ref = :interaction_ref AND assistant_status = 'queued'"
+                    "attempt_count = attempt_count + :attempt_increment, reason_code "
+                    "= NULL, updated_at = :now WHERE interaction_ref = "
+                    ":interaction_ref AND assistant_status = :prior_status"
                 ),
-                {"interaction_ref": row.interaction_ref, "now": time.time()},
+                {
+                    "interaction_ref": row.interaction_ref,
+                    "attempt_increment": (
+                        1 if row.assistant_status == "queued" else 0
+                    ),
+                    "prior_status": row.assistant_status,
+                    "now": time.time(),
+                },
             )
             if not updated.rowcount:
                 return False
         job_ref = _companion_operation_ref(str(row.interaction_ref))
-        attempt_count = int(row.attempt_count) + 1
+        provider_job_ref = job_ref
+        continuation_control_revision: int | None = None
+        attempt_count = int(row.attempt_count) + (
+            1 if row.assistant_status == "queued" else 0
+        )
         protection_effect = _companion_runtime_effect(
             scope_ref=str(row.scope_ref),
             interaction_ref=str(row.interaction_ref),
@@ -511,6 +574,7 @@ class SQLiteHumanCollaborationLadder:
                     )
                 self._finish_companion_runtime_boundary(boundary)
                 return True
+        root_runtime_scope: dict[str, object] | None = None
         try:
             view_context = _turn_view_context(row)
             if self._context_resolver is None:
@@ -526,12 +590,68 @@ class SQLiteHumanCollaborationLadder:
                 context = self._context_resolver(row.scope_ref, view_context)
             context = _document(context, "companion_context_invalid")
             _reject_secret_content(context)
+            quest_ref = context.get("quest_ref")
+            runtime_binding = getattr(
+                self._drafting_provider, "runtime_binding", None
+            )
+            if (
+                self._agent_runtime is not None
+                and isinstance(quest_ref, str)
+                and quest_ref
+                and callable(runtime_binding)
+            ):
+                binding = runtime_binding()
+                binding_document = getattr(binding, "as_dict", None)
+                if (
+                    not callable(binding_document)
+                    or protection_effect.attempt_ref is None
+                    or protection_effect.fence_ref is None
+                ):
+                    raise OwnerConflict("external_root_task_scope_invalid")
+                root_runtime_scope = {
+                    "quest_ref": quest_ref,
+                    "run_ref": protection_effect.operation_ref,
+                    "attempt_ref": protection_effect.attempt_ref,
+                    "root_session_ref": str(row.session_ref),
+                    "fence_ref": protection_effect.fence_ref,
+                    "runtime_binding_hash": canonical_hash(binding_document()),
+                    "generation": attempt_count,
+                }
+                registered = self._agent_runtime.register_external_root_task_scope(
+                    root_kind="companion",
+                    root_runtime_scope=root_runtime_scope,
+                )
+                if registered.get("status") == "suspended":
+                    return False
+                control_revision = registered.get("control_revision")
+                if (
+                    row.assistant_status == "processing"
+                    and row.native_session_ref is not None
+                    and registered.get("status") == "running"
+                    and isinstance(control_revision, int)
+                    and not isinstance(control_revision, bool)
+                    and control_revision > 1
+                ):
+                    continuation_control_revision = control_revision
+                    provider_job_ref = _companion_continuation_job_ref(
+                        str(row.interaction_ref), control_revision
+                    )
             draft = {
                 "interaction_kind": "conversation",
                 "scope_ref": row.scope_ref,
                 "authoritative_effect": False,
                 "current_context": context,
             }
+            if continuation_control_revision is not None:
+                draft["human_request_resume"] = {
+                    "status": "response_committed",
+                    "control_revision": continuation_control_revision,
+                    "instruction": (
+                        "Reconcile the prior HumanRequest effect in this Session, "
+                        "read its resolution, then decide whether the response is "
+                        "sufficient before continuing."
+                    ),
+                }
             request = IntentTurnRequest(
                 initialization_id=row.scope_ref,
                 draft_revision=0,
@@ -539,7 +659,8 @@ class SQLiteHumanCollaborationLadder:
                 draft=draft,
                 message=row.message,
                 native_session_ref=row.native_session_ref,
-                job_ref=job_ref,
+                job_ref=provider_job_ref,
+                root_runtime_scope=root_runtime_scope,
             )
             result = self._drafting_provider.reply(request)
             reply = _text(
@@ -568,13 +689,104 @@ class SQLiteHumanCollaborationLadder:
                     agent_proposal, "agent_proposal_invalid"
                 )
                 _reject_secret_content(agent_proposal)
+            if root_runtime_scope is not None:
+                assert self._agent_runtime is not None
+                with self._database.write() as connection:
+                    checkpointed = connection.execute(
+                        text(
+                            "UPDATE hc_companion_sessions SET native_session_ref = "
+                            ":native_session_ref, updated_at = :now WHERE "
+                            "session_ref = :session_ref AND (native_session_ref IS "
+                            "NULL OR native_session_ref = :native_session_ref)"
+                        ),
+                        {
+                            "native_session_ref": native_session_ref,
+                            "now": time.time(),
+                            "session_ref": row.session_ref,
+                        },
+                    )
+                    if not checkpointed.rowcount:
+                        raise OwnerConflict("companion_native_session_stale")
+                registered = self._agent_runtime.register_external_root_task_scope(
+                    root_kind="companion",
+                    root_runtime_scope=root_runtime_scope,
+                )
+                if registered.get("status") == "suspended":
+                    finish_job = getattr(
+                        self._drafting_provider, "finish_job", None
+                    )
+                    if callable(finish_job):
+                        finish_job(provider_job_ref)
+                    return False
         except (DraftingUnavailable, OSError, OwnerConflict, ValueError) as error:
             reason_code = (
                 error.code
                 if isinstance(error, (DraftingUnavailable, OwnerConflict))
                 else "companion_provider_unavailable"
             )
+            error_session_ref = getattr(error, "native_session_ref", None)
+            if (
+                isinstance(error_session_ref, str)
+                and error_session_ref
+                and root_runtime_scope is not None
+            ):
+                assert self._agent_runtime is not None
+                registered = self._agent_runtime.register_external_root_task_scope(
+                    root_kind="companion",
+                    root_runtime_scope=root_runtime_scope,
+                )
+                if registered.get("status") == "suspended":
+                    native_session_ref = _text(
+                        error_session_ref,
+                        "companion_native_session_invalid",
+                        256,
+                    )
+                    _reject_secret_content(native_session_ref)
+                    with self._database.write() as connection:
+                        checkpointed = connection.execute(
+                            text(
+                                "UPDATE hc_companion_sessions SET "
+                                "native_session_ref = :native_session_ref, "
+                                "updated_at = :now WHERE session_ref = "
+                                ":session_ref AND (native_session_ref IS NULL OR "
+                                "native_session_ref = :native_session_ref)"
+                            ),
+                            {
+                                "native_session_ref": native_session_ref,
+                                "now": time.time(),
+                                "session_ref": row.session_ref,
+                            },
+                        )
+                        if not checkpointed.rowcount:
+                            raise OwnerConflict(
+                                "companion_native_session_stale"
+                            )
+                    finish_job = getattr(
+                        self._drafting_provider, "finish_job", None
+                    )
+                    if callable(finish_job):
+                        finish_job(provider_job_ref)
+                    return False
             outcome_unknown = _companion_provider_outcome_unknown(reason_code)
+            if (
+                isinstance(error, OwnerConflict)
+                and error.code == "external_root_task_scope_suspended"
+            ):
+                return False
+            if root_runtime_scope is not None and not outcome_unknown:
+                assert self._agent_runtime is not None
+                try:
+                    self._agent_runtime.complete_external_root_task_scope(
+                        root_kind="companion",
+                        root_runtime_scope=root_runtime_scope,
+                    )
+                except OwnerConflict as completion_error:
+                    if (
+                        completion_error.code
+                        == "external_root_task_scope_suspended"
+                    ):
+                        return False
+                    raise
             with self._database.write() as connection:
                 transitioned = connection.execute(
                     text(
@@ -624,7 +836,7 @@ class SQLiteHumanCollaborationLadder:
                 self._finish_companion_runtime_boundary(boundary)
             finish_job = getattr(self._drafting_provider, "finish_job", None)
             if callable(finish_job) and not outcome_unknown:
-                finish_job(job_ref)
+                finish_job(provider_job_ref)
             return True
         with self._database.write() as connection:
             updated = connection.execute(
@@ -723,10 +935,78 @@ class SQLiteHumanCollaborationLadder:
                 interaction_ref=str(row.interaction_ref),
                 attempt_count=attempt_count,
             )
+        if root_runtime_scope is not None:
+            assert self._agent_runtime is not None
+            self._agent_runtime.complete_external_root_task_scope(
+                root_kind="companion",
+                root_runtime_scope=root_runtime_scope,
+            )
         self._finish_companion_runtime_boundary(boundary)
         finish_job = getattr(self._drafting_provider, "finish_job", None)
         if callable(finish_job):
-            finish_job(job_ref)
+            finish_job(provider_job_ref)
+        return True
+
+    def _recover_completed_companion_root_scope(self) -> bool:
+        if self._agent_runtime is None:
+            return False
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT turns.interaction_ref, turns.attempt_count, "
+                    "sessions.scope_ref, controls.quest_ref, controls.attempt_ref, "
+                    "controls.root_session_ref, controls.fence_ref, "
+                    "controls.runtime_binding_hash, controls.attempt_generation, "
+                    "controls.control_revision "
+                    "FROM hc_companion_turns AS turns JOIN hc_companion_sessions AS "
+                    "sessions ON sessions.session_ref = turns.session_ref JOIN "
+                    "ar_run_controls AS controls ON controls.run_ref = "
+                    "turns.interaction_ref AND controls.run_kind = 'companion' AND "
+                    "controls.root_session_ref = sessions.session_ref WHERE "
+                    "turns.assistant_status = 'completed' AND controls.status = "
+                    "'running' AND controls.attempt_generation = "
+                    "turns.attempt_count ORDER BY turns.updated_at LIMIT 1"
+                )
+            ).first()
+        if row is None:
+            return False
+        root_runtime_scope = {
+            "quest_ref": str(row.quest_ref),
+            "run_ref": str(row.interaction_ref),
+            "attempt_ref": str(row.attempt_ref),
+            "root_session_ref": str(row.root_session_ref),
+            "fence_ref": str(row.fence_ref),
+            "runtime_binding_hash": str(row.runtime_binding_hash),
+            "generation": int(row.attempt_generation),
+        }
+        self._agent_runtime.complete_external_root_task_scope(
+            root_kind="companion",
+            root_runtime_scope=root_runtime_scope,
+        )
+        attempt_count = int(row.attempt_count)
+        effect = _companion_runtime_effect(
+            scope_ref=str(row.scope_ref),
+            interaction_ref=str(row.interaction_ref),
+            attempt_count=attempt_count,
+            job_ref=_companion_operation_ref(str(row.interaction_ref)),
+        )
+        with self._database.write() as connection:
+            boundaries = self._record_companion_runtime_boundary(
+                connection,
+                effect=effect,
+                interaction_ref=str(row.interaction_ref),
+                attempt_count=attempt_count,
+            )
+        self._finish_companion_runtime_boundary(boundaries)
+        finish_job = getattr(self._drafting_provider, "finish_job", None)
+        if callable(finish_job):
+            provider_job_ref = _companion_operation_ref(str(row.interaction_ref))
+            control_revision = int(row.control_revision)
+            if control_revision > 1:
+                provider_job_ref = _companion_continuation_job_ref(
+                    str(row.interaction_ref), control_revision
+                )
+            finish_job(provider_job_ref)
         return True
 
     def _finish_companion_turn(

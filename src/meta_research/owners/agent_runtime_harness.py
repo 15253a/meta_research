@@ -34,6 +34,7 @@ from meta_research.target_run_runtime_contract import (
 _TARGET_ROOT_OBSERVATION_SEQUENCE_BASE = 1_000_000_000
 TARGET_ROOT_RECOVERY_PENDING_CODE = "target_root_recovery_pending"
 TARGET_ROOT_RECOVERY_READY_CODE = "target_root_recovery_ready"
+TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE = "human_request_wait"
 _TARGET_ROOT_RETRY_BASE_SECONDS = 1.0
 _TARGET_ROOT_RETRY_MAX_SECONDS = 60.0
 _PROVIDER_CEILING_CODES = frozenset(
@@ -414,6 +415,18 @@ class AgentRuntimeHarnessInterface(Protocol):
         invocation_hash: str,
         resume: bool,
     ) -> None: ...
+
+    def checkpoint_target_root_human_request_session(
+        self,
+        *,
+        operation_ref: str,
+        run_ref: str,
+        native_session_ref: str,
+    ) -> AgentRuntimeHarnessRun | None: ...
+
+    def target_root_human_request_continuation_generation(
+        self, run_ref: str
+    ) -> int | None: ...
 
     def begin_reconciliation(self, operation_ref: str) -> int: ...
 
@@ -2369,6 +2382,136 @@ class SQLiteAgentRuntimeHarness:
             ).fetchone()
         return None if row is None else _operation_from_row(row)
 
+    def checkpoint_target_root_human_request_session(
+        self,
+        *,
+        operation_ref: str,
+        run_ref: str,
+        native_session_ref: str,
+    ) -> AgentRuntimeHarnessRun | None:
+        """Seal one returned provider turn that explicitly yielded to a human.
+
+        The provider result is deliberately not accepted here.  Only its
+        verified native Session identity is retained while the exact Target
+        waiter remains the public blocking fact.
+        """
+
+        if (
+            not isinstance(native_session_ref, str)
+            or not native_session_ref
+            or len(native_session_ref) > 160
+        ):
+            raise AgentRuntimeHarnessError("native_session_identity_unavailable")
+        now = time.time()
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT runs.*, operations.run_ref AS operation_run_ref, "
+                    "operations.generation AS operation_generation, "
+                    "operations.status AS operation_status, "
+                    "operations.outcome_code AS operation_outcome_code, "
+                    "admissions.target_ref AS admission_target_ref, "
+                    "launches.target_ref AS launch_target_ref, "
+                    "launches.target_run_ref AS launch_target_run_ref, "
+                    "launches.quest_ref AS launch_quest_ref, "
+                    "launches.status AS launch_status, (SELECT MAX(generation) "
+                    "FROM ar_harness_provider_operations WHERE run_ref = "
+                    "runs.run_ref) AS latest_generation FROM ar_harness_runs "
+                    "AS runs JOIN ar_harness_provider_operations AS operations "
+                    "ON operations.run_ref = runs.run_ref JOIN "
+                    "ar_target_harness_admissions AS admissions ON "
+                    "admissions.target_run_ref = runs.run_ref JOIN "
+                    "ar_target_launches AS launches ON launches.target_ref = "
+                    "admissions.target_ref WHERE runs.run_ref = :run_ref AND "
+                    "operations.operation_ref = :operation_ref"
+                ),
+                {"run_ref": run_ref, "operation_ref": operation_ref},
+            ).first()
+            if row is None:
+                return None
+            run = _run_from_row(row)
+            generation = int(row.operation_generation)
+            if (
+                run.status != "suspended"
+                or row.operation_run_ref != run_ref
+                or row.operation_status != "running"
+                or int(row.latest_generation) != generation
+                or operation_ref
+                != provider_operation_ref(run_ref, "harness_turn", generation)
+                or run.native_session_ref not in {None, native_session_ref}
+                or row.admission_target_ref != row.launch_target_ref
+                or row.launch_target_run_ref != run_ref
+                or row.launch_status not in {"admitted", "active"}
+                or len(
+                    _matching_target_root_human_request_effects(
+                        connection,
+                        run=run,
+                        quest_ref=str(row.launch_quest_ref),
+                        waiter_status="blocked",
+                    )
+                )
+                != 1
+            ):
+                return None
+            operation_transition = connection.execute(
+                text(
+                    "UPDATE ar_harness_provider_operations SET status = "
+                    "'executed', outcome_code = :outcome_code, completed_at = "
+                    ":now WHERE operation_ref = :operation_ref AND run_ref = "
+                    ":run_ref AND generation = :generation AND status = 'running'"
+                ),
+                {
+                    "outcome_code": TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE,
+                    "now": now,
+                    "operation_ref": operation_ref,
+                    "run_ref": run_ref,
+                    "generation": generation,
+                },
+            )
+            run_transition = connection.execute(
+                text(
+                    "UPDATE ar_harness_runs SET native_session_ref = "
+                    ":native_session_ref, failure_code = :failure_code, "
+                    "updated_at = :now, completed_at = NULL WHERE run_ref = "
+                    ":run_ref AND status = 'suspended' AND "
+                    "(native_session_ref IS NULL OR native_session_ref = "
+                    ":native_session_ref)"
+                ),
+                {
+                    "native_session_ref": native_session_ref,
+                    "failure_code": TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE,
+                    "now": now,
+                    "run_ref": run_ref,
+                },
+            )
+            if operation_transition.rowcount != 1 or run_transition.rowcount != 1:
+                raise AgentRuntimeHarnessError("harness_turn_state_conflict")
+            self._record_owner_change(
+                connection,
+                "agent_runtime.target_root_human_request_session_checkpointed",
+                {
+                    "run_ref": run_ref,
+                    "operation_ref": operation_ref,
+                    "generation": generation,
+                    "native_session_ref": native_session_ref,
+                },
+            )
+            refreshed = connection.execute(
+                text("SELECT * FROM ar_harness_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).one()
+            return _run_from_row(refreshed)
+
+    def target_root_human_request_continuation_generation(
+        self, run_ref: str
+    ) -> int | None:
+        """Return the one generation authorized by a consumed Target waiter."""
+
+        with self._database.read() as connection:
+            return _target_root_human_request_continuation_generation(
+                connection, run_ref
+            )
+
     def start_operation(
         self,
         *,
@@ -2396,6 +2539,13 @@ class SQLiteAgentRuntimeHarness:
                     if row.status in {"running", "unknown_outcome"}
                     else "harness_operation_already_terminal"
                 )
+            continuation_generation = (
+                _target_root_human_request_continuation_generation(
+                    connection, run_ref
+                )
+                if resume
+                else None
+            )
             connection.execute(
                 text(
                     "INSERT INTO ar_harness_provider_operations "
@@ -2421,7 +2571,13 @@ class SQLiteAgentRuntimeHarness:
                 {
                     "now": now,
                     "run_ref": run_ref,
-                    "prior_status": "executed" if resume else "admitted",
+                    "prior_status": (
+                        "running"
+                        if continuation_generation == generation
+                        else "executed"
+                        if resume
+                        else "admitted"
+                    ),
                 },
             )
             if transition.rowcount != 1:
@@ -3710,7 +3866,8 @@ class SQLiteAgentRuntimeHarness:
             if int(interrupted) > 0:
                 connection.execute(
                     text(
-                        "UPDATE ar_harness_runs SET status = 'running', "
+                        "UPDATE ar_harness_runs SET status = CASE WHEN status "
+                        "= 'suspended' THEN 'suspended' ELSE 'running' END, "
                         "failure_code = 'provider_outcome_unknown', updated_at "
                         "= :now, completed_at = NULL WHERE run_ref IN (SELECT "
                         "run_ref FROM ar_harness_provider_operations WHERE "
@@ -4611,6 +4768,163 @@ def _validate_provider_ceiling_effect(
         not in {"harness_probe", "harness_root", "runtime_reconciliation"}
     ):
         raise AgentRuntimeHarnessError("provider_ceiling_evidence_invalid")
+
+
+def _matching_target_root_human_request_effects(
+    connection,
+    *,
+    run: AgentRuntimeHarnessRun,
+    quest_ref: str,
+    waiter_status: Literal["blocked", "consumed"],
+    consumed_after: float | None = None,
+) -> tuple[object, ...]:
+    rows = connection.execute(
+        text(
+            "SELECT effects.*, waiters.status AS waiter_status, "
+            "waiters.generation AS waiter_generation, requests.status AS "
+            "request_status, requests.is_current AS request_is_current, "
+            "consumptions.consumption_ref, consumptions.work_ref, "
+            "consumptions.created_at AS consumption_created_at FROM "
+            "owner_human_request_open_effects AS effects JOIN "
+            "owner_human_request_waiters AS waiters ON waiters.request_ref = "
+            "effects.request_ref AND waiters.waiter_ref = effects.waiter_ref "
+            "JOIN owner_human_requests AS requests ON requests.request_ref = "
+            "effects.request_ref LEFT JOIN "
+            "owner_human_request_resume_consumptions AS consumptions ON "
+            "consumptions.request_ref = effects.request_ref AND "
+            "consumptions.waiter_ref = effects.waiter_ref AND "
+            "consumptions.generation = effects.generation WHERE "
+            "effects.issuer = 'agent_runtime' AND requests.issuer = "
+            "'agent_runtime' AND requests.is_current = 1 AND "
+            "effects.waiter_ref = :waiter_ref AND waiters.status = "
+            ":waiter_status ORDER BY effects.created_at"
+        ),
+        {
+            "waiter_ref": f"root_run:{run.run_ref}",
+            "waiter_status": waiter_status,
+        },
+    ).all()
+    matches: list[object] = []
+    for row in rows:
+        try:
+            binding = json.loads(str(row.operation_binding_json))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(binding, dict)
+            or canonical_json(binding) != str(row.operation_binding_json)
+            or canonical_hash(binding) != str(row.operation_binding_hash)
+            or binding.get("root_kind") != "target"
+            or binding.get("phase") != "target_root_lifecycle"
+            or binding.get("operation_id") != "human_request.open"
+            or binding.get("request_owner") != "agent_runtime"
+            or binding.get("quest_ref") != quest_ref
+            or binding.get("task_ref") != run.run_ref
+            or binding.get("attempt_ref") != run.attempt_ref
+            or binding.get("root_session_ref") != run.root_session_ref
+            or binding.get("fence_ref") != run.fence_ref
+            or binding.get("runtime_binding_hash")
+            != run.capability_binding_hash
+            or binding.get("generation") != int(row.generation)
+            or int(row.waiter_generation) != int(row.generation)
+        ):
+            continue
+        if waiter_status == "blocked":
+            if row.request_status != "open" or row.consumption_ref is not None:
+                continue
+        elif (
+            row.request_status not in {"satisfied", "unsatisfied"}
+            or row.consumption_ref is None
+            or row.work_ref != run.run_ref
+            or consumed_after is None
+            or float(row.consumption_created_at) < consumed_after
+        ):
+            continue
+        matches.append(row)
+    return tuple(matches)
+
+
+def _target_root_human_request_continuation_generation(
+    connection, run_ref: str
+) -> int | None:
+    row = connection.execute(
+        text(
+            "SELECT runs.*, admissions.target_ref AS admission_target_ref, "
+            "launches.target_ref AS launch_target_ref, "
+            "launches.target_run_ref AS launch_target_run_ref, "
+            "launches.quest_ref AS launch_quest_ref, launches.status AS "
+            "launch_status FROM ar_harness_runs AS runs JOIN "
+            "ar_target_harness_admissions AS admissions ON "
+            "admissions.target_run_ref = runs.run_ref JOIN ar_target_launches "
+            "AS launches ON launches.target_ref = admissions.target_ref WHERE "
+            "runs.run_ref = :run_ref"
+        ),
+        {"run_ref": run_ref},
+    ).first()
+    if row is None:
+        return None
+    run = _run_from_row(row)
+    if (
+        run.status != "running"
+        or run.native_session_ref is None
+        or row.admission_target_ref != row.launch_target_ref
+        or row.launch_target_run_ref != run_ref
+        or row.launch_status not in {"admitted", "active"}
+    ):
+        return None
+    latest = connection.execute(
+        text(
+            "SELECT * FROM ar_harness_provider_operations WHERE run_ref = "
+            ":run_ref ORDER BY generation DESC LIMIT 1"
+        ),
+        {"run_ref": run_ref},
+    ).first()
+    if latest is None:
+        return None
+    marker = None
+    generation = None
+    if (
+        latest.status == "executed"
+        and latest.outcome_code == TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE
+    ):
+        marker = latest
+        generation = int(latest.generation) + 1
+        if run.failure_code != TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE:
+            return None
+    elif latest.status in {"running", "unknown_outcome"}:
+        previous = connection.execute(
+            text(
+                "SELECT * FROM ar_harness_provider_operations WHERE run_ref = "
+                ":run_ref AND generation = :generation"
+            ),
+            {"run_ref": run_ref, "generation": int(latest.generation) - 1},
+        ).first()
+        if (
+            previous is not None
+            and previous.status == "executed"
+            and previous.outcome_code == TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE
+        ):
+            marker = previous
+            generation = int(latest.generation)
+    if (
+        marker is None
+        or generation is None
+        or marker.completed_at is None
+        or marker.operation_ref
+        != provider_operation_ref(run_ref, "harness_turn", int(marker.generation))
+        or len(
+            _matching_target_root_human_request_effects(
+                connection,
+                run=run,
+                quest_ref=str(row.launch_quest_ref),
+                waiter_status="consumed",
+                consumed_after=float(marker.completed_at),
+            )
+        )
+        != 1
+    ):
+        return None
+    return generation
 
 
 def _run_from_row(row) -> AgentRuntimeHarnessRun:

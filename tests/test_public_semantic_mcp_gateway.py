@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -133,6 +135,8 @@ def test_semantic_gateway_validates_input_and_owner_output_before_returning() ->
         fence_ref="fence:schema",
         capability_binding_hash="a" * 64,
         operation_ids=("research_graph.validated.read",),
+        root_kind=None,
+        phase="harness_probe",
     )
 
     status, invalid_input = gateway.dispatch(
@@ -170,6 +174,105 @@ def test_semantic_gateway_validates_input_and_owner_output_before_returning() ->
         "semantic_output_schema_mismatch"
     )
     assert calls == 1
+
+
+def test_semantic_channel_derives_root_and_current_operation_metadata() -> None:
+    contexts = []
+
+    def inspect_context(context, _arguments):
+        contexts.append(context)
+        return {"status": "ok"}
+
+    gateway = SemanticMcpGateway(
+        (
+            SemanticOperation(
+                semantic_operation_id="research_graph.context.read",
+                owning_module="research_graph",
+                description="Inspect server-derived operation context.",
+                input_schema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                output_schema={
+                    "type": "object",
+                    "required": ["status"],
+                    "properties": {
+                        "status": {"type": "string", "enum": ["ok"]}
+                    },
+                    "additionalProperties": False,
+                },
+                handler=inspect_context,
+            ),
+        )
+    )
+    connection, binding = gateway.issue_channel(
+        run_ref="run:context",
+        attempt_ref="attempt:context",
+        root_session_ref="session:context",
+        fence_ref="fence:context",
+        capability_binding_hash="c" * 64,
+        operation_ids=("research_graph.context.read",),
+        root_kind="idea",
+        phase="primary",
+    )
+
+    status, rejected = gateway.dispatch(
+        connection.token,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "research_graph.context.read",
+                "arguments": {
+                    "root_kind": "target",
+                    "phase": "review",
+                    "operation_id": "human_request.open",
+                },
+            },
+        },
+    )
+    assert status == 200
+    assert rejected["result"]["structuredContent"]["code"] == (
+        "semantic_input_schema_mismatch"
+    )
+    assert contexts == []
+
+    status, called = gateway.dispatch(
+        connection.token,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "research_graph.context.read",
+                "arguments": {},
+            },
+        },
+    )
+    assert status == 200
+    assert called["result"]["isError"] is False
+    assert binding.as_dict()["root_kind"] == "idea"
+    assert binding.as_dict()["phase"] == "primary"
+    assert len(contexts) == 1
+    assert contexts[0].root_kind == "idea"
+    assert contexts[0].phase == "primary"
+    assert contexts[0].operation_id == "research_graph.context.read"
+
+    effect_key = contexts[0].effect_key("effect:shared")
+    assert replace(
+        contexts[0],
+        operation_id="research_graph.context.read.reconcile",
+    ).effect_key("effect:shared") == effect_key
+    for changed in (
+        {"root_session_ref": "session:other"},
+        {"root_kind": "plan"},
+        {"phase": "review"},
+        {"capability_binding_hash": "d" * 64},
+        {"operation_id": "research_graph.other.read"},
+    ):
+        assert replace(contexts[0], **changed).effect_key("effect:shared") != effect_key
 
 
 class _CountingHostProbe:
@@ -385,6 +488,53 @@ def test_typed_harness_admission_scopes_a_real_mcp_owner_query(tmp_path) -> None
         runtime.close()
 
 
+def test_web_composition_binds_all_root_resident_mcp_channels(tmp_path) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "root-resident-mcp-composition"),
+        startup_harness_diagnostics=False,
+    )
+    try:
+        new_root_channels = {}
+        for provider in runtime._resident_mcp_providers:
+            adapter = getattr(provider, "_root", provider)
+            channels = adapter._root_resident_mcp
+            new_root_channels[channels._root_kind] = channels
+
+        assert set(new_root_channels) == {
+            "acquisition",
+            "companion",
+            "deepfetch",
+            "idea",
+            "plan",
+            "writing",
+        }
+        assert all(
+            channels._authority is runtime.harnesses
+            for channels in new_root_channels.values()
+        )
+
+        create_app(
+            runtime,
+            base_url="http://127.0.0.1:8766",
+            control_key="control-key",
+        )
+
+        assert all(
+            channels._base_url == "http://127.0.0.1:8766"
+            for channels in new_root_channels.values()
+        )
+        bundle_provider = runtime.bundle_stage._provider
+        reasoning_provider = runtime.reasoning_stage._provider
+        assert bundle_provider._full_conformance_authority is runtime.harnesses
+        assert reasoning_provider._full_conformance_authority is runtime.harnesses
+        assert bundle_provider._resident_mcp_base_url == "http://127.0.0.1:8766"
+        assert reasoning_provider._resident_mcp_base_url == "http://127.0.0.1:8766"
+        assert runtime.target_run_runtime._harnesses is runtime.harnesses
+        assert runtime.target_run_runtime._mcp_base_url == "http://127.0.0.1:8766"
+    finally:
+        runtime.close()
+
+
 def test_daemon_restart_restores_the_typed_run_with_a_new_scoped_channel(
     tmp_path,
 ) -> None:
@@ -393,9 +543,9 @@ def test_daemon_restart_restores_the_typed_run_with_a_new_scoped_channel(
     first = first_runtime.harnesses.admit_probe(
         HarnessProbeRequest(
             request_ref="probe-request-restart",
-            harness_family="claude",
-            model_ref="claude-test",
-            auth_profile_ref="harness-profile:claude-default",
+            harness_family="codex",
+            model_ref="codex-test",
+            auth_profile_ref="harness-profile:codex-default",
             required_operation_ids=("agent_runtime.snapshot.read",),
             required_capabilities=("semantic_mcp", "resume"),
         ),

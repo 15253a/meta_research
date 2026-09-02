@@ -70,6 +70,9 @@ class PlanSkillRequest:
     owner_rejection_kind: str | None = None
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
+    run_ref: str | None = None
+    attempt_ref: str | None = None
+    fence_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -359,9 +362,13 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
 
     def runtime_binding(self) -> PlanRuntimeBinding:
         resources = _plan_skill_resources()
+        resident_mcp_facts = self._resident_mcp_runtime_facts()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)
         adapter_source_hash = _file_sha256(Path(__file__).resolve())
         shared_adapter_source_hash = _shared_codex_adapter_source_hash()
+        resident_mcp_source_hash = _file_sha256(
+            Path(__file__).with_name("root_resident_mcp.py").resolve()
+        )
         supervisor_source_hash = _file_sha256(
             Path(__file__).with_name("provider_supervisor.py").resolve()
         )
@@ -385,18 +392,23 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                     "skill_instructions": _plan_skill_instructions(),
                     "adapter_source_hash": adapter_source_hash,
                     "shared_adapter_source_hash": shared_adapter_source_hash,
+                    "resident_mcp_source_hash": resident_mcp_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
                 }
             ),
             model_ref=self._model_ref,
             harness_adapter_ref=harness_ref,
-            mcp_bindings=(),
+            mcp_bindings=resident_mcp_facts.mcp_bindings,
             capability_bindings=merge_root_capability_bindings(
                 (
                     "approval-policy-never",
                     "filesystem-danger-full-access",
                     "user-config-loaded",
-                    "mcp-config-empty",
+                    *(
+                        ("mcp-config-empty",)
+                        if not resident_mcp_facts.mcp_bindings
+                        else resident_mcp_facts.capability_bindings
+                    ),
                     "native-session-resume",
                     "structured-output-json-schema",
                     "trusted-local-quest-authorization",
@@ -418,6 +430,8 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 f"{adapter_source_hash}",
                 "adapter-source:meta_research.idea_skill@sha256:"
                 f"{shared_adapter_source_hash}",
+                "adapter-source:meta_research.root_resident_mcp@sha256:"
+                f"{resident_mcp_source_hash}",
                 "adapter-source:meta_research.provider_supervisor@sha256:"
                 f"{supervisor_source_hash}",
                 "disabled-codex-features:" + ",".join(_DISABLED_CODEX_FEATURES),
@@ -433,15 +447,24 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
                 "runtime-policy:trusted-local-broad/v1",
                 "sandbox-policy:danger-full-access",
                 "transport-seal-key:sha256:" + transport_key_hash(transport_key),
-            ),
+            )
+            + resident_mcp_facts.resource_bindings,
         )
 
     def generate_draft(self, request: PlanSkillRequest) -> PlanSkillDraft:
         if request.runtime_binding != self.runtime_binding():
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         lineage = _plan_owner_rejection_prompt(request)
+        human_resume = (
+            ""
+            if request.native_session_ref is None
+            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
+            "human_request.open.reconcile，读取 resolution 后再判断"
+            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
+        )
         primary_prompt = (
             f"{_plan_skill_instructions()}\n\n"
+            f"{human_resume}"
             "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
             "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是 Plan 主 Agent。只返回 {\"plan\": ...}，其中 plan 是完整、"
@@ -467,12 +490,19 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"完整 IdeaSet={canonical_json(request.accepted_idea_set)}\n"
             f"context_pack={canonical_json(request.context_pack)}"
         )
-        primary_output, primary_session, _primary_stdout = self._invoke(
+        primary_output, primary_session, _primary_stdout = (
+            self._invoke_root_operation(
             operation_name="primary",
             prompt=primary_prompt,
             schema=_plan_envelope_schema(request),
             native_session_ref=request.native_session_ref,
             job_ref=request.job_ref,
+            run_ref=request.run_ref,
+            attempt_ref=request.attempt_ref,
+            root_session_ref=request.root_session_ref,
+            fence_ref=request.fence_ref,
+            runtime_binding=request.runtime_binding.as_dict(),
+            )
         )
         if primary_session is None:
             raise PlanSkillUnavailable("codex_primary_session_missing")
@@ -526,12 +556,17 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"context_pack={canonical_json(request.context_pack)}\n"
             f"reviewed_draft={canonical_json(draft.draft)}"
         )
-        reviewed, resumed_session, _review_stdout = self._invoke(
+        reviewed, resumed_session, _review_stdout = self._invoke_root_operation(
             operation_name="review",
             prompt=reviewer_prompt,
             schema=_review_finalization_schema(request),
             native_session_ref=draft.primary_session_ref,
             job_ref=request.job_ref,
+            run_ref=request.run_ref,
+            attempt_ref=request.attempt_ref,
+            root_session_ref=request.root_session_ref,
+            fence_ref=request.fence_ref,
+            runtime_binding=request.runtime_binding.as_dict(),
         )
         if resumed_session != draft.primary_session_ref:
             raise PlanSkillUnavailable("codex_primary_session_changed")

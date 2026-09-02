@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 from meta_research.bundle_exhaustion import (
     BundleExhaustionOperationResult,
@@ -45,7 +46,11 @@ from meta_research.semantic_mcp import (
     SemanticMcpGateway,
     SemanticOperation,
 )
-from meta_research.root_capabilities import root_operation_catalog
+from meta_research.root_capabilities import (
+    ROOT_AGENT_KINDS,
+    RootAgentKind,
+    root_operation_catalog,
+)
 from meta_research.target_run_semantic import (
     TARGET_RUN_DAEMON_BOUNDARIES,
     TARGET_RUN_SEMANTIC_OPERATION_IDS,
@@ -58,20 +63,21 @@ from meta_research.owners.target_run_runtime import (
 )
 
 
-BUNDLE_ROOT_SEMANTIC_OPERATION_IDS = root_operation_catalog(
-    "bundle",
-    common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
-)
+ROOT_AGENT_SEMANTIC_OPERATION_IDS: dict[
+    RootAgentKind, tuple[str, ...]
+] = {
+    root_kind: root_operation_catalog(
+        root_kind,
+        common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+    )
+    for root_kind in ROOT_AGENT_KINDS
+}
 
-REASONING_ROOT_SEMANTIC_OPERATION_IDS = root_operation_catalog(
-    "reasoning",
-    common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
-)
-
-TARGET_ROOT_SEMANTIC_OPERATION_IDS = root_operation_catalog(
-    "target",
-    common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
-)
+BUNDLE_ROOT_SEMANTIC_OPERATION_IDS = ROOT_AGENT_SEMANTIC_OPERATION_IDS["bundle"]
+REASONING_ROOT_SEMANTIC_OPERATION_IDS = ROOT_AGENT_SEMANTIC_OPERATION_IDS[
+    "reasoning"
+]
+TARGET_ROOT_SEMANTIC_OPERATION_IDS = ROOT_AGENT_SEMANTIC_OPERATION_IDS["target"]
 
 # These boundaries are intentionally not Semantic MCP tools.  The Bundle
 # daemon deterministically reconstructs the fixed report from issuer-owned
@@ -104,6 +110,7 @@ class _RootHumanRequestCommand:
     condition: dict[str, object]
     acceptance_conditions: tuple[str, ...]
     required_authorization: dict[str, object] | None
+    predecessor_request_ref: str | None
 
 
 BUNDLE_TARGET_SEMANTIC_MISSING_MATRIX = (
@@ -649,11 +656,11 @@ def _root_agent_human_request_operations(
             semantic_operation_id=open_id,
             owning_module="agent_runtime",
             description=(
-                "Open one blocking HumanRequest from this exact current root Agent. "
-                "The server derives the root waiter identity; this operation performs "
-                "no requested external effect and does not validate a later response."
+                "Open one blocking HumanRequest for this exact authenticated Root "
+                "operation. The server derives ownership and waiter identity; any "
+                "participating Agent Session holding the operation bearer may call it."
             ),
-            input_schema=_root_human_request_input_schema(),
+            input_schema=_root_human_request_open_input_schema(),
             output_schema=_root_human_request_output_schema(),
             access_mode="effect",
             reconciliation_operation_id=reconcile_id,
@@ -667,10 +674,9 @@ def _root_agent_human_request_operations(
             semantic_operation_id=reconcile_id,
             owning_module="agent_runtime",
             description=(
-                "Reconcile a root Agent HumanRequest open effect without replaying "
-                "the request or treating a human response as Owner validation."
+                "Read the immutable receipt for an earlier HumanRequest open effect."
             ),
-            input_schema=_root_human_request_input_schema(),
+            input_schema=_effect_input_schema(),
             output_schema=_root_human_request_output_schema(),
             access_mode="reconcile",
             handler=lambda context, arguments: _reconcile_root_agent_human_request(
@@ -690,11 +696,33 @@ def _open_root_agent_human_request(
     effect_id, effect_key = _semantic_effect_key(context, arguments)
     scope = _root_agent_human_request_scope(owner, context)
     command = _root_human_request_command(arguments)
+    generation = _root_human_request_generation(
+        owner,
+        scope=scope,
+        predecessor_request_ref=command.predecessor_request_ref,
+    )
+    operation_binding = _root_human_request_operation_binding(
+        scope,
+        context,
+        generation=generation,
+    )
+    required_authorization = _root_human_request_required_authorization(
+        command.required_authorization,
+        effect_id=effect_id,
+        operation_binding=operation_binding,
+    )
     target_assertion = _root_human_request_target(
-        scope, context, command.condition
+        scope,
+        context,
+        command.condition,
+        operation_binding=operation_binding,
     )
     try:
-        request = owner.open_human_request(
+        request = owner.open_human_request_effect(
+            effect_key=effect_key,
+            effect_id=effect_id,
+            operation_binding=operation_binding,
+            predecessor_request_ref=command.predecessor_request_ref,
             request_kind=command.request_kind,
             obligation=command.obligation,
             business_purpose=command.business_purpose,
@@ -702,24 +730,48 @@ def _open_root_agent_human_request(
             acceptance_conditions=command.acceptance_conditions,
             direct_waiter={
                 "waiter_ref": scope["waiter_ref"],
-                "generation": scope["waiter_generation"],
+                "generation": generation,
                 "target_assertion": target_assertion,
                 "wait_scope": "local",
                 "other_blockers": [],
             },
-            idempotency_key=effect_key,
             quest_ref=scope.get("quest_ref"),
-            required_authorization=command.required_authorization,
+            required_authorization=required_authorization,
         )
     except OwnerConflict as error:
         raise SemanticMcpError(error.code) from error
     return _root_human_request_result(
-        effect_id=effect_id,
         request=request,
-        scope=scope,
-        target_assertion=target_assertion,
-        command=command,
+        context=context,
     )
+
+
+def _root_human_request_required_authorization(
+    authorization: dict[str, object] | None,
+    *,
+    effect_id: str,
+    operation_binding: dict[str, object],
+) -> dict[str, object] | None:
+    if authorization is None:
+        return None
+    return {
+        "capability": authorization["capability"],
+        "scope": {
+            "schema_ref": (
+                "meta-research/root-human-request-capability-scope/v1"
+            ),
+            "human_request_effect_id": effect_id,
+            "quest_ref": operation_binding["quest_ref"],
+            "task_ref": operation_binding["task_ref"],
+            "root_session_ref": operation_binding["root_session_ref"],
+            "operation_id": operation_binding["operation_id"],
+            "attempt_ref": operation_binding["attempt_ref"],
+            "generation": operation_binding["generation"],
+            "destination": authorization["destination"],
+            "duration": authorization["duration"],
+            "exclusions": authorization["exclusions"],
+        },
+    }
 
 
 def _reconcile_root_agent_human_request(
@@ -728,23 +780,17 @@ def _reconcile_root_agent_human_request(
     arguments: dict[str, object],
 ) -> dict[str, object]:
     effect_id, effect_key = _semantic_effect_key(context, arguments)
-    scope = _root_agent_human_request_scope(owner, context)
-    command = _root_human_request_command(arguments)
     try:
-        request = owner.reconcile_human_request_open(effect_key)
+        request = owner.reconcile_human_request_effect(effect_key)
     except OwnerConflict as error:
         raise SemanticMcpError(error.code) from error
-    if request is None:
-        return {"status": "unknown_outcome", "effect_id": effect_id}
-    target_assertion = _root_human_request_target(
-        scope, context, command.condition
-    )
+    open_effect = request.get("open_effect")
+    if not isinstance(open_effect, dict) or open_effect.get("effect_id") != effect_id:
+        raise SemanticMcpError("human_request_open_effect_invalid")
     return _root_human_request_result(
-        effect_id=effect_id,
         request=request,
-        scope=scope,
-        target_assertion=target_assertion,
-        command=command,
+        context=context,
+        reconcile=True,
     )
 
 
@@ -752,7 +798,17 @@ def _root_agent_human_request_scope(
     owner: AgentRuntimeInterface,
     context: SemanticCallContext,
 ) -> dict[str, object]:
+    if context.root_kind is None:
+        raise SemanticMcpError("root_agent_human_request_effect_unauthorized")
     try:
+        owner.verify_root_agent_runtime_scope(
+            root_kind=context.root_kind,
+            run_ref=context.run_ref,
+            attempt_ref=context.attempt_ref,
+            root_session_ref=context.root_session_ref,
+            fence_ref=context.fence_ref,
+            runtime_binding_hash=context.capability_binding_hash,
+        )
         return owner.verify_root_agent_human_request_scope(
             run_ref=context.run_ref,
             attempt_ref=context.attempt_ref,
@@ -773,6 +829,7 @@ def _root_human_request_command(
     condition = arguments.get("condition")
     acceptance_conditions = arguments.get("acceptance_conditions")
     authorization = arguments.get("required_authorization")
+    predecessor_request_ref = arguments.get("predecessor_request_ref")
     if (
         request_kind not in HUMAN_REQUEST_KINDS
         or not isinstance(obligation, str)
@@ -788,11 +845,24 @@ def _root_human_request_command(
             isinstance(item, str) and bool(item.strip())
             for item in acceptance_conditions
         )
-        or (authorization is not None and not isinstance(authorization, dict))
-        or (isinstance(authorization, dict) and not authorization)
+        or (
+            authorization is not None
+            and not _valid_root_human_request_authorization(authorization)
+        )
+        or (
+            predecessor_request_ref is not None
+            and (
+                not isinstance(predecessor_request_ref, str)
+                or not predecessor_request_ref.strip()
+            )
+        )
         or (
             request_kind == "capability_authorization"
-            and not isinstance(authorization, dict)
+            and not _valid_root_human_request_authorization(authorization)
+        )
+        or (
+            request_kind != "capability_authorization"
+            and authorization is not None
         )
     ):
         raise SemanticMcpError("root_agent_human_request_condition_invalid")
@@ -810,13 +880,91 @@ def _root_human_request_command(
         required_authorization=(
             authorization if isinstance(authorization, dict) else None
         ),
+        predecessor_request_ref=(
+            predecessor_request_ref.strip()
+            if isinstance(predecessor_request_ref, str)
+            else None
+        ),
     )
+
+
+def _valid_root_human_request_authorization(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {
+            "capability",
+            "destination",
+            "duration",
+            "exclusions",
+        }
+        and all(
+            isinstance(value.get(name), str) and bool(value.get(name))
+            for name in ("capability", "destination", "duration")
+        )
+        and isinstance(value.get("exclusions"), list)
+        and all(
+            isinstance(item, str) and bool(item)
+            for item in cast(list[object], value.get("exclusions"))
+        )
+    )
+
+
+def _root_human_request_generation(
+    owner: AgentRuntimeInterface,
+    *,
+    scope: dict[str, object],
+    predecessor_request_ref: str | None,
+) -> int:
+    generation = scope.get("waiter_generation")
+    if not isinstance(generation, int) or isinstance(generation, bool):
+        raise SemanticMcpError("root_agent_human_request_scope_invalid")
+    if predecessor_request_ref is None:
+        return generation
+    predecessor = owner.query_human_request(predecessor_request_ref)
+    waiters = None if predecessor is None else predecessor.get("direct_waiters")
+    if (
+        not isinstance(waiters, list)
+        or len(waiters) != 1
+        or not isinstance(waiters[0], dict)
+        or not isinstance(waiters[0].get("generation"), int)
+        or isinstance(waiters[0].get("generation"), bool)
+    ):
+        raise SemanticMcpError("human_request_predecessor_invalid")
+    return max(generation, int(waiters[0]["generation"]) + 1)
+
+
+def _root_human_request_operation_binding(
+    scope: dict[str, object],
+    context: SemanticCallContext,
+    *,
+    generation: int,
+) -> dict[str, object]:
+    if context.root_kind is None:
+        raise SemanticMcpError("root_agent_human_request_effect_unauthorized")
+    quest_ref = scope.get("quest_ref")
+    if not isinstance(quest_ref, str) or not quest_ref:
+        raise SemanticMcpError("root_agent_human_request_scope_invalid")
+    return {
+        "quest_ref": quest_ref,
+        "task_ref": context.run_ref,
+        "root_session_ref": context.root_session_ref,
+        "operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+        "attempt_ref": context.attempt_ref,
+        "generation": generation,
+        "request_owner": "agent_runtime",
+        "root_kind": context.root_kind,
+        "phase": context.phase,
+        "fence_ref": context.fence_ref,
+        "runtime_binding_hash": context.capability_binding_hash,
+    }
 
 
 def _root_human_request_target(
     scope: dict[str, object],
     context: SemanticCallContext,
     condition: dict[str, object],
+    *,
+    operation_binding: dict[str, object],
 ) -> dict[str, object]:
     root = {
         "run_kind": scope["run_kind"],
@@ -824,7 +972,11 @@ def _root_human_request_target(
         "attempt_ref": context.attempt_ref,
         "root_session_ref": context.root_session_ref,
         "fence_ref": context.fence_ref,
-        "waiter_generation": scope["waiter_generation"],
+        "waiter_generation": operation_binding["generation"],
+        "root_kind": operation_binding["root_kind"],
+        "phase": operation_binding["phase"],
+        "operation_id": operation_binding["operation_id"],
+        "request_owner": operation_binding["request_owner"],
     }
     if isinstance(scope.get("target_ref"), str):
         root["target_ref"] = scope["target_ref"]
@@ -837,34 +989,51 @@ def _root_human_request_target(
 
 def _root_human_request_result(
     *,
-    effect_id: str,
     request: dict[str, object],
-    scope: dict[str, object],
-    target_assertion: dict[str, object],
-    command: _RootHumanRequestCommand,
+    context: SemanticCallContext,
+    reconcile: bool = False,
 ) -> dict[str, object]:
     waiters = request.get("direct_waiters")
+    open_effect = request.get("open_effect")
+    binding = (
+        None
+        if not isinstance(open_effect, dict)
+        else open_effect.get("operation_binding")
+    )
+    task_yield = (
+        None if not isinstance(open_effect, dict) else open_effect.get("yield")
+    )
+    receipt = (
+        None if not isinstance(open_effect, dict) else open_effect.get("receipt")
+    )
     if (
         request.get("issuer") != "agent_runtime"
-        or request.get("kind") != command.request_kind
-        or request.get("quest_ref") != scope.get("quest_ref")
-        or request.get("obligation") != command.obligation
-        or request.get("business_purpose") != command.business_purpose
-        or request.get("target_assertion") != target_assertion
-        or request.get("acceptance_conditions")
-        != list(command.acceptance_conditions)
-        or request.get("required_authorization")
-        != command.required_authorization
-        or request.get("expires_at") is not None
-        or request.get("current") is not True
+        or not isinstance(open_effect, dict)
+        or not isinstance(binding, dict)
+        or not isinstance(task_yield, dict)
+        or not isinstance(receipt, dict)
         or not isinstance(waiters, list)
         or len(waiters) != 1
         or not isinstance(waiters[0], dict)
-        or waiters[0].get("waiter_ref") != scope["waiter_ref"]
-        or waiters[0].get("generation") != scope["waiter_generation"]
-        or waiters[0].get("target_assertion") != target_assertion
-        or waiters[0].get("wait_scope") != "local"
-        or waiters[0].get("other_blockers") != []
+        or waiters[0].get("waiter_ref") != task_yield.get("waiter_ref")
+        or waiters[0].get("generation") != binding.get("generation")
+        or open_effect.get("effect_id") is None
+        or receipt.get("kind") != "human_request_open"
+        or receipt.get("subject_ref") != request.get("request_ref")
+        or binding.get("request_owner") != "agent_runtime"
+        or binding.get("task_ref") != context.run_ref
+        or binding.get("root_session_ref") != context.root_session_ref
+        or binding.get("root_kind") != context.root_kind
+        or binding.get("operation_id")
+        != ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0]
+        or not reconcile
+        and (
+            binding.get("attempt_ref") != context.attempt_ref
+            or binding.get("fence_ref") != context.fence_ref
+            or binding.get("runtime_binding_hash")
+            != context.capability_binding_hash
+            or binding.get("phase") != context.phase
+        )
     ):
         raise SemanticMcpError("root_agent_human_request_artifact_invalid")
     request_status = request.get("status")
@@ -885,18 +1054,95 @@ def _root_human_request_result(
         resume_requirement = "human_response_required"
     else:
         resume_requirement = "closed"
-    return {
+    predecessor_request_ref = request.get("predecessor_request_ref")
+    successor_request_ref = request.get("successor_request_ref")
+    lineage: dict[str, object] = {}
+    if isinstance(predecessor_request_ref, str):
+        lineage["predecessor_request_ref"] = predecessor_request_ref
+    if isinstance(successor_request_ref, str):
+        lineage["successor_request_ref"] = successor_request_ref
+    result = {
         "status": "condition_reported",
-        "effect_id": effect_id,
+        "effect_id": open_effect["effect_id"],
+        "request_ref": request["request_ref"],
+        "request_owner": "agent_runtime",
+        "operation_binding": binding,
+        "waiter": {
+            "waiter_ref": waiters[0]["waiter_ref"],
+            "generation": waiters[0]["generation"],
+        },
+        "task_yield": task_yield,
+        "receipt": receipt,
+        "lineage": lineage,
         "condition": {
             "schema_ref": "meta-research/blocking-human-request-condition/v1",
             "code": "blocking_human_request",
             "request_ref": request["request_ref"],
-            "request_kind": command.request_kind,
+            "request_kind": request["kind"],
             "request_status": request_status,
             "waiter_status": waiter_status,
             "resume_requirement": resume_requirement,
         },
+    }
+    resolution = _root_human_request_resolution(request)
+    if resolution is not None:
+        result["resolution"] = resolution
+    return result
+
+
+def _root_human_request_resolution(
+    request: dict[str, object],
+) -> dict[str, object] | None:
+    """Expose the exact safe Response used by the issuing Owner's disposition."""
+
+    evaluation = request.get("evaluation")
+    disposition = request.get("disposition")
+    responses = request.get("responses")
+    if (
+        request.get("status") not in {"satisfied", "unsatisfied"}
+        or not isinstance(evaluation, dict)
+        or not isinstance(disposition, dict)
+        or not isinstance(responses, list)
+        or disposition.get("decision") != request.get("status")
+    ):
+        return None
+    response_refs = evaluation.get("response_refs")
+    evidence_refs = evaluation.get("accepted_evidence_refs")
+    reason = evaluation.get("reason")
+    if (
+        not isinstance(response_refs, list)
+        or not response_refs
+        or not isinstance(evidence_refs, list)
+        or not isinstance(reason, dict)
+        or not isinstance(reason.get("code"), str)
+    ):
+        raise SemanticMcpError("root_agent_human_request_artifact_invalid")
+    selected = next(
+        (
+            response
+            for response in reversed(responses)
+            if isinstance(response, dict)
+            and response.get("response_ref") in response_refs
+        ),
+        None,
+    )
+    if (
+        selected is None
+        or not isinstance(selected.get("response_ref"), str)
+        or selected.get("decision") not in {"provided", "declined", "deferred"}
+        or not isinstance(selected.get("facts"), dict)
+        or not isinstance(selected.get("note"), str)
+        or any(not isinstance(item, str) for item in evidence_refs)
+    ):
+        raise SemanticMcpError("root_agent_human_request_artifact_invalid")
+    return {
+        "response_ref": selected["response_ref"],
+        "decision": selected["decision"],
+        "facts": selected["facts"],
+        "note": selected["note"],
+        "disposition": disposition["decision"],
+        "reason_code": reason["code"],
+        "accepted_evidence_refs": evidence_refs,
     }
 
 
@@ -1857,19 +2103,39 @@ def _effect_input_schema() -> dict[str, object]:
     )
 
 
-def _root_human_request_input_schema() -> dict[str, object]:
+def _root_human_request_open_input_schema() -> dict[str, object]:
     return _closed_object(
         {
             "effect_id": _string(max_length=128),
             "request_kind": _string(enum=tuple(sorted(HUMAN_REQUEST_KINDS))),
             "obligation": _string(max_length=8000),
             "business_purpose": _string(max_length=4000),
-            "condition": {"type": "object"},
+            "condition": _closed_object(
+                {
+                    "impact": _string(max_length=4000),
+                    "safe_response": _string(max_length=4000),
+                },
+                required=("impact", "safe_response"),
+            ),
             "acceptance_conditions": {
                 "type": "array",
                 "items": _string(max_length=2000),
             },
-            "required_authorization": {"type": "object"},
+            "required_authorization": _closed_object(
+                {
+                    "capability": _string(max_length=256),
+                    "destination": _string(max_length=1000),
+                    "duration": _string(max_length=1000),
+                    "exclusions": _string_array(),
+                },
+                required=(
+                    "capability",
+                    "destination",
+                    "duration",
+                    "exclusions",
+                ),
+            ),
+            "predecessor_request_ref": _string(max_length=96),
         },
         required=(
             "effect_id",
@@ -1883,12 +2149,114 @@ def _root_human_request_input_schema() -> dict[str, object]:
 
 
 def _root_human_request_output_schema() -> dict[str, object]:
+    operation_binding = _closed_object(
+        {
+            "quest_ref": _string(max_length=256),
+            "task_ref": _string(max_length=256),
+            "root_session_ref": _string(max_length=256),
+            "operation_id": _string(
+                enum=(ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],)
+            ),
+            "attempt_ref": _string(max_length=256),
+            "generation": {"type": "integer"},
+            "request_owner": _string(enum=("agent_runtime",)),
+            "root_kind": _string(enum=tuple(ROOT_AGENT_KINDS)),
+            "phase": _string(max_length=128),
+            "fence_ref": _string(max_length=256),
+            "runtime_binding_hash": _hash_schema(),
+        },
+        required=(
+            "quest_ref",
+            "task_ref",
+            "root_session_ref",
+            "operation_id",
+            "attempt_ref",
+            "generation",
+            "request_owner",
+            "root_kind",
+            "phase",
+            "fence_ref",
+            "runtime_binding_hash",
+        ),
+    )
+    waiter = _closed_object(
+        {
+            "waiter_ref": _string(max_length=128),
+            "generation": {"type": "integer"},
+        },
+        required=("waiter_ref", "generation"),
+    )
+    task_yield = _closed_object(
+        {
+            "schema_ref": _string(
+                enum=("meta-research/human-request-task-yield/v1",)
+            ),
+            "status": _string(enum=("yielded",)),
+            "request_ref": _string(max_length=96),
+            "task_ref": _string(max_length=256),
+            "root_session_ref": _string(max_length=256),
+            "operation_id": _string(
+                enum=(ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],)
+            ),
+            "attempt_ref": _string(max_length=256),
+            "generation": {"type": "integer"},
+            "request_owner": _string(enum=("agent_runtime",)),
+            "waiter_ref": _string(max_length=128),
+        },
+        required=(
+            "schema_ref",
+            "status",
+            "request_ref",
+            "task_ref",
+            "root_session_ref",
+            "operation_id",
+            "attempt_ref",
+            "generation",
+            "request_owner",
+            "waiter_ref",
+        ),
+    )
     return _closed_object(
         {
-            "status": _string(
-                enum=("condition_reported", "unknown_outcome")
-            ),
+            "status": _string(enum=("condition_reported",)),
             "effect_id": _string(max_length=128),
+            "request_ref": _string(max_length=96),
+            "request_owner": _string(enum=("agent_runtime",)),
+            "operation_binding": operation_binding,
+            "waiter": waiter,
+            "task_yield": task_yield,
+            "receipt": _receipt_schema(),
+            "lineage": _closed_object(
+                {
+                    "predecessor_request_ref": _string(max_length=96),
+                    "successor_request_ref": _string(max_length=96),
+                }
+            ),
+            "resolution": _closed_object(
+                {
+                    "response_ref": _string(max_length=64),
+                    "decision": _string(
+                        enum=("provided", "declined", "deferred")
+                    ),
+                    "facts": {"type": "object"},
+                    "note": _string(max_length=4000, min_length=0),
+                    "disposition": _string(enum=("satisfied", "unsatisfied")),
+                    "reason_code": _string(max_length=128),
+                    "accepted_evidence_refs": {
+                        "type": "array",
+                        "items": _string(max_length=512),
+                    },
+                },
+                required=(
+                    "response_ref",
+                    "decision",
+                    "facts",
+                    "note",
+                    "disposition",
+                    "reason_code",
+                    "accepted_evidence_refs",
+                ),
+            ),
             "condition": _closed_object(
                 {
                     "schema_ref": _string(
@@ -1905,6 +2273,7 @@ def _root_human_request_output_schema() -> dict[str, object]:
                         enum=(
                             "open",
                             "satisfied",
+                            "unsatisfied",
                             "declined",
                             "withdrawn",
                             "expired",
@@ -1935,7 +2304,18 @@ def _root_human_request_output_schema() -> dict[str, object]:
                 ),
             ),
         },
-        required=("status", "effect_id"),
+        required=(
+            "status",
+            "effect_id",
+            "request_ref",
+            "request_owner",
+            "operation_binding",
+            "waiter",
+            "task_yield",
+            "receipt",
+            "lineage",
+            "condition",
+        ),
     )
 
 
@@ -1945,6 +2325,8 @@ def _semantic_effect_key(
     effect_id = arguments.get("effect_id")
     if not isinstance(effect_id, str):
         raise SemanticMcpError("semantic_effect_id_invalid")
+    if context.operation_id in ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS:
+        return effect_id, context.human_request_effect_key(effect_id)
     return effect_id, context.effect_key(effect_id)
 
 
@@ -2755,11 +3137,14 @@ def _closed_object(
 
 
 def _string(
-    *, max_length: int = 4096, enum: tuple[str, ...] | None = None
+    *,
+    max_length: int = 4096,
+    min_length: int = 1,
+    enum: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     value: dict[str, object] = {
         "type": "string",
-        "minLength": 1,
+        "minLength": min_length,
         "maxLength": max_length,
     }
     if enum is not None:
@@ -2779,6 +3164,7 @@ __all__ = [
     "BUNDLE_DAEMON_COMPLETION_BOUNDARIES",
     "BUNDLE_ROOT_SEMANTIC_OPERATION_IDS",
     "REASONING_ROOT_SEMANTIC_OPERATION_IDS",
+    "ROOT_AGENT_SEMANTIC_OPERATION_IDS",
     "BUNDLE_TARGET_SEMANTIC_MISSING_MATRIX",
     "MissingSemanticOwnerOperation",
     "TARGET_RUN_DAEMON_BOUNDARIES",

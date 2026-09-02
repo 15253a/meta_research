@@ -1193,8 +1193,16 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         if request.runtime_binding != self.runtime_binding():
             raise ReasoningSkillUnavailable("reasoning_runtime_binding_drift")
         lineage = _owner_rejection_prompt(request)
+        human_resume = (
+            ""
+            if request.native_session_ref is None
+            else "\n若本 Session 曾显式打开 HumanRequest，先以原 effect_id 调 "
+            "human_request.open.reconcile，读取 resolution 后再判断"
+            "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
+        )
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
+            f"{human_resume}"
             "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
             "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是当前 Reasoning 根 Agent，而不是 State Owner。先通过 resident "
