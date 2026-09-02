@@ -130,7 +130,39 @@ function currentExperimentHasFence(
   );
 }
 
+function isCurrentQuestion(item: QuestionTreeItem): boolean {
+  const foreground = item.cycle_binding.foreground;
+  return item.cycle_binding.status === "bound"
+    && foreground?.quest_ref === item.quest_ref
+    && foreground.question_ref === item.question_ref
+    && foreground.cycle_ref === item.cycle_binding.cycle_ref;
+}
+
+function lifecycleCopy(item: QuestionTreeItem): string {
+  if (item.lifecycle_status === "active") {
+    return `active r${item.lifecycle_revision} · 已保留`;
+  }
+  if (item.lifecycle_status === "pruned") {
+    return `pruned r${item.lifecycle_revision} · 已移出`;
+  }
+  return "生命周期信息不可用";
+}
+
 function cycleBindingCopy(item: QuestionTreeItem): string {
+  const binding = item.cycle_binding;
+  if (binding.status === "not_bound") {
+    return "未绑定当前 Cycle";
+  }
+  if (binding.status === "unavailable") {
+    return "当前 Cycle 信息不可用";
+  }
+  if (!binding.foreground || !binding.cycle_ref) {
+    return "当前 Cycle 绑定信息不完整";
+  }
+  return `${binding.cycle_ref} · ${binding.foreground.stage} · epoch ${binding.foreground.epoch} · ${binding.foreground.status}`;
+}
+
+function cycleBindingTechnicalCopy(item: QuestionTreeItem): string {
   const binding = item.cycle_binding;
   if (binding.status !== "bound" || !binding.foreground || !binding.cycle_ref) {
     return `${binding.status} · ${binding.reason?.code ?? "cycle_binding_not_bound"}`;
@@ -139,6 +171,16 @@ function cycleBindingCopy(item: QuestionTreeItem): string {
 }
 
 function relatedHumanRequestCopy(item: QuestionTreeItem): string {
+  const related = item.related_human_requests;
+  if (related.status !== "ready") {
+    return "关联 HumanRequest 暂不可用";
+  }
+  if (!related.items.length) return "当前没有关联 HumanRequest";
+  const statuses = Array.from(new Set(related.items.map((request) => request.status)));
+  return `${related.items.length} 项 · ${statuses.join(" / ")}`;
+}
+
+function relatedHumanRequestTechnicalCopy(item: QuestionTreeItem): string {
   const related = item.related_human_requests;
   if (related.status !== "ready") {
     return `${related.status} · ${related.reason?.code ?? "human_request_projection_unavailable"}`;
@@ -150,6 +192,39 @@ function relatedHumanRequestCopy(item: QuestionTreeItem): string {
     )).join(", ");
     return `${request.request_ref} · ${request.kind} · ${request.status} · ${bindings}`;
   }).join(" / ");
+}
+
+function recentAcceptedResultCopy(item: QuestionTreeItem): string {
+  if (!("recent_accepted_result" in item)) {
+    return "Projection 未提供";
+  }
+  const result = item.recent_accepted_result;
+  if (!result) return "没有已接纳结果";
+  const kind = typeof result.kind === "string"
+    ? result.kind
+    : typeof result.stage === "string"
+      ? `${result.stage} Stage`
+      : typeof result.report_ref === "string"
+        ? "Bundle 研究汇总"
+        : "已接纳研究结果";
+  return [kind, result.status, result.disposition]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .join(" · ");
+}
+
+function recentAcceptedResultTechnicalCopy(item: QuestionTreeItem): string {
+  const result = item.recent_accepted_result;
+  if (!result) return "none";
+  const resultRef = [
+    result.result_ref,
+    result.report_ref,
+    result.formal_plan_ref,
+    result.outcome_ref,
+    result.idea_set_ref,
+  ].find((value): value is string => typeof value === "string" && value.length > 0);
+  return [resultRef, result.source, result.stage, result.kind, result.status]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .join(" · ") || "accepted_result_identity_unavailable";
 }
 
 function relatedHumanRequestCount(item: QuestionTreeItem): number {
@@ -263,9 +338,9 @@ function nodeClass(item: CanvasQuestion): string {
 }
 
 function nodeLabel(item: CanvasQuestion): string {
-  if (item.depth === 0) return "Root Question · RG accepted";
-  if (item.depth === 1) return "Formal Question · RG accepted";
-  return "Research branch · RG topology";
+  if (item.depth === 0) return "研究根问题";
+  if (item.depth === 1) return "正式研究问题";
+  return "研究分支";
 }
 
 function questionInspectorBasis(item: QuestionTreeItem): string {
@@ -356,7 +431,10 @@ function validateHistoryResponse(
         !== question.question_receipt_ref
       || value.lifecycle?.question_ref !== question.question_ref
       || value.lifecycle.quest_ref !== question.quest_ref
-      || value.lifecycle.revision < question.lifecycle_revision
+      || (
+        question.lifecycle_revision !== null
+        && value.lifecycle.revision < question.lifecycle_revision
+      )
     ))
   ) {
     throw new Error("question_history_response_identity_invalid");
@@ -909,7 +987,10 @@ export function QuestionTree({
       Math.min(96, viewport.height / transform.scale * miniScaleY),
     ),
   };
-  const graphLabel = graphRevision === null ? "Graph revision unavailable" : `Graph r${graphRevision}`;
+  const graphLabel = graphRevision === null ? "结构版本不可用" : `结构版本 r${graphRevision}`;
+  const technicalGraphLabel = graphRevision === null
+    ? "Graph revision unavailable"
+    : `Graph r${graphRevision}`;
   const projectionLabel = projectionStatus === "ready"
     ? `只读投影 · ${graphLabel}`
     : `${projectionStatus} · ${projectionReason ?? "question_tree_unavailable"}`;
@@ -927,9 +1008,9 @@ export function QuestionTree({
       <div className="question-tree-world">
         <header className="question-tree-header">
           <div>
-            <small>QUESTION WORLD · {graphLabel}</small>
+            <small>研究问题结构 · {graphLabel}</small>
             <h1 id="question-tree-title">问题树</h1>
-            <p>从已接纳父题沿父题—子题关系查看研究支线。树只表达 RG 问题拓扑；Stage 进度仍在总览中单独解释。</p>
+            <p>从已接纳父题沿父题—子题关系查看研究支线。树只表达问题结构；Stage 进度仍在总览中单独解释。</p>
           </div>
           <div className="question-tree-tools">
             <span className="projection">{projectionLabel}</span>
@@ -1074,6 +1155,7 @@ export function QuestionTree({
                     tabIndex={item.question_ref === selected?.question_ref ? 0 : -1}
                     key={item.question_ref}
                     data-question-ref={item.question_ref}
+                    data-current-question={isCurrentQuestion(item) ? "true" : undefined}
                     onClick={() => setSelectedRef(item.question_ref)}
                     onKeyDown={(event) => selectFromKeyboard(event, item.question_ref)}
                     onMouseEnter={() => setHoveredRef(item.question_ref)}
@@ -1098,9 +1180,14 @@ export function QuestionTree({
                     >
                       ×
                     </button>
-                    <small>{nodeLabel(item)}</small>
+                    <small>
+                      {nodeLabel(item)}
+                      {isCurrentQuestion(item) ? (
+                        <mark className="question-node-current">当前攻克</mark>
+                      ) : null}
+                    </small>
                     <b>{item.title ?? item.unknown_statement ?? item.question_ref}</b>
-                    <span>{item.question_ref} · parent {item.parent_question_ref ?? "root"}</span>
+                    <span>{lifecycleCopy(item)}</span>
                     {!controlsInert && relatedHumanRequestCount(item) ? (
                       <i
                         className="question-node-human-request"
@@ -1182,7 +1269,8 @@ export function QuestionTree({
             ) : null}
           </div>
           <div className="question-tree-caption">
-            <span><i aria-hidden="true" /> 实线：RG 父子拓扑</span>
+            <span><i aria-hidden="true" /> 实线：问题父子关系</span>
+            <span><i className="foreground" aria-hidden="true" /> 金色标记：当前攻克</span>
             <span><i className="selected" aria-hidden="true" /> 紫色光晕：本地选中</span>
             {controlsInert ? (
               <span><i className="human" aria-hidden="true" /> 珊瑚点：当前未显示关联的人工处理事项</span>
@@ -1200,7 +1288,9 @@ export function QuestionTree({
             <div className="question-tree-inspector-main">
               <div className="question-tree-inspector-kicker">
                 <span>{nodeLabel(selected)}</span>
-                <small>{selected.question_ref}</small>
+                {isCurrentQuestion(selected) ? (
+                  <mark className="question-inspector-current">当前攻克</mark>
+                ) : null}
               </div>
               <h2>{selected.title ?? "已接纳 Question"}</h2>
               <p>{selected.unknown_statement ?? "公开 Projection 没有附带 unknown statement。"}</p>
@@ -1279,15 +1369,24 @@ export function QuestionTree({
               ) : null}
             </div>
             <div className="question-tree-inspector-facts">
-              <div><small>Topology / RG</small><b>{selected.parent_question_ref ? `${selected.parent_question_ref} 的直接子题` : "Quest 根问题"} · {graphLabel}</b></div>
-              <div><small>Question fact / RG</small><b>{selected.question_receipt_ref}{controlsInert ? "" : ` · ${selected.lifecycle_status} r${selected.lifecycle_revision}`}</b></div>
-              <div><small>Content fact / RM</small><b>{selected.content_ref} · {selected.content_hash}</b></div>
-              <div><small>Cycle binding / AE</small><b>{controlsInert
-                ? "capability_unavailable · Projection 未提供"
-                : cycleBindingCopy(selected)}</b></div>
-              {!controlsInert ? (
-                <div><small>HumanRequest / Owner</small><b>{relatedHumanRequestCopy(selected)}</b></div>
-              ) : null}
+              <div><small>问题状态</small><b>{lifecycleCopy(selected)}</b></div>
+              <div><small>当前 Cycle / Stage</small><b>{cycleBindingCopy(selected)}</b></div>
+              <div><small>HumanRequest</small><b>{relatedHumanRequestCopy(selected)}</b></div>
+              <div><small>最近接纳结果</small><b>{recentAcceptedResultCopy(selected)}</b></div>
+              <details className="question-tree-technical-details">
+                <summary>技术详情</summary>
+                <div>
+                  <small>Topology / RG</small>
+                  <b>{selected.parent_question_ref
+                    ? `${selected.parent_question_ref} 的直接子题`
+                    : "Quest 根问题"} · {technicalGraphLabel}</b>
+                </div>
+                <div><small>Question fact / RG</small><b>{selected.question_ref} · {selected.question_receipt_ref} · {selected.schema_ref}</b></div>
+                <div><small>Content fact / RM</small><b>{selected.content_ref} · {selected.content_hash}</b></div>
+                <div><small>Cycle binding / AE</small><b>{cycleBindingTechnicalCopy(selected)}</b></div>
+                <div><small>HumanRequest / Owner</small><b>{relatedHumanRequestTechnicalCopy(selected)}</b></div>
+                <div><small>Accepted result</small><b>{recentAcceptedResultTechnicalCopy(selected)}</b></div>
+              </details>
             </div>
           </section>
         ) : null}

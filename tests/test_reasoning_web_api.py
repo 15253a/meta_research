@@ -52,7 +52,9 @@ def test_reasoning_stage_is_daemon_owned_and_read_only(tmp_path: Path) -> None:
                 for check in snapshot["readiness"]["checks"]
             }
             assert checks["reasoning_stage_worker"]["status"] == "ready"
-            assert "reasoning_stage" not in snapshot
+            assert snapshot["reasoning_stage"] == (
+                runtime.reasoning_stage.query_current()
+            )
 
             eligible = {
                 "eligibility": {
@@ -92,9 +94,9 @@ def test_reasoning_stage_is_daemon_owned_and_read_only(tmp_path: Path) -> None:
             runtime.reasoning_stage.query_current = (  # type: ignore[method-assign]
                 lambda: routed_away
             )
-            assert "reasoning_stage" not in client.get(
-                "/api/v1/snapshot"
-            ).json()
+            assert client.get("/api/v1/snapshot").json()[
+                "reasoning_stage"
+            ] == routed_away
 
             start = client.post(
                 "/api/v1/reasoning-stage/start",

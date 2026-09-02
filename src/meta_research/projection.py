@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 
 _MAX_SNAPSHOT_ATTEMPTS = 3
 _COLLABORATION_SCOPE_PAGE_SIZE = 101
-_STAGE_ORDER = {"idea": 0, "plan": 1, "bundle": 2, "reasoning": 3}
 
 
 class SnapshotConsistencyUnavailable(RuntimeError):
@@ -477,23 +476,16 @@ class PublicProjection:
                 None if self._idea_stage is None else self._idea_stage.query_current()
             )
             plan_stage = (
-                None
-                if self._plan_stage is None
-                or not _stage_projection_query_allowed(current_foreground, "plan")
-                else self._plan_stage.query_current()
+                None if self._plan_stage is None else self._plan_stage.query_current()
             )
             bundle_stage = (
                 None
                 if self._bundle_stage is None
-                or not _stage_projection_query_allowed(current_foreground, "bundle")
                 else self._bundle_stage.query_current()
             )
             reasoning_stage = (
                 None
                 if self._reasoning_stage is None
-                or not _stage_projection_query_allowed(
-                    current_foreground, "reasoning"
-                )
                 else self._reasoning_stage.query_current()
             )
             autonomous_creation = (
@@ -509,10 +501,18 @@ class PublicProjection:
             current_experiment = (
                 None if self._experiment is None else self._experiment.query_current()
             )
-            current_question = (
-                None
-                if self._idea_stage is None
-                else self._idea_stage.query_current_question()
+            current_question = _query_foreground_question(
+                self._research_graph,
+                self._research_memory,
+                current_foreground,
+                graph_revision=owner_snapshots["research_graph"].revision,
+            )
+            recent_accepted_result = _recent_accepted_stage_result(
+                current_foreground,
+                idea_stage=idea_stage,
+                plan_stage=plan_stage,
+                bundle_stage=bundle_stage,
+                reasoning_stage=reasoning_stage,
             )
             writing = (
                 {
@@ -551,31 +551,36 @@ class PublicProjection:
                         lifecycle = (
                             query_lifecycle(question.question_ref)
                             if callable(query_lifecycle)
-                            else {"status": "active", "revision": 1}
+                            else {"status": "unavailable", "revision": None}
                         )
-                        question_tree_items.append(
-                            {
-                                "question_ref": question.question_ref,
-                                "quest_ref": question.quest_ref,
-                                "parent_question_ref": question.parent_question_ref,
-                                "title": content.get("title"),
-                                "unknown_statement": content.get("unknown_statement"),
-                                "content_ref": question.content_ref,
-                                "content_hash": question.content_hash,
-                                "schema_ref": question.schema_ref,
-                                "question_receipt_ref": (
-                                    question.receipt.receipt_ref
-                                ),
-                                "lifecycle_status": lifecycle["status"],
-                                "lifecycle_revision": lifecycle["revision"],
-                                "cycle_binding": _query_question_cycle_binding(
-                                    foreground_query,
-                                    foregrounds_by_quest,
-                                    quest_ref=question.quest_ref,
-                                    question_ref=question.question_ref,
-                                ),
-                            }
-                        )
+                        question_item: dict[str, object] = {
+                            "question_ref": question.question_ref,
+                            "quest_ref": question.quest_ref,
+                            "parent_question_ref": question.parent_question_ref,
+                            "title": content.get("title"),
+                            "unknown_statement": content.get("unknown_statement"),
+                            "content_ref": question.content_ref,
+                            "content_hash": question.content_hash,
+                            "schema_ref": question.schema_ref,
+                            "question_receipt_ref": question.receipt.receipt_ref,
+                            "lifecycle_status": lifecycle["status"],
+                            "lifecycle_revision": lifecycle["revision"],
+                            "cycle_binding": _query_question_cycle_binding(
+                                foreground_query,
+                                foregrounds_by_quest,
+                                quest_ref=question.quest_ref,
+                                question_ref=question.question_ref,
+                            ),
+                        }
+                        if _is_exact_foreground_question(
+                            current_foreground,
+                            quest_ref=question.quest_ref,
+                            question_ref=question.question_ref,
+                        ):
+                            question_item["recent_accepted_result"] = (
+                                recent_accepted_result
+                            )
+                        question_tree_items.append(question_item)
                 except OwnerConflict as error:
                     question_tree_items = []
                     question_tree_reason = {"code": str(error)}
@@ -822,16 +827,17 @@ class PublicProjection:
             "runtime_observability": runtime_observability,
             "unavailable": _release_capabilities(),
         }
-        if idea_stage is not None:
-            snapshot["idea_stage"] = idea_stage
-        if plan_stage is not None and _plan_stage_is_public(plan_stage):
-            snapshot["plan_stage"] = plan_stage
-        if bundle_stage is not None and _bundle_stage_is_public(bundle_stage):
-            snapshot["bundle_stage"] = bundle_stage
-        if reasoning_stage is not None and _reasoning_stage_is_public(
-            reasoning_stage
+        for name, stage_projection in (
+            ("idea_stage", idea_stage),
+            ("plan_stage", plan_stage),
+            ("bundle_stage", bundle_stage),
+            ("reasoning_stage", reasoning_stage),
         ):
-            snapshot["reasoning_stage"] = reasoning_stage
+            if stage_projection is not None and _stage_projection_matches_foreground(
+                stage_projection,
+                current_foreground,
+            ):
+                snapshot[name] = stage_projection
         if self._autonomous_creation is not None:
             snapshot["autonomous_creation"] = {
                 "status": "ready",
@@ -908,18 +914,143 @@ def _query_current_quest_goal(
     }
 
 
-def _stage_projection_query_allowed(
+def _query_foreground_question(
+    research_graph: ResearchGraphInterface,
+    research_memory: ResearchMemoryInterface,
     foreground: dict[str, object] | None,
-    stage: str,
+    *,
+    graph_revision: int,
+) -> dict[str, object] | None:
+    """Read only the accepted Question named by the exact foreground."""
+
+    if not isinstance(foreground, dict):
+        return None
+    quest_ref = foreground.get("quest_ref")
+    question_ref = foreground.get("question_ref")
+    query = getattr(research_graph, "query_question_by_ref", None)
+    read_content = getattr(research_memory, "read_question_content", None)
+    if (
+        not isinstance(quest_ref, str)
+        or not quest_ref
+        or not isinstance(question_ref, str)
+        or not question_ref
+        or not callable(query)
+        or not callable(read_content)
+    ):
+        return None
+    question = query(question_ref)
+    if question is None:
+        return None
+    if (
+        getattr(question, "question_ref", None) != question_ref
+        or getattr(question, "quest_ref", None) != quest_ref
+        or not isinstance(getattr(question, "content_ref", None), str)
+        or not isinstance(getattr(question, "content_hash", None), str)
+    ):
+        return None
+    content = read_content(question.content_ref, question.content_hash)
+    if not isinstance(content, dict):
+        return None
+    summary: dict[str, object] = {
+        "quest_ref": quest_ref,
+        "question_ref": question_ref,
+        "graph_revision": graph_revision,
+    }
+    for field in (
+        "title",
+        "unknown_statement",
+        "answer_shape",
+        "applicability_scope",
+    ):
+        value = content.get(field)
+        if isinstance(value, str):
+            summary[field] = value
+    return summary
+
+
+def _stage_projection_matches_foreground(
+    projection: dict[str, object],
+    foreground: dict[str, object] | None,
 ) -> bool:
-    """Avoid querying stages that the exact foreground cannot have reached."""
+    """Reject a Stage projection that is explicitly bound to another Cycle."""
 
     if not isinstance(foreground, dict):
         return True
-    foreground_stage = foreground.get("stage")
-    if foreground_stage not in _STAGE_ORDER:
-        return True
-    return _STAGE_ORDER[stage] <= _STAGE_ORDER[foreground_stage]
+    expected_cycle_ref = foreground.get("cycle_ref")
+    expected_question_ref = foreground.get("question_ref")
+    expected_quest_ref = foreground.get("quest_ref")
+    if (
+        not isinstance(expected_cycle_ref, str)
+        or not expected_cycle_ref
+        or not isinstance(expected_question_ref, str)
+        or not expected_question_ref
+        or not isinstance(expected_quest_ref, str)
+        or not expected_quest_ref
+    ):
+        return False
+    eligibility = projection.get("eligibility")
+    if not isinstance(eligibility, dict):
+        return False
+    cycle_ref = eligibility.get("cycle_ref")
+    question_ref = eligibility.get("question_ref")
+    if cycle_ref is not None and cycle_ref != expected_cycle_ref:
+        return False
+    if question_ref is not None and question_ref != expected_question_ref:
+        return False
+    request = projection.get("stage_run_request")
+    binding = (
+        request.get("accepted_question_binding")
+        if isinstance(request, dict)
+        else None
+    )
+    if isinstance(binding, dict) and (
+        binding.get("quest_ref") != expected_quest_ref
+        or binding.get("question_ref") != expected_question_ref
+    ):
+        return False
+    return True
+
+
+def _recent_accepted_stage_result(
+    foreground: dict[str, object] | None,
+    *,
+    idea_stage: dict[str, object] | None,
+    plan_stage: dict[str, object] | None,
+    bundle_stage: dict[str, object] | None,
+    reasoning_stage: dict[str, object] | None,
+) -> dict[str, object] | None:
+    """Choose one accepted same-Cycle fact by a fixed, non-temporal priority."""
+
+    for projection, field in (
+        (reasoning_stage, "reasoning_acceptance"),
+        (bundle_stage, "bundle_report"),
+        (plan_stage, "plan_acceptance"),
+        (idea_stage, "outcome_acceptance"),
+    ):
+        if (
+            projection is None
+            or not _stage_projection_matches_foreground(projection, foreground)
+        ):
+            continue
+        result = projection.get(field)
+        if isinstance(result, dict) and result.get("status") == "accepted":
+            return dict(result)
+    return None
+
+
+def _is_exact_foreground_question(
+    foreground: dict[str, object] | None,
+    *,
+    quest_ref: str,
+    question_ref: str,
+) -> bool:
+    return (
+        isinstance(foreground, dict)
+        and foreground.get("quest_ref") == quest_ref
+        and foreground.get("question_ref") == question_ref
+        and isinstance(foreground.get("cycle_ref"), str)
+        and bool(foreground["cycle_ref"])
+    )
 
 
 def _query_question_cycle_binding(
@@ -1092,79 +1223,6 @@ def _question_binding_document(
         **({} if waiter_ref is None else {"waiter_ref": waiter_ref}),
         "field": field,
         "ref": ref,
-    }
-
-
-def _plan_stage_is_public(projection: dict[str, object]) -> bool:
-    """Publish Plan only after the accepted IdeaSet makes it actionable.
-
-    An empty, ineligible Plan projection must not displace the still-current Idea
-    experience in the fixed public shell.  Once eligibility is established, any
-    durable downstream boundary keeps Plan visible through recovery and commit.
-    """
-
-    eligibility = projection.get("eligibility")
-    if isinstance(eligibility, dict) and eligibility.get("status") in {
-        "eligible",
-        "requested",
-        "consumed",
-    }:
-        return True
-    if any(
-        projection.get(field) is not None
-        for field in (
-            "stage_run_request",
-            "run",
-            "stage_commit",
-        )
-    ):
-        return True
-    acceptance = projection.get("plan_acceptance")
-    return isinstance(acceptance, dict) and acceptance.get("status") not in {
-        None,
-        "not_attempted",
-    }
-
-
-def _bundle_stage_is_public(projection: dict[str, object]) -> bool:
-    """Publish Bundle once an accepted FormalPlan makes it actionable."""
-
-    eligibility = projection.get("eligibility")
-    if isinstance(eligibility, dict) and eligibility.get("status") == "eligible":
-        return True
-    target_graph = projection.get("target_graph")
-    return (
-        any(
-            projection.get(field) is not None
-            for field in ("stage_run_request", "run", "stage_commit")
-        )
-        or (
-            isinstance(target_graph, dict)
-            and target_graph.get("status") != "not_attempted"
-        )
-        or bool(projection.get("target_commits"))
-    )
-
-
-def _reasoning_stage_is_public(projection: dict[str, object]) -> bool:
-    """Publish Reasoning only once the routed closure is actionable."""
-
-    eligibility = projection.get("eligibility")
-    if isinstance(eligibility, dict) and eligibility.get("status") in {
-        "eligible",
-        "requested",
-        "consumed",
-    }:
-        return True
-    if any(
-        projection.get(field) is not None
-        for field in ("stage_run_request", "run", "stage_commit")
-    ):
-        return True
-    acceptance = projection.get("reasoning_acceptance")
-    return isinstance(acceptance, dict) and acceptance.get("status") not in {
-        None,
-        "not_attempted",
     }
 
 

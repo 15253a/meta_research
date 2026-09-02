@@ -518,8 +518,8 @@ export type QuestionTreeItem = {
   content_hash: string;
   schema_ref: string;
   question_receipt_ref: string;
-  lifecycle_status: "active" | "pruned";
-  lifecycle_revision: number;
+  lifecycle_status: "active" | "pruned" | "unavailable";
+  lifecycle_revision: number | null;
   cycle_binding: {
     status: "bound" | "not_bound" | "unavailable";
     cycle_ref: string | null;
@@ -554,6 +554,21 @@ export type QuestionTreeItem = {
       }>;
     }>;
     reason: { code: string } | null;
+  };
+  recent_accepted_result?: null | {
+    status: string;
+    source?: string;
+    stage?: string;
+    kind?: string;
+    result_ref?: string | null;
+    report_ref?: string | null;
+    formal_plan_ref?: string | null;
+    outcome_ref?: string | null;
+    idea_set_ref?: string | null;
+    disposition?: string | null;
+    accepted_at?: number | null;
+    reason?: null | { code?: string; [key: string]: unknown };
+    [key: string]: unknown;
   };
 };
 

@@ -49,7 +49,7 @@ def test_bundle_stage_is_daemon_owned_and_has_a_read_only_current_endpoint(
             snapshot = client.get("/api/v1/snapshot").json()
             checks = {check["name"]: check for check in snapshot["readiness"]["checks"]}
             assert checks["bundle_stage_worker"]["status"] == "ready"
-            assert "bundle_stage" not in snapshot
+            assert snapshot["bundle_stage"] == runtime.bundle_stage.query_current()
 
             eligible = {
                 "eligibility": {

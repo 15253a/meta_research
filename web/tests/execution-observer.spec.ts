@@ -564,6 +564,7 @@ test("current Fence auto-presents once, remains reopenable, and exposes honest o
 
   await autoClose.click();
   await expect(observer).toBeHidden();
+  await expect(observer.getByRole("log")).toHaveCount(0);
   await expect(
     page.locator("[data-execution-observer-entry]:visible").first(),
   ).toBeFocused();

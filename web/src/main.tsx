@@ -451,9 +451,18 @@ function useStableQuestionTreeItems(
   graphRevision: number | null,
 ): readonly QuestionTreeItem[] {
   const cache = useRef<{ key: string; items: readonly QuestionTreeItem[] } | null>(null);
-  const key = graphRevision === null
-    ? items.map((item) => item.question_ref).join("|")
-    : String(graphRevision);
+  const key = JSON.stringify({
+    graphRevision,
+    items: items.map((item) => ({
+      questionRef: item.question_ref,
+      parentQuestionRef: item.parent_question_ref,
+      lifecycleStatus: item.lifecycle_status,
+      lifecycleRevision: item.lifecycle_revision,
+      cycleBinding: item.cycle_binding,
+      relatedHumanRequests: item.related_human_requests,
+      recentAcceptedResult: item.recent_accepted_result,
+    })),
+  });
   if (cache.current?.key !== key) cache.current = { key, items };
   return cache.current?.items ?? items;
 }
@@ -577,6 +586,7 @@ function LumenRail({
   onBrowseAssets,
   onBrowseWriting,
   onBrowseHumanRequests,
+  onOverview,
 }: {
   canCreate: boolean;
   canBrowseAssets: boolean;
@@ -599,10 +609,16 @@ function LumenRail({
   onBrowseQuestions: () => void;
   onBrowseHistory: () => void;
   onBrowseHumanRequests: () => void;
+  onOverview: () => void;
 }) {
   return (
     <nav className="lumen-rail" aria-label="主导航" data-shell-region="rail">
-      <RailButton label="Quest 总览" glyph="⌂" active={!questionsActive && !writingOpen} />
+      <RailButton
+        label="Quest 总览"
+        glyph="⌂"
+        active={!questionsActive && !writingOpen}
+        onClick={onOverview}
+      />
       <RailButton
         label="问题树"
         glyph="树"
@@ -697,31 +713,178 @@ type CurrentStageSurface =
   | { kind: "Bundle"; projection: BundleStageProjection }
   | { kind: "Reasoning"; projection: ReasoningStageProjection };
 
+type StagePosition = Lowercase<CurrentStageSurface["kind"]>;
+type StagePositionState =
+  | "current"
+  | "result"
+  | "skipped"
+  | "recorded"
+  | "not-entered"
+  | "no-record"
+  | "unavailable";
+
+const stagePositions: Array<{
+  kind: CurrentStageSurface["kind"];
+  position: StagePosition;
+  purpose: string;
+}> = [
+  { kind: "Idea", position: "idea", purpose: "形成候选解释" },
+  { kind: "Plan", position: "plan", purpose: "设计验证路线" },
+  { kind: "Bundle", position: "bundle", purpose: "收集实验与证据" },
+  { kind: "Reasoning", position: "reasoning", purpose: "综合证据形成判断" },
+];
+
 type ResearchActivitySignal = {
   eventType: string;
   revision: number;
   observedAt: number;
 };
 
-function currentStageSurface(snapshot: PublicSnapshot): CurrentStageSurface | null {
-  const candidates: CurrentStageSurface[] = [];
-  if (snapshot.reasoning_stage) {
-    candidates.push({ kind: "Reasoning", projection: snapshot.reasoning_stage });
+function stageProjectionMatchesForeground(
+  projection: CurrentStageSurface["projection"],
+  foreground: NonNullable<PublicSnapshot["research_control"]["foreground"]>,
+): boolean {
+  const eligibility = projection.eligibility;
+  if (
+    eligibility.cycle_ref != null
+    && eligibility.cycle_ref !== foreground.cycle_ref
+  ) return false;
+  if (
+    eligibility.question_ref != null
+    && eligibility.question_ref !== foreground.question_ref
+  ) return false;
+  const request = projection.stage_run_request;
+  if (request?.cycle_ref && request.cycle_ref !== foreground.cycle_ref) return false;
+  const binding = request?.accepted_question_binding;
+  if (binding?.question_ref && binding.question_ref !== foreground.question_ref) {
+    return false;
   }
-  if (snapshot.bundle_stage) {
-    candidates.push({ kind: "Bundle", projection: snapshot.bundle_stage });
+  if (binding?.quest_ref && binding.quest_ref !== foreground.quest_ref) return false;
+  return true;
+}
+
+function allStageSurfaces(snapshot: PublicSnapshot): CurrentStageSurface[] {
+  const candidates: CurrentStageSurface[] = [];
+  if (snapshot.idea_stage) {
+    candidates.push({ kind: "Idea", projection: snapshot.idea_stage });
   }
   if (snapshot.plan_stage) {
     candidates.push({ kind: "Plan", projection: snapshot.plan_stage });
   }
-  if (snapshot.idea_stage) {
-    candidates.push({ kind: "Idea", projection: snapshot.idea_stage });
+  if (snapshot.bundle_stage) {
+    candidates.push({ kind: "Bundle", projection: snapshot.bundle_stage });
+  }
+  if (snapshot.reasoning_stage) {
+    candidates.push({ kind: "Reasoning", projection: snapshot.reasoning_stage });
+  }
+  const foreground = snapshot.research_control.foreground;
+  return foreground
+    ? candidates.filter((candidate) => (
+        stageProjectionMatchesForeground(candidate.projection, foreground)
+      ))
+    : candidates;
+}
+
+function currentStageSurface(snapshot: PublicSnapshot): CurrentStageSurface | null {
+  const candidates = allStageSurfaces(snapshot);
+  const foreground = snapshot.research_control.foreground;
+  if (snapshot.research_control.status === "ready") {
+    if (!foreground) return null;
+    return candidates.find(
+      (candidate) => candidate.kind.toLowerCase() === foreground.stage.toLowerCase(),
+    ) ?? null;
   }
   return candidates.find(
     (candidate) => ["eligible", "requested"].includes(
       candidate.projection.eligibility.status,
     ),
   ) ?? candidates[0] ?? null;
+}
+
+function exactForegroundQuestion(snapshot: PublicSnapshot): IdeaQuestionSummary | null {
+  const foreground = snapshot.research_control.foreground;
+  if (!foreground) return null;
+  const projected = snapshot.research_space.current_question;
+  if (
+    projected?.question_ref === foreground.question_ref
+    && (!projected.quest_ref || projected.quest_ref === foreground.quest_ref)
+  ) {
+    return {
+      ...projected,
+      quest_ref: foreground.quest_ref,
+      question_ref: foreground.question_ref,
+    };
+  }
+  if (snapshot.question_tree.status !== "ready") return null;
+  const item = snapshot.question_tree.items.find(
+    (candidate) => (
+      candidate.quest_ref === foreground.quest_ref
+      && candidate.question_ref === foreground.question_ref
+    ),
+  );
+  return item ? {
+    quest_ref: item.quest_ref,
+    question_ref: item.question_ref,
+    graph_revision: snapshot.owners.research_graph?.revision,
+    title: item.title ?? undefined,
+    unknown_statement: item.unknown_statement ?? undefined,
+  } : null;
+}
+
+function stagePositionState(
+  surface: CurrentStageSurface | null,
+  foreground: NonNullable<PublicSnapshot["research_control"]["foreground"]>,
+  position: StagePosition,
+): StagePositionState {
+  if (!surface) return "unavailable";
+  if (foreground.stage.toLowerCase() === position) return "current";
+  const projection = surface.projection;
+  const reason = projection.eligibility.reason?.code ?? "";
+  const bundleDisposition = surface.kind === "Bundle"
+    ? surface.projection.disposition
+    : null;
+  const commitDisposition = surface.kind === "Bundle"
+    ? surface.projection.stage_commit?.disposition
+    : surface.kind === "Reasoning"
+      ? surface.projection.stage_commit?.disposition
+      : undefined;
+  if (
+    projection.eligibility.status === "skipped"
+    || reason.includes("skip")
+    || reason === "no_new_experiment_required"
+    || bundleDisposition?.status === "skipped"
+    || commitDisposition === "skipped"
+  ) return "skipped";
+  if (projection.stage_commit) return "result";
+  if (
+    (surface.kind === "Idea" && surface.projection.outcome_acceptance.status === "accepted")
+    || (surface.kind === "Plan" && surface.projection.plan_acceptance.status === "accepted")
+    || (surface.kind === "Reasoning" && surface.projection.reasoning_acceptance.status === "accepted")
+    || (surface.kind === "Bundle" && surface.projection.target_commits.length > 0)
+  ) return "result";
+  if (projection.run || projection.stage_run_request) return "recorded";
+  const foregroundIndex = stagePositions.findIndex(
+    (item) => item.position === foreground.stage.toLowerCase(),
+  );
+  const positionIndex = stagePositions.findIndex((item) => item.position === position);
+  if (
+    projection.eligibility.status === "not_eligible"
+    && foregroundIndex >= 0
+    && positionIndex > foregroundIndex
+  ) return "not-entered";
+  return "no-record";
+}
+
+function stagePositionCopy(state: StagePositionState): string {
+  return {
+    current: "当前研究位置",
+    result: "已有正式结果",
+    skipped: "本 Cycle 明确跳过",
+    recorded: "已有运行记录",
+    "not-entered": "本 Cycle 尚未进入",
+    "no-record": "本 Cycle 没有记录",
+    unavailable: "事实暂不可用",
+  }[state];
 }
 
 function researchWorkCopy(stage: CurrentStageSurface | null): {
@@ -949,6 +1112,86 @@ function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
   );
 }
 
+type ResearchActivityItem = {
+  ref: string;
+  source: string;
+  status: string;
+  updatedAt: number | null;
+};
+
+function managedRunActivity(
+  run: PublicSnapshot["research_control"]["managed_runs"][number],
+): ResearchActivityItem {
+  return {
+    ref: run.run_ref,
+    source: run.run_kind,
+    status: run.status,
+    updatedAt: run.updated_at,
+  };
+}
+
+function activityObservedAt(updatedAt: number | null): string {
+  if (updatedAt === null) return "更新时间未记录";
+  const milliseconds = updatedAt < 10_000_000_000 ? updatedAt * 1_000 : updatedAt;
+  return `更新 ${new Date(milliseconds).toLocaleString()}`;
+}
+
+function ResearchActivityLane({
+  name,
+  items,
+  emptyCopy,
+}: {
+  name: "当前阶段" | "资料获取" | "实验任务";
+  items: ResearchActivityItem[];
+  emptyCopy: string;
+}) {
+  const pageSize = 3;
+  const [page, setPage] = useState(0);
+  const maxPage = Math.max(0, Math.ceil(items.length / pageSize) - 1);
+  const boundedPage = Math.min(page, maxPage);
+  const visible = items.slice(boundedPage * pageSize, (boundedPage + 1) * pageSize);
+
+  useEffect(() => {
+    if (page > maxPage) setPage(maxPage);
+  }, [maxPage, page]);
+
+  return (
+    <section className="lumen-activity-lane" aria-label={name}>
+      <header>
+        <b>{name}</b>
+        <small>{items.length ? `${items.length} 条来源事实` : "没有来源事实"}</small>
+      </header>
+      {visible.length ? (
+        <ul>
+          {visible.map((item) => (
+            <li key={`${item.source}:${item.ref}`}>
+              <span><b>{item.ref}</b><small>{item.source}</small></span>
+              <code>{item.status}</code>
+              <time>{activityObservedAt(item.updatedAt)}</time>
+            </li>
+          ))}
+        </ul>
+      ) : <p>{emptyCopy}</p>}
+      <p className="lumen-activity-capture-note">暂无可观察输出；静默不等于根 Agent 已停止。</p>
+      {items.length > pageSize ? (
+        <nav aria-label={`${name}分页`}>
+          <button
+            type="button"
+            disabled={boundedPage === 0}
+            onClick={() => setPage((current) => Math.max(0, current - 1))}
+          >返回上一页</button>
+          <small>{boundedPage + 1} / {maxPage + 1}</small>
+          <button
+            type="button"
+            disabled={boundedPage >= maxPage}
+            onClick={() => setPage((current) => Math.min(maxPage, current + 1))}
+          >读取下一页</button>
+        </nav>
+      ) : null}
+    </section>
+  );
+}
+
 function ResearchTracePanel({
   snapshot,
   latestActivity,
@@ -965,6 +1208,31 @@ function ResearchTracePanel({
   const work = researchWorkCopy(stage);
   const product = researchProductCopy(stage);
   const lastObservedAt = latestActivity?.observedAt ?? observedSince;
+  const foreground = snapshot.research_control.foreground;
+  const scopedRuns = foreground
+    ? snapshot.research_control.managed_runs.filter((run) => (
+        run.quest_ref === foreground.quest_ref
+        && run.cycle_ref === foreground.cycle_ref
+      ))
+    : [];
+  const normalizedForegroundStage = foreground?.stage.toLowerCase().replace(/[^a-z]/g, "") ?? "";
+  const currentStageRuns = scopedRuns.filter((run) => {
+    const kind = run.run_kind.toLowerCase().replace(/[^a-z]/g, "");
+    return normalizedForegroundStage !== "" && kind.includes(normalizedForegroundStage);
+  }).map(managedRunActivity);
+  const acquisitionRuns = scopedRuns.filter((run) => (
+    /deepfetch|acquisition/i.test(run.run_kind)
+  )).map(managedRunActivity);
+  const targetRuns = scopedRuns.filter((run) => (
+    /target/i.test(run.run_kind)
+  )).map(managedRunActivity);
+  const sortActivity = (left: ResearchActivityItem, right: ResearchActivityItem) => (
+    (right.updatedAt ?? -1) - (left.updatedAt ?? -1)
+    || left.ref.localeCompare(right.ref)
+  );
+  currentStageRuns.sort(sortActivity);
+  acquisitionRuns.sort(sortActivity);
+  targetRuns.sort(sortActivity);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1_000);
@@ -1017,6 +1285,29 @@ function ResearchTracePanel({
           </div>
         </article>
       </div>
+      <section className="lumen-activity-sources" aria-label="研究活动来源">
+        <header>
+          <b>按来源查看研究活动</b>
+          <small>各来源保留自己的边界，不建立跨来源总顺序</small>
+        </header>
+        <div>
+          <ResearchActivityLane
+            name="当前阶段"
+            items={currentStageRuns}
+            emptyCopy="当前 Stage 暂无托管运行记录。"
+          />
+          <ResearchActivityLane
+            name="资料获取"
+            items={acquisitionRuns}
+            emptyCopy="DeepFetch / Acquisition 暂无托管运行记录。"
+          />
+          <ResearchActivityLane
+            name="实验任务"
+            items={targetRuns}
+            emptyCopy="当前 Cycle 暂无 Target 托管运行记录。"
+          />
+        </div>
+      </section>
       <details className="lumen-trace-technical">
         <summary>查看系统核验细节</summary>
         <ReturnSummary snapshot={snapshot} />
@@ -1025,6 +1316,66 @@ function ResearchTracePanel({
         ) : null}
       </details>
     </section>
+  );
+}
+
+function CurrentCycleOverview({ snapshot }: { snapshot: PublicSnapshot }) {
+  const foreground = snapshot.research_control.foreground;
+  if (!foreground) return null;
+  const question = exactForegroundQuestion(snapshot);
+  const surfaces = allStageSurfaces(snapshot);
+  const currentPurpose = stagePositions.find(
+    (item) => item.position === foreground.stage.toLowerCase(),
+  )?.purpose ?? "继续当前研究";
+
+  return (
+    <div
+      className="lumen-current-cycle"
+      data-testid="current-cycle-overview"
+      data-cycle-ref={foreground.cycle_ref}
+      data-question-ref={foreground.question_ref}
+    >
+      <p className="lumen-eyebrow">当前 Cycle · 可信研究现场</p>
+      <h1 id="workspace-title">
+        {question?.title ?? question?.unknown_statement ?? "当前研究问题"}<br />
+        <em>{currentPurpose}</em>
+      </h1>
+      <p>
+        当前攻克 <b>{foreground.question_ref}</b> · Cycle <b>{foreground.cycle_ref}</b>
+      </p>
+      <ol
+        className="lumen-cycle-stage-map"
+        aria-label="当前 Cycle 的四个可能 Stage"
+      >
+        {stagePositions.map(({ kind, position, purpose }) => {
+          const surface = surfaces.find((candidate) => candidate.kind === kind) ?? null;
+          const state = stagePositionState(surface, foreground, position);
+          return (
+            <li
+              key={position}
+              data-stage-position={position}
+              data-stage-state={state}
+              data-cycle-ref={foreground.cycle_ref}
+            >
+              <small>{kind} · 可能位置</small>
+              <b>{stagePositionCopy(state)}</b>
+              <span>{purpose}</span>
+              {surface ? (
+                <details>
+                  <summary>验证详情</summary>
+                  <code>
+                    {surface.projection.eligibility.status}
+                    {surface.projection.stage_commit?.commit_ref
+                      ? ` · ${surface.projection.stage_commit.commit_ref}`
+                      : ""}
+                  </code>
+                </details>
+              ) : null}
+            </li>
+          );
+        })}
+      </ol>
+    </div>
   );
 }
 
@@ -1080,6 +1431,13 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
         </div>
       </>
     );
+  }
+
+  if (
+    snapshot.research_control.status === "ready"
+    && snapshot.research_control.foreground
+  ) {
+    return <CurrentCycleOverview snapshot={snapshot} />;
   }
 
   if (stageSurface?.kind === "Reasoning") {
@@ -2283,20 +2641,6 @@ function validateTargetRawOutputPage(
   }
 }
 
-function mergeTargetRawOutputPage(
-  current: TargetRawTerminalState | null,
-  incoming: TargetRawOutputPage,
-): TargetRawTerminalState {
-  if (!current || current.stream_ref !== incoming.stream_ref) return incoming;
-  if (incoming.offset !== current.next_offset) {
-    throw new ProductError("target_raw_output_cursor_invalid");
-  }
-  return {
-    ...incoming,
-    text: current.text + incoming.text,
-  };
-}
-
 function BundleTargetCard({
   target,
   targetCommit,
@@ -2351,6 +2695,7 @@ function TargetTerminalDialog({
   observationPointer,
   minimized,
   blockedByHumanRequest,
+  activityPaused,
   onMinimize,
   onClose,
 }: {
@@ -2358,26 +2703,36 @@ function TargetTerminalDialog({
   observationPointer: TargetRootObservationPointer | null;
   minimized: boolean;
   blockedByHumanRequest: boolean;
+  activityPaused: boolean;
   onMinimize: () => void;
   onClose: () => void;
 }) {
   const [terminal, setTerminal] = useState<TargetRawTerminalState | null>(null);
   const [loading, setLoading] = useState(false);
   const [terminalError, setTerminalError] = useState<string | null>(null);
+  const [previousOffsets, setPreviousOffsets] = useState<number[]>([]);
+  const [documentVisible, setDocumentVisible] = useState(
+    () => document.visibilityState !== "hidden",
+  );
   const terminalRef = useRef<TargetRawTerminalState | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
   const requestSequence = useRef(0);
+  const paused = minimized
+    || blockedByHumanRequest
+    || activityPaused
+    || !documentVisible;
 
-  const loadRawOutput = useCallback(async (restart: boolean) => {
-    if (!restart && activeRequest.current !== null) return;
+  const loadRawOutput = useCallback(async (
+    after: number,
+    direction: "reset" | "next" | "previous" | "refresh",
+  ) => {
+    if (activeRequest.current !== null) return;
     const request = requestSequence.current + 1;
     requestSequence.current = request;
-    if (restart) activeRequest.current?.abort();
     const controller = new AbortController();
     activeRequest.current = controller;
-    let current = restart ? null : terminalRef.current;
-    let after = current?.next_offset ?? 0;
-    setLoading(current === null);
+    const current = terminalRef.current;
+    setLoading(current === null || direction !== "refresh");
     try {
       let page: TargetRawOutputPage;
       try {
@@ -2388,27 +2743,28 @@ function TargetTerminalDialog({
         });
       } catch (caught) {
         if (
-          !current
-          || after === 0
+          after === 0
           || !(caught instanceof ProductError)
           || caught.code !== "target_raw_output_cursor_stale"
         ) throw caught;
-        current = null;
         after = 0;
+        direction = "reset";
         page = await fetchTargetRawOutput(target.target_ref, {
           after,
           limit: targetRawOutputPageSize,
           signal: controller.signal,
         });
       }
-      if (current && page.stream_ref !== current.stream_ref && after !== 0) {
-        current = null;
-        after = 0;
-        page = await fetchTargetRawOutput(target.target_ref, {
-          after,
-          limit: targetRawOutputPageSize,
-          signal: controller.signal,
-        });
+      if (current && page.stream_ref !== current.stream_ref) {
+        if (after !== 0) {
+          after = 0;
+          page = await fetchTargetRawOutput(target.target_ref, {
+            after,
+            limit: targetRawOutputPageSize,
+            signal: controller.signal,
+          });
+        }
+        direction = "reset";
       }
       validateTargetRawOutputPage(
         page,
@@ -2417,9 +2773,15 @@ function TargetTerminalDialog({
         after,
       );
       if (request !== requestSequence.current) return;
-      const next = mergeTargetRawOutputPage(current, page);
-      terminalRef.current = next;
-      setTerminal(next);
+      if (direction === "next" && current) {
+        setPreviousOffsets((offsets) => [...offsets, current.offset]);
+      } else if (direction === "previous") {
+        setPreviousOffsets((offsets) => offsets.slice(0, -1));
+      } else if (direction === "reset") {
+        setPreviousOffsets([]);
+      }
+      terminalRef.current = page;
+      setTerminal(page);
       setTerminalError(null);
     } catch (caught) {
       if ((caught as Error).name === "AbortError") return;
@@ -2437,24 +2799,48 @@ function TargetTerminalDialog({
   }, [target.target_ref, target.target_run_ref]);
 
   useEffect(() => {
+    const handleVisibility = () => {
+      setDocumentVisible(document.visibilityState !== "hidden");
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, []);
+
+  useEffect(() => {
     terminalRef.current = null;
     setTerminal(null);
+    setPreviousOffsets([]);
     setTerminalError(null);
-    void loadRawOutput(true);
     return () => {
       requestSequence.current += 1;
       activeRequest.current?.abort();
       activeRequest.current = null;
     };
-  }, [loadRawOutput]);
+  }, [target.target_ref]);
 
   useEffect(() => {
+    if (paused) {
+      requestSequence.current += 1;
+      activeRequest.current?.abort();
+      activeRequest.current = null;
+      setLoading(false);
+      return;
+    }
+    const current = terminalRef.current;
+    void loadRawOutput(current?.offset ?? 0, current ? "refresh" : "reset");
+  }, [loadRawOutput, paused]);
+
+  useEffect(() => {
+    if (paused) return;
     if (observationPointer?.target_ref !== target.target_ref) return;
-    void loadRawOutput(false);
+    const current = terminalRef.current;
+    if (!current || current.has_more) return;
+    void loadRawOutput(current.offset, "refresh");
   }, [
     loadRawOutput,
     observationPointer?.head_cursor,
     observationPointer?.target_ref,
+    paused,
     target.target_ref,
   ]);
 
@@ -2467,27 +2853,22 @@ function TargetTerminalDialog({
   ].includes(target.status.toLowerCase());
   useEffect(() => {
     if (
-      loading
-      || !(
-        terminal?.has_more
-        || terminal?.status === "live"
-        || (!terminal && targetMayStillProduceOutput)
-      )
+      paused
+      || loading
+      || terminal?.has_more
+      || !(terminal?.status === "live" || (!terminal && targetMayStillProduceOutput))
     ) return;
-    const madeProgress = Boolean(
-      terminal && terminal.next_offset > terminal.offset,
-    );
-    const delay = terminal?.has_more && madeProgress
-      ? 0
-      : targetRawOutputPollMilliseconds;
-    const timer = window.setTimeout(() => void loadRawOutput(false), delay);
+    const timer = window.setTimeout(() => {
+      const current = terminalRef.current;
+      void loadRawOutput(current?.offset ?? 0, current ? "refresh" : "reset");
+    }, targetRawOutputPollMilliseconds);
     return () => window.clearTimeout(timer);
   }, [
     loadRawOutput,
     loading,
+    paused,
     targetMayStillProduceOutput,
     terminal?.has_more,
-    terminal?.next_offset,
     terminal?.offset,
     terminal?.status,
     terminalError,
@@ -2550,7 +2931,13 @@ function TargetTerminalDialog({
               <code>{terminalError}</code>
               <button
                 type="button"
-                onClick={() => void loadRawOutput(terminalRef.current === null)}
+                onClick={() => {
+                  const current = terminalRef.current;
+                  void loadRawOutput(
+                    current?.offset ?? 0,
+                    current ? "refresh" : "reset",
+                  );
+                }}
               >
                 继续读取
               </button>
@@ -2572,9 +2959,27 @@ function TargetTerminalDialog({
           {terminal ? (
             <footer>
               <small>
-                {atHead ? "已追到当前 spool" : "正在读取后续字节"}
+                {atHead ? "已追到当前 spool" : "还有后续页，可按需读取"}
                 {` · ${terminal.mapped_bytes} mapped / ${terminal.source_bytes} source bytes`}
               </small>
+              <nav aria-label="原始输出分页">
+                <button
+                  type="button"
+                  disabled={loading || previousOffsets.length === 0}
+                  onClick={() => {
+                    const previous = previousOffsets.at(-1);
+                    if (previous !== undefined) {
+                      void loadRawOutput(previous, "previous");
+                    }
+                  }}
+                >返回上一页</button>
+                <code>{terminal.offset}–{terminal.next_offset}</code>
+                <button
+                  type="button"
+                  disabled={loading || !terminal.has_more}
+                  onClick={() => void loadRawOutput(terminal.next_offset, "next")}
+                >读取下一页</button>
+              </nav>
             </footer>
           ) : null}
         </div>
@@ -2589,12 +2994,14 @@ function BundleStageCard({
   healthBlocker,
   observationPointers,
   humanRequestModalOpen,
+  activityPaused,
   runtimeControl,
 }: {
   bundleStage: BundleStageProjection;
   healthBlocker: IdeaStageHealthBlocker | null;
   observationPointers: Record<string, TargetRootObservationPointer>;
   humanRequestModalOpen: boolean;
+  activityPaused: boolean;
   runtimeControl: ReactNode;
 }) {
   const phase = currentBundleStageState(bundleStage);
@@ -2607,7 +3014,14 @@ function BundleStageCard({
   const formalPlan = request?.accepted_formal_plan_binding ?? {};
   const [terminalTargetRef, setTerminalTargetRef] = useState<string | null>(null);
   const [terminalMinimized, setTerminalMinimized] = useState(false);
-  const automaticallyOpenedRuns = useRef<Set<string>>(new Set());
+  const [targetPage, setTargetPage] = useState(0);
+  const targetPageSize = 6;
+  const targetPageCount = Math.max(1, Math.ceil(graph.targets.length / targetPageSize));
+  const boundedTargetPage = Math.min(targetPage, targetPageCount - 1);
+  const visibleTargets = graph.targets.slice(
+    boundedTargetPage * targetPageSize,
+    (boundedTargetPage + 1) * targetPageSize,
+  );
   const terminalTarget = graph.targets.find(
     (target) => target.target_ref === terminalTargetRef,
   ) ?? null;
@@ -2617,18 +3031,8 @@ function BundleStageCard({
   }, [terminalTarget, terminalTargetRef]);
 
   useEffect(() => {
-    if (terminalTargetRef) return;
-    const candidate = graph.targets.find((target) => {
-      const status = target.status.toLowerCase();
-      return Boolean(target.target_run_ref)
-        && !automaticallyOpenedRuns.current.has(target.target_run_ref as string)
-        && !["committed", "failed", "blocked", "fenced", "cancelled"].includes(status);
-    });
-    if (!candidate?.target_run_ref) return;
-    automaticallyOpenedRuns.current.add(candidate.target_run_ref);
-    setTerminalTargetRef(candidate.target_ref);
-    setTerminalMinimized(false);
-  }, [graph.targets, terminalTargetRef]);
+    if (targetPage >= targetPageCount) setTargetPage(targetPageCount - 1);
+  }, [targetPage, targetPageCount]);
 
   return (
     <section
@@ -2680,7 +3084,7 @@ function BundleStageCard({
       </details>
       {graph.targets.length ? (
         <div className="lumen-bundle-targets" data-testid="bundle-target-list">
-          {graph.targets.map((target) => {
+          {visibleTargets.map((target) => {
             const targetCommit = bundleStage.target_commits.find(
               (candidate) => candidate.target_ref === target.target_ref,
             );
@@ -2697,6 +3101,21 @@ function BundleStageCard({
               />
             );
           })}
+          {targetPageCount > 1 ? (
+            <nav className="lumen-bundle-target-pagination" aria-label="实验任务分页">
+              <button
+                type="button"
+                disabled={boundedTargetPage === 0}
+                onClick={() => setTargetPage((current) => Math.max(0, current - 1))}
+              >返回上一页</button>
+              <small>{boundedTargetPage + 1} / {targetPageCount}</small>
+              <button
+                type="button"
+                disabled={boundedTargetPage === targetPageCount - 1}
+                onClick={() => setTargetPage((current) => Math.min(targetPageCount - 1, current + 1))}
+              >读取下一页</button>
+            </nav>
+          ) : null}
         </div>
       ) : null}
       {terminalTarget ? (
@@ -2706,6 +3125,7 @@ function BundleStageCard({
           observationPointer={observationPointers[terminalTarget.target_ref] ?? null}
           minimized={terminalMinimized}
           blockedByHumanRequest={humanRequestModalOpen}
+          activityPaused={activityPaused}
           onMinimize={() => setTerminalMinimized((current) => !current)}
           onClose={() => setTerminalTargetRef(null)}
         />
@@ -3501,6 +3921,7 @@ function WorkspaceMain({
             healthBlocker={bundleHealthBlocker}
             observationPointers={targetRootObservationPointers}
             humanRequestModalOpen={humanRequestModalOpen}
+            activityPaused={hidden}
             runtimeControl={runtimeControl}
           />
         ) : planStage ? (
@@ -3996,6 +4417,25 @@ function App() {
   const verificationWorkerReady = snapshot?.readiness.checks.find(
     (check) => check.name === "research_asset_verification_worker",
   )?.status === "ready";
+  const openOverview = () => {
+    setCreationMode(null);
+    setAssetsOpen(false);
+    setWritingOpen(false);
+    setQuestionTreeOpen(false);
+    setQuestCompletionLanding(null);
+    setManualPanel(null);
+    setManualOpenError(null);
+    setQuestionInspectorMode(null);
+    setQuestionRouteNodeRef(null);
+    setSelectedQuestionContext(null);
+    setPendingDirectManualParentRef(null);
+    if (currentOpenRequests.length === 0) {
+      setHumanRequestsOpen(false);
+      setHumanRequestRouteKind(null);
+      setSelectedHumanRequestRef(null);
+    }
+    window.history.replaceState(null, "", "/");
+  };
   const openCreation = () => {
     if (!canCreate) return;
     const currentCreation = restorableQuestCreation(
@@ -4468,6 +4908,7 @@ function App() {
           onBrowseAssets={openAssets}
           onBrowseWriting={openWriting}
           onBrowseHumanRequests={() => openHumanRequests()}
+          onOverview={openOverview}
         />
         <WorkspaceMain
           snapshot={snapshot}

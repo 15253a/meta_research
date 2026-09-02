@@ -48,7 +48,7 @@ def test_plan_stage_is_daemon_owned_and_has_a_read_only_current_endpoint(
                 check["name"]: check for check in snapshot["readiness"]["checks"]
             }
             assert checks["plan_stage_worker"]["status"] == "ready"
-            assert "plan_stage" not in snapshot
+            assert snapshot["plan_stage"] == runtime.plan_stage.query_current()
 
             eligible = {
                 "eligibility": {
@@ -82,7 +82,9 @@ def test_plan_stage_is_daemon_owned_and_has_a_read_only_current_endpoint(
             runtime.plan_stage.query_current = (  # type: ignore[method-assign]
                 lambda: routed_to_reasoning
             )
-            assert "plan_stage" not in client.get("/api/v1/snapshot").json()
+            assert client.get("/api/v1/snapshot").json()[
+                "plan_stage"
+            ] == routed_to_reasoning
 
             # Admission and execution belong to the daemon.  The public Web
             # intentionally exposes no per-Run start command.

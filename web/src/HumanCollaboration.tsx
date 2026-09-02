@@ -272,7 +272,7 @@ export function QuestCompanion({
       await sendCompanionMessage(
         message,
         companion.scope_ref,
-        questionContext ? {
+        questionContext && questionContext.lifecycle_revision !== null ? {
           kind: "question",
           quest_ref: questionContext.quest_ref,
           question_ref: questionContext.question_ref,

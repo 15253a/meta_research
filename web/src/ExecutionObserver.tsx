@@ -717,7 +717,7 @@ export function ExecutionObserver({
         aria-describedby="execution-observer-boundary execution-observer-identity"
         onKeyDown={handleKeyDown}
       >
-        {experiment && stdoutMeta ? (
+        {isOpen && experiment && stdoutMeta ? (
           <>
             <header className="execution-observer-head">
               <span className="execution-live-mark" data-status={freshness} aria-hidden="true" />

@@ -149,6 +149,16 @@ class _QuestionTreeResearchGraph(_StaticResearchGraph):
             if quest_ref is None or question.quest_ref == quest_ref
         )
 
+    def query_question_by_ref(self, question_ref: str):
+        return next(
+            (
+                question
+                for question in self._questions
+                if question.question_ref == question_ref
+            ),
+            None,
+        )
+
     def query_question_lifecycle(self, question_ref: str) -> dict[str, object]:
         assert question_ref in {item.question_ref for item in self._questions}
         return {"status": "active", "revision": 1}
@@ -166,13 +176,25 @@ class _QuestionTreeResearchMemory(_StaticResearchMemory):
 
 
 class _QuestionForegroundOwner(_StaticOwner):
+    def __init__(
+        self,
+        owner: str,
+        facts: dict[str, int],
+        *,
+        question_ref: str = "question_projection_root",
+        stage: str = "idea",
+    ) -> None:
+        super().__init__(owner, facts)
+        self._question_ref = question_ref
+        self._stage = stage
+
     def query_foreground(self, quest_ref: str) -> dict[str, object] | None:
         assert quest_ref == "quest_projection"
         return {
             "quest_ref": quest_ref,
             "cycle_ref": "cycle_projection_root",
-            "question_ref": "question_projection_root",
-            "stage": "idea",
+            "question_ref": self._question_ref,
+            "stage": self._stage,
             "epoch": 4,
             "status": "active",
             "grant_ref": "grant_projection_root",
@@ -278,17 +300,68 @@ class _StageProjection:
 
 
 class _IdeaStageProjection(_StageProjection):
-    def query_current_question(self) -> None:
-        return None
+    def __init__(
+        self,
+        projection: dict[str, object],
+        *,
+        current_question: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(projection)
+        self._current_question = current_question
+
+    def query_current_question(self) -> dict[str, object] | None:
+        return self._current_question
 
 
-def test_idea_foreground_does_not_query_ineligible_downstream_stages(
+class _QuestionTreeWithoutLifecycle(_QuestionTreeResearchGraph):
+    query_question_lifecycle = None
+
+
+def test_bundle_foreground_keeps_all_four_typed_stage_projections(
     tmp_path: Path,
 ) -> None:
-    idea = _IdeaStageProjection({"eligibility": {"status": "requested"}})
-    plan = _StageProjection({"eligibility": {"status": "not_eligible"}})
-    bundle = _StageProjection({"eligibility": {"status": "not_eligible"}})
-    reasoning = _StageProjection({"eligibility": {"status": "not_eligible"}})
+    cycle_ref = "cycle_projection_root"
+    question_ref = "question_projection_root"
+    idea = _IdeaStageProjection(
+        {
+            "eligibility": {
+                "status": "not_eligible",
+                "cycle_ref": cycle_ref,
+                "reason": {"code": "idea_not_entered"},
+            }
+        }
+    )
+    plan = _StageProjection(
+        {
+            "eligibility": {
+                "status": "not_eligible",
+                "cycle_ref": cycle_ref,
+                "question_ref": question_ref,
+                "reason": {"code": "plan_not_entered"},
+            }
+        }
+    )
+    bundle = _StageProjection(
+        {
+            "eligibility": {
+                "status": "eligible",
+                "cycle_ref": cycle_ref,
+                "question_ref": question_ref,
+                "reason": None,
+            },
+            "disposition": {"status": "running"},
+        }
+    )
+    reasoning = _StageProjection(
+        {
+            "eligibility": {
+                "status": "not_eligible",
+                "cycle_ref": cycle_ref,
+                "question_ref": question_ref,
+                "reason": {"code": "reasoning_not_entered"},
+            }
+        }
+    )
     collaboration = _HumanCollaboration("human_collaboration", {})
     collaboration.collaboration_scope = "quest:quest_projection"
     projection = PublicProjection(
@@ -298,7 +371,9 @@ def test_idea_foreground_does_not_query_ineligible_downstream_stages(
             "research_graph", {"quest_count": 1, "question_count": 1}
         ),  # type: ignore[arg-type]
         advancement_engine=_QuestionForegroundOwner(
-            "advancement_engine", {"foreground_cycle_count": 1}
+            "advancement_engine",
+            {"foreground_cycle_count": 1},
+            stage="bundle",
         ),  # type: ignore[arg-type]
         research_memory=_StaticResearchMemory(
             "research_memory", {}
@@ -314,10 +389,197 @@ def test_idea_foreground_does_not_query_ineligible_downstream_stages(
     snapshot = projection.query_snapshot()
 
     assert snapshot["idea_stage"] == idea.projection
+    assert snapshot["plan_stage"] == plan.projection
+    assert snapshot["bundle_stage"] == bundle.projection
+    assert snapshot["reasoning_stage"] == reasoning.projection
+    assert (idea.queries, plan.queries, bundle.queries, reasoning.queries) == (
+        1,
+        1,
+        1,
+        1,
+    )
+
+
+def test_stage_projection_bound_to_another_cycle_is_not_published(
+    tmp_path: Path,
+) -> None:
+    plan = _StageProjection(
+        {
+            "eligibility": {
+                "status": "eligible",
+                "cycle_ref": "cycle_foreign",
+                "question_ref": "question_projection_root",
+                "reason": None,
+            }
+        }
+    )
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_projection"
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=_StaticResearchGraph(
+            "research_graph", {"quest_count": 1, "question_count": 1}
+        ),  # type: ignore[arg-type]
+        advancement_engine=_QuestionForegroundOwner(
+            "advancement_engine",
+            {"foreground_cycle_count": 1},
+            stage="bundle",
+        ),  # type: ignore[arg-type]
+        research_memory=_StaticResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+        plan_stage=plan,  # type: ignore[arg-type]
+    )
+
+    snapshot = projection.query_snapshot()
+
+    assert plan.queries == 1
     assert "plan_stage" not in snapshot
-    assert "bundle_stage" not in snapshot
-    assert "reasoning_stage" not in snapshot
-    assert (plan.queries, bundle.queries, reasoning.queries) == (0, 0, 0)
+
+
+def test_current_question_follows_exact_foreground_instead_of_idea_current(
+    tmp_path: Path,
+) -> None:
+    stale_idea_question = {
+        "quest_ref": "quest_projection",
+        "question_ref": "question_projection_root",
+        "graph_revision": 1,
+        "title": "stale idea question",
+        "unknown_statement": "stale idea unknown",
+    }
+    idea = _IdeaStageProjection(
+        {
+            "eligibility": {
+                "status": "not_eligible",
+                "cycle_ref": "cycle_projection_root",
+                "reason": {"code": "idea_not_entered"},
+            }
+        },
+        current_question=stale_idea_question,
+    )
+    bundle = _StageProjection(
+        {
+            "eligibility": {
+                "status": "eligible",
+                "cycle_ref": "cycle_projection_root",
+                "question_ref": "question_projection_child",
+                "reason": None,
+            }
+        }
+    )
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_projection"
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=_QuestionTreeResearchGraph(
+            goal_revision=None,
+            requests=(),
+        ),  # type: ignore[arg-type]
+        advancement_engine=_QuestionForegroundOwner(
+            "advancement_engine",
+            {"foreground_cycle_count": 1},
+            question_ref="question_projection_child",
+            stage="bundle",
+        ),  # type: ignore[arg-type]
+        research_memory=_QuestionTreeResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+        idea_stage=idea,  # type: ignore[arg-type]
+        bundle_stage=bundle,  # type: ignore[arg-type]
+    )
+
+    current = projection.query_snapshot()["research_space"]["current_question"]
+
+    assert current["question_ref"] == "question_projection_child"
+    assert current["title"] == "projection-child"
+    assert current["unknown_statement"] == (
+        "unknown:memory:projection-child"
+    )
+
+
+def test_question_tree_does_not_invent_active_lifecycle_without_owner_seam(
+    tmp_path: Path,
+) -> None:
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_projection"
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=_QuestionTreeWithoutLifecycle(
+            goal_revision=None,
+            requests=(),
+        ),  # type: ignore[arg-type]
+        advancement_engine=_StaticOwner(
+            "advancement_engine", {"foreground_cycle_count": 0}
+        ),  # type: ignore[arg-type]
+        research_memory=_QuestionTreeResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+    )
+
+    items = projection.query_snapshot()["question_tree"]["items"]
+
+    assert items
+    assert all(item.get("lifecycle_status") != "active" for item in items)
+    assert all(item.get("lifecycle_revision") is None for item in items)
+
+
+def test_current_question_projects_recent_accepted_bundle_result(
+    tmp_path: Path,
+) -> None:
+    bundle_report = {
+        "status": "accepted",
+        "report_ref": "bundle_report_projection_root",
+        "disposition": "realized",
+    }
+    bundle = _StageProjection(
+        {
+            "eligibility": {
+                "status": "eligible",
+                "cycle_ref": "cycle_projection_root",
+                "question_ref": "question_projection_root",
+                "reason": None,
+            },
+            "bundle_report": bundle_report,
+        }
+    )
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_projection"
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=_QuestionTreeResearchGraph(
+            goal_revision=None,
+            requests=(),
+        ),  # type: ignore[arg-type]
+        advancement_engine=_QuestionForegroundOwner(
+            "advancement_engine",
+            {"foreground_cycle_count": 1},
+            stage="bundle",
+        ),  # type: ignore[arg-type]
+        research_memory=_QuestionTreeResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+        bundle_stage=bundle,  # type: ignore[arg-type]
+    )
+
+    current_question = next(
+        item
+        for item in projection.query_snapshot()["question_tree"]["items"]
+        if item["question_ref"] == "question_projection_root"
+    )
+
+    assert current_question["recent_accepted_result"] == bundle_report
 
 
 def test_snapshot_retries_when_feed_advances_during_owner_reads(
