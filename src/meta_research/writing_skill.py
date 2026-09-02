@@ -368,7 +368,6 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
                 "runtime-policy:untrusted-writing-input-confined/v1",
                 "sandbox-policy:permission-profile;minimal=read;"
                 "agent-workspace=write;frozen-source-root=read;network=true",
-                "external-effects:forbidden",
                 "transport-seal-key:sha256:"
                 + transport_key_hash(transport_key),
                 "writing-run-limits:"
@@ -556,8 +555,9 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             "Intent、Snapshot 与 source manifest，形成 bounded findings；对每条 finding "
             "给出 revised | not_adopted disposition，并在当前 resumed Session 返回最终 "
             "Markdown 与 citations。revised 必须实际改变稿件或 citations。不要返回或"
-            "声称 reviewer identity，不调用 Owner 写入。可按需使用无 Owner "
-            "authority 的 advisory child，但验收不依赖 child 数量、拓扑、"
+            "声称 reviewer identity。Owner effect 只通过当前 operation 已授权的 resident "
+            "MCP；不得伪造 Owner 写入或 receipt。可按需使用无 Owner authority 的 "
+            "advisory child，但验收不依赖 child 数量、拓扑、"
             "顺序或 reviewer identity。\n"
             f"{advisory_prompt}"
         )

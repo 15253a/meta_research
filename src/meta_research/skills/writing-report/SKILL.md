@@ -21,9 +21,14 @@ restart resumes the sealed cut without recapture, revalidation, or replacement.
 - Read the staged files listed in `accepted_source_manifest` before making
   evidence claims. Bind each file back to its manifest `version_ref`; the file
   path is transport only and is never a citation identity.
-- Use only the exact Frozen Snapshot source root exposed by the permission
-  profile. Web search, MCP, other workspace roots, and live Owner files are not
-  Writing inputs.
+- Use Web search and the common MCP operations to locate evidence gaps, request
+  one exact Acquisition target, or open/reconcile a HumanRequest when useful.
+  Treat their results as leads for later research, not evidence for this run.
+- Build formal evidence claims and citations only from the exact Frozen
+  Snapshot source root and `accepted_source_manifest`. A Web, MCP, or
+  Acquisition result becomes eligible only through a later authorized Writing
+  Intent whose new Snapshot binds it. Other workspace roots and live Owner
+  files are not evidence inputs.
 - Make claim coverage machine-checkable. The first block must be the single H1
   document title. Every later block must begin with exactly one marker. A
   section heading uses `<!-- meta-research-structure -->` followed immediately

@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
@@ -40,7 +41,14 @@ from meta_research.runtime_protection import (
     InhibitorLease,
     RuntimeProtectionUnavailable,
 )
-from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+from meta_research.semantic_mcp import (
+    ROOT_AGENT_ACQUISITION_OPERATION_IDS,
+    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+)
+from meta_research.semantic_owner_gateway import (
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
+)
+from meta_research.web import create_app
 from meta_research.writing_contract import (
     WritingRuntimeBinding,
     validate_writing_claim_inventory,
@@ -54,6 +62,7 @@ from meta_research.writing_skill import (
     writing_review_task_hash,
 )
 from meta_research.writing_snapshot import WritingResearchSnapshotReader
+from test_public_acquisition_session import ObtainingAcquisitionProvider
 
 
 _QUESTION = {
@@ -180,8 +189,8 @@ class _DeterministicWritingSkill(WritingSkillProvider):
                 },
             ),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="writing-reviewer-1",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             review_task_hash=writing_review_task_hash(request, draft),
             adapter_kind=draft.adapter_kind,
         )
@@ -275,6 +284,7 @@ def _runtime(
     path: Path,
     writing_skill: WritingSkillProvider | None = None,
     power_inhibitor=None,
+    acquisition_provider=None,
 ):
     drafting = _DeterministicDraftingAdapter()
     return build_production_runtime(
@@ -284,10 +294,13 @@ def _runtime(
         host_compute_probe=_DeterministicProbe(),
         writing_skill_provider=writing_skill or _DeterministicWritingSkill(),
         power_inhibitor=power_inhibitor,
+        acquisition_provider=acquisition_provider,
     )
 
 
-def _confirm_direct_quest(runtime) -> dict[str, object]:
+def _confirm_direct_quest(
+    runtime, *, prepare_acquisition: bool = False
+) -> dict[str, object]:
     human = runtime.owners.human_collaboration
     opened = human.create_quest({}, "writing-quest-open")
     probed = human.observe_host_compute(
@@ -319,6 +332,13 @@ def _confirm_direct_quest(runtime) -> dict[str, object]:
         probed["quest_draft"]["revision"],
     )
     drafted = human.query_quest_creation(opened["initialization_id"])
+    if prepare_acquisition:
+        human.prepare_acquisition_session(
+            opened["initialization_id"],
+            drafted["quest_draft"]["hash"],
+            "writing-acquisition-prepare",
+            drafted["quest_draft"]["revision"],
+        )
     human.generate_question_proposal(
         opened["initialization_id"],
         drafted["quest_draft"]["hash"],
@@ -1128,6 +1148,51 @@ class _RevisionWritingSkill(_DeterministicWritingSkill):
             reviewer_agent_ref=f"revision-reviewer-{request.revision}",
             review_task_hash=writing_review_task_hash(request, draft),
             adapter_kind=draft.adapter_kind,
+        )
+
+
+class _FrozenSourceCapabilityWritingSkill(_DeterministicWritingSkill):
+    frozen_source_ref: str | None = None
+    late_source_ref: str | None = None
+
+    def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
+        self.draft_requests.append(request)
+        assert self.frozen_source_ref is not None
+        assert self.late_source_ref is not None
+        assert [
+            material.version_ref for material in request.source_materials
+        ] == [self.frozen_source_ref]
+        if len(self.draft_requests) == 1:
+            citation_ref = "citation-late-acquisition"
+            return WritingSkillDraft(
+                markdown=(
+                    "# Frozen source boundary\n\n"
+                    "<!-- meta-research-claim:supported "
+                    f"refs={citation_ref} -->\n"
+                    "late acquisition result "
+                    f"[[citation:{citation_ref}]]\n"
+                ),
+                citations=(
+                    {
+                        "citation_ref": citation_ref,
+                        "source_version_ref": self.late_source_ref,
+                        "locator": "line:1",
+                        "claim": "late acquisition result",
+                        "source_quote": "late acquisition result",
+                    },
+                ),
+                primary_session_ref="frozen-source-session",
+                adapter_kind="test_frozen_source",
+            )
+        return WritingSkillDraft(
+            markdown=(
+                "# Frozen source boundary\n\n"
+                "<!-- meta-research-claim:evidence-gap -->\n"
+                "**Evidence gap:** 新取得材料等待后续 Writing Intent。\n"
+            ),
+            citations=(),
+            primary_session_ref="frozen-source-session",
+            adapter_kind="test_frozen_source",
         )
 
 
@@ -2156,6 +2221,164 @@ def test_confirmation_keeps_frozen_snapshot_when_research_advances(
             drafted["intent_id"]
         ) is not None
     finally:
+        runtime.close()
+
+
+def test_writing_acquisition_capability_does_not_expand_frozen_sources(
+    tmp_path: Path,
+) -> None:
+    writing_provider = _FrozenSourceCapabilityWritingSkill()
+    acquisition_provider = ObtainingAcquisitionProvider()
+    runtime = _runtime(
+        tmp_path / "writing-acquisition-frozen-source",
+        writing_provider,
+        acquisition_provider=acquisition_provider,
+    )
+    client: TestClient | None = None
+    try:
+        quest = _confirm_direct_quest(runtime, prepare_acquisition=True)
+        frozen_source = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="intent-authorized-source.txt",
+                media_type="text/plain; charset=utf-8",
+                content=b"intent authorized evidence\n",
+            ),
+            idempotency_key="writing-capability-frozen-source",
+        )
+        assert frozen_source.asset is not None
+        runtime.owners.research_graph.accept_asset_role(
+            binding=frozen_source.asset.as_binding(),
+            role="evidence",
+            quest_ref=quest["quest_ref"],
+            idempotency_key="writing-capability-frozen-role",
+        )
+        writing_provider.frozen_source_ref = frozen_source.asset.version_ref
+        admitted = _admit_report(
+            runtime,
+            str(quest["quest_ref"]),
+            "writing-capability-frozen",
+        )
+        frozen_snapshot = admitted["snapshot"]
+        run_ref = admitted["run"]["run_ref"]
+        owner_run = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert owner_run is not None
+
+        client = TestClient(
+            create_app(
+                runtime,
+                base_url="http://testserver",
+                control_key="writing-capability-control",
+            ),
+            base_url="http://testserver",
+        )
+        channel = runtime.harnesses.issue_resident_mcp_channel(
+            run_ref=owner_run.run_ref,
+            attempt_ref=owner_run.attempt_ref,
+            root_session_ref=owner_run.root_session_ref,
+            fence_ref=owner_run.fence_ref,
+            capability_binding_hash=owner_run.runtime_binding_hash,
+            operation_ids=ROOT_AGENT_SEMANTIC_OPERATION_IDS["writing"],
+            root_kind="writing",
+            phase="writing-primary",
+            subject_policy="operation_tree",
+        )
+        try:
+            response = client.post(
+                "/mcp",
+                headers={
+                    "Authorization": f"Bearer {channel.connection.token}",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-06-18",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+                        "arguments": {
+                            "effect_id": "writing-late-source",
+                            "targets": [
+                                {
+                                    "paper_id": "paper:writing-late-source",
+                                    "title": "Late source for later research",
+                                    "source_urls": [],
+                                }
+                            ],
+                        },
+                    },
+                },
+            )
+        finally:
+            runtime.harnesses.revoke_resident_mcp_channel(channel)
+        assert response.status_code == 200
+        acquired = response.json()["result"]["structuredContent"]
+        assert acquired["status"] == "obtained"
+        acquired_path = Path(acquired["results"][0]["verified_path"])
+
+        late_source = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="intent-after-acquisition.txt",
+                media_type="text/html",
+                content=acquired_path.read_bytes(),
+            ),
+            idempotency_key="writing-capability-late-source",
+        )
+        assert late_source.asset is not None
+        runtime.owners.research_graph.accept_asset_role(
+            binding=late_source.asset.as_binding(),
+            role="evidence",
+            quest_ref=quest["quest_ref"],
+            idempotency_key="writing-capability-late-role",
+        )
+        writing_provider.late_source_ref = late_source.asset.version_ref
+
+        assert runtime.writing.process_once()
+        successor = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert successor is not None
+        assert successor.attempt_generation == owner_run.attempt_generation + 1
+        assert successor.root_session_ref == owner_run.root_session_ref
+        blocked = runtime.writing.query_writing_report(run_ref)
+        assert blocked["deliverable"] == {"status": "not_attempted"}
+        assert blocked["citation"] == {"status": "not_attempted"}
+        assert blocked["snapshot"] == frozen_snapshot
+
+        assert runtime.writing.process_once()
+        first_request, corrected_request = writing_provider.draft_requests
+        assert corrected_request.snapshot == first_request.snapshot == frozen_snapshot
+        assert corrected_request.source_materials == first_request.source_materials
+        assert corrected_request.runtime_binding == first_request.runtime_binding
+        assert late_source.asset.version_ref not in {
+            material.version_ref for material in corrected_request.source_materials
+        }
+        for _step in range(3):
+            assert runtime.writing.process_once()
+        accepted = runtime.writing.query_writing_report(run_ref)
+        assert accepted["citation"]["status"] == "accepted"
+        assert accepted["snapshot"] == frozen_snapshot
+
+        later_intent = runtime.writing.create_report_intent(
+            quest_ref=str(quest["quest_ref"]),
+            title="Later Writing Intent",
+            audience="研究负责人",
+            purpose="纳入后续研究已接纳的新材料",
+            instructions="使用新的授权 Snapshot。",
+            idempotency_key="writing-capability-later-intent",
+        )
+        assert {
+            source["version_ref"]
+            for source in later_intent["snapshot"]["accepted_sources"]
+        } == {
+            frozen_source.asset.version_ref,
+            late_source.asset.version_ref,
+        }
+    finally:
+        if client is not None:
+            client.close()
         runtime.close()
 
 
