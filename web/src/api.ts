@@ -555,20 +555,13 @@ export type QuestionTreeItem = {
     }>;
     reason: { code: string } | null;
   };
-  recent_accepted_result?: null | {
-    status: string;
-    source?: string;
-    stage?: string;
-    kind?: string;
-    result_ref?: string | null;
-    report_ref?: string | null;
-    formal_plan_ref?: string | null;
-    outcome_ref?: string | null;
-    idea_set_ref?: string | null;
+  furthest_accepted_stage_result?: null | {
+    status: "accepted";
+    source: "stage_projection";
+    stage: "Idea" | "Plan" | "Bundle" | "Reasoning";
+    kind: string;
+    result_ref: string;
     disposition?: string | null;
-    accepted_at?: number | null;
-    reason?: null | { code?: string; [key: string]: unknown };
-    [key: string]: unknown;
   };
 };
 
@@ -835,6 +828,11 @@ export type IdeaQuestionSummary = {
   [key: string]: unknown;
 };
 
+export type StageTypedSkipFact = {
+  status: "skipped";
+  basis_refs: string[];
+};
+
 export type IdeaStageProjection = {
   eligibility: {
     status: string;
@@ -945,6 +943,7 @@ export type IdeaStageProjection = {
     next_stage?: string;
     [key: string]: unknown;
   };
+  typed_skip?: StageTypedSkipFact | null;
   [key: string]: unknown;
 };
 
@@ -1009,6 +1008,7 @@ export type PlanStageProjection = {
     [key: string]: unknown;
   };
   stage_commit: IdeaStageProjection["stage_commit"];
+  typed_skip?: StageTypedSkipFact | null;
   [key: string]: unknown;
 };
 
@@ -1186,6 +1186,7 @@ export type BundleStageProjection = {
     basis_ref?: string | null;
     basis_receipt?: IdeaReceipt | null;
   });
+  typed_skip?: StageTypedSkipFact | null;
   [key: string]: unknown;
 };
 
@@ -1248,6 +1249,7 @@ export type ReasoningStageProjection = {
     transition_kind?: string;
     transition_ref?: string;
   });
+  typed_skip?: StageTypedSkipFact | null;
   [key: string]: unknown;
 };
 

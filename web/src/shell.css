@@ -881,7 +881,7 @@ a:focus-visible,
 
 .lumen-activity-sources > div {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 8px;
 }
 
@@ -942,6 +942,17 @@ a:focus-visible,
 .lumen-activity-lane li time { grid-column: 1 / -1; }
 .lumen-activity-lane li code { font: 750 7px/1.35 var(--utility); }
 .lumen-activity-lane .lumen-activity-capture-note { margin: 8px 0 0; }
+.lumen-activity-technical {
+  margin-top: 7px;
+  color: var(--ink-muted);
+  font: 7px/1.4 var(--utility);
+}
+.lumen-activity-technical > summary { cursor: pointer; }
+.lumen-activity-technical li { grid-template-columns: minmax(0, 1fr); }
+.lumen-activity-technical code {
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
 .lumen-activity-lane nav {
   display: flex;
   align-items: center;
@@ -1523,6 +1534,22 @@ a:focus-visible,
   border-color: #363a59;
   background: #363a59;
 }
+
+.lumen-bundle-target-technical {
+  padding: 0 10px 8px 42px;
+  color: var(--ink-muted);
+  font: 7px/1.4 var(--utility);
+}
+
+.lumen-bundle-target-technical > summary { cursor: pointer; }
+.lumen-bundle-target-technical dl { margin: 6px 0 0; }
+.lumen-bundle-target-technical div {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 7px;
+}
+.lumen-bundle-target-technical dt,
+.lumen-bundle-target-technical dd { margin: 0; overflow-wrap: anywhere; }
 
 .lumen-bundle-target-pagination {
   display: flex;

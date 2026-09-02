@@ -27,48 +27,6 @@ async function fulfill(route: Route, body: unknown) {
   });
 }
 
-function stageResult(stage: string, outcomeRef: string, nextStage: string) {
-  return {
-    eligibility: {
-      status: "consumed",
-      cycle_ref: CYCLE_REF,
-      question_ref: QUESTION_REF,
-      reason: null,
-    },
-    stage_run_request: null,
-    run: null,
-    ...(stage === "idea" ? {
-      outcome_acceptance: {
-        status: "accepted",
-        outcome_kind: "IdeaSet",
-        outcome_ref: outcomeRef,
-        content: { status: "accepted" },
-        domain: { status: "accepted" },
-      },
-    } : {
-      plan_acceptance: {
-        status: "accepted",
-        plan_document_ref: "plan-document-143",
-        formal_plan_ref: outcomeRef,
-        outcome_ref: outcomeRef,
-        content: { status: "accepted" },
-        domain: { status: "accepted" },
-        bundle_disposition: "no_new_experiment_required",
-        gap_count: 0,
-        experiment_brief_count: 0,
-      },
-    }),
-    stage_commit: {
-      status: "committed",
-      commit_ref: `${stage}-stage-commit-143`,
-      cycle_ref: CYCLE_REF,
-      stage,
-      outcome_ref: outcomeRef,
-      next_stage: nextStage,
-    },
-  };
-}
-
 function currentCycleSnapshot(base: JsonRecord): JsonRecord {
   const foreground = {
     quest_ref: QUEST_REF,
@@ -171,20 +129,20 @@ function currentCycleSnapshot(base: JsonRecord): JsonRecord {
         cleanup_status: "none",
         updated_at: 1_788_200_025,
       }, {
-        run_ref: "target-run-143-a",
-        run_kind: "target",
+        run_ref: "bundle-run-143",
+        run_kind: "bundle_stage",
         quest_ref: QUEST_REF,
         cycle_ref: CYCLE_REF,
-        epoch: 4,
-        status: "running",
-        attempt_ref: "target-attempt-143-a",
-        root_session_ref: "target-root-session-143-a",
-        fence_ref: "target-fence-143-a",
+        epoch: 3,
+        status: "completed",
+        attempt_ref: "bundle-attempt-143",
+        root_session_ref: "bundle-root-session-143",
+        fence_ref: "bundle-fence-143",
         control_revision: 2,
         safe_point_ref: null,
-        terminal_reason: null,
-        cleanup_status: "none",
-        updated_at: 1_788_200_050,
+        terminal_reason: "completed",
+        cleanup_status: "completed",
+        updated_at: 1_788_200_075,
       }],
       recovery_records: [],
       actions: [],
@@ -204,12 +162,13 @@ function currentCycleSnapshot(base: JsonRecord): JsonRecord {
         question_receipt_ref: "question-receipt-143-current",
         lifecycle_status: "active",
         lifecycle_revision: 7,
-        recent_accepted_result: {
-          status: "ready",
-          stage: "Idea",
-          result_ref: "idea-set-143",
-          accepted_at: 1_788_199_900,
-          reason: null,
+        furthest_accepted_stage_result: {
+          status: "accepted",
+          source: "stage_projection",
+          stage: "Bundle",
+          kind: "BundleReport",
+          result_ref: "bundle-report-143",
+          disposition: "realized",
         },
         cycle_binding: {
           status: "bound",
@@ -273,8 +232,40 @@ function currentCycleSnapshot(base: JsonRecord): JsonRecord {
         items: [],
       },
     },
-    idea_stage: stageResult("idea", "idea-set-143", "Plan"),
-    plan_stage: stageResult("plan", "formal-plan-143", "Bundle"),
+    idea_stage: {
+      eligibility: {
+        status: "not_eligible",
+        cycle_ref: CYCLE_REF,
+        question_ref: QUESTION_REF,
+        reason: { code: "idea_route_unavailable" },
+      },
+      stage_run_request: null,
+      run: null,
+      outcome_acceptance: {
+        status: "not_attempted",
+        content: { status: "not_attempted" },
+        domain: { status: "not_attempted" },
+      },
+      stage_commit: null,
+      typed_skip: { status: "skipped", basis_refs: ["idea-set-143"] },
+    },
+    plan_stage: {
+      eligibility: {
+        status: "not_eligible",
+        cycle_ref: CYCLE_REF,
+        question_ref: QUESTION_REF,
+        reason: { code: "plan_route_unavailable" },
+      },
+      stage_run_request: null,
+      run: null,
+      plan_acceptance: {
+        status: "not_attempted",
+        content: { status: "not_attempted" },
+        domain: { status: "not_attempted" },
+      },
+      stage_commit: null,
+      typed_skip: { status: "skipped", basis_refs: ["formal-plan-143"] },
+    },
     bundle_stage: {
       eligibility: {
         status: "consumed",
@@ -285,21 +276,37 @@ function currentCycleSnapshot(base: JsonRecord): JsonRecord {
       },
       stage_run_request: null,
       run: null,
-      target_graph: { status: "not_attempted", targets: [], frontier: [] },
+      target_graph: {
+        status: "accepted",
+        targets: [{
+          target_ref: "target-143-a",
+          target_key: "检验关键假设 A",
+          spec_hash: "4".repeat(64),
+          dependency_refs: [],
+          target_run_ref: "target-run-143-a",
+          status: "running",
+        }],
+        frontier: ["target-143-a"],
+      },
       target_commits: [],
       baseline_pool: [],
       disposition: {
-        status: "skipped",
-        target_count: 0,
+        status: "realized",
+        target_count: 1,
         target_commit_count: 0,
-        reason: { code: "no_new_experiment_required" },
+        reason: null,
+      },
+      bundle_report: {
+        status: "accepted",
+        report_ref: "bundle-report-143",
+        disposition: "realized",
       },
       stage_commit: {
         status: "committed",
         commit_ref: "bundle-stage-commit-143",
         cycle_ref: CYCLE_REF,
         stage: "Bundle",
-        disposition: "skipped",
+        disposition: "completed",
         next_stage: "Reasoning",
       },
     },
@@ -368,9 +375,9 @@ test("the foreground Cycle keeps one exact Question and four possible Stage posi
   await expect.soft(stages).toBeVisible();
   if (await stages.count()) {
     const expected = {
-      idea: "result",
-      plan: "result",
-      bundle: "skipped",
+      idea: "skipped",
+      plan: "skipped",
+      bundle: "result",
       reasoning: "current",
     };
     await expect(stages.getByRole("listitem")).toHaveCount(4);
@@ -402,8 +409,8 @@ test("QuestionTree marks only the foreground Question and keeps its facts separa
   await expect(tree).toContainText("active r7");
   await expect(tree).toContainText(`${CYCLE_REF} · reasoning · epoch 4 · active`);
   await expect(tree).toContainText("human-request-143-current");
-  await expect.soft(tree).toContainText("最近接纳结果");
-  await expect.soft(tree).toContainText("idea-set-143");
+  await expect.soft(tree).toContainText("最远已接纳 Stage 结果");
+  await expect.soft(tree).toContainText("bundle-report-143");
   for (const viewport of [
     { width: 800, height: 900 },
     { width: 390, height: 844 },
@@ -424,19 +431,24 @@ test("research activity stays source-separated, names silence honestly, and disa
 
   await expect.soft(activity).toBeVisible();
   if (await activity.count()) {
-    const currentStage = activity.getByRole("region", { name: "当前阶段" });
+    const currentStage = activity.getByRole("region", { name: "Stage 主智能体" });
     const acquisition = activity.getByRole("region", { name: "资料获取" });
+    const bundle = activity.getByRole("region", { name: "Bundle 策略" });
     const targets = activity.getByRole("region", { name: "实验任务" });
-    await expect(currentStage).toContainText("reasoning-run-143");
-    await expect(currentStage).toContainText("running");
+    await expect(currentStage).toContainText("Reasoning 阶段主智能体");
+    await expect(currentStage).toContainText("正在运行");
     await expect(currentStage).toContainText(/更新|fresh/i);
-    await expect(acquisition).toContainText("acquisition-run-143");
-    await expect(acquisition).toContainText("completed");
-    await expect(acquisition).toContainText("deepfetch-run-143");
-    await expect(acquisition).toContainText("running");
+    await expect(acquisition).toContainText("资料获取任务");
+    await expect(acquisition).toContainText("已完成");
+    await expect(acquisition).toContainText("DeepFetch 文献检索");
+    await expect(acquisition).toContainText("正在运行");
     await expect(acquisition).toContainText("暂无可观察输出");
-    await expect(targets).toContainText("target-run-143-a");
+    await expect(bundle).toContainText("Bundle 策略主智能体");
+    await expect(targets).toContainText("检验关键假设 A");
+    await expect(targets).toContainText("正在运行");
     await expect(activity).toContainText("静默不等于根 Agent 已停止");
+    await expect(currentStage.getByText("reasoning-run-143")).toBeHidden();
+    await expect(bundle.getByText("bundle-run-143")).toBeHidden();
   }
 
   await page.getByRole("button", { name: "问题树", exact: true }).click();

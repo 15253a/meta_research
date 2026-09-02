@@ -460,7 +460,7 @@ function useStableQuestionTreeItems(
       lifecycleRevision: item.lifecycle_revision,
       cycleBinding: item.cycle_binding,
       relatedHumanRequests: item.related_human_requests,
-      recentAcceptedResult: item.recent_accepted_result,
+      furthestAcceptedStageResult: item.furthest_accepted_stage_result,
     })),
   });
   if (cache.current?.key !== key) cache.current = { key, items };
@@ -788,17 +788,10 @@ function allStageSurfaces(snapshot: PublicSnapshot): CurrentStageSurface[] {
 function currentStageSurface(snapshot: PublicSnapshot): CurrentStageSurface | null {
   const candidates = allStageSurfaces(snapshot);
   const foreground = snapshot.research_control.foreground;
-  if (snapshot.research_control.status === "ready") {
-    if (!foreground) return null;
-    return candidates.find(
-      (candidate) => candidate.kind.toLowerCase() === foreground.stage.toLowerCase(),
-    ) ?? null;
-  }
+  if (snapshot.research_control.status !== "ready" || !foreground) return null;
   return candidates.find(
-    (candidate) => ["eligible", "requested"].includes(
-      candidate.projection.eligibility.status,
-    ),
-  ) ?? candidates[0] ?? null;
+    (candidate) => candidate.kind.toLowerCase() === foreground.stage.toLowerCase(),
+  ) ?? null;
 }
 
 function exactForegroundQuestion(snapshot: PublicSnapshot): IdeaQuestionSummary | null {
@@ -849,8 +842,8 @@ function stagePositionState(
       ? surface.projection.stage_commit?.disposition
       : undefined;
   if (
-    projection.eligibility.status === "skipped"
-    || reason.includes("skip")
+    projection.typed_skip?.status === "skipped"
+    || projection.eligibility.status === "skipped"
     || reason === "no_new_experiment_required"
     || bundleDisposition?.status === "skipped"
     || commitDisposition === "skipped"
@@ -1115,19 +1108,73 @@ function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
 type ResearchActivityItem = {
   ref: string;
   source: string;
+  label: string;
+  lane: "stage" | "bundle" | "acquisition" | "target";
   status: string;
   updatedAt: number | null;
 };
 
+const managedActivityKinds = {
+  idea_stage: { lane: "stage", label: "Idea 阶段主智能体" },
+  plan_stage: { lane: "stage", label: "Plan 阶段主智能体" },
+  bundle_stage: { lane: "bundle", label: "Bundle 策略主智能体" },
+  reasoning_stage: { lane: "stage", label: "Reasoning 阶段主智能体" },
+  deepfetch: { lane: "acquisition", label: "DeepFetch 文献检索" },
+  acquisition: { lane: "acquisition", label: "资料获取任务" },
+} as const;
+
+type ManagedActivityKind = keyof typeof managedActivityKinds;
+
+const stageManagedRunKinds: Record<StagePosition, ManagedActivityKind> = {
+  idea: "idea_stage",
+  plan: "plan_stage",
+  bundle: "bundle_stage",
+  reasoning: "reasoning_stage",
+};
+
 function managedRunActivity(
   run: PublicSnapshot["research_control"]["managed_runs"][number],
-): ResearchActivityItem {
+): ResearchActivityItem | null {
+  const metadata = managedActivityKinds[run.run_kind as ManagedActivityKind];
+  if (!metadata) return null;
   return {
     ref: run.run_ref,
     source: run.run_kind,
+    label: metadata.label,
+    lane: metadata.lane,
     status: run.status,
     updatedAt: run.updated_at,
   };
+}
+
+function targetActivity(
+  target: BundleStageProjection["target_graph"]["targets"][number],
+): ResearchActivityItem {
+  return {
+    ref: target.target_ref,
+    source: "bundle_target",
+    label: target.target_key,
+    lane: "target",
+    status: target.status,
+    updatedAt: null,
+  };
+}
+
+function activityStatusCopy(status: string): string {
+  const labels: Record<string, string> = {
+    running: "正在运行",
+    active: "正在运行",
+    completed: "已完成",
+    committed: "已完成",
+    realized: "已形成结果",
+    suspended: "已暂停",
+    paused: "已暂停",
+    blocked: "等待处理",
+    failed: "运行失败",
+    cancelled: "已取消",
+    fenced: "已停止",
+  };
+  return labels[status.toLowerCase()] ?? "状态已记录";
 }
 
 function activityObservedAt(updatedAt: number | null): string {
@@ -1141,7 +1188,7 @@ function ResearchActivityLane({
   items,
   emptyCopy,
 }: {
-  name: "当前阶段" | "资料获取" | "实验任务";
+  name: string;
   items: ResearchActivityItem[];
   emptyCopy: string;
 }) {
@@ -1165,14 +1212,28 @@ function ResearchActivityLane({
         <ul>
           {visible.map((item) => (
             <li key={`${item.source}:${item.ref}`}>
-              <span><b>{item.ref}</b><small>{item.source}</small></span>
-              <code>{item.status}</code>
+              <span><b>{item.label}</b><small>{activityStatusCopy(item.status)}</small></span>
               <time>{activityObservedAt(item.updatedAt)}</time>
             </li>
           ))}
         </ul>
       ) : <p>{emptyCopy}</p>}
-      <p className="lumen-activity-capture-note">暂无可观察输出；静默不等于根 Agent 已停止。</p>
+      <p className="lumen-activity-capture-note">
+        未捕获正文时显示暂无可观察输出；静默不等于根 Agent 已停止。
+      </p>
+      {visible.length ? (
+        <details className="lumen-activity-technical">
+          <summary>查看运行详情</summary>
+          <ul>
+            {visible.map((item) => (
+              <li key={`detail:${item.source}:${item.ref}`}>
+                <code>{item.ref}</code>
+                <small>{item.source} · {item.status}</small>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
       {items.length > pageSize ? (
         <nav aria-label={`${name}分页`}>
           <button
@@ -1215,23 +1276,32 @@ function ResearchTracePanel({
         && run.cycle_ref === foreground.cycle_ref
       ))
     : [];
-  const normalizedForegroundStage = foreground?.stage.toLowerCase().replace(/[^a-z]/g, "") ?? "";
-  const currentStageRuns = scopedRuns.filter((run) => {
-    const kind = run.run_kind.toLowerCase().replace(/[^a-z]/g, "");
-    return normalizedForegroundStage !== "" && kind.includes(normalizedForegroundStage);
-  }).map(managedRunActivity);
-  const acquisitionRuns = scopedRuns.filter((run) => (
-    /deepfetch|acquisition/i.test(run.run_kind)
-  )).map(managedRunActivity);
-  const targetRuns = scopedRuns.filter((run) => (
-    /target/i.test(run.run_kind)
-  )).map(managedRunActivity);
+  const managedActivity = scopedRuns
+    .map(managedRunActivity)
+    .filter((item): item is ResearchActivityItem => item !== null);
+  const foregroundPosition = foreground?.stage.toLowerCase() as StagePosition | undefined;
+  const foregroundRunKind = foregroundPosition
+    ? stageManagedRunKinds[foregroundPosition]
+    : undefined;
+  const currentStageRuns = managedActivity.filter(
+    (item) => item.source === foregroundRunKind,
+  );
+  const acquisitionRuns = managedActivity.filter((item) => item.lane === "acquisition");
+  const bundleStrategyRuns = managedActivity.filter((item) => item.lane === "bundle");
+  const bundleSurface = allStageSurfaces(snapshot).find(
+    (candidate) => candidate.kind === "Bundle",
+  );
+  const targetRuns = bundleSurface?.kind === "Bundle"
+    ? bundleSurface.projection.target_graph.targets.map(targetActivity)
+    : [];
+  const bundleIsCurrentStage = foregroundRunKind === "bundle_stage";
   const sortActivity = (left: ResearchActivityItem, right: ResearchActivityItem) => (
     (right.updatedAt ?? -1) - (left.updatedAt ?? -1)
     || left.ref.localeCompare(right.ref)
   );
   currentStageRuns.sort(sortActivity);
   acquisitionRuns.sort(sortActivity);
+  bundleStrategyRuns.sort(sortActivity);
   targetRuns.sort(sortActivity);
 
   useEffect(() => {
@@ -1292,7 +1362,9 @@ function ResearchTracePanel({
         </header>
         <div>
           <ResearchActivityLane
-            name="当前阶段"
+            name={bundleIsCurrentStage
+              ? "Bundle 策略（当前 Stage 主智能体）"
+              : "Stage 主智能体"}
             items={currentStageRuns}
             emptyCopy="当前 Stage 暂无托管运行记录。"
           />
@@ -1301,6 +1373,13 @@ function ResearchTracePanel({
             items={acquisitionRuns}
             emptyCopy="DeepFetch / Acquisition 暂无托管运行记录。"
           />
+          {!bundleIsCurrentStage ? (
+            <ResearchActivityLane
+              name="Bundle 策略"
+              items={bundleStrategyRuns}
+              emptyCopy="当前 Cycle 暂无 Bundle 策略托管运行记录。"
+            />
+          ) : null}
           <ResearchActivityLane
             name="实验任务"
             items={targetRuns}
@@ -2655,6 +2734,11 @@ function BundleTargetCard({
   const result = targetCommit?.result_disposition
     ?? target.blocker?.code
     ?? target.status;
+  const statusCopy = targetCommit
+    ? "实验结果已接纳"
+    : target.blocker
+      ? "等待处理"
+      : activityStatusCopy(target.status);
 
   return (
     <article
@@ -2668,12 +2752,9 @@ function BundleTargetCard({
         </span>
         <p>
           <b>{target.target_key}</b>
-          <small>
-            {target.target_ref} · {target.target_run_ref ?? "等待实验运行"}
-          </small>
+          <small>{statusCopy}</small>
         </p>
         <div className="lumen-bundle-target-actions">
-          <code>{result}</code>
           {target.target_run_ref ? (
             <button
               type="button"
@@ -2686,6 +2767,14 @@ function BundleTargetCard({
           ) : null}
         </div>
       </div>
+      <details className="lumen-bundle-target-technical">
+        <summary>查看核验详情</summary>
+        <dl>
+          <div><dt>Target</dt><dd>{target.target_ref}</dd></div>
+          <div><dt>Target run</dt><dd>{target.target_run_ref ?? "not recorded"}</dd></div>
+          <div><dt>Result</dt><dd>{result}</dd></div>
+        </dl>
+      </details>
     </article>
   );
 }

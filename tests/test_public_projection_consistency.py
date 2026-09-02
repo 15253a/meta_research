@@ -183,10 +183,12 @@ class _QuestionForegroundOwner(_StaticOwner):
         *,
         question_ref: str = "question_projection_root",
         stage: str = "idea",
+        successor_context: dict[str, object] | None = None,
     ) -> None:
         super().__init__(owner, facts)
         self._question_ref = question_ref
         self._stage = stage
+        self._successor_context = successor_context
 
     def query_foreground(self, quest_ref: str) -> dict[str, object] | None:
         assert quest_ref == "quest_projection"
@@ -203,6 +205,12 @@ class _QuestionForegroundOwner(_StaticOwner):
             "pending_operation_ref": None,
             "owner_revision": 7,
         }
+
+    def query_reasoning_successor_context(
+        self, cycle_ref: str
+    ) -> dict[str, object] | None:
+        assert cycle_ref == "cycle_projection_root"
+        return self._successor_context
 
 
 class _RacingResearchGraph:
@@ -440,6 +448,78 @@ def test_stage_projection_bound_to_another_cycle_is_not_published(
     assert "plan_stage" not in snapshot
 
 
+def test_direct_entry_projects_typed_stage_skips_without_inventing_runs(
+    tmp_path: Path,
+) -> None:
+    idea = _StageProjection(
+        {
+            "eligibility": {
+                "status": "not_eligible",
+                "cycle_ref": "cycle_projection_root",
+                "question_ref": "question_projection_root",
+                "reason": {"code": "idea_route_unavailable"},
+            },
+            "stage_run_request": None,
+            "run": None,
+        }
+    )
+    plan = _StageProjection(
+        {
+            "eligibility": {
+                "status": "not_eligible",
+                "cycle_ref": "cycle_projection_root",
+                "question_ref": "question_projection_root",
+                "reason": {"code": "plan_route_unavailable"},
+            },
+            "stage_run_request": None,
+            "run": None,
+        }
+    )
+    collaboration = _HumanCollaboration("human_collaboration", {})
+    collaboration.collaboration_scope = "quest:quest_projection"
+    projection = PublicProjection(
+        feed=_MutableFeed(),  # type: ignore[arg-type]
+        object_store=tmp_path,
+        research_graph=_StaticResearchGraph(
+            "research_graph", {"quest_count": 1, "question_count": 1}
+        ),  # type: ignore[arg-type]
+        advancement_engine=_QuestionForegroundOwner(
+            "advancement_engine",
+            {"foreground_cycle_count": 1},
+            stage="bundle",
+            successor_context={
+                "cycle_ref": "cycle_projection_root",
+                "target_question_ref": "question_projection_root",
+                "entry_stage": "bundle",
+                "typed_skip_basis_refs_by_stage": {
+                    "idea": ["idea-set-projection-root"],
+                    "plan": ["formal-plan-projection-root"],
+                },
+            },
+        ),  # type: ignore[arg-type]
+        research_memory=_StaticResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
+        agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
+        human_collaboration=collaboration,  # type: ignore[arg-type]
+        idea_stage=idea,  # type: ignore[arg-type]
+        plan_stage=plan,  # type: ignore[arg-type]
+    )
+
+    snapshot = projection.query_snapshot()
+
+    assert snapshot["idea_stage"]["typed_skip"] == {
+        "status": "skipped",
+        "basis_refs": ["idea-set-projection-root"],
+    }
+    assert snapshot["plan_stage"]["typed_skip"] == {
+        "status": "skipped",
+        "basis_refs": ["formal-plan-projection-root"],
+    }
+    assert snapshot["idea_stage"]["stage_run_request"] is None
+    assert snapshot["plan_stage"]["run"] is None
+
+
 def test_current_question_follows_exact_foreground_instead_of_idea_current(
     tmp_path: Path,
 ) -> None:
@@ -532,7 +612,7 @@ def test_question_tree_does_not_invent_active_lifecycle_without_owner_seam(
     assert all(item.get("lifecycle_revision") is None for item in items)
 
 
-def test_current_question_projects_recent_accepted_bundle_result(
+def test_current_question_projects_furthest_accepted_bundle_result(
     tmp_path: Path,
 ) -> None:
     bundle_report = {
@@ -579,7 +659,14 @@ def test_current_question_projects_recent_accepted_bundle_result(
         if item["question_ref"] == "question_projection_root"
     )
 
-    assert current_question["recent_accepted_result"] == bundle_report
+    assert current_question["furthest_accepted_stage_result"] == {
+        "status": "accepted",
+        "source": "stage_projection",
+        "stage": "Bundle",
+        "kind": "BundleReport",
+        "result_ref": "bundle_report_projection_root",
+        "disposition": "realized",
+    }
 
 
 def test_snapshot_retries_when_feed_advances_during_owner_reads(

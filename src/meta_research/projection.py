@@ -472,6 +472,18 @@ class PublicProjection:
                 if control_quest_ref is not None
                 else None
             )
+            successor_context_query = getattr(
+                self._advancement_engine,
+                "query_reasoning_successor_context",
+                None,
+            )
+            successor_context = (
+                successor_context_query(current_foreground["cycle_ref"])
+                if isinstance(current_foreground, dict)
+                and isinstance(current_foreground.get("cycle_ref"), str)
+                and callable(successor_context_query)
+                else None
+            )
             idea_stage = (
                 None if self._idea_stage is None else self._idea_stage.query_current()
             )
@@ -487,6 +499,30 @@ class PublicProjection:
                 None
                 if self._reasoning_stage is None
                 else self._reasoning_stage.query_current()
+            )
+            idea_stage = _with_typed_stage_skip(
+                idea_stage,
+                stage="idea",
+                foreground=current_foreground,
+                successor_context=successor_context,
+            )
+            plan_stage = _with_typed_stage_skip(
+                plan_stage,
+                stage="plan",
+                foreground=current_foreground,
+                successor_context=successor_context,
+            )
+            bundle_stage = _with_typed_stage_skip(
+                bundle_stage,
+                stage="bundle",
+                foreground=current_foreground,
+                successor_context=successor_context,
+            )
+            reasoning_stage = _with_typed_stage_skip(
+                reasoning_stage,
+                stage="reasoning",
+                foreground=current_foreground,
+                successor_context=successor_context,
             )
             autonomous_creation = (
                 None
@@ -507,7 +543,7 @@ class PublicProjection:
                 current_foreground,
                 graph_revision=owner_snapshots["research_graph"].revision,
             )
-            recent_accepted_result = _recent_accepted_stage_result(
+            furthest_accepted_stage_result = _furthest_accepted_stage_result(
                 current_foreground,
                 idea_stage=idea_stage,
                 plan_stage=plan_stage,
@@ -577,8 +613,8 @@ class PublicProjection:
                             quest_ref=question.quest_ref,
                             question_ref=question.question_ref,
                         ):
-                            question_item["recent_accepted_result"] = (
-                                recent_accepted_result
+                            question_item["furthest_accepted_stage_result"] = (
+                                furthest_accepted_stage_result
                             )
                         question_tree_items.append(question_item)
                 except OwnerConflict as error:
@@ -1011,7 +1047,7 @@ def _stage_projection_matches_foreground(
     return True
 
 
-def _recent_accepted_stage_result(
+def _furthest_accepted_stage_result(
     foreground: dict[str, object] | None,
     *,
     idea_stage: dict[str, object] | None,
@@ -1019,13 +1055,31 @@ def _recent_accepted_stage_result(
     bundle_stage: dict[str, object] | None,
     reasoning_stage: dict[str, object] | None,
 ) -> dict[str, object] | None:
-    """Choose one accepted same-Cycle fact by a fixed, non-temporal priority."""
+    """Summarize the furthest accepted same-Cycle Stage position."""
 
-    for projection, field in (
-        (reasoning_stage, "reasoning_acceptance"),
-        (bundle_stage, "bundle_report"),
-        (plan_stage, "plan_acceptance"),
-        (idea_stage, "outcome_acceptance"),
+    for projection, stage, field, kind, ref_fields in (
+        (
+            reasoning_stage,
+            "Reasoning",
+            "reasoning_acceptance",
+            "ReasoningOutcome",
+            ("outcome_ref",),
+        ),
+        (bundle_stage, "Bundle", "bundle_report", "BundleReport", ("report_ref",)),
+        (
+            plan_stage,
+            "Plan",
+            "plan_acceptance",
+            "FormalPlan",
+            ("formal_plan_ref", "outcome_ref"),
+        ),
+        (
+            idea_stage,
+            "Idea",
+            "outcome_acceptance",
+            "IdeaOutcome",
+            ("outcome_ref",),
+        ),
     ):
         if (
             projection is None
@@ -1034,8 +1088,67 @@ def _recent_accepted_stage_result(
             continue
         result = projection.get(field)
         if isinstance(result, dict) and result.get("status") == "accepted":
-            return dict(result)
+            result_ref = next(
+                (
+                    result.get(ref_field)
+                    for ref_field in ref_fields
+                    if isinstance(result.get(ref_field), str)
+                    and result.get(ref_field)
+                ),
+                None,
+            )
+            if not isinstance(result_ref, str):
+                continue
+            summary: dict[str, object] = {
+                "status": "accepted",
+                "source": "stage_projection",
+                "stage": stage,
+                "kind": (
+                    result.get("outcome_kind")
+                    if stage == "Idea"
+                    and isinstance(result.get("outcome_kind"), str)
+                    else kind
+                ),
+                "result_ref": result_ref,
+            }
+            disposition = result.get("disposition")
+            if isinstance(disposition, str):
+                summary["disposition"] = disposition
+            return summary
     return None
+
+
+def _with_typed_stage_skip(
+    projection: dict[str, object] | None,
+    *,
+    stage: str,
+    foreground: dict[str, object] | None,
+    successor_context: object,
+) -> dict[str, object] | None:
+    """Attach AE's exact direct-entry skip fact to its Stage position."""
+
+    if (
+        projection is None
+        or not isinstance(foreground, dict)
+        or not isinstance(successor_context, dict)
+        or successor_context.get("cycle_ref") != foreground.get("cycle_ref")
+        or successor_context.get("target_question_ref")
+        != foreground.get("question_ref")
+    ):
+        return projection
+    raw_skips = successor_context.get("typed_skip_basis_refs_by_stage")
+    raw_refs = raw_skips.get(stage) if isinstance(raw_skips, dict) else None
+    if not isinstance(raw_refs, list) or not all(
+        isinstance(item, str) and item for item in raw_refs
+    ):
+        return projection
+    return {
+        **projection,
+        "typed_skip": {
+            "status": "skipped",
+            "basis_refs": list(raw_refs),
+        },
+    }
 
 
 def _is_exact_foreground_question(

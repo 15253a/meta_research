@@ -185,6 +185,26 @@ async function freezeBundleProjection(page: Page) {
           foreground_cycle_count: 1,
           current_question: QUESTION,
         },
+        research_control: {
+          status: "ready",
+          quest_ref: QUESTION.quest_ref,
+          foreground: {
+            quest_ref: QUESTION.quest_ref,
+            cycle_ref: "cycle-bundle-007",
+            question_ref: QUESTION.question_ref,
+            stage: "bundle",
+            epoch: 1,
+            status: "active",
+            grant_ref: "bundle-grant-007",
+            grant_status: "active",
+            safe_point_ref: null,
+            pending_operation_ref: null,
+            owner_revision: 311,
+          },
+          managed_runs: [],
+          recovery_records: [],
+          actions: [],
+        },
         idea_stage: undefined,
         plan_stage: undefined,
         bundle_stage: PARTIAL_BUNDLE,
@@ -453,6 +473,9 @@ test("Target raw output is bounded, explicit, quiescent when hidden, and isolate
   const targetList = page.getByTestId("bundle-target-list");
   const targetA = targetList.locator('[data-target-ref="target-007-a"]');
   const targetB = targetList.locator('[data-target-ref="target-007-b"]');
+  await expect(targetA).toContainText("gap-structure");
+  await expect(targetA.getByText("target-007-a", { exact: true })).toBeHidden();
+  await expect(targetA.getByText("target-run-007-a", { exact: true })).toBeHidden();
   await targetA.getByRole("button", { name: "查看原始输出" }).click();
   let terminal = page.getByRole("dialog", { name: "gap-structure 实验原始输出" });
   let log = terminal.getByRole("log", { name: /gap-structure.*stdout\/stderr/ });

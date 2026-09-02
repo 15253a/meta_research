@@ -194,37 +194,23 @@ function relatedHumanRequestTechnicalCopy(item: QuestionTreeItem): string {
   }).join(" / ");
 }
 
-function recentAcceptedResultCopy(item: QuestionTreeItem): string {
-  if (!("recent_accepted_result" in item)) {
+function furthestAcceptedStageResultCopy(item: QuestionTreeItem): string {
+  if (!("furthest_accepted_stage_result" in item)) {
     return "Projection 未提供";
   }
-  const result = item.recent_accepted_result;
+  const result = item.furthest_accepted_stage_result;
   if (!result) return "没有已接纳结果";
-  const kind = typeof result.kind === "string"
-    ? result.kind
-    : typeof result.stage === "string"
-      ? `${result.stage} Stage`
-      : typeof result.report_ref === "string"
-        ? "Bundle 研究汇总"
-        : "已接纳研究结果";
-  return [kind, result.status, result.disposition]
+  return [result.kind, result.status, result.disposition]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .join(" · ");
 }
 
-function recentAcceptedResultTechnicalCopy(item: QuestionTreeItem): string {
-  const result = item.recent_accepted_result;
+function furthestAcceptedStageResultTechnicalCopy(item: QuestionTreeItem): string {
+  const result = item.furthest_accepted_stage_result;
   if (!result) return "none";
-  const resultRef = [
-    result.result_ref,
-    result.report_ref,
-    result.formal_plan_ref,
-    result.outcome_ref,
-    result.idea_set_ref,
-  ].find((value): value is string => typeof value === "string" && value.length > 0);
-  return [resultRef, result.source, result.stage, result.kind, result.status]
+  return [result.result_ref, result.source, result.stage, result.kind, result.status]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
-    .join(" · ") || "accepted_result_identity_unavailable";
+    .join(" · ");
 }
 
 function relatedHumanRequestCount(item: QuestionTreeItem): number {
@@ -1372,7 +1358,10 @@ export function QuestionTree({
               <div><small>问题状态</small><b>{lifecycleCopy(selected)}</b></div>
               <div><small>当前 Cycle / Stage</small><b>{cycleBindingCopy(selected)}</b></div>
               <div><small>HumanRequest</small><b>{relatedHumanRequestCopy(selected)}</b></div>
-              <div><small>最近接纳结果</small><b>{recentAcceptedResultCopy(selected)}</b></div>
+              <div>
+                <small>最远已接纳 Stage 结果</small>
+                <b>{furthestAcceptedStageResultCopy(selected)}</b>
+              </div>
               <details className="question-tree-technical-details">
                 <summary>技术详情</summary>
                 <div>
@@ -1385,7 +1374,10 @@ export function QuestionTree({
                 <div><small>Content fact / RM</small><b>{selected.content_ref} · {selected.content_hash}</b></div>
                 <div><small>Cycle binding / AE</small><b>{cycleBindingTechnicalCopy(selected)}</b></div>
                 <div><small>HumanRequest / Owner</small><b>{relatedHumanRequestTechnicalCopy(selected)}</b></div>
-                <div><small>Accepted result</small><b>{recentAcceptedResultTechnicalCopy(selected)}</b></div>
+                <div>
+                  <small>Accepted result</small>
+                  <b>{furthestAcceptedStageResultTechnicalCopy(selected)}</b>
+                </div>
               </details>
             </div>
           </section>
