@@ -247,6 +247,14 @@ class _HumanCollaboration(_StaticOwner):
     def query_collaboration_scope(self) -> str:
         return self.collaboration_scope
 
+    def query_companion(self, scope_ref: str) -> dict[str, object]:
+        return {
+            "scope_ref": scope_ref,
+            "session_ref": None,
+            "status": "ready",
+            "turns": [],
+        }
+
     def query_collaboration_projection(
         self, scope_refs: tuple[str, ...]
     ) -> dict[str, list[dict[str, object]]]:

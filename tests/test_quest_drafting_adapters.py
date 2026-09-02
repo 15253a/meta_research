@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import meta_research.quest_drafting as quest_drafting
+from meta_research.companion import CodexCompanionAdapter
 from meta_research.composition import build_production_runtime
 from meta_research.paths import prepare_data_root
 from meta_research.provider_supervisor import (
@@ -1926,8 +1927,8 @@ def test_production_composition_installs_real_drafting_and_compute_adapters(
     runtime = build_production_runtime(prepare_data_root(tmp_path / "production-seams"))
     try:
         hc = runtime.owners.human_collaboration
-        assert isinstance(hc._proposal_drafter, CodexDraftingAdapter)
-        assert isinstance(hc._intent_drafting_provider, CodexDraftingAdapter)
+        assert isinstance(hc._proposal_drafter, CodexCompanionAdapter)
+        assert isinstance(hc._intent_drafting_provider, CodexCompanionAdapter)
         assert isinstance(
             runtime.owners.agent_runtime._host_compute_probe, NvidiaSmiProbe
         )

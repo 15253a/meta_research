@@ -214,7 +214,10 @@ export function QuestCompanion({
     request.direct_waiters?.some((waiter) => waiter.wait_scope === "quest"),
   ) ?? requests[0];
   const messages = scopeRef
-    ? companion?.messages.filter((item) => item.scope_ref === scopeRef) ?? []
+    ? companion?.messages.filter((item) =>
+      item.scope_ref === scopeRef
+      && item.view_context?.kind !== "human_request",
+    ) ?? []
     : [];
   const hiddenMessageCount = Math.max(0, messages.length - visibleMessageCount);
   const visibleMessages = hiddenMessageCount
@@ -1592,6 +1595,7 @@ function HumanRequestView({
         </main>
         <IntentDraftingSession
           request={request}
+          scopeRef={collaboration?.companion.scope_ref ?? null}
           messages={collaboration?.companion.messages ?? []}
           onChanged={onChanged}
         />
@@ -1747,26 +1751,42 @@ function firstDefined(
 
 function IntentDraftingSession({
   request,
+  scopeRef,
   messages,
   onChanged,
 }: {
   request: HumanRequestItem;
+  scopeRef: string | null;
   messages: CompanionMessage[];
   onChanged: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const scoped = messages.filter((message) => message.scope_ref === request.request_ref);
+  const questRef = typeof request.quest_ref === "string" && request.quest_ref
+    ? request.quest_ref
+    : null;
+  const scoped = messages.filter((message) =>
+    message.scope_ref === scopeRef
+    && message.view_context?.kind === "human_request"
+    && message.view_context.quest_ref === questRef
+    && message.view_context.request_ref === request.request_ref
+    && message.view_context.revision === request.revision,
+  );
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const message = draft.trim();
-    if (!message || sending) return;
+    if (!message || sending || !scopeRef || !questRef) return;
     setSending(true);
     setError(null);
     try {
-      await sendCompanionMessage(message, request.request_ref);
+      await sendCompanionMessage(message, scopeRef, {
+        kind: "human_request",
+        quest_ref: questRef,
+        request_ref: request.request_ref,
+        revision: request.revision,
+      });
       setDraft("");
       onChanged();
     } catch (caught) {
@@ -1805,11 +1825,11 @@ function IntentDraftingSession({
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={submitTextareaOnEnter}
-              disabled={sending}
+              disabled={sending || !scopeRef || !questRef}
             />
             <button
               type="submit"
-              disabled={sending || !draft.trim()}
+              disabled={sending || !scopeRef || !questRef || !draft.trim()}
               aria-label="发送消息"
             >↑</button>
           </span>

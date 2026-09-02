@@ -146,10 +146,16 @@ async function installHumanCollaborationSnapshot(
           },
           {
             message_ref: "msg-request-only",
-            scope_ref: "research_memory:HR-41:r1",
+            scope_ref: "quest_chrome_1",
             role: "assistant",
             content: "REQUEST-ONLY transcript marker",
             status: "completed",
+            view_context: {
+              kind: "human_request",
+              quest_ref: "quest_chrome_1",
+              request_ref: "research_memory:HR-41:r1",
+              revision: 1,
+            },
           },
         ],
         soft_constraints: [{
@@ -368,10 +374,30 @@ test("the persistent Quest Companion sends ordinary conversation without command
   page,
 }) => {
   const snapshot = await installHumanCollaborationSnapshot(page);
+  const humanRequestsProjection = (snapshot.human_collaboration as JsonRecord)
+    .human_requests as JsonRecord;
+  humanRequestsProjection.items = [];
   let posted: JsonRecord | null = null;
   const explicitWrites: Array<{ path: string; body: JsonRecord }> = [];
   await page.route("**/api/v1/companion/messages", async (route) => {
     posted = route.request().postDataJSON() as JsonRecord;
+    const messages = companionProjection.messages as JsonRecord[];
+    messages.push(
+      {
+        message_ref: "msg-web-user",
+        scope_ref: "quest_chrome_1",
+        role: "user",
+        content: posted.message,
+        status: "completed",
+      },
+      {
+        message_ref: "msg-web-assistant",
+        scope_ref: "quest_chrome_1",
+        role: "assistant",
+        content: "普通聊天不会被猜成硬命令。",
+        status: "completed",
+      },
+    );
     await fulfillJson(route, (snapshot.human_collaboration as JsonRecord).companion as object);
   });
   const companionProjection = (snapshot.human_collaboration as JsonRecord)
@@ -528,8 +554,10 @@ test("the persistent Quest Companion sends ordinary conversation without command
   });
   await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
 
-  const companion = page.getByRole("complementary", { name: "Quest Companion" });
+  const companion = page.getByRole("complementary", { name: "研究助手" });
   await expect(companion).toBeVisible();
+  expect(posted).toBeNull();
+  expect(explicitWrites).toEqual([]);
   await expect(companion).toContainText("DF-09 只有一篇全文等待图书馆访问");
   await expect(companion).toContainText("YOU · CONVERSATION");
   await expect(companion).toContainText("SOFT CONSTRAINT · ACTIVE");
@@ -624,7 +652,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
   });
   await expect(companion).toContainText("Capability Authorization · granted");
 
-  await companion.getByLabel("给 Quest Companion 发消息").fill("为什么这里只是局部等待？");
+  await companion.getByLabel("给研究助手发消息").fill("为什么这里只是局部等待？");
   await companion.getByRole("button", { name: "发送消息" }).click();
   await expect.poll(() => posted).toEqual({
     scope_ref: "quest_chrome_1",
@@ -773,7 +801,7 @@ test("a prefixed Quest scope exposes the current broad grant and revokes only th
   });
 
   await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
-  const companion = page.getByRole("complementary", { name: "Quest Companion" });
+  const companion = page.getByRole("complementary", { name: "研究助手" });
   await expect(companion).toContainText("NEEDS YOU");
   await expect(companion).toContainText("BROAD RESEARCH AUTHORIZATION · CURRENT GRANT");
   await companion.getByRole("button", { name: "建立 revoke Command Draft" }).click();
@@ -1015,8 +1043,14 @@ test("the HumanRequest surface keeps all four shortest-path forms and a separate
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/companion/messages",
     body: {
-      scope_ref: "agent_runtime:HR-27:r1",
+      scope_ref: "quest_chrome_1",
       message: "如果今天不处理会怎样？",
+      view_context: {
+        kind: "human_request",
+        quest_ref: "quest_chrome_1",
+        request_ref: "agent_runtime:HR-27:r1",
+        revision: 1,
+      },
     },
   });
   await dialog.getByPlaceholder("例如：先暂停这篇；或者改为向作者索取全文。").fill(
@@ -1946,7 +1980,7 @@ test("a quest-wide wait auto-opens once while a local request only remains visib
     + new URL(page.url()).search + new URL(page.url()).hash).toBe(returnLocation);
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(dialog).toBeHidden();
-  await expect(page.getByRole("complementary", { name: "Quest Companion" })).toContainText(
+  await expect(page.getByRole("complementary", { name: "研究助手" })).toContainText(
     "需要你处理",
   );
 
@@ -2097,7 +2131,7 @@ test("a quest-wide wait queues behind an active formal creation window", async (
   const humanRequest = page.getByRole("dialog", { name: "需要你处理的事项" });
   await expect(quest).toBeVisible();
   await expect(humanRequest).toBeHidden();
-  await expect(page.getByRole("complementary", { name: "Quest Companion" }))
+  await expect(page.getByRole("complementary", { name: "研究助手" }))
     .toContainText("需要你处理");
 
   await quest.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();

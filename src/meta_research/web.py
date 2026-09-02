@@ -438,12 +438,23 @@ class CompanionQuestionViewContext(BaseModel):
     lifecycle_revision: int = Field(ge=1)
 
 
+class CompanionHumanRequestViewContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["human_request"]
+    quest_ref: str = Field(min_length=1, max_length=128)
+    request_ref: str = Field(min_length=1, max_length=256)
+    revision: int = Field(ge=1)
+
+
 class CompanionMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope_ref: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=INTENT_MESSAGE_MAX_LENGTH)
-    view_context: CompanionQuestionViewContext | None = None
+    view_context: (
+        CompanionQuestionViewContext | CompanionHumanRequestViewContext | None
+    ) = None
 
 
 class HumanRequestResponseRequest(BaseModel):
@@ -466,13 +477,6 @@ class AgentProposalConversionRequest(BaseModel):
 
     expected_scope_ref: str = Field(min_length=1, max_length=128)
     expected_proposal_hash: str = Field(min_length=64, max_length=64)
-
-
-class SoftConstraintRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scope_ref: str = Field(min_length=1, max_length=128)
-    guidance: dict[str, object]
 
 
 class WithdrawSoftConstraintRequest(BaseModel):
@@ -1009,6 +1013,19 @@ def create_app(
         }
         return snapshot
 
+    def require_current_collaboration_scope(
+        requested_scope_ref: str | None, *, conflict_code: str
+    ) -> str:
+        current_scope_ref = (
+            runtime.owners.human_collaboration.query_collaboration_scope()
+        )
+        if (
+            requested_scope_ref is not None
+            and requested_scope_ref != current_scope_ref
+        ):
+            raise OwnerConflict(conflict_code)
+        return current_scope_ref
+
     @app.middleware("http")
     async def protect_every_request(request: Request, call_next):
         path = request.url.path
@@ -1480,8 +1497,12 @@ def create_app(
     def send_companion_message(
         request: Request, message: CompanionMessageRequest
     ) -> dict[str, object]:
+        scope_ref = require_current_collaboration_scope(
+            message.scope_ref,
+            conflict_code="companion_scope_stale",
+        )
         return runtime.owners.human_collaboration.send_companion_message(
-            message.scope_ref or "workspace",
+            scope_ref,
             message.message,
             _idempotency_key(request),
             view_context=(
@@ -1509,8 +1530,12 @@ def create_app(
     def record_agent_proposal(
         request: Request, proposal: AgentProposalRequest
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.record_agent_proposal(
+        scope_ref = require_current_collaboration_scope(
             proposal.scope_ref,
+            conflict_code="agent_proposal_scope_stale",
+        )
+        return runtime.owners.human_collaboration.record_agent_proposal(
+            scope_ref,
             proposal.proposal,
             _idempotency_key(request),
         )
@@ -1524,6 +1549,10 @@ def create_app(
         request: Request,
         conversion: AgentProposalConversionRequest,
     ) -> dict[str, object]:
+        require_current_collaboration_scope(
+            conversion.expected_scope_ref,
+            conflict_code="agent_proposal_scope_stale",
+        )
         return runtime.owners.human_collaboration.convert_agent_proposal_to_soft_constraint(
             proposal_ref,
             expected_scope_ref=conversion.expected_scope_ref,
@@ -1540,6 +1569,10 @@ def create_app(
         request: Request,
         conversion: AgentProposalConversionRequest,
     ) -> dict[str, object]:
+        require_current_collaboration_scope(
+            conversion.expected_scope_ref,
+            conflict_code="agent_proposal_scope_stale",
+        )
         return (
             runtime.owners.human_collaboration.convert_agent_proposal_to_command_draft(
                 proposal_ref,
@@ -1547,16 +1580,6 @@ def create_app(
                 expected_proposal_hash=conversion.expected_proposal_hash,
                 idempotency_key=_idempotency_key(request),
             )
-        )
-
-    @app.post("/api/v1/human-collaboration/soft-constraints", status_code=201)
-    def record_soft_constraint(
-        request: Request, constraint: SoftConstraintRequest
-    ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.record_soft_constraint(
-            constraint.scope_ref,
-            constraint.guidance,
-            _idempotency_key(request),
         )
 
     @app.post(

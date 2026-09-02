@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 
 from meta_research.composition import build_production_runtime
 from meta_research.paths import prepare_data_root
-from meta_research.quest_drafting import IntentTurnResult, ProposalDraftResult
+from meta_research.quest_drafting import (
+    HostComputeDevice,
+    HostComputeSnapshot,
+    IntentTurnResult,
+    ProposalDraftResult,
+)
 from meta_research.web import create_app
 
 
@@ -34,13 +39,95 @@ class _DeterministicDraftingProvider:
         )
 
 
+class _DeterministicProbe:
+    def observe(self) -> HostComputeSnapshot:
+        return HostComputeSnapshot(
+            status="ready",
+            observed_at=1720000000.0,
+            devices=(
+                HostComputeDevice(
+                    uuid="GPU-web-test",
+                    name="Web Test GPU",
+                    memory_total_mib=81920,
+                ),
+            ),
+            adapter_kind="deterministic_web_test",
+        )
+
+
 def _runtime(path: Path):
     provider = _DeterministicDraftingProvider()
     return build_production_runtime(
         prepare_data_root(path),
         proposal_drafter=provider,
         intent_drafting_provider=provider,
+        host_compute_probe=_DeterministicProbe(),
     )
+
+
+def _confirm_direct_quest(runtime) -> dict[str, object]:
+    human = runtime.owners.human_collaboration
+    opened = human.create_quest({}, "web-companion-quest-open")
+    probed = human.observe_host_compute(
+        opened["initialization_id"],
+        ["GPU-web-test"],
+        "web-companion-compute-probe",
+    )
+    draft = dict(probed["quest_draft"]["value"])
+    draft.update(
+        {
+            "goal": "Answer the current Quest with public evidence.",
+            "completion_criteria": "Produce one falsifiable answer.",
+            "time_budget": "7d",
+            "route": "direct",
+            "literature": {
+                "mode": "oa_only",
+                "library_entry_url": "",
+                "scope_exclusions": "",
+                "accepted_material_bindings": [],
+            },
+            "background_and_initial_direction": "Start with public literature.",
+        }
+    )
+    revised = human.revise_quest_draft(
+        opened["initialization_id"],
+        draft,
+        probed["quest_draft"]["hash"],
+        "web-companion-quest-draft",
+        probed["quest_draft"]["revision"],
+    )
+    human.generate_question_proposal(
+        opened["initialization_id"],
+        revised["quest_draft"]["hash"],
+        "web-companion-question-proposal",
+        revised["quest_draft"]["revision"],
+    )
+    assert human.process_drafting_once()
+    proposed = human.query_quest_creation(opened["initialization_id"])
+    previewed = human.preview_confirmation(
+        opened["initialization_id"],
+        quest_draft_revision=proposed["quest_draft"]["revision"],
+        quest_draft_hash=proposed["quest_draft"]["hash"],
+        proposal_ref=proposed["proposal"]["ref"],
+        proposal_hash=proposed["proposal"]["hash"],
+        idempotency_key="web-companion-quest-preview",
+    )
+    human.confirm_quest(
+        opened["initialization_id"],
+        quest_draft_revision=proposed["quest_draft"]["revision"],
+        quest_draft_hash=proposed["quest_draft"]["hash"],
+        proposal_ref=proposed["proposal"]["ref"],
+        proposal_hash=proposed["proposal"]["hash"],
+        preview_ref=previewed["confirmation_preview"]["ref"],
+        preview_hash=previewed["confirmation_preview"]["hash"],
+        idempotency_key="web-companion-quest-confirm",
+    )
+    for _step in range(5):
+        if not human.reconcile_once():
+            break
+    completed = human.query_quest_creation(opened["initialization_id"])
+    assert completed["status"] == "completed"
+    return completed
 
 
 def _authenticated_client(runtime) -> tuple[TestClient, dict[str, str]]:
@@ -468,10 +555,63 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
 ) -> None:
     data_path = tmp_path / "companion-web"
     runtime = _runtime(data_path)
+    completed = _confirm_direct_quest(runtime)
+    scope_ref = f"quest:{completed['quest_ref']}"
+    prepared_session_ref = runtime.owners.human_collaboration.query_companion(
+        scope_ref
+    )["session_ref"]
+    assert prepared_session_ref is not None
     client, auth = _authenticated_client(runtime)
-    scope_ref = "workspace"
     try:
         with client:
+            owner_revisions = {
+                name: owner.query_snapshot().revision
+                for name, owner in vars(runtime.owners).items()
+            }
+            first_snapshot_response = client.get("/api/v1/snapshot")
+            second_snapshot_response = client.get("/api/v1/snapshot")
+            assert first_snapshot_response.status_code == 200
+            assert second_snapshot_response.status_code == 200
+            assert first_snapshot_response.json()["human_collaboration"][
+                "companion"
+            ]["session_ref"] == prepared_session_ref
+            assert {
+                name: owner.query_snapshot().revision
+                for name, owner in vars(runtime.owners).items()
+            } == owner_revisions
+
+            stale_scope_response = client.post(
+                "/api/v1/companion/messages",
+                headers=_write_headers(auth, "companion-stale-scope-web"),
+                json={
+                    "scope_ref": "workspace",
+                    "message": "Do not create a second Companion root.",
+                },
+            )
+            assert stale_scope_response.status_code == 409
+            assert stale_scope_response.json()["detail"]["code"] == (
+                "companion_scope_stale"
+            )
+            assert runtime.owners.human_collaboration.query_companion(
+                "workspace"
+            )["session_ref"] is None
+
+            stale_proposal_response = client.post(
+                "/api/v1/human-collaboration/agent-proposals",
+                headers=_write_headers(auth, "agent-proposal-stale-scope-web"),
+                json={
+                    "scope_ref": "workspace",
+                    "proposal": {
+                        "proposal_kind": "narrow_scope",
+                        "text": "Do not accept this stale Proposal.",
+                    },
+                },
+            )
+            assert stale_proposal_response.status_code == 409
+            assert stale_proposal_response.json()["detail"]["code"] == (
+                "agent_proposal_scope_stale"
+            )
+
             denied = client.post(
                 "/api/v1/companion/messages",
                 headers={
@@ -511,7 +651,7 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
             assert proposal_response.json()["status"] == "proposed"
             assert proposal_response.json()["authoritative_effect"] is False
 
-            constraint_response = client.post(
+            direct_constraint_response = client.post(
                 "/api/v1/human-collaboration/soft-constraints",
                 headers=_write_headers(auth, "soft-constraint-web-1"),
                 json={
@@ -522,14 +662,42 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
                     },
                 },
             )
+            assert direct_constraint_response.status_code == 404
+
+            constraint_response = client.post(
+                "/api/v1/human-collaboration/agent-proposals/"
+                f"{quote(proposal_response.json()['proposal_ref'], safe='')}"
+                "/soft-constraint",
+                headers=_write_headers(auth, "proposal-to-constraint-web-1"),
+                json={
+                    "expected_scope_ref": scope_ref,
+                    "expected_proposal_hash": proposal_response.json()[
+                        "proposal_hash"
+                    ],
+                },
+            )
             assert constraint_response.status_code == 201, constraint_response.json()
-            constraint = constraint_response.json()
+            conversion = constraint_response.json()
+            assert conversion["proposal"]["status"] == "converted"
+            constraint = conversion["soft_constraint"]
             assert constraint["status"] == "active"
+            assert constraint["source_proposal_ref"] == proposal_response.json()[
+                "proposal_ref"
+            ]
 
             companion: dict[str, object] = {}
             deadline = time.monotonic() + 4
             while time.monotonic() < deadline:
-                snapshot = client.get("/api/v1/snapshot").json()
+                snapshot_response = client.get("/api/v1/snapshot")
+                if (
+                    snapshot_response.status_code == 503
+                    and snapshot_response.json().get("detail", {}).get("code")
+                    == "snapshot_consistency_unavailable"
+                ):
+                    time.sleep(0.05)
+                    continue
+                assert snapshot_response.status_code == 200, snapshot_response.json()
+                snapshot = snapshot_response.json()
                 companion = snapshot["human_collaboration"]["companion"]
                 assistant_messages = [
                     message
@@ -542,6 +710,8 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
                     break
                 time.sleep(0.05)
             assert companion["scope_ref"] == scope_ref
+            session_ref = companion["session_ref"]
+            assert session_ref == prepared_session_ref
             assert any(
                 message["role"] == "user"
                 and message["content"] == "Why is this only a local wait?"
@@ -553,7 +723,9 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
                 and message["content"].startswith("Companion reply:")
                 for message in companion["messages"]
             )
-            assert companion["agent_proposals"] == [proposal_response.json()]
+            assert [
+                item["proposal_ref"] for item in companion["agent_proposals"]
+            ] == [proposal_response.json()["proposal_ref"]]
             assert companion["soft_constraints"] == [constraint]
 
             withdrawn_response = client.post(
@@ -576,13 +748,23 @@ def test_companion_and_guidance_web_facts_are_durable_in_snapshot(
                 "human_collaboration"
             ]["companion"]
             assert companion["scope_ref"] == scope_ref
+            assert companion["session_ref"] == session_ref
             assert any(
                 message["role"] == "assistant"
                 and message["status"] == "completed"
                 for message in companion["messages"]
             )
-            assert companion["agent_proposals"] == [proposal_response.json()]
+            assert [
+                item["proposal_ref"] for item in companion["agent_proposals"]
+            ] == [proposal_response.json()["proposal_ref"]]
+            assert all(
+                item["status"] == "converted"
+                for item in companion["agent_proposals"]
+            )
             assert companion["soft_constraints"][0]["status"] == "withdrawn"
+            assert companion["soft_constraints"][0]["source_proposal_ref"] == (
+                proposal_response.json()["proposal_ref"]
+            )
     finally:
         restarted_client.close()
         restarted.close()
@@ -592,8 +774,10 @@ def test_companion_web_rejects_a_noncurrent_question_view_context(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(tmp_path / "companion-question-view-context-web")
+    completed = _confirm_direct_quest(runtime)
     client, auth = _authenticated_client(runtime)
-    scope_ref = "quest:missing-question-quest"
+    quest_ref = str(completed["quest_ref"])
+    scope_ref = f"quest:{quest_ref}"
     try:
         with client:
             response = client.post(
@@ -604,7 +788,7 @@ def test_companion_web_rejects_a_noncurrent_question_view_context(
                     "message": "Do not enqueue a Question the Owner cannot rebind.",
                     "view_context": {
                         "kind": "question",
-                        "quest_ref": "missing-question-quest",
+                        "quest_ref": quest_ref,
                         "question_ref": "missing-question",
                         "content_ref": "missing-content",
                         "content_hash": "a" * 64,
@@ -629,10 +813,9 @@ def test_command_web_requires_exact_preview_then_separate_authorization(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(tmp_path / "command-web")
+    completed = _confirm_direct_quest(runtime)
     client, auth = _authenticated_client(runtime)
-    # No Quest exists in this vertical slice, so the public Snapshot's exact
-    # collaboration scope is the workspace.
-    scope_ref = "workspace"
+    scope_ref = f"quest:{completed['quest_ref']}"
     command = {
         "command_kind": "capability_authorization",
         "payload": {
@@ -646,23 +829,51 @@ def test_command_web_requires_exact_preview_then_separate_authorization(
     }
     try:
         with client:
+            proposal_response = client.post(
+                "/api/v1/human-collaboration/agent-proposals",
+                headers=_write_headers(auth, "command-proposal-web-1"),
+                json={
+                    "scope_ref": scope_ref,
+                    "proposal": {
+                        "proposal_kind": "command_draft",
+                        "command": command,
+                    },
+                },
+            )
+            assert proposal_response.status_code == 201, proposal_response.json()
+            proposal = proposal_response.json()
+            assert proposal["authoritative_effect"] is False
+
             created_response = client.post(
-                "/api/v1/human-collaboration/commands",
+                "/api/v1/human-collaboration/agent-proposals/"
+                f"{quote(proposal['proposal_ref'], safe='')}/command-draft",
                 headers=_write_headers(auth, "command-create-web-1"),
-                json={"scope_ref": scope_ref, "command": command},
+                json={
+                    "expected_scope_ref": scope_ref,
+                    "expected_proposal_hash": proposal["proposal_hash"],
+                },
             )
             assert created_response.status_code == 201, created_response.json()
-            created = created_response.json()
+            conversion = created_response.json()
+            assert conversion["proposal"]["status"] == "converted"
+            created = conversion["command_draft"]
             assert created["draft_revision"] == 1
             assert created["status"] == "draft"
+            assert created["source_proposal_ref"] == proposal["proposal_ref"]
 
             replay = client.post(
-                "/api/v1/human-collaboration/commands",
+                "/api/v1/human-collaboration/agent-proposals/"
+                f"{quote(proposal['proposal_ref'], safe='')}/command-draft",
                 headers=_write_headers(auth, "command-create-web-1"),
-                json={"scope_ref": scope_ref, "command": command},
+                json={
+                    "expected_scope_ref": scope_ref,
+                    "expected_proposal_hash": proposal["proposal_hash"],
+                },
             )
             assert replay.status_code == 201
-            assert replay.json()["intent_id"] == created["intent_id"]
+            assert replay.json()["command_draft"]["intent_id"] == created[
+                "intent_id"
+            ]
 
             preview_response = client.post(
                 "/api/v1/human-collaboration/commands/"

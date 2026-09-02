@@ -214,6 +214,26 @@ def _confirm_direct_quest(runtime) -> dict[str, object]:
     return completed
 
 
+def _accept_soft_constraint(
+    human,
+    *,
+    scope_ref: str,
+    guidance: dict[str, object],
+    key: str,
+) -> dict[str, object]:
+    proposal = human.record_agent_proposal(
+        scope_ref,
+        guidance,
+        f"{key}-proposal",
+    )
+    return human.convert_agent_proposal_to_soft_constraint(
+        proposal["proposal_ref"],
+        expected_scope_ref=scope_ref,
+        expected_proposal_hash=proposal["proposal_hash"],
+        idempotency_key=f"{key}-accept",
+    )["soft_constraint"]
+
+
 def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
     tmp_path: Path,
 ) -> None:
@@ -531,10 +551,11 @@ def test_idea_context_pack_uses_only_current_hc_guidance_receipts(
         quest = _confirm_direct_quest(runtime)
         human = runtime.owners.human_collaboration
         scope_ref = f"quest:{quest['quest_ref']}"
-        constraint = human.record_soft_constraint(
-            scope_ref,
-            {"text": "优先比较可证伪的局部机制，不扩大 Quest 范围。"},
-            "idea-guidance-constraint",
+        constraint = _accept_soft_constraint(
+            human,
+            scope_ref=scope_ref,
+            guidance={"text": "优先比较可证伪的局部机制，不扩大 Quest 范围。"},
+            key="idea-guidance-constraint",
         )
 
         runtime.idea_stage.start("idea-guidance-start")
@@ -562,10 +583,11 @@ def test_idea_request_rejects_guidance_withdrawn_after_context_pack_build(
         quest = _confirm_direct_quest(runtime)
         human = runtime.owners.human_collaboration
         scope_ref = f"quest:{quest['quest_ref']}"
-        constraint = human.record_soft_constraint(
-            scope_ref,
-            {"text": "Keep the Idea stage within the accepted Quest scope."},
-            "idea-guidance-race-constraint",
+        constraint = _accept_soft_constraint(
+            human,
+            scope_ref=scope_ref,
+            guidance={"text": "Keep the Idea stage within the accepted Quest scope."},
+            key="idea-guidance-race-constraint",
         )
         advancement = runtime.owners.advancement_engine
         ensure = advancement.ensure_idea_stage_request
@@ -604,10 +626,11 @@ def test_multiple_active_guidance_bindings_use_one_canonical_order(
         human = runtime.owners.human_collaboration
         scope_ref = f"quest:{quest['quest_ref']}"
         constraints = [
-            human.record_soft_constraint(
-                scope_ref,
-                {"text": f"Canonical guidance {ordinal}."},
-                f"idea-guidance-order-{ordinal}",
+            _accept_soft_constraint(
+                human,
+                scope_ref=scope_ref,
+                guidance={"text": f"Canonical guidance {ordinal}."},
+                key=f"idea-guidance-order-{ordinal}",
             )
             for ordinal in (1, 2)
         ]

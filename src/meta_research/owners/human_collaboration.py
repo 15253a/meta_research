@@ -277,10 +277,6 @@ class HumanCollaborationInterface(Protocol):
         idempotency_key: str,
     ) -> dict[str, object]: ...
 
-    def record_soft_constraint(
-        self, scope_ref: str, guidance: dict[str, object], idempotency_key: str
-    ) -> dict[str, object]: ...
-
     def withdraw_soft_constraint(
         self, constraint_ref: str, expected_revision: int, idempotency_key: str
     ) -> dict[str, object]: ...
@@ -1957,6 +1953,68 @@ class SQLiteHumanCollaboration:
                 authorizations.append(authorization)
         return {**projection, "authorizations": authorizations}
 
+    def _companion_quest_context(
+        self,
+        *,
+        scope_ref: str,
+        quest_ref: str,
+    ) -> dict[str, object]:
+        quest = self._research_graph.query_quest_by_ref(quest_ref)
+        if quest is None:
+            raise OwnerConflict("companion_scope_stale")
+        foreground = self._advancement_engine.query_foreground(quest_ref)
+        current_question: dict[str, object] | None = None
+        question_ref = (
+            foreground.get("question_ref")
+            if isinstance(foreground, dict)
+            else None
+        )
+        if isinstance(question_ref, str) and question_ref:
+            question = self._research_graph.query_question_by_ref(question_ref)
+            if question is not None:
+                lifecycle = self._research_graph.query_question_lifecycle(
+                    question_ref
+                )
+                content = self._research_memory.read_question_content(
+                    question.content_ref,
+                    question.content_hash,
+                )
+                current_question = {
+                    "question_ref": question.question_ref,
+                    "parent_question_ref": question.parent_question_ref,
+                    "content_ref": question.content_ref,
+                    "content_hash": question.content_hash,
+                    "lifecycle_status": lifecycle["status"],
+                    "lifecycle_revision": lifecycle["revision"],
+                    "title": content.get("title"),
+                    "unknown_statement": content.get("unknown_statement"),
+                }
+        return {
+            "schema_ref": "meta-research/companion-context/v1",
+            "scope_ref": scope_ref,
+            "context_kind": "quest",
+            "quest_ref": quest_ref,
+            "quest": {
+                "initialization_id": quest.initialization_id,
+                "quest_ref": quest.quest_ref,
+                "draft_revision": quest.draft_revision,
+                "draft_hash": quest.draft_hash,
+                "goal": quest.draft.get("goal"),
+                "completion_criteria": quest.draft.get("completion_criteria"),
+                "background_and_initial_direction": quest.draft.get(
+                    "background_and_initial_direction"
+                ),
+                "receipt_ref": quest.receipt.receipt_ref,
+            },
+            "current_question": current_question,
+            "activity": {
+                "foreground": foreground,
+                "managed_runs": list(
+                    self._agent_runtime.query_managed_runs(quest_ref)[:20]
+                ),
+            },
+        }
+
     def _resolve_companion_context(
         self,
         scope_ref: str,
@@ -1965,12 +2023,81 @@ class SQLiteHumanCollaboration:
         """Resolve current public Owner facts without giving Companion write authority."""
 
         if view_context is not None:
-            return _companion_question_context(
+            if view_context.get("kind") == "human_request":
+                expected_fields = {
+                    "kind",
+                    "quest_ref",
+                    "request_ref",
+                    "revision",
+                }
+                quest_ref = view_context.get("quest_ref")
+                request_ref = view_context.get("request_ref")
+                revision = view_context.get("revision")
+                if (
+                    set(view_context) != expected_fields
+                    or not isinstance(quest_ref, str)
+                    or not quest_ref
+                    or not isinstance(request_ref, str)
+                    or not request_ref
+                    or not isinstance(revision, int)
+                    or isinstance(revision, bool)
+                    or revision < 1
+                ):
+                    raise OwnerConflict(
+                        "companion_human_request_view_context_invalid"
+                    )
+                if scope_ref != f"quest:{quest_ref}":
+                    raise OwnerConflict(
+                        "companion_human_request_view_context_stale"
+                    )
+                request = next(
+                    (
+                        candidate
+                        for candidate in self.query_open_human_requests(
+                            quest_ref=quest_ref
+                        )
+                        if candidate.get("request_ref") == request_ref
+                    ),
+                    None,
+                )
+                if (
+                    request is None
+                    or request.get("quest_ref") != quest_ref
+                    or request.get("revision") != revision
+                ):
+                    raise OwnerConflict(
+                        "companion_human_request_view_context_stale"
+                    )
+                return {
+                    **self._companion_quest_context(
+                        scope_ref=scope_ref,
+                        quest_ref=quest_ref,
+                    ),
+                    "context_kind": "human_request",
+                    "view_context": {
+                        "kind": "human_request",
+                        "quest_ref": quest_ref,
+                        "request_ref": request_ref,
+                        "revision": revision,
+                    },
+                    "human_request": _companion_human_request_context(request),
+                }
+            question_context = _companion_question_context(
                 scope_ref,
                 view_context,
                 research_graph=self._research_graph,
                 research_memory=self._research_memory,
             )
+            quest_ref = cast(str, question_context["quest_ref"])
+            return {
+                **self._companion_quest_context(
+                    scope_ref=scope_ref,
+                    quest_ref=quest_ref,
+                ),
+                "context_kind": "question",
+                "view_context": question_context["view_context"],
+                "question": question_context["question"],
+            }
         owners = (
             self._research_graph,
             self._research_memory,
@@ -1991,11 +2118,22 @@ class SQLiteHumanCollaboration:
                     is not None
                     else None
                 )
+                context = (
+                    {
+                        "schema_ref": "meta-research/companion-context/v1",
+                        "scope_ref": scope_ref,
+                        "context_kind": "workspace",
+                        "quest_ref": None,
+                    }
+                    if quest_ref is None
+                    else self._companion_quest_context(
+                        scope_ref=scope_ref,
+                        quest_ref=quest_ref,
+                    )
+                )
                 return {
-                    "schema_ref": "meta-research/companion-context/v1",
-                    "scope_ref": scope_ref,
+                    **context,
                     "context_kind": "human_request",
-                    "quest_ref": quest_ref,
                     "human_request": _companion_human_request_context(request),
                 }
         candidate_quest_ref = (
@@ -2020,11 +2158,21 @@ class SQLiteHumanCollaboration:
                 if request.get("status") == "open"
             ][:20]
         )
+        context = (
+            {
+                "schema_ref": "meta-research/companion-context/v1",
+                "scope_ref": scope_ref,
+                "context_kind": "workspace",
+                "quest_ref": None,
+            }
+            if quest_ref is None
+            else self._companion_quest_context(
+                scope_ref=scope_ref,
+                quest_ref=quest_ref,
+            )
+        )
         return {
-            "schema_ref": "meta-research/companion-context/v1",
-            "scope_ref": scope_ref,
-            "context_kind": "quest" if quest_ref is not None else "workspace",
-            "quest_ref": quest_ref,
+            **context,
             "open_human_requests": [
                 _companion_human_request_context(request) for request in requests
             ],
@@ -2065,13 +2213,6 @@ class SQLiteHumanCollaboration:
             expected_scope_ref=expected_scope_ref,
             expected_proposal_hash=expected_proposal_hash,
             idempotency_key=idempotency_key,
-        )
-
-    def record_soft_constraint(
-        self, scope_ref: str, guidance: dict[str, object], idempotency_key: str
-    ) -> dict[str, object]:
-        return self._collaboration_ladder.record_soft_constraint(
-            scope_ref, guidance, idempotency_key
         )
 
     def withdraw_soft_constraint(
@@ -8710,7 +8851,7 @@ class SQLiteHumanCollaboration:
             return False
         if quest is None:
             try:
-                self._research_graph.accept_quest(
+                quest = self._research_graph.accept_quest(
                     initialization_id=initialization_id,
                     draft=draft,
                     draft_revision=int(row.confirmed_draft_revision),
@@ -8728,9 +8869,32 @@ class SQLiteHumanCollaboration:
                     _dispatch_failure_reason(error, "quest_acceptance_io_unavailable"),
                 )
                 return False
-            self._clear_dispatch_failure(initialization_id, "quest_goal")
-            return True
+        try:
+            with self._database.read() as connection:
+                companion_native_session_ref = connection.execute(
+                    text(
+                        "SELECT native_session_ref FROM "
+                        "hc_intent_drafting_sessions WHERE initialization_id = "
+                        ":initialization_id"
+                    ),
+                    {"initialization_id": initialization_id},
+                ).scalar_one_or_none()
+            companion_created = self._collaboration_ladder.ensure_companion_session(
+                f"quest:{quest.quest_ref}",
+                native_session_ref=companion_native_session_ref,
+            )
+        except (OwnerConflict, OSError) as error:
+            self._record_dispatch_failure(
+                initialization_id,
+                "quest_goal",
+                _dispatch_failure_reason(
+                    error, "companion_session_preparation_unavailable"
+                ),
+            )
+            return False
         self._clear_dispatch_failure(initialization_id, "quest_goal")
+        if companion_created:
+            return True
 
         try:
             broad_authorization = self.query_broad_research_authorization(

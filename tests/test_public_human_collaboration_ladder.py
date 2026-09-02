@@ -531,8 +531,26 @@ def test_conversation_proposal_constraint_and_authorization_are_distinct(
     provider = _DeterministicDraftingProvider()
     runtime = _runtime(tmp_path / "interaction-ladder", provider)
     human = runtime.owners.human_collaboration
-    scope_ref = "quest:quest_interaction_ladder"
     try:
+        confirmed = _confirm_direct_quest(runtime)
+        for _step in range(5):
+            if not human.reconcile_once():
+                break
+        creation = human.query_quest_creation(confirmed["initialization_id"])
+        assert creation["status"] == "completed"
+        scope_ref = f"quest:{creation['quest_ref']}"
+        prepared_companion = human.query_companion(scope_ref)
+        assert prepared_companion["session_ref"] is not None
+        assert prepared_companion["turns"] == []
+        projected_companion = runtime.projection.query_snapshot()[
+            "human_collaboration"
+        ]["companion"]
+        assert projected_companion["scope_ref"] == scope_ref
+        assert projected_companion["session_ref"] == prepared_companion[
+            "session_ref"
+        ]
+        assert projected_companion["messages"] == []
+
         initial_authorization_count = human.query_snapshot().facts[
             "authorization_count"
         ]
@@ -547,12 +565,22 @@ def test_conversation_proposal_constraint_and_authorization_are_distinct(
         assert human.process_drafting_once()
 
         companion = human.query_companion(scope_ref)
+        assert companion["session_ref"] == prepared_companion["session_ref"]
         assert companion["scope_ref"] == scope_ref
         assert companion["turns"][-1]["message"] == (
             "Help me reason about a narrower scope."
         )
         assert companion["turns"][-1]["assistant_status"] == "completed"
         assert companion["turns"][-1]["assistant_content"].startswith("assistant:")
+        context = provider.intent_requests[-1].draft["current_context"]
+        assert context["quest"]["quest_ref"] == creation["quest_ref"]
+        assert context["quest"]["goal"] == (
+            "Answer a bounded research question."
+        )
+        assert context["activity"]["foreground"]["quest_ref"] == creation[
+            "quest_ref"
+        ]
+        assert context["activity"]["managed_runs"] == []
         assert human.query_active_guidance_bindings(scope_ref) == []
         assert human.query_snapshot().facts["authorization_count"] == (
             initial_authorization_count
@@ -570,15 +598,15 @@ def test_conversation_proposal_constraint_and_authorization_are_distinct(
         assert proposal["authoritative_effect"] is False
         assert human.query_active_guidance_bindings(scope_ref) == []
 
-        constraint = human.record_soft_constraint(
-            scope_ref,
-            {
-                "text": "Prefer public literature for the first pass.",
-                "applies_to": ["idea"],
-            },
-            "soft-constraint-1",
+        converted = human.convert_agent_proposal_to_soft_constraint(
+            proposal["proposal_ref"],
+            expected_scope_ref=scope_ref,
+            expected_proposal_hash=proposal["proposal_hash"],
+            idempotency_key="soft-constraint-1",
         )
+        constraint = converted["soft_constraint"]
         assert constraint["status"] == "active"
+        assert constraint["source_proposal_ref"] == proposal["proposal_ref"]
         assert constraint["issuer"] == "human_collaboration"
         assert constraint["receipt_ref"]
         bindings = human.query_active_guidance_bindings(scope_ref)
@@ -597,6 +625,63 @@ def test_conversation_proposal_constraint_and_authorization_are_distinct(
         )
         assert withdrawn["status"] == "withdrawn"
         assert human.query_active_guidance_bindings(scope_ref) == []
+    finally:
+        runtime.close()
+
+
+def test_quest_companion_session_preparation_recovers_in_quest_goal_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _DeterministicDraftingProvider()
+    runtime = _runtime(tmp_path / "companion-session-recovery", provider)
+    human = runtime.owners.human_collaboration
+    ladder = human._collaboration_ladder
+    original = ladder.ensure_companion_session
+    try:
+        confirmed = _confirm_direct_quest(runtime)
+
+        def unavailable(
+            scope_ref: str,
+            *,
+            native_session_ref: str | None = None,
+        ) -> bool:
+            del scope_ref, native_session_ref
+            raise OSError("simulated companion session storage failure")
+
+        monkeypatch.setattr(ladder, "ensure_companion_session", unavailable)
+        assert not human.reconcile_once()
+        interrupted = human.query_quest_creation(confirmed["initialization_id"])
+        assert interrupted["status"] == "partial"
+        assert interrupted["recovery"]["first_missing_step"] == "quest_goal"
+        assert interrupted["recovery"]["reason"] == {
+            "code": "companion_session_preparation_unavailable"
+        }
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT step FROM hc_reconciliation_attempts WHERE "
+                    "initialization_id = :initialization_id"
+                ),
+                {"initialization_id": confirmed["initialization_id"]},
+            ).scalar_one() == "quest_goal"
+
+        monkeypatch.setattr(ladder, "ensure_companion_session", original)
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_reconciliation_checkpoints SET next_retry_at = 0 "
+                    "WHERE initialization_id = :initialization_id"
+                ),
+                {"initialization_id": confirmed["initialization_id"]},
+            )
+        assert human.reconcile_once()
+        recovered = human.query_quest_creation(confirmed["initialization_id"])
+        scope_ref = f"quest:{recovered['quest_ref']}"
+        assert recovered["recovery"]["state"] == "idle"
+        assert recovered["recovery"]["first_missing_step"] is None
+        assert recovered["recovery"]["reason"] is None
+        assert human.query_companion(scope_ref)["session_ref"] is not None
     finally:
         runtime.close()
 
@@ -700,27 +785,35 @@ def test_companion_binds_an_exact_current_question_view_context_into_the_agent_t
         assert provider_request.message == (
             "What evidence is still missing for this Question?"
         )
-        assert provider_request.draft["current_context"] == {
-            "schema_ref": "meta-research/companion-context/v1",
-            "scope_ref": scope_ref,
-            "context_kind": "question",
+        current_context = provider_request.draft["current_context"]
+        assert current_context["schema_ref"] == (
+            "meta-research/companion-context/v1"
+        )
+        assert current_context["scope_ref"] == scope_ref
+        assert current_context["context_kind"] == "question"
+        assert current_context["quest_ref"] == question.quest_ref
+        assert current_context["view_context"] == view_context
+        assert current_context["question"] == {
+            "question_ref": question.question_ref,
             "quest_ref": question.quest_ref,
-            "view_context": view_context,
-            "question": {
-                "question_ref": question.question_ref,
-                "quest_ref": question.quest_ref,
-                "parent_question_ref": None,
-                "content_ref": question.content_ref,
-                "content_hash": question.content_hash,
-                "schema_ref": question.schema_ref,
-                "question_receipt_ref": question.receipt.receipt_ref,
-                "content_receipt_ref": question.content_receipt.receipt_ref,
-                "lifecycle_status": "active",
-                "lifecycle_revision": lifecycle["revision"],
-                "title": "A bounded question",
-                "unknown_statement": "What remains unknown?",
-            },
+            "parent_question_ref": None,
+            "content_ref": question.content_ref,
+            "content_hash": question.content_hash,
+            "schema_ref": question.schema_ref,
+            "question_receipt_ref": question.receipt.receipt_ref,
+            "content_receipt_ref": question.content_receipt.receipt_ref,
+            "lifecycle_status": "active",
+            "lifecycle_revision": lifecycle["revision"],
+            "title": "A bounded question",
+            "unknown_statement": "What remains unknown?",
         }
+        assert current_context["quest"]["goal"] == (
+            "Answer a bounded research question."
+        )
+        assert current_context["activity"]["foreground"]["question_ref"] == (
+            question.question_ref
+        )
+        assert current_context["activity"]["managed_runs"] == []
         assert human.query_companion(scope_ref)["turns"][-1][
             "view_context"
         ] == view_context
@@ -1129,15 +1222,20 @@ def test_collaboration_projection_isolates_every_artifact_by_exact_scope(
                 f"scope-{suffix}-message",
             )
             assert human.process_drafting_once()
-            human.record_agent_proposal(
+            proposal = human.record_agent_proposal(
                 scope_ref,
-                {"proposal_kind": "scope_probe", "scope": suffix},
+                {
+                    "proposal_kind": "scope_probe",
+                    "scope": suffix,
+                    "text": f"Only apply guidance {suffix} in its exact scope.",
+                },
                 f"scope-{suffix}-proposal",
             )
-            human.record_soft_constraint(
-                scope_ref,
-                {"text": f"Only apply guidance {suffix} in its exact scope."},
-                f"scope-{suffix}-constraint",
+            human.convert_agent_proposal_to_soft_constraint(
+                proposal["proposal_ref"],
+                expected_scope_ref=scope_ref,
+                expected_proposal_hash=proposal["proposal_hash"],
+                idempotency_key=f"scope-{suffix}-constraint",
             )
             confirmation = _confirm_capability_command(
                 human,
@@ -1347,15 +1445,32 @@ def test_quest_bound_request_context_preserves_companion_root_scope(
             idempotency_key="companion-request-root-scope-open",
             quest_ref=quest_ref,
         )
+        scope_ref = f"quest:{quest_ref}"
+        view_context = {
+            "kind": "human_request",
+            "quest_ref": quest_ref,
+            "request_ref": request["request_ref"],
+            "revision": request["revision"],
+        }
         queued = human.send_companion_message(
-            cast(str, request["request_ref"]),
+            scope_ref,
             "Help me evaluate this exact request.",
             "companion-request-root-scope-message",
+            view_context=view_context,
         )
 
         assert not human.process_drafting_once()
         [first_request] = provider.intent_requests
-        assert first_request.draft["current_context"]["quest_ref"] == quest_ref
+        current_context = first_request.draft["current_context"]
+        assert current_context["quest_ref"] == quest_ref
+        assert current_context["context_kind"] == "human_request"
+        assert current_context["view_context"] == view_context
+        assert current_context["human_request"]["request_ref"] == request[
+            "request_ref"
+        ]
+        assert human.query_companion(scope_ref)["turns"][0][
+            "view_context"
+        ] == view_context
         root_scope = first_request.root_runtime_scope
         assert root_scope is not None
         assert root_scope["quest_ref"] == quest_ref
@@ -2133,17 +2248,6 @@ def test_all_human_collaboration_write_surfaces_reject_credentials(tmp_path) -> 
                 scope_ref,
                 {"proposal_kind": "narrow_scope", "client_secret": "value"},
                 "secret-agent-proposal",
-            )
-        with pytest.raises(
-            OwnerConflict, match="human_collaboration_secret_forbidden"
-        ):
-            human.record_soft_constraint(
-                scope_ref,
-                {
-                    "text": "Use only public sources.",
-                    "private_key": "-----BEGIN PRIVATE KEY-----",
-                },
-                "secret-soft-constraint",
             )
         with pytest.raises(
             OwnerConflict, match="human_collaboration_secret_forbidden"

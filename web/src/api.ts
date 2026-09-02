@@ -2104,6 +2104,17 @@ export type CompanionQuestionViewContext = {
   lifecycle_revision: number;
 };
 
+export type CompanionHumanRequestViewContext = {
+  kind: "human_request";
+  quest_ref: string;
+  request_ref: string;
+  revision: number;
+};
+
+export type CompanionViewContext =
+  | CompanionQuestionViewContext
+  | CompanionHumanRequestViewContext;
+
 export type CompanionMessage = {
   message_ref?: string;
   scope_ref?: string | null;
@@ -2114,7 +2125,7 @@ export type CompanionMessage = {
   status?: "queued" | "processing" | "running" | "completed" | "failed";
   created_at?: number;
   reason?: { code?: string } | null;
-  view_context?: CompanionQuestionViewContext | null;
+  view_context?: CompanionViewContext | null;
 };
 
 export type CompanionSoftConstraint = {
@@ -2484,6 +2495,7 @@ export type HumanCollaborationProjection = {
   companion: {
     status: "ready" | "unavailable";
     scope_ref?: string | null;
+    session_ref: string | null;
     messages: CompanionMessage[];
     soft_constraints: CompanionSoftConstraint[];
     agent_proposals: CompanionAgentProposal[];
@@ -3026,7 +3038,7 @@ export function cancelManualQuestionCreation(
 export function sendCompanionMessage(
   message: string,
   scopeRef?: string | null,
-  viewContext?: CompanionQuestionViewContext | null,
+  viewContext?: CompanionViewContext | null,
 ): Promise<Record<string, unknown>> {
   return writeJson("/api/v1/companion/messages", "POST", {
     ...(scopeRef ? { scope_ref: scopeRef } : {}),
@@ -3710,16 +3722,6 @@ export function authorizeHumanCommand(
       confirmation_receipt_ref: confirmation.receipt_ref,
     },
   );
-}
-
-export function recordSoftConstraint(
-  scopeRef: string,
-  guidance: Record<string, unknown>,
-): Promise<CompanionSoftConstraint> {
-  return writeJson("/api/v1/human-collaboration/soft-constraints", "POST", {
-    scope_ref: scopeRef,
-    guidance,
-  });
 }
 
 export function convertAgentProposalToSoftConstraint(

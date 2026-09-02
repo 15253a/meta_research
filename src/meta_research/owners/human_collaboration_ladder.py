@@ -334,6 +334,81 @@ class SQLiteHumanCollaborationLadder:
             raise OwnerConflict("writing_delivery_verifier_already_bound")
         self._writing_delivery_binding_validator = validator
 
+    def ensure_companion_session(
+        self,
+        scope_ref: str,
+        *,
+        native_session_ref: str | None = None,
+    ) -> bool:
+        """Create the one durable Companion identity for an accepted Quest."""
+
+        scope_ref = _scope_ref(scope_ref, "companion_scope_required")
+        if not scope_ref.startswith("quest:"):
+            raise OwnerConflict("companion_quest_scope_required")
+        if native_session_ref is not None:
+            native_session_ref = _text(
+                native_session_ref,
+                "companion_native_session_invalid",
+                256,
+            )
+        with self._database.write() as connection:
+            session_ref, created = self._ensure_companion_session_row(
+                connection,
+                scope_ref,
+                native_session_ref=native_session_ref,
+            )
+            if not created:
+                return False
+            connection.execute(
+                text(
+                    "UPDATE human_collaboration_state SET revision = revision + 1, "
+                    "companion_session_count = companion_session_count + 1 WHERE "
+                    "singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "human_collaboration.companion_session_prepared",
+                {"scope_ref": scope_ref, "session_ref": session_ref},
+            )
+        return True
+
+    def _ensure_companion_session_row(
+        self,
+        connection,
+        scope_ref: str,
+        *,
+        native_session_ref: str | None = None,
+    ) -> tuple[str, bool]:
+        session = connection.execute(
+            text(
+                "SELECT session_ref, status FROM hc_companion_sessions WHERE "
+                "scope_ref = :scope_ref"
+            ),
+            {"scope_ref": scope_ref},
+        ).first()
+        if session is not None:
+            if session.status != "open":
+                raise OwnerConflict("companion_session_closed")
+            return str(session.session_ref), False
+        session_ref = new_ref("companion_session")
+        now = time.time()
+        connection.execute(
+            text(
+                "INSERT INTO hc_companion_sessions (session_ref, scope_ref, "
+                "native_session_ref, status, created_at, updated_at) VALUES "
+                "(:session_ref, :scope_ref, :native_session_ref, 'open', :now, "
+                ":now)"
+            ),
+            {
+                "session_ref": session_ref,
+                "scope_ref": scope_ref,
+                "native_session_ref": native_session_ref,
+                "now": now,
+            },
+        )
+        return session_ref, True
+
     def send_companion_message(
         self,
         scope_ref: str,
@@ -408,28 +483,11 @@ class SQLiteHumanCollaborationLadder:
                 )
                 if pending_count >= _MAX_PENDING_COMPANION_TURNS:
                     raise OwnerConflict("companion_queue_full")
-                session = connection.execute(
-                    text(
-                        "SELECT * FROM hc_companion_sessions WHERE scope_ref = :scope_ref"
-                    ),
-                    {"scope_ref": scope_ref},
-                ).first()
                 now = time.time()
-                created_session = session is None
-                if session is None:
-                    session_ref = new_ref("companion_session")
-                    connection.execute(
-                        text(
-                            "INSERT INTO hc_companion_sessions (session_ref, scope_ref, "
-                            "status, created_at, updated_at) VALUES (:session_ref, "
-                            ":scope_ref, 'open', :now, :now)"
-                        ),
-                        {"session_ref": session_ref, "scope_ref": scope_ref, "now": now},
-                    )
-                else:
-                    if session.status != "open":
-                        raise OwnerConflict("companion_session_closed")
-                    session_ref = session.session_ref
+                session_ref, created_session = self._ensure_companion_session_row(
+                    connection,
+                    scope_ref,
+                )
                 ordinal = int(
                     connection.execute(
                         text(
@@ -1546,78 +1604,6 @@ class SQLiteHumanCollaborationLadder:
         if command_draft.get("source_proposal_ref") != proposal_ref:
             raise OwnerConflict("agent_proposal_conversion_invalid")
         return {"proposal": proposal, "command_draft": command_draft}
-
-    def record_soft_constraint(
-        self,
-        scope_ref: str,
-        guidance: dict[str, object],
-        idempotency_key: str,
-    ) -> dict[str, object]:
-        scope_ref = _scope_ref(scope_ref, "soft_constraint_scope_required")
-        guidance = _document(guidance, "soft_constraint_invalid")
-        text_value = guidance.get("text")
-        if not isinstance(text_value, str) or not text_value.strip():
-            raise OwnerConflict("soft_constraint_text_required")
-        _reject_secret_content(guidance)
-        _idempotency_key(idempotency_key)
-        command_hash = canonical_hash(
-            {"command": "record_soft_constraint", "scope_ref": scope_ref, "guidance": guidance}
-        )
-        with self._database.write() as connection:
-            replay = _collaboration_command(
-                connection, idempotency_key, "soft_constraint", command_hash
-            )
-            if replay is None:
-                constraint_ref = new_ref("soft_constraint")
-                receipt_ref = new_ref("hc_receipt")
-                revision = 1
-                receipt_hash = _guidance_receipt_hash(
-                    constraint_ref, scope_ref, revision, canonical_hash(guidance)
-                )
-                now = time.time()
-                connection.execute(
-                    text(
-                        "INSERT INTO hc_soft_constraints (constraint_ref, scope_ref, "
-                        "revision, guidance_json, guidance_hash, status, receipt_ref, "
-                        "receipt_hash, idempotency_key, created_at, updated_at) VALUES "
-                        "(:constraint_ref, :scope_ref, :revision, :guidance_json, "
-                        ":guidance_hash, 'active', :receipt_ref, :receipt_hash, "
-                        ":idempotency_key, :now, :now)"
-                    ),
-                    {
-                        "constraint_ref": constraint_ref,
-                        "scope_ref": scope_ref,
-                        "revision": revision,
-                        "guidance_json": canonical_json(guidance),
-                        "guidance_hash": canonical_hash(guidance),
-                        "receipt_ref": receipt_ref,
-                        "receipt_hash": receipt_hash,
-                        "idempotency_key": idempotency_key,
-                        "now": now,
-                    },
-                )
-                _record_collaboration_command(
-                    connection,
-                    idempotency_key,
-                    "soft_constraint",
-                    command_hash,
-                    constraint_ref,
-                )
-                connection.execute(
-                    text(
-                        "UPDATE human_collaboration_state SET revision = revision + 1, "
-                        "soft_constraint_count = soft_constraint_count + 1 WHERE "
-                        "singleton = 'owner'"
-                    )
-                )
-                self._feed.record(
-                    connection,
-                    "human_collaboration.soft_constraint_recorded",
-                    {"constraint_ref": constraint_ref, "scope_ref": scope_ref},
-                )
-            else:
-                constraint_ref = replay
-        return self._query_soft_constraint(constraint_ref)
 
     def withdraw_soft_constraint(
         self,

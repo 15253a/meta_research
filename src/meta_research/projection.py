@@ -619,6 +619,9 @@ class PublicProjection:
                 self._human_collaboration,
                 collaboration_scopes,
             )
+            companion_session = self._human_collaboration.query_companion(
+                collaboration_scope
+            )
             safe_runnable_basis = _safe_meaningful_runnable_basis(
                 self._agent_runtime,
                 collaboration_scope,
@@ -806,6 +809,7 @@ class PublicProjection:
                 collaboration_scope,
                 human_requests,
                 collaboration,
+                companion_session,
                 safe_runnable_basis,
             ),
             "research_control": research_control,
@@ -1226,6 +1230,7 @@ def _human_collaboration_projection(
     scope_ref: str,
     requests: tuple[dict[str, object], ...],
     collaboration: dict[str, list[dict[str, object]]],
+    companion_session: dict[str, object],
     safe_runnable_basis: list[dict[str, object]],
 ) -> dict[str, object]:
     quest_ref = (
@@ -1270,6 +1275,7 @@ def _human_collaboration_projection(
         "companion": {
             "status": "ready",
             "scope_ref": scope_ref,
+            "session_ref": companion_session.get("session_ref"),
             "messages": collaboration["messages"],
             "soft_constraints": collaboration["soft_constraints"],
             "agent_proposals": collaboration["agent_proposals"],
