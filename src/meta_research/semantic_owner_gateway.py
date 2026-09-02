@@ -4,6 +4,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
+from meta_research.acquisition import (
+    ACQUISITION_ROUTE_POLICY,
+    AcquisitionBatchExecution,
+    AcquisitionBatchRequest,
+    AcquisitionPaper,
+    AcquisitionProvider,
+    AcquisitionUnavailable,
+    freeze_acquisition_item_artifacts,
+)
 from meta_research.bundle_exhaustion import (
     BundleExhaustionOperationResult,
     BundleExhaustionProposal,
@@ -40,6 +49,8 @@ from meta_research.owners.human_requests import HUMAN_REQUEST_KINDS
 from meta_research.owners.research_graph import ResearchGraphInterface
 from meta_research.owners.research_memory import ResearchMemoryInterface
 from meta_research.semantic_mcp import (
+    ROOT_AGENT_ACQUISITION_OPERATION_IDS,
+    ROOT_AGENT_COMMON_OPERATION_IDS,
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
     SemanticCallContext,
     SemanticMcpError,
@@ -68,7 +79,7 @@ ROOT_AGENT_SEMANTIC_OPERATION_IDS: dict[
 ] = {
     root_kind: root_operation_catalog(
         root_kind,
-        common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+        common_operation_ids=ROOT_AGENT_COMMON_OPERATION_IDS,
     )
     for root_kind in ROOT_AGENT_KINDS
 }
@@ -239,6 +250,7 @@ def create_semantic_owner_gateway(
     *,
     research_graph: ResearchGraphInterface,
     agent_runtime: AgentRuntimeInterface,
+    acquisition_provider: AcquisitionProvider | None = None,
     advancement_engine: AdvancementEngineInterface | None = None,
     research_memory: ResearchMemoryInterface | None = None,
     advancement_engine_snapshot: Callable[[], OwnerSnapshot] | None = None,
@@ -314,6 +326,10 @@ def create_semantic_owner_gateway(
         ),
         *_root_agent_human_request_operations(
             agent_runtime=agent_runtime,
+        ),
+        *_root_agent_acquisition_operations(
+            agent_runtime=agent_runtime,
+            acquisition_provider=acquisition_provider,
         ),
     ]
     if advancement_engine is not None:
@@ -686,6 +702,264 @@ def _root_agent_human_request_operations(
             ),
         ),
     )
+
+
+def _root_agent_acquisition_operations(
+    *,
+    agent_runtime: AgentRuntimeInterface,
+    acquisition_provider: AcquisitionProvider | None,
+) -> tuple[SemanticOperation, SemanticOperation]:
+    request_id, reconcile_id = ROOT_AGENT_ACQUISITION_OPERATION_IDS
+    return (
+        SemanticOperation(
+            semantic_operation_id=request_id,
+            owning_module="agent_runtime",
+            description=(
+                "Request one exact full-text target through the Quest's existing "
+                "Acquisition Session. Provider, route, Session and private storage "
+                "are selected by the server."
+            ),
+            input_schema=_root_acquisition_request_input_schema(),
+            output_schema=_root_acquisition_output_schema(),
+            access_mode="effect",
+            reconciliation_operation_id=reconcile_id,
+            handler=lambda context, arguments: _request_root_agent_acquisition(
+                agent_runtime,
+                acquisition_provider,
+                context,
+                arguments,
+            ),
+        ),
+        SemanticOperation(
+            semantic_operation_id=reconcile_id,
+            owning_module="agent_runtime",
+            description=(
+                "Read the recorded result for one exact Acquisition request after "
+                "a lost acknowledgement; this operation never invokes a Provider."
+            ),
+            input_schema=_effect_input_schema(),
+            output_schema=_root_acquisition_output_schema(),
+            access_mode="reconcile",
+            handler=lambda context, arguments: _reconcile_root_agent_acquisition(
+                agent_runtime,
+                context,
+                arguments,
+            ),
+        ),
+    )
+
+
+def _request_root_agent_acquisition(
+    owner: AgentRuntimeInterface,
+    provider: AcquisitionProvider | None,
+    context: SemanticCallContext,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    effect_id, effect_key = _semantic_effect_key(context, arguments)
+    session_ref = _root_agent_acquisition_session_ref(
+        owner,
+        context,
+        allow_suspended=False,
+    )
+    request = _root_agent_acquisition_request(
+        session_ref=session_ref,
+        effect_key=effect_key,
+        arguments=arguments,
+    )
+    try:
+        recorded = owner.query_acquisition_request(
+            session_ref,
+            request.request_id,
+        )
+        if recorded is not None:
+            if recorded.request.identity_payload() != request.identity_payload():
+                raise SemanticMcpError("acquisition_request_identity_conflict")
+        if recorded is None or recorded.status == "waiting_user":
+            if provider is None:
+                raise SemanticMcpError("acquisition_provider_unavailable")
+            execution = owner.acquire_literature(
+                session_ref,
+                request,
+                provider,
+            )
+        else:
+            execution = recorded
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    return _root_agent_acquisition_result(
+        effect_id=effect_id,
+        execution=execution,
+    )
+
+
+def _reconcile_root_agent_acquisition(
+    owner: AgentRuntimeInterface,
+    context: SemanticCallContext,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    effect_id, effect_key = _semantic_effect_key(context, arguments)
+    session_ref = _root_agent_acquisition_session_ref(
+        owner,
+        context,
+        allow_suspended=True,
+    )
+    request_id = _root_agent_acquisition_request_id(effect_key)
+    try:
+        execution = owner.query_acquisition_request(session_ref, request_id)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    if execution is None:
+        return {
+            "effect_id": effect_id,
+            "request_id": request_id,
+            "status": "unknown_outcome",
+        }
+    return _root_agent_acquisition_result(
+        effect_id=effect_id,
+        execution=execution,
+    )
+
+
+def _root_agent_acquisition_session_ref(
+    owner: AgentRuntimeInterface,
+    context: SemanticCallContext,
+    *,
+    allow_suspended: bool,
+) -> str:
+    if context.root_kind is None:
+        raise SemanticMcpError("root_agent_acquisition_effect_unauthorized")
+    try:
+        verify_scope = (
+            owner.verify_root_agent_human_request_reconcile_scope
+            if allow_suspended
+            else owner.verify_root_agent_runtime_scope
+        )
+        scope = verify_scope(
+            root_kind=context.root_kind,
+            run_ref=context.run_ref,
+            attempt_ref=context.attempt_ref,
+            root_session_ref=context.root_session_ref,
+            fence_ref=context.fence_ref,
+            runtime_binding_hash=context.capability_binding_hash,
+        )
+        quest_ref = scope.get("quest_ref")
+        acquisition_session_ref = scope.get("acquisition_session_ref")
+        if isinstance(quest_ref, str) and quest_ref:
+            session = owner.query_acquisition_session(quest_ref=quest_ref)
+        elif (
+            context.root_kind == "deepfetch"
+            and isinstance(acquisition_session_ref, str)
+            and acquisition_session_ref
+        ):
+            session = owner.query_acquisition_session(
+                session_ref=acquisition_session_ref
+            )
+        else:
+            raise SemanticMcpError("root_agent_acquisition_effect_unauthorized")
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    if session is None:
+        raise SemanticMcpError("acquisition_session_not_found")
+    return session.session_ref
+
+
+def _root_agent_acquisition_request(
+    *,
+    session_ref: str,
+    effect_key: str,
+    arguments: dict[str, object],
+) -> AcquisitionBatchRequest:
+    target = arguments.get("target")
+    if not isinstance(target, dict):
+        raise SemanticMcpError("acquisition_target_invalid")
+    source_urls = target.get("source_urls")
+    if not isinstance(source_urls, list):
+        raise SemanticMcpError("acquisition_target_invalid")
+    return AcquisitionBatchRequest(
+        request_id=_root_agent_acquisition_request_id(effect_key),
+        route_policy=ACQUISITION_ROUTE_POLICY,
+        papers=(
+            AcquisitionPaper(
+                paper_id=cast(str, target["paper_id"]),
+                title=cast(str, target["title"]),
+                doi=cast(str | None, target.get("doi")),
+                arxiv_id=cast(str | None, target.get("arxiv_id")),
+                source_urls=tuple(cast(list[str], source_urls)),
+            ),
+        ),
+        session_ref=session_ref,
+    )
+
+
+def _root_agent_acquisition_request_id(effect_key: str) -> str:
+    return "mcp_acquisition_" + effect_key.removeprefix("mcp-effect:")
+
+
+def _root_agent_acquisition_result(
+    *,
+    effect_id: str,
+    execution: AcquisitionBatchExecution,
+) -> dict[str, object]:
+    if len(execution.results) != 1 or execution.status == "partial":
+        raise SemanticMcpError("acquisition_single_target_result_invalid")
+    item = execution.results[0]
+    if item.status == "obtained":
+        try:
+            (item,) = freeze_acquisition_item_artifacts(
+                execution.request,
+                execution.results,
+            )
+        except AcquisitionUnavailable as error:
+            if error.code not in {
+                "acquisition_artifact_invalid",
+                "acquisition_artifact_drift",
+            }:
+                raise SemanticMcpError(error.code) from error
+            return {
+                "effect_id": effect_id,
+                "request_id": execution.request_id,
+                "status": "missing",
+                "result": {
+                    "paper_id": item.paper_id,
+                    "status": "missing",
+                    "failure": {
+                        "code": error.code,
+                        "detail": (
+                            "Owner 无法重新验证该全文文件；不会返回路径或重放 Provider。"
+                        ),
+                    },
+                },
+            }
+    result: dict[str, object] = {
+        "paper_id": item.paper_id,
+        "status": item.status,
+    }
+    if item.status == "obtained":
+        if (
+            item.path is None
+            or item.format is None
+            or item.content_sha256 is None
+            or item.content_bytes is None
+        ):
+            raise SemanticMcpError("acquisition_verified_result_invalid")
+        result.update(
+            {
+                "verified_path": item.path,
+                "format": item.format,
+                "content_sha256": item.content_sha256,
+                "content_bytes": item.content_bytes,
+            }
+        )
+    else:
+        if item.failure is None:
+            raise SemanticMcpError("acquisition_failure_result_invalid")
+        result["failure"] = item.failure
+    return {
+        "effect_id": effect_id,
+        "request_id": execution.request_id,
+        "status": item.status,
+        "result": result,
+    }
 
 
 def _open_root_agent_human_request(
@@ -2103,6 +2377,62 @@ def _effect_input_schema() -> dict[str, object]:
     )
 
 
+def _root_acquisition_request_input_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "effect_id": _string(max_length=128),
+            "target": _closed_object(
+                {
+                    "paper_id": _string(max_length=512),
+                    "title": _string(max_length=2000),
+                    "doi": _string(max_length=512),
+                    "arxiv_id": _string(max_length=512),
+                    "source_urls": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": _string(max_length=4096),
+                    },
+                },
+                required=("paper_id", "title", "source_urls"),
+            ),
+        },
+        required=("effect_id", "target"),
+    )
+
+
+def _root_acquisition_output_schema() -> dict[str, object]:
+    return _closed_object(
+        {
+            "effect_id": _string(max_length=128),
+            "request_id": _string(max_length=128),
+            "status": _string(
+                enum=("obtained", "waiting_user", "missing", "unknown_outcome")
+            ),
+            "result": _closed_object(
+                {
+                    "paper_id": _string(max_length=512),
+                    "status": _string(
+                        enum=("obtained", "waiting_user", "missing")
+                    ),
+                    "verified_path": _string(max_length=4096),
+                    "format": _string(enum=("pdf", "html", "xml")),
+                    "content_sha256": _hash_schema(),
+                    "content_bytes": {"type": "integer"},
+                    "failure": _closed_object(
+                        {
+                            "code": _string(max_length=256),
+                            "detail": _string(max_length=4000),
+                        },
+                        required=("code", "detail"),
+                    ),
+                },
+                required=("paper_id", "status"),
+            ),
+        },
+        required=("effect_id", "request_id", "status"),
+    )
+
+
 def _root_human_request_open_input_schema() -> dict[str, object]:
     return _closed_object(
         {
@@ -2325,6 +2655,8 @@ def _semantic_effect_key(
     effect_id = arguments.get("effect_id")
     if not isinstance(effect_id, str):
         raise SemanticMcpError("semantic_effect_id_invalid")
+    if context.operation_id in ROOT_AGENT_ACQUISITION_OPERATION_IDS:
+        return effect_id, context.acquisition_effect_key(effect_id)
     if context.operation_id in ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS:
         return effect_id, context.human_request_effect_key(effect_id)
     return effect_id, context.effect_key(effect_id)

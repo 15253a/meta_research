@@ -11,11 +11,6 @@ from pathlib import Path
 
 import pytest
 
-from meta_research.acquisition import (
-    AcquisitionBatchExecution,
-    AcquisitionBatchRequest,
-    AcquisitionItemResult,
-)
 from meta_research.codex_ledger import CodexHomeLedgerReader
 from meta_research.deepfetch import (
     CodexDeepFetchAdapter,
@@ -26,12 +21,13 @@ from meta_research.deepfetch import (
     DeepFetchUnavailable,
     _deepfetch_web_evidence_gate_output_schema,
     _read_hosted_acquisition_artifact,
+    _validated_v4_acquisition_effect,
     _verified_codex_reader_ledger_refs,
     canonical_hash,
     validate_deepfetch_result,
 )
 from meta_research.harness import FullConformanceBinding, ResidentMcpChannel
-from meta_research.owners.common import AcceptanceReceipt, OwnerConflict
+from meta_research.owners.common import AcceptanceReceipt
 from meta_research.provider_supervisor import (
     ensure_transport_key,
     read_transport_envelope,
@@ -198,17 +194,13 @@ PROTOTYPE_FINAL = {
 PROTOTYPE_ACQUIRE = {
     "action": "acquire",
     "acquisition_request": {
-        "request_id": "acq-v4-1",
-        "route_policy": "oa_first_then_institution",
-        "papers": [
-            {
-                "paper_id": "doi:10.1000/example",
-                "title": "A verifiable paper",
-                "doi": "10.1000/example",
-                "arxiv_id": None,
-                "source_urls": ["https://example.org/paper"],
-            }
-        ],
+        "effect_id": "acq-v4-1",
+        "target": {
+            "paper_id": "doi:10.1000/example",
+            "title": "A verifiable paper",
+            "doi": "10.1000/example",
+            "source_urls": ["https://example.org/paper"],
+        },
     },
     "completion": None,
     "limitations": [],
@@ -790,7 +782,14 @@ class ResidentRecordingRunner(RecordingRunner):
 
 
 class _DeepFetchResidentMcpAuthority:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        artifact_root: Path | None = None,
+        *,
+        content: bytes = PROTOTYPE_FULLTEXT,
+        wait_once: bool = False,
+        drift_after_commit: bool = False,
+    ) -> None:
         self.operation_ids = ROOT_AGENT_SEMANTIC_OPERATION_IDS["deepfetch"]
         self.operation_bindings = tuple(
             {"semantic_operation_id": operation_id}
@@ -798,6 +797,14 @@ class _DeepFetchResidentMcpAuthority:
         )
         self.issued: list[dict[str, object]] = []
         self.revoked: list[ResidentMcpChannel] = []
+        self.artifact_root = artifact_root
+        self.content = content
+        self.wait_once = wait_once
+        self.drift_after_commit = drift_after_commit
+        self.waited = False
+        self.calls: list[dict[str, object]] = []
+        self.query_calls: list[tuple[str, str]] = []
+        self.executions: dict[tuple[str, str], dict[str, object]] = {}
 
     def require_operation_binding(self, **values: object) -> FullConformanceBinding:
         assert values == {
@@ -841,6 +848,124 @@ class _DeepFetchResidentMcpAuthority:
 
     def revoke_resident_mcp_channel(self, channel: ResidentMcpChannel) -> None:
         self.revoked.append(channel)
+
+    def dispatch_mcp(
+        self, token: str | None, message: object
+    ) -> tuple[int, dict[str, object]]:
+        assert token == "deepfetch-token"
+        assert isinstance(message, dict)
+        params = message.get("params")
+        assert isinstance(params, dict)
+        operation_id = params.get("name")
+        arguments = params.get("arguments")
+        assert isinstance(operation_id, str)
+        assert isinstance(arguments, dict)
+        phase = self.issued[-1]["phase"]
+        assert isinstance(phase, str)
+        effect_id = arguments.get("effect_id")
+        assert isinstance(effect_id, str)
+        identity = (phase, effect_id)
+
+        if operation_id == "agent_runtime.acquisition.request.reconcile":
+            self.query_calls.append(identity)
+            result = self.executions.get(identity)
+            if result is None:
+                result = {
+                    "effect_id": effect_id,
+                    "request_id": _fake_acquisition_request_id(phase, effect_id),
+                    "status": "unknown_outcome",
+                }
+            return _mcp_success(result)
+
+        assert operation_id == "agent_runtime.acquisition.request"
+        target = arguments.get("target")
+        assert isinstance(target, dict)
+        paper_id = target.get("paper_id")
+        assert isinstance(paper_id, str)
+        request_id = _fake_acquisition_request_id(phase, effect_id)
+        self.calls.append(
+            {
+                "phase": phase,
+                "effect_id": effect_id,
+                "target": copy.deepcopy(target),
+                "request_id": request_id,
+            }
+        )
+        if self.wait_once and not self.waited:
+            self.waited = True
+            waiting = {
+                "effect_id": effect_id,
+                "request_id": request_id,
+                "status": "waiting_user",
+                "result": {
+                    "paper_id": paper_id,
+                    "status": "waiting_user",
+                    "failure": {
+                        "code": "institutional_login_required",
+                        "detail": "请在既有浏览器上下文中完成登录。",
+                    },
+                },
+            }
+            self.executions[identity] = waiting
+            return _mcp_success(waiting)
+        assert self.artifact_root is not None
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
+        artifact = self.artifact_root / (
+            hashlib.sha256(paper_id.encode()).hexdigest() + ".html"
+        )
+        artifact.write_bytes(self.content)
+        result = {
+            "effect_id": effect_id,
+            "request_id": request_id,
+            "status": "obtained",
+            "result": {
+                "paper_id": paper_id,
+                "status": "obtained",
+                "verified_path": str(artifact.resolve()),
+                "format": "html",
+                "content_sha256": hashlib.sha256(self.content).hexdigest(),
+                "content_bytes": len(self.content),
+            },
+        }
+        self.executions[identity] = result
+        if self.drift_after_commit:
+            artifact.write_bytes(TAMPERED_FULLTEXT)
+        return _mcp_success(result)
+
+    @property
+    def provider_effect_count(self) -> int:
+        return len(self.calls)
+
+    @property
+    def acquire_calls(self) -> list[tuple[str, str]]:
+        return [
+            (str(call["phase"]), str(call["effect_id"]))
+            for call in self.calls
+        ]
+
+
+def _mcp_success(
+    structured: dict[str, object],
+) -> tuple[int, dict[str, object]]:
+    return (
+        200,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [],
+                "structuredContent": structured,
+                "isError": False,
+            },
+        },
+    )
+
+
+def _fake_acquisition_request_id(phase: str, effect_id: str) -> str:
+    identity = canonical_hash(
+        {"root_kind": "deepfetch", "phase": phase, "effect_id": effect_id}
+    )
+    return "mcp_acquisition_" + identity
 
 
 class MalformedReaderTraceRunner(SequencedPrototypeRunner):
@@ -1141,130 +1266,23 @@ class OutputLimitedDurableStreamRunner:
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
 
-class RecordingAcquisitionClient:
+class RecordingAcquisitionClient(_DeepFetchResidentMcpAuthority):
     def __init__(self, artifact_root: Path) -> None:
-        self.calls: list[tuple[str, AcquisitionBatchRequest]] = []
-        self.artifact_root = artifact_root
-        self.executions: dict[tuple[str, str], AcquisitionBatchExecution] = {}
-
-    def acquire(
-        self, session_ref: str, request: AcquisitionBatchRequest
-    ) -> AcquisitionBatchExecution:
-        self.calls.append((session_ref, request))
-        self.artifact_root.mkdir(parents=True, exist_ok=True)
-        results: list[AcquisitionItemResult] = []
-        for paper in request.papers:
-            artifact = self.artifact_root / (
-                hashlib.sha256(paper.paper_id.encode()).hexdigest() + ".html"
-            )
-            artifact.write_bytes(PROTOTYPE_FULLTEXT)
-            results.append(
-                AcquisitionItemResult(
-                    paper_id=paper.paper_id,
-                    status="obtained",
-                    path=str(artifact.resolve()),
-                    format="html",
-                    failure=None,
-                    content_sha256=hashlib.sha256(PROTOTYPE_FULLTEXT).hexdigest(),
-                    content_bytes=len(PROTOTYPE_FULLTEXT),
-                )
-            )
-        execution = AcquisitionBatchExecution(
-            request_id=request.request_id,
-            session_ref=session_ref,
-            status="obtained",
-            request=_bound_fake_acquisition_request(
-                request,
-                session_ref,
-                self.artifact_root,
-            ),
-            results=tuple(results),
-        )
-        self.executions[(session_ref, request.request_id)] = execution
-        return execution
-
-    def query_completed_batch(
-        self, session_ref: str, request_id: str
-    ) -> AcquisitionBatchExecution | None:
-        return self.executions.get((session_ref, request_id))
+        super().__init__(artifact_root)
 
 
-class FileBackedAcquisitionClient:
+class FileBackedAcquisitionClient(_DeepFetchResidentMcpAuthority):
     def __init__(self, artifact_root: Path, content: bytes) -> None:
-        self.artifact_root = artifact_root
-        self.content = content
-        self.acquire_calls: list[tuple[str, str]] = []
-        self.query_calls: list[tuple[str, str]] = []
-        self.executions: dict[tuple[str, str], AcquisitionBatchExecution] = {}
-
-    def acquire(
-        self, session_ref: str, request: AcquisitionBatchRequest
-    ) -> AcquisitionBatchExecution:
-        self.acquire_calls.append((session_ref, request.request_id))
-        self.artifact_root.mkdir(parents=True, exist_ok=True)
-        results: list[AcquisitionItemResult] = []
-        for paper in request.papers:
-            path = self.artifact_root / f"{hashlib.sha256(paper.paper_id.encode()).hexdigest()}.html"
-            path.write_bytes(self.content)
-            results.append(
-                AcquisitionItemResult(
-                    paper_id=paper.paper_id,
-                    status="obtained",
-                    path=str(path.resolve()),
-                    format="html",
-                    failure=None,
-                    content_sha256=hashlib.sha256(self.content).hexdigest(),
-                    content_bytes=len(self.content),
-                )
-            )
-        execution = AcquisitionBatchExecution(
-            request_id=request.request_id,
-            session_ref=session_ref,
-            status="obtained",
-            request=_bound_fake_acquisition_request(
-                request,
-                session_ref,
-                self.artifact_root,
-            ),
-            results=tuple(results),
-        )
-        self.executions[(session_ref, request.request_id)] = execution
-        return execution
-
-    def query_completed_batch(
-        self, session_ref: str, request_id: str
-    ) -> AcquisitionBatchExecution | None:
-        self.query_calls.append((session_ref, request_id))
-        return self.executions.get((session_ref, request_id))
-
-
-class CorruptedOwnerIdentityAcquisitionClient(FileBackedAcquisitionClient):
-    def query_completed_batch(
-        self, session_ref: str, request_id: str
-    ) -> AcquisitionBatchExecution | None:
-        self.query_calls.append((session_ref, request_id))
-        raise OwnerConflict("acquisition_request_identity_conflict")
+        super().__init__(artifact_root, content=content)
 
 
 class DriftedTerminalAcquisitionClient(FileBackedAcquisitionClient):
     def __init__(self, artifact_root: Path) -> None:
-        super().__init__(artifact_root, PROTOTYPE_FULLTEXT)
-        self.provider_effect_count = 0
-
-    def acquire(
-        self, session_ref: str, request: AcquisitionBatchRequest
-    ) -> AcquisitionBatchExecution:
-        key = (session_ref, request.request_id)
-        existing = self.executions.get(key)
-        if existing is not None:
-            self.acquire_calls.append(key)
-            return existing
-        self.provider_effect_count += 1
-        execution = super().acquire(session_ref, request)
-        for result in execution.results:
-            assert result.path is not None
-            Path(result.path).write_bytes(TAMPERED_FULLTEXT)
-        return execution
+        _DeepFetchResidentMcpAuthority.__init__(
+            self,
+            artifact_root,
+            drift_after_commit=True,
+        )
 
 
 class VerifiedTerminalCodexDeepFetchAdapter(CodexDeepFetchAdapter):
@@ -1273,90 +1291,64 @@ class VerifiedTerminalCodexDeepFetchAdapter(CodexDeepFetchAdapter):
         return True
 
 
-class WaitingThenReadyAcquisitionClient:
+class WaitingThenReadyAcquisitionClient(_DeepFetchResidentMcpAuthority):
     def __init__(self, artifact_root: Path) -> None:
-        self.calls: list[tuple[str, AcquisitionBatchRequest]] = []
-        self.artifact_root = artifact_root
-        self.executions: dict[tuple[str, str], AcquisitionBatchExecution] = {}
+        super().__init__(artifact_root, wait_once=True)
 
-    def acquire(
-        self, session_ref: str, request: AcquisitionBatchRequest
-    ) -> AcquisitionBatchExecution:
-        self.calls.append((session_ref, request))
-        waiting = len(self.calls) == 1
-        self.artifact_root.mkdir(parents=True, exist_ok=True)
-        for paper in request.papers:
-            artifact = self.artifact_root / (
-                hashlib.sha256(paper.paper_id.encode()).hexdigest() + ".html"
-            )
-            artifact.write_bytes(PROTOTYPE_FULLTEXT)
-        execution = AcquisitionBatchExecution(
-            request_id=request.request_id,
-            session_ref=session_ref,
-            status="waiting_user" if waiting else "obtained",
-            request=_bound_fake_acquisition_request(
-                request,
-                session_ref,
-                self.artifact_root,
-            ),
-            results=tuple(
-                AcquisitionItemResult(
-                    paper_id=paper.paper_id,
-                    status="waiting_user" if waiting else "obtained",
-                    path=(
-                        None
-                        if waiting
-                        else str(
-                            (
-                                self.artifact_root
-                                / (
-                                    hashlib.sha256(paper.paper_id.encode()).hexdigest()
-                                    + ".html"
-                                )
-                            ).resolve()
-                        )
-                    ),
-                    format=None if waiting else "html",
-                    failure=(
-                        {
-                            "code": "institutional_login_required",
-                            "detail": "请在既有浏览器上下文中完成登录。",
-                        }
-                        if waiting
-                        else None
-                    ),
-                    content_sha256=(
-                        None
-                        if waiting
-                        else hashlib.sha256(PROTOTYPE_FULLTEXT).hexdigest()
-                    ),
-                    content_bytes=None if waiting else len(PROTOTYPE_FULLTEXT),
-                )
-                for paper in request.papers
-            ),
+
+class _ResidentRunnerProxy:
+    def __init__(self, runner: object) -> None:
+        self.runner = runner
+
+    def __call__(
+        self,
+        argv: list[str],
+        prompt: str,
+        timeout: float | None,
+        _environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.runner(argv, prompt, timeout)  # type: ignore[operator]
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "run_durable_job":
+            runner = object.__getattribute__(self, "runner")
+            if not callable(getattr(runner, name, None)):
+                raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+    def run_durable_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        prompt: str,
+        timeout: float | None,
+        stdout_path: Path,
+        pid_path: Path,
+        supervisor_request_path: Path,
+        _environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.runner.run_durable_job(  # type: ignore[attr-defined,no-any-return]
+            job_ref,
+            argv,
+            prompt,
+            timeout,
+            stdout_path,
+            pid_path,
+            supervisor_request_path,
         )
-        if execution.status != "waiting_user":
-            self.executions[(session_ref, request.request_id)] = execution
-        return execution
 
-    def query_completed_batch(
-        self, session_ref: str, request_id: str
-    ) -> AcquisitionBatchExecution | None:
-        return self.executions.get((session_ref, request_id))
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.runner, name)
 
 
-def _bound_fake_acquisition_request(
-    request: AcquisitionBatchRequest,
-    session_ref: str,
-    artifact_root: Path,
-) -> AcquisitionBatchRequest:
-    return request.bind_to_session(
-        session_ref=session_ref,
-        session_mode="oa_then_institution",
-        browser_context_ref=None,
-        provider_state_dir=artifact_root.parent,
-        target_dir=artifact_root,
-    )
+def _bind_acquisition(
+    adapter: CodexDeepFetchAdapter,
+    authority: _DeepFetchResidentMcpAuthority,
+) -> CodexDeepFetchAdapter:
+    adapter._runner = _ResidentRunnerProxy(adapter._runner)
+    adapter.bind_resident_mcp_authority(authority)
+    adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
+    return adapter
 
 
 def _request() -> DeepFetchProviderRequest:
@@ -1368,9 +1360,6 @@ def _request() -> DeepFetchProviderRequest:
         draft_hash="a" * 64,
         scope={"goal": "核查证据边界"},
         scope_hash="b" * 64,
-        acquisition_session_ref="acquisition_session_1",
-        acquisition_config_hash="e" * 64,
-        acquisition_runtime_binding_hash="f" * 64,
         accepted_material_bindings=(),
         authorization_receipt=AcceptanceReceipt(
             issuer="human_collaboration",
@@ -1441,11 +1430,13 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
 ) -> None:
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            model_ref="gpt-test",
+            process_runner=runner,
+        ),
+        acquisition,
     )
 
     result = _execute(adapter)
@@ -1466,7 +1457,7 @@ def test_codex_deepfetch_runs_the_bound_v4_roles_and_imports_only_public_artifac
         "codex-reader-ledger:v1",
         "deepfetch-v4-main-agent",
         "filesystem-danger-full-access",
-        "hosted-acquisition-session",
+        "quest-acquisition-semantic-effect",
         "native-child-readers",
         "papers-v4-finalize",
         (
@@ -1576,12 +1567,12 @@ def test_codex_deepfetch_explains_evidence_completion_in_every_final_prompt(
     tmp_path: Path,
 ) -> None:
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     _execute(adapter)
@@ -1603,10 +1594,9 @@ def test_codex_deepfetch_rejects_noncurrent_binding_before_any_effect(
     runner = SequencedPrototypeRunner([PROTOTYPE_EMPTY_FINAL])
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
     workspace = tmp_path / "provider"
-    adapter = CodexDeepFetchAdapter(
-        workspace,
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(workspace, process_runner=runner),
+        acquisition,
     )
     current = adapter.runtime_binding()
     old_binding = replace(current, model_ref="gpt-stale")
@@ -1631,10 +1621,9 @@ def test_codex_deepfetch_retires_signed_gate_ack_loss_without_new_effect(
     workspace = tmp_path / "provider"
     runner = DurableSegmentSequenceRunner(workspace, stopped_segments=0)
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
-    adapter = CodexDeepFetchAdapter(
-        workspace,
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(workspace, process_runner=runner),
+        acquisition,
     )
     request = replace(
         _request(),
@@ -1674,8 +1663,8 @@ def test_codex_deepfetch_retires_signed_gate_ack_loss_without_new_effect(
     with pytest.raises(DeepFetchUnavailable) as failure:
         adapter.execute(replace(request, reconcile_only=True))
 
-    assert failure.value.code == "deepfetch_runtime_binding_transition_required"
-    assert failure.value.durable_outcome == "terminal"
+    assert failure.value.code == "deepfetch_provider_reconciliation_pending"
+    assert failure.value.durable_outcome == "pending"
     assert tuple(runner.calls) == calls_before
     assert acquisition.calls == []
     assert checkpoint_path.read_bytes() == checkpoint_before
@@ -1759,8 +1748,8 @@ def test_codex_deepfetch_treats_selected_oa_as_the_primary_route(
     assert "oa_only 是用户明确选择的主路线" in prompt
     assert "跳过 institution/browser preflight" in prompt
     assert "不得描述为被迫、只能或降级到 OA" in prompt
-    assert "不得直接运行 Nature Downloader" in prompt
-    assert "需要全文时必须先返回 action=acquire" in prompt
+    assert "Quest-scoped Acquisition" in prompt
+    assert "只含 effect_id 和一个 target 的 action=acquire" in prompt
 
 
 def test_deepfetch_activity_tail_projects_live_events_without_provider_content(
@@ -2126,15 +2115,15 @@ def test_deepfetch_result_rejects_malformed_fulltext_file_proof(
     tmp_path: Path,
     file_proof: object,
 ) -> None:
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        model_ref="gpt-test",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            model_ref="gpt-test",
+            process_runner=SequencedPrototypeRunner(
+                [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL]
+            ),
         ),
-        process_runner=SequencedPrototypeRunner(
-            [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL]
-        ),
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
     result = _execute(adapter)
     web_evidence = copy.deepcopy(result.web_evidence)
@@ -2309,25 +2298,29 @@ def test_codex_deepfetch_rejects_oversized_fulltext_before_validator_reads_it(
         _execute(adapter)
 
 
-def test_codex_deepfetch_routes_each_finite_batch_through_the_hosted_session(
+def test_codex_deepfetch_routes_one_target_through_the_common_acquisition_effect(
     tmp_path: Path,
 ) -> None:
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            model_ref="gpt-test",
+            process_runner=runner,
+        ),
+        acquisition,
     )
 
     result = _execute(adapter)
 
     assert len(acquisition.calls) == 1
-    session_ref, batch = acquisition.calls[0]
-    assert session_ref == "acquisition_session_1"
-    assert batch.request_id == "acq-v4-1"
-    assert batch.route_policy == "oa_first_then_institution"
+    call = acquisition.calls[0]
+    assert call["phase"] == "turn-1"
+    assert call["effect_id"] == "acq-v4-1"
+    assert call["target"] == PROTOTYPE_ACQUIRE["acquisition_request"]["target"]
+    request_id = call["request_id"]
+    assert isinstance(request_id, str)
     assert len(runner.calls) == 3
     assert "resume" in runner.calls[2][0]
     assert "acquisition_result=" in runner.calls[2][1]
@@ -2340,7 +2333,10 @@ def test_codex_deepfetch_routes_each_finite_batch_through_the_hosted_session(
         "acquisition_item_proofs"
     ][0]
     assert proof == {
-        "request_id": "acq-v4-1",
+        "effect_id": "acq-v4-1",
+        "phase": "turn-1",
+        "target_hash": canonical_hash(call["target"]),
+        "request_id": request_id,
         "paper_id": "doi:10.1000/example",
         "status": "obtained",
         "path": str(
@@ -2359,25 +2355,27 @@ def test_codex_deepfetch_routes_each_finite_batch_through_the_hosted_session(
     }
     assert result.web_evidence is not None
     assert result.web_evidence["prototype"]["acquisition_request_ids"] == [
-        "acq-v4-1"
+        request_id
     ]
 
 
-@pytest.mark.parametrize("request_id", ["/tmp/x", "../x", "a/b"])
-def test_codex_deepfetch_rejects_path_unsafe_acquisition_request_id_before_hosting(
+@pytest.mark.parametrize("caller_field", ["request_id", "route_policy", "papers"])
+def test_codex_deepfetch_rejects_caller_owned_acquisition_routing_fields(
     tmp_path: Path,
-    request_id: str,
+    caller_field: str,
 ) -> None:
     output = copy.deepcopy(PROTOTYPE_ACQUIRE)
     acquisition_request = output["acquisition_request"]
     assert isinstance(acquisition_request, dict)
-    acquisition_request["request_id"] = request_id
+    acquisition_request[caller_field] = "forged"
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=PrototypeRecordingRunner(output),
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            model_ref="gpt-test",
+            process_runner=PrototypeRecordingRunner(output),
+        ),
+        acquisition,
     )
 
     with pytest.raises(
@@ -2387,6 +2385,24 @@ def test_codex_deepfetch_rejects_path_unsafe_acquisition_request_id_before_hosti
         _execute(adapter)
 
     assert acquisition.calls == []
+
+
+def test_deepfetch_acquisition_source_url_fits_the_common_effect_schema() -> None:
+    output = copy.deepcopy(PROTOTYPE_ACQUIRE)
+    request = output["acquisition_request"]
+    assert isinstance(request, dict)
+    target = request["target"]
+    assert isinstance(target, dict)
+    target["source_urls"] = ["https://example.org/" + "x" * 4_076]
+    assert _validated_v4_acquisition_effect(output)["target"] == target
+
+    target["source_urls"] = ["https://example.org/" + "x" * 4_077]
+
+    with pytest.raises(
+        DeepFetchUnavailable,
+        match="deepfetch_acquisition_request_invalid",
+    ):
+        _validated_v4_acquisition_effect(output)
 
 
 def test_hosted_acquisition_reader_rejects_a_symlinked_owner_target_root(
@@ -2417,11 +2433,13 @@ def test_pending_acquisition_proof_drift_requires_a_successor_without_replay(
         tmp_path / "owner-artifacts"
     )
     runner = PrototypeRecordingRunner(PROTOTYPE_ACQUIRE)
-    adapter = VerifiedTerminalCodexDeepFetchAdapter(
-        tmp_path / "provider",
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        VerifiedTerminalCodexDeepFetchAdapter(
+            tmp_path / "provider",
+            model_ref="gpt-test",
+            process_runner=runner,
+        ),
+        acquisition,
     )
 
     with pytest.raises(DeepFetchUnavailable) as first_failure:
@@ -2440,7 +2458,7 @@ def test_pending_acquisition_proof_drift_requires_a_successor_without_replay(
     assert repeated_failure.value.code == "deepfetch_acquisition_artifact_drift"
     assert repeated_failure.value.durable_outcome == "pending"
     assert acquisition.provider_effect_count == 1
-    assert len(acquisition.acquire_calls) == 2
+    assert len(acquisition.acquire_calls) == 1
     assert len(runner.calls) == 2
 
 
@@ -2464,7 +2482,7 @@ def test_codex_deepfetch_binds_each_reader_fulltext_to_an_obtained_hosted_item(
     tmp_path: Path,
 ) -> None:
     unrelated_acquisition = copy.deepcopy(PROTOTYPE_ACQUIRE)
-    unrelated_paper = unrelated_acquisition["acquisition_request"]["papers"][0]
+    unrelated_paper = unrelated_acquisition["acquisition_request"]["target"]
     unrelated_paper.update(
         {
             "paper_id": "doi:10.1000/unrelated",
@@ -2472,15 +2490,15 @@ def test_codex_deepfetch_binds_each_reader_fulltext_to_an_obtained_hosted_item(
             "doi": "10.1000/unrelated",
         }
     )
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        model_ref="gpt-test",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            model_ref="gpt-test",
+            process_runner=SequencedPrototypeRunner(
+                [unrelated_acquisition, PROTOTYPE_FINAL]
+            ),
         ),
-        process_runner=SequencedPrototypeRunner(
-            [unrelated_acquisition, PROTOTYPE_FINAL]
-        ),
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     with pytest.raises(
@@ -2493,15 +2511,17 @@ def test_codex_deepfetch_binds_each_reader_fulltext_to_an_obtained_hosted_item(
 def test_codex_deepfetch_rejects_reader_bytes_not_returned_by_hosted_acquisition(
     tmp_path: Path,
 ) -> None:
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        model_ref="gpt-test",
-        acquisition_client=FileBackedAcquisitionClient(
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            model_ref="gpt-test",
+            process_runner=SequencedPrototypeRunner(
+                [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL]
+            ),
+        ),
+        FileBackedAcquisitionClient(
             tmp_path / "owner-artifacts",
             b"<html><body>Different hosted artifact.</body></html>",
-        ),
-        process_runner=SequencedPrototypeRunner(
-            [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL]
         ),
     )
 
@@ -2525,11 +2545,13 @@ def test_codex_deepfetch_rejects_owner_artifact_mutated_after_terminal_commit(
         PROTOTYPE_FULLTEXT,
     )
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
-    adapter = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            workspace,
+            model_ref="gpt-test",
+            process_runner=runner,
+        ),
+        acquisition,
     )
     _execute(adapter)
     artifact_path.write_bytes(TAMPERED_FULLTEXT)
@@ -2562,18 +2584,20 @@ def test_codex_deepfetch_rejects_owner_artifact_mutated_after_terminal_commit(
         DeepFetchUnavailable,
         match="deepfetch_acquisition_artifact_drift",
     ):
-        restarted = CodexDeepFetchAdapter(
-            workspace,
-            model_ref="gpt-test",
-            acquisition_client=acquisition,
-            process_runner=runner,
+        restarted = _bind_acquisition(
+            CodexDeepFetchAdapter(
+                workspace,
+                model_ref="gpt-test",
+                process_runner=runner,
+            ),
+            acquisition,
         )
         _execute(restarted)
 
-    assert acquisition.acquire_calls == [("acquisition_session_1", "acq-v4-1")]
+    assert acquisition.acquire_calls == [("turn-1", "acq-v4-1")]
 
 
-def test_codex_deepfetch_reattests_completed_owner_artifact_when_upgrading_v1(
+def test_codex_deepfetch_rejects_a_legacy_acquisition_checkpoint(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "provider"
@@ -2582,150 +2606,36 @@ def test_codex_deepfetch_reattests_completed_owner_artifact_when_upgrading_v1(
         PROTOTYPE_FULLTEXT,
     )
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
-    adapter = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
-    )
-    expected = _execute(adapter)
-    checkpoint_path = next(workspace.glob("runs/*/private/protocol.json"))
-    legacy = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    legacy["schema_ref"] = "meta-research/deepfetch-v4-protocol-checkpoint/v1"
-    del legacy["acquisition_item_proofs"]
-    checkpoint_path.write_text(
-        json.dumps(legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-
-    restarted = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
-    )
-    replayed = _execute(restarted)
-
-    assert replayed == expected
-    assert acquisition.acquire_calls == [("acquisition_session_1", "acq-v4-1")]
-    assert acquisition.query_calls == [
-        ("acquisition_session_1", "acq-v4-1"),
-        ("acquisition_session_1", "acq-v4-1"),
-        ("acquisition_session_1", "acq-v4-1"),
-    ]
-    upgraded = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    assert upgraded["schema_ref"] == (
-        "meta-research/deepfetch-v4-protocol-checkpoint/v2"
-    )
-    assert upgraded["acquisition_item_proofs"][0]["sha256"] == (
-        hashlib.sha256(PROTOTYPE_FULLTEXT).hexdigest()
-    )
-
-
-def test_codex_deepfetch_blocks_v1_obtained_item_without_owner_frozen_proof(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / "provider"
-    acquisition = FileBackedAcquisitionClient(
-        tmp_path / "owner-artifacts",
-        PROTOTYPE_FULLTEXT,
-    )
-    runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
-    adapter = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
-    )
-    _execute(adapter)
-    checkpoint_path = next(workspace.glob("runs/*/private/protocol.json"))
-    legacy = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    legacy["schema_ref"] = "meta-research/deepfetch-v4-protocol-checkpoint/v1"
-    del legacy["acquisition_item_proofs"]
-    checkpoint_path.write_text(
-        json.dumps(legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    identity = ("acquisition_session_1", "acq-v4-1")
-    execution = acquisition.executions[identity]
-    acquisition.executions[identity] = replace(
-        execution,
-        results=tuple(
-            replace(item, content_sha256=None, content_bytes=None)
-            for item in execution.results
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            workspace,
+            model_ref="gpt-test",
+            process_runner=runner,
         ),
-    )
-
-    replayed = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
-    )
-    for _attempt in range(2):
-        with pytest.raises(
-            DeepFetchUnavailable,
-            match="deepfetch_acquisition_owner_proof_legacy_missing",
-        ) as blocked:
-            _execute(replayed)
-        assert blocked.value.durable_outcome == "terminal"
-
-    assert acquisition.acquire_calls == [("acquisition_session_1", "acq-v4-1")]
-    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["schema_ref"] == (
-        "meta-research/deepfetch-v4-protocol-checkpoint/v1"
-    )
-
-
-def test_codex_deepfetch_does_not_upgrade_v1_from_corrupted_owner_identity(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / "provider"
-    initial_acquisition = FileBackedAcquisitionClient(
-        tmp_path / "owner-artifacts",
-        PROTOTYPE_FULLTEXT,
-    )
-    runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
-    adapter = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=initial_acquisition,
-        process_runner=runner,
+        acquisition,
     )
     _execute(adapter)
     checkpoint_path = next(workspace.glob("runs/*/private/protocol.json"))
     legacy = json.loads(checkpoint_path.read_text(encoding="utf-8"))
     legacy["schema_ref"] = "meta-research/deepfetch-v4-protocol-checkpoint/v1"
-    del legacy["acquisition_item_proofs"]
     checkpoint_path.write_text(
         json.dumps(legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
-    )
-    corrupt_owner = CorruptedOwnerIdentityAcquisitionClient(
-        tmp_path / "owner-artifacts",
-        PROTOTYPE_FULLTEXT,
     )
 
     with pytest.raises(
         DeepFetchUnavailable,
-        match="^deepfetch_acquisition_reattestation_required$",
-    ) as blocked:
-        restarted = CodexDeepFetchAdapter(
-            workspace,
-            model_ref="gpt-test",
-            acquisition_client=corrupt_owner,
-            process_runner=runner,
+        match="^deepfetch_protocol_checkpoint_invalid$",
+    ):
+        restarted = _bind_acquisition(
+            CodexDeepFetchAdapter(
+                workspace,
+                model_ref="gpt-test",
+                process_runner=runner,
+            ),
+            acquisition,
         )
         _execute(restarted)
-
-    assert blocked.value.durable_outcome == "pending"
-    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["schema_ref"] == (
-        "meta-research/deepfetch-v4-protocol-checkpoint/v1"
-    )
-    assert corrupt_owner.acquire_calls == []
-    assert corrupt_owner.query_calls == [
-        ("acquisition_session_1", "acq-v4-1")
-    ]
-    assert len(runner.calls) == 3
 
 
 def test_codex_deepfetch_rejects_checkpoint_proof_not_reissued_by_owner(
@@ -2737,11 +2647,13 @@ def test_codex_deepfetch_rejects_checkpoint_proof_not_reissued_by_owner(
         PROTOTYPE_FULLTEXT,
     )
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
-    adapter = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            workspace,
+            model_ref="gpt-test",
+            process_runner=runner,
+        ),
+        acquisition,
     )
     _execute(adapter)
     checkpoint_path = next(workspace.glob("runs/*/private/protocol.json"))
@@ -2764,19 +2676,19 @@ def test_codex_deepfetch_rejects_checkpoint_proof_not_reissued_by_owner(
         DeepFetchUnavailable,
         match="deepfetch_hosted_acquisition_proof_mismatch",
     ):
-        restarted = CodexDeepFetchAdapter(
-            workspace,
-            model_ref="gpt-test",
-            acquisition_client=acquisition,
-            process_runner=runner,
+        restarted = _bind_acquisition(
+            CodexDeepFetchAdapter(
+                workspace,
+                model_ref="gpt-test",
+                process_runner=runner,
+            ),
+            acquisition,
         )
         _execute(restarted)
 
-    assert acquisition.acquire_calls == [("acquisition_session_1", "acq-v4-1")]
-    assert acquisition.query_calls == [
-        ("acquisition_session_1", "acq-v4-1"),
-        ("acquisition_session_1", "acq-v4-1"),
-    ]
+    assert acquisition.acquire_calls == [("turn-1", "acq-v4-1")]
+    assert acquisition.query_calls
+    assert set(acquisition.query_calls) == {("turn-1", "acq-v4-1")}
 
 
 def test_codex_deepfetch_has_no_hidden_provider_turn_generation_limit_across_restart(
@@ -2787,31 +2699,35 @@ def test_codex_deepfetch_has_no_hidden_provider_turn_generation_limit_across_res
         turn = copy.deepcopy(PROTOTYPE_ACQUIRE)
         request = turn["acquisition_request"]
         assert isinstance(request, dict)
-        request["request_id"] = f"acq-v4-{generation}"
+        request["effect_id"] = f"acq-v4-{generation}"
         acquisition_turns.append(turn)
     runner = SequencedPrototypeRunner([*acquisition_turns, PROTOTYPE_FINAL])
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
     workspace = tmp_path / "provider"
-    adapter = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            workspace,
+            model_ref="gpt-test",
+            process_runner=runner,
+        ),
+        acquisition,
     )
 
     result = _execute(adapter)
 
     assert result.completion == "complete"
     assert len(runner.calls) == 14
-    assert [call[1].request_id for call in acquisition.calls] == [
+    assert [call["effect_id"] for call in acquisition.calls] == [
         f"acq-v4-{generation}" for generation in range(1, 13)
     ]
 
-    restarted = CodexDeepFetchAdapter(
-        workspace,
-        model_ref="gpt-test",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    restarted = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            workspace,
+            model_ref="gpt-test",
+            process_runner=runner,
+        ),
+        acquisition,
     )
     replayed = _execute(restarted)
 
@@ -2828,17 +2744,17 @@ def test_codex_deepfetch_cleanup_uses_the_durable_child_operation_registry(
         turn = copy.deepcopy(PROTOTYPE_ACQUIRE)
         request = turn["acquisition_request"]
         assert isinstance(request, dict)
-        request["request_id"] = f"acq-v4-{generation}"
+        request["effect_id"] = f"acq-v4-{generation}"
         acquisition_turns.append(turn)
     runner = LifecycleSequencedPrototypeRunner(
         [*acquisition_turns, PROTOTYPE_FINAL]
     )
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
     root_job_ref = "deepfetch-logical-operation"
 
@@ -2918,10 +2834,12 @@ def test_codex_deepfetch_replays_the_exact_pending_batch_after_user_login(
     acquisition = WaitingThenReadyAcquisitionClient(
         tmp_path / "owner-artifacts"
     )
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
+        ),
+        acquisition,
     )
 
     with pytest.raises(DeepFetchUnavailable) as interrupted:
@@ -2933,19 +2851,17 @@ def test_codex_deepfetch_replays_the_exact_pending_batch_after_user_login(
     checkpoint_path = next((tmp_path / "provider" / "runs").glob("*/private/protocol.json"))
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
     assert checkpoint["phase"] == "pending_acquisition"
-    assert checkpoint["pending_acquisition"]["request_id"] == "acq-v4-1"
+    assert checkpoint["pending_acquisition"]["effect_id"] == "acq-v4-1"
 
     result = _execute(adapter)
 
     assert result.completion == "complete"
     assert len(runner.calls) == 3
-    assert [call[1].request_id for call in acquisition.calls] == [
+    assert [call["effect_id"] for call in acquisition.calls] == [
         "acq-v4-1",
         "acq-v4-1",
     ]
-    assert acquisition.calls[0][1].identity_payload() == (
-        acquisition.calls[1][1].identity_payload()
-    )
+    assert acquisition.calls[0]["target"] == acquisition.calls[1]["target"]
     assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["phase"] == (
         "finalized"
     )
@@ -2963,12 +2879,12 @@ def test_codex_deepfetch_accepts_public_result_without_internal_reader_trace(
         [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL],
     )
     runner.emit_reader_evidence = False
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     result = _execute(adapter)
@@ -2988,13 +2904,13 @@ def test_codex_deepfetch_accepts_reader_output_from_verified_codex_ledgers(
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, final])
     runner.emit_reader_evidence = False
     ledger = RecordedCodexReaderLedger()
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
+            codex_ledger_reader=ledger,
         ),
-        process_runner=runner,
-        codex_ledger_reader=ledger,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
     request = replace(_request(), runtime_binding=adapter.runtime_binding())
     ledger.expected_cwd = str(
@@ -3046,13 +2962,13 @@ def test_codex_deepfetch_accepts_terminal_delivery_after_reader_progress_message
     assert isinstance(assignments, list)
     assignments[0]["reader_agent_ref"] = "/root/reader_agent_1"
     ledger = ProgressThenFinalLedger()
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, final]),
+            codex_ledger_reader=ledger,
         ),
-        process_runner=SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, final]),
-        codex_ledger_reader=ledger,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
     request = replace(_request(), runtime_binding=adapter.runtime_binding())
     ledger.expected_cwd = str(
@@ -3112,15 +3028,15 @@ def test_codex_deepfetch_ledger_diagnostic_failure_does_not_block_result(
         def read(self, session_ref: str) -> tuple[dict[str, object], ...]:
             raise OSError(f"missing {session_ref}")
 
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=SequencedPrototypeRunner(
+                [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL]
+            ),
+            codex_ledger_reader=MissingLedger(),
         ),
-        process_runner=SequencedPrototypeRunner(
-            [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL]
-        ),
-        codex_ledger_reader=MissingLedger(),
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     result = _execute(adapter)
@@ -3170,15 +3086,13 @@ def test_codex_deepfetch_does_not_bind_result_to_internal_child_identity(
     assert isinstance(assignments, list)
     assignments[0]["reader_agent_ref"] = "/root/reader_agent_1"
     ledger = RecordedCodexReaderLedger()
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=DifferentChildRunner([PROTOTYPE_ACQUIRE, final]),
+            codex_ledger_reader=ledger,
         ),
-        process_runner=DifferentChildRunner(
-            [PROTOTYPE_ACQUIRE, final]
-        ),
-        codex_ledger_reader=ledger,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
     request = replace(_request(), runtime_binding=adapter.runtime_binding())
     ledger.expected_cwd = str(
@@ -3199,12 +3113,12 @@ def test_codex_deepfetch_ignores_malformed_internal_agent_diagnostics(
     runner = MalformedReaderTraceRunner(
         [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL],
     )
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     result = _execute(adapter)
@@ -3219,12 +3133,12 @@ def test_codex_deepfetch_accepts_completed_close_agent_reader_evidence(
         [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL],
         terminal_reader_tool="close_agent",
     )
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     result = _execute(adapter)
@@ -3239,12 +3153,12 @@ def test_codex_deepfetch_accepts_visible_reader_name_with_verified_native_child(
     runner = NativeReaderIdentityRunner(
         [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL],
     )
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     result = _execute(adapter)
@@ -3259,12 +3173,12 @@ def test_codex_deepfetch_does_not_require_reader_trace_count_match(
     runner = AdditionalNativeReaderRunner(
         [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL],
     )
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     result = _execute(adapter)
@@ -3290,12 +3204,12 @@ def test_codex_deepfetch_rejects_duplicate_visible_reader_names(
     )
     runner = SequencedPrototypeRunner([PROTOTYPE_ACQUIRE, final])
     runner.emit_reader_evidence = False
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     with pytest.raises(DeepFetchUnavailable) as failure:
@@ -3311,12 +3225,12 @@ def test_codex_deepfetch_deduplicates_wait_and_close_for_one_reader(
         [PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL],
         emit_close_after_wait=True,
     )
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=RecordingAcquisitionClient(
-            tmp_path / "owner-artifacts"
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
         ),
-        process_runner=runner,
+        RecordingAcquisitionClient(tmp_path / "owner-artifacts"),
     )
 
     result = _execute(adapter)
@@ -3482,10 +3396,12 @@ def test_codex_deepfetch_web_gate_rejects_search_without_fetch_before_acquisitio
 ) -> None:
     runner = WebEvidenceGateRunner(PROTOTYPE_ACQUIRE, gate_fetch=False)
     acquisition = RecordingAcquisitionClient(tmp_path / "owner-artifacts")
-    adapter = CodexDeepFetchAdapter(
-        tmp_path / "provider",
-        acquisition_client=acquisition,
-        process_runner=runner,
+    adapter = _bind_acquisition(
+        CodexDeepFetchAdapter(
+            tmp_path / "provider",
+            process_runner=runner,
+        ),
+        acquisition,
     )
 
     with pytest.raises(DeepFetchUnavailable) as failure:

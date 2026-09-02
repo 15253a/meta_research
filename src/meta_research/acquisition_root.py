@@ -199,6 +199,9 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         root_runtime_scope: object,
     ) -> dict[str, object]:
         previous_native_session_ref = self._latest_native_session_ref(session_ref)
+        formal_human_request_available = (
+            allow_human_request and root_runtime_scope is not None
+        )
         human_request_schema: dict[str, object] = {
             "anyOf": [
                 {"type": "null"},
@@ -221,7 +224,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                 },
             ]
         }
-        if not allow_human_request:
+        if not allow_human_request or formal_human_request_available:
             human_request_schema = {"type": "null"}
         schema = {
             "type": "object",
@@ -232,13 +235,26 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             },
             "required": ["accepted", "human_request"],
         }
+        if formal_human_request_available:
+            human_request_instruction = (
+                "provider 的 waiting_user 本身不等于正式请求。若你独立判断当前任务"
+                "确有人的义务，必须在返回前通过 resident MCP 调用共同的 "
+                "human_request.open；随后返回 human_request=null，不得只返回 proposal。"
+            )
+        elif allow_human_request:
+            human_request_instruction = (
+                "只有在确实需要用户提供访问、资源、澄清或伦理法律决定时，才返回"
+                "一个明确的 human_request proposal；provider 的 waiting_user 本身"
+                "不等于请求。该 proposal 只供 initialization inline 展示，不是 "
+                "formal HumanRequest。"
+            )
+        else:
+            human_request_instruction = "本轮返回 human_request=null。"
         prompt = (
             "你是长期存在的 Acquisition 根智能体。Nature Downloader 是你的下载"
             " effect adapter；下面是它对当前精确任务返回的 typed observation。"
-            "复核其状态并在可接受时返回 accepted=true。不要伪造下载结果。只有在"
-            "确实需要用户提供访问、资源、澄清或伦理法律决定时，才返回一个明确的"
-            " human_request proposal；provider 的 waiting_user 本身不等于请求。"
-            "该 proposal 不是 formal HumanRequest，正式副作用只能由认证接口提交。\n\n"
+            "复核其状态并在可接受时返回 accepted=true。不要伪造下载结果。"
+            f"{human_request_instruction}\n\n"
             f"phase={phase}\n"
             f"session_ref={session_ref}\n"
             f"observation={canonical_json(observed)}"

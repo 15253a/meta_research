@@ -1,6 +1,6 @@
 # Agent contracts
 
-DeepFetch uses one main agent, one Acquisition session, and independent Readers. Keep each role inside its boundary.
+DeepFetch uses one main agent, the Quest-scoped Acquisition Root, and independent Readers. Keep each role inside its boundary.
 
 ## Main agent
 
@@ -8,72 +8,30 @@ Own topic interpretation, multidimensional discovery, OpenAlex and Web Search ca
 
 ## Preflight and Acquisition
 
-DeepFetch accepts an injected Quest-level Acquisition session when the host has one. A standalone run creates one download-only session for that run. The session reads `providers/nature-downloader/SKILL.md` completely and follows it as the retrieval authority.
+The Quest-scoped Acquisition Root owns provider selection, access mode, lawful routing, browser
+state and private storage. DeepFetch submits one exact target through the common
+`agent_runtime.acquisition.request` effect. The host reconciles the same `effect_id` before any
+request replay. A Reader may receive only the same `paper_id` returned as `obtained` with a verified
+path and content proof.
 
-When the host injects that session, the main agent must not execute Nature Downloader or its
-download scripts directly. It requests each finite batch through the host's `action=acquire`
-envelope and may register or assign a Reader only for the same `paper_id` returned as `obtained` by
-that hosted request. A first-turn `finalize` may contain discovery-only placeholders, but it cannot
-claim a full text or Reader without this hosted proof.
-
-Before the active-search clock starts, first inspect the injected Acquisition session mode. When
-it is already `oa_only`, treat that as the user's selected primary route, skip institutional/browser
-probing, and do not ask the user to select OA again or narrate OA as a forced fallback. Otherwise:
-
-1. run Nature Downloader configuration and connectivity health checks;
-2. verify that browser control reaches the configured institutional resource in the user's authenticated browser context, rather than merely reaching a login page;
-3. if institutional access is unavailable, ask the user to re-login, continue OA-only, or cancel;
-4. start the clock only after access is verified or OA-only continuation is explicit.
-
-DeepFetch requests article bodies without Supporting Information by default. This is the batch-level `--no-si` choice. A later explicit SI request is a separate targeted acquisition.
-
-Send a finite batch:
+Return this `action=acquire` envelope for one target:
 
 ```json
 {
-  "request_id": "acq-unique",
-  "route_policy": "oa_first_then_institution",
-  "target_dir": "/absolute/private/acquisition/path",
-  "papers": [
-    {
-      "paper_id": "openalex:W123",
-      "title": "Exact title",
-      "doi": null,
-      "arxiv_id": null,
-      "source_urls": []
-    }
-  ]
+  "effect_id": "fulltext-openalex-W123",
+  "target": {
+    "paper_id": "openalex:W123",
+    "title": "Exact title",
+    "source_urls": []
+  }
 }
 ```
 
-Set `route_policy` on every turn, including turns sent to a persistent Quest-level Acquisition
-session. Do not rely on that session remembering the desired route from an earlier batch. Under
-this policy, attempt lawful open access for every English paper first. The injected session mode is
-the authoritative route ceiling: when it is `oa_only`, stop after the OA pass and return
-`oa_not_found` for an exhausted item; the `route_policy` name does not authorize publisher-API or
-institutional fallback. Otherwise, send only unresolved items to publisher-API or institutional
-fallback. Chinese papers remain CNKI-only.
-Pass every arXiv identifier and source URL already present in Radar metadata. They are retrieval
-hints, not trusted full-text evidence; Acquisition verifies identity, access, and content.
-
-Return exactly one compact result per item:
-
-```json
-{
-  "paper_id": "openalex:W123",
-  "status": "obtained",
-  "path": "/absolute/provider/result.pdf",
-  "format": "pdf",
-  "failure": null
-}
-```
-
-`status` is `obtained`, `waiting_user`, or `missing`; format is `pdf`, `html`, `xml`,
-or `null`. `waiting_user` retains the exact retry state inside Acquisition and returns the specific
-login, upload, or verification action in `failure`. Terminal failure uses null file fields and
-`{ "code": "...", "detail": "..." }`. Nature Downloader owns lawful routing, authentication
-handoff, validation, and its private manifest. It does not select literature, read scientific
-content, or edit DeepFetch public artifacts.
+Include DOI, arXiv ID and source URLs when Radar already has them. Acquisition treats them as hints,
+applies the Quest's accepted access configuration, and returns one typed result. `obtained` includes
+the verified path, format and content proof. `waiting_user` or `missing` includes only status and
+failure. When a real human obligation blocks the current task, use the common HumanRequest effect
+explicitly; a provider wait is only an Acquisition result.
 
 Acquisition works from the main agent's ranked reserve queue. Never keep more unresolved
 acquisition items than the unfilled read-target capacity. Before the active-search deadline,
@@ -90,7 +48,7 @@ Create one logical Reader per admitted full text. Across the run, no more than t
 
 `readers_to_start = min(queued jobs, max(0, 10 - active Readers), runtime slots currently free for Readers)`
 
-Fill available capacity immediately. Ten is a ceiling, not a required peak. Never assign multiple papers to one Reader. Use successive waves only for already admitted papers when host capacity is lower than the admitted job count, or for retries of those papers; no later wave may admit an eleventh paper. An idle Acquisition session must not reserve an execution slot. Dormancy is sufficient only when it releases that slot; otherwise release a standalone Acquisition session and recreate it for the next finite batch. A lower observed peak caused by host capacity is a runtime limitation, not a reason to serialize otherwise independent Reader jobs.
+Fill available capacity immediately. Ten is a ceiling, not a required peak. Never assign multiple papers to one Reader. Use successive waves only for already admitted papers when host capacity is lower than the admitted job count, or for retries of those papers; no later wave may admit an eleventh paper. An idle Acquisition Root does not reserve an execution slot. A lower observed peak caused by host capacity is a runtime limitation, not a reason to serialize otherwise independent Reader jobs.
 
 A Reader receives:
 

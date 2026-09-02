@@ -58,6 +58,7 @@ from meta_research.root_operation_diagnostics import (
 )
 from meta_research.semantic_mcp import (
     McpConnection,
+    ROOT_AGENT_ACQUISITION_OPERATION_IDS,
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
     ResidentMcpBinding,
     SemanticMcpError,
@@ -3794,7 +3795,11 @@ def _resident_reconcile_dispatch_allowed(message: object) -> bool:
     return (
         method == "tools/call"
         and isinstance(params, dict)
-        and params.get("name") == "human_request.open.reconcile"
+        and params.get("name")
+        in {
+            ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
+        }
     )
 
 

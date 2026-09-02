@@ -7,7 +7,11 @@ from meta_research.root_capabilities import (
     ROOT_ROLE_OPERATION_DELTAS,
     root_operation_catalog,
 )
-from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+from meta_research.semantic_mcp import (
+    ROOT_AGENT_ACQUISITION_OPERATION_IDS,
+    ROOT_AGENT_COMMON_OPERATION_IDS,
+    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+)
 from meta_research.semantic_owner_gateway import (
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
     REASONING_ROOT_SEMANTIC_OPERATION_IDS,
@@ -78,14 +82,31 @@ def test_catalog_rejects_duplicate_or_overlapping_grants() -> None:
         )
 
 
-def test_all_root_catalogs_use_the_registered_human_request_operations() -> None:
+def test_all_root_catalogs_use_the_registered_common_operations() -> None:
+    assert ROOT_AGENT_COMMON_OPERATION_IDS == (
+        *ROOT_AGENT_ACQUISITION_OPERATION_IDS,
+        *ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+    )
     assert tuple(ROOT_AGENT_SEMANTIC_OPERATION_IDS) == ROOT_AGENT_KINDS
     for root_kind, catalog in ROOT_AGENT_SEMANTIC_OPERATION_IDS.items():
         assert catalog == root_operation_catalog(
             root_kind,
-            common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+            common_operation_ids=ROOT_AGENT_COMMON_OPERATION_IDS,
         )
-        assert not any("acquisition.request" in item for item in catalog)
+        assert catalog[-4:] == ROOT_AGENT_COMMON_OPERATION_IDS
+
+    assert len(BUNDLE_ROOT_SEMANTIC_OPERATION_IDS) == 18
+    assert len(TARGET_ROOT_SEMANTIC_OPERATION_IDS) == 5
+    assert len(REASONING_ROOT_SEMANTIC_OPERATION_IDS) == 7
+    for root_kind in {
+        "deepfetch",
+        "acquisition",
+        "companion",
+        "idea",
+        "plan",
+        "writing",
+    }:
+        assert len(ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind]) == 4
 
     assert BUNDLE_ROOT_SEMANTIC_OPERATION_IDS == ROOT_AGENT_SEMANTIC_OPERATION_IDS[
         "bundle"

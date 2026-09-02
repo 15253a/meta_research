@@ -51,7 +51,10 @@ from meta_research.reasoning_contract import (
     validate_reasoning_stage_output,
     validate_scientific_outcome,
 )
-from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+from meta_research.semantic_mcp import (
+    ROOT_AGENT_COMMON_OPERATION_IDS,
+    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+)
 
 
 ReasoningSkillContractError = ReasoningContractError
@@ -70,7 +73,7 @@ _REASONING_REQUIRED_SEMANTIC_OPERATION_IDS = ROOT_ROLE_OPERATION_DELTAS[
 ]
 REASONING_ROOT_SEMANTIC_OPERATION_IDS = root_operation_catalog(
     "reasoning",
-    common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+    common_operation_ids=ROOT_AGENT_COMMON_OPERATION_IDS,
 )
 _REASONING_CURRENTNESS_OPERATION_ID = (
     "advancement_engine.reasoning_stage_run.observe"
@@ -1617,7 +1620,7 @@ def _verify_reasoning_semantic_trace(
     required_operation_ids = tuple(
         operation_id
         for operation_id in operation_ids
-        if operation_id not in ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+        if operation_id not in ROOT_AGENT_COMMON_OPERATION_IDS
     )
     if not set(required_operation_ids) <= set(observed):
         raise ReasoningSkillUnavailable(

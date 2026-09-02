@@ -37,6 +37,7 @@ class _SequenceRunner:
     def __init__(self, outputs: list[dict[str, object]]) -> None:
         self._outputs = iter(outputs)
         self.environments: list[dict[str, str] | None] = []
+        self.prompts: list[str] = []
 
     def __call__(
         self,
@@ -45,8 +46,9 @@ class _SequenceRunner:
         timeout: float | None,
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        del prompt, timeout
+        del timeout
         self.environments.append(environment)
+        self.prompts.append(prompt)
         output_path = Path(argv[argv.index("--output-last-message") + 1])
         output_path.write_text(
             json.dumps(next(self._outputs), ensure_ascii=False),
@@ -116,6 +118,25 @@ class _AcquisitionDelegate:
 
     def request_stop(self) -> None:
         return None
+
+
+class _WaitingAcquisitionDelegate(_AcquisitionDelegate):
+    def acquire(
+        self, request: AcquisitionBatchRequest
+    ) -> tuple[AcquisitionItemResult, ...]:
+        self.batches.append(request)
+        return (
+            AcquisitionItemResult(
+                paper_id="paper:1",
+                status="waiting_user",
+                path=None,
+                format=None,
+                failure={
+                    "code": "institutional_login_required",
+                    "detail": "The authenticated Agent must decide whether to ask.",
+                },
+            ),
+        )
 
 
 class _QuestDrafter:
@@ -265,7 +286,7 @@ def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
     runner = _SequenceRunner([{"accepted": True, "human_request": None}])
     adapter = CodexAcquisitionRootAdapter(
         tmp_path / "acquisition",
-        _AcquisitionDelegate(),  # type: ignore[arg-type]
+        _WaitingAcquisitionDelegate(),  # type: ignore[arg-type]
         executable=str(_fake_codex(tmp_path / "acquisition-codex")),
         process_runner=runner,
     )
@@ -281,7 +302,7 @@ def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
 
     result = adapter.acquire(request)  # type: ignore[arg-type]
 
-    assert result[0].status == "missing"
+    assert result[0].status == "waiting_user"
     issued = authority.issue_resident_mcp_channel.call_args.kwargs
     assert issued["subject_policy"] == "operation_tree"
     assert issued["root_kind"] == "acquisition"
@@ -297,6 +318,8 @@ def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
             "no_proxy": "127.0.0.1,localhost,::1",
         }
     ]
+    assert "resident MCP 调用共同的 human_request.open" in runner.prompts[0]
+    assert "不得只返回 proposal" in runner.prompts[0]
 
 
 def test_unmanaged_acquisition_turn_remains_without_resident_channel(

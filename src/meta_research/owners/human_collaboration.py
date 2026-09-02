@@ -675,6 +675,35 @@ class SQLiteDeepFetchRunRequestVerifier:
     def __init__(self, database: Database) -> None:
         self._database = database
 
+    def query_initialization_acquisition_binding(
+        self, request_ref: str
+    ) -> dict[str, str] | None:
+        """Return the HC-owned pre-Quest binding for one active request."""
+
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT initialization_id, acquisition_session_ref, "
+                    "acquisition_config_hash, acquisition_runtime_binding_hash "
+                    "FROM hc_deepfetch_requests WHERE request_ref = "
+                    ":request_ref AND status = 'queued'"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            return None
+        values = {
+            "initialization_id": row.initialization_id,
+            "acquisition_session_ref": row.acquisition_session_ref,
+            "acquisition_config_hash": row.acquisition_config_hash,
+            "acquisition_runtime_binding_hash": (
+                row.acquisition_runtime_binding_hash
+            ),
+        }
+        if any(not isinstance(value, str) or not value for value in values.values()):
+            raise OwnerConflict("deepfetch_acquisition_binding_invalid")
+        return values
+
     def verify_deepfetch_run_request(
         self,
         *,

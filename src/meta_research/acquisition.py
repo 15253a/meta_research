@@ -1340,6 +1340,11 @@ def validate_batch_request(request: AcquisitionBatchRequest) -> str:
             or not paper.title.strip()
             or len(paper.paper_id) > 512
             or len(paper.title) > 2_000
+            or len(paper.source_urls) > 20
+            or any(
+                not isinstance(url, str) or len(url) > 4_096
+                for url in paper.source_urls
+            )
         ):
             raise AcquisitionUnavailable("acquisition_batch_request_invalid")
         paper_ids.add(paper.paper_id)
@@ -1388,6 +1393,8 @@ def validate_item_results(
                     isinstance(value, str) and value.strip()
                     for value in result.failure.values()
                 )
+                or len(result.failure["code"]) > 256
+                or len(result.failure["detail"]) > 4_000
             ):
                 raise AcquisitionUnavailable("acquisition_result_invalid")
         else:

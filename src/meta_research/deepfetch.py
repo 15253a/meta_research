@@ -18,16 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlsplit
 
-from meta_research.acquisition import (
-    AcquisitionBatchExecution,
-    AcquisitionBatchRequest,
-    AcquisitionUnavailable,
-    AcquisitionPaper,
-    DEEPFETCH_PROTOTYPE_COMMIT,
-    aggregate_batch_status,
-    validate_batch_request,
-    validate_item_results,
-)
+from meta_research.acquisition import DEEPFETCH_PROTOTYPE_COMMIT
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
@@ -77,6 +68,7 @@ from meta_research.root_resident_mcp import (
     RootResidentMcpError,
     semantic_mcp_environment,
 )
+from meta_research.semantic_mcp import ROOT_AGENT_ACQUISITION_OPERATION_IDS
 
 if TYPE_CHECKING:
     from meta_research.owners.common import AcceptanceReceipt
@@ -94,11 +86,8 @@ DEEPFETCH_RESULT_SCHEMA = "meta-research/first-question-deepfetch-result/v2"
 DEEPFETCH_RUNTIME_BINDING_SCHEMA = "meta-research/deepfetch-runtime-binding/v1"
 DEEPFETCH_WEB_EVIDENCE_SCHEMA = "meta-research/deepfetch-web-evidence/v1"
 DEEPFETCH_PROTOTYPE_EVIDENCE_SCHEMA = "meta-research/deepfetch-prototype-evidence/v4"
-LEGACY_DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA = (
-    "meta-research/deepfetch-v4-protocol-checkpoint/v1"
-)
 DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA = (
-    "meta-research/deepfetch-v4-protocol-checkpoint/v2"
+    "meta-research/deepfetch-v4-protocol-checkpoint/v3"
 )
 DEEPFETCH_PROVIDER_OPERATION_REGISTRY_SCHEMA = (
     "meta-research/deepfetch-provider-operation-registry/v1"
@@ -438,9 +427,6 @@ class DeepFetchProviderRequest:
     draft_hash: str
     scope: dict[str, object]
     scope_hash: str
-    acquisition_session_ref: str
-    acquisition_config_hash: str
-    acquisition_runtime_binding_hash: str
     accepted_material_bindings: tuple[dict[str, object], ...]
     authorization_receipt: AcceptanceReceipt
     runtime_binding: DeepFetchRuntimeBinding
@@ -483,7 +469,6 @@ class _DeepFetchProtocolCheckpoint:
     pending_acquisition: dict[str, object] | None
     next_prompt: str | None
     final_envelope: dict[str, object] | None
-    legacy_checkpoint: bool
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -514,24 +499,6 @@ class DeepFetchProvider(Protocol):
     def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult: ...
 
     def reconcile_cancelled_job(self, job_ref: str) -> bool: ...
-
-
-class DeepFetchAcquisitionClient(Protocol):
-    """Narrow hosted port exposed to the v4 main-agent adapter."""
-
-    def acquire(
-        self,
-        session_ref: str,
-        request: AcquisitionBatchRequest,
-    ) -> AcquisitionBatchExecution: ...
-
-    def query_completed_batch(
-        self,
-        session_ref: str,
-        request_id: str,
-    ) -> AcquisitionBatchExecution | None:
-        """Read one Owner-recorded terminal batch without replaying acquisition."""
-        ...
 
 
 def validate_runtime_binding(binding: DeepFetchRuntimeBinding) -> str:
@@ -762,7 +729,6 @@ class CodexDeepFetchAdapter:
         *,
         executable: str = "codex",
         model_ref: str = CODEX_MODEL_REF,
-        acquisition_client: DeepFetchAcquisitionClient | None = None,
         process_runner: (
             Callable[
                 [list[str], str, float | None],
@@ -779,7 +745,6 @@ class CodexDeepFetchAdapter:
         self._agent_workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._executable = executable
         self._model_ref = model_ref
-        self._acquisition_client = acquisition_client
         self._runner = process_runner or _CancellableProcessRunner(
             stream_max_bytes=DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
         )
@@ -1437,7 +1402,7 @@ class CodexDeepFetchAdapter:
                     "deepfetch-v4-main-agent",
                     f"deepfetch-v4-skill-bundle-sha256:{self._skill_bundle_hash}",
                     "filesystem-danger-full-access",
-                    "hosted-acquisition-session",
+                    "quest-acquisition-semantic-effect",
                     "native-child-readers",
                     "papers-v4-finalize",
                     "codex-reader-ledger:v1",
@@ -1697,7 +1662,7 @@ class CodexDeepFetchAdapter:
         """Rebuild protocol facts from signed predecessor supervisor receipts."""
 
         assert request.job_ref is not None
-        acquisition_requests: list[dict[str, object]] = []
+        acquisition_effects: list[tuple[str, dict[str, object]]] = []
         observed_evidence: list[dict[str, object]] = []
         previous_native_session_ref: str | None = None
         enforce_previous_native = False
@@ -1724,8 +1689,11 @@ class CodexDeepFetchAdapter:
                 _validate_web_evidence_gate_result(raw)
                 _merge_web_evidence([evidence])
             elif raw.get("action") == "acquire":
-                acquisition_requests.append(
-                    _validated_v4_acquisition_request(raw).identity_payload()
+                acquisition_effects.append(
+                    (
+                        f"turn-{turn_number}",
+                        _validated_v4_acquisition_effect(raw),
+                    )
                 )
             elif raw.get("action") == "finalize":
                 _validate_final_envelope_shape(raw)
@@ -1736,15 +1704,31 @@ class CodexDeepFetchAdapter:
 
         if tuple(observed_evidence) != checkpoint.evidence_parts:
             raise ValueError("deepfetch reconciliation evidence mismatch")
+        observed_effects = tuple(
+            {
+                "effect_id": effect["effect_id"],
+                "phase": phase,
+                "target_hash": canonical_hash(effect["target"]),
+            }
+            for phase, effect in acquisition_effects
+        )
+        recorded_effects = tuple(
+            {
+                key: proof[key]
+                for key in ("effect_id", "phase", "target_hash")
+            }
+            for proof in checkpoint.acquisition_item_proofs
+        )
+        recorded_request_ids = tuple(
+            cast(str, proof["request_id"])
+            for proof in checkpoint.acquisition_item_proofs
+        )
         if checkpoint.phase == "finalized":
             if (
-                not acquisition_requests
+                not acquisition_effects
                 and checkpoint.acquisition_request_ids
-                or tuple(
-                    str(item["request_id"])
-                    for item in acquisition_requests
-                )
-                != checkpoint.acquisition_request_ids
+                or observed_effects != recorded_effects
+                or recorded_request_ids != checkpoint.acquisition_request_ids
                 or checkpoint.final_envelope is None
                 or checkpoint.next_turn_number < 1
             ):
@@ -1776,13 +1760,11 @@ class CodexDeepFetchAdapter:
 
         if checkpoint.phase == "pending_acquisition":
             if (
-                not acquisition_requests
-                or checkpoint.pending_acquisition != acquisition_requests[-1]
-                or tuple(
-                    str(item["request_id"])
-                    for item in acquisition_requests[:-1]
-                )
-                != checkpoint.acquisition_request_ids
+                not acquisition_effects
+                or checkpoint.pending_acquisition
+                != acquisition_effects[-1][1]
+                or observed_effects[:-1] != recorded_effects
+                or recorded_request_ids != checkpoint.acquisition_request_ids
             ):
                 raise ValueError("deepfetch reconciliation acquisition mismatch")
             assert checkpoint.native_session_ref is not None
@@ -1792,9 +1774,10 @@ class CodexDeepFetchAdapter:
                 native_session_ref=checkpoint.native_session_ref,
             )
 
-        if tuple(
-            str(item["request_id"]) for item in acquisition_requests
-        ) != checkpoint.acquisition_request_ids:
+        if (
+            observed_effects != recorded_effects
+            or recorded_request_ids != checkpoint.acquisition_request_ids
+        ):
             raise ValueError("deepfetch reconciliation acquisition mismatch")
         raw, native_session_ref, evidence = self._read_existing_turn(
             request,
@@ -1824,7 +1807,7 @@ class CodexDeepFetchAdapter:
             # The predecessor provider effect is signed-terminal at this turn
             # boundary, but continuing would start a new old-binding effect.
             # Retire the old Attempt so a later command can transition binding.
-            _validated_v4_acquisition_request(raw)
+            _validated_v4_acquisition_effect(raw)
             raise DeepFetchUnavailable(
                 "deepfetch_runtime_binding_transition_required",
                 durable_outcome="terminal",
@@ -2210,41 +2193,41 @@ class CodexDeepFetchAdapter:
         checkpoint_path: Path,
         checkpoint: _DeepFetchProtocolCheckpoint,
     ) -> DeepFetchResult:
-        if checkpoint.legacy_checkpoint:
-            checkpoint = self._reattest_legacy_acquisition_proofs(
-                request,
-                checkpoint,
-            )
-            # Seal the query-only Owner re-attestation before any provider or
-            # hosted Acquisition effect can continue under the upgraded schema.
-            if checkpoint.phase != "finalized":
-                checkpoint = replace(checkpoint, legacy_checkpoint=False)
-                _write_protocol_checkpoint(checkpoint_path, checkpoint)
         while checkpoint.phase != "finalized":
             if checkpoint.phase == "pending_acquisition":
-                if self._acquisition_client is None:
-                    raise DeepFetchUnavailable(
-                        "deepfetch_acquisition_capability_unavailable"
-                    )
                 assert checkpoint.pending_acquisition is not None
-                batch = _acquisition_batch_from_checkpoint(
+                effect = _acquisition_effect_from_checkpoint(
                     checkpoint.pending_acquisition
                 )
-                execution = self._acquisition_client.acquire(
-                    request.acquisition_session_ref,
-                    batch,
+                effect_phase = f"turn-{checkpoint.next_turn_number - 1}"
+                execution = self._call_acquisition_operation(
+                    request,
+                    operation_id=ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
+                    phase=effect_phase,
+                    arguments={"effect_id": effect["effect_id"]},
                 )
-                if execution.status == "waiting_user":
+                if execution.get("status") in {
+                    "unknown_outcome",
+                    "waiting_user",
+                }:
+                    execution = self._call_acquisition_operation(
+                        request,
+                        operation_id=ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+                        phase=effect_phase,
+                        arguments=effect,
+                    )
+                if execution.get("status") == "waiting_user":
                     raise DeepFetchUnavailable(
                         "deepfetch_acquisition_waiting_user",
                         durable_outcome="pending",
                         native_session_ref=checkpoint.native_session_ref,
                     )
                 try:
-                    item_proofs = _hosted_acquisition_item_proofs(
-                        request.acquisition_session_ref,
-                        batch,
+                    item_proof = _semantic_acquisition_item_proof(
                         execution,
+                        effect_id=cast(str, effect["effect_id"]),
+                        phase=effect_phase,
+                        target=cast(dict[str, object], effect["target"]),
                     )
                 except DeepFetchUnavailable as error:
                     # Acquisition already committed this immutable request.  A
@@ -2257,7 +2240,7 @@ class CodexDeepFetchAdapter:
                     ) from error
                 acquisition_ids = (
                     *checkpoint.acquisition_request_ids,
-                    batch.request_id,
+                    cast(str, item_proof["request_id"]),
                 )
                 checkpoint = replace(
                     checkpoint,
@@ -2265,13 +2248,13 @@ class CodexDeepFetchAdapter:
                     acquisition_request_ids=acquisition_ids,
                     acquisition_item_proofs=(
                         *checkpoint.acquisition_item_proofs,
-                        *item_proofs,
+                        item_proof,
                     ),
                     pending_acquisition=None,
                     next_prompt=self._acquisition_result_prompt(
                         public_root,
                         execution,
-                        item_proofs,
+                        item_proof,
                     ),
                 )
                 _write_protocol_checkpoint(checkpoint_path, checkpoint)
@@ -2355,8 +2338,12 @@ class CodexDeepFetchAdapter:
                 break
             if raw.get("action") != "acquire":
                 raise DeepFetchUnavailable("codex_deepfetch_output_invalid")
-            batch = _validated_v4_acquisition_request(raw)
-            if batch.request_id in checkpoint.acquisition_request_ids:
+            effect = _validated_v4_acquisition_effect(raw)
+            if any(
+                proof["effect_id"] == effect["effect_id"]
+                and proof["phase"] == f"turn-{turn_number}"
+                for proof in checkpoint.acquisition_item_proofs
+            ):
                 raise DeepFetchUnavailable(
                     "deepfetch_acquisition_identity_duplicate"
                 )
@@ -2366,10 +2353,10 @@ class CodexDeepFetchAdapter:
                 native_session_ref=native_session_ref,
                 next_turn_number=turn_number + 1,
                 evidence_parts=evidence_parts,
-                pending_acquisition=batch.identity_payload(),
+                pending_acquisition=effect,
                 next_prompt=None,
             )
-            # The exact batch is durable before the hosted side effect begins.
+            # The exact effect is durable before the Owner-side effect begins.
             _write_protocol_checkpoint(checkpoint_path, checkpoint)
 
         assert checkpoint.final_envelope is not None
@@ -2378,7 +2365,7 @@ class CodexDeepFetchAdapter:
         authoritative_acquisition_proofs = (
             self._query_authoritative_acquisition_proofs(
                 request,
-                checkpoint.acquisition_request_ids,
+                checkpoint.acquisition_item_proofs,
                 native_session_ref=checkpoint.native_session_ref,
             )
         )
@@ -2394,7 +2381,6 @@ class CodexDeepFetchAdapter:
         imported = _import_v4_public_artifacts(
             public_root,
             checkpoint.final_envelope,
-            acquisition_session_ref=request.acquisition_session_ref,
             acquisition_request_ids=checkpoint.acquisition_request_ids,
             acquisition_item_proofs=authoritative_acquisition_proofs,
         )
@@ -2415,96 +2401,74 @@ class CodexDeepFetchAdapter:
         )
         validate_deepfetch_result(request, result)
         # "finalized" is durable only after the exact v4 validator, artifact
-        # import, hosted artifact/Reader-output checks, native child-tool
+        # import, Acquisition artifact/Reader-output checks, native child-tool
         # provenance, and public-result validation all pass.
-        _write_protocol_checkpoint(
-            checkpoint_path,
-            replace(checkpoint, legacy_checkpoint=False),
-        )
+        _write_protocol_checkpoint(checkpoint_path, checkpoint)
         return result
-
-    def _reattest_legacy_acquisition_proofs(
-        self,
-        request: DeepFetchProviderRequest,
-        checkpoint: _DeepFetchProtocolCheckpoint,
-    ) -> _DeepFetchProtocolCheckpoint:
-        if not checkpoint.acquisition_request_ids:
-            return checkpoint
-        proofs = self._query_authoritative_acquisition_proofs(
-            request,
-            checkpoint.acquisition_request_ids,
-            native_session_ref=checkpoint.native_session_ref,
-        )
-        return replace(
-            checkpoint,
-            acquisition_item_proofs=proofs,
-        )
 
     def _query_authoritative_acquisition_proofs(
         self,
         request: DeepFetchProviderRequest,
-        request_ids: tuple[str, ...],
+        recorded_proofs: tuple[dict[str, object], ...],
         *,
         native_session_ref: str | None,
     ) -> tuple[dict[str, object], ...]:
-        if not request_ids:
+        if not recorded_proofs:
             return ()
-        query_completed = getattr(
-            self._acquisition_client,
-            "query_completed_batch",
-            None,
-        )
-        if not callable(query_completed):
-            raise DeepFetchUnavailable(
-                "deepfetch_acquisition_reattestation_required",
-                durable_outcome="pending",
-                native_session_ref=native_session_ref,
-            )
         proofs: list[dict[str, object]] = []
         try:
-            for request_id in request_ids:
-                execution = query_completed(
-                    request.acquisition_session_ref,
-                    request_id,
+            for recorded in recorded_proofs:
+                effect_id = cast(str, recorded["effect_id"])
+                phase = cast(str, recorded["phase"])
+                execution = self._call_acquisition_operation(
+                    request,
+                    operation_id=ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
+                    phase=phase,
+                    arguments={"effect_id": effect_id},
                 )
-                if execution is None or execution.request_id != request_id:
+                if execution.get("status") == "unknown_outcome":
                     raise DeepFetchUnavailable(
                         "deepfetch_acquisition_reattestation_required"
                     )
-                proofs.extend(
-                    _hosted_acquisition_item_proofs(
-                        request.acquisition_session_ref,
-                        execution.request,
-                        execution,
-                    )
+                current = _semantic_acquisition_item_proof(
+                    execution,
+                    effect_id=effect_id,
+                    phase=phase,
+                    target_hash=cast(str, recorded["target_hash"]),
                 )
+                proofs.append(current)
         except DeepFetchUnavailable as error:
             raise DeepFetchUnavailable(
                 error.code,
-                durable_outcome=(
-                    "terminal"
-                    if error.code
-                    == "deepfetch_acquisition_owner_proof_legacy_missing"
-                    else "pending"
-                ),
-                native_session_ref=native_session_ref,
-            ) from error
-        except RuntimeError as error:
-            code = (
-                "deepfetch_acquisition_owner_proof_legacy_missing"
-                if str(error) == "acquisition_artifact_proof_legacy_missing"
-                else "deepfetch_acquisition_reattestation_required"
-            )
-            raise DeepFetchUnavailable(
-                code,
-                durable_outcome=(
-                    "terminal"
-                    if code == "deepfetch_acquisition_owner_proof_legacy_missing"
-                    else "pending"
-                ),
+                durable_outcome="pending",
                 native_session_ref=native_session_ref,
             ) from error
         return tuple(proofs)
+
+    def _call_acquisition_operation(
+        self,
+        request: DeepFetchProviderRequest,
+        *,
+        operation_id: str,
+        phase: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        try:
+            return self._root_resident_mcp.call_operation(
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                capability_binding_hash=canonical_hash(
+                    request.runtime_binding.as_dict()
+                ),
+                phase=phase,
+                job_ref=request.job_ref,
+                operation_id=operation_id,
+                arguments=arguments,
+            )
+        except RootResidentMcpError as error:
+            raise DeepFetchUnavailable(error.code) from error
 
     def _initial_prompt(
         self,
@@ -2526,11 +2490,11 @@ class CodexDeepFetchAdapter:
             f"{DEEPFETCH_PROTOTYPE_COMMIT} 的 DeepFetch v4 main agent。"
             f"开始前必须完整读取 {skill_entrypoint}，以及它直接链接的所有 reference；"
             "把该固定 bundle 作为行为规范，不得改写它。必须执行 Radar、Ledger、"
-            "hosted Acquisition、independent Readers、Synthesis 与 "
+            "Quest-scoped Acquisition、independent Readers、Synthesis 与 "
             "scripts/papers.py finalize 闭环；不得把它扁平化成单体 Web Search/Fetch "
             "回答。主 Agent 负责发现、选择、ledger 和 summary，Acquisition 只负责"
-            "合法获取；不得直接运行 Nature Downloader 或其下载脚本，需要全文时必须先返回 "
-            "action=acquire，并且只把 hosted Acquisition 返回为 obtained 的同一 paper_id "
+            "合法获取；需要全文时返回只含 effect_id 和一个 target 的 action=acquire，"
+            "并且只把共同 Acquisition effect 返回为 obtained 的同一 paper_id "
             "交给 Reader。每份已注册全文必须用原生 spawn_agent 启动一个独立 Reader，"
             "并 wait 到终态。最终 workflow.reader_assignments 的 reader_agent_ref "
             "填写 spawn_agent 返回的 task_name。"
@@ -2541,7 +2505,6 @@ class CodexDeepFetchAdapter:
             f"deepfetch_skill_root={self._skill_root}\n"
             f"public_output_root={public_root}\n"
             f"private_work_root={private_root}\n"
-            f"acquisition_session_ref={request.acquisition_session_ref}\n"
             f"request_ref={request.request_ref}\n"
             f"draft_revision={request.draft_revision}\n"
             f"draft_hash={request.draft_hash}\n"
@@ -2603,26 +2566,26 @@ class CodexDeepFetchAdapter:
     def _acquisition_result_prompt(
         self,
         public_root: Path,
-        execution: AcquisitionBatchExecution,
-        item_proofs: tuple[dict[str, object], ...],
+        execution: dict[str, object],
+        item_proof: dict[str, object],
     ) -> str:
         return (
-            "继续同一 DeepFetch v4 main agent Session。以下是 hosted Acquisition "
-            "对上一精确批次返回的紧凑结果；不得改变 request_id 或把私有 manifest "
-            "带入公开资产。继续 Radar/Ledger/Readers，必要时提出一个新的有限批次，"
+            "继续同一 DeepFetch v4 main agent Session。以下是共同 Acquisition effect "
+            "对上一精确 target 返回的紧凑结果；把 request_id 当作只读 receipt，"
+            "继续 Radar/Ledger/Readers，必要时提出一个新的单 target effect，"
             "最终运行固定 bundle 的 scripts/papers.py finalize。每个 Reader 的 "
             "reader_agent_ref 使用原生 spawn_agent 返回的 task_name。"
             "Reader 和 "
-            "public fulltext/ 必须读取 obtained path 并逐字节复制同一 hosted artifact；"
+            "public fulltext/ 必须读取 obtained path 并逐字节复制同一 verified artifact；"
             "不得按同一 paper_id 自造或替换正文 bytes。\n"
             f"{_DEEPFETCH_COMPLETION_RULES}\n"
             f"deepfetch_skill_root={self._skill_root}\n"
             f"public_output_root={public_root}\n"
-            f"acquisition_request_id={execution.request_id}\n"
+            f"acquisition_request_id={execution['request_id']}\n"
             "acquisition_artifact_proofs="
-            f"{canonical_json(list(item_proofs))}\n"
+            f"{canonical_json([item_proof])}\n"
             "acquisition_result="
-            f"{canonical_json([item.as_dict() for item in execution.results])}"
+            f"{canonical_json(execution['result'])}"
         )
 
     def _invoke(
@@ -3333,11 +3296,6 @@ def _deepfetch_protocol_identity(request: DeepFetchProviderRequest) -> str:
             "draft_revision": request.draft_revision,
             "draft_hash": request.draft_hash,
             "scope_hash": request.scope_hash,
-            "acquisition_session_ref": request.acquisition_session_ref,
-            "acquisition_config_hash": request.acquisition_config_hash,
-            "acquisition_runtime_binding_hash": (
-                request.acquisition_runtime_binding_hash
-            ),
             "accepted_material_bindings": list(
                 request.accepted_material_bindings
             ),
@@ -3373,8 +3331,7 @@ def _load_or_create_protocol_checkpoint(
                 checkpoint,
                 native_session_ref=native_session_ref,
             )
-            if not checkpoint.legacy_checkpoint:
-                _write_protocol_checkpoint(path, checkpoint)
+            _write_protocol_checkpoint(path, checkpoint)
         return checkpoint
     checkpoint = _DeepFetchProtocolCheckpoint(
         identity_hash=identity_hash,
@@ -3387,7 +3344,6 @@ def _load_or_create_protocol_checkpoint(
         pending_acquisition=None,
         next_prompt=initial_prompt,
         final_envelope=None,
-        legacy_checkpoint=False,
     )
     _write_protocol_checkpoint(path, checkpoint)
     return checkpoint
@@ -3418,20 +3374,12 @@ def _read_protocol_checkpoint(
     }
     if not isinstance(value, dict):
         raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
-    schema_ref = value.get("schema_ref")
-    legacy_required = required - {"acquisition_item_proofs"}
     if (
-        schema_ref == DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
-        and set(value) == required
+        value.get("schema_ref") != DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
+        or set(value) != required
     ):
-        acquisition_item_proofs = value.get("acquisition_item_proofs")
-    elif (
-        schema_ref == LEGACY_DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
-        and set(value) == legacy_required
-    ):
-        acquisition_item_proofs = []
-    else:
         raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+    acquisition_item_proofs = value.get("acquisition_item_proofs")
     if value.get("identity_hash") != identity_hash:
         raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
     phase = value.get("phase")
@@ -3460,9 +3408,7 @@ def _read_protocol_checkpoint(
     validated_item_proofs = _validated_hosted_acquisition_item_proofs(
         acquisition_item_proofs,
         acquisition_request_ids=cast(list[str], acquisition_request_ids),
-        require_every_request=(
-            schema_ref == DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
-        ),
+        require_every_request=True,
     )
     validated_evidence = tuple(
         _validated_turn_evidence_part(item) for item in evidence_parts
@@ -3486,8 +3432,13 @@ def _read_protocol_checkpoint(
             or native_session_ref is None
         ):
             raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
-        batch = _acquisition_batch_from_checkpoint(pending)
-        if batch.request_id in acquisition_request_ids:
+        effect = _acquisition_effect_from_checkpoint(pending)
+        pending_phase = f"turn-{next_turn_number - 1}"
+        if any(
+            proof["effect_id"] == effect["effect_id"]
+            and proof["phase"] == pending_phase
+            for proof in validated_item_proofs
+        ):
             raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
     else:
         if (
@@ -3512,9 +3463,6 @@ def _read_protocol_checkpoint(
         pending_acquisition=cast(dict[str, object] | None, pending),
         next_prompt=cast(str | None, prompt),
         final_envelope=cast(dict[str, object] | None, final),
-        legacy_checkpoint=(
-            schema_ref == LEGACY_DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA
-        ),
     )
 
 
@@ -3562,16 +3510,12 @@ def _checkpoint_native_session(path: Path, identity_hash: str) -> str | None:
         return None
 
 
-def _acquisition_batch_from_checkpoint(
+def _acquisition_effect_from_checkpoint(
     value: dict[str, object],
-) -> AcquisitionBatchRequest:
-    if value.get("schema_ref") != "meta-research/acquisition-batch-request/v1":
-        raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
+) -> dict[str, object]:
     envelope = {
         "action": "acquire",
-        "acquisition_request": {
-            key: item for key, item in value.items() if key != "schema_ref"
-        },
+        "acquisition_request": value,
         "completion": None,
         "limitations": [],
         "workflow": {
@@ -3583,81 +3527,85 @@ def _acquisition_batch_from_checkpoint(
         },
     }
     try:
-        return _validated_v4_acquisition_request(envelope)
+        return _validated_v4_acquisition_effect(envelope)
     except DeepFetchUnavailable as error:
         raise DeepFetchUnavailable(
             "deepfetch_protocol_checkpoint_invalid"
         ) from error
 
 
-def _hosted_acquisition_item_proofs(
-    session_ref: str,
-    batch: AcquisitionBatchRequest,
-    execution: AcquisitionBatchExecution,
-) -> tuple[dict[str, object], ...]:
-    expected_paper_ids = {paper.paper_id for paper in batch.papers}
-    result_paper_ids = [result.paper_id for result in execution.results]
+def _semantic_acquisition_item_proof(
+    execution: dict[str, object],
+    *,
+    effect_id: str,
+    phase: str,
+    target: dict[str, object] | None = None,
+    target_hash: str | None = None,
+) -> dict[str, object]:
+    result = execution.get("result")
+    request_id = execution.get("request_id")
+    status = execution.get("status")
     if (
-        execution.session_ref != session_ref
-        or execution.request_id != batch.request_id
-        or execution.request.identity_payload() != batch.identity_payload()
-        or execution.request.session_ref != session_ref
-        or not execution.request.target_dir
-        or not Path(execution.request.target_dir).is_absolute()
-        or len(result_paper_ids) != len(set(result_paper_ids))
-        or set(result_paper_ids) != expected_paper_ids
-        or any(result.status not in {"obtained", "missing"} for result in execution.results)
+        set(execution) != {"effect_id", "request_id", "status", "result"}
+        or execution.get("effect_id") != effect_id
+        or not isinstance(request_id, str)
+        or not request_id
+        or status not in {"obtained", "missing"}
+        or not isinstance(result, dict)
+        or result.get("status") != status
+        or not isinstance(result.get("paper_id"), str)
     ):
         raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
-    try:
-        validate_item_results(batch, execution.results)
-    except AcquisitionUnavailable as error:
-        raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid") from error
-    if execution.status != aggregate_batch_status(execution.results):
+    if target is not None:
+        if result["paper_id"] != target.get("paper_id"):
+            raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
+        target_hash = canonical_hash(target)
+    if not isinstance(target_hash, str) or len(target_hash) != 64:
         raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
-    proofs: list[dict[str, object]] = []
-    for result in execution.results:
-        proof: dict[str, object] = {
-            "request_id": batch.request_id,
-            "paper_id": result.paper_id,
-            "status": result.status,
-            "path": None,
-            "format": None,
-            "sha256": None,
-            "bytes": None,
-        }
-        if result.status == "obtained":
-            if (
-                result.content_sha256 is None
-                or result.content_bytes is None
-            ):
-                raise DeepFetchUnavailable(
-                    "deepfetch_acquisition_owner_proof_legacy_missing"
-                )
-            path, artifact_format, observed_digest, observed_bytes = (
-                _read_hosted_acquisition_artifact(
-                    result.path,
-                    result.format,
-                    required_root=Path(execution.request.target_dir),
-                )
+    proof: dict[str, object] = {
+        "effect_id": effect_id,
+        "phase": phase,
+        "target_hash": target_hash,
+        "request_id": request_id,
+        "paper_id": result["paper_id"],
+        "status": status,
+        "path": None,
+        "format": None,
+        "sha256": None,
+        "bytes": None,
+    }
+    if status == "obtained":
+        if set(result) != {
+            "paper_id",
+            "status",
+            "verified_path",
+            "format",
+            "content_sha256",
+            "content_bytes",
+        }:
+            raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
+        path, artifact_format, observed_digest, observed_bytes = (
+            _read_hosted_acquisition_artifact(
+                result["verified_path"],
+                result["format"],
             )
-            if (
-                observed_digest != result.content_sha256
-                or observed_bytes != result.content_bytes
-            ):
-                raise DeepFetchUnavailable(
-                    "deepfetch_acquisition_artifact_drift"
-                )
-            proof.update(
-                {
-                    "path": path,
-                    "format": artifact_format,
-                    "sha256": result.content_sha256,
-                    "bytes": result.content_bytes,
-                }
-            )
-        proofs.append(proof)
-    return tuple(proofs)
+        )
+        if (
+            observed_digest != result["content_sha256"]
+            or observed_bytes != result["content_bytes"]
+        ):
+            raise DeepFetchUnavailable("deepfetch_acquisition_artifact_drift")
+        proof.update(
+            {
+                "path": path,
+                "format": artifact_format,
+                "sha256": observed_digest,
+                "bytes": observed_bytes,
+            }
+        )
+    elif set(result) != {"paper_id", "status", "failure"}:
+        raise DeepFetchUnavailable("deepfetch_acquisition_result_invalid")
+    return proof
 
 
 def _read_hosted_acquisition_artifact(
@@ -3722,6 +3670,9 @@ def _validated_hosted_acquisition_item_proofs(
     request_ids = set(acquisition_request_ids)
     for proof in value:
         if not isinstance(proof, dict) or set(proof) != {
+            "effect_id",
+            "phase",
+            "target_hash",
             "request_id",
             "paper_id",
             "status",
@@ -3732,6 +3683,9 @@ def _validated_hosted_acquisition_item_proofs(
         }:
             raise DeepFetchUnavailable("deepfetch_protocol_checkpoint_invalid")
         request_id = proof.get("request_id")
+        effect_id = proof.get("effect_id")
+        phase = proof.get("phase")
+        target_hash = proof.get("target_hash")
         paper_id = proof.get("paper_id")
         status = proof.get("status")
         identity = (str(request_id), str(paper_id))
@@ -3739,6 +3693,16 @@ def _validated_hosted_acquisition_item_proofs(
             not isinstance(request_id, str)
             or not request_id
             or request_id not in request_ids
+            or not isinstance(effect_id, str)
+            or not effect_id
+            or not isinstance(phase, str)
+            or re.fullmatch(r"turn-[0-9]+", phase) is None
+            or not isinstance(target_hash, str)
+            or len(target_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in target_hash
+            )
             or not isinstance(paper_id, str)
             or not paper_id
             or status not in {"obtained", "missing"}
@@ -3763,6 +3727,9 @@ def _validated_hosted_acquisition_item_proofs(
         identities.add(identity)
         proofs.append(
             {
+                "effect_id": effect_id,
+                "phase": phase,
+                "target_hash": target_hash,
                 "request_id": request_id,
                 "paper_id": paper_id,
                 "status": status,
@@ -3880,9 +3847,9 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _validated_v4_acquisition_request(
+def _validated_v4_acquisition_effect(
     envelope: dict[str, object],
-) -> AcquisitionBatchRequest:
+) -> dict[str, object]:
     if set(envelope) != {
         "action",
         "acquisition_request",
@@ -3909,80 +3876,65 @@ def _validated_v4_acquisition_request(
     ):
         raise DeepFetchUnavailable("deepfetch_workflow_evidence_invalid")
     value = envelope.get("acquisition_request")
-    if not isinstance(value, dict) or set(value) != {
-        "request_id",
-        "route_policy",
-        "papers",
-    }:
+    if not isinstance(value, dict) or set(value) != {"effect_id", "target"}:
         raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
-    request_id = value.get("request_id")
-    papers_value = value.get("papers")
+    effect_id = value.get("effect_id")
+    target = value.get("target")
     if (
-        not isinstance(request_id, str)
-        or not request_id
-        or len(request_id) > 128
-        or value.get("route_policy") != "oa_first_then_institution"
-        or not isinstance(papers_value, list)
-        or not 1 <= len(papers_value) <= 10
-    ):
-        raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
-    papers: list[AcquisitionPaper] = []
-    paper_ids: set[str] = set()
-    for paper in papers_value:
-        if not isinstance(paper, dict) or set(paper) != {
+        not isinstance(effect_id, str)
+        or not effect_id
+        or len(effect_id) > 128
+        or not isinstance(target, dict)
+        or not {"paper_id", "title", "source_urls"} <= set(target)
+        or not set(target) <= {
             "paper_id",
             "title",
             "doi",
             "arxiv_id",
             "source_urls",
-        }:
-            raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
-        paper_id = paper.get("paper_id")
-        title = paper.get("title")
-        doi = paper.get("doi")
-        arxiv_id = paper.get("arxiv_id")
-        urls = paper.get("source_urls")
-        if (
-            not isinstance(paper_id, str)
-            or not paper_id
-            or paper_id in paper_ids
-            or not isinstance(title, str)
-            or not title
-            or doi is not None
-            and not isinstance(doi, str)
-            or arxiv_id is not None
-            and not isinstance(arxiv_id, str)
-            or not isinstance(urls, list)
-            or len(urls) > 20
-        ):
-            raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
-        paper_ids.add(paper_id)
-        papers.append(
-            AcquisitionPaper(
-                paper_id=paper_id,
-                title=title,
-                doi=cast(str | None, doi),
-                arxiv_id=cast(str | None, arxiv_id),
-                source_urls=tuple(
-                    _validated_public_url(
-                        url, "deepfetch_acquisition_source_url_invalid"
-                    )
-                    for url in urls
-                ),
-            )
+        }
+    ):
+        raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
+    paper_id = target.get("paper_id")
+    title = target.get("title")
+    doi = target.get("doi")
+    arxiv_id = target.get("arxiv_id")
+    urls = target.get("source_urls")
+    if (
+        not isinstance(paper_id, str)
+        or not paper_id
+        or len(paper_id) > 512
+        or not isinstance(title, str)
+        or not title.strip()
+        or len(title) > 2_000
+        or doi is not None
+        and (not isinstance(doi, str) or not doi or len(doi) > 512)
+        or arxiv_id is not None
+        and (
+            not isinstance(arxiv_id, str)
+            or not arxiv_id
+            or len(arxiv_id) > 512
         )
-    batch = AcquisitionBatchRequest(
-        request_id=request_id,
-        route_policy="oa_first_then_institution",
-        papers=tuple(papers),
-    )
-    try:
-        validate_batch_request(batch)
-    except AcquisitionUnavailable as error:
-        raise DeepFetchUnavailable(
-            "deepfetch_acquisition_request_invalid"
-        ) from error
-    return batch
+        or not isinstance(urls, list)
+        or len(urls) > 20
+        or any(not isinstance(url, str) or len(url) > 4_096 for url in urls)
+    ):
+        raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
+    normalized_target: dict[str, object] = {
+        "paper_id": paper_id,
+        "title": title,
+        "source_urls": [
+            _validated_public_url(
+                url, "deepfetch_acquisition_source_url_invalid"
+            )
+            for url in urls
+        ],
+    }
+    if isinstance(doi, str):
+        normalized_target["doi"] = doi
+    if isinstance(arxiv_id, str):
+        normalized_target["arxiv_id"] = arxiv_id
+    return {"effect_id": effect_id, "target": normalized_target}
 
 
 def _merge_web_evidence(
@@ -4011,7 +3963,6 @@ def _import_v4_public_artifacts(
     public_root: Path,
     envelope: dict[str, object],
     *,
-    acquisition_session_ref: str,
     acquisition_request_ids: tuple[str, ...],
     acquisition_item_proofs: tuple[dict[str, object], ...],
 ) -> tuple[
@@ -4423,7 +4374,6 @@ def _import_v4_public_artifacts(
     prototype_evidence = {
         "schema_ref": DEEPFETCH_PROTOTYPE_EVIDENCE_SCHEMA,
         "prototype_commit": DEEPFETCH_PROTOTYPE_COMMIT,
-        "acquisition_session_ref": acquisition_session_ref,
         "acquisition_request_ids": list(acquisition_request_ids),
         "main_agent_status": workflow["main_agent_status"],
         "reader_assignments": assignments,
@@ -4685,7 +4635,6 @@ def _validated_prototype_evidence(value: object) -> dict[str, object]:
     required = {
         "schema_ref",
         "prototype_commit",
-        "acquisition_session_ref",
         "acquisition_request_ids",
         "main_agent_status",
         "reader_assignments",
@@ -4702,8 +4651,6 @@ def _validated_prototype_evidence(value: object) -> dict[str, object]:
     if (
         value.get("schema_ref") != DEEPFETCH_PROTOTYPE_EVIDENCE_SCHEMA
         or value.get("prototype_commit") != DEEPFETCH_PROTOTYPE_COMMIT
-        or not isinstance(value.get("acquisition_session_ref"), str)
-        or not value.get("acquisition_session_ref")
         or not isinstance(request_ids, list)
         or any(not isinstance(item, str) or not item for item in request_ids)
         or len(set(request_ids)) != len(request_ids)
@@ -5224,49 +5171,34 @@ def _deepfetch_web_evidence_gate_output_schema() -> dict[str, object]:
 
 
 def _deepfetch_output_schema() -> dict[str, object]:
-    acquisition_paper = {
+    acquisition_target = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "paper_id": {"type": "string", "minLength": 1, "maxLength": 512},
             "title": {"type": "string", "minLength": 1, "maxLength": 2_000},
-            "doi": {
-                "anyOf": [
-                    {"type": "string", "minLength": 1, "maxLength": 512},
-                    {"type": "null"},
-                ]
-            },
+            "doi": {"type": "string", "minLength": 1, "maxLength": 512},
             "arxiv_id": {
-                "anyOf": [
-                    {"type": "string", "minLength": 1, "maxLength": 512},
-                    {"type": "null"},
-                ]
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
             },
             "source_urls": {
                 "type": "array",
                 "maxItems": 20,
-                "items": {"type": "string", "minLength": 1, "maxLength": 8_000},
+                "items": {"type": "string", "minLength": 1, "maxLength": 4_096},
             },
         },
-        "required": ["paper_id", "title", "doi", "arxiv_id", "source_urls"],
+        "required": ["paper_id", "title", "source_urls"],
     }
     acquisition_request = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
-            "route_policy": {
-                "type": "string",
-                "enum": ["oa_first_then_institution"],
-            },
-            "papers": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 10,
-                "items": acquisition_paper,
-            },
+            "effect_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "target": acquisition_target,
         },
-        "required": ["request_id", "route_policy", "papers"],
+        "required": ["effect_id", "target"],
     }
     reader_assignment = {
         "type": "object",

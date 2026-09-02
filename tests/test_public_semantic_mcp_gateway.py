@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,11 +12,20 @@ from meta_research.harness import HarnessAdmissionError, HarnessProbeRequest
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import HostComputeDevice, HostComputeSnapshot
 from meta_research.semantic_mcp import (
+    ROOT_AGENT_ACQUISITION_OPERATION_IDS,
     SemanticMcpError,
     SemanticMcpGateway,
     SemanticOperation,
 )
+from meta_research.semantic_owner_gateway import ROOT_AGENT_SEMANTIC_OPERATION_IDS
 from meta_research.web import create_app
+from test_public_acquisition_session import (
+    HumanRequestAcquisitionProvider,
+    NoCompute,
+    ObtainingAcquisitionProvider,
+    _authenticated_client,
+    _open_ready_acquisition,
+)
 
 
 def test_effectful_semantic_operation_fails_closed_without_reconciliation() -> None:
@@ -760,6 +771,329 @@ def test_lost_effect_response_reconciles_before_replay_without_duplication(
         ]
         assert probe.calls == 1
     finally:
+        runtime.close()
+
+
+def test_two_root_kinds_share_one_quest_acquisition_effect_and_reconcile(
+    tmp_path,
+) -> None:
+    provider = ObtainingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "root-acquisition-effect"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="root-acquisition-effect",
+        )
+        quest_ref = "quest:root-acquisition-effect"
+        bound = runtime.owners.agent_runtime.bind_acquisition_session_to_quest(
+            initialization_id,
+            quest_ref,
+        )
+        assert bound is not None and bound.session_ref == session_ref
+
+        def channel_for(root_kind: str, suffix: str):
+            scope = {
+                "quest_ref": quest_ref,
+                "run_ref": f"{root_kind}-caller-{suffix}",
+                "attempt_ref": f"{root_kind}-attempt-{suffix}",
+                "root_session_ref": f"{root_kind}-session-{suffix}",
+                "fence_ref": f"{root_kind}-fence-{suffix}",
+                "runtime_binding_hash": suffix * 64,
+                "generation": 1,
+            }
+            runtime.owners.agent_runtime.register_external_root_task_scope(
+                root_kind=root_kind,
+                root_runtime_scope=scope,
+            )
+            return runtime.harnesses.issue_resident_mcp_channel(
+                run_ref=scope["run_ref"],
+                attempt_ref=scope["attempt_ref"],
+                root_session_ref=scope["root_session_ref"],
+                fence_ref=scope["fence_ref"],
+                capability_binding_hash=scope["runtime_binding_hash"],
+                operation_ids=ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind],
+                root_kind=root_kind,
+                phase="primary",
+                subject_policy="operation_tree",
+            )
+
+        def call(token: str, request_id: int, operation_id: str, arguments):
+            response = client.post(
+                "/mcp",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-06-18",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {"name": operation_id, "arguments": arguments},
+                },
+            )
+            assert response.status_code == 200
+            return response.json()["result"]
+
+        companion = channel_for("companion", "c")
+        first_arguments = {
+            "effect_id": "companion-fulltext-1",
+            "target": {
+                "paper_id": "paper:companion-fulltext-1",
+                "title": "One exact Companion full-text target",
+                "doi": "10.1000/companion-fulltext-1",
+                "source_urls": [],
+            },
+        }
+        first = call(
+            companion.connection.token,
+            1,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            first_arguments,
+        )
+        assert first["isError"] is False
+        first_value = first["structuredContent"]
+        assert first_value["effect_id"] == "companion-fulltext-1"
+        assert first_value["status"] == "obtained"
+        assert set(first_value) == {"effect_id", "request_id", "status", "result"}
+        assert first_value["result"]["paper_id"] == (
+            "paper:companion-fulltext-1"
+        )
+        assert first_value["result"]["format"] == "html"
+        assert first_value["result"]["content_sha256"] == hashlib.sha256(
+            provider.content
+        ).hexdigest()
+        assert Path(first_value["result"]["verified_path"]).is_file()
+
+        # Treat the request response as transport-lost. Reconcile is read-only.
+        reconciled = call(
+            companion.connection.token,
+            2,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
+            {"effect_id": "companion-fulltext-1"},
+        )
+        assert reconciled["structuredContent"] == first_value
+        assert len(provider.batches) == 1
+
+        acquisition = channel_for("acquisition", "a")
+        second = call(
+            acquisition.connection.token,
+            3,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            {
+                "effect_id": "acquisition-fulltext-2",
+                "target": {
+                    "paper_id": "paper:acquisition-fulltext-2",
+                    "title": "One exact Acquisition full-text target",
+                    "arxiv_id": "2401.00002",
+                    "source_urls": ["https://example.test/fulltext-2"],
+                },
+            },
+        )
+        assert second["isError"] is False
+        assert second["structuredContent"]["status"] == "obtained"
+        assert len(provider.batches) == 2
+        assert all(len(batch.papers) == 1 for batch in provider.batches)
+        assert all(batch.session_ref == session_ref for batch in provider.batches)
+
+        forged_route = call(
+            acquisition.connection.token,
+            4,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            {
+                "effect_id": "forged-route",
+                "target": {
+                    "paper_id": "paper:forged-route",
+                    "title": "Caller must not select routing",
+                    "source_urls": [],
+                },
+                "provider": "caller-selected",
+                "session_ref": "caller-selected",
+                "route_policy": "caller-selected",
+                "target_dir": "/tmp/caller-selected",
+                "return_path": "/tmp/caller-selected.pdf",
+            },
+        )
+        assert forged_route["isError"] is True
+        assert forged_route["structuredContent"]["code"] == (
+            "semantic_input_schema_mismatch"
+        )
+
+        too_many_sources = call(
+            acquisition.connection.token,
+            5,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            {
+                "effect_id": "too-many-source-urls",
+                "target": {
+                    "paper_id": "paper:too-many-source-urls",
+                    "title": "Bound the provider work for one target",
+                    "source_urls": [
+                        f"https://example.test/source-{index}"
+                        for index in range(21)
+                    ],
+                },
+            },
+        )
+        assert too_many_sources["isError"] is True
+        assert too_many_sources["structuredContent"]["code"] == (
+            "acquisition_batch_request_invalid"
+        )
+        assert len(provider.batches) == 2
+
+        Path(first_value["result"]["verified_path"]).write_bytes(
+            b"drifted-after-owner-proof"
+        )
+        drifted = call(
+            companion.connection.token,
+            5,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
+            {"effect_id": "companion-fulltext-1"},
+        )
+        assert drifted["isError"] is False
+        assert drifted["structuredContent"]["status"] == "missing"
+        assert drifted["structuredContent"]["result"] == {
+            "paper_id": "paper:companion-fulltext-1",
+            "status": "missing",
+            "failure": {
+                "code": "acquisition_artifact_drift",
+                "detail": (
+                    "Owner 无法重新验证该全文文件；不会返回路径或重放 Provider。"
+                ),
+            },
+        }
+        replay_after_drift = call(
+            companion.connection.token,
+            6,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            first_arguments,
+        )
+        assert replay_after_drift["structuredContent"] == drifted[
+            "structuredContent"
+        ]
+        assert len(provider.batches) == 2
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_common_acquisition_effect_resumes_only_after_its_human_waiter(
+    tmp_path,
+) -> None:
+    provider = HumanRequestAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "root-acquisition-human-resume"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    provider.owner = runtime.owners.agent_runtime
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        initialization_id, _saved, _session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="root-acquisition-human-resume",
+        )
+        quest_ref = "quest:root-acquisition-human-resume"
+        runtime.owners.agent_runtime.bind_acquisition_session_to_quest(
+            initialization_id,
+            quest_ref,
+        )
+        scope = {
+            "quest_ref": quest_ref,
+            "run_ref": "companion-human-resume",
+            "attempt_ref": "companion-human-resume-attempt",
+            "root_session_ref": "companion-human-resume-session",
+            "fence_ref": "companion-human-resume-fence",
+            "runtime_binding_hash": "d" * 64,
+            "generation": 1,
+        }
+        runtime.owners.agent_runtime.register_external_root_task_scope(
+            root_kind="companion",
+            root_runtime_scope=scope,
+        )
+        channel = runtime.harnesses.issue_resident_mcp_channel(
+            run_ref=scope["run_ref"],
+            attempt_ref=scope["attempt_ref"],
+            root_session_ref=scope["root_session_ref"],
+            fence_ref=scope["fence_ref"],
+            capability_binding_hash=scope["runtime_binding_hash"],
+            operation_ids=ROOT_AGENT_SEMANTIC_OPERATION_IDS["companion"],
+            root_kind="companion",
+            phase="primary",
+            subject_policy="operation_tree",
+        )
+        arguments = {
+            "effect_id": "human-resume-fulltext",
+            "target": {
+                "paper_id": "paper:human-resume-fulltext",
+                "title": "Resume one exact Acquisition request",
+                "source_urls": [],
+            },
+        }
+
+        def call(request_id: int, operation_id: str, values):
+            response = client.post(
+                "/mcp",
+                headers={
+                    "Authorization": f"Bearer {channel.connection.token}",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-06-18",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {"name": operation_id, "arguments": values},
+                },
+            )
+            assert response.status_code == 200
+            return response.json()["result"]["structuredContent"]
+
+        waiting = call(
+            1,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            arguments,
+        )
+        assert waiting["status"] == "waiting_user"
+        assert call(
+            2,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            arguments,
+        ) == waiting
+        assert len(provider.batches) == 1
+        assert provider.reconciliations == []
+
+        assert provider.human_request is not None
+        runtime.owners.human_collaboration.respond_to_human_request(
+            str(provider.human_request["request_ref"]),
+            decision="deferred",
+            facts={},
+            note="Continue this exact task without the optional input.",
+            idempotency_key="root-acquisition-human-resume-response",
+        )
+        settled = call(
+            3,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
+            arguments,
+        )
+        assert settled["status"] == "missing"
+        assert len(provider.batches) == 1
+        assert len(provider.reconciliations) == 1
+        assert call(
+            4,
+            ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
+            {"effect_id": "human-resume-fulltext"},
+        ) == settled
+        assert len(provider.reconciliations) == 1
+    finally:
+        client.close()
         runtime.close()
 
 

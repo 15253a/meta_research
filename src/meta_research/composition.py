@@ -8,8 +8,6 @@ from typing import cast
 from sqlalchemy import text
 
 from meta_research.acquisition import (
-    AcquisitionBatchExecution,
-    AcquisitionBatchRequest,
     AcquisitionProvider,
     NatureDownloaderAdapter,
 )
@@ -26,7 +24,6 @@ from meta_research.companion import CodexCompanionAdapter
 from meta_research.database import Database
 from meta_research.deepfetch import (
     CodexDeepFetchAdapter,
-    DeepFetchAcquisitionClient,
     DeepFetchProvider,
     DeepFetchRunRequest,
 )
@@ -165,6 +162,15 @@ class _DeepFetchRequestVerifierRouter:
         self, advancement_engine: AdvancementEngineInterface
     ) -> None:
         self._advancement_engine = advancement_engine
+
+    def query_initialization_acquisition_binding(
+        self, request_ref: str
+    ) -> dict[str, str] | None:
+        query = getattr(
+            self._human_verifier,
+            "query_initialization_acquisition_binding",
+        )
+        return cast(dict[str, str] | None, query(request_ref))
 
     def verify_deepfetch_run_request(self, **values: object) -> None:
         if values.get("creation_context_kind") == "autonomous_question_creation":
@@ -451,37 +457,6 @@ class ProductionRuntime:
                 self._database.close()
 
 
-class _AgentRuntimeAcquisitionClient(DeepFetchAcquisitionClient):
-    def __init__(
-        self,
-        agent_runtime: AgentRuntimeInterface,
-        provider: AcquisitionProvider,
-    ) -> None:
-        self._agent_runtime = agent_runtime
-        self._provider = provider
-
-    def acquire(
-        self,
-        session_ref: str,
-        request: AcquisitionBatchRequest,
-    ) -> AcquisitionBatchExecution:
-        return self._agent_runtime.acquire_literature(
-            session_ref,
-            request,
-            self._provider,
-        )
-
-    def query_completed_batch(
-        self,
-        session_ref: str,
-        request_id: str,
-    ) -> AcquisitionBatchExecution | None:
-        return self._agent_runtime.query_acquisition_execution(
-            session_ref,
-            request_id,
-        )
-
-
 def _configured_power_inhibitor(data_root: DataRoot) -> PowerInhibitor:
     if os.environ.get("META_RESEARCH_ASSUME_ALWAYS_ON") == "1":
         return OperatorAttestedPowerInhibitor()
@@ -669,10 +644,6 @@ def build_production_runtime(
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
         executable=codex_executable,
-        acquisition_client=_AgentRuntimeAcquisitionClient(
-            agent_runtime,
-            acquisition_provider,
-        ),
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
     )
@@ -913,6 +884,7 @@ def build_production_runtime(
         advancement_engine=owners.advancement_engine,
         research_memory=owners.research_memory,
         agent_runtime=owners.agent_runtime,
+        acquisition_provider=acquisition_provider,
         human_collaboration_snapshot=owners.human_collaboration.query_snapshot,
         target_run_agent=target_run_agent,
     )

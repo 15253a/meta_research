@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from meta_research.owners.common import canonical_hash
 from meta_research.root_capabilities import RootAgentKind, root_operation_catalog
-from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+from meta_research.semantic_mcp import ROOT_AGENT_COMMON_OPERATION_IDS
 
 
 _OPERATION_BINDING_CONTRACT = "meta-research/harness-operation-binding/v1"
@@ -82,6 +82,10 @@ class RootResidentMcpAuthority(Protocol):
         self, channel: _ResidentMcpChannel
     ) -> None: ...
 
+    def dispatch_mcp(
+        self, token: str | None, message: object
+    ) -> tuple[int, dict[str, object] | None]: ...
+
 
 @dataclass(frozen=True)
 class RootResidentMcpRuntimeFacts:
@@ -108,7 +112,7 @@ class RootResidentMcpChannels:
         self._root_kind = root_kind
         self._operation_ids = root_operation_catalog(
             root_kind,
-            common_operation_ids=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+            common_operation_ids=ROOT_AGENT_COMMON_OPERATION_IDS,
         )
         self._authority: RootResidentMcpAuthority | None = None
         self._base_url: str | None = None
@@ -297,6 +301,69 @@ class RootResidentMcpChannels:
             raise RootResidentMcpError(
                 str(getattr(error, "code", "semantic_mcp_revoke_failed"))
             ) from error
+
+    def call_operation(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        root_session_ref: str,
+        fence_ref: str,
+        capability_binding_hash: str,
+        phase: str,
+        job_ref: str | None,
+        operation_id: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        """Call one operation through the same exact resident bearer as Agents."""
+
+        if operation_id not in self._operation_ids:
+            raise RootResidentMcpError("semantic_mcp_operation_unavailable")
+        authority = self._authority
+        if authority is None:
+            raise RootResidentMcpError("semantic_mcp_unavailable")
+        key, access = self.acquire(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            root_session_ref=root_session_ref,
+            fence_ref=fence_ref,
+            capability_binding_hash=capability_binding_hash,
+            phase=phase,
+            job_ref=job_ref,
+        )
+        try:
+            status, payload = authority.dispatch_mcp(
+                access.token,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": operation_id,
+                        "arguments": arguments,
+                    },
+                },
+            )
+            result = payload.get("result") if isinstance(payload, dict) else None
+            structured = (
+                result.get("structuredContent")
+                if isinstance(result, dict)
+                else None
+            )
+            if (
+                status != 200
+                or not isinstance(result, dict)
+                or not isinstance(structured, dict)
+            ):
+                raise RootResidentMcpError("semantic_mcp_call_failed")
+            if result.get("isError") is True:
+                code = structured.get("code")
+                raise RootResidentMcpError(
+                    code if isinstance(code, str) else "semantic_mcp_call_failed"
+                )
+            return structured
+        finally:
+            self.release(key)
 
     def release_job(self, job_ref: str, *, include_children: bool = False) -> None:
         with self._lock:

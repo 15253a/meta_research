@@ -16,6 +16,14 @@ ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS = (
     "human_request.open",
     "human_request.open.reconcile",
 )
+ROOT_AGENT_ACQUISITION_OPERATION_IDS = (
+    "agent_runtime.acquisition.request",
+    "agent_runtime.acquisition.request.reconcile",
+)
+ROOT_AGENT_COMMON_OPERATION_IDS = (
+    *ROOT_AGENT_ACQUISITION_OPERATION_IDS,
+    *ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
+)
 
 
 class SemanticMcpError(RuntimeError):
@@ -67,6 +75,22 @@ class SemanticCallContext:
                 "root_kind": self.root_kind,
                 "phase": self.phase,
                 "operation_family": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                "effect_id": effect_id,
+            }
+        )
+
+    def acquisition_effect_key(self, effect_id: str) -> str:
+        """Bind one Acquisition request to the logical task across recovery."""
+
+        if not effect_id or len(effect_id) > 128:
+            raise SemanticMcpError("semantic_effect_id_invalid")
+        return "mcp-effect:" + canonical_hash(
+            {
+                "run_ref": self.run_ref,
+                "root_session_ref": self.root_session_ref,
+                "root_kind": self.root_kind,
+                "phase": self.phase,
+                "operation_family": ROOT_AGENT_ACQUISITION_OPERATION_IDS[0],
                 "effect_id": effect_id,
             }
         )

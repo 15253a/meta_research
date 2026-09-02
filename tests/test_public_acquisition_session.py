@@ -19,14 +19,9 @@ from meta_research.acquisition import (
     canonical_hash as acquisition_hash,
     canonical_json as acquisition_json,
     validate_batch_request,
+    validate_item_results,
 )
 from meta_research.composition import build_production_runtime
-from meta_research.deepfetch import (
-    DeepFetchProviderRequest,
-    DeepFetchResult,
-    DeepFetchRuntimeBinding,
-    DeepFetchUnavailable,
-)
 from meta_research.paths import prepare_data_root
 from meta_research.owners.common import OwnerConflict
 from meta_research.quest_drafting import HostComputeDevice, HostComputeSnapshot
@@ -114,6 +109,45 @@ class RecordingAcquisitionProvider:
             )
             for item in request.papers
         )
+
+
+@pytest.mark.parametrize(
+    ("code_length", "detail_length", "accepted"),
+    ((256, 4_000, True), (257, 1, False), (1, 4_001, False)),
+)
+def test_acquisition_failure_fits_the_public_effect_contract(
+    code_length: int,
+    detail_length: int,
+    accepted: bool,
+) -> None:
+    request = AcquisitionBatchRequest(
+        request_id="failure-public-effect-contract",
+        route_policy="oa_first_then_institution",
+        papers=(
+            AcquisitionPaper(
+                paper_id="paper:failure-contract",
+                title="Failure contract",
+                doi=None,
+                arxiv_id=None,
+                source_urls=(),
+            ),
+        ),
+    )
+    results = (
+        AcquisitionItemResult(
+            paper_id="paper:failure-contract",
+            status="missing",
+            path=None,
+            format=None,
+            failure={"code": "c" * code_length, "detail": "d" * detail_length},
+        ),
+    )
+
+    if accepted:
+        assert validate_item_results(request, results) == results
+    else:
+        with pytest.raises(AcquisitionUnavailable, match="acquisition_result_invalid"):
+            validate_item_results(request, results)
 
 
 class ObtainingAcquisitionProvider(RecordingAcquisitionProvider):
@@ -351,6 +385,56 @@ class SwitchablePowerInhibitor:
 
     def release(self, lease: InhibitorLease) -> None:
         self.live_holders.discard(lease.holder_ref)
+
+
+class BlockingConfirmationPowerInhibitor:
+    kind = "test_blocking_confirmation_inhibitor"
+
+    def __init__(self) -> None:
+        self.block_next_confirmation = False
+        self.confirmation_started = threading.Event()
+        self.continue_confirmation = threading.Event()
+        self.live_holders: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        self.live_holders.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=1_720_000_000.0,
+            native_holder_ref="test-blocking-confirmation-holder",
+        )
+
+    def query_hold(self, lease: InhibitorLease) -> str:
+        if self.block_next_confirmation:
+            self.block_next_confirmation = False
+            self.confirmation_started.set()
+            assert self.continue_confirmation.wait(timeout=5)
+            return "unknown"
+        return "confirmed" if lease.holder_ref in self.live_holders else "absent"
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self.live_holders
+
+    def release(self, lease: InhibitorLease) -> None:
+        self.live_holders.discard(lease.holder_ref)
+
+
+class BlockingRepreflightAcquisitionProvider(RecordingAcquisitionProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_next_preflight = False
+        self.preflight_started = threading.Event()
+        self.continue_preflight = threading.Event()
+
+    def preflight(self, request) -> AcquisitionPreflightResult:
+        if self.block_next_preflight:
+            self.block_next_preflight = False
+            self.preflight_started.set()
+            assert self.continue_preflight.wait(timeout=5)
+        return super().preflight(request)
 
 
 class PartialAcquisitionProvider(RecordingAcquisitionProvider):
@@ -769,79 +853,6 @@ class CrashAfterOaResumeProvider(RecordingAcquisitionProvider):
         )
 
 
-class AcquisitionWaitingDeepFetchProvider:
-    """Test seam that exercises the hosted Acquisition port through the worker."""
-
-    def __init__(self, acquisition_provider: RecordingAcquisitionProvider) -> None:
-        self.acquisition_provider = acquisition_provider
-        self.agent_runtime = None
-        self.requests: list[DeepFetchProviderRequest] = []
-
-    def runtime_binding(self) -> DeepFetchRuntimeBinding:
-        return DeepFetchRuntimeBinding(
-            provider_ref="test/acquisition-aware-deepfetch",
-            provider_version="1",
-            model_ref="test-model",
-            harness_ref="test-harness",
-            capability_bindings=("web-search-live", "web-fetch-live"),
-        )
-
-    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
-        assert self.agent_runtime is not None
-        self.requests.append(request)
-        batch = AcquisitionBatchRequest(
-            request_id="deepfetch-exact-batch-1",
-            route_policy="oa_first_then_institution",
-            papers=(
-                AcquisitionPaper(
-                    paper_id="paper:waiting",
-                    title="Institutional full text candidate",
-                    doi="10.1000/waiting",
-                    arxiv_id=None,
-                    source_urls=("https://example.org/paper",),
-                ),
-            ),
-        )
-        execution = self.agent_runtime.acquire_literature(
-            request.acquisition_session_ref,
-            batch,
-            self.acquisition_provider,
-        )
-        native_session_ref = (
-            request.native_session_ref or "native-acquisition-recovery-1"
-        )
-        if execution.status == "waiting_user":
-            raise DeepFetchUnavailable(
-                "deepfetch_acquisition_waiting_user",
-                durable_outcome="pending",
-                native_session_ref=native_session_ref,
-            )
-        return DeepFetchResult(
-            completion="limited",
-            summary="已核查一篇候选论文，但合法全文路由未取得正文。",
-            papers=(
-                {
-                    "title": "Institutional full text candidate",
-                    "url": "https://example.org/paper",
-                    "doi": "10.1000/waiting",
-                    "source_kind": "publisher",
-                    "fulltext_status": "unavailable",
-                    "retrieved_at": "2026-08-22T00:00:00Z",
-                },
-            ),
-            fulltexts=(),
-            limitations=("合法全文路由未返回可用正文。",),
-            native_session_ref=native_session_ref,
-            adapter_kind="test_acquisition_aware_deepfetch",
-            web_evidence={
-                "schema_ref": "meta-research/deepfetch-web-evidence/v1",
-                "search_event_count": 1,
-                "fetch_event_count": 1,
-                "trace_hash": "e" * 64,
-            },
-        )
-
-
 def _authenticated_client(runtime) -> tuple[TestClient, dict[str, str]]:
     base_url = "http://testserver"
     client = TestClient(
@@ -1210,6 +1221,899 @@ def test_completed_acquisition_execution_is_queryable_without_provider_replay(
             str(root_scope["run_ref"])
         )
         assert managed is not None and managed["status"] == "completed"
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_waiting_acquisition_request_is_queryable_without_provider_replay(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "query-waiting-acquisition"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="query-waiting-acquisition",
+        )
+        request = AcquisitionBatchRequest(
+            request_id="query-waiting-acquisition-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:waiting",
+                    title="Query waiting acquisition",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        waiting = runtime.owners.agent_runtime.acquire_literature(
+            session_ref,
+            request,
+            provider,
+        )
+        queried = runtime.owners.agent_runtime.query_acquisition_request(
+            session_ref,
+            request.request_id,
+        )
+
+        assert waiting.status == "waiting_user"
+        assert queried == waiting
+        assert runtime.owners.agent_runtime.query_acquisition_execution(
+            session_ref,
+            request.request_id,
+        ) is None
+        assert runtime.owners.agent_runtime.query_acquisition_request(
+            session_ref,
+            "query-waiting-acquisition-absent",
+        ) is None
+        assert [batch.request_id for batch in provider.batches] == [
+            request.request_id
+        ]
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_quest_deletion_terminates_acquisition_without_provider_replay(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "quest-deleted-acquisition"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="quest-deleted-acquisition",
+        )
+        quest_ref = "quest_deleted_acquisition"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="quest-deleted-acquisition-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:waiting",
+                    title="A request terminated with its Quest",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        waiting = owner.acquire_literature(session_ref, request, provider)
+        assert waiting.status == "waiting_user"
+        assert len(provider.batches) == 1
+        assert len(provider.preflights) == 1
+
+        terminated = owner.terminate_acquisition_session(quest_ref)
+        assert terminated is not None
+        assert terminated.session_ref == session_ref
+        assert terminated.status == "cancelled"
+        assert terminated.current_request_id is None
+        assert terminated.slot_held is False
+        assert terminated.reason_code == "quest_deleted"
+
+        cancelled_request = owner.query_acquisition_request(
+            session_ref,
+            request.request_id,
+        )
+        assert cancelled_request is not None
+        assert cancelled_request.status == "missing"
+        [cancelled_item] = cancelled_request.results
+        assert cancelled_item.status == "missing"
+        assert cancelled_item.path is None
+        assert cancelled_item.format is None
+        assert cancelled_item.failure == {
+            "code": "acquisition_session_cancelled",
+            "detail": "Quest 已删除；该正文获取请求不会恢复。",
+        }
+
+        assert owner.terminate_acquisition_session(quest_ref) == terminated
+        with pytest.raises(
+            OwnerConflict,
+            match="acquisition_session_cancelled",
+        ):
+            owner.acquire_literature(session_ref, request, provider)
+        with pytest.raises(
+            OwnerConflict,
+            match="acquisition_session_cancelled",
+        ):
+            owner.prepare_acquisition_session(
+                initialization_id=initialization_id,
+                draft_revision=2,
+                config={
+                    "mode": "oa_then_institution",
+                    "library_entry_url": (
+                        "https://library.example.edu/resources"
+                    ),
+                },
+                provider=provider,
+            )
+        assert len(provider.batches) == 1
+        assert len(provider.preflights) == 1
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_quest_deletion_fences_an_inflight_acquisition_completion(
+    tmp_path: Path,
+) -> None:
+    provider = BlockingAcquisitionProvider()
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "quest-deleted-inflight-acquisition"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+        startup_power_probe=False,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    failures: list[BaseException] = []
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="quest-deleted-inflight-acquisition",
+        )
+        quest_ref = "quest_deleted_inflight_acquisition"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="quest-deleted-inflight-acquisition-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:deleted-inflight",
+                    title="An inflight request fenced by Quest deletion",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        def acquire() -> None:
+            try:
+                owner.acquire_literature(session_ref, request, provider)
+            except BaseException as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        thread = threading.Thread(target=acquire)
+        thread.start()
+        assert provider.started.wait(timeout=5)
+
+        terminated = owner.terminate_acquisition_session(quest_ref)
+        assert terminated is not None and terminated.status == "cancelled"
+        managed = owner.query_managed_run(request.request_id)
+        assert managed is not None and managed["status"] == "terminated"
+
+        provider.release.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], OwnerConflict)
+        assert str(failures[0]) == "acquisition_request_fence_stale"
+
+        still_terminated = owner.query_acquisition_session(quest_ref=quest_ref)
+        assert still_terminated is not None
+        assert still_terminated.status == "cancelled"
+        cancelled_request = owner.query_acquisition_request(
+            session_ref,
+            request.request_id,
+        )
+        assert cancelled_request is not None
+        assert cancelled_request.status == "missing"
+        assert cancelled_request.results[0].failure is not None
+        assert (
+            cancelled_request.results[0].failure["code"]
+            == "acquisition_session_cancelled"
+        )
+        assert owner.query_managed_run(request.request_id)["status"] == "terminated"
+        assert len(provider.batches) == 1
+        assert owner.query_snapshot().facts["acquisition_active_slot_count"] == 0
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT status, boundary, checkpoint_ref FROM "
+                    "ar_execution_responsibilities WHERE effect_kind = "
+                    "'acquisition' AND operation_ref = :request_id"
+                ),
+                {"request_id": request.request_id},
+            ).one()
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "permanent_fence"
+        assert responsibility.checkpoint_ref is None
+        assert inhibitor.live_holders == set()
+    finally:
+        provider.release.set()
+        client.close()
+        runtime.close()
+
+
+def test_quest_deletion_terminates_a_late_acquisition_root_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "quest-deleted-late-root-registration"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    registration_started = threading.Event()
+    continue_registration = threading.Event()
+    failures: list[BaseException] = []
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="quest-deleted-late-root-registration",
+        )
+        quest_ref = "quest_deleted_late_root_registration"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="quest-deleted-late-root-registration-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:deleted-before-root-registration",
+                    title="A request deleted before its Root run registration",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        original_register = owner.register_external_root_task_scope
+
+        def delayed_register(**values):
+            registration_started.set()
+            assert continue_registration.wait(timeout=5)
+            return original_register(**values)
+
+        monkeypatch.setattr(
+            owner,
+            "register_external_root_task_scope",
+            delayed_register,
+        )
+
+        def acquire() -> None:
+            try:
+                owner.acquire_literature(session_ref, request, provider)
+            except BaseException as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        thread = threading.Thread(target=acquire)
+        thread.start()
+        assert registration_started.wait(timeout=5)
+
+        terminated = owner.terminate_acquisition_session(quest_ref)
+        assert terminated is not None and terminated.status == "cancelled"
+        continue_registration.set()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], OwnerConflict)
+        assert str(failures[0]) == "acquisition_request_fence_stale"
+        assert provider.batches == []
+        managed = owner.query_managed_run(request.request_id)
+        assert managed is not None
+        assert managed["status"] == "terminated"
+        assert managed["terminal_reason"] == "acquisition_session_cancelled"
+        with runtime._database.read() as connection:
+            responsibility_count = connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM ar_execution_responsibilities WHERE "
+                    "root_run_ref = :session_ref AND operation_ref = :request_id"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                },
+            ).scalar_one()
+        assert responsibility_count == 0
+    finally:
+        continue_registration.set()
+        client.close()
+        runtime.close()
+
+
+def test_quest_deletion_finishes_waiting_acquisition_human_request(
+    tmp_path: Path,
+) -> None:
+    provider = HumanRequestAcquisitionProvider()
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "quest-deleted-waiting-acquisition"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+        startup_power_probe=False,
+    )
+    provider.owner = runtime.owners.agent_runtime
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="quest-deleted-waiting-acquisition",
+        )
+        quest_ref = "quest_deleted_waiting_acquisition"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="quest-deleted-waiting-acquisition-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:deleted-waiting",
+                    title="A waiting request terminated with its Quest",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        waiting = owner.acquire_literature(session_ref, request, provider)
+        assert waiting.status == "waiting_user"
+        assert provider.human_request is not None
+        request_ref = str(provider.human_request["request_ref"])
+        open_request = owner.query_human_request(request_ref)
+        assert open_request is not None
+        assert open_request["status"] == "open"
+        assert open_request["direct_waiters"][0]["status"] == "blocked"
+        assert inhibitor.live_holders
+
+        terminated = owner.terminate_acquisition_session(quest_ref)
+        assert terminated is not None and terminated.status == "cancelled"
+
+        withdrawn = owner.query_human_request(request_ref)
+        assert withdrawn is not None
+        assert withdrawn["status"] == "withdrawn"
+        assert withdrawn["disposition"]["decision"] == "withdrawn"
+        assert withdrawn["direct_waiters"][0]["status"] == "cancelled"
+        cancelled_request = owner.query_acquisition_request(
+            session_ref,
+            request.request_id,
+        )
+        assert cancelled_request is not None
+        assert cancelled_request.status == "missing"
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT status, boundary, checkpoint_ref FROM "
+                    "ar_execution_responsibilities WHERE effect_kind = "
+                    "'acquisition' AND root_run_ref = :session_ref AND "
+                    "operation_ref = :request_id"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                },
+            ).one()
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "permanent_fence"
+        assert responsibility.checkpoint_ref is None
+        assert inhibitor.live_holders == set()
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_quest_deletion_fences_failed_protection_before_provider(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    inhibitor = BlockingConfirmationPowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "quest-deleted-protection-acquire"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+        startup_power_probe=False,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    failures: list[BaseException] = []
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="quest-deleted-protection-acquire",
+        )
+        quest_ref = "quest_deleted_protection_acquire"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="quest-deleted-protection-acquire-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:deleted-before-provider",
+                    title="A request deleted before Provider admission",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        inhibitor.block_next_confirmation = True
+
+        def acquire() -> None:
+            try:
+                owner.acquire_literature(session_ref, request, provider)
+            except BaseException as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        thread = threading.Thread(target=acquire)
+        thread.start()
+        assert inhibitor.confirmation_started.wait(timeout=5)
+
+        terminated = owner.terminate_acquisition_session(quest_ref)
+        assert terminated is not None and terminated.status == "cancelled"
+        inhibitor.continue_confirmation.set()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], OwnerConflict)
+        assert str(failures[0]) == "acquisition_request_fence_stale"
+        assert provider.batches == []
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT status, boundary, checkpoint_ref FROM "
+                    "ar_execution_responsibilities WHERE root_run_ref = "
+                    ":session_ref AND operation_ref = :request_id"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                },
+            ).one()
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "permanent_fence"
+        assert responsibility.checkpoint_ref is None
+        assert inhibitor.live_holders == set()
+    finally:
+        inhibitor.continue_confirmation.set()
+        client.close()
+        runtime.close()
+
+
+def test_quest_deletion_fences_inflight_acquisition_repreflight(
+    tmp_path: Path,
+) -> None:
+    provider = BlockingRepreflightAcquisitionProvider()
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "quest-deleted-repreflight"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+        startup_power_probe=False,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    failures: list[BaseException] = []
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="quest-deleted-repreflight",
+        )
+        quest_ref = "quest_deleted_repreflight"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        provider.block_next_preflight = True
+
+        def repreflight() -> None:
+            try:
+                owner.prepare_acquisition_session(
+                    initialization_id=initialization_id,
+                    draft_revision=2,
+                    config={
+                        "mode": "oa_only",
+                        "library_entry_url": (
+                            "https://library.example.edu/resources"
+                        ),
+                    },
+                    provider=provider,
+                )
+            except BaseException as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        thread = threading.Thread(target=repreflight)
+        thread.start()
+        assert provider.preflight_started.wait(timeout=5)
+
+        terminated = owner.terminate_acquisition_session(quest_ref)
+        assert terminated is not None and terminated.status == "cancelled"
+        provider.continue_preflight.set()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], OwnerConflict)
+        assert str(failures[0]) == "acquisition_preflight_fence_stale"
+        assert len(provider.preflights) == 2
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT status, boundary, checkpoint_ref FROM "
+                    "ar_execution_responsibilities WHERE root_run_ref = "
+                    ":session_ref AND attempt_ref = 'acquisition_preflight_2'"
+                ),
+                {"session_ref": session_ref},
+            ).one()
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "permanent_fence"
+        assert responsibility.checkpoint_ref is None
+        assert inhibitor.live_holders == set()
+    finally:
+        provider.continue_preflight.set()
+        client.close()
+        runtime.close()
+
+
+def test_quest_deletion_replays_waiting_acquisition_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "quest-deleted-waiting-checkpoint"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+        startup_power_probe=False,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="quest-deleted-waiting-checkpoint",
+        )
+        quest_ref = "quest_deleted_waiting_checkpoint"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="quest-deleted-waiting-checkpoint-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:waiting",
+                    title="A waiting request with a committed checkpoint",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        original_finish = runtime.runtime_protection.finish
+
+        def lose_finish_ack(*_args, **_kwargs) -> None:
+            raise RuntimeProtectionUnavailable(
+                "simulated_acquisition_finish_ack_loss"
+            )
+
+        monkeypatch.setattr(runtime.runtime_protection, "finish", lose_finish_ack)
+        with pytest.raises(
+            RuntimeProtectionUnavailable,
+            match="simulated_acquisition_finish_ack_loss",
+        ):
+            owner.acquire_literature(session_ref, request, provider)
+        monkeypatch.setattr(runtime.runtime_protection, "finish", original_finish)
+
+        waiting = owner.query_acquisition_session(session_ref=session_ref)
+        assert waiting is not None and waiting.status == "waiting_user"
+        terminated = owner.terminate_acquisition_session(quest_ref)
+        assert terminated is not None and terminated.status == "cancelled"
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT status, boundary, checkpoint_ref FROM "
+                    "ar_execution_responsibilities WHERE root_run_ref = "
+                    ":session_ref AND operation_ref = :request_id"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                },
+            ).one()
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "checkpoint"
+        assert responsibility.checkpoint_ref is not None
+        assert inhibitor.live_holders == set()
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_cancelled_quest_replays_terminal_acquisition_finish_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "quest-deleted-terminal-checkpoint"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+        startup_power_probe=False,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="quest-deleted-terminal-checkpoint",
+        )
+        quest_ref = "quest_deleted_terminal_checkpoint"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="quest-deleted-terminal-checkpoint-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:terminal-before-delete",
+                    title="A terminal request with a lost finish ACK",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        original_finish = runtime.runtime_protection.finish
+
+        def lose_finish_ack(*_args, **_kwargs) -> None:
+            raise RuntimeProtectionUnavailable(
+                "simulated_acquisition_finish_ack_loss"
+            )
+
+        monkeypatch.setattr(runtime.runtime_protection, "finish", lose_finish_ack)
+        with pytest.raises(
+            RuntimeProtectionUnavailable,
+            match="simulated_acquisition_finish_ack_loss",
+        ):
+            owner.acquire_literature(session_ref, request, provider)
+        ready = owner.query_acquisition_session(session_ref=session_ref)
+        assert ready is not None
+        assert ready.status == "ready"
+        assert ready.current_request_id is None
+
+        with pytest.raises(
+            OwnerConflict,
+            match="simulated_acquisition_finish_ack_loss",
+        ):
+            owner.terminate_acquisition_session(quest_ref)
+        committed = owner.query_acquisition_session(quest_ref=quest_ref)
+        assert committed is not None and committed.status == "cancelled"
+
+        monkeypatch.setattr(runtime.runtime_protection, "finish", original_finish)
+        replayed = owner.terminate_acquisition_session(quest_ref)
+        assert replayed == committed
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT status, boundary, checkpoint_ref FROM "
+                    "ar_execution_responsibilities WHERE root_run_ref = "
+                    ":session_ref AND operation_ref = :request_id"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                },
+            ).one()
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "checkpoint"
+        assert responsibility.checkpoint_ref is not None
+        assert inhibitor.live_holders == set()
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_acquisition_request_reconcile_replays_lost_finish_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "acquisition-reconcile-finish-ack"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+        startup_power_probe=False,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="acquisition-reconcile-finish-ack",
+        )
+        quest_ref = "quest_acquisition_reconcile_finish_ack"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="acquisition-reconcile-finish-ack-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:reconcile-finish-ack",
+                    title="A terminal request reconciled after a lost finish ACK",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+        original_finish = runtime.runtime_protection.finish
+
+        def lose_finish_ack(*_args, **_kwargs) -> None:
+            raise RuntimeProtectionUnavailable(
+                "simulated_acquisition_finish_ack_loss"
+            )
+
+        monkeypatch.setattr(runtime.runtime_protection, "finish", lose_finish_ack)
+        with pytest.raises(
+            RuntimeProtectionUnavailable,
+            match="simulated_acquisition_finish_ack_loss",
+        ):
+            owner.acquire_literature(session_ref, request, provider)
+        assert inhibitor.live_holders
+        managed = owner.query_managed_run(request.request_id)
+        assert managed is not None and managed["status"] == "running"
+
+        monkeypatch.setattr(runtime.runtime_protection, "finish", original_finish)
+        reconciled = owner.query_acquisition_request(
+            session_ref,
+            request.request_id,
+        )
+        assert reconciled is not None and reconciled.status == "missing"
+        assert len(provider.batches) == 1
+        completed = owner.query_managed_run(request.request_id)
+        assert completed is not None and completed["status"] == "completed"
+        assert inhibitor.live_holders == set()
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_terminal_acquisition_reconcile_replays_predecessor_finish_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RepeatedPendingAcquisitionProvider(pending_reconciliations=0)
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "acquisition-predecessor-finish-ack"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+        startup_power_probe=False,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    owner = runtime.owners.agent_runtime
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="acquisition-predecessor-finish-ack",
+        )
+        quest_ref = "quest_acquisition_predecessor_finish_ack"
+        owner.bind_acquisition_session_to_quest(initialization_id, quest_ref)
+        request = AcquisitionBatchRequest(
+            request_id="acquisition-predecessor-finish-ack-batch",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:predecessor-finish-ack",
+                    title="A terminal reconciliation with a lost predecessor ACK",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        pending = owner.acquire_literature(session_ref, request, provider)
+        assert pending.status == "waiting_user"
+        original_finish = runtime.runtime_protection.finish
+        finish_calls = 0
+
+        def lose_predecessor_finish(*args, **kwargs) -> None:
+            nonlocal finish_calls
+            finish_calls += 1
+            if finish_calls == 2:
+                raise RuntimeProtectionUnavailable(
+                    "simulated_predecessor_finish_ack_loss"
+                )
+            original_finish(*args, **kwargs)
+
+        monkeypatch.setattr(
+            runtime.runtime_protection,
+            "finish",
+            lose_predecessor_finish,
+        )
+        with pytest.raises(
+            RuntimeProtectionUnavailable,
+            match="simulated_predecessor_finish_ack_loss",
+        ):
+            owner.acquire_literature(session_ref, request, provider)
+        monkeypatch.setattr(runtime.runtime_protection, "finish", original_finish)
+
+        reconciled = owner.query_acquisition_request(
+            session_ref,
+            request.request_id,
+        )
+        assert reconciled is not None and reconciled.status == "missing"
+        completed = owner.query_managed_run(request.request_id)
+        assert completed is not None and completed["status"] == "completed"
+        with runtime._database.read() as connection:
+            responsibilities = connection.execute(
+                text(
+                    "SELECT status, boundary FROM "
+                    "ar_execution_responsibilities WHERE root_run_ref = "
+                    ":session_ref AND operation_ref = :request_id ORDER BY "
+                    "created_at"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                },
+            ).all()
+        assert responsibilities == [
+            ("finished", "permanent_fence"),
+            ("finished", "checkpoint"),
+        ]
+        assert inhibitor.live_holders == set()
     finally:
         client.close()
         runtime.close()
@@ -2770,116 +3674,6 @@ def test_deepfetch_requires_a_current_ready_acquisition_session(
         assert (
             request.acquisition_runtime_binding_hash
             == bound_session.runtime_binding_hash
-        )
-    finally:
-        client.close()
-        runtime.close()
-
-
-def test_deepfetch_waits_without_an_automatic_acquisition_human_request(
-    tmp_path: Path,
-) -> None:
-    acquisition_provider = RecordingAcquisitionProvider()
-    deepfetch_provider = AcquisitionWaitingDeepFetchProvider(acquisition_provider)
-    runtime = build_production_runtime(
-        prepare_data_root(tmp_path / "data"),
-        deepfetch_provider=deepfetch_provider,
-        acquisition_provider=acquisition_provider,
-        host_compute_probe=NoCompute(),
-    )
-    deepfetch_provider.agent_runtime = runtime.owners.agent_runtime
-    client, write_headers = _authenticated_client(runtime)
-    try:
-        opened = client.post(
-            "/api/v1/quest-initializations",
-            headers=_write_headers(write_headers, "waiting-open"),
-            json={},
-        ).json()
-        initialization_id = opened["initialization_id"]
-        probed = client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/compute-probe",
-            headers=_write_headers(write_headers, "waiting-compute"),
-            json={"selected_device_uuids": ["GPU-acquisition-1"]},
-        ).json()
-        draft = dict(probed["quest_draft"]["value"])
-        draft.update(
-            {
-                "goal": "核查一个需要机构全文的首问题。",
-                "completion_criteria": "返回可审计的论文账本和全文状态。",
-                "route": "deepfetch",
-                "literature": {
-                    **draft["literature"],
-                    "mode": "oa_then_institution",
-                    "library_entry_url": "https://library.example.edu/resources",
-                },
-            }
-        )
-        saved_response = client.put(
-            f"/api/v1/quest-initializations/{initialization_id}/draft",
-            headers=_write_headers(write_headers, "waiting-draft"),
-            json={
-                "expected_draft_revision": probed["quest_draft"]["revision"],
-                "expected_draft_hash": probed["quest_draft"]["hash"],
-                "draft": draft,
-            },
-        )
-        saved_response.raise_for_status()
-        saved = saved_response.json()
-        prepared_response = client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
-            headers=_write_headers(write_headers, "waiting-preflight"),
-            json={
-                "expected_draft_revision": saved["quest_draft"]["revision"],
-                "expected_draft_hash": saved["quest_draft"]["hash"],
-            },
-        )
-        prepared_response.raise_for_status()
-        session_ref = prepared_response.json()["acquisition_session"]["session_ref"]
-        queued_response = client.post(
-            f"/api/v1/quest-initializations/{initialization_id}/proposal-generations",
-            headers=_write_headers(write_headers, "waiting-start"),
-            json={
-                "expected_draft_revision": saved["quest_draft"]["revision"],
-                "expected_draft_hash": saved["quest_draft"]["hash"],
-            },
-        )
-        assert queued_response.status_code == 202
-        request_ref = queued_response.json()["deepfetch"]["request_ref"]
-
-        assert runtime.deepfetch.process_once() is False
-        waiting = client.get(
-            f"/api/v1/quest-initializations/{initialization_id}"
-        ).json()
-        assert waiting["deepfetch"]["status"] == "queued"
-        assert waiting["deepfetch"]["failure"] is None
-        assert waiting["acquisition_session"]["status"] == "waiting_user"
-        assert waiting["acquisition_session"]["current_request_id"] == (
-            "deepfetch-exact-batch-1"
-        )
-        run = runtime.owners.agent_runtime.query_deepfetch_run(request_ref)
-        assert run is not None
-        assert run.status == "admitted"
-        assert run.native_session_ref == "native-acquisition-recovery-1"
-        assert len(deepfetch_provider.requests) == 1
-
-        # Polling the queued worker while login is pending must not consume the
-        # request, fail Human Collaboration, or repeat the provider side effect.
-        assert runtime.deepfetch.process_once() is False
-        assert len(deepfetch_provider.requests) == 1
-        still_waiting = client.get(
-            f"/api/v1/quest-initializations/{initialization_id}"
-        ).json()
-        assert still_waiting["deepfetch"]["status"] == "queued"
-        assert still_waiting["deepfetch"]["failure"] is None
-
-        collaboration = client.get("/api/v1/snapshot").json()[
-            "human_collaboration"
-        ]
-        assert collaboration["human_requests"]["items"] == []
-        _assert_waiting_without_automatic_human_request(
-            runtime,
-            session_ref=session_ref,
-            request_id="deepfetch-exact-batch-1",
         )
     finally:
         client.close()
