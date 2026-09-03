@@ -54,9 +54,6 @@ def _domain_counts(runtime) -> dict[str, int]:
                 "research_graph_state WHERE singleton = 'owner'"
             )
         ).one()
-        provider_requests = connection.execute(
-            text("SELECT COUNT(*) FROM rg_experiment_requests")
-        ).scalar_one()
     return {
         "baseline": int(row.experiment_baseline_count),
         "variant": int(row.experiment_variant_count),
@@ -66,7 +63,6 @@ def _domain_counts(runtime) -> dict[str, int]:
         "variant_run": int(row.variant_run_count),
         "evaluation_attempt": int(row.evaluation_attempt_count),
         "authority": int(row.target_measurement_domain_authority_count),
-        "provider_request": int(provider_requests),
     }
 
 
@@ -151,7 +147,6 @@ def test_initial_authority_is_restart_safe_idempotent_and_pre_execution(
             "variant_run": 0,
             "evaluation_attempt": 0,
             "authority": 1,
-            "provider_request": 0,
         }
 
         run = runtime.owners.agent_runtime.query_bundle_stage_run(graph.request_ref)

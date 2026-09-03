@@ -38,6 +38,7 @@ from meta_research.owners.common import (
     canonical_hash,
     canonical_json,
 )
+from meta_research.owners.research_graph import SQLiteResearchGraph
 from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.paths import prepare_data_root
 from meta_research.runtime_protection import (
@@ -926,21 +927,13 @@ def _accept_real_target_root_commit(runtime):
     return target, launch.graph_ref
 
 
-def _legacy_target_write_counts(runtime) -> dict[str, int]:
-    tables = (
-        "ar_target_run_admissions",
-        "ar_experiment_runs",
-        "rg_target_run_bindings",
-        "rg_experiment_requests",
-        "rg_target_commits",
-    )
+def _target_commit_count(runtime) -> int:
     with runtime._database.read() as connection:
-        return {
-            table: int(
-                connection.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
-            )
-            for table in tables
-        }
+        return int(
+            connection.execute(
+                text("SELECT COUNT(*) FROM rg_target_commits")
+            ).scalar_one()
+        )
 
 
 def _install_fixture_plan_evidence(
@@ -1539,7 +1532,7 @@ def test_rolling_worker_waits_for_native_commit_without_legacy_execution(
         _confirm_direct_quest(runtime)
         _finish_idea_stage(runtime)
         _finish_plan_stage(runtime)
-        before = _legacy_target_write_counts(runtime)
+        before = _target_commit_count(runtime)
         for _step in range(20):
             runtime.bundle_stage.process_once()
             current = runtime.bundle_stage.query_current()
@@ -1564,7 +1557,7 @@ def test_rolling_worker_waits_for_native_commit_without_legacy_execution(
         assert runtime.owners.advancement_engine.query_bundle_stage_commit(
             request_ref
         ) is None
-        assert _legacy_target_write_counts(runtime) == before
+        assert _target_commit_count(runtime) == before
     finally:
         runtime.close()
 
@@ -2297,7 +2290,7 @@ def test_bundle_cannot_stage_commit_while_native_target_is_pending(
         _confirm_direct_quest(runtime)
         _finish_idea_stage(runtime)
         _finish_plan_stage(runtime)
-        before = _legacy_target_write_counts(runtime)
+        before = _target_commit_count(runtime)
         for _step in range(20):
             runtime.bundle_stage.process_once()
             current = runtime.bundle_stage.query_current()
@@ -2312,7 +2305,7 @@ def test_bundle_cannot_stage_commit_while_native_target_is_pending(
         assert current["run"]["status"] in {"running", "awaiting_acceptance"}
         assert current["target_commits"] == []
         assert current["stage_commit"] is None
-        assert _legacy_target_write_counts(runtime) == before
+        assert _target_commit_count(runtime) == before
     finally:
         runtime.close()
 
@@ -2337,7 +2330,7 @@ def test_legacy_target_commit_is_rejected_before_receipt_or_fence_checks(
         graph = runtime.owners.research_graph.query_target_graph(request_ref)
         assert graph is not None
         target = graph.targets[0]
-        before = _legacy_target_write_counts(runtime)
+        before = _target_commit_count(runtime)
         before_rg = runtime.owners.research_graph.query_snapshot()
         before_feed = runtime.feed.current_revision()
         for fence_ref in ("stale-fence", "apparently-current-fence"):
@@ -2353,7 +2346,7 @@ def test_legacy_target_commit_is_rejected_before_receipt_or_fence_checks(
                     execution_receipt=graph.head_receipt,
                     result_content={"result_disposition": "negative"},
                 )
-        assert _legacy_target_write_counts(runtime) == before
+        assert _target_commit_count(runtime) == before
         assert runtime.owners.research_graph.query_snapshot() == before_rg
         assert runtime.feed.current_revision() == before_feed
         assert runtime.owners.research_graph.query_target_commits(graph.graph_ref) == ()
@@ -2442,7 +2435,7 @@ def test_restart_preserves_native_launch_identity_without_legacy_recovery(
         admitted = runtime.owners.agent_runtime.query_admitted_target_launch(target_ref)
         assert admitted is not None
         target_run_ref = admitted.target_run_ref
-        before = _legacy_target_write_counts(runtime)
+        before = _target_commit_count(runtime)
         assert current["target_commits"] == []
     finally:
         runtime.close()
@@ -2462,51 +2455,11 @@ def test_restart_preserves_native_launch_identity_without_legacy_recovery(
         assert recovered_admission.target_run_ref == target_run_ref
         assert recovered["target_commits"] == []
         assert restarted.owners.research_graph.query_target_commits(graph_ref) == ()
-        assert _legacy_target_write_counts(restarted) == before
+        assert _target_commit_count(restarted) == before
     finally:
         restarted.close()
 
 
-def test_legacy_target_run_binding_is_unconditionally_read_only(
-    tmp_path: Path,
-) -> None:
-    runtime = _bundle_runtime(tmp_path / "bundle-legacy-binding-rejected")
-    try:
-        _confirm_direct_quest(runtime)
-        _finish_idea_stage(runtime)
-        _finish_plan_stage(runtime)
-        for _step in range(12):
-            runtime.bundle_stage.process_once()
-            current = runtime.bundle_stage.query_current()
-            if current["target_graph"]["status"] == "accepted":
-                break
-        else:
-            raise AssertionError("Bundle did not accept its Target graph")
-
-        graph = runtime.owners.research_graph.query_target_graph(
-            current["stage_run_request"]["request_ref"]
-        )
-        assert graph is not None
-        target = graph.targets[0]
-        before = _legacy_target_write_counts(runtime)
-        before_rg = runtime.owners.research_graph.query_snapshot()
-        before_feed = runtime.feed.current_revision()
-        with pytest.raises(
-            OwnerConflict, match="legacy_target_run_binding_write_forbidden"
-        ):
-            runtime.owners.research_graph.bind_target_run(
-                target_ref=target.target_ref,
-                target_run_ref="legacy-target-run",
-                evaluation_attempt_ref="legacy-evaluation-attempt",
-                execution_request_ref=f"bundle-target-{target.target_ref}",
-                definition_hash="0" * 64,
-                admission_receipt=graph.head_receipt,
-            )
-        assert _legacy_target_write_counts(runtime) == before
-        assert runtime.owners.research_graph.query_snapshot() == before_rg
-        assert runtime.feed.current_revision() == before_feed
-        assert runtime.owners.research_graph.query_target_run_binding(
-            target.target_ref
-        ) is None
-    finally:
-        runtime.close()
+def test_legacy_target_run_binding_write_entry_is_absent() -> None:
+    assert not hasattr(SQLiteResearchGraph, "bind_target_run")
+    assert not hasattr(SQLiteResearchGraph, "query_target_run_binding")

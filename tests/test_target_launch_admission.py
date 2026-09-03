@@ -71,16 +71,12 @@ def _side_effect_counts(runtime) -> dict[str, int]:
             for table in (
                 "ar_target_launches",
                 "ar_target_frontier_entries",
-                "ar_target_run_admissions",
-                "ar_experiment_runs",
-                "rg_target_run_bindings",
-                "rg_experiment_requests",
                 "rm_asset_versions",
             )
         }
 
 
-def test_target_launch_admission_precedes_all_experiment_side_effects(
+def test_target_launch_admission_precedes_target_execution_side_effects(
     tmp_path: Path,
 ) -> None:
     runtime = _bundle_runtime(tmp_path / "target-launch-admission")
@@ -142,12 +138,7 @@ def test_target_launch_admission_precedes_all_experiment_side_effects(
         after = _side_effect_counts(runtime)
         assert after["ar_target_launches"] == 1
         assert after["ar_target_frontier_entries"] == 0
-        for table in (
-            "ar_experiment_runs",
-            "rg_experiment_requests",
-            "rm_asset_versions",
-        ):
-            assert after[table] == before[table]
+        assert after["rm_asset_versions"] == before["rm_asset_versions"]
 
         assert runtime.owners.agent_runtime.query_target_frontier_entry(
             target.target_ref
@@ -255,14 +246,7 @@ def test_bundle_worker_admits_exact_launch_then_waits_without_execution(
         admitted = _side_effect_counts(runtime)
         assert admitted["ar_target_launches"] == before["ar_target_launches"] + 1
         assert admitted["ar_target_frontier_entries"] == 0
-        for table in (
-            "ar_target_run_admissions",
-            "ar_experiment_runs",
-            "rg_target_run_bindings",
-            "rg_experiment_requests",
-            "rm_asset_versions",
-        ):
-            assert admitted[table] == before[table]
+        assert admitted["rm_asset_versions"] == before["rm_asset_versions"]
         assert runtime.owners.agent_runtime.query_target_frontier_entry(
             target.target_ref
         ) is None
@@ -534,14 +518,7 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
         assert persisted["direct_waiters"][0]["status"] == "consumed"
         admitted = _side_effect_counts(runtime)
         assert admitted["ar_target_frontier_entries"] == 0
-        for table in (
-            "ar_target_run_admissions",
-            "ar_experiment_runs",
-            "rg_target_run_bindings",
-            "rg_experiment_requests",
-            "rm_asset_versions",
-        ):
-            assert admitted[table] == before[table]
+        assert admitted["rm_asset_versions"] == before["rm_asset_versions"]
         for _step in range(4):
             advanced = runtime.bundle_stage.process_once()
             if runtime.bundle_stage.transient_error == "target_launch_pending":
