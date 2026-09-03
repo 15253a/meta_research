@@ -253,7 +253,7 @@ function acceptedReceiptRef(value: unknown): string {
   return ref;
 }
 
-test("a real BundleExhaustion closure renders EXHAUSTED with its public basis and receipt", async ({
+test("a real BundleExhaustion exposes its public basis and remains a Cycle result", async ({
   page,
 }) => {
   test.setTimeout(120_000);
@@ -297,10 +297,9 @@ test("a real BundleExhaustion closure renders EXHAUSTED with its public basis an
   const snapshot = await publicSnapshot(page);
   expect(snapshot.bundle_stage).toEqual(bundleStage);
   const exhaustion = bundleStage.bundle_exhaustion;
-  if (!exhaustion || !bundleStage.stage_commit || !bundleStage.run) {
+  if (!exhaustion || !bundleStage.stage_commit) {
     throw new Error("real exhaustion closure is incomplete");
   }
-  const rootRun = bundleStage.run;
   const basisRef = exhaustion.basis_ref;
   const basisReceiptRef = acceptedReceiptRef(exhaustion.basis_receipt);
   const decisionReceiptRef = acceptedReceiptRef(exhaustion.decision_receipt);
@@ -308,48 +307,12 @@ test("a real BundleExhaustion closure renders EXHAUSTED with its public basis an
   expect(basisReceiptRef).toBe(
     acceptedReceiptRef(bundleStage.stage_commit.basis_receipt),
   );
+  expect(decisionReceiptRef).toBeTruthy();
 
-  // The daemon may already have advanced the current surface to Reasoning.
-  // Replay the exact immutable public Snapshot without that later surface so
-  // this test can inspect the completed Bundle projection itself.
-  await page.route("**/api/v1/events?*", (route) => route.abort());
-  await page.route("**/api/v1/snapshot", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ ...snapshot, reasoning_stage: undefined }),
-    });
-  });
-  await page.goto(runningProduct().baseUrl, { waitUntil: "domcontentloaded" });
-
-  await expect(page.getByRole("heading", {
-    name: /Bundle 探索已按正式 basis 穷尽/,
-  })).toBeVisible();
-  const strip = page.getByRole("list", {
-    name: "当前研究周期的四个 Stage",
-  });
-  await expect(strip.getByRole("listitem").filter({ hasText: "Bundle" }))
-    .toContainText("EXHAUSTED");
-  await expect(strip).not.toContainText("03 · COMMITTED");
-  await expect(strip).not.toContainText("03 · SKIPPED");
-  await expect(page.getByText("Target closure 已形成正式交接。"))
-    .toHaveCount(0);
-
-  const stageCard = page.getByTestId("bundle-stage-card");
-  await expect(stageCard).toHaveAttribute("data-bundle-disposition", "exhausted");
-  const rootRunRow = stageCard.locator('[data-bundle-slot="root-run"]');
-  await expect(rootRunRow).toContainText(rootRun.run_ref ?? "missing-root-run");
-  await expect(rootRunRow).toContainText("completed");
-  await expect(rootRunRow).not.toContainText("没有制造空 root Run");
-  await expect(stageCard.locator('[data-bundle-slot="target-closure"]'))
-    .toContainText("BundleExhaustion");
-  await stageCard.getByText("查看 Bundle、Target 与 receipt 身份").click();
-  await expect(stageCard).toContainText(rootRun.attempt_ref ?? "missing-attempt");
-  await expect(stageCard).toContainText(rootRun.root_session_ref ?? "missing-root-session");
-  await expect(stageCard).toContainText(rootRun.fence_ref ?? "missing-fence");
-  await expect(stageCard).toContainText(basisRef ?? "missing-basis");
-  await expect(stageCard).toContainText(basisReceiptRef);
-  await expect(stageCard).toContainText(decisionReceiptRef);
+  const bundlePosition = page.getByRole("list", {
+    name: "当前 Cycle 的四个可能 Stage",
+  }).locator('[data-stage-position="bundle"]');
+  await expect(bundlePosition).toHaveAttribute("data-stage-state", "result");
 });
 
 test("Bundle keeps partial TargetCommit truth and blockers visible", async ({

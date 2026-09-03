@@ -18,6 +18,7 @@ from meta_research.bundle_skill import (
     BundleSkillUnavailable,
     BundleTargetBatchRequest,
     BundleTargetBatchResult,
+    bind_bundle_runtime_to_full_conformance,
 )
 from meta_research.bundle_stage import _public_target_graph_rejection
 from meta_research.bundle_target_contract import (
@@ -44,6 +45,9 @@ from meta_research.paths import prepare_data_root
 from meta_research.runtime_protection import (
     InhibitorLease,
     RuntimeProtectionUnavailable,
+)
+from meta_research.semantic_owner_gateway import (
+    BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
 )
 from meta_research.target_run_finalizer import (
     SQLiteTargetRootCompletionMemoryAuthority,
@@ -344,15 +348,34 @@ def _formal_target_plan(
 
 
 class _DeterministicBundleSkill:
+    def bind_full_conformance_authority(self, authority) -> None:
+        self._full_conformance_authority = authority
+
     def runtime_binding(self) -> BundleRuntimeBinding:
-        return BundleRuntimeBinding(
+        authority = getattr(self, "_full_conformance_authority", None)
+        binding = BundleRuntimeBinding(
             packaged_skill_bundle_hash=canonical_hash({"skill": "bundle-public"}),
             instruction_set_hash=canonical_hash({"instructions": "bundle-public"}),
             model_ref="test-model-v1",
-            harness_adapter_ref="test-deterministic-v1",
+            harness_adapter_ref=(
+                "codex-cli/test-operation-bound"
+                if authority is not None
+                else "test-deterministic-v1"
+            ),
             mcp_bindings=(),
             capability_bindings=(),
             resource_bindings=(),
+        )
+        if authority is None:
+            return binding
+        return bind_bundle_runtime_to_full_conformance(
+            binding,
+            authority.require_operation_binding(
+                harness_family="codex",
+                required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+                required_capabilities=("semantic_mcp",),
+            ),
+            required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
         )
 
     def _target_plan(self, request: BundleSkillRequest) -> dict[str, object]:
@@ -396,8 +419,8 @@ class _DeterministicBundleSkill:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="bundle-child-reviewer-1",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
 
@@ -436,15 +459,6 @@ class _DeterministicBundleSkill:
             native_session_ref=request.native_session_ref,
             adapter_kind="test_deterministic",
         )
-
-
-class _CountingBundleSkill(_DeterministicBundleSkill):
-    def __init__(self) -> None:
-        self.generate_calls = 0
-
-    def generate_draft(self, request: BundleSkillRequest) -> BundleSkillDraft:
-        self.generate_calls += 1
-        return super().generate_draft(request)
 
 
 class _TwoTargetBundleSkill(_DeterministicBundleSkill):
@@ -793,9 +807,12 @@ def _bundle_runtime(
     if harness_ready and runtime.harnesses.query_status()["status"] != "ready":
         runtime.harnesses.start_full_conformance(_full_request())
         for _turn in range(4):
+            if runtime.harnesses.query_status()["status"] == "ready":
+                break
             assert runtime.harnesses.advance_full_conformance(
-                mcp_base_url="http://127.0.0.1:8765"
+                mcp_base_url="http://127.0.0.1:0"
             )
+        assert runtime.harnesses.query_status()["status"] == "ready"
     return runtime
 
 
@@ -1004,13 +1021,35 @@ def _prepare_bundle_request(runtime) -> None:
     assert runtime.bundle_stage.query_current()["stage_run_request"] is not None
 
 
-def test_bundle_admission_rejects_unavailable_and_legacy_partial_harness(
+def _assert_public_bundle_execution(current: dict[str, object]) -> dict[str, object]:
+    run = current["run"]
+    assert isinstance(run, dict)
+    assert run["status"] == "awaiting_acceptance"
+    assert run["primary_draft_checkpoint"]["status"] == "recorded"
+    assert run["provider_operations"]["primary"]["status"] == "completed"
+    assert run["provider_operations"]["review"]["status"] == "prepared"
+    assert run["attempt_execution_receipt"]["status"] == "accepted"
+    assert current["target_graph"]["status"] == "not_attempted"
+    assert current["stage_commit"] is None
+    return run
+
+
+def _advance_to_public_bundle_execution(runtime) -> dict[str, object]:
+    for _step in range(3):
+        current = runtime.bundle_stage.query_current()
+        run = current["run"]
+        if isinstance(run, dict) and run["attempt_execution_receipt"] is not None:
+            return _assert_public_bundle_execution(current)
+        assert runtime.bundle_stage.process_once()
+    return _assert_public_bundle_execution(runtime.bundle_stage.query_current())
+
+
+def test_bundle_admission_uses_operation_binding_without_global_conformance(
     tmp_path: Path,
 ) -> None:
-    provider = _CountingBundleSkill()
     runtime = _bundle_runtime(
         tmp_path / "bundle-harness-unavailable",
-        bundle_skill_provider=provider,
+        bundle_skill_provider=_DeterministicBundleSkill(),
         harness_ready=False,
     )
     try:
@@ -1028,93 +1067,108 @@ def test_bundle_admission_rejects_unavailable_and_legacy_partial_harness(
         runtime.harnesses.execute_probe(
             admission.run.request_ref,
             prompt="Run only the legacy diagnostic subset.",
-            mcp_base_url="http://127.0.0.1:8765",
+            mcp_base_url="http://127.0.0.1:0",
         )
         _prepare_bundle_request(runtime)
 
-        assert not runtime.bundle_stage.process_once()
-        assert provider.generate_calls == 0
-        assert runtime.bundle_stage.transient_error == (
-            "bundle_harness_full_conformance_unavailable"
-        )
-        assert runtime.bundle_stage.query_current()["run"] is None
+        assert runtime.bundle_stage.process_once()
+        admitted = runtime.bundle_stage.query_current()
+        assert admitted["run"]["status"] == "admitted"
+        assert admitted["run"]["attempt_execution_receipt"] is None
+        _advance_to_public_bundle_execution(runtime)
+        assert runtime.bundle_stage.transient_error is None
     finally:
         runtime.close()
 
 
-def test_bundle_admission_rejects_partial_full_conformance_without_side_effect(
+def test_partial_global_conformance_does_not_gate_bundle_operation_binding(
     tmp_path: Path,
 ) -> None:
-    provider = _CountingBundleSkill()
     runtime = _bundle_runtime(
         tmp_path / "bundle-harness-partial",
-        bundle_skill_provider=provider,
+        bundle_skill_provider=_DeterministicBundleSkill(),
         harness_ready=False,
     )
     try:
         runtime.harnesses.start_full_conformance(_full_request())
         assert runtime.harnesses.advance_full_conformance(
-            mcp_base_url="http://127.0.0.1:8765"
+            mcp_base_url="http://127.0.0.1:0"
         )
         _prepare_bundle_request(runtime)
 
-        assert not runtime.bundle_stage.process_once()
-        assert provider.generate_calls == 0
-        assert runtime.bundle_stage.query_current()["run"] is None
+        assert runtime.bundle_stage.process_once()
+        admitted = runtime.bundle_stage.query_current()
+        assert admitted["run"]["status"] == "admitted"
+        assert admitted["run"]["attempt_execution_receipt"] is None
+        _advance_to_public_bundle_execution(runtime)
+        assert runtime.bundle_stage.transient_error is None
     finally:
         runtime.close()
 
 
-def test_bundle_freezes_ready_harness_receipts_and_rejects_current_set_drift(
+def test_bundle_freezes_operation_binding_independently_of_global_conformance(
     tmp_path: Path,
 ) -> None:
-    provider = _CountingBundleSkill()
     runtime = _bundle_runtime(
-        tmp_path / "bundle-harness-drift", bundle_skill_provider=provider
+        tmp_path / "bundle-harness-drift",
+        bundle_skill_provider=_DeterministicBundleSkill(),
     )
     try:
         _prepare_bundle_request(runtime)
         assert runtime.bundle_stage.process_once()
-        run = runtime.owners.agent_runtime.query_bundle_stage_run(
-            runtime.bundle_stage.query_current()["stage_run_request"]["request_ref"]
+        admitted = runtime.bundle_stage.query_current()
+        binding = admitted["run"]["runtime_binding"]
+        assert binding["capability_bindings"] == [
+            "harness-operation-binding-v1",
+            "semantic-mcp-resident",
+        ]
+        assert len(binding["mcp_bindings"]) == 2
+        assert len(binding["resource_bindings"]) == 2
+        assert all(
+            item.startswith("harness-artifact:operation-binding-")
+            for item in binding["resource_bindings"]
         )
-        assert run is not None
-        assert "harness-full-conformance-v1" in (
-            run.runtime_binding.capability_bindings
-        )
-        assert len(run.runtime_binding.mcp_bindings) == 2
-        assert len(
-            [
-                item
-                for item in run.runtime_binding.resource_bindings
-                if item.startswith("harness-artifact:full-conformance-")
-            ]
-        ) == 4
+        frozen_binding = binding
 
         runtime.harnesses.start_full_conformance(_full_request())
-        assert not runtime.bundle_stage.process_once()
-        assert provider.generate_calls == 0
-        for _turn in range(4):
-            assert runtime.harnesses.advance_full_conformance(
-                mcp_base_url="http://127.0.0.1:8765"
+        executed = _advance_to_public_bundle_execution(runtime)
+        execution_identity = {
+            key: executed[key]
+            for key in (
+                "run_ref",
+                "attempt_ref",
+                "submission_ref",
+                "attempt_execution_receipt",
             )
-        assert not runtime.bundle_stage.process_once()
-        assert provider.generate_calls == 0
-        assert runtime.bundle_stage.transient_error == "bundle_runtime_binding_drift"
+        }
+        for _turn in range(4):
+            if runtime.harnesses.query_status()["status"] == "ready":
+                break
+            assert runtime.harnesses.advance_full_conformance(
+                mcp_base_url="http://127.0.0.1:0"
+            )
+        assert runtime.harnesses.query_status()["status"] == "ready"
+        assert runtime.bundle_stage.process_once()
+        projected = runtime.bundle_stage.query_current()
+        assert {
+            key: projected["run"][key]
+            for key in execution_identity
+        } == execution_identity
+        assert projected["run"]["runtime_binding"] == frozen_binding
+        assert runtime.bundle_stage.transient_error is None
     finally:
         runtime.close()
 
 
 def test_bundle_ready_full_conformance_allows_provider_entry(tmp_path: Path) -> None:
-    provider = _CountingBundleSkill()
     runtime = _bundle_runtime(
-        tmp_path / "bundle-harness-ready", bundle_skill_provider=provider
+        tmp_path / "bundle-harness-ready",
+        bundle_skill_provider=_DeterministicBundleSkill(),
     )
     try:
         _prepare_bundle_request(runtime)
         assert runtime.bundle_stage.process_once()
-        assert runtime.bundle_stage.process_once()
-        assert provider.generate_calls == 1
+        _advance_to_public_bundle_execution(runtime)
     finally:
         runtime.close()
 
@@ -1276,12 +1330,12 @@ def test_bundle_root_run_accepts_a_distinct_target_dag(
         assert run["root_session_ref"].startswith("bundle_session_")
         assert run["native_session_ref"] == "bundle-primary-1"
         assert run["root_session_ref"] != run["native_session_ref"]
-        assert run["review"]["reviewer_agent_ref"] == "bundle-child-reviewer-1"
+        assert run["review"]["review_mode"] == "advisory_unobserved"
+        assert "reviewer_agent_ref" not in run["review"]
         assert target["target_ref"].startswith("target_")
         assert target["target_ref"] not in {
             run["root_session_ref"],
             run["native_session_ref"],
-            run["review"]["reviewer_agent_ref"],
         }
         assert current["target_graph"]["frontier"] == [target["target_ref"]]
         assert current["stage_commit"] is None

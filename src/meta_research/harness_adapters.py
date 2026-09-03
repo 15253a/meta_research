@@ -932,13 +932,17 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
                 "--config",
                 'shell_environment_policy.inherit="none"',
             )
-        capability_profile = root_capability_profile("target")
+        capability_profile = root_capability_profile(
+            invocation.root_kind or "target"
+        )
         argv = [
             self.executable,
             "exec",
             "--skip-git-repo-check",
             "--strict-config",
-            *capability_profile.codex_arguments(),
+            *capability_profile.codex_arguments(
+                entry_path=invocation.entry_path
+            ),
             "--json",
             "--model",
             invocation.model_ref,

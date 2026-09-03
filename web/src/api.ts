@@ -904,7 +904,10 @@ export type IdeaStageProjection = {
     };
     review?: null | {
       status?: string;
-      review_mode?: "harness_child_agent" | "legacy_external_session";
+      review_mode?:
+        | "advisory_unobserved"
+        | "harness_child_agent"
+        | "legacy_external_session";
       reviewer_agent_ref?: string;
       reviewer_session_ref?: string;
       finding_count?: number;

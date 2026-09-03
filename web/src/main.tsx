@@ -819,6 +819,7 @@ function stagePositionState(
   surface: CurrentStageSurface | null,
   foreground: NonNullable<PublicSnapshot["research_control"]["foreground"]>,
   position: StagePosition,
+  skippedByCurrentStage: boolean,
 ): StagePositionState {
   if (!surface) return "unavailable";
   if (foreground.stage.toLowerCase() === position) return "current";
@@ -833,7 +834,8 @@ function stagePositionState(
       ? surface.projection.stage_commit?.disposition
       : undefined;
   if (
-    projection.typed_skip?.status === "skipped"
+    skippedByCurrentStage
+    || projection.typed_skip?.status === "skipped"
     || projection.eligibility.status === "skipped"
     || reason === "no_new_experiment_required"
     || bundleDisposition?.status === "skipped"
@@ -1397,6 +1399,15 @@ function CurrentCycleOverview({ snapshot }: { snapshot: PublicSnapshot }) {
   if (!foreground) return null;
   const question = exactForegroundQuestion(snapshot);
   const surfaces = allStageSurfaces(snapshot);
+  const currentSurface = currentStageSurface(snapshot);
+  const skippedStages = new Set(
+    currentSurface?.kind === "Reasoning"
+      ? currentSurface.projection.stage_run_request?.context_pack
+        ?.upstream_stage_closure
+        ?.filter((item) => item.disposition === "skipped")
+        .map((item) => String(item.stage).toLowerCase())
+      : [],
+  );
   const currentPurpose = stagePositions.find(
     (item) => item.position === foreground.stage.toLowerCase(),
   )?.purpose ?? "继续当前研究";
@@ -1422,7 +1433,12 @@ function CurrentCycleOverview({ snapshot }: { snapshot: PublicSnapshot }) {
       >
         {stagePositions.map(({ kind, position, purpose }) => {
           const surface = surfaces.find((candidate) => candidate.kind === kind) ?? null;
-          const state = stagePositionState(surface, foreground, position);
+          const state = stagePositionState(
+            surface,
+            foreground,
+            position,
+            skippedStages.has(position),
+          );
           return (
             <li
               key={position}

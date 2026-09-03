@@ -269,6 +269,37 @@ def test_codex_adapter_generates_a_schema_checked_proposal_outside_domain_state(
     assert timeout > 0
 
 
+def test_companion_proposal_fork_returns_public_content_without_replacing_root_session(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingRunner(
+        {
+            "proposal_fork_native_session_ref": "proposal-drafter-native-1",
+            "content": QUESTION,
+        },
+        thread_id="companion-native-1",
+    )
+    adapter = CodexCompanionAdapter(
+        tmp_path / "companion",
+        process_runner=runner,
+    )
+
+    result = adapter.draft(
+        ProposalDraftRequest(
+            initialization_id="quest_init_companion_fork",
+            draft_revision=1,
+            draft_hash="f" * 64,
+            draft={"goal": "研究稀有形态", "completion_criteria": "形成证据边界"},
+            companion_native_session_ref="companion-native-1",
+        )
+    )
+
+    assert result.content == QUESTION
+    assert result.adapter_kind == "codex_companion_fork"
+    assert result.companion_native_session_ref == "companion-native-1"
+    assert result.proposal_fork_native_session_ref == "proposal-drafter-native-1"
+
+
 def test_codex_proposal_marks_a_literature_snapshot_as_untrusted_data(
     tmp_path: Path,
 ) -> None:

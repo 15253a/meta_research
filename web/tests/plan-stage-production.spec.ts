@@ -76,11 +76,23 @@ async function createAcceptedQuestThroughWeb(page: Page): Promise<void> {
   });
   await expect(confirmation).toBeEnabled();
   await confirmation.click();
-  await expect(
-    dialog.getByText("Quest 与第一个问题已就绪。", { exact: false }),
-  ).toBeVisible({ timeout: 30_000 });
-  await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
-  await expect(dialog).toBeHidden();
+  await expect.poll(async () => {
+    try {
+      const snapshot = await publicSnapshot(page);
+      return snapshot.question_tree.status === "ready"
+        && snapshot.question_tree.items.length > 0
+        && snapshot.research_control.foreground
+        ? "completed"
+        : "pending";
+    } catch {
+      return "snapshot_unavailable";
+    }
+  }, { timeout: 30_000 }).toBe("completed");
+  if (await dialog.isVisible()) {
+    await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
+  }
+  await page.getByRole("button", { name: "Quest 总览", exact: true }).click();
+  await expect(page.getByTestId("current-cycle-overview")).toBeVisible();
 }
 
 async function publicPlanStage(page: Page): Promise<PlanStageProjection> {
@@ -219,8 +231,7 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
       },
       review: {
         status: "completed",
-        review_mode: "harness_child_agent",
-        reviewer_agent_ref: "chrome-plan-child-reviewer",
+        review_mode: "advisory_unobserved",
       },
     },
     plan_acceptance: {
@@ -278,6 +289,10 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
     formal_plan_ref: committed.plan_acceptance.formal_plan_ref,
     stage_commit_ref: committed.stage_commit?.stage_commit_ref,
   });
+  const transitionedForeground = transitionedSnapshot.research_control.foreground;
+  if (!transitionedForeground) {
+    throw new Error("Bundle transition has no foreground");
+  }
 
   // The main workspace always shows the highest current Stage. Plan remains a
   // complete Snapshot fact while Bundle takes over the current Stage surface.
@@ -285,15 +300,15 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
   const bundleCard = page.getByTestId("bundle-stage-card");
   await expect(bundleCard).toBeVisible();
   await expect(page.getByTestId("current-question-card")).toContainText(
-    "Current StageBundle",
+    transitionedForeground.question_ref,
   );
   const stageStrip = page.getByRole("list", {
-    name: "当前研究周期的四个 Stage",
+    name: "当前 Cycle 的四个可能 Stage",
   });
-  await expect(stageStrip.getByRole("listitem").filter({ hasText: "Plan" }))
-    .toContainText("COMMITTED");
-  await expect(stageStrip.getByRole("listitem").filter({ hasText: "Bundle" }))
-    .toContainText("NOW");
+  await expect(stageStrip.locator('[data-stage-position="plan"]'))
+    .toHaveAttribute("data-stage-state", "result");
+  await expect(stageStrip.locator('[data-stage-position="bundle"]'))
+    .toHaveAttribute("data-stage-state", "current");
 
   const dynamicFacts = [
     committed.stage_run_request?.request_ref,

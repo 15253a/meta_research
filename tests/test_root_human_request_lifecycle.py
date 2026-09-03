@@ -3,13 +3,16 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from meta_research.bundle_skill import bind_bundle_runtime_to_full_conformance
 from meta_research.owners.agent_runtime import BundleRuntimeBinding
+from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.semantic_owner_gateway import (
     BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
 )
 from meta_research.web import create_app
 from test_harness_full_conformance import _full_request
@@ -186,6 +189,82 @@ def _structured(result: dict[str, object]) -> dict[str, object]:
     value = result["structuredContent"]
     assert isinstance(value, dict)
     return value
+
+
+@pytest.mark.parametrize("root_kind", ROOT_AGENT_KINDS)
+def test_each_root_catalog_routes_one_common_human_request_through_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_kind: RootAgentKind,
+) -> None:
+    runtime = _runtime(tmp_path / f"root-human-request-{root_kind}")
+    try:
+        run, _bundle_channel = _bundle_root_channel(runtime)
+        owner = runtime.owners.agent_runtime
+        managed = owner.query_managed_run(run.run_ref)
+        assert managed is not None
+
+        # Per-domain admission is covered by the Root lifecycle tests. This
+        # seam isolates catalog selection from the shared MCP/Owner lifecycle.
+        def verify_scope(**values: object) -> dict[str, object]:
+            assert values["root_kind"] in {None, root_kind}
+            assert values["run_ref"] == run.run_ref
+            assert values["attempt_ref"] == run.attempt_ref
+            assert values["root_session_ref"] == run.root_session_ref
+            assert values["fence_ref"] == run.fence_ref
+            assert values["runtime_binding_hash"] == run.runtime_binding_hash
+            return {
+                "run_kind": root_kind,
+                "quest_ref": managed["quest_ref"],
+                "waiter_ref": f"root_run:{run.run_ref}",
+                "waiter_generation": run.attempt_generation,
+            }
+
+        monkeypatch.setattr(owner, "_verify_root_agent_runtime_scope", verify_scope)
+        channel = runtime.harnesses.issue_resident_mcp_channel(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            root_session_ref=run.root_session_ref,
+            fence_ref=run.fence_ref,
+            capability_binding_hash=run.runtime_binding_hash,
+            operation_ids=ROOT_AGENT_SEMANTIC_OPERATION_IDS[root_kind],
+            root_kind=root_kind,
+            phase="primary",
+            subject_policy="operation_tree",
+        )
+        with TestClient(
+            create_app(runtime, base_url="http://testserver", control_key="control-key")
+        ) as client:
+            headers = _initialized_child(client, channel.connection.token)
+            effect_id = f"{root_kind}-canonical-offline-action"
+            opened = _structured(
+                _tool_call(
+                    client,
+                    headers,
+                    operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                    arguments=_open_arguments(effect_id, "offline_action"),
+                    request_id=10,
+                )
+            )
+            assert opened["operation_binding"]["root_kind"] == root_kind
+            assert opened["task_yield"]["status"] == "yielded"
+            assert opened["receipt"]["kind"] == "human_request_open"
+            persisted = owner.query_human_request(str(opened["request_ref"]))
+            assert persisted is not None
+            assert persisted["open_effect"]["receipt"] == opened["receipt"]
+
+            reconciled = _structured(
+                _tool_call(
+                    client,
+                    headers,
+                    operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
+                    arguments={"effect_id": effect_id},
+                    request_id=11,
+                )
+            )
+            assert reconciled == opened
+    finally:
+        runtime.close()
 
 
 def test_non_root_session_opens_all_kinds_and_reconciles_frozen_effect(

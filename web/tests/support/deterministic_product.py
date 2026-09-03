@@ -6,7 +6,6 @@ import json
 import socket
 import threading
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -15,9 +14,6 @@ import uvicorn
 import meta_research.web as web_module
 from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_ASSESSMENT_SCHEMA,
-    BundleExhaustionReviewTrace,
-    bundle_exhaustion_review_response_document,
-    bundle_exhaustion_review_task_hash,
     bundle_exhaustion_route_fingerprint,
 )
 from meta_research.bundle_protocol import RouteSpec
@@ -25,6 +21,7 @@ from meta_research.bundle_skill import (
     BundleExhaustionSkillResult,
     BundleSkillDraft,
     BundleSkillRequest,
+    bind_bundle_runtime_to_full_conformance,
 )
 from meta_research.bundle_target_contract import (
     build_normalized_completion_contract,
@@ -89,6 +86,9 @@ from meta_research.quest_drafting import (
     ProposalDraftResult,
 )
 from meta_research.runtime_protection import InhibitorLease
+from meta_research.semantic_owner_gateway import (
+    BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+)
 from meta_research.web import create_app
 from meta_research.writing_contract import WritingRuntimeBinding
 from meta_research.writing_delivery import (
@@ -533,8 +533,8 @@ class DeterministicIdeaSkill:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="chrome-idea-child-reviewer",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind="chrome_deterministic_idea",
         )
 
@@ -647,8 +647,8 @@ class ControlledDeterministicReasoningSkill:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="chrome-reasoning-child-reviewer",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
 
@@ -756,8 +756,8 @@ class ControlledAutonomousReasoningSkill:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="chrome-reasoning-autonomous-scope-reviewer",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
 
@@ -812,8 +812,8 @@ class ControlledAutonomousReasoningSkill:
             ),
             primary_session_ref=request.native_session_ref
             or "chrome-reasoning-autonomous-primary-session",
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="chrome-reasoning-autonomous-reviewer",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind="chrome_deterministic_reasoning",
         )
 
@@ -873,8 +873,8 @@ class DeterministicWritingSkill:
                 },
             ),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="chrome-writing-child-reviewer",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             review_task_hash=writing_review_task_hash(request, draft),
             adapter_kind=draft.adapter_kind,
         )
@@ -1113,8 +1113,8 @@ class ControlledDeterministicPlanSkill:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="chrome-plan-child-reviewer",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind="chrome_deterministic_plan",
         )
 
@@ -1126,8 +1126,12 @@ class ControlledDeterministicPlanSkill:
 class DeterministicExhaustionBundleSkill:
     """A fixed-contract exhaustion provider exercised by the Bundle worker."""
 
+    def bind_full_conformance_authority(self, authority) -> None:
+        self._full_conformance_authority = authority
+
     def runtime_binding(self) -> BundleRuntimeBinding:
-        return BundleRuntimeBinding(
+        authority = getattr(self, "_full_conformance_authority", None)
+        binding = BundleRuntimeBinding(
             packaged_skill_bundle_hash=canonical_hash(
                 {"skill": "chrome-production-bundle-exhaustion"}
             ),
@@ -1135,10 +1139,25 @@ class DeterministicExhaustionBundleSkill:
                 {"instructions": "chrome-production-bundle-exhaustion"}
             ),
             model_ref="chrome-test-model",
-            harness_adapter_ref="chrome-deterministic-bundle-exhaustion-v1",
+            harness_adapter_ref=(
+                "codex-cli/chrome-deterministic-bundle-exhaustion-v1"
+                if authority is not None
+                else "chrome-deterministic-bundle-exhaustion-v1"
+            ),
             mcp_bindings=(),
             capability_bindings=(),
             resource_bindings=(),
+        )
+        if authority is None:
+            return binding
+        return bind_bundle_runtime_to_full_conformance(
+            binding,
+            authority.require_operation_binding(
+                harness_family="codex",
+                required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+                required_capabilities=("semantic_mcp",),
+            ),
+            required_operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
         )
 
     def _assessment(self, request: BundleSkillRequest) -> dict[str, object]:
@@ -1218,84 +1237,22 @@ class DeterministicExhaustionBundleSkill:
             output_kind="exhaustion_assessment",
         )
 
-    @staticmethod
-    def _transport_seal(
-        trace: BundleExhaustionReviewTrace,
-        *,
-        runtime_binding_hash: str,
-    ) -> str:
-        return canonical_hash(
-            {
-                "schema_ref": "test/bundle-exhaustion-transport-seal/v1",
-                "runtime_binding_hash": runtime_binding_hash,
-                "trace": trace.unsigned_dict(),
-            }
-        )
-
     def review_draft(
         self,
         request: BundleSkillRequest,
         draft: BundleSkillDraft,
     ) -> BundleExhaustionSkillResult:
         assessment_hash = canonical_hash(draft.draft)
-        reviewer = "chrome-bundle-exhaustion-independent-reviewer"
-        trace = BundleExhaustionReviewTrace(
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            fence_ref=request.fence_ref,
-            primary_session_ref=draft.primary_session_ref,
-            reviewer_agent_ref=reviewer,
-            reviewed_assessment_hash=assessment_hash,
-            review_task_hash=bundle_exhaustion_review_task_hash(
-                reviewed_assessment_hash=assessment_hash,
-                formal_plan_content_hash=canonical_hash(request.plan_document),
-            ),
-            review_response_hash=canonical_hash(
-                bundle_exhaustion_review_response_document(
-                    reviewer_agent_ref=reviewer,
-                    reviewed_assessment_hash=assessment_hash,
-                )
-            ),
-            spawn_event_hash=canonical_hash(
-                {"event": "spawn", "reviewer": reviewer}
-            ),
-            completion_event_hash=canonical_hash(
-                {"event": "completed", "reviewer": reviewer}
-            ),
-            transport_seal="0" * 64,
-        )
-        trace = replace(
-            trace,
-            transport_seal=self._transport_seal(
-                trace,
-                runtime_binding_hash=canonical_hash(
-                    request.runtime_binding.as_dict()
-                ),
-            ),
-        )
         return BundleExhaustionSkillResult(
             reviewed_assessment=draft.draft,
             reviewed_assessment_hash=assessment_hash,
             findings=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=reviewer,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
-            review_trace=trace,
+            review_trace=None,
         )
-
-    def verify_bundle_exhaustion_review_trace(
-        self,
-        trace: BundleExhaustionReviewTrace,
-        *,
-        runtime_binding_hash: str,
-    ) -> None:
-        expected = self._transport_seal(
-            replace(trace, transport_seal="0" * 64),
-            runtime_binding_hash=runtime_binding_hash,
-        )
-        if trace.transport_seal != expected:
-            raise RuntimeError("bundle_exhaustion_review_trace_seal_invalid")
 
     def execute(
         self, request: BundleSkillRequest
@@ -1558,6 +1515,12 @@ async def serve(
         harness_adapters=harness_adapters,
         startup_harness_diagnostics=False,
     )
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2048)
+    port = int(listener.getsockname()[1])
+    base_url = f"http://127.0.0.1:{port}"
     if stage_pipeline == "bundle-exhaustion":
         runtime.harnesses.start_full_conformance(
             FullConformanceRequest(
@@ -1568,8 +1531,10 @@ async def serve(
             )
         )
         for _turn in range(4):
+            if runtime.harnesses.query_status()["status"] == "ready":
+                break
             if not runtime.harnesses.advance_full_conformance(
-                mcp_base_url="http://127.0.0.1:8765"
+                mcp_base_url=base_url
             ):
                 raise RuntimeError(
                     "deterministic Harness full conformance did not advance"
@@ -1587,12 +1552,6 @@ async def serve(
     if legacy_state is not None:
         seed_legacy_current(human_collaboration, legacy_state)
 
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(2048)
-    port = int(listener.getsockname()[1])
-    base_url = f"http://127.0.0.1:{port}"
     original_files = web_module.files
     if web_root is not None:
         resolved_web_root = web_root.resolve()

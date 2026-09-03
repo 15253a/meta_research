@@ -17,26 +17,30 @@ from meta_research.bundle_protocol import (
 )
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
-from meta_research.harness import HarnessAdmissionError
-from meta_research.harness_adapters import HarnessSupervisorTransport
+from meta_research.harness import HarnessAdmissionError, HarnessRuntime
+from meta_research.harness_adapters import (
+    CodexHarnessAdapter,
+    HarnessSupervisorTransport,
+)
 from meta_research.migration import upgrade_database
 from meta_research.owners.agent_runtime_harness import (
     AgentRuntimeHarnessError,
     SQLiteAgentRuntimeHarness,
 )
 from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.target_raw_output import TargetRawOutputStore
 from meta_research.target_run_runtime_contract import TargetCompletionHandoff
 from meta_research.web import create_app
 
 
-def _target_scope() -> dict[str, object]:
+def _target_scope(suffix: str = "observed") -> dict[str, object]:
     return {
         "schema_ref": "meta-research/target-root-observation-scope/v1",
-        "target_run_ref": "target-run-observed",
-        "attempt_ref": "target-attempt-observed",
+        "target_run_ref": f"target-run-{suffix}",
+        "attempt_ref": f"target-attempt-{suffix}",
         "attempt_generation": 2,
-        "root_session_ref": "target-root-session-observed",
-        "fence_ref": "target-fence-observed",
+        "root_session_ref": f"target-root-session-{suffix}",
+        "fence_ref": f"target-fence-{suffix}",
         "native_session_ref": None,
     }
 
@@ -81,13 +85,40 @@ def _event(
     }
 
 
-def _seed_running_target_harness(path: Path) -> None:
+def _seed_running_target_harness(
+    path: Path,
+    *,
+    admitted_target: bool = False,
+    suffix: str = "observed",
+) -> None:
+    target_ref = f"target-{suffix}"
+    target_run_ref = f"target-run-{suffix}"
+    operation_ref = f"target-provider-operation-{suffix}"
     request = {
-        "request_ref": "target-harness-request-observed",
+        "request_ref": f"target-harness-request-{suffix}",
         "harness_family": "codex",
-        "model_ref": "gpt-observed",
-        "auth_profile_ref": "harness-profile:observed",
+        "model_ref": f"gpt-{suffix}",
+        "auth_profile_ref": f"harness-profile:{suffix}",
     }
+    full_conformance_binding: dict[str, object] = {}
+    full_conformance_binding_hash = (
+        canonical_hash(full_conformance_binding) if admitted_target else "c" * 64
+    )
+    target_scope_binding_hash = (
+        canonical_hash(_target_scope(suffix))
+        if admitted_target
+        else "d" * 64
+    )
+    if admitted_target:
+        request.update(
+            {
+                "target_ref": target_ref,
+                "target_run_ref": target_run_ref,
+                "full_conformance_binding": full_conformance_binding,
+                "full_conformance_binding_hash": full_conformance_binding_hash,
+                "target_scope_binding_hash": target_scope_binding_hash,
+            }
+        )
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute(
@@ -102,13 +133,13 @@ def _seed_running_target_harness(path: Path) -> None:
             "1.0, 1.0, NULL)",
             (
                 request["request_ref"],
-                "target-harness-observed",
+                f"target-harness-{suffix}",
                 canonical_json(request),
                 canonical_hash(request),
-                "target-run-observed",
-                "target-attempt-observed",
-                "target-root-session-observed",
-                "target-fence-observed",
+                target_run_ref,
+                f"target-attempt-{suffix}",
+                f"target-root-session-{suffix}",
+                f"target-fence-{suffix}",
                 request["model_ref"],
                 request["auth_profile_ref"],
                 "a" * 64,
@@ -117,9 +148,8 @@ def _seed_running_target_harness(path: Path) -> None:
         connection.execute(
             "INSERT INTO ar_harness_provider_operations (operation_ref, run_ref, "
             "generation, invocation_hash, status, outcome_code, created_at, "
-            "completed_at) VALUES ('target-provider-operation-observed', "
-            "'target-run-observed', 4, ?, 'running', NULL, 1.0, NULL)",
-            ("b" * 64,),
+            "completed_at) VALUES (?, ?, 4, ?, 'running', NULL, 1.0, NULL)",
+            (operation_ref, target_run_ref, canonical_hash(suffix)),
         )
         connection.execute(
             "INSERT INTO ar_target_harness_admissions (target_run_ref, "
@@ -127,17 +157,83 @@ def _seed_running_target_harness(path: Path) -> None:
             "auth_profile_ref, full_conformance_binding_json, "
             "full_conformance_binding_hash, target_scope_binding_hash, "
             "idempotency_key, request_hash, admitted_at) VALUES "
-            "('target-run-observed', 'target-observed', ?, 'codex', ?, ?, '{}', "
-            "?, ?, 'target-admission-observed', ?, 1.0)",
+            "(?, ?, ?, 'codex', ?, ?, '{}', ?, ?, ?, ?, 1.0)",
             (
+                target_run_ref,
+                target_ref,
                 request["request_ref"],
                 request["model_ref"],
                 request["auth_profile_ref"],
-                "c" * 64,
-                "d" * 64,
-                "e" * 64,
+                full_conformance_binding_hash,
+                target_scope_binding_hash,
+                f"target-admission-{suffix}",
+                canonical_hash({"target-admission": suffix}),
             ),
         )
+        if admitted_target:
+            empty_projection = canonical_json([])
+            empty_projection_hash = canonical_hash([])
+            connection.execute(
+                "INSERT INTO ar_target_launches (launch_ref, operation_ref, "
+                "target_ref, graph_ref, stage_request_ref, quest_ref, "
+                "target_spec_content_hash_ref, target_spec_receipt_ref, "
+                "target_spec_receipt_subject_ref, "
+                "accepted_input_target_commit_refs_json, "
+                "accepted_input_target_commit_refs_hash, "
+                "accepted_input_asset_refs_json, accepted_input_asset_refs_hash, "
+                "accepted_input_asset_proofs_json, "
+                "accepted_input_asset_proofs_hash, recoverable_required, "
+                "target_run_ref, status, dispatch_decision_ref, "
+                "dispatch_receipt_ref, dispatch_receipt_hash, idempotency_key, "
+                "request_hash, receipt_ref, receipt_hash, admitted_at) VALUES "
+                "(:launch_ref, :operation_ref, :target_ref, :graph_ref, "
+                ":stage_request_ref, :quest_ref, :target_spec_content_hash_ref, "
+                ":target_spec_receipt_ref, :target_spec_receipt_subject_ref, "
+                ":accepted_input_target_commit_refs_json, "
+                ":accepted_input_target_commit_refs_hash, "
+                ":accepted_input_asset_refs_json, "
+                ":accepted_input_asset_refs_hash, "
+                ":accepted_input_asset_proofs_json, "
+                ":accepted_input_asset_proofs_hash, 1, :target_run_ref, "
+                "'admitted', :dispatch_decision_ref, :dispatch_receipt_ref, "
+                ":dispatch_receipt_hash, :idempotency_key, :request_hash, "
+                ":receipt_ref, :receipt_hash, 1.0)",
+                {
+                    "launch_ref": f"target-launch-{suffix}",
+                    "operation_ref": f"target-launch-operation-{suffix}",
+                    "target_ref": target_ref,
+                    "graph_ref": f"target-graph-{suffix}",
+                    "stage_request_ref": f"stage-request-{suffix}",
+                    "quest_ref": f"quest-{suffix}",
+                    "target_spec_content_hash_ref": f"target-spec-{suffix}",
+                    "target_spec_receipt_ref": (
+                        f"target-spec-receipt-{suffix}"
+                    ),
+                    "target_spec_receipt_subject_ref": target_ref,
+                    "accepted_input_target_commit_refs_json": empty_projection,
+                    "accepted_input_target_commit_refs_hash": (
+                        empty_projection_hash
+                    ),
+                    "accepted_input_asset_refs_json": empty_projection,
+                    "accepted_input_asset_refs_hash": empty_projection_hash,
+                    "accepted_input_asset_proofs_json": empty_projection,
+                    "accepted_input_asset_proofs_hash": empty_projection_hash,
+                    "target_run_ref": target_run_ref,
+                    "dispatch_decision_ref": f"dispatch-{suffix}",
+                    "dispatch_receipt_ref": f"dispatch-receipt-{suffix}",
+                    "dispatch_receipt_hash": canonical_hash(
+                        {"dispatch": suffix}
+                    ),
+                    "idempotency_key": f"target-launch-{suffix}",
+                    "request_hash": canonical_hash(
+                        {"target-launch": suffix}
+                    ),
+                    "receipt_ref": f"target-launch-receipt-{suffix}",
+                    "receipt_hash": canonical_hash(
+                        {"target-launch-receipt": suffix}
+                    ),
+                },
+            )
         connection.commit()
 
 
@@ -149,6 +245,36 @@ def _authenticated_client(runtime) -> TestClient:
     )
     client.cookies.set("meta_research_session", "test-session")
     return client
+
+
+def _raw_output_harness(
+    owner: SQLiteAgentRuntimeHarness,
+    transport: HarnessSupervisorTransport,
+    store: TargetRawOutputStore,
+    workspace: Path,
+) -> HarnessRuntime:
+    class _RawOutputGateway:
+        @staticmethod
+        def required_bindings(
+            _operation_ids: tuple[str, ...],
+        ) -> tuple[dict[str, object], ...]:
+            return ()
+
+        @staticmethod
+        def query_status() -> dict[str, object]:
+            return {"catalog_hash": "a" * 64}
+
+    adapter = CodexHarnessAdapter(
+        workspace / "adapter",
+        executable=sys.executable,
+        runner=transport,
+    )
+    return HarnessRuntime(
+        owner,
+        _RawOutputGateway(),
+        (adapter,),
+        target_raw_output_store=store,
+    )
 
 
 def test_target_root_events_append_live_page_and_complete_exact_replay(
@@ -584,4 +710,207 @@ def test_long_target_root_output_emits_gaps_and_keeps_web_cursor_advancing(
         assert "visible-secret" not in json.dumps(pointer_payloads)
     finally:
         client.close()
+        database.close()
+
+
+def test_authenticated_target_raw_output_keeps_two_streams_isolated_across_reconnect(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "target-raw-output-web.sqlite3"
+    upgrade_database(path)
+    database = Database(path)
+    feed = DurableFeed(database)
+    owner = SQLiteAgentRuntimeHarness(database, feed)
+    outputs = {
+        "observed": "alpha-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "alternate": "omega-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    }
+    native_sessions = {
+        "observed": "native-target-root-observed",
+        "alternate": "native-target-root-alternate",
+    }
+    for suffix in outputs:
+        _seed_running_target_harness(
+            path,
+            admitted_target=True,
+            suffix=suffix,
+        )
+    transport_root = tmp_path / "target-raw-output-transport"
+    store = TargetRawOutputStore(transport_root)
+    transport = HarnessSupervisorTransport(
+        transport_root,
+        event_sink=owner.append_target_root_events,
+        raw_output_store=store,
+    )
+    provider = tmp_path / "target-raw-output-provider.py"
+    provider.write_text(
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "native_session_ref, command_ref, output = sys.argv[1:]\n"
+        "print(json.dumps({'type':'thread.started',"
+        "'thread_id':native_session_ref}), flush=True)\n"
+        "print(json.dumps({'type':'item.completed','item':{"
+        "'type':'command_execution','id':command_ref,'exit_code':0,"
+        "'output':output}}), flush=True)\n"
+        "print(json.dumps({'type':'turn.completed',"
+        "'thread_id':native_session_ref}), flush=True)\n",
+        encoding="utf-8",
+    )
+    configurable = SimpleNamespace(
+        configure_resident_mcp_endpoint=lambda _base_url: None
+    )
+    harness = _raw_output_harness(owner, transport, store, tmp_path)
+    runtime = SimpleNamespace(
+        configure_resident_mcp_endpoint=lambda _base_url: None,
+        bundle_stage=configurable,
+        reasoning_stage=configurable,
+        target_run_runtime=configurable,
+        harnesses=harness,
+        authentication=SimpleNamespace(
+            session_is_valid=lambda token: token == "test-session",
+            control_key_matches=lambda supplied, expected: supplied == expected,
+        ),
+    )
+
+    def owner_state() -> tuple[tuple[object | None, object | None], ...]:
+        return tuple(
+            (
+                owner.query_target_run_by_ref(f"target-run-{suffix}"),
+                owner.latest_operation(f"target-run-{suffix}"),
+            )
+            for suffix in outputs
+        )
+
+    def read_pages(
+        client: TestClient,
+        suffix: str,
+    ) -> tuple[str, list[dict[str, object]]]:
+        pages: list[dict[str, object]] = []
+        output = ""
+        after = 0
+        while True:
+            response = client.get(
+                f"/api/v1/bundle/targets/target-{suffix}/raw-output",
+                params={"after": after, "limit": 32},
+            )
+            assert response.status_code == 200, response.text
+            page = response.json()
+            pages.append(page)
+            assert page["offset"] == after
+            assert 0 < len(page["text"].encode("utf-8")) <= 32
+            assert page["next_offset"] > after
+            output += page["text"]
+            if not page["has_more"]:
+                break
+            after = page["next_offset"]
+        return output, pages
+
+    try:
+        for suffix, output in outputs.items():
+            completed = transport(
+                [
+                    sys.executable,
+                    str(provider),
+                    native_sessions[suffix],
+                    f"command-{suffix}",
+                    output,
+                ],
+                f"emit exact paginated Target output for {suffix}",
+                10.0,
+                {
+                    "META_RESEARCH_MCP_TOKEN": "private-transport-token",
+                    "META_RESEARCH_HARNESS_FAMILY": "codex",
+                    "META_RESEARCH_HARNESS_WORKSPACE": str(tmp_path),
+                    "META_RESEARCH_PROVIDER_OPERATION_REF": (
+                        f"target-provider-operation-{suffix}"
+                    ),
+                    "META_RESEARCH_HARNESS_EVIDENCE_SCOPE_REF": "a" * 64,
+                    "META_RESEARCH_HARNESS_OBSERVATION_SCOPE": canonical_json(
+                        _target_scope(suffix)
+                    ),
+                },
+            )
+            assert completed.returncode == 0
+
+        public_revision_before = feed.current_revision()
+        owner_state_before = owner_state()
+        assert all(
+            run is not None and operation is not None
+            for run, operation in owner_state_before
+        )
+
+        first_client = _authenticated_client(runtime)
+        try:
+            observed_output, observed_pages = read_pages(
+                first_client, "observed"
+            )
+            alternate_output, alternate_pages = read_pages(
+                first_client, "alternate"
+            )
+        finally:
+            first_client.close()
+
+        assert observed_output == outputs["observed"]
+        assert alternate_output == outputs["alternate"]
+        assert len(observed_pages) > 1
+        assert len(alternate_pages) > 1
+        for suffix, pages in (
+            ("observed", observed_pages),
+            ("alternate", alternate_pages),
+        ):
+            expected_identity = {
+                "target_ref": f"target-{suffix}",
+                "target_run_ref": f"target-run-{suffix}",
+                "attempt_ref": f"target-attempt-{suffix}",
+                "attempt_generation": 2,
+                "root_session_ref": f"target-root-session-{suffix}",
+                "native_session_ref": native_sessions[suffix],
+                "root_native_session_ref": native_sessions[suffix],
+                "fence_ref": f"target-fence-{suffix}",
+                "operation_ref": f"target-provider-operation-{suffix}",
+                "operation_generation": 4,
+            }
+            assert all(
+                page["schema_ref"]
+                == "meta-research/target-raw-output-page/v1"
+                for page in pages
+            )
+            assert all(
+                all(page[key] == value for key, value in expected_identity.items())
+                for page in pages
+            )
+            assert all(page["exact"] is True for page in pages)
+            assert all(page["unredacted"] is True for page in pages)
+            assert pages[-1]["source_caught_up"] is True
+        assert (
+            observed_pages[0]["transport_invocation_hash"]
+            != alternate_pages[0]["transport_invocation_hash"]
+        )
+        assert (
+            observed_pages[0]["stream_ref"]
+            != alternate_pages[0]["stream_ref"]
+        )
+        assert feed.current_revision() == public_revision_before
+        assert owner_state() == owner_state_before
+
+        reconnected_client = _authenticated_client(runtime)
+        try:
+            reconnected_output, reconnected_pages = read_pages(
+                reconnected_client, "observed"
+            )
+        finally:
+            reconnected_client.close()
+
+        assert reconnected_output == outputs["observed"]
+        assert reconnected_pages[0]["target_ref"] == "target-observed"
+        assert reconnected_pages[0]["operation_ref"] == (
+            "target-provider-operation-observed"
+        )
+        assert (
+            reconnected_pages[0]["stream_ref"]
+            == observed_pages[0]["stream_ref"]
+        )
+        assert feed.current_revision() == public_revision_before
+        assert owner_state() == owner_state_before
+    finally:
         database.close()
