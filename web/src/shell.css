@@ -3026,15 +3026,13 @@ a:focus-visible,
 }
 .hc-head h2 { margin: 5px 0 3px; font-family: var(--display); font-size: 23px; }
 .hc-head p {
-  overflow: hidden;
   margin: 0;
   color: var(--ink-muted);
   font-size: 10px;
   line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
-.hc-dialog-library .hc-head p { display: none; }
 .hc-symbol {
   display: grid;
   width: 42px;

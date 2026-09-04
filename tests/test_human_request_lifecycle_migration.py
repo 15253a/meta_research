@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from meta_research.owners.common import canonical_hash, canonical_json
 from test_migration_recovery import _upgrade_to_revision
 
@@ -38,6 +40,7 @@ def _insert_request(
     revision: int,
     status: str,
     is_current: int,
+    kind: str = "offline_action",
     predecessor_request_ref: str | None = None,
 ) -> None:
     target = {"revision": revision}
@@ -49,7 +52,7 @@ def _insert_request(
         "human_request_lineage",
         revision,
         "quest_migration",
-        "offline_action",
+        kind,
         f"obligation-{revision}",
         f"business-purpose-{revision}",
         canonical_json(target),
@@ -310,5 +313,51 @@ def test_0041_preserves_history_and_accepts_operation_lifecycle_facts(
             "SELECT status FROM ar_harness_runs "
             "WHERE run_ref = 'harness_run_migration'"
         ).fetchone() == ("suspended",)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+
+def test_0043_accepts_exact_five_human_request_kinds_on_fresh_head(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "human-request-five-kinds.sqlite3"
+    _upgrade_to_revision(database, "0043_human_request_contract")
+
+    expected_kinds = (
+        "library_reconnect",
+        "external_material_api_access",
+        "offline_action",
+        "capability_authorization",
+        "system_operation_help",
+    )
+    with sqlite3.connect(database) as connection:
+        for revision, kind in enumerate(expected_kinds, start=1):
+            _insert_request(
+                connection,
+                request_ref=f"human_request_kind:r{revision}",
+                revision=revision,
+                status="open",
+                is_current=int(revision == len(expected_kinds)),
+                kind=kind,
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_request(
+                connection,
+                request_ref="human_request_kind:invalid",
+                revision=len(expected_kinds) + 1,
+                status="open",
+                is_current=0,
+                kind="generic_incident",
+            )
+
+        assert tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT kind FROM owner_human_requests ORDER BY revision"
+            )
+        ) == expected_kinds
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0043_human_request_contract",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)

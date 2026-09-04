@@ -372,7 +372,35 @@ const humanRequestPanelByKind: Record<HumanRequestItem["kind"], string> = {
   external_material_api_access: "external-request",
   offline_action: "offline-operation",
   capability_authorization: "permission-request",
+  system_operation_help: "system-operation-help",
 };
+
+const humanRequestPresentedPrefix = "meta_research_human_request_presented:";
+const humanRequestPresentedFallback = new Set<string>();
+
+function humanRequestPresentationKey(request: HumanRequestItem): string {
+  return `${humanRequestPresentedPrefix}${request.request_ref}:${request.revision}`;
+}
+
+function humanRequestWasPresented(request: HumanRequestItem): boolean {
+  const key = humanRequestPresentationKey(request);
+  if (humanRequestPresentedFallback.has(key)) return true;
+  try {
+    return window.sessionStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markHumanRequestPresented(request: HumanRequestItem): void {
+  const key = humanRequestPresentationKey(request);
+  humanRequestPresentedFallback.add(key);
+  try {
+    window.sessionStorage.setItem(key, "1");
+  } catch {
+    // An unavailable session store must not make the request impossible to dismiss.
+  }
+}
 
 function humanRequestKindFromPanel(
   panel: string | null,
@@ -4466,7 +4494,7 @@ function App() {
     () => currentOpenHumanRequests(snapshot),
     [snapshot?.human_collaboration?.human_requests],
   );
-  const humanRequestSurfaceOpen = humanRequestsOpen || currentOpenRequests.length > 0;
+  const humanRequestSurfaceOpen = humanRequestsOpen;
 
   const handleConnection = useCallback((next: boolean) => {
     setConnected(next);
@@ -4610,6 +4638,7 @@ function App() {
       (item) => item.kind === humanRequestRouteKind && item.status === "open",
     ) ?? humanRequests.items.find((item) => item.kind === humanRequestRouteKind);
     if (!selected) return;
+    if (selected.status === "open") markHumanRequestPresented(selected);
     setSelectedHumanRequestRef(selected.request_ref);
     setHumanRequestRouteKind(null);
   }, [humanRequestRouteKind, humanRequestsOpen, snapshot?.human_collaboration?.human_requests]);
@@ -4623,7 +4652,13 @@ function App() {
         (item) => item.request_ref === selectedHumanRequestRef,
       )
     ) return;
-    const nextRequest = currentOpenRequests[0];
+    const selectedHistory = snapshot?.human_collaboration?.human_requests.items.find(
+      (item) => item.request_ref === selectedHumanRequestRef,
+    );
+    const nextRequest = currentOpenRequests.find(
+      (item) => item.request_ref === selectedHistory?.successor_request_ref,
+    ) ?? currentOpenRequests[0];
+    markHumanRequestPresented(nextRequest);
     setSelectedHumanRequestRef(nextRequest.request_ref);
     window.history.replaceState(
       null,
@@ -4635,14 +4670,16 @@ function App() {
     humanRequestRouteKind,
     humanRequestsOpen,
     selectedHumanRequestRef,
+    snapshot?.human_collaboration?.human_requests.items,
   ]);
 
   useEffect(() => {
-    // A current formal request takes the top layer, including a local wait.
-    // Other workflow dialogs remain mounted beneath it so their drafts survive.
     if (humanRequestsOpen) return;
-    const currentRequest = currentOpenRequests[0];
+    const currentRequest = currentOpenRequests.find(
+      (request) => !humanRequestWasPresented(request),
+    );
     if (!currentRequest) return;
+    markHumanRequestPresented(currentRequest);
     prepareHumanRequestReturn();
     setSelectedHumanRequestRef(currentRequest.request_ref);
     setHumanRequestRouteKind(null);
@@ -5095,6 +5132,7 @@ function App() {
     const request = snapshot?.human_collaboration?.human_requests.items.find(
       (item) => item.request_ref === requestRef,
     );
+    if (request?.status === "open") markHumanRequestPresented(request);
     const panel = request ? humanRequestPanelByKind[request.kind] : "human-requests";
     window.history.replaceState(null, "", `/?panel=${panel}`);
     setHumanRequestsOpen(true);
@@ -5109,6 +5147,7 @@ function App() {
       (item) => item.request_ref === requestRef,
     );
     if (request) {
+      if (request.status === "open") markHumanRequestPresented(request);
       window.history.replaceState(
         null,
         "",
@@ -5117,18 +5156,7 @@ function App() {
     }
   };
   const closeHumanRequests = () => {
-    const currentRequest = currentOpenRequests.find(
-      (item) => item.request_ref === selectedHumanRequestRef,
-    ) ?? currentOpenRequests[0];
-    if (currentRequest) {
-      setSelectedHumanRequestRef(currentRequest.request_ref);
-      window.history.replaceState(
-        null,
-        "",
-        `/?panel=${humanRequestPanelByKind[currentRequest.kind]}`,
-      );
-      return;
-    }
+    currentOpenRequests.forEach(markHumanRequestPresented);
     const returnFocus = humanRequestReturnFocusRef.current;
     const returnUrl = humanRequestReturnUrlRef.current ?? "/";
     setHumanRequestsOpen(false);

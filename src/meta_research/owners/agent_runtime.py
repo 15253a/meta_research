@@ -1204,6 +1204,16 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, request_ref: str
     ) -> dict[str, object] | None: ...
 
+    def consume_system_operation_help_waiter(
+        self,
+        request_ref: str,
+        *,
+        waiter_ref: str,
+        generation: int,
+        work_ref: str,
+        work_hash: str,
+    ) -> dict[str, object]: ...
+
     def recover_root_human_requests(self) -> None: ...
 
     def acquire_literature(
@@ -14006,6 +14016,42 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             self._recover_writing_after_human_request(binding)
         return self.query_human_request(request_ref)
 
+    def consume_system_operation_help_waiter(
+        self,
+        request_ref: str,
+        *,
+        waiter_ref: str,
+        generation: int,
+        work_ref: str,
+        work_hash: str,
+    ) -> dict[str, object]:
+        """Bind one successful component retry to its exact released waiter."""
+
+        request = self.query_human_request(request_ref)
+        waiters = None if request is None else request.get("direct_waiters")
+        if (
+            request is None
+            or request.get("issuer") != AR_OWNER
+            or request.get("kind") != "system_operation_help"
+            or request.get("status") != "satisfied"
+            or request.get("successor_request_ref") is not None
+            or not isinstance(waiters, list)
+            or len(waiters) != 1
+            or not isinstance(waiters[0], dict)
+            or waiters[0].get("waiter_ref") != waiter_ref
+            or waiters[0].get("generation") != generation
+        ):
+            raise OwnerConflict("system_operation_help_waiter_invalid")
+        with self._database.write() as connection:
+            return self._consume_human_request_waiter(
+                connection,
+                request_ref=request_ref,
+                waiter_ref=waiter_ref,
+                generation=generation,
+                work_ref=work_ref,
+                work_hash=work_hash,
+            )
+
     def _root_human_request_resume_checkpoint_ready(
         self, operation_binding: dict[str, object]
     ) -> bool:
@@ -14260,14 +14306,26 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 None,
             )
         if kind in {"external_material_api_access", "offline_action"}:
-            resolver = self._research_material_resolver
-            if resolver is None:
-                return None
             prefix = (
                 "material"
                 if kind == "external_material_api_access"
                 else "result"
             )
+            binding_fields = {
+                f"{prefix}_source_ref",
+                f"{prefix}_version_ref",
+                f"{prefix}_content_hash",
+                f"{prefix}_manifest_hash",
+                f"{prefix}_acceptance_receipt_ref",
+            }
+            supplied_binding_fields = binding_fields.intersection(facts)
+            if not supplied_binding_fields:
+                return "human_response_accepted", (), None
+            if supplied_binding_fields != binding_fields:
+                return None
+            resolver = self._research_material_resolver
+            if resolver is None:
+                return None
             version_ref = facts.get(f"{prefix}_version_ref")
             if not isinstance(version_ref, str) or not version_ref:
                 return None
@@ -14294,6 +14352,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ):
                 return None
             return "accepted_asset_binding_verified", (receipt_ref,), None
+        if kind == "system_operation_help" and facts.get("action") == "retry":
+            return "system_operation_retry_requested", (), None
         if kind == "capability_authorization":
             requirement = request.get("required_authorization")
             receipt_ref = facts.get("authorization_receipt_ref")

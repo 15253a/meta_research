@@ -2235,7 +2235,8 @@ export type HumanRequestItem = {
     | "library_reconnect"
     | "external_material_api_access"
     | "offline_action"
-    | "capability_authorization";
+    | "capability_authorization"
+    | "system_operation_help";
   status:
     | "open"
     | "satisfied"
@@ -2264,6 +2265,15 @@ export type HumanRequestResponseBody = {
   decision: "provided" | "declined" | "deferred";
   facts: Record<string, unknown>;
   note: string;
+  linked_local_material?: {
+    source_locator: string;
+  };
+};
+
+export type HumanRequestRetryResult = HumanRequestItem & {
+  retry:
+    | { status: "processing" | "succeeded" }
+    | { status: "failed"; reason: { code: string } };
 };
 
 export type PendingHumanRequestResponse = {
@@ -3147,6 +3157,16 @@ export async function respondToHumanRequest(
   );
 }
 
+export function retryHumanRequest(
+  requestRef: string,
+): Promise<HumanRequestRetryResult> {
+  return writeJson<HumanRequestRetryResult>(
+    `/api/v1/human-requests/${encodeURIComponent(requestRef)}/retry`,
+    "POST",
+    {},
+  );
+}
+
 async function stageHumanRequestResponse(
   requestRef: string,
   response: HumanRequestResponseBody,
@@ -3664,10 +3684,7 @@ async function deliverPendingHumanRequestAssetResponseOnce(
 
 function isCorrectableHumanResponseRejection(error: unknown): boolean {
   return error instanceof ProductError && (
-    error.code === "human_response_secret_forbidden"
-    || error.code === "human_request_secret_forbidden"
-    || error.code === "human_collaboration_secret_forbidden"
-    || error.code === "human_response_decision_invalid"
+    error.code === "human_response_decision_invalid"
     || error.code === "human_response_facts_invalid"
     || error.code === "human_response_facts_too_large"
     || error.code === "human_response_note_invalid"

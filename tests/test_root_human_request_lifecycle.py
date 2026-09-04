@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
 
 from meta_research.bundle_skill import bind_bundle_runtime_to_full_conformance
 from meta_research.owners.agent_runtime import BundleRuntimeBinding
+from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.semantic_owner_gateway import (
@@ -191,6 +194,20 @@ def _structured(result: dict[str, object]) -> dict[str, object]:
     return value
 
 
+def _consistent_snapshot(client: TestClient) -> dict[str, object]:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        response = client.get("/api/v1/snapshot")
+        if response.status_code == 200:
+            return response.json()
+        assert response.status_code == 503, response.json()
+        assert response.json()["detail"]["code"] == (
+            "snapshot_consistency_unavailable"
+        )
+        time.sleep(0.02)
+    raise AssertionError("Snapshot did not reach a consistent revision")
+
+
 @pytest.mark.parametrize("root_kind", ROOT_AGENT_KINDS)
 def test_each_root_catalog_routes_one_common_human_request_through_owner(
     tmp_path: Path,
@@ -283,6 +300,34 @@ def test_non_root_session_opens_all_kinds_and_reconciles_frozen_effect(
             headers = _initialized_child(client, channel.connection.token)
             managed = runtime.owners.agent_runtime.query_managed_run(run.run_ref)
             assert managed is not None
+            guidance = runtime.owners.research_memory.submit_asset_intake(
+                AssetIntakeRequest(
+                    source_kind="text",
+                    custody_mode="managed",
+                    display_name="external-guidance.txt",
+                    media_type="text/plain; charset=utf-8",
+                    content=b"Use the approved external request route.\n",
+                ),
+                idempotency_key="external-human-request-guidance",
+            )
+            assert guidance.asset is not None
+            invalid_guidance_arguments = _open_arguments(
+                "child-invalid-guidance", "external_material_api_access"
+            )
+            invalid_guidance_arguments["condition"]["guidance_asset_ref"] = (
+                "asset_version_missing_guidance"
+            )
+            invalid_guidance = _tool_call(
+                client,
+                headers,
+                operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                arguments=invalid_guidance_arguments,
+                request_id=9,
+            )
+            assert invalid_guidance["isError"] is True
+            assert invalid_guidance["structuredContent"]["code"] == (
+                "root_agent_human_request_guidance_invalid"
+            )
             opened: list[dict[str, object]] = []
             for index, kind in enumerate(
                 (
@@ -290,15 +335,25 @@ def test_non_root_session_opens_all_kinds_and_reconciles_frozen_effect(
                     "external_material_api_access",
                     "offline_action",
                     "capability_authorization",
+                    "system_operation_help",
                 ),
                 10,
             ):
                 effect_id = f"child-{kind}"
+                arguments = _open_arguments(effect_id, kind)
+                if kind == "external_material_api_access":
+                    arguments["obligation"] = "  Apply for the exact dataset.  "
+                    arguments["business_purpose"] = (
+                        "\nResume the current material acquisition unchanged.\n"
+                    )
+                    arguments["condition"]["guidance_asset_ref"] = (
+                        guidance.asset.version_ref
+                    )
                 result = _tool_call(
                     client,
                     headers,
                     operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
-                    arguments=_open_arguments(effect_id, kind),
+                    arguments=arguments,
                     request_id=index,
                 )
                 value = _structured(result)
@@ -332,6 +387,11 @@ def test_non_root_session_opens_all_kinds_and_reconciles_frozen_effect(
                 )
                 assert request is not None
                 assert request["kind"] == kind
+                assert request["obligation"] == arguments["obligation"]
+                assert request["business_purpose"] == arguments["business_purpose"]
+                assert request["target_assertion"]["condition"] == arguments[
+                    "condition"
+                ]
                 assert request["open_effect"]["receipt"] == receipt
                 assert request["open_effect"]["operation_binding"] == value[
                     "operation_binding"
@@ -408,6 +468,272 @@ def test_non_root_session_opens_all_kinds_and_reconciles_frozen_effect(
             )
         finally:
             client.close()
+    finally:
+        runtime.close()
+
+
+def test_non_root_agent_external_request_round_trips_raw_business_text_and_resumes(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "root-human-request-raw-business-text")
+    try:
+        run, channel = _bundle_root_channel(runtime)
+        app = create_app(
+            runtime,
+            base_url="http://testserver",
+            control_key="control-key",
+        )
+        with TestClient(app, base_url="http://testserver") as client:
+            agent_headers = _initialized_child(client, channel.connection.token)
+            managed_before = runtime.owners.agent_runtime.query_managed_run(
+                run.run_ref
+            )
+            assert managed_before is not None
+            assert managed_before["status"] == "running"
+
+            effect_id = "child-external-raw-business-text"
+            obligation = "  Fetch fixture with token=test-only-token-147.  "
+            business_purpose = (
+                "\nResume this current operation with "
+                "password=test-only-password-147 unchanged.\n"
+            )
+            condition = {
+                "impact": (
+                    "Cookie: test_session=test-only-cookie-147 is literal "
+                    "test data; only this operation waits."
+                ),
+                "safe_response": "Return one natural-language status update.",
+            }
+            opened = _structured(
+                _tool_call(
+                    client,
+                    agent_headers,
+                    operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                    arguments={
+                        "effect_id": effect_id,
+                        "request_kind": "external_material_api_access",
+                        "obligation": obligation,
+                        "business_purpose": business_purpose,
+                        "condition": condition,
+                        "acceptance_conditions": [
+                            "The response addresses this exact current operation."
+                        ],
+                    },
+                    request_id=20,
+                )
+            )
+            request_ref = str(opened["request_ref"])
+            assert opened["operation_binding"]["task_ref"] == run.run_ref
+            assert opened["operation_binding"]["root_session_ref"] == (
+                run.root_session_ref
+            )
+            assert opened["condition"] == {
+                "schema_ref": "meta-research/blocking-human-request-condition/v1",
+                "code": "blocking_human_request",
+                "request_ref": request_ref,
+                "request_kind": "external_material_api_access",
+                "request_status": "open",
+                "waiter_status": "blocked",
+                "resume_requirement": "human_response_required",
+            }
+
+            owner_request = runtime.owners.agent_runtime.query_human_request(
+                request_ref
+            )
+            assert owner_request is not None
+            assert owner_request["obligation"] == obligation
+            assert owner_request["business_purpose"] == business_purpose
+            assert owner_request["target_assertion"]["condition"] == condition
+
+            bootstrap = runtime.authentication.issue_bootstrap_token()
+            authenticated = client.post(
+                "/auth/bootstrap",
+                headers={"Origin": "http://testserver"},
+                json={"token": bootstrap},
+            )
+            assert authenticated.status_code == 200
+            auth_headers = {
+                "Origin": "http://testserver",
+                "X-CSRF-Token": authenticated.json()["csrf_token"],
+            }
+            before_response = _consistent_snapshot(client)
+            snapshot_item = next(
+                item
+                for item in before_response["human_collaboration"]["human_requests"][
+                    "items"
+                ]
+                if item["request_ref"] == request_ref
+            )
+            assert snapshot_item["obligation"] == obligation
+            assert snapshot_item["business_purpose"] == business_purpose
+            assert snapshot_item["target_assertion"]["condition"] == condition
+
+            response_facts = {
+                "operator_report": (
+                    "Provided the test fixture with token=test-only-token-147, "
+                    "password=test-only-password-147, and "
+                    "Cookie: test_session=test-only-cookie-147."
+                )
+            }
+            response_note = "  The requested test fixture is now available.\n"
+            posted = client.post(
+                f"/api/v1/human-requests/{quote(request_ref, safe='')}/responses",
+                headers={
+                    **auth_headers,
+                    "Idempotency-Key": "raw-business-text-response",
+                },
+                json={
+                    "decision": "provided",
+                    "facts": response_facts,
+                    "note": response_note,
+                },
+            )
+            assert posted.status_code == 201, posted.json()
+            response = posted.json()
+            assert response["decision"] == "provided"
+            assert response["facts"] == response_facts
+            assert response["note"] == response_note
+
+            current = runtime.owners.agent_runtime.query_human_request(request_ref)
+            assert current is not None
+            assert current["responses"] == [response]
+            evaluation = current["evaluation"]
+            disposition = current["disposition"]
+            waiter = current["direct_waiters"][0]
+            validation = waiter["resume_validation"]
+            consumption = validation["consumption"]
+            assert evaluation["response_refs"] == [response["response_ref"]]
+            assert evaluation["decision"] == "satisfied"
+            assert evaluation["reason"] == {"code": "human_response_accepted"}
+            assert disposition["evaluation_ref"] == evaluation["evaluation_ref"]
+            assert disposition["decision"] == "satisfied"
+            assert validation["status"] == "released"
+            assert waiter["status"] == "consumed"
+            assert consumption["request_ref"] == request_ref
+            assert consumption["waiter_ref"] == opened["waiter"]["waiter_ref"]
+            assert consumption["generation"] == opened["waiter"]["generation"]
+            assert consumption["work_ref"] == run.run_ref
+
+            after_response = _consistent_snapshot(client)
+            response_item = next(
+                item
+                for item in after_response["human_collaboration"]["human_requests"][
+                    "items"
+                ]
+                if item["request_ref"] == request_ref
+            )
+            assert response_item["responses"] == [response]
+            assert response_item["evaluation"] == evaluation
+            assert response_item["disposition"] == disposition
+            assert response_item["direct_waiters"] == current["direct_waiters"]
+
+            reconciled = _structured(
+                _tool_call(
+                    client,
+                    agent_headers,
+                    operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
+                    arguments={"effect_id": effect_id},
+                    request_id=21,
+                )
+            )
+            assert reconciled["receipt"] == opened["receipt"]
+            assert reconciled["operation_binding"] == opened["operation_binding"]
+            assert reconciled["task_yield"] == opened["task_yield"]
+            assert reconciled["condition"]["request_status"] == "satisfied"
+            assert reconciled["condition"]["waiter_status"] == "consumed"
+            assert reconciled["condition"]["resume_requirement"] == "consumed"
+            assert reconciled["resolution"] == {
+                "response_ref": response["response_ref"],
+                "decision": "provided",
+                "facts": response_facts,
+                "note": response_note,
+                "disposition": "satisfied",
+                "reason_code": "human_response_accepted",
+                "accepted_evidence_refs": [],
+            }
+            managed_after = runtime.owners.agent_runtime.query_managed_run(
+                run.run_ref
+            )
+            assert managed_after is not None
+            assert managed_after["status"] == "running"
+            assert managed_after["root_session_ref"] == run.root_session_ref
+    finally:
+        runtime.close()
+
+
+def test_agent_system_help_repeat_failure_reuses_public_effect_revision(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "root-system-help-repeat-failure")
+    try:
+        run, channel = _bundle_root_channel(runtime)
+        with TestClient(
+            create_app(
+                runtime,
+                base_url="http://testserver",
+                control_key="control-key",
+            )
+        ) as client:
+            headers = _initialized_child(client, channel.connection.token)
+            effect_id = "retry-the-same-failed-operation"
+            opened = _structured(
+                _tool_call(
+                    client,
+                    headers,
+                    operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                    arguments=_open_arguments(effect_id, "system_operation_help"),
+                    request_id=30,
+                )
+            )
+            request_ref = str(opened["request_ref"])
+            runtime.owners.human_collaboration.respond_to_human_request(
+                request_ref,
+                decision="provided",
+                facts={"action": "retry"},
+                note="",
+                idempotency_key="agent-system-help-first-retry",
+            )
+            first = runtime.owners.agent_runtime.query_human_request(request_ref)
+            assert first is not None
+            assert first["status"] == "satisfied"
+            assert first["direct_waiters"][0]["status"] == "consumed"
+
+            repeated_result = _structured(
+                _tool_call(
+                    client,
+                    headers,
+                    operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                    arguments=_open_arguments(
+                        effect_id,
+                        "system_operation_help",
+                        predecessor_request_ref=request_ref,
+                    ),
+                    request_id=31,
+                )
+            )
+            repeated = runtime.owners.agent_runtime.query_human_request(
+                str(repeated_result["request_ref"])
+            )
+            assert repeated is not None
+            assert repeated["request_id"] == first["request_id"]
+            assert repeated["request_ref"] == f"{first['request_id']}:r2"
+            assert repeated["revision"] == 2
+            assert repeated["predecessor_request_ref"] == request_ref
+            assert repeated["open_effect"]["operation_binding"]["task_ref"] == (
+                run.run_ref
+            )
+
+            reconciled = _structured(
+                _tool_call(
+                    client,
+                    headers,
+                    operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
+                    arguments={"effect_id": effect_id},
+                    request_id=32,
+                )
+            )
+            assert reconciled["request_ref"] == repeated["request_ref"]
+            assert reconciled["lineage"]["predecessor_request_ref"] == request_ref
     finally:
         runtime.close()
 

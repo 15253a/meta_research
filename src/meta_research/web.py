@@ -30,7 +30,7 @@ from meta_research.harness import (
     FullConformanceRequest,
     HarnessAdmissionError,
 )
-from meta_research.owners.common import OwnerConflict
+from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.owners.secret_detection import contains_secret
 from meta_research.owners.research_graph import ASSET_ROLE_QUERY_MAX_PAGE_SIZE
 from meta_research.owners.research_memory import (
@@ -456,12 +456,48 @@ class CompanionMessageRequest(BaseModel):
     ) = None
 
 
+class HumanRequestLinkedLocalMaterialRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_locator: str = Field(min_length=1, max_length=16_000)
+
+    def as_owner_request(
+        self,
+        *,
+        request_ref: str,
+        evidence_kind: Literal["external_approval", "offline_result"],
+        asynchronous: bool,
+    ) -> AssetIntakeRequest:
+        request = AssetIntakeRequest(
+            source_kind="local_path",
+            custody_mode="linked_local",
+            display_name=Path(self.source_locator).name or self.source_locator,
+            media_type="application/octet-stream",
+            source_locator=self.source_locator,
+            provenance={
+                "submitted_via": "human_request_response",
+                "human_request_ref": request_ref,
+                "evidence_kind": evidence_kind,
+            },
+            asynchronous=asynchronous,
+        )
+        try:
+            request.validate()
+        except OwnerConflict as error:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": error.code},
+            ) from error
+        return request
+
+
 class HumanRequestResponseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: Literal["provided", "declined", "deferred"]
     facts: dict[str, object] = Field(default_factory=dict)
     note: str = Field(default="", max_length=4000)
+    linked_local_material: HumanRequestLinkedLocalMaterialRequest | None = None
 
 
 class AgentProposalRequest(BaseModel):
@@ -1462,18 +1498,286 @@ def create_app(
         )
 
     @app.post("/api/v1/human-requests/{request_ref}/responses", status_code=201)
-    def respond_to_human_request(
+    async def respond_to_human_request(
         request_ref: str,
         request: Request,
         response: HumanRequestResponseRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.respond_to_human_request(
+        idempotency_key = _idempotency_key(request)
+        material = response.linked_local_material
+        if material is None:
+            return runtime.owners.human_collaboration.respond_to_human_request(
+                request_ref,
+                decision=response.decision,
+                facts=response.facts,
+                note=response.note,
+                idempotency_key=idempotency_key,
+            )
+
+        current = runtime.owners.human_collaboration.query_human_request(request_ref)
+        expected_material = {
+            "external_material_api_access": ("material", "external_approval"),
+            "offline_action": ("result", "offline_result"),
+        }.get(None if current is None else current.get("kind"))
+        if current is None or response.decision != "provided" or expected_material is None:
+            raise OwnerConflict("human_request_material_response_invalid")
+        fact_prefix, evidence_kind = expected_material
+
+        sync_request = material.as_owner_request(
+            request_ref=request_ref,
+            evidence_kind=evidence_kind,
+            asynchronous=False,
+        )
+        intake_key = "human-request-linked:" + canonical_hash(
+            {
+                "request_ref": request_ref,
+                "response_idempotency_key": idempotency_key,
+                "source_locator": material.source_locator,
+                "fact_prefix": fact_prefix,
+            }
+        )
+        facts = {
+            **response.facts,
+            f"{fact_prefix}_path": material.source_locator,
+        }
+        if current.get("status") != "open":
+            responses = current.get("responses")
+            if (
+                not isinstance(responses, list)
+                or not responses
+                or not isinstance(responses[-1], dict)
+                or not isinstance(responses[-1].get("facts"), dict)
+            ):
+                raise OwnerConflict("human_request_material_response_invalid")
+            recorded_facts = responses[-1]["facts"]
+            binding_names = tuple(
+                f"{fact_prefix}_{suffix}"
+                for suffix in (
+                    "source_ref",
+                    "version_ref",
+                    "content_hash",
+                    "manifest_hash",
+                    "acceptance_receipt_ref",
+                )
+            )
+            for name in binding_names:
+                if name in recorded_facts:
+                    facts[name] = recorded_facts[name]
+            recorded = runtime.owners.human_collaboration.respond_to_human_request(
+                request_ref,
+                decision=response.decision,
+                facts=facts,
+                note=response.note,
+                idempotency_key=idempotency_key,
+            )
+            replay_request = (
+                sync_request
+                if all(name in recorded_facts for name in binding_names)
+                else material.as_owner_request(
+                    request_ref=request_ref,
+                    evidence_kind=evidence_kind,
+                    asynchronous=True,
+                )
+            )
+            intake = runtime.owners.research_memory.query_asset_intake_by_idempotency_key(
+                intake_key,
+                replay_request,
+            )
+            if intake is None and replay_request.asynchronous:
+                try:
+                    intake = runtime.owners.research_memory.submit_asset_intake(
+                        replay_request,
+                        idempotency_key=intake_key,
+                    )
+                except Exception:
+                    # The HumanResponse replay already succeeded. A later replay
+                    # may retry this existing queue seam without gating it.
+                    pass
+            return {
+                **recorded,
+                "asset_intake": (
+                    {
+                        "job_ref": None,
+                        "status": "not_queued",
+                        "failure": {"code": "asset_intake_not_queued"},
+                    }
+                    if intake is None
+                    else intake.as_public_dict()
+                ),
+            }
+        try:
+            intake_mode = await _await_bounded_asset_io(
+                lambda: runtime.owners.research_memory.linked_local_intake_mode(
+                    material.source_locator
+                ),
+                slots=asset_io_slots,
+                timeout_code="asset_intake_classification_timeout",
+            )
+        except HTTPException:
+            # A stalled mount is precisely the uncertain case: preserve the
+            # human response first and let the existing durable worker inspect it.
+            intake_mode = "asynchronous"
+        if intake_mode == "synchronous":
+            intake = await _await_bounded_asset_io(
+                lambda: runtime.owners.research_memory.submit_asset_intake(
+                    sync_request,
+                    idempotency_key=intake_key,
+                ),
+                slots=asset_io_slots,
+                timeout_code="asset_intake_operation_timeout",
+            )
+            if intake.status != "accepted" or intake.asset is None:
+                raise OwnerConflict(
+                    intake.failure_code or "asset_intake_not_terminal"
+                )
+            asset = intake.asset
+            facts.update(
+                {
+                    f"{fact_prefix}_source_ref": asset.memory_ref,
+                    f"{fact_prefix}_version_ref": asset.version_ref,
+                    f"{fact_prefix}_content_hash": asset.content_hash,
+                    f"{fact_prefix}_manifest_hash": asset.manifest_hash,
+                    f"{fact_prefix}_acceptance_receipt_ref": (
+                        asset.receipt.receipt_ref
+                    ),
+                }
+            )
+            recorded = runtime.owners.human_collaboration.respond_to_human_request(
+                request_ref,
+                decision=response.decision,
+                facts=facts,
+                note=response.note,
+                idempotency_key=idempotency_key,
+            )
+            return {**recorded, "asset_intake": intake.as_public_dict()}
+
+        recorded = runtime.owners.human_collaboration.respond_to_human_request(
             request_ref,
             decision=response.decision,
-            facts=response.facts,
+            facts=facts,
             note=response.note,
-            idempotency_key=_idempotency_key(request),
+            idempotency_key=idempotency_key,
         )
+        async_request = material.as_owner_request(
+            request_ref=request_ref,
+            evidence_kind=evidence_kind,
+            asynchronous=True,
+        )
+        try:
+            intake = runtime.owners.research_memory.submit_asset_intake(
+                async_request,
+                idempotency_key=intake_key,
+            )
+            intake_public = intake.as_public_dict()
+        except Exception as error:
+            intake_public = {
+                "job_ref": None,
+                "status": "not_queued",
+                "failure": {
+                    "code": (
+                        error.code
+                        if isinstance(error, OwnerConflict)
+                        else "asset_intake_enqueue_unavailable"
+                    )
+                },
+            }
+        return {**recorded, "asset_intake": intake_public}
+
+    @app.post("/api/v1/human-requests/{request_ref}/retry")
+    def retry_human_request_operation(
+        request_ref: str,
+        request: Request,
+        _command: EmptyCommandRequest,
+    ) -> dict[str, object]:
+        def agent_retry_result(current: dict[str, object]) -> dict[str, object]:
+            open_effect = current.get("open_effect")
+            binding = (
+                None
+                if not isinstance(open_effect, dict)
+                else open_effect.get("operation_binding")
+            )
+            waiters = current.get("direct_waiters")
+            waiter = (
+                waiters[0]
+                if isinstance(waiters, list)
+                and len(waiters) == 1
+                and isinstance(waiters[0], dict)
+                else None
+            )
+            validation = (
+                None if waiter is None else waiter.get("resume_validation")
+            )
+            consumption = (
+                None
+                if not isinstance(validation, dict)
+                else validation.get("consumption")
+            )
+            succeeded = bool(
+                current.get("status") == "satisfied"
+                and waiter is not None
+                and waiter.get("status") == "consumed"
+                and isinstance(binding, dict)
+                and isinstance(consumption, dict)
+                and consumption.get("work_ref") == binding.get("task_ref")
+            )
+            return {
+                **current,
+                "retry": {
+                    "status": "succeeded" if succeeded else "processing"
+                },
+            }
+
+        current = runtime.owners.agent_runtime.query_human_request(request_ref)
+        target = None if current is None else current.get("target_assertion")
+        idempotency_key = _idempotency_key(request)
+        if (
+            isinstance(target, dict)
+            and target.get("schema_ref")
+            == "meta-research/writing-system-operation-help/v1"
+        ):
+            return runtime.writing.retry_system_operation_help(
+                request_ref,
+                idempotency_key=idempotency_key,
+            )
+        if (
+            current is None
+            or current.get("kind") != "system_operation_help"
+            or not isinstance(current.get("open_effect"), dict)
+        ):
+            raise OwnerConflict("system_operation_retry_unavailable")
+        response_key = "system-operation-retry:" + canonical_hash(
+            {"request_ref": request_ref, "idempotency_key": idempotency_key}
+        )
+        if current.get("status") == "satisfied":
+            # Only the original command identity may replay a terminal Retry.
+            runtime.owners.human_collaboration.respond_to_human_request(
+                request_ref,
+                decision="provided",
+                facts={"action": "retry"},
+                note="",
+                idempotency_key=response_key,
+            )
+            reconciled = runtime.owners.agent_runtime.reconcile_root_human_request(
+                request_ref
+            )
+            return agent_retry_result(current if reconciled is None else reconciled)
+        if current.get("status") != "open":
+            raise OwnerConflict("system_operation_retry_unavailable")
+        runtime.owners.human_collaboration.respond_to_human_request(
+            request_ref,
+            decision="provided",
+            facts={"action": "retry"},
+            note="",
+            idempotency_key=response_key,
+        )
+        reconciled = runtime.owners.agent_runtime.reconcile_root_human_request(
+            request_ref
+        )
+        if reconciled is None:
+            reconciled = runtime.owners.agent_runtime.query_human_request(request_ref)
+        if reconciled is None:
+            raise OwnerConflict("human_request_not_found")
+        return agent_retry_result(reconciled)
 
     @app.post("/api/v1/human-collaboration/agent-proposals", status_code=201)
     def record_agent_proposal(

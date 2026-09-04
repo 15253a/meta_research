@@ -835,6 +835,8 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
         operation_namespace: str | None = None,
     ) -> AssetIntakeResult: ...
 
+    def linked_local_intake_mode(self, source_locator: str) -> str: ...
+
     def process_asset_intake_once(self) -> bool: ...
 
     def verify_asset_inventory_once(self) -> bool: ...
@@ -3085,6 +3087,11 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             self._process_asset_job(job_ref, already_claimed=True)
         return self.query_asset_intake(job_ref)
 
+    def linked_local_intake_mode(self, source_locator: str) -> str:
+        """Choose the bounded synchronous path without hashing source bytes."""
+
+        return _linked_local_intake_mode(source_locator)
+
     def process_asset_intake_once(self) -> bool:
         now = time.time()
         with self._database.write() as connection:
@@ -3159,15 +3166,12 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         basis_hash = _asset_observation_basis_hash(row, custodies)
         try:
             self._verified_accepted_asset(row, custodies)
-            if int(row.byte_count) > MAX_ASSET_BYTES:
-                # 0005 allowed larger payloads. Preserve their durable facts,
-                # but do not let a legacy GiB-scale object monopolize the
-                # bounded background verifier or the intake worker.
-                integrity, availability = "unknown", "unavailable"
-            else:
-                integrity, availability = _asset_current_state(
-                    self._object_store, row, custodies
-                )
+            integrity, availability = _asset_current_state(
+                self._object_store,
+                row,
+                custodies,
+                allow_large_linked=True,
+            )
         except (OSError, OwnerConflict):
             integrity, availability = "failed", "unavailable"
         completed_at = time.time()
@@ -3502,11 +3506,46 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 raise OwnerConflict("asset_source_unavailable")
             if not directory_source and not source.is_file():
                 raise OwnerConflict("asset_source_entry_unsupported")
-            if directory_source:
+            streaming_link = (
+                custody_mode == "linked_local" and bool(request.get("asynchronous"))
+            )
+            entries: list[dict[str, object]] = []
+            byte_count = 0
+            if directory_source and streaming_link:
+                source_directories, scanned_entries = _scan_directory_content(
+                    source,
+                    ignored_top_level=(".git",) if source_kind == "repository" else (),
+                    enforce_limits=False,
+                )
+                entries = [
+                    {**entry, "object_path": None} for entry in scanned_entries
+                ]
+                byte_count = sum(int(entry["size"]) for entry in entries)
+            elif directory_source:
                 source_directories, source_files = _read_directory_files(
                     source,
                     ignored_top_level=(".git",) if source_kind == "repository" else (),
                 )
+            elif streaming_link:
+                try:
+                    size = source.stat().st_size
+                except OSError as error:
+                    raise OwnerConflict("asset_source_unavailable") from error
+                source_directories = ()
+                entries = [
+                    {
+                        "path": _safe_asset_name(str(request["display_name"])),
+                        "sha256": _sha256_exact_file(
+                            source,
+                            size,
+                            unavailable_code="asset_source_unavailable",
+                            mismatch_code="asset_source_changed_during_intake",
+                        ),
+                        "size": size,
+                        "object_path": None,
+                    }
+                ]
+                byte_count = size
             else:
                 source_directories = ()
                 source_files = (
@@ -3515,24 +3554,23 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                         _read_bounded_source_file(source),
                     ),
                 )
-            entries: list[dict[str, object]] = []
-            byte_count = 0
-            for relative_path, content in source_files:
-                content_hash = hashlib.sha256(content).hexdigest()
-                object_path: str | None = None
-                if custody_mode == "managed":
-                    object_path = self._store_asset_object(
-                        content_hash, content
+            if not streaming_link:
+                for relative_path, content in source_files:
+                    content_hash = hashlib.sha256(content).hexdigest()
+                    object_path: str | None = None
+                    if custody_mode == "managed":
+                        object_path = self._store_asset_object(
+                            content_hash, content
+                        )
+                    entries.append(
+                        {
+                            "path": relative_path,
+                            "sha256": content_hash,
+                            "size": len(content),
+                            "object_path": object_path,
+                        }
                     )
-                entries.append(
-                    {
-                        "path": relative_path,
-                        "sha256": content_hash,
-                        "size": len(content),
-                        "object_path": object_path,
-                    }
-                )
-                byte_count += len(content)
+                    byte_count += len(content)
             manifest = {
                 "schema_ref": ASSET_MANIFEST_SCHEMA,
                 "kind": "directory" if directory_source else "file",
@@ -3606,7 +3644,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 raise OwnerConflict("asset_source_unavailable")
             try:
                 source_matches = _linked_source_matches(
-                    prepared.manifest, Path(source_locator)
+                    prepared.manifest,
+                    Path(source_locator),
+                    enforce_limits=not bool(request.get("asynchronous")),
                 )
             except (OSError, OwnerConflict) as error:
                 raise OwnerConflict("asset_source_changed_during_intake") from error
@@ -10382,8 +10422,61 @@ def _read_bounded_source_file(source: Path) -> bytes:
     )
 
 
+def _linked_local_intake_mode(source_locator: str) -> str:
+    """Classify only the cheap metadata needed for sync versus async intake."""
+
+    if (
+        not isinstance(source_locator, str)
+        or not source_locator
+        or "\x00" in source_locator
+    ):
+        raise OwnerConflict("asset_source_locator_invalid")
+    if not os.path.isabs(source_locator):
+        raise OwnerConflict("asset_source_locator_absolute_required")
+    source = Path(os.path.normpath(source_locator))
+    try:
+        if source.is_symlink() or not source.exists():
+            return "asynchronous"
+        if source.is_file():
+            return (
+                "synchronous"
+                if source.stat().st_size <= MAX_ASSET_BYTES
+                else "asynchronous"
+            )
+        if not source.is_dir():
+            return "asynchronous"
+        entry_count = 0
+        total_bytes = 0
+        for root, directory_names, file_names in os.walk(
+            source,
+            topdown=True,
+            onerror=_raise_asset_walk_error,
+            followlinks=False,
+        ):
+            root_path = Path(root)
+            entry_count += len(directory_names) + len(file_names)
+            if entry_count > MAX_ASSET_FILES:
+                return "asynchronous"
+            for name in (*directory_names, *file_names):
+                if (root_path / name).is_symlink():
+                    return "asynchronous"
+            for name in file_names:
+                candidate = root_path / name
+                if not candidate.is_file():
+                    return "asynchronous"
+                total_bytes += candidate.stat().st_size
+                if total_bytes > MAX_ASSET_BYTES:
+                    return "asynchronous"
+    except (OSError, OwnerConflict):
+        return "asynchronous"
+    return "synchronous"
+
+
 def _scan_directory_content(
-    source: Path, *, ignored_top_level: tuple[str, ...] = ()
+    source: Path,
+    *,
+    ignored_top_level: tuple[str, ...] = (),
+    enforce_limits: bool = True,
 ) -> tuple[list[str], list[dict[str, object]]]:
     directories: list[str] = []
     entries: list[dict[str, object]] = []
@@ -10410,7 +10503,7 @@ def _scan_directory_content(
             directories.append(relative_directory)
         directory_names[:] = retained_directories
         entry_count += len(retained_directories)
-        if entry_count > MAX_ASSET_FILES:
+        if enforce_limits and entry_count > MAX_ASSET_FILES:
             raise OwnerConflict("asset_source_too_large")
         for name in sorted(file_names):
             if name in ignored_top_level:
@@ -10425,7 +10518,10 @@ def _scan_directory_content(
                 size = candidate.stat().st_size
             except OSError as error:
                 raise OwnerConflict("asset_source_unavailable") from error
-            if entry_count > MAX_ASSET_FILES or size > MAX_ASSET_BYTES - total_bytes:
+            if enforce_limits and (
+                entry_count > MAX_ASSET_FILES
+                or size > MAX_ASSET_BYTES - total_bytes
+            ):
                 raise OwnerConflict("asset_source_too_large")
             entries.append(
                 {
@@ -10968,7 +11064,11 @@ def _verify_asset_custody_rows(row, custodies) -> None:
 
 
 def _asset_current_state(
-    object_store: Path, row, custodies
+    object_store: Path,
+    row,
+    custodies,
+    *,
+    allow_large_linked: bool = False,
 ) -> tuple[str, str]:
     try:
         manifest, _provenance = _verify_asset_metadata(
@@ -10977,7 +11077,12 @@ def _asset_current_state(
         _verify_asset_custody_rows(row, custodies)
     except OwnerConflict:
         return "failed", "unavailable"
-    if int(row.byte_count) > MAX_ASSET_BYTES:
+    entry_count = len(manifest["entries"]) + len(manifest.get("directories", []))
+    oversized = int(row.byte_count) > MAX_ASSET_BYTES or entry_count > MAX_ASSET_FILES
+    if oversized and not (
+        allow_large_linked
+        and any(custody.custody_mode == "linked_local" for custody in custodies)
+    ):
         return "unknown", "unavailable"
     entries = manifest["entries"]
     managed_failed = False
@@ -11000,7 +11105,11 @@ def _asset_current_state(
         try:
             if not source.exists() or source.is_symlink():
                 continue
-            if _linked_source_matches(manifest, source):
+            if _linked_source_matches(
+                manifest,
+                source,
+                enforce_limits=not allow_large_linked,
+            ):
                 return "failed" if managed_failed else "verified", "available"
             drifted = True
         except (OSError, OwnerConflict):
@@ -11058,7 +11167,12 @@ def _receipt_bound_asset_sources(row, custodies) -> list[Path]:
     return sources
 
 
-def _linked_source_matches(manifest: dict[str, object], source: Path) -> bool:
+def _linked_source_matches(
+    manifest: dict[str, object],
+    source: Path,
+    *,
+    enforce_limits: bool = True,
+) -> bool:
     entries = manifest["entries"]
     if manifest["kind"] == "file":
         if not source.is_file() or len(entries) != 1:
@@ -11075,7 +11189,9 @@ def _linked_source_matches(manifest: dict[str, object], source: Path) -> bool:
     ):
         raise OwnerConflict("asset_manifest_invalid")
     current_directories, current_entries = _scan_directory_content(
-        source, ignored_top_level=tuple(ignored)
+        source,
+        ignored_top_level=tuple(ignored),
+        enforce_limits=enforce_limits,
     )
     frozen_entries = [
         {"path": entry["path"], "sha256": entry["sha256"], "size": entry["size"]}

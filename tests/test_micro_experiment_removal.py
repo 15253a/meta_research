@@ -143,7 +143,7 @@ def test_fresh_head_schema_removes_only_micro_experiment_state(
             "name = 'ar_provider_units'"
         ).fetchone()[0]
 
-    assert version == ("0042_remove_micro_experiment",)
+    assert version == ("0043_human_request_contract",)
     assert _MICRO_ONLY_TABLES.isdisjoint(tables)
     assert _FORMAL_TARGET_TABLES <= tables
     assert {
@@ -205,7 +205,7 @@ def test_micro_schema_cleanup_is_atomic_and_retryable(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0042_remove_micro_experiment",)
+        ).fetchone() == ("0043_human_request_contract",)
         recovered_tables = {
             row[0]
             for row in connection.execute(

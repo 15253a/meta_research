@@ -27,6 +27,7 @@ HUMAN_REQUEST_KINDS = {
     "external_material_api_access",
     "offline_action",
     "capability_authorization",
+    "system_operation_help",
 }
 HUMAN_EVALUATIONS = {
     "satisfied",
@@ -486,25 +487,53 @@ class SQLiteHumanRequestOwner:
                 if effect is None or effect.request_ref != request_ref:
                     raise OwnerConflict("human_request_open_effect_invalid")
             else:
+                predecessor = None
                 if predecessor_request_ref is not None:
-                    _verify_effect_successor_predecessor(
+                    predecessor = _verify_effect_successor_predecessor(
                         connection,
                         issuer=self._issuer,
                         response_verifier=self._response_verifier,
                         predecessor_request_ref=predecessor_request_ref,
                         operation_binding=binding,
+                        effect_id=effect_id,
+                        request_kind=cast(str, contract["kind"]),
                         generation=cast(int, waiter["generation"]),
                         quest_ref=quest_ref,
                     )
                 now = time.time()
-                request_id = new_ref("human_request")
-                request_ref = f"{request_id}:r1"
+                continues_system_operation = bool(
+                    predecessor is not None
+                    and predecessor.kind == "system_operation_help"
+                    and predecessor.status == "satisfied"
+                    and contract["kind"] == "system_operation_help"
+                )
+                if continues_system_operation:
+                    # The prior Retry already resumed its exact task. Preserve
+                    # that terminal receipt while a repeat failure becomes the
+                    # next current revision of the same user-visible request.
+                    request_id = str(predecessor.request_id)
+                    revision = int(predecessor.revision) + 1
+                    request_ref = f"{request_id}:r{revision}"
+                    updated = connection.execute(
+                        text(
+                            "UPDATE owner_human_requests SET is_current = 0, "
+                            "updated_at = :now WHERE request_ref = :request_ref "
+                            "AND is_current = 1 AND status = 'satisfied'"
+                        ),
+                        {"now": now, "request_ref": predecessor_request_ref},
+                    )
+                    if int(updated.rowcount or 0) != 1:
+                        raise OwnerConflict("human_request_predecessor_invalid")
+                else:
+                    request_id = new_ref("human_request")
+                    revision = 1
+                    request_ref = f"{request_id}:r1"
                 _insert_request(
                     connection,
                     issuer=self._issuer,
                     request_id=request_id,
                     request_ref=request_ref,
-                    revision=1,
+                    revision=revision,
                     contract=contract,
                     identity_hash=canonical_hash(contract),
                     predecessor_request_ref=predecessor_request_ref,
@@ -574,9 +603,10 @@ class SQLiteHumanRequestOwner:
                 connection.execute(
                     text(
                         f"UPDATE {self._state_table} SET revision = revision + 1, "
-                        "human_request_count = human_request_count + 1 WHERE "
+                        "human_request_count = human_request_count + :created WHERE "
                         "singleton = 'owner'"
-                    )
+                    ),
+                    {"created": 0 if continues_system_operation else 1},
                 )
                 self._feed.record(
                     connection,
@@ -1086,7 +1116,6 @@ class SQLiteHumanRequestOwner:
         blockers = _unique_refs(other_blockers, "human_request_blocker_invalid")
         if contains_secret(
             {
-                "target_assertion": target_assertion,
                 "other_blockers": blockers,
                 "authorization_receipt_ref": authorization_receipt_ref,
             }
@@ -1425,7 +1454,7 @@ class SQLiteHumanRequestOwner:
     def reconcile_human_request_effect(
         self, effect_key: str
     ) -> dict[str, object]:
-        """Read the immutable matching open effect without replaying its command."""
+        """Read the current revision of an immutable matching effect lineage."""
 
         _validate_idempotency_key(effect_key)
         with self._database.read() as connection:
@@ -1439,6 +1468,37 @@ class SQLiteHumanRequestOwner:
         request = self.query_human_request(cast(str, row.request_ref))
         if request is None or request.get("open_effect") is None:
             raise OwnerConflict("human_request_open_effect_invalid")
+        if request.get("kind") == "system_operation_help" and not request.get(
+            "current"
+        ):
+            with self._database.read() as connection:
+                current_ref = connection.execute(
+                    text(
+                        "SELECT request_ref FROM owner_human_requests WHERE "
+                        "issuer = :issuer AND request_id = :request_id AND "
+                        "is_current = 1"
+                    ),
+                    {
+                        "issuer": self._issuer,
+                        "request_id": request["request_id"],
+                    },
+                ).scalar_one_or_none()
+            current = (
+                None
+                if current_ref is None
+                else self.query_human_request(str(current_ref))
+            )
+            current_effect = (
+                None if current is None else current.get("open_effect")
+            )
+            if (
+                current is None
+                or current.get("kind") != "system_operation_help"
+                or not isinstance(current_effect, dict)
+                or current_effect.get("effect_id") != row.effect_id
+            ):
+                raise OwnerConflict("human_request_open_effect_invalid")
+            request = current
         return request
 
     def _materialize_expiration_if_due(self, request_ref: str) -> None:
@@ -1533,8 +1593,10 @@ def _validate_contract(
 ) -> dict[str, object]:
     if request_kind not in HUMAN_REQUEST_KINDS:
         raise OwnerConflict("human_request_kind_invalid")
-    obligation = _bounded_text(obligation, "human_request_obligation_required", 8000)
-    business_purpose = _bounded_text(
+    obligation = _bounded_verbatim_text(
+        obligation, "human_request_obligation_required", 8000
+    )
+    business_purpose = _bounded_verbatim_text(
         business_purpose, "human_request_business_purpose_required", 4000
     )
     target_assertion = _object(target_assertion, "target_assertion_invalid")
@@ -1569,8 +1631,6 @@ def _validate_contract(
         "required_authorization": required_authorization,
         "expires_at": expires_at,
     }
-    if contains_secret(contract):
-        raise OwnerConflict("human_request_secret_forbidden")
     return contract
 
 
@@ -1607,7 +1667,12 @@ def _validate_waiter(value: dict[str, object]) -> dict[str, object]:
             _unique_refs(tuple(blockers), "human_request_blocker_invalid")
         ),
     }
-    if contains_secret(waiter):
+    if contains_secret(
+        {
+            "waiter_ref": waiter_ref,
+            "other_blockers": waiter["other_blockers"],
+        }
+    ):
         raise OwnerConflict("human_request_secret_forbidden")
     return waiter
 
@@ -1719,9 +1784,11 @@ def _verify_effect_successor_predecessor(
     response_verifier: HumanResponseVerifier | None,
     predecessor_request_ref: str,
     operation_binding: dict[str, object],
+    effect_id: str,
+    request_kind: str,
     generation: int,
     quest_ref: str | None,
-) -> None:
+):
     predecessor = _request_row(connection, issuer, predecessor_request_ref)
     disposition = connection.execute(
         text(
@@ -1779,6 +1846,11 @@ def _verify_effect_successor_predecessor(
         or canonical_hash(predecessor_binding)
         != predecessor_effect.operation_binding_hash
         or predecessor_effect.request_ref != predecessor_request_ref
+        or (
+            predecessor.kind == "system_operation_help"
+            and request_kind == "system_operation_help"
+            and predecessor_effect.effect_id != effect_id
+        )
         or len(predecessor_waiters) != 1
         or predecessor_waiters[0].waiter_ref != predecessor_effect.waiter_ref
         or predecessor_waiters[0].status != "consumed"
@@ -1798,6 +1870,7 @@ def _verify_effect_successor_predecessor(
         raise OwnerConflict("human_request_predecessor_invalid")
     if successor is not None:
         raise OwnerConflict("human_request_successor_exists")
+    return predecessor
 
 
 def _insert_request(
@@ -2132,6 +2205,12 @@ def _verify_request_state_integrity(connection: Connection, row, disposition) ->
         or (
             not bool(row.is_current)
             and row.status != "superseded"
+            # A completed system Retry remains an auditable terminal fact when
+            # the resumed task reports a repeat failure in a later revision.
+            and not (
+                row.kind == "system_operation_help"
+                and row.status == "satisfied"
+            )
         )
     ):
         raise OwnerConflict("human_request_artifact_invalid")
@@ -2237,8 +2316,6 @@ def _public_request(
         "required_authorization": authorization,
         "expires_at": row.expires_at,
     }
-    if contains_secret(contract):
-        raise OwnerConflict("human_request_secret_forbidden")
     if canonical_hash(contract) != row.identity_hash:
         raise OwnerConflict("human_request_artifact_invalid")
     public_waiters = []
@@ -2251,12 +2328,7 @@ def _public_request(
             or canonical_hash(blockers) != waiter.other_blockers_hash
         ):
             raise OwnerConflict("human_request_waiter_invalid")
-        if contains_secret(
-            {
-                "target_assertion": waiter_target,
-                "other_blockers": blockers,
-            }
-        ):
+        if contains_secret({"other_blockers": blockers}):
             raise OwnerConflict("human_request_secret_forbidden")
         latest = validations.get(waiter.waiter_ref)
         consumption = consumptions.get(waiter.waiter_ref)
@@ -2548,6 +2620,12 @@ def _bounded_text(value: object, code: str, maximum: int) -> str:
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
         raise OwnerConflict(code)
     return value.strip()
+
+
+def _bounded_verbatim_text(value: object, code: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise OwnerConflict(code)
+    return value
 
 
 def _object(value: object, code: str) -> dict[str, object]:

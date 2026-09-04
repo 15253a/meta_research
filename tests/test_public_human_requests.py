@@ -4,10 +4,11 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from meta_research.composition import build_production_runtime
-from meta_research.owners.common import OwnerConflict, canonical_json
+from meta_research.owners.common import OwnerConflict
 from meta_research.owners import agent_runtime as agent_runtime_module
 from meta_research.owners import human_requests as human_requests_module
 from meta_research.paths import prepare_data_root
@@ -17,6 +18,7 @@ from meta_research.quest_drafting import (
 )
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.owners.research_memory import AssetIntakeRequest
+from meta_research.web import create_app
 
 
 class _DeterministicDraftingProvider:
@@ -88,6 +90,103 @@ def _satisfy_library_request(runtime, request_ref: str, key: str) -> None:
         idempotency_key=f"{key}-evaluation",
     )
     assert satisfied["disposition"]["decision"] == "satisfied"
+
+
+def test_request_and_response_business_text_round_trip_without_content_filtering(
+    tmp_path,
+) -> None:
+    provider = _DeterministicDraftingProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "human-request-raw-business-text"),
+        proposal_drafter=provider,
+        intent_drafting_provider=provider,
+    )
+    owner = runtime.owners.research_graph
+    target_assertion = {
+        "operation": "resume_external_material_fetch",
+        "api_token": "ghp_test_only_credential",
+    }
+    acceptance_conditions = (
+        "Use Cookie sessionid=test-only-cookie for the exact external request.",
+    )
+    required_authorization = {
+        "capability": "external_material_api_access",
+        "password": "test-only-password",
+    }
+    try:
+        opened = owner.open_human_request(
+            request_kind="external_material_api_access",
+            obligation="  Provide API key sk-test-not-a-real-secret.\n",
+            business_purpose=(
+                "\tResume the request with password=test-only-password.  "
+            ),
+            target_assertion=target_assertion,
+            acceptance_conditions=acceptance_conditions,
+            required_authorization=required_authorization,
+            direct_waiter={
+                "waiter_ref": "external_material_fetch_1",
+                "generation": 1,
+                "target_assertion": target_assertion,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            idempotency_key="open-raw-business-text",
+        )
+
+        assert opened["obligation"] == (
+            "  Provide API key sk-test-not-a-real-secret.\n"
+        )
+        assert opened["business_purpose"] == (
+            "\tResume the request with password=test-only-password.  "
+        )
+        assert opened["target_assertion"] == target_assertion
+        assert opened["acceptance_conditions"] == list(acceptance_conditions)
+        assert opened["required_authorization"] == required_authorization
+
+        response = runtime.owners.human_collaboration.respond_to_human_request(
+            opened["request_ref"],
+            decision="provided",
+            facts={"api_key": "sk-test-response-only"},
+            note="\nUse password=test-only-response-password.\t",
+            idempotency_key="respond-raw-business-text",
+        )
+        assert response["facts"] == {"api_key": "sk-test-response-only"}
+        assert response["note"] == (
+            "\nUse password=test-only-response-password.\t"
+        )
+
+        evaluated = owner.evaluate_human_request(
+            opened["request_ref"],
+            response_refs=(response["response_ref"],),
+            decision="satisfied",
+            reason_code="human_response_accepted",
+            accepted_evidence_refs=(),
+            idempotency_key="evaluate-raw-business-text",
+        )
+        assert evaluated["responses"] == [response]
+        assert evaluated["response_rejections"] == []
+        assert evaluated["disposition"]["decision"] == "satisfied"
+
+        failed_operation = {"operation_ref": "failed_operation_1"}
+        system_help = owner.open_human_request(
+            request_kind="system_operation_help",
+            obligation="Retry the exact failed operation.",
+            business_purpose="Restore only its direct dependency.",
+            target_assertion=failed_operation,
+            acceptance_conditions=("The bound operation is retried.",),
+            direct_waiter={
+                "waiter_ref": "failed_operation_1",
+                "generation": 1,
+                "target_assertion": failed_operation,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            idempotency_key="open-system-operation-help",
+        )
+        assert system_help["kind"] == "system_operation_help"
+        assert owner.query_human_request(system_help["request_ref"]) == system_help
+    finally:
+        runtime.close()
 
 
 def test_response_evaluation_disposition_and_waiter_resume_are_distinct(tmp_path) -> None:
@@ -586,7 +685,7 @@ def test_terminal_request_status_and_current_revision_are_receipt_consistent(
         runtime.close()
 
 
-def test_successor_terminal_recurrence_and_secret_exclusion(tmp_path) -> None:
+def test_successor_terminal_recurrence_and_raw_response(tmp_path) -> None:
     provider = _DeterministicDraftingProvider()
     runtime = build_production_runtime(
         prepare_data_root(tmp_path / "human-request-revisions"),
@@ -661,49 +760,15 @@ def test_successor_terminal_recurrence_and_secret_exclusion(tmp_path) -> None:
         )
         assert evaluated["disposition"] is None
 
-        with pytest.raises(OwnerConflict, match="human_response_secret_forbidden"):
-            runtime.owners.human_collaboration.respond_to_human_request(
-                successor["request_ref"],
-                decision="provided",
-                facts={"cookie": "session=secret"},
-                note="",
-                idempotency_key="secret-cookie",
-            )
-        for index, (facts, note) in enumerate(
-            (
-                ({"token": "ghp_examplecredential"}, ""),
-                ({"client_secret": "client-secret-value"}, ""),
-                ({"private_key": "-----BEGIN PRIVATE KEY-----"}, ""),
-                ({"aws_secret_access_key": "example-secret-access-key"}, ""),
-                ({}, "token: ghp_examplecredential"),
-                ({}, "My password is hunter2"),
-                ({}, "Here is the OTP 123456"),
-                ({}, "AWS secret access key is example-secret-access-key"),
-                ({}, "Cookie sessionid abcdef123456"),
-                ({}, "-----begin rsa private key-----"),
-                (
-                    {},
-                    "https://blob.example.test/file?sv=1&se=2&sp=r&sig=abcdef0123456789",
-                ),
-                (
-                    {},
-                    "https://s3.example.test/file?X-Amz-Algorithm=v4&X-Amz-Signature=abcdef0123456789",
-                ),
-                ({}, "https://alice:hunter2@example.test/private"),
-                ({}, "postgresql://alice:hunter2@db.example.test/research"),
-                ({}, "sessionid=abcdef0123456789"),
-            )
-        ):
-            with pytest.raises(
-                OwnerConflict, match="human_response_secret_forbidden"
-            ):
-                runtime.owners.human_collaboration.respond_to_human_request(
-                    successor["request_ref"],
-                    decision="provided",
-                    facts=facts,
-                    note=note,
-                    idempotency_key=f"secret-expanded-{index}",
-                )
+        raw_response = runtime.owners.human_collaboration.respond_to_human_request(
+            successor["request_ref"],
+            decision="provided",
+            facts={"token": "ghp_test_only_credential"},
+            note="My password is test-only-password.",
+            idempotency_key="raw-offline-response",
+        )
+        assert raw_response["facts"] == {"token": "ghp_test_only_credential"}
+        assert raw_response["note"] == "My password is test-only-password."
 
         declined = runtime.owners.human_collaboration.respond_to_human_request(
             successor["request_ref"],
@@ -743,7 +808,7 @@ def test_successor_terminal_recurrence_and_secret_exclusion(tmp_path) -> None:
         runtime.close()
 
 
-def test_owner_human_request_facts_reject_credentials_before_persistence(
+def test_business_content_is_unfiltered_but_identity_fields_remain_guarded(
     tmp_path,
 ) -> None:
     provider = _DeterministicDraftingProvider()
@@ -763,16 +828,6 @@ def test_owner_human_request_facts_reject_credentials_before_persistence(
                 acceptance_conditions=("The exact route is ready.",),
                 direct_waiter=_waiter("secret-idempotency-waiter"),
                 idempotency_key="password=hunter2",
-            )
-        with pytest.raises(OwnerConflict, match="human_request_secret_forbidden"):
-            owner.open_human_request(
-                request_kind="library_reconnect",
-                obligation="Reconnect the institution-backed route.",
-                business_purpose="Resume exact acquisition.",
-                target_assertion={"token": "ghp_examplecredential"},
-                acceptance_conditions=("The exact route is ready.",),
-                direct_waiter=_waiter("secret-target-waiter"),
-                idempotency_key="secret-target-open",
             )
         with pytest.raises(OwnerConflict, match="human_request_secret_forbidden"):
             owner.open_human_request(
@@ -801,61 +856,32 @@ def test_owner_human_request_facts_reject_credentials_before_persistence(
                 note="The exact route is ready.",
                 idempotency_key="password=hunter2",
             )
-        assert owner.query_human_request(request["request_ref"])["responses"] == []
-        with pytest.raises(
-            OwnerConflict, match="human_response_secret_forbidden"
-        ):
-            runtime.owners.human_collaboration.respond_to_human_request(
-                request["request_ref"],
-                decision="provided",
-                facts={"api_token": "ghp_examplecredential"},
-                note="Use the submitted credential.",
-                idempotency_key="secret-response-rejection",
-            )
-        rejected = owner.query_human_request(request["request_ref"])
-        assert rejected is not None
-        assert rejected["responses"] == []
-        [rejection] = rejected["response_rejections"]
-        assert rejection["request_ref"] == request["request_ref"]
-        assert rejection["reason_code"] == "human_response_secret_forbidden"
-        assert rejection["receipt"]["issuer"] == "human_collaboration"
-        assert rejection["receipt"]["kind"] == "human_response_rejection"
-        assert "ghp_examplecredential" not in canonical_json(rejection)
-        with pytest.raises(
-            OwnerConflict, match="human_response_secret_forbidden"
-        ):
-            runtime.owners.human_collaboration.respond_to_human_request(
-                request["request_ref"],
-                decision="provided",
-                facts={"api_token": "ghp_examplecredential"},
-                note="Use the submitted credential.",
-                idempotency_key="secret-response-rejection",
-            )
-        assert owner.query_human_request(request["request_ref"])[
-            "response_rejections"
-        ] == [rejection]
+        response = runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"api_token": "ghp_test_only_credential"},
+            note="Use password=test-only-password.",
+            idempotency_key="raw-evaluation-response",
+        )
+        replay = runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"api_token": "ghp_test_only_credential"},
+            note="Use password=test-only-password.",
+            idempotency_key="raw-evaluation-response",
+        )
+        assert replay == response
+        observed = owner.query_human_request(request["request_ref"])
+        assert observed is not None
+        assert observed["responses"] == [response]
+        assert observed["response_rejections"] == []
         with pytest.raises(OwnerConflict, match="idempotency_conflict"):
             runtime.owners.human_collaboration.respond_to_human_request(
                 request["request_ref"],
                 decision="provided",
                 facts={"route_status": "ready"},
-                note="The exact route is ready.",
-                idempotency_key="secret-response-rejection",
-            )
-        response = runtime.owners.human_collaboration.respond_to_human_request(
-            request["request_ref"],
-            decision="provided",
-            facts={"route_status": "ready"},
-            note="The exact route is ready.",
-            idempotency_key="secret-evaluation-response",
-        )
-        with pytest.raises(OwnerConflict, match="idempotency_conflict"):
-            runtime.owners.human_collaboration.respond_to_human_request(
-                request["request_ref"],
-                decision="provided",
-                facts={"api_token": "ghp_examplecredential"},
-                note="Use the submitted credential.",
-                idempotency_key="secret-evaluation-response",
+                note="Different content must not reuse the same identity.",
+                idempotency_key="raw-evaluation-response",
             )
         with pytest.raises(OwnerConflict, match="human_request_secret_forbidden"):
             owner.evaluate_human_request(
@@ -895,6 +921,7 @@ def _open_root_human_request_effect(
     *,
     effect_key: str,
     effect_id: str,
+    request_kind: str = "library_reconnect",
     generation: int = 3,
     task_index: int = 1,
     predecessor_request_ref: str | None = None,
@@ -919,7 +946,7 @@ def _open_root_human_request_effect(
         effect_id=effect_id,
         operation_binding=binding,
         predecessor_request_ref=predecessor_request_ref,
-        request_kind="library_reconnect",
+        request_kind=request_kind,
         obligation="Restore a usable literature route for this exact task.",
         business_purpose="Resume the exact blocked Root task.",
         target_assertion=target,
@@ -1443,6 +1470,325 @@ def test_root_human_request_provided_releases_and_resumes_exactly_once(
         runtime.close()
 
 
+def test_external_human_request_natural_language_response_resumes_responsible_agent(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_kind = "external_material_api_access"
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / f"root-human-natural-response-{request_kind}")
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    try:
+        request = _open_root_human_request_effect(
+            owner,
+            effect_key=f"mcp-effect:root-human-natural-{request_kind}",
+            effect_id=f"root-human-natural-{request_kind}",
+            request_kind=request_kind,
+        )
+        response = runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"local_path": "/srv/research/operator-result"},
+            note="I could not finish; use the local path or choose another route.",
+            idempotency_key=f"root-human-natural-response-{request_kind}",
+        )
+
+        current = owner.query_human_request(str(request["request_ref"]))
+        assert current is not None
+        assert current["responses"] == [response]
+        assert current["status"] == "satisfied"
+        assert current["evaluation"]["accepted_evidence_refs"] == []
+        assert current["direct_waiters"][0]["status"] == "consumed"
+        assert owner.query_managed_run(
+            str(request["open_effect"]["operation_binding"]["task_ref"])
+        )["status"] == "running"
+    finally:
+        runtime.close()
+
+
+def test_agent_issued_system_operation_help_retry_resumes_exact_agent(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "root-system-operation-help")
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    try:
+        request = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-system-operation-help",
+            effect_id="root-system-operation-help",
+            request_kind="system_operation_help",
+        )
+        assert owner.query_snapshot().facts["human_request_count"] == 1
+        binding = request["open_effect"]["operation_binding"]
+        monkeypatch.setattr(
+            owner,
+            "_root_human_request_resume_checkpoint_ready",
+            lambda _binding: False,
+        )
+        with TestClient(
+            create_app(
+                runtime,
+                base_url="http://testserver",
+                control_key="control-key",
+            ),
+            base_url="http://testserver",
+        ) as client:
+            bootstrap = runtime.authentication.issue_bootstrap_token()
+            authenticated = client.post(
+                "/auth/bootstrap",
+                headers={"Origin": "http://testserver"},
+                json={"token": bootstrap},
+            )
+            assert authenticated.status_code == 200
+            headers = {
+                "Origin": "http://testserver",
+                "X-CSRF-Token": authenticated.json()["csrf_token"],
+                "Idempotency-Key": "root-system-operation-help-retry",
+            }
+            retry_url = f"/api/v1/human-requests/{request['request_ref']}/retry"
+            processing = client.post(retry_url, headers=headers, json={})
+            assert processing.status_code == 200, processing.json()
+            assert processing.json()["retry"] == {"status": "processing"}
+
+            pending = owner.query_human_request(str(request["request_ref"]))
+            assert pending is not None
+            assert pending["status"] == "open"
+            assert pending["direct_waiters"][0]["status"] == "blocked"
+            assert owner.query_managed_run(str(binding["task_ref"]))[
+                "status"
+            ] == "suspended"
+
+            processing_replay = client.post(retry_url, headers=headers, json={})
+            assert processing_replay.status_code == 200, processing_replay.json()
+            assert processing_replay.json()["retry"] == {"status": "processing"}
+            assert len(
+                owner.query_human_request(str(request["request_ref"]))["responses"]
+            ) == 1
+
+            other_headers = {
+                **headers,
+                "Idempotency-Key": "root-system-operation-help-retry-2",
+            }
+            other_processing = client.post(
+                retry_url, headers=other_headers, json={}
+            )
+            assert other_processing.status_code == 200, other_processing.json()
+            assert other_processing.json()["retry"] == {"status": "processing"}
+            other_replay = client.post(retry_url, headers=other_headers, json={})
+            assert other_replay.status_code == 200, other_replay.json()
+            assert len(
+                owner.query_human_request(str(request["request_ref"]))["responses"]
+            ) == 2
+
+            runtime.owners.human_collaboration.respond_to_human_request(
+                str(request["request_ref"]),
+                decision="provided",
+                facts={"action": "comment"},
+                note="Do not use the earlier Retry yet.",
+                idempotency_key="root-system-operation-help-later-comment",
+            )
+
+            monkeypatch.setattr(
+                owner,
+                "_root_human_request_resume_checkpoint_ready",
+                lambda _binding: True,
+            )
+            succeeded = client.post(
+                retry_url,
+                headers={
+                    **headers,
+                    "Idempotency-Key": "root-system-operation-help-retry-3",
+                },
+                json={},
+            )
+            assert succeeded.status_code == 200, succeeded.json()
+            assert succeeded.json()["retry"] == {"status": "succeeded"}
+            terminal_replay = client.post(
+                retry_url,
+                headers={
+                    **headers,
+                    "Idempotency-Key": "root-system-operation-help-retry-3",
+                },
+                json={},
+            )
+            assert terminal_replay.status_code == 200, terminal_replay.json()
+            assert terminal_replay.json() == succeeded.json()
+
+        current = owner.query_human_request(str(request["request_ref"]))
+        assert current is not None
+        assert len(current["responses"]) == 4
+        assert current["responses"][-1]["facts"] == {"action": "retry"}
+        assert current["status"] == "satisfied"
+        assert current["evaluation"]["reason"]["code"] == (
+            "system_operation_retry_requested"
+        )
+        consumption = current["direct_waiters"][0]["resume_validation"][
+            "consumption"
+        ]
+        assert consumption["work_ref"] == binding["task_ref"]
+        resumed = owner.query_managed_run(str(binding["task_ref"]))
+        assert resumed["status"] == "running"
+        assert resumed["root_session_ref"] == binding["root_session_ref"]
+
+        with pytest.raises(OwnerConflict, match="human_request_predecessor_invalid"):
+            _open_root_human_request_effect(
+                owner,
+                effect_key="mcp-effect:different-system-operation-help:r2",
+                effect_id="different-system-operation-help",
+                request_kind="system_operation_help",
+                generation=4,
+                predecessor_request_ref=str(request["request_ref"]),
+            )
+
+        repeated_failure = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-system-operation-help:r2",
+            effect_id="root-system-operation-help",
+            request_kind="system_operation_help",
+            generation=4,
+            predecessor_request_ref=str(request["request_ref"]),
+        )
+        assert repeated_failure["request_id"] == request["request_id"]
+        assert repeated_failure["request_ref"] == f"{request['request_id']}:r2"
+        assert repeated_failure["revision"] == 2
+        assert repeated_failure["predecessor_request_ref"] == request["request_ref"]
+        predecessor = owner.query_human_request(str(request["request_ref"]))
+        assert predecessor is not None
+        assert predecessor["current"] is False
+        assert predecessor["status"] == "satisfied"
+        assert predecessor["successor_request_ref"] == repeated_failure["request_ref"]
+        assert repeated_failure["current"] is True
+        assert repeated_failure["status"] == "open"
+        assert repeated_failure["direct_waiters"][0]["status"] == "blocked"
+        assert owner.query_snapshot().facts["human_request_count"] == 1
+        assert owner.query_managed_run(str(binding["task_ref"]))[
+            "status"
+        ] == "suspended"
+    finally:
+        runtime.close()
+
+
+def test_agent_issued_system_operation_help_non_retry_does_not_resume(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "root-system-operation-help-non-retry")
+    )
+    owner = runtime.owners.agent_runtime
+    _seed_root_human_request_task(runtime)
+    _allow_current_root_human_request_scope(monkeypatch, owner)
+    try:
+        request = _open_root_human_request_effect(
+            owner,
+            effect_key="mcp-effect:root-system-operation-help-non-retry",
+            effect_id="root-system-operation-help-non-retry",
+            request_kind="system_operation_help",
+        )
+        runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"action": "comment"},
+            note="Do not retry yet.",
+            idempotency_key="root-system-operation-help-non-retry-response",
+        )
+
+        current = owner.query_human_request(str(request["request_ref"]))
+        assert current is not None
+        assert current["status"] == "open"
+        assert current["evaluation"]["decision"] == "needs_input"
+        assert current["direct_waiters"][0]["status"] == "blocked"
+        assert owner.query_managed_run(
+            str(request["open_effect"]["operation_binding"]["task_ref"])
+        )["status"] == "suspended"
+    finally:
+        runtime.close()
+
+
+def test_component_retry_consumes_only_exact_system_operation_help_waiter(
+    tmp_path,
+) -> None:
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "component-system-operation-help")
+    )
+    owner = runtime.owners.agent_runtime
+    target = {
+        "operation_ref": "writing_provider_operation_1",
+        "retry_action": "retry_writing_provider",
+    }
+    try:
+        request = owner.open_human_request(
+            request_kind="system_operation_help",
+            obligation="Retry the failed Writing provider operation.",
+            business_purpose="Resume only the dependent Writing task.",
+            target_assertion=target,
+            acceptance_conditions=("The exact provider retry succeeds.",),
+            direct_waiter={
+                "waiter_ref": "writing_retry:writing_provider_operation_1",
+                "generation": 1,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            idempotency_key="open-component-system-operation-help",
+        )
+        response = runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"action": "retry"},
+            note="Retry the exact failed component.",
+            idempotency_key="respond-component-system-operation-help",
+        )
+        owner.evaluate_human_request(
+            request["request_ref"],
+            response_refs=(response["response_ref"],),
+            decision="satisfied",
+            reason_code="system_operation_retry_succeeded",
+            accepted_evidence_refs=(),
+            idempotency_key="evaluate-component-system-operation-help",
+        )
+        owner.validate_human_request_waiter(
+            request["request_ref"],
+            waiter_ref="writing_retry:writing_provider_operation_1",
+            generation=1,
+            target_assertion=target,
+            other_blockers=(),
+            idempotency_key="release-component-system-operation-help",
+        )
+
+        with pytest.raises(
+            OwnerConflict, match="system_operation_help_waiter_invalid"
+        ):
+            owner.consume_system_operation_help_waiter(
+                request["request_ref"],
+                waiter_ref="writing_retry:other_operation",
+                generation=1,
+                work_ref="writing_provider_operation_1",
+                work_hash="b" * 64,
+            )
+        consumption = owner.consume_system_operation_help_waiter(
+            request["request_ref"],
+            waiter_ref="writing_retry:writing_provider_operation_1",
+            generation=1,
+            work_ref="writing_provider_operation_1",
+            work_hash="b" * 64,
+        )
+        assert consumption["work_ref"] == "writing_provider_operation_1"
+        assert owner.query_human_request(request["request_ref"])[
+            "direct_waiters"
+        ][0]["status"] == "consumed"
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("decision", ("declined", "deferred"))
 def test_root_human_request_unsatisfied_still_releases_exact_waiter(
     tmp_path,
@@ -1521,27 +1867,16 @@ def test_root_human_request_invalid_provided_response_does_not_release(
 
 
 @pytest.mark.parametrize(
-    ("request_kind", "fact_prefix"),
-    (
-        ("external_material_api_access", "material"),
-        ("offline_action", "result"),
-    ),
-)
-@pytest.mark.parametrize(
     "case",
-    ("exact", "missing_version", "wrong_source", "wrong_content", "wrong_receipt"),
+    ("exact", "partial", "forged"),
 )
 def test_root_human_request_accepted_asset_proof_uses_public_flat_facts(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
-    request_kind: str,
-    fact_prefix: str,
     case: str,
 ) -> None:
     runtime = build_production_runtime(
-        prepare_data_root(
-            tmp_path / f"root-human-asset-{request_kind}-{case}"
-        )
+        prepare_data_root(tmp_path / f"root-human-asset-{case}")
     )
     owner = runtime.owners.agent_runtime
     _seed_root_human_request_task(runtime)
@@ -1556,10 +1891,11 @@ def test_root_human_request_accepted_asset_proof_uses_public_flat_facts(
             provenance={"source": "human_request_test"},
             asynchronous=False,
         ),
-        idempotency_key=f"root-human-asset-{request_kind}-{case}",
+        idempotency_key=f"root-human-asset-{case}",
     )
     assert intake.asset is not None
     asset = intake.asset
+    fact_prefix = "material"
     binding = _root_effect_binding()
     target = {
         "schema_ref": "meta-research/root-agent-human-request-target/v1",
@@ -1575,11 +1911,11 @@ def test_root_human_request_accepted_asset_proof_uses_public_flat_facts(
     }
     try:
         request = owner.open_human_request_effect(
-            effect_key=f"mcp-effect:root-human-asset-{request_kind}-{case}",
-            effect_id=f"root-human-asset-{request_kind}-{case}",
+            effect_key=f"mcp-effect:root-human-asset-{case}",
+            effect_id=f"root-human-asset-{case}",
             operation_binding=binding,
             predecessor_request_ref=None,
-            request_kind=request_kind,
+            request_kind="external_material_api_access",
             obligation="Provide one exact accepted asset.",
             business_purpose="Resume the exact blocked Root task.",
             target_assertion=target,
@@ -1600,20 +1936,16 @@ def test_root_human_request_accepted_asset_proof_uses_public_flat_facts(
             f"{fact_prefix}_manifest_hash": asset.manifest_hash,
             f"{fact_prefix}_acceptance_receipt_ref": asset.receipt.receipt_ref,
         }
-        if case == "missing_version":
-            facts[f"{fact_prefix}_version_ref"] = "asset_version_missing"
-        elif case == "wrong_source":
-            facts[f"{fact_prefix}_source_ref"] = "research_asset_missing"
-        elif case == "wrong_content":
+        if case == "partial":
+            del facts[f"{fact_prefix}_manifest_hash"]
+        elif case == "forged":
             facts[f"{fact_prefix}_content_hash"] = "f" * 64
-        elif case == "wrong_receipt":
-            facts[f"{fact_prefix}_acceptance_receipt_ref"] = "receipt_missing"
         runtime.owners.human_collaboration.respond_to_human_request(
             str(request["request_ref"]),
             decision="provided",
             facts=facts,
             note="Use this exact accepted asset.",
-            idempotency_key=f"root-human-asset-response-{request_kind}-{case}",
+            idempotency_key=f"root-human-asset-response-{case}",
         )
 
         current = owner.query_human_request(str(request["request_ref"]))

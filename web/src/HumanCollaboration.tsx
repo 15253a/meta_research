@@ -27,6 +27,7 @@ import {
   ProductError,
   reconcileOrphanedHumanRequestAssetRecovery,
   respondToHumanRequest,
+  retryHumanRequest,
   reviseHumanCommand,
   sendCompanionMessage,
   stagePendingAcceptedHumanRequestAssetResponse,
@@ -58,40 +59,45 @@ export type CompanionShellState =
 
 const requestCopy: Record<HumanRequestItem["kind"], {
   list: string;
-  title: string;
-  eyebrow: string;
   draftLabel: string;
   draftPlaceholder: string;
 }> = {
   library_reconnect: {
     list: "图书馆访问",
-    title: "处理图书馆访问阻塞",
-    eyebrow: "需要你恢复访问",
     draftLabel: "就图书馆恢复事项发消息",
     draftPlaceholder: "询问当前状态，或说明你希望怎样处理……",
   },
   external_material_api_access: {
     list: "外部材料或 API",
-    title: "完成外部材料或 API 申请",
-    eyebrow: "需要你完成外部申请",
     draftLabel: "就外部材料事项发消息",
     draftPlaceholder: "询问为什么需要材料，或讨论替代路线……",
   },
   offline_action: {
     list: "线下操作",
-    title: "完成线下操作",
-    eyebrow: "需要你完成线下操作",
     draftLabel: "就线下操作事项发消息",
     draftPlaceholder: "询问步骤、安全边界，或说明现场限制……",
   },
   capability_authorization: {
     list: "低频权限",
-    title: "决定低频能力授权",
-    eyebrow: "需要你决定是否授权",
     draftLabel: "就权限事项发消息",
     draftPlaceholder: "询问风险，或讨论更窄的授权范围……",
   },
+  system_operation_help: {
+    list: "系统操作协助",
+    draftLabel: "就系统操作失败发消息",
+    draftPlaceholder: "询问错误背景或确认将重试哪个操作……",
+  },
 };
+
+function renderAgentText(value: string): ReactNode {
+  return value.split(/(https?:\/\/[^\s]+)/g).map((part, index) => (
+    /^https?:\/\//.test(part) ? (
+      <a key={`${index}:${part}`} href={part} target="_blank" rel="noreferrer">
+        {part}
+      </a>
+    ) : part
+  ));
+}
 
 const fallbackCompanionCopy: Record<CompanionShellState, {
   label: string;
@@ -1920,10 +1926,6 @@ export function HumanRequestSurface({
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
-      if (blocking) {
-        event.stopImmediatePropagation();
-        return;
-      }
       onCloseRef.current();
     };
     window.addEventListener("keydown", closeOnEscape);
@@ -1934,7 +1936,7 @@ export function HumanRequestSurface({
       });
       document.body.style.overflow = previousOverflow;
     };
-  }, [blocking, open]);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -1991,11 +1993,11 @@ export function HumanRequestSurface({
       tabIndex={-1}
       onCancel={(event) => {
         event.preventDefault();
-        if (!blocking) onClose();
+        onClose();
       }}
       onKeyDown={trapDialogFocus}
       onMouseDown={(event) => {
-        if (!blocking && event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget) onClose();
       }}
     >
       <section
@@ -2058,9 +2060,7 @@ function HumanRequestList({
           <h2>需要你处理的事项</h2>
           <p>这里列出需要你决定或完成的事情；只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
         </div>
-        {!blocking ? (
-          <button type="button" className="hc-close" onClick={onClose} aria-label="关闭需要你处理的事项">×</button>
-        ) : null}
+        <button type="button" className="hc-close" onClick={onClose} aria-label="关闭需要你处理的事项">×</button>
       </header>
       <main className="hc-list">
         {items.length ? orderedKinds.map((kind) => {
@@ -2121,13 +2121,7 @@ function HumanRequestView({
   hasPrevious: boolean;
   hasNext: boolean;
 }) {
-  const copy = requestCopy[request.kind];
-  const waiter = request.direct_waiters?.find((item) => item.status === "blocked")
-    ?? request.direct_waiters?.[0];
   const waiting = collaboration?.human_requests.waiting;
-  const safeWork = waiter?.wait_scope === "quest"
-    ? waiting?.safe_meaningful_runnable_exists ?? false
-    : true;
 
   return (
     <>
@@ -2136,32 +2130,35 @@ function HumanRequestView({
         <div>
           <small>
             {blocking
-              ? `当前待办 · ${queuePosition} / ${queueSize} · ${copy.eyebrow}`
-              : `${copy.eyebrow} · ${scopeLabel(request)}`}
+              ? `当前待办 · ${queuePosition} / ${queueSize}`
+              : scopeLabel(request)}
           </small>
-          <h2>{copy.title}</h2>
-          <p>{request.obligation}</p>
+          <h2>{renderAgentText(request.obligation)}</h2>
+          <p>{renderAgentText(request.business_purpose ?? "")}</p>
         </div>
         {blocking ? (
-          <nav className="hc-queue-nav" aria-label="当前待办队列">
-            <button
-              type="button"
-              disabled={!hasPrevious}
-              onClick={onPrevious}
-              aria-label="查看上一个待办"
-            >
-              ← 上一个
-            </button>
-            <span><b>{queuePosition}</b> / {queueSize}</span>
-            <button
-              type="button"
-              disabled={!hasNext}
-              onClick={onNext}
-              aria-label="查看下一个待办"
-            >
-              下一个 →
-            </button>
-          </nav>
+          <div className="hc-head-actions">
+            <nav className="hc-queue-nav" aria-label="当前待办队列">
+              <button
+                type="button"
+                disabled={!hasPrevious}
+                onClick={onPrevious}
+                aria-label="查看上一个待办"
+              >
+                ← 上一个
+              </button>
+              <span><b>{queuePosition}</b> / {queueSize}</span>
+              <button
+                type="button"
+                disabled={!hasNext}
+                onClick={onNext}
+                aria-label="查看下一个待办"
+              >
+                下一个 →
+              </button>
+            </nav>
+            <button type="button" className="hc-close" onClick={onClose} aria-label="关闭需要你处理的事项">×</button>
+          </div>
         ) : (
           <div className="hc-head-actions">
             <button type="button" onClick={onBack}>返回请求列表</button>
@@ -2171,17 +2168,6 @@ function HumanRequestView({
       </header>
       <div className="hc-request-workspace">
         <main className="hc-request-core">
-          {request.kind !== "library_reconnect" ? (
-            <section className={`hc-waiting ${safeWork ? "local" : "quest"}`}>
-              <small>对研究的影响</small>
-              <b>{safeWork ? "只等待直接依赖，其他工作继续" : "当前没有安全且有意义的工作可继续"}</b>
-              <p>
-                {safeWork
-                  ? "这件事只暂停与它直接相关的任务，其他研究仍可继续。"
-                  : "提交回应后，系统会核对当前任务和所需材料；只有核对通过且没有其他阻碍，相关工作才会继续。"}
-              </p>
-            </section>
-          ) : null}
           <RequestForm
             request={request}
             commands={collaboration?.commands.items ?? []}
@@ -2278,7 +2264,6 @@ function RequestDetails({
         />
         <Detail label="Predecessor request" value={request.predecessor_request_ref ?? undefined} />
         <Detail label="Successor request" value={request.successor_request_ref ?? undefined} />
-        <Detail label="Business purpose" value={request.business_purpose} />
         <Detail label="TargetAssertion" value={stringify(request.target_assertion)} />
         <Detail label="Acceptance" value={request.acceptance_conditions?.join("；")} />
         <Detail label="Required authorization" value={stringify(request.required_authorization)} />
@@ -2403,7 +2388,7 @@ function IntentDraftingSession({
         {!scoped.length ? (
           <article>
             <small>当前事项</small>
-            <p>{request.obligation} 你可以询问状态、验收边界或讨论替代路线。</p>
+            <p>你可以询问当前状态，或讨论替代路线。</p>
           </article>
         ) : scoped.map((message, index) => (
           <article className={message.role === "user" ? "me" : ""} key={message.message_ref ?? index}>
@@ -2458,9 +2443,18 @@ async function acceptHumanRequestMaterial(
   requestRef: string,
   material: HumanRequestMaterial,
   response: HumanRequestResponseBody,
-): Promise<boolean> {
+): Promise<"none" | "asset_staged" | "response_recorded"> {
   const localPath = material.localPath.trim();
-  if (!material.file && !localPath) return false;
+  if (!material.file && !localPath) return "none";
+  if (!material.file && material.evidenceKind !== "library_fulltext") {
+    await respondToHumanRequest(requestRef, {
+      ...response,
+      linked_local_material: {
+        source_locator: material.localPath,
+      },
+    });
+    return "response_recorded";
+  }
   if (pendingAssetIntakeJobRef()) {
     throw new ProductError("asset_intake_recovery_required");
   }
@@ -2497,7 +2491,7 @@ async function acceptHumanRequestMaterial(
   if (result.status !== "accepted" || !result.asset) {
     throw new ProductError("asset_intake_not_terminal");
   }
-  return true;
+  return "asset_staged";
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -2518,6 +2512,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
   const [note, setNote] = useState("");
   const [pending, setPending] = useState(false);
   const [recorded, setRecorded] = useState(false);
+  const [retryStatus, setRetryStatus] = useState<"processing" | "succeeded" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const currentRequestRef = useRef(request.request_ref);
   const successRef = useRef<HTMLElement>(null);
@@ -2529,6 +2524,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
     setNote("");
     setPending(false);
     setRecorded(false);
+    setRetryStatus(null);
     setError(null);
   }, [request.request_ref, evaluationDecision]);
 
@@ -2605,12 +2601,12 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         markResponseRecorded();
         return;
       }
-      const acceptedMaterial = material
+      const materialResult = material
         ? await acceptHumanRequestMaterial(request.request_ref, material, response)
-        : false;
-      if (acceptedMaterial) {
+        : "none";
+      if (materialResult === "asset_staged") {
         await deliverPendingHumanRequestAssetResponse(request.request_ref);
-      } else {
+      } else if (materialResult === "none") {
         await respondToHumanRequest(request.request_ref, response);
       }
       markResponseRecorded();
@@ -2621,17 +2617,49 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
     }
   };
 
-  if (request.status !== "open") {
+  const retry = async () => {
+    if (pending || recorded || retryStatus === "processing") return;
+    setPending(true);
+    setError(null);
+    try {
+      const result = await retryHumanRequest(request.request_ref);
+      if (result.retry.status === "failed") {
+        setRetryStatus(null);
+        setError(result.retry.reason.code);
+        onChanged();
+        return;
+      }
+      setRetryStatus(result.retry.status);
+      onChanged();
+    } catch (caught) {
+      setError(reasonCode(caught));
+    } finally {
+      setPending(false);
+    }
+  };
+
+  if (request.status !== "open" || retryStatus === "succeeded") {
     return (
       <div className="hc-response-boundary" role="status">
-        <b>这件事已处理 · {requestStatusLabel(request.status)}</b><br />
+        <b>这件事已处理 · {requestStatusLabel(
+          retryStatus === "succeeded" ? "satisfied" : request.status,
+        )}</b><br />
         处理记录可在详情中查看；如果出现后续待办，可在那里补充。
       </div>
     );
   }
 
-  const awaitingOwner = recorded
-    || ((request.responses?.length ?? 0) > 0 && evaluationDecision !== "needs_input");
+  const latestResponse = request.responses?.at(-1);
+  const projectedRetryProcessing = request.kind === "system_operation_help"
+    && isRecord(latestResponse)
+    && latestResponse.decision === "provided"
+    && isRecord(latestResponse.facts)
+    && latestResponse.facts.action === "retry"
+    && request.evaluation === null
+    && request.disposition === null;
+  const retryProcessing = retryStatus === "processing" || projectedRetryProcessing;
+  const awaitingOwner = request.kind !== "system_operation_help" && (recorded
+    || ((request.responses?.length ?? 0) > 0 && evaluationDecision !== "needs_input"));
   if (awaitingOwner) {
     return (
       <section
@@ -2655,10 +2683,26 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending} />
       ) : null}
       {request.kind === "external_material_api_access" ? (
-        <ExternalForm note={note} setNote={setNote} submit={submit} disabled={pending} />
+        <NaturalLanguageMaterialForm
+          request={request}
+          note={note}
+          setNote={setNote}
+          submit={submit}
+          disabled={pending}
+          factPrefix="material"
+          evidenceKind="external_approval"
+        />
       ) : null}
       {request.kind === "offline_action" ? (
-        <OfflineForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending} />
+        <NaturalLanguageMaterialForm
+          request={request}
+          note={note}
+          setNote={setNote}
+          submit={submit}
+          disabled={pending}
+          factPrefix="result"
+          evidenceKind="offline_result"
+        />
       ) : null}
       {request.kind === "capability_authorization" ? (
         <PermissionForm
@@ -2672,23 +2716,39 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           onChanged={onChanged}
         />
       ) : null}
+      {request.kind === "system_operation_help" ? (
+        retryProcessing ? (
+          <section className="hc-submission-success" role="status">
+            <span aria-hidden="true">↻</span>
+            <div>
+              <h3>重试进行中</h3>
+              <p>正在执行当前绑定的同一操作；失败会显示新修订，成功后会显示完成。</p>
+            </div>
+          </section>
+        ) : (
+          <button
+            className="hc-submit"
+            type="button"
+            disabled={pending}
+            onClick={() => void retry()}
+          >重试</button>
+        )
+      ) : null}
       {error || request.kind !== "library_reconnect" ? (
       <div className="hc-response-boundary" role="status">
         {error ? (
-          <><b>回应没有记录</b><br />{error}</>
+          <><b>{request.kind === "system_operation_help" ? "重试未成功" : "回应没有记录"}</b><br />{error}</>
+        ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
+          <><b>提交只表示人的回应已接纳</b><br />这不代表材料充分、实验成功或研究结论为真；负责当前请求的 Agent 会解释回应并决定下一步。</>
+        ) : request.kind === "capability_authorization" ? (
+          <><b>文本提交不会授权</b><br />只有“接受”后的当前影响预览、精确确认与独立授权票据才会授权。</>
+        ) : request.kind === "system_operation_help" ? (
+          <><b>只重试当前绑定的失败操作</b><br />成功后只恢复它的精确依赖；失败会保留同一操作链并显示新修订。</>
         ) : (
           <><b>提交回应不会立即代表条件已经满足</b><br />系统会核对当前任务、材料和授权；只有核对通过且没有其他阻碍，相关工作才会继续。</>
         )}
       </div>
       ) : null}
-      {request.kind !== "library_reconnect" ? <button
-        type="button"
-        className="hc-defer"
-        disabled={pending}
-        onClick={() => void submit({}, "deferred")}
-      >
-        稍后处理
-      </button> : null}
     </>
   );
 }
@@ -2712,19 +2772,6 @@ function OptionalNote({
       <p>不需要先完成其他字段；核对时会判断是否还需补充。</p>
       <textarea value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />
     </label>
-  );
-}
-
-function ShortSteps({ steps }: { steps: Array<{ title: string; detail: string }> }) {
-  return (
-    <section className="hc-request-section">
-      <header><b>怎么做</b><small>三步即可</small></header>
-      <ol className="hc-short-steps">
-        {steps.map((step, index) => (
-          <li key={step.title}><i>{index + 1}</i><span><b>{step.title}</b><small>{step.detail}</small></span></li>
-        ))}
-      </ol>
-    </section>
   );
 }
 
@@ -2764,10 +2811,6 @@ function LibraryForm({
           <i>提供全文</i><b>手动上传该文献</b><small>提交文件或本地路径，等待系统核对。</small>
         </button>
       </section>
-      <div className="hc-secret-note" role="note">
-        <span aria-hidden="true">!</span>
-        <p><b>不要在这里提交密码、Cookie、验证码或 token。</b> 登录只在受控浏览器中完成。</p>
-      </div>
       {mode === "oa" ? (
         <section className="hc-choice-panel">
           <h4>提交 OA-only 路线回应？</h4>
@@ -2837,177 +2880,95 @@ function LibraryForm({
   );
 }
 
-function ExternalForm({
-  note,
-  setNote,
-  submit,
-  disabled,
-}: {
-  note: string;
-  setNote: (value: string) => void;
-  submit: SubmitResponse;
-  disabled: boolean;
-}) {
-  const [applicationRef, setApplicationRef] = useState("");
-  const [scope, setScope] = useState("");
-  const [localPath, setLocalPath] = useState("");
-  const [proofFile, setProofFile] = useState<File | null>(null);
-  const facts = useMemo(() => ({
-    ...(applicationRef ? { application_ref: applicationRef } : {}),
-    ...(scope ? { approved_scope: scope } : {}),
-  }), [applicationRef, scope]);
-  return (
-    <>
-      <RequestIntro>
-        <h3>本人完成外部申请，并把结果交回来。</h3>
-        <p>协议、身份验证和 secret 只在官方页面完成；不要把密码、Cookie、OTP 或 API secret 填在这里。</p>
-      </RequestIntro>
-      <ShortSteps steps={[
-        { title: "打开请求指定的官方页面", detail: "核对目标材料或 API 及真实申请主体。" },
-        { title: "完成协议并等待结果", detail: "培训、DUA、PI 或伦理声明留在外部系统。" },
-        { title: "把批准结果交回", detail: "可提供申请编号、获准范围和材料来源。" },
-      ]} />
-      <section className="hc-request-section">
-        <header><b>完成后交回</b><small>所有内容均可选</small></header>
-        <div className="hc-return-fields">
-          <label>申请编号 · 可选<input value={applicationRef} disabled={disabled} onChange={(event) => setApplicationRef(event.target.value)} /></label>
-          <label>获准版本与范围 · 可选<input value={scope} disabled={disabled} onChange={(event) => setScope(event.target.value)} /></label>
-          <label className="hc-file-picker full">
-            批准凭证 · 可选文件
-            <input
-              type="file"
-              accept="application/pdf,image/*"
-              aria-label="批准凭证文件"
-              disabled={disabled}
-              onChange={(event) => setProofFile(event.target.files?.[0] ?? null)}
-            />
-            <small>{proofFile ? `待接纳 · ${proofFile.name}` : "尚未选择文件"}</small>
-          </label>
-          <label className="full">
-            批准凭证本地路径 · 可选
-            <input
-              value={localPath}
-              disabled={disabled}
-              onChange={(event) => setLocalPath(event.target.value)}
-              placeholder="例如 /data/approvals/physionet-1842"
-            />
-          </label>
-        </div>
-        <p className="hc-asset-boundary">文件或路径会先安全保存并核对；核对通过后才会随回应交回。</p>
-      </section>
-      <OptionalNote value={note} onChange={setNote} placeholder="例如：审批周期太长，建议改用公开替代数据。" />
-      <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit(
-        facts,
-        "provided",
-        {
-          file: proofFile,
-          localPath,
-          factPrefix: "material",
-          evidenceKind: "external_approval",
-        },
-      )}>提交回应</button>
-    </>
-  );
-}
-
-function OfflineForm({
+function NaturalLanguageMaterialForm({
   request,
   note,
   setNote,
   submit,
   disabled,
+  factPrefix,
+  evidenceKind,
 }: {
   request: HumanRequestItem;
   note: string;
   setNote: (value: string) => void;
   submit: SubmitResponse;
   disabled: boolean;
+  factPrefix: "material" | "result";
+  evidenceKind: "external_approval" | "offline_result";
 }) {
-  const [steps, setSteps] = useState([false, false, false]);
-  const [deviceRef, setDeviceRef] = useState("");
-  const [temperature, setTemperature] = useState("");
-  const [resultPath, setResultPath] = useState("");
-  const [resultFile, setResultFile] = useState<File | null>(null);
-  const [deviation, setDeviation] = useState("");
-  const protocolMaterialRef = documentText(
-    request.target_assertion,
-    "protocol_material_ref",
-    "protocol_asset_ref",
-  );
-  const toggle = (index: number) => setSteps((current) => current.map((value, item) => item === index ? !value : value));
+  const [localPath, setLocalPath] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const condition = isRecord(request.target_assertion?.condition)
+    ? request.target_assertion.condition
+    : {};
+  const guidanceAssetRef = documentText(condition, "guidance_asset_ref");
   return (
     <>
-      <RequestIntro>
-        <h3>按已接纳协议完成线下操作，并交回原始结果。</h3>
-        <p>设备、环境或安全边界不匹配时应中止并记录原因；浏览器不会把勾选框当成领域验收。</p>
-      </RequestIntro>
       <section className="hc-request-section">
         <header>
-          <b>怎么做</b>
-          <small>先核对完整协议</small>
-          {protocolMaterialRef ? (
+          <b>你的回应</b>
+          <small>自然语言、一个文件或一个绝对路径</small>
+          {guidanceAssetRef ? (
             <a
               className="hc-protocol-download"
-              href={`/api/v1/research-assets/${encodeURIComponent(protocolMaterialRef)}/content`}
+              href={`/api/v1/research-assets/${encodeURIComponent(guidanceAssetRef)}/content`}
               download
             >
-              下载实验说明.md ↓
+              下载参考材料 ↓
             </a>
-          ) : (
-            <small className="hc-protocol-unavailable">暂无可下载协议</small>
-          )}
+          ) : null}
         </header>
-        <ol className="hc-short-steps">
-          {[
-            ["阅读协议并核对设备", "确认设备身份、安全边界和现场条件。"],
-            ["按协议执行线下操作", "保留原始观察，不替系统声称成功。"],
-            ["保留原始结果", "不要平滑、覆盖或删除异常；把完整记录交回。"],
-          ].map(([title, detail], index) => (
-            <li key={title}><i>{index + 1}</i><span><b>{title}</b><small>{detail}</small></span><label><input type="checkbox" checked={steps[index]} disabled={disabled} onChange={() => toggle(index)} />已完成</label></li>
-          ))}
-        </ol>
-      </section>
-      <section className="hc-request-section">
-        <header><b>完成后交回</b><small>所有内容均可选</small></header>
         <div className="hc-return-fields">
-          <label>设备或现场标识 · 可选<input value={deviceRef} disabled={disabled} onChange={(event) => setDeviceRef(event.target.value)} /></label>
-          <label>现场温度 · 可选<input value={temperature} disabled={disabled} onChange={(event) => setTemperature(event.target.value)} placeholder="例如 24.2°C" /></label>
+          <label className="full">
+            自然语言回应 · 可选
+            <textarea
+              aria-label="自然语言回应"
+              value={note}
+              disabled={disabled}
+              onChange={(event) => setNote(event.target.value)}
+              placeholder="写下结果、拒绝、限制或建议的替代路线。"
+            />
+          </label>
           <label className="hc-file-picker full">
-            原始结果 · 可选文件
+            浏览器文件 · 可选
             <input
               type="file"
-              accept=".zip,.csv,application/zip,text/csv,image/*"
-              aria-label="原始结果文件"
-              disabled={disabled}
-              onChange={(event) => setResultFile(event.target.files?.[0] ?? null)}
+              aria-label="回应文件"
+              disabled={disabled || Boolean(localPath.trim())}
+              onChange={(event) => {
+                setFile(event.target.files?.[0] ?? null);
+                setLocalPath("");
+              }}
             />
-            <small>{resultFile ? `待接纳 · ${resultFile.name}` : "尚未选择结果文件"}</small>
+            <small>{file ? `待接纳 · ${file.name}` : "尚未选择文件"}</small>
           </label>
           <label className="full">
-            原始结果本地路径 · 可选
+            绝对本地文件或目录路径 · 可选
             <input
-              value={resultPath}
-              disabled={disabled}
-              onChange={(event) => setResultPath(event.target.value)}
-              placeholder="例如 /data/experiments/fsr-04/run-07"
+              aria-label="绝对本地文件或目录路径"
+              value={localPath}
+              disabled={disabled || file !== null}
+              onChange={(event) => {
+                setLocalPath(event.target.value);
+                if (event.target.value) setFile(null);
+              }}
+              placeholder="例如 /data/research/result"
             />
           </label>
-          <label className="full">偏差、异常或中止原因 · 可选<textarea value={deviation} disabled={disabled} onChange={(event) => setDeviation(event.target.value)} /></label>
         </div>
-        <p className="hc-asset-boundary">结果文件或路径会先由 Research Memory 接纳；页面不会把文件选择冒充为领域验收。</p>
+        <p className="hc-asset-boundary">提交只表示你的回应已被接纳；负责当前请求的 Agent 会解释其含义。</p>
       </section>
-      <OptionalNote value={note} onChange={setNote} placeholder="例如：现场设备型号不符，建议先修改实验方案。" />
-      <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit({
-        completed_steps: steps.flatMap((done, index) => done ? [index + 1] : []),
-        ...(deviceRef ? { device_ref: deviceRef } : {}),
-        ...(temperature ? { temperature } : {}),
-        ...(deviation ? { deviation } : {}),
-      }, "provided", {
-        file: resultFile,
-        localPath: resultPath,
-        factPrefix: "result",
-        evidenceKind: "offline_result",
-      })}>提交回应</button>
+      <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit(
+        {},
+        "provided",
+        {
+          file,
+          localPath,
+          factPrefix,
+          evidenceKind,
+        },
+      )}>提交</button>
     </>
   );
 }
@@ -3031,7 +2992,7 @@ function PermissionForm({
   disabled: boolean;
   onChanged: () => void;
 }) {
-  const [decision, setDecision] = useState<"denied" | "allow_once" | null>(null);
+  const [decision, setDecision] = useState<"allow_once" | null>(null);
   const [recordedCommand, setRecordedCommand] = useState<HumanCommand | null>(null);
   const [recordedAuthorization, setRecordedAuthorization] = useState<HumanCapabilityAuthorization | null>(null);
   const [authorizationPending, setAuthorizationPending] = useState(false);
@@ -3114,31 +3075,17 @@ function PermissionForm({
     }
   };
 
-  const summary = [
-    ["允许什么", firstDefined(authorization, "capability", "method", "action")],
-    ["访问哪里", firstDefined(authorizationScope, "destination", "target")],
-    ["持续多久", firstDefined(authorizationScope, "duration", "expires_at", "valid_for")],
-    ["明确不允许", firstDefined(authorizationScope, "exclusions", "forbidden", "not_allowed")],
-  ] as const;
   return (
     <>
-      <RequestIntro>
-        <h3>决定是否允许精确、低频的能力扩张。</h3>
-        <p>日常、可撤销的本地研究已在现有范围内；这里仅处理超出范围的动作。</p>
-      </RequestIntro>
-      <section className="hc-permission-brief">
-        {summary.map(([label, value]) => (
-          <div key={label}><small>{label}</small><b>{stringify(value)}</b></div>
-        ))}
-      </section>
       {request.impact_preview ? <ImpactPreview preview={request.impact_preview} /> : (
         <p className="hc-preview-missing">影响说明尚未提供；提交只记录回应，不代表动作已经执行。</p>
       )}
+      <OptionalNote value={note} onChange={setNote} placeholder="写下限制、疑问或建议的替代方案。" />
       <div className="hc-permission-actions">
-        <button type="button" aria-pressed={decision === "denied"} onClick={() => setDecision("denied")}>拒绝这次访问</button>
-        <button type="button" className="allow" aria-pressed={decision === "allow_once"} onClick={() => setDecision("allow_once")}>仅允许本次任务</button>
+        <button type="button" disabled={disabled} onClick={() => void submit({}, "deferred")}>提交</button>
+        <button type="button" disabled={disabled} onClick={() => void submit({}, "declined")}>拒绝</button>
+        <button type="button" className="allow" disabled={disabled} aria-pressed={decision === "allow_once"} onClick={() => setDecision("allow_once")}>接受</button>
       </div>
-      <OptionalNote value={note} onChange={setNote} placeholder="例如：仅允许 /metadata，并限制最多下载 10 MB。" />
       {decision === "allow_once" ? (
         <section className="lumen-command" data-command-status={command?.status ?? "required"}>
           <small>本次精确授权</small>
@@ -3203,14 +3150,6 @@ function PermissionForm({
           ) : null}
           {authorizationError ? <em role="alert">授权步骤失败 · {authorizationError}</em> : null}
         </section>
-      ) : null}
-      {decision === "denied" ? (
-        <button
-          className="hc-submit"
-          type="button"
-          disabled={disabled}
-          onClick={() => void submit({}, "declined")}
-        >提交拒绝</button>
       ) : null}
       {decision === "allow_once" && authorizationReceipt ? (
         <button

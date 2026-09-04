@@ -710,6 +710,10 @@ class WritingReportService:
         if any(item is not None for item in expected):
             if not all(isinstance(item, str) and item for item in expected):
                 raise OwnerConflict("writing_worker_claim_invalid")
+            if self._recover_pending_system_operation_help_retry(
+                expected_run_ref=cast(str, expected_run_ref)
+            ):
+                return True
             observed = self._agent_runtime.query_writing_report(
                 cast(str, expected_run_ref)
             )
@@ -730,11 +734,27 @@ class WritingReportService:
                 return False
             runs = (observed,)
         else:
+            if self._recover_pending_system_operation_help_retry():
+                return True
             runs = self._agent_runtime.query_active_writing_reports()
         for run in runs:
             if run.status == "blocked":
                 self._resume_contract_correction(run)
                 return True
+            if self._complete_system_operation_help_retry(run) is not None:
+                return True
+            pending_help = self._current_system_operation_help(run)
+            if pending_help is not None:
+                target, _waiter, effect_id = _writing_system_help_binding(
+                    pending_help
+                )
+                if _system_operation_retry_response(
+                    pending_help, effect_id
+                ) is None:
+                    # A crash may leave the failed Attempt active after the
+                    # HumanRequest was durably opened. Do not rerun its sealed
+                    # provider job until the exact Retry response is recorded.
+                    return True
             try:
                 self._agent_runtime.verify_current_writing_attempt(
                     run_ref=run.run_ref,
@@ -826,6 +846,9 @@ class WritingReportService:
                             "writing-checkpoint", run.run_ref, run.attempt_ref
                         ),
                     )
+                    current = self._agent_runtime.query_writing_report(run.run_ref)
+                    if current is not None:
+                        self._complete_system_operation_help_retry(current)
                 except (WritingSkillUnavailable, OwnerConflict) as error:
                     provider_safe = error.code != _PROVIDER_RECONCILIATION_PENDING
                     native_session_ref = getattr(error, "native_session_ref", None)
@@ -867,7 +890,13 @@ class WritingReportService:
                                 run, error.code
                             )
                         else:
-                            self._block_if_still_current(run, error.code)
+                            self._block_if_still_current(
+                                run,
+                                error.code,
+                                offer_human_retry=isinstance(
+                                    error, WritingSkillUnavailable
+                                ),
+                            )
                 finally:
                     if unit_ref is not None and provider_safe:
                         self._acknowledge_provider_unit(run, unit_ref)
@@ -931,6 +960,9 @@ class WritingReportService:
                             "writing-execution", run.run_ref, run.attempt_ref
                         ),
                     )
+                    current = self._agent_runtime.query_writing_report(run.run_ref)
+                    if current is not None:
+                        self._complete_system_operation_help_retry(current)
                 except (WritingSkillUnavailable, OwnerConflict) as error:
                     provider_safe = error.code != _PROVIDER_RECONCILIATION_PENDING
                     review_session_ref = (
@@ -975,7 +1007,13 @@ class WritingReportService:
                                 run, error.code
                             )
                         else:
-                            self._block_if_still_current(run, error.code)
+                            self._block_if_still_current(
+                                run,
+                                error.code,
+                                offer_human_retry=isinstance(
+                                    error, WritingSkillUnavailable
+                                ),
+                            )
                     return True
                 finally:
                     if unit_ref is not None and provider_safe:
@@ -1162,6 +1200,393 @@ class WritingReportService:
                     )
                 )
         return self.query_writing_report(run_ref)
+
+    def _open_failed_operation_human_request(
+        self,
+        run: WritingRun,
+        *,
+        failure_code: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        """Expose only Writing's existing retry when its Agent is unavailable."""
+
+        if run.status != "active":
+            raise OwnerConflict("writing_operation_not_retryable")
+        target = _writing_system_help_target(
+            run,
+            failure_code=failure_code,
+        )
+        waiter_ref = "writing_retry:" + str(target["effect_id"])
+        return self._agent_runtime.open_human_request(
+            request_kind="system_operation_help",
+            obligation=failure_code,
+            business_purpose=(
+                "Retry only this failed Writing operation and preserve "
+                "its existing run lineage."
+            ),
+            target_assertion=target,
+            acceptance_conditions=(
+                "The existing Writing resume action succeeds for this exact failed attempt.",
+            ),
+            direct_waiter={
+                "waiter_ref": waiter_ref,
+                "generation": run.attempt_generation,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            quest_ref=run.quest_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def retry_system_operation_help(
+        self,
+        request_ref: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        """Retry one exact failed Writing operation behind a kind-5 request."""
+
+        request = self._agent_runtime.query_human_request(request_ref)
+        if request is None:
+            raise OwnerConflict("human_request_not_found")
+        target, _waiter, effect_id = _writing_system_help_binding(request)
+        if request.get("status") == "superseded":
+            successor_ref = request.get("successor_request_ref")
+            successor = (
+                self._agent_runtime.query_human_request(successor_ref)
+                if isinstance(successor_ref, str)
+                else None
+            )
+            successor_target = (
+                None if successor is None else successor.get("target_assertion")
+            )
+            if (
+                successor is None
+                or successor.get("request_id") != request.get("request_id")
+                or not isinstance(successor_target, dict)
+                or successor_target.get("effect_id") != effect_id
+            ):
+                raise OwnerConflict("system_operation_retry_stale")
+            return {
+                **successor,
+                "retry": {
+                    "status": "failed",
+                    "reason": {
+                        "code": successor_target.get(
+                            "failure_code", "system_operation_retry_failed"
+                        ),
+                    },
+                },
+            }
+        request_status = request.get("status")
+        if request_status not in {"open", "satisfied"}:
+            raise OwnerConflict("system_operation_retry_stale")
+        if request_status == "satisfied":
+            current_run = self._agent_runtime.query_writing_report(
+                cast(str, target["run_ref"])
+            )
+            if current_run is not None:
+                self._complete_system_operation_help_retry(current_run)
+            completed = self._agent_runtime.query_human_request(request_ref)
+            completed_waiters = (
+                None if completed is None else completed.get("direct_waiters")
+            )
+            if (
+                completed is None
+                or not isinstance(completed_waiters, list)
+                or len(completed_waiters) != 1
+                or not isinstance(completed_waiters[0], dict)
+                or completed_waiters[0].get("status") != "consumed"
+            ):
+                raise OwnerConflict("system_operation_retry_incomplete")
+            return {**completed, "retry": {"status": "succeeded"}}
+
+        if _system_operation_retry_response(request, effect_id) is None:
+            self._human_collaboration.respond_to_human_request(
+                request_ref,
+                decision="provided",
+                facts={"action": "retry", "effect_id": effect_id},
+                note="",
+                idempotency_key=_operation_key(
+                    "writing-system-help-response", request_ref, idempotency_key
+                ),
+            )
+        try:
+            self._start_system_operation_help_retry(
+                target,
+                request_ref=request_ref,
+                effect_id=effect_id,
+            )
+        except OwnerConflict as error:
+            blocked = self._agent_runtime.query_writing_report(
+                cast(str, target["run_ref"])
+            )
+            if (
+                blocked is None
+                or blocked.status != "blocked"
+                or blocked.attempt_ref != target["attempt_ref"]
+                or blocked.fence_ref != target["fence_ref"]
+            ):
+                raise
+            revised = self._revise_system_operation_help(
+                request,
+                blocked,
+                failure_code=error.code,
+            )
+            return {
+                **revised,
+                "retry": {"status": "failed", "reason": {"code": error.code}},
+            }
+        current = self._agent_runtime.query_human_request(request_ref)
+        if current is None:
+            raise OwnerConflict("human_request_not_found")
+        return {**current, "retry": {"status": "processing"}}
+
+    def _start_system_operation_help_retry(
+        self,
+        target: dict[str, object],
+        *,
+        request_ref: str,
+        effect_id: str,
+    ) -> None:
+        run_ref = cast(str, target["run_ref"])
+        run = self._agent_runtime.query_writing_report(run_ref)
+        if (
+            run is None
+            or run.root_session_ref != target["root_session_ref"]
+            or run.runtime_binding_hash != target["runtime_binding_hash"]
+        ):
+            raise OwnerConflict("system_operation_retry_binding_invalid")
+        targets_failed_attempt = (
+            run.attempt_ref == target["attempt_ref"]
+            and run.fence_ref == target["fence_ref"]
+        )
+        if run.status == "active" and targets_failed_attempt:
+            try:
+                run = self._agent_runtime.fail_writing_report(
+                    run_ref=run_ref,
+                    attempt_ref=cast(str, target["attempt_ref"]),
+                    fence_ref=cast(str, target["fence_ref"]),
+                    failure_code=cast(str, target["failure_code"]),
+                )
+            except OwnerConflict:
+                run = self._agent_runtime.query_writing_report(run_ref)
+                if run is None:
+                    raise
+        if (
+            run.status == "blocked"
+            and run.attempt_ref == target["attempt_ref"]
+            and run.fence_ref == target["fence_ref"]
+        ):
+            self.control_report(
+                run_ref,
+                action="resume",
+                expected_attempt_ref=cast(str, target["attempt_ref"]),
+                expected_fence_ref=cast(str, target["fence_ref"]),
+                idempotency_key=_operation_key(
+                    "writing-system-help-retry", request_ref, effect_id
+                ),
+            )
+            return
+        if (
+            run.status != "active"
+            or run.attempt_ref == target["attempt_ref"]
+            or run.fence_ref == target["fence_ref"]
+            or run.root_session_ref != target["root_session_ref"]
+            or run.runtime_binding_hash != target["runtime_binding_hash"]
+        ):
+            raise OwnerConflict("system_operation_retry_binding_invalid")
+
+    def _recover_pending_system_operation_help_retry(
+        self, *, expected_run_ref: str | None = None
+    ) -> bool:
+        for request in self._agent_runtime.query_human_requests():
+            target = request.get("target_assertion")
+            if (
+                request.get("status") != "open"
+                or request.get("kind") != "system_operation_help"
+                or request.get("open_effect") is not None
+                or not isinstance(target, dict)
+                or target.get("schema_ref")
+                != "meta-research/writing-system-operation-help/v1"
+            ):
+                continue
+            target, _waiter, effect_id = _writing_system_help_binding(request)
+            if (
+                expected_run_ref is not None
+                and target["run_ref"] != expected_run_ref
+            ):
+                continue
+            response = _system_operation_retry_response(request, effect_id)
+            if response is None:
+                continue
+            run = self._agent_runtime.query_writing_report(
+                cast(str, target["run_ref"])
+            )
+            if run is None:
+                raise OwnerConflict("system_operation_retry_binding_invalid")
+            if (
+                run.attempt_ref == target["attempt_ref"]
+                and run.fence_ref == target["fence_ref"]
+                and run.status in {"active", "blocked"}
+            ):
+                self.retry_system_operation_help(
+                    cast(str, request["request_ref"]),
+                    idempotency_key=_operation_key(
+                        "writing-system-help-recovery",
+                        cast(str, response["response_ref"]),
+                    ),
+                )
+                return True
+        return False
+
+    def _current_system_operation_help(
+        self, run: WritingRun
+    ) -> dict[str, object] | None:
+        matches = []
+        for request in self._agent_runtime.query_human_requests(
+            quest_ref=run.quest_ref
+        ):
+            target = request.get("target_assertion")
+            waiters = request.get("direct_waiters")
+            completed = (
+                request.get("status") == "satisfied"
+                and isinstance(waiters, list)
+                and len(waiters) == 1
+                and isinstance(waiters[0], dict)
+                and waiters[0].get("status") == "consumed"
+            )
+            if (
+                request.get("kind") == "system_operation_help"
+                and not completed
+                and request.get("open_effect") is None
+                and isinstance(target, dict)
+                and target.get("schema_ref")
+                == "meta-research/writing-system-operation-help/v1"
+                and target.get("run_ref") == run.run_ref
+            ):
+                matches.append(request)
+        if len(matches) > 1:
+            raise OwnerConflict("system_operation_help_identity_conflict")
+        return matches[0] if matches else None
+
+    def _revise_system_operation_help(
+        self,
+        request: dict[str, object],
+        failed_run: WritingRun,
+        *,
+        failure_code: str,
+    ) -> dict[str, object]:
+        target, waiter, effect_id = _writing_system_help_binding(request)
+        if (
+            failed_run.run_ref != target["run_ref"]
+            or failed_run.status not in {"active", "blocked"}
+            or failed_run.root_session_ref != target["root_session_ref"]
+            or failed_run.runtime_binding_hash != target["runtime_binding_hash"]
+        ):
+            raise OwnerConflict("system_operation_retry_binding_invalid")
+        next_target = {
+            **target,
+            "attempt_ref": failed_run.attempt_ref,
+            "fence_ref": failed_run.fence_ref,
+            "failure_code": failure_code,
+        }
+        return self._agent_runtime.revise_human_request(
+            cast(str, request["request_ref"]),
+            expected_revision=cast(int, request["revision"]),
+            obligation=failure_code,
+            target_assertion=next_target,
+            acceptance_conditions=tuple(
+                cast(list[str], request["acceptance_conditions"])
+            ),
+            direct_waiters=(
+                {
+                    "waiter_ref": waiter["waiter_ref"],
+                    "generation": cast(int, waiter["generation"]) + 1,
+                    "target_assertion": next_target,
+                    "wait_scope": waiter["wait_scope"],
+                    "other_blockers": waiter.get("other_blockers", []),
+                },
+            ),
+            required_authorization=None,
+            idempotency_key=_operation_key(
+                "writing-system-help-revision",
+                cast(str, request["request_ref"]),
+                failed_run.attempt_ref,
+                effect_id,
+                failure_code,
+            ),
+        )
+
+    def _complete_system_operation_help_retry(
+        self, run: WritingRun
+    ) -> dict[str, object] | None:
+        request = self._current_system_operation_help(run)
+        if request is None:
+            return None
+        target, waiter, effect_id = _writing_system_help_binding(request)
+        if waiter.get("status") == "consumed":
+            return None
+        response = _system_operation_retry_response(request, effect_id)
+        if (
+            not isinstance(response, dict)
+            or run.status != "active"
+            or run.root_session_ref != target["root_session_ref"]
+            or run.runtime_binding_hash != target["runtime_binding_hash"]
+        ):
+            return None
+        phase = target["phase"]
+        if phase == "writing-primary":
+            evidence_ref = None if run.checkpoint is None else run.checkpoint.checkpoint_ref
+            evidence_hash = None if run.checkpoint is None else run.checkpoint.markdown_hash
+        else:
+            evidence_ref = None if run.execution is None else run.execution.execution_ref
+            evidence_hash = (
+                None if run.execution is None else run.execution.final_markdown_hash
+            )
+        if evidence_ref is None or evidence_hash is None:
+            return None
+        request_ref = cast(str, request["request_ref"])
+        if request.get("status") == "open":
+            self._agent_runtime.evaluate_human_request(
+                request_ref,
+                response_refs=(cast(str, response["response_ref"]),),
+                decision="satisfied",
+                reason_code="system_operation_retry_succeeded",
+                accepted_evidence_refs=(evidence_ref,),
+                idempotency_key=_operation_key(
+                    "writing-system-help-satisfied", request_ref, effect_id
+                ),
+            )
+        self._agent_runtime.validate_human_request_waiter(
+            request_ref,
+            waiter_ref=cast(str, waiter["waiter_ref"]),
+            generation=cast(int, waiter["generation"]),
+            target_assertion=target,
+            other_blockers=(),
+            idempotency_key=_operation_key(
+                "writing-system-help-release", request_ref, effect_id
+            ),
+        )
+        self._agent_runtime.consume_system_operation_help_waiter(
+            request_ref,
+            waiter_ref=cast(str, waiter["waiter_ref"]),
+            generation=cast(int, waiter["generation"]),
+            work_ref=run.run_ref,
+            work_hash=canonical_hash(
+                {
+                    "effect_id": effect_id,
+                    "request_ref": request_ref,
+                    "attempt_ref": run.attempt_ref,
+                    "fence_ref": run.fence_ref,
+                    "phase": phase,
+                    "evidence_ref": evidence_ref,
+                    "evidence_hash": evidence_hash,
+                }
+            ),
+        )
+        return self._agent_runtime.query_human_request(request_ref)
 
     def preview_report_cancellation(
         self, run_ref: str, *, idempotency_key: str
@@ -2500,7 +2925,13 @@ class WritingReportService:
         reason = result.failure_code or f"asset_intake_{result.status}"
         return f"writing_deliverable:{reason}"[:128]
 
-    def _block_if_still_current(self, run: WritingRun, code: str) -> None:
+    def _block_if_still_current(
+        self,
+        run: WritingRun,
+        code: str,
+        *,
+        offer_human_retry: bool = False,
+    ) -> None:
         current = self._agent_runtime.query_writing_report(run.run_ref)
         if (
             current is not None
@@ -2508,12 +2939,52 @@ class WritingReportService:
             and current.attempt_ref == run.attempt_ref
             and current.fence_ref == run.fence_ref
         ):
-            self._agent_runtime.fail_writing_report(
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                failure_code=code,
-            )
+            if offer_human_retry:
+                existing = self._current_system_operation_help(current)
+            else:
+                existing = None
+            if existing is not None:
+                _target, _waiter, effect_id = _writing_system_help_binding(
+                    existing
+                )
+                if (
+                    existing.get("status") == "open"
+                    and _system_operation_retry_response(existing, effect_id)
+                    is not None
+                ):
+                    self._revise_system_operation_help(
+                        existing,
+                        current,
+                        failure_code=code,
+                    )
+            elif offer_human_retry:
+                self._open_failed_operation_human_request(
+                    current,
+                    failure_code=code,
+                    idempotency_key=_operation_key(
+                        "writing-system-help-open",
+                        current.run_ref,
+                        current.attempt_ref,
+                        code,
+                    ),
+                )
+            try:
+                self._agent_runtime.fail_writing_report(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    failure_code=code,
+                )
+            except OwnerConflict:
+                taken_over = self._agent_runtime.query_writing_report(run.run_ref)
+                if (
+                    not offer_human_retry
+                    or taken_over is None
+                    or taken_over.status != "active"
+                    or taken_over.attempt_ref == run.attempt_ref
+                    or taken_over.fence_ref == run.fence_ref
+                ):
+                    raise
 
     @staticmethod
     def _is_provider_contract_correction(code: str) -> bool:
@@ -2634,6 +3105,130 @@ def _receipt(value: object) -> AcceptanceReceipt:
         )
     except (KeyError, TypeError) as error:
         raise OwnerConflict("writing_confirmation_receipt_invalid") from error
+
+
+def _writing_retry_effect_id(
+    *,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+    failure_code: str,
+) -> str:
+    return "writing_resume:" + canonical_hash(
+        {
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "fence_ref": fence_ref,
+            "failure_code": failure_code,
+        }
+    )
+
+
+def _writing_system_help_target(
+    run: WritingRun,
+    *,
+    failure_code: str,
+) -> dict[str, object]:
+    if not failure_code or len(failure_code) > 128:
+        raise OwnerConflict("writing_operation_not_retryable")
+    return {
+        "schema_ref": "meta-research/writing-system-operation-help/v1",
+        "component": "writing",
+        "operation": "resume",
+        "phase": (
+            "writing-primary" if run.checkpoint is None else "writing-review"
+        ),
+        "run_ref": run.run_ref,
+        "attempt_ref": run.attempt_ref,
+        "fence_ref": run.fence_ref,
+        "origin_attempt_ref": run.attempt_ref,
+        "origin_fence_ref": run.fence_ref,
+        "origin_failure_code": failure_code,
+        "root_session_ref": run.root_session_ref,
+        "runtime_binding_hash": run.runtime_binding_hash,
+        "failure_code": failure_code,
+        "effect_id": _writing_retry_effect_id(
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            failure_code=failure_code,
+        ),
+    }
+
+
+def _writing_system_help_binding(
+    request: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object], str]:
+    target = request.get("target_assertion")
+    waiters = request.get("direct_waiters")
+    if (
+        request.get("issuer") != "agent_runtime"
+        or request.get("kind") != "system_operation_help"
+        or request.get("open_effect") is not None
+        or not isinstance(target, dict)
+        or target.get("schema_ref")
+        != "meta-research/writing-system-operation-help/v1"
+        or target.get("component") != "writing"
+        or target.get("operation") != "resume"
+        or target.get("phase") not in {"writing-primary", "writing-review"}
+        or not isinstance(waiters, list)
+        or len(waiters) != 1
+        or not isinstance(waiters[0], dict)
+    ):
+        raise OwnerConflict("system_operation_retry_unavailable")
+    required_fields = (
+        "run_ref",
+        "attempt_ref",
+        "fence_ref",
+        "origin_attempt_ref",
+        "origin_fence_ref",
+        "origin_failure_code",
+        "root_session_ref",
+        "runtime_binding_hash",
+        "failure_code",
+        "effect_id",
+    )
+    if (
+        any(
+            not isinstance(target.get(field), str) or not target[field]
+            for field in required_fields
+        )
+    ):
+        raise OwnerConflict("system_operation_retry_binding_invalid")
+    effect_id = _writing_retry_effect_id(
+        run_ref=cast(str, target["run_ref"]),
+        attempt_ref=cast(str, target["origin_attempt_ref"]),
+        fence_ref=cast(str, target["origin_fence_ref"]),
+        failure_code=cast(str, target["origin_failure_code"]),
+    )
+    waiter = cast(dict[str, object], waiters[0])
+    if (
+        target["effect_id"] != effect_id
+        or waiter.get("waiter_ref") != "writing_retry:" + effect_id
+        or waiter.get("target_assertion") != target
+        or not isinstance(waiter.get("generation"), int)
+    ):
+        raise OwnerConflict("system_operation_retry_binding_invalid")
+    return target, waiter, effect_id
+
+
+def _system_operation_retry_response(
+    request: dict[str, object], effect_id: str
+) -> dict[str, object] | None:
+    responses = request.get("responses")
+    if not isinstance(responses, list):
+        return None
+    for response in reversed(responses):
+        facts = None if not isinstance(response, dict) else response.get("facts")
+        if (
+            isinstance(response, dict)
+            and response.get("decision") == "provided"
+            and isinstance(facts, dict)
+            and facts.get("action") == "retry"
+            and facts.get("effect_id") == effect_id
+        ):
+            return response
+    return None
 
 
 def _operation_key(*parts: str) -> str:

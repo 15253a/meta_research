@@ -329,6 +329,7 @@ def create_semantic_owner_gateway(
         ),
         *_root_agent_human_request_operations(
             agent_runtime=agent_runtime,
+            research_memory=research_memory,
         ),
         *_root_agent_acquisition_operations(
             agent_runtime=agent_runtime,
@@ -668,6 +669,7 @@ def _target_work_operations(
 def _root_agent_human_request_operations(
     *,
     agent_runtime: AgentRuntimeInterface,
+    research_memory: ResearchMemoryInterface | None,
 ) -> tuple[SemanticOperation, SemanticOperation]:
     open_id, reconcile_id = ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
     return (
@@ -675,9 +677,12 @@ def _root_agent_human_request_operations(
             semantic_operation_id=open_id,
             owning_module="agent_runtime",
             description=(
-                "Open one blocking HumanRequest for this exact authenticated Root "
-                "operation. The server derives ownership and waiter identity; any "
-                "participating Agent Session holding the operation bearer may call it."
+                "Solve autonomously when the Agent or system can do so; open a "
+                "HumanRequest only for a genuine human obligation or action. Open "
+                "one blocking HumanRequest for this exact authenticated Root "
+                "operation, with the kind chosen explicitly by the Agent. The "
+                "server derives ownership and waiter identity; any participating "
+                "Agent Session holding the operation bearer may call it."
             ),
             input_schema=_root_human_request_open_input_schema(),
             output_schema=_root_human_request_output_schema(),
@@ -685,6 +690,7 @@ def _root_agent_human_request_operations(
             reconciliation_operation_id=reconcile_id,
             handler=lambda context, arguments: _open_root_agent_human_request(
                 agent_runtime,
+                research_memory,
                 context,
                 arguments,
             ),
@@ -984,12 +990,39 @@ def _root_agent_acquisition_item_result(
 
 def _open_root_agent_human_request(
     owner: AgentRuntimeInterface,
+    research_memory: ResearchMemoryInterface | None,
     context: SemanticCallContext,
     arguments: dict[str, object],
 ) -> dict[str, object]:
     effect_id, effect_key = _semantic_effect_key(context, arguments)
     scope = _root_agent_human_request_scope(owner, context)
     command = _root_human_request_command(arguments)
+    if (
+        command.request_kind == "system_operation_help"
+        and command.predecessor_request_ref is not None
+    ):
+        # Keep the Agent-visible effect identity stable while giving each
+        # repeat-failure revision its own replay key and immutable open receipt.
+        effect_key = "mcp-effect:" + canonical_hash(
+            {
+                "logical_effect_key": effect_key,
+                "predecessor_request_ref": command.predecessor_request_ref,
+            }
+        )
+    guidance_asset_ref = command.condition.get("guidance_asset_ref")
+    if isinstance(guidance_asset_ref, str):
+        try:
+            guidance = (
+                None
+                if research_memory is None
+                else research_memory.query_asset_version(guidance_asset_ref)
+            )
+        except OwnerConflict as error:
+            raise SemanticMcpError(
+                "root_agent_human_request_guidance_invalid"
+            ) from error
+        if guidance is None:
+            raise SemanticMcpError("root_agent_human_request_guidance_invalid")
     generation = _root_human_request_generation(
         owner,
         scope=scope,
@@ -1165,6 +1198,12 @@ def _root_human_request_command(
             request_kind != "capability_authorization"
             and authorization is not None
         )
+        or (
+            isinstance(condition, dict)
+            and "guidance_asset_ref" in condition
+            and request_kind
+            not in {"external_material_api_access", "offline_action"}
+        )
     ):
         raise SemanticMcpError("root_agent_human_request_condition_invalid")
     normalized_conditions = tuple(
@@ -1174,8 +1213,8 @@ def _root_human_request_command(
         raise SemanticMcpError("root_agent_human_request_condition_invalid")
     return _RootHumanRequestCommand(
         request_kind=str(request_kind),
-        obligation=obligation.strip(),
-        business_purpose=business_purpose.strip(),
+        obligation=obligation,
+        business_purpose=business_purpose,
         condition=condition,
         acceptance_conditions=normalized_conditions,
         required_authorization=(
@@ -1213,10 +1252,15 @@ def _valid_root_human_request_authorization(value: object) -> bool:
 def _valid_root_human_request_condition(value: object) -> bool:
     if not isinstance(value, dict):
         return False
-    if set(value) == {"impact", "safe_response"}:
+    generic_fields = {"impact", "safe_response"}
+    if set(value) in (generic_fields, generic_fields | {"guidance_asset_ref"}):
         return all(
             isinstance(value.get(name), str) and bool(value.get(name))
             for name in ("impact", "safe_response")
+        ) and (
+            "guidance_asset_ref" not in value
+            or isinstance(value.get("guidance_asset_ref"), str)
+            and bool(value.get("guidance_asset_ref"))
         )
     if set(value) != {"schema_ref", "root", "condition"}:
         return False
@@ -2627,13 +2671,32 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
     return _closed_object(
         {
             "effect_id": _string(max_length=128),
-            "request_kind": _string(enum=tuple(sorted(HUMAN_REQUEST_KINDS))),
-            "obligation": _string(max_length=8000),
-            "business_purpose": _string(max_length=4000),
+            "request_kind": {
+                **_string(enum=tuple(sorted(HUMAN_REQUEST_KINDS))),
+                "description": (
+                    "Agent-selected kind: library_reconnect for library access; "
+                    "external_material_api_access for internet, material, or API "
+                    "human work; offline_action only for research-related physical "
+                    "or offline work; capability_authorization for formal permission; "
+                    "system_operation_help for a Meta Research runtime failure."
+                ),
+            },
+            "obligation": {
+                **_string(max_length=8000),
+                "description": "Raw Agent-written short title.",
+            },
+            "business_purpose": {
+                **_string(max_length=4000),
+                "description": "Raw Agent-written primary body.",
+            },
             "condition": _closed_object(
                 {
                     "impact": _string(max_length=4000),
                     "safe_response": _string(max_length=4000),
+                    "guidance_asset_ref": {
+                        **_string(max_length=96),
+                        "description": "One already accepted Research Asset version.",
+                    },
                 },
                 required=("impact", "safe_response"),
             ),

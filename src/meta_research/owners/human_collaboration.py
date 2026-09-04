@@ -228,6 +228,8 @@ class HumanCollaborationInterface(Protocol):
         self, *, quest_ref: str
     ) -> tuple[dict[str, object], ...]: ...
 
+    def query_human_request(self, request_ref: str) -> dict[str, object] | None: ...
+
     def respond_to_human_request(
         self,
         request_ref: str,
@@ -1912,6 +1914,16 @@ class SQLiteHumanCollaboration:
                     raise OwnerConflict("human_request_identity_conflict")
                 by_ref[request_ref] = request
         return tuple(by_ref[key] for key in sorted(by_ref))
+
+    def query_human_request(self, request_ref: str) -> dict[str, object] | None:
+        """Read one exact HumanRequest across the established issuing Owners."""
+
+        try:
+            return self._query_issuing_owner_request(request_ref)
+        except OwnerConflict as error:
+            if error.code == "human_request_not_found":
+                return None
+            raise
 
     def send_companion_message(
         self,
@@ -3711,20 +3723,12 @@ class SQLiteHumanCollaboration:
             raise OwnerConflict("human_response_facts_too_large")
         if not isinstance(note, str) or len(note) > 4000:
             raise OwnerConflict("human_response_note_invalid")
-        note = note.strip()
         if (
             not idempotency_key
             or len(idempotency_key) > 128
             or contains_secret(idempotency_key)
         ):
             raise OwnerConflict("idempotency_key_invalid")
-        if contains_secret(facts) or contains_secret(note):
-            request = self._query_issuing_owner_request(request_ref)
-            self._record_human_response_rejection(
-                request,
-                idempotency_key=idempotency_key,
-            )
-            raise OwnerConflict("human_response_secret_forbidden")
         command = {
             "command": "respond_to_human_request",
             "request_ref": request_ref,
@@ -10372,11 +10376,7 @@ def _public_human_response(row) -> dict[str, object]:
         facts = decoded_object(row.facts_json)
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise OwnerConflict("human_response_receipt_invalid") from error
-    if (
-        canonical_hash(facts) != row.facts_hash
-        or contains_secret(facts)
-        or contains_secret(row.note)
-    ):
+    if canonical_hash(facts) != row.facts_hash:
         raise OwnerConflict("human_response_receipt_invalid")
     payload = {
         "schema_ref": HUMAN_RESPONSE_RECEIPT_SCHEMA,
