@@ -519,11 +519,25 @@ import sys
 
 
 expected_codex_home = {str(expected_codex_home)!r}
+expected_codex_cache = str(pathlib.Path(expected_codex_home) / "cache")
+expected_codex_tmp = str(pathlib.Path(expected_codex_home) / "tmp")
 assert os.environ.get("CODEX_HOME") == expected_codex_home
 assert os.environ.get("CODEX_SQLITE_HOME") == expected_codex_home
+assert os.environ.get("XDG_CACHE_HOME") == expected_codex_cache
+assert os.environ.get("PIP_CACHE_DIR") == str(
+    pathlib.Path(expected_codex_cache) / "pip"
+)
+assert os.environ.get("npm_config_cache") == str(
+    pathlib.Path(expected_codex_cache) / "npm"
+)
+assert os.environ.get("UV_CACHE_DIR") == str(
+    pathlib.Path(expected_codex_cache) / "uv"
+)
+for name in ("TMPDIR", "TEMP", "TMP", "SQLITE_TMPDIR"):
+    assert os.environ.get(name) == expected_codex_tmp
 args = sys.argv[1:]
 if args == ["--version"]:
-    print("codex-cli 0.147.0")
+    print("codex-cli 0.153.2")
     raise SystemExit(0)
 assert args[0] == "exec"
 assert "--skip-git-repo-check" in args

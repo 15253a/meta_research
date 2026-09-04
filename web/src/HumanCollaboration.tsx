@@ -152,6 +152,29 @@ function submitTextareaOnEnter(
 
 const COMPANION_MESSAGE_PAGE_SIZE = 50;
 
+type OptimisticCompanionMessage = {
+  localRef: number;
+  scopeRef: string;
+  content: string;
+  interactionRef: string | null;
+  matchingProjectedMessagesAtSend: number;
+  status: "sending" | "queued";
+};
+
+function optimisticMessageIsProjected(
+  optimistic: OptimisticCompanionMessage,
+  messages: readonly CompanionMessage[],
+): boolean {
+  if (optimistic.interactionRef && messages.some((message) =>
+    message.message_ref === `${optimistic.interactionRef}:user`
+  )) return true;
+  return messages.filter((message) =>
+    message.role === "user"
+    && message.scope_ref === optimistic.scopeRef
+    && messageText(message) === optimistic.content
+  ).length > optimistic.matchingProjectedMessagesAtSend;
+}
+
 function openRequests(projection?: HumanCollaborationProjection): HumanRequestItem[] {
   return projection?.human_requests.items.filter((item) => item.status === "open") ?? [];
 }
@@ -201,6 +224,10 @@ export function QuestCompanion({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [optimisticMessages, setOptimisticMessages] = useState<
+    OptimisticCompanionMessage[]
+  >([]);
+  const optimisticSequence = useRef(0);
   const [visibleMessageCount, setVisibleMessageCount] = useState(
     COMPANION_MESSAGE_PAGE_SIZE,
   );
@@ -213,16 +240,20 @@ export function QuestCompanion({
   const attention = requests.find((request) =>
     request.direct_waiters?.some((waiter) => waiter.wait_scope === "quest"),
   ) ?? requests[0];
-  const messages = scopeRef
+  const messages = useMemo(() => scopeRef
     ? companion?.messages.filter((item) =>
       item.scope_ref === scopeRef
       && item.view_context?.kind !== "human_request",
     ) ?? []
-    : [];
+    : [], [companion?.messages, scopeRef]);
   const hiddenMessageCount = Math.max(0, messages.length - visibleMessageCount);
   const visibleMessages = hiddenMessageCount
     ? messages.slice(-visibleMessageCount)
     : messages;
+  const visibleOptimisticMessages = optimisticMessages.filter((message) =>
+    message.scopeRef === scopeRef
+    && !optimisticMessageIsProjected(message, messages)
+  );
   const softConstraints = scopeRef
     ? companion?.soft_constraints.filter((item) => item.scope_ref === scopeRef) ?? []
     : [];
@@ -254,7 +285,8 @@ export function QuestCompanion({
     setVisibleMessageCount(COMPANION_MESSAGE_PAGE_SIZE);
   }, [scopeRef]);
 
-  const newestMessageRef = messages.at(-1)?.message_ref
+  const newestMessageRef = visibleOptimisticMessages.at(-1)?.localRef
+    ?? messages.at(-1)?.message_ref
     ?? messages.at(-1)?.created_at
     ?? messages.length;
   useEffect(() => {
@@ -262,16 +294,43 @@ export function QuestCompanion({
     if (!chat) return;
     chat.scrollTop = chat.scrollHeight;
   }, [newestMessageRef, scopeRef]);
+  const optimisticProjectionKey = optimisticMessages.map((message) =>
+    `${message.localRef}:${message.interactionRef ?? "pending"}`
+  ).join("|");
+  useEffect(() => {
+    setOptimisticMessages((current) => {
+      const remaining = current.filter((message) =>
+        !optimisticMessageIsProjected(message, messages)
+      );
+      return remaining.length === current.length ? current : remaining;
+    });
+  }, [messages, optimisticProjectionKey]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const message = draft.trim();
-    if (!canSend || !message || sending) return;
+    if (!canSend || !scopeRef || !message || sending) return;
+    const localRef = optimisticSequence.current + 1;
+    optimisticSequence.current = localRef;
+    const pending: OptimisticCompanionMessage = {
+      localRef,
+      scopeRef,
+      content: message,
+      interactionRef: null,
+      matchingProjectedMessagesAtSend: messages.filter((item) =>
+        item.role === "user"
+        && item.scope_ref === scopeRef
+        && messageText(item) === message
+      ).length,
+      status: "sending",
+    };
+    setDraft("");
+    setOptimisticMessages((current) => [...current, pending]);
     setSending(true);
     setError(null);
     try {
-      await sendCompanionMessage(
+      const queued = await sendCompanionMessage(
         message,
-        companion.scope_ref,
+        scopeRef,
         questionContext && questionContext.lifecycle_revision !== null ? {
           kind: "question",
           quest_ref: questionContext.quest_ref,
@@ -281,9 +340,23 @@ export function QuestCompanion({
           lifecycle_revision: questionContext.lifecycle_revision,
         } : null,
       );
-      setDraft("");
+      setOptimisticMessages((current) => current.map((item) =>
+        item.localRef === localRef
+          ? {
+              ...item,
+              interactionRef: typeof queued.interaction_ref === "string"
+                ? queued.interaction_ref
+                : null,
+              status: "queued",
+            }
+          : item
+      ));
       onChanged();
     } catch (caught) {
+      setOptimisticMessages((current) => current.filter(
+        (item) => item.localRef !== localRef,
+      ));
+      setDraft((current) => current || message);
       setError(reasonCode(caught));
     } finally {
       setSending(false);
@@ -339,30 +412,59 @@ export function QuestCompanion({
             显示更早的 {Math.min(hiddenMessageCount, COMPANION_MESSAGE_PAGE_SIZE)} 条消息
           </button>
         ) : null}
-        {ready && visibleMessages.length ? visibleMessages.map((message, index) => (
-          <article
-            key={message.message_ref ?? `${message.role}-${index}`}
-            className={`lumen-message ${message.role === "user" ? "me" : ""}`}
-            data-message-status={message.status}
-          >
-            <small>
-              {message.role === "user"
-                ? "YOU · CONVERSATION"
-                : message.role === "system"
-                  ? "SYSTEM · STATUS"
-                  : "COMPANION · READ-ONLY EXPLANATION"}
-            </small>
-            {messageText(message)}
-            {message.status === "queued" || message.status === "processing" || message.status === "running" ? (
-              <span className="lumen-message-state">正在形成回复…</span>
-            ) : null}
-          </article>
-        )) : (
+        {ready && visibleMessages.length ? visibleMessages.map((message, index) => {
+          const pending = message.status === "queued"
+            || message.status === "processing"
+            || message.status === "running";
+          return (
+            <article
+              key={message.message_ref ?? `${message.role}-${index}`}
+              className={`lumen-message ${message.role === "user" ? "me" : ""}`}
+              data-message-status={message.status}
+            >
+              <small>
+                {message.role === "user"
+                  ? "YOU · CONVERSATION"
+                  : message.role === "system"
+                    ? "SYSTEM · STATUS"
+                    : "COMPANION · READ-ONLY EXPLANATION"}
+              </small>
+              {messageText(message)}
+              {pending ? (
+                <span className="lumen-message-state" role="status">
+                  {message.role === "user" ? "消息正在发送…" : "Codex 正在思考…"}
+                </span>
+              ) : null}
+            </article>
+          );
+        }) : (
           <article className="lumen-message">
             <small>{fallbackCompanionCopy[state].label}</small>
             {fallbackCompanionCopy[state].message}
           </article>
         )}
+        {visibleOptimisticMessages.map((message) => (
+          <article
+            key={`optimistic-${message.localRef}`}
+            className="lumen-message me"
+            data-message-status={message.status}
+          >
+            <small>YOU · CONVERSATION</small>
+            {message.content}
+            <span className="lumen-message-state">
+              {message.status === "sending" ? "消息正在发送…" : "消息已发送"}
+            </span>
+          </article>
+        ))}
+        {visibleOptimisticMessages.length ? (
+          <article
+            className="lumen-message lumen-companion-thinking"
+            data-message-status="processing"
+          >
+            <small>COMPANION · THINKING</small>
+            <span className="lumen-message-state" role="status">Codex 正在思考…</span>
+          </article>
+        ) : null}
         {ready ? softConstraints.map((constraint, index) => (
           <SoftConstraintCard
             key={constraint.constraint_ref ?? `constraint-${index}`}
@@ -549,6 +651,501 @@ const researchControlLabels: Record<ResearchControlAction, string> = {
   prune: "剪裁 Question",
   restore: "恢复 Question",
 };
+
+type ForegroundResearchControlShortcutProps = {
+  control?: ResearchControlProjection;
+  commands?: readonly HumanCommand[];
+  disabled?: boolean;
+  onChanged: () => void;
+};
+
+const researchControlRepreviewErrors = new Set([
+  "research_control_repreview_required",
+  "foreground_control_repreview_required",
+  "runtime_control_repreview_required",
+  "runtime_control_reservation_stale",
+  "command_preview_stale",
+  "command_draft_stale",
+  "command_preview_current_required",
+]);
+
+function foregroundControlIdentity(
+  foreground: NonNullable<ResearchControlProjection["foreground"]> | null,
+): string | null {
+  return foreground
+    ? [
+        foreground.quest_ref,
+        foreground.cycle_ref,
+        foreground.question_ref,
+        foreground.epoch,
+      ].join(":")
+    : null;
+}
+
+function commandControlAction(
+  command: HumanCommand | null,
+): Extract<ResearchControlAction, "pause" | "resume"> | null {
+  if (command?.draft.command_kind !== "research_control") return null;
+  const action = command.draft.payload.action;
+  return action === "pause" || action === "resume" ? action : null;
+}
+
+function commandMatchesForeground(
+  command: HumanCommand,
+  foreground: NonNullable<ResearchControlProjection["foreground"]>,
+  action: Extract<ResearchControlAction, "pause" | "resume">,
+): boolean {
+  if (
+    command.executed
+    || !command.confirmation_receipt
+    || command.draft.command_kind !== "research_control"
+    || command.draft.payload.action !== action
+  ) return false;
+  const target = command.draft.payload.target;
+  return target.target_scope === "cycle"
+    && target.quest_ref === foreground.quest_ref
+    && target.cycle_ref === foreground.cycle_ref
+    && target.question_ref === foreground.question_ref
+    && target.epoch === foreground.epoch;
+}
+
+export function ForegroundResearchControlShortcut({
+  control,
+  commands = [],
+  disabled = false,
+  onChanged,
+}: ForegroundResearchControlShortcutProps) {
+  const foreground = control?.status === "ready" ? control.foreground : null;
+  const action: Extract<ResearchControlAction, "pause" | "resume"> | null =
+    foreground?.status === "active"
+      ? "pause"
+      : foreground?.status === "suspended"
+        ? "resume"
+        : null;
+  const [command, setCommand] = useState<HumanCommand | null>(null);
+  const [open, setOpen] = useState(false);
+  const [pending, setPending] = useState<"preview" | "execute" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [previewInvalidated, setPreviewInvalidated] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const dismissedCommandRefs = useRef(new Set<string>());
+  const foregroundIdentity = foregroundControlIdentity(foreground);
+  const foregroundIdentityRef = useRef(foregroundIdentity);
+  foregroundIdentityRef.current = foregroundIdentity;
+
+  const commandAction = commandControlAction(command);
+  const exactCommandTarget = Boolean(
+    command
+    && commandAction
+    && foreground
+    && command.draft.command_kind === "research_control"
+    && command.draft.payload.target.target_scope === "cycle"
+    && command.draft.payload.target.quest_ref === foreground.quest_ref
+    && command.draft.payload.target.cycle_ref === foreground.cycle_ref
+    && command.draft.payload.target.question_ref === foreground.question_ref
+    && command.draft.payload.target.epoch === foreground.epoch,
+  );
+  const confirmedExecutionPending = Boolean(
+    commandAction && command?.confirmation_receipt && !command.executed && exactCommandTarget,
+  );
+  const commandApplied = Boolean(
+    commandAction
+    && exactCommandTarget
+    && foreground
+    && (commandAction === "pause"
+      ? foreground.status === "suspended"
+      : foreground.status === "active"),
+  );
+  const executionAwaitingProjection = Boolean(
+    commandAction && command?.executed && exactCommandTarget && !commandApplied,
+  );
+  const projectedConfirmedCommand = foreground && action
+    ? commands.find((item) =>
+        !dismissedCommandRefs.current.has(item.intent_id)
+        && commandMatchesForeground(item, foreground, action)
+      ) ?? null
+    : null;
+
+  useEffect(() => {
+    if (!projectedConfirmedCommand) return;
+    if (command && (
+      command.intent_id !== projectedConfirmedCommand.intent_id
+      || command.confirmation_receipt
+    )) return;
+    setCommand(projectedConfirmedCommand);
+    setError(null);
+    setPreviewInvalidated(false);
+  }, [command, projectedConfirmedCommand]);
+
+  useEffect(() => {
+    if (!commandAction || !foreground) return;
+    if (exactCommandTarget && !commandApplied) return;
+    setCommand(null);
+    setOpen(false);
+    setError(null);
+    setPreviewInvalidated(false);
+  }, [commandAction, commandApplied, exactCommandTarget, foregroundIdentity]);
+
+  if (!foreground || !action || !control?.actions.includes(action)) return null;
+
+  const assertCurrentForeground = (expectedIdentity: string | null) => {
+    if (!expectedIdentity || foregroundIdentityRef.current !== expectedIdentity) {
+      throw new ProductError("foreground_control_changed");
+    }
+  };
+
+  const close = () => {
+    if (pending) return;
+    setOpen(false);
+    setError(null);
+    if (!command?.confirmation_receipt) {
+      setCommand(null);
+      setPreviewInvalidated(false);
+    }
+    requestAnimationFrame(() => buttonRef.current?.focus({ preventScroll: true }));
+  };
+
+  const preview = async () => {
+    if (pending || executionAwaitingProjection) return;
+    if (confirmedExecutionPending) {
+      setOpen(true);
+      return;
+    }
+    const expectedIdentity = foregroundIdentity;
+    setPending("preview");
+    setError(null);
+    let current: HumanCommand | null = null;
+    try {
+      current = await createHumanCommand(`quest:${foreground.quest_ref}`, {
+        command_kind: "research_control",
+        payload: {
+          action,
+          target: {
+            quest_ref: foreground.quest_ref,
+            cycle_ref: foreground.cycle_ref,
+            question_ref: foreground.question_ref,
+            epoch: foreground.epoch,
+            target_scope: "cycle",
+          },
+          reason: "operator_requested",
+        },
+      });
+      assertCurrentForeground(expectedIdentity);
+      setCommand(current);
+      setPreviewInvalidated(false);
+      setOpen(true);
+      current = await previewHumanCommand(current);
+      assertCurrentForeground(expectedIdentity);
+      setCommand(current);
+      setPreviewInvalidated(false);
+      onChanged();
+    } catch (caught) {
+      const code = reasonCode(caught);
+      if (code === "foreground_control_changed") {
+        setCommand(null);
+        setOpen(false);
+      } else {
+        setCommand(current);
+        setOpen(Boolean(current));
+      }
+      setError(code);
+      if (current) onChanged();
+    } finally {
+      setPending(null);
+    }
+  };
+
+  const retryPreview = async () => {
+    if (!command || pending || command.confirmation_receipt) return;
+    const expectedIdentity = foregroundIdentity;
+    setPending("preview");
+    setError(null);
+    try {
+      const previewed = await previewHumanCommand(command);
+      assertCurrentForeground(expectedIdentity);
+      setCommand(previewed);
+      setPreviewInvalidated(false);
+      onChanged();
+    } catch (caught) {
+      const code = reasonCode(caught);
+      if (code === "foreground_control_changed") {
+        setCommand(null);
+        setOpen(false);
+      }
+      setError(code);
+      onChanged();
+    } finally {
+      setPending(null);
+    }
+  };
+
+  const confirmAndExecute = async () => {
+    if (!command || pending) return;
+    const expectedIdentity = foregroundIdentity;
+    setPending("execute");
+    setError(null);
+    let executable = command;
+    try {
+      assertCurrentForeground(expectedIdentity);
+      if (!executable.confirmation_receipt) {
+        if (
+          previewInvalidated
+          || executable.impact_preview?.status !== "current"
+          || executable.impact_preview.draft_revision !== executable.draft_revision
+          || executable.impact_preview.draft_hash !== executable.draft_hash
+        ) {
+          throw new ProductError("command_preview_current_required");
+        }
+        executable = await confirmHumanCommand(executable);
+        assertCurrentForeground(expectedIdentity);
+        setCommand(executable);
+        onChanged();
+      }
+      const executed = await executeHumanCommand(executable);
+      setCommand(executed);
+      setOpen(false);
+      setError(null);
+      onChanged();
+      requestAnimationFrame(() => buttonRef.current?.focus({ preventScroll: true }));
+    } catch (caught) {
+      const code = reasonCode(caught);
+      // A successful confirmation is durable even when execution times out.
+      // Retain that exact command so the user retries execution without
+      // rebuilding a draft or issuing a second confirmation.
+      setCommand(executable);
+      setError(code);
+      if (researchControlRepreviewErrors.has(code)) {
+        setPreviewInvalidated(true);
+      }
+      onChanged();
+    } finally {
+      setPending(null);
+    }
+  };
+
+  const resetForFreshPreview = () => {
+    if (pending) return;
+    if (command) dismissedCommandRefs.current.add(command.intent_id);
+    setCommand(null);
+    setOpen(false);
+    setError(null);
+    setPreviewInvalidated(false);
+    onChanged();
+    requestAnimationFrame(() => buttonRef.current?.focus({ preventScroll: true }));
+  };
+
+  const effectiveAction = confirmedExecutionPending || executionAwaitingProjection
+    ? commandAction
+    : action;
+  const actionLabel = effectiveAction === "resume" ? "继续研究" : "暂停研究";
+  const busyLabel = pending === "preview"
+    ? "正在核对…"
+    : pending === "execute"
+      ? effectiveAction === "pause" ? "正在暂停…" : "正在继续…"
+      : executionAwaitingProjection
+        ? "正在同步状态…"
+      : confirmedExecutionPending
+        ? effectiveAction === "pause" ? "完成暂停" : "完成继续"
+        : actionLabel;
+  const unavailable = disabled
+    || pending !== null
+    || executionAwaitingProjection
+    || Boolean(foreground.pending_operation_ref && !confirmedExecutionPending);
+
+  return (
+    <div className="lumen-research-power">
+      <button
+        ref={buttonRef}
+        type="button"
+        data-action={effectiveAction}
+        disabled={unavailable}
+        aria-label={busyLabel}
+        title={`${actionLabel}当前 Cycle；当前界面与 Web 服务保持在线`}
+        onClick={() => void preview()}
+      >
+        <span aria-hidden="true">{effectiveAction === "resume" ? "▶" : "Ⅱ"}</span>
+        <b>{busyLabel}</b>
+      </button>
+      {error && !open ? (
+        <small className="lumen-research-power-error" role="alert">
+          控制未完成 · {error}
+        </small>
+      ) : null}
+      {open && command && commandAction ? (
+        <ForegroundResearchControlDialog
+          command={command}
+          action={commandAction}
+          pending={pending}
+          error={error}
+          previewInvalidated={previewInvalidated}
+          onClose={close}
+          onRetryPreview={() => void retryPreview()}
+          onConfirm={() => void confirmAndExecute()}
+          onReset={resetForFreshPreview}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function ForegroundResearchControlDialog({
+  command,
+  action,
+  pending,
+  error,
+  previewInvalidated,
+  onClose,
+  onRetryPreview,
+  onConfirm,
+  onReset,
+}: {
+  command: HumanCommand;
+  action: Extract<ResearchControlAction, "pause" | "resume">;
+  pending: "preview" | "execute" | null;
+  error: string | null;
+  previewInvalidated: boolean;
+  onClose: () => void;
+  onRetryPreview: () => void;
+  onConfirm: () => void;
+  onReset: () => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const preview = command.impact_preview;
+  const currentPreview = preview?.status === "current"
+    && preview.draft_revision === command.draft_revision
+    && preview.draft_hash === command.draft_hash
+    && !previewInvalidated
+    ? preview
+    : null;
+  const confirmed = Boolean(command.confirmation_receipt);
+  const visiblePreview = confirmed ? preview : currentPreview;
+  const executionRequiresFreshPreview = Boolean(
+    confirmed && (previewInvalidated
+      || Boolean(error && researchControlRepreviewErrors.has(error))),
+  );
+  const verb = action === "pause" ? "暂停" : "继续";
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    dialog.showModal();
+    requestAnimationFrame(() => closeRef.current?.focus({ preventScroll: true }));
+    return () => dialog.close();
+  }, []);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="lumen-research-power-dialog"
+      aria-labelledby="research-power-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section>
+        <header>
+          <div>
+            <small>OWNER IMPACT PREVIEW</small>
+            <h2 id="research-power-title">{verb}当前研究？</h2>
+            <p>
+              {action === "pause"
+                ? "系统会等待当前 Provider 到达安全边界；当前界面与 Web 服务保持在线。"
+                : "系统会从已记录的安全边界继续当前 Cycle。"}
+            </p>
+          </div>
+          <button
+            ref={closeRef}
+            type="button"
+            aria-label="关闭研究控制确认"
+            disabled={pending !== null}
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </header>
+        <div className="lumen-research-power-preview">
+          <p className="lumen-research-power-scope">
+            Quest {command.draft.command_kind === "research_control"
+              ? command.draft.payload.target.quest_ref
+              : "unknown"}
+            {command.draft.command_kind === "research_control"
+              ? ` · Cycle ${command.draft.payload.target.cycle_ref} · Epoch ${command.draft.payload.target.epoch}`
+              : ""}
+          </p>
+          {visiblePreview ? visiblePreview.owner_previews.map((owner) => (
+            <article key={owner.digest}>
+              <small>{owner.source_owner}</small>
+              <code>{JSON.stringify(owner.target_assertion)}</code>
+              <ResearchControlPreviewList label="会发生" items={owner.will_happen} />
+              <ResearchControlPreviewList label="不会发生" items={owner.will_not_happen} />
+              <ResearchControlPreviewList
+                label="风险 / 陈旧条件"
+                items={[...owner.risks, ...owner.stale_conditions]}
+              />
+            </article>
+          )) : (
+            <p className="lumen-research-power-loading" role="status">
+              {pending === "preview" ? "正在生成精确影响预览…" : "影响预览尚未生成。"}
+            </p>
+          )}
+          {error ? (
+            <p className="lumen-research-power-dialog-error" role="alert">
+              {confirmed
+                ? executionRequiresFreshPreview
+                  ? `当前控制绑定已变化，原确认不会继续执行 · ${error}`
+                  : `Human Confirmation 已记录，执行尚未完成 · ${error}`
+                : `控制尚未确认，也不会执行 · ${error}`}
+            </p>
+          ) : null}
+        </div>
+        <footer>
+          <button type="button" disabled={pending !== null} onClick={onClose}>暂不操作</button>
+          {executionRequiresFreshPreview ? (
+            <button type="button" disabled={pending !== null} onClick={onReset}>
+              重新读取当前状态
+            </button>
+          ) : !currentPreview && !confirmed ? (
+            <button type="button" disabled={pending !== null} onClick={onRetryPreview}>
+              {pending === "preview" ? "正在生成预览…" : "重新生成预览"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={pending !== null || (!confirmed && !currentPreview)}
+              onClick={onConfirm}
+            >
+              {pending === "execute"
+                ? action === "pause" ? "正在等待安全边界…" : "正在继续…"
+                : confirmed
+                  ? `重试执行${verb}`
+                  : `确认并${verb}研究`}
+            </button>
+          )}
+        </footer>
+      </section>
+    </dialog>
+  );
+}
+
+function ResearchControlPreviewList({
+  label,
+  items,
+}: {
+  label: string;
+  items: readonly string[];
+}) {
+  return (
+    <div>
+      <b>{label}</b>
+      {items.length ? <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul> : <p>无</p>}
+    </div>
+  );
+}
 
 const questionTargetActions = new Set<ResearchControlAction>([
   "normal_switch",

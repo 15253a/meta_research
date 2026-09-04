@@ -48,6 +48,7 @@ from meta_research.root_capabilities import RootAgentKind
 from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticError,
 )
+from meta_research.stage_root_observations import StageRootObservationError
 from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
 
 
@@ -2634,6 +2635,66 @@ def create_app(
             after_cursor=after,
             limit=limit,
         )
+        return page.as_dict()
+
+    @app.get("/api/v1/stage-runs/{run_ref}/root-observations")
+    def query_stage_root_observations(
+        run_ref: str,
+        after: str | None = Query(default=None, max_length=512),
+        limit: int = Query(default=128, ge=1, le=256),
+    ) -> dict[str, object]:
+        try:
+            page = runtime.query_stage_root_observations(
+                run_ref,
+                after_cursor=after,
+                limit=limit,
+            )
+        except StageRootObservationError as error:
+            status_code = (
+                404
+                if error.code == "stage_root_observation_run_not_found"
+                else (
+                    503
+                    if error.code == "stage_root_observation_spool_unavailable"
+                    else 409
+                )
+            )
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": error.code},
+            ) from error
+        return page.as_dict()
+
+    @app.get("/api/v1/stage-runs/{run_ref}/raw-output")
+    def query_stage_raw_output(
+        run_ref: str,
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=64 * 1024, ge=4, le=256 * 1024),
+    ) -> dict[str, object]:
+        try:
+            page = runtime.query_stage_raw_output(
+                run_ref,
+                after=after,
+                limit=limit,
+            )
+        except StageRootObservationError as error:
+            status_code = (
+                404
+                if error.code == "stage_root_observation_run_not_found"
+                else (
+                    409
+                    if error.code
+                    in {
+                        "stage_raw_output_cursor_invalid",
+                        "stage_raw_output_cursor_stale",
+                    }
+                    else 503
+                )
+            )
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": error.code},
+            ) from error
         return page.as_dict()
 
     @app.get("/api/v1/bundle/targets/{target_ref}/raw-output")

@@ -2458,6 +2458,29 @@ def test_deepfetch_acquisition_source_url_fits_the_common_effect_schema() -> Non
         _validated_v4_acquisition_effect(output)
 
 
+def test_deepfetch_acquisition_null_identifiers_normalize_to_optional_fields() -> None:
+    output = copy.deepcopy(PROTOTYPE_ACQUIRE)
+    request = output["acquisition_request"]
+    assert isinstance(request, dict)
+    targets = request["targets"]
+    assert isinstance(targets, list)
+    target = targets[0]
+    assert isinstance(target, dict)
+    target["doi"] = None
+    target["arxiv_id"] = None
+
+    assert _validated_v4_acquisition_effect(output) == {
+        "effect_id": "acq-v4-1",
+        "targets": [
+            {
+                "paper_id": "doi:10.1000/example",
+                "title": "A verifiable paper",
+                "source_urls": ["https://example.org/paper"],
+            }
+        ],
+    }
+
+
 def test_hosted_acquisition_reader_rejects_a_symlinked_owner_target_root(
     tmp_path: Path,
 ) -> None:

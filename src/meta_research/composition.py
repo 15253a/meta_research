@@ -119,6 +119,11 @@ from meta_research.runtime_protection import (
 from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticStore,
 )
+from meta_research.stage_root_observations import (
+    StageRawOutputPage,
+    StageRootObservationPage,
+    StageRootObservationReader,
+)
 from meta_research.telemetry import (
     OtlpHttpTelemetryExporter,
     validate_otlp_http_endpoint,
@@ -263,6 +268,7 @@ class ProductionRuntime:
     target_root_readiness: dict[str, object]
     runtime_protection: RuntimeProtection
     root_operation_diagnostics: RootOperationDiagnosticStore
+    stage_root_observations: StageRootObservationReader
     _database: Database
     _telemetry_exporter_factory: Callable[[str], TelemetryExporter]
     _provider_lifecycles: tuple[object, ...] = ()
@@ -295,6 +301,36 @@ class ProductionRuntime:
 
     def query_runtime_observability(self) -> dict[str, object]:
         return self.runtime_protection.query_evidence()
+
+    def query_stage_root_observations(
+        self,
+        run_ref: str,
+        *,
+        after_cursor: str | None = None,
+        limit: int = 128,
+    ) -> StageRootObservationPage:
+        """Read only the current Stage root's redacted observer projection."""
+
+        return self.stage_root_observations.query(
+            run_ref,
+            after_cursor=after_cursor,
+            limit=limit,
+        )
+
+    def query_stage_raw_output(
+        self,
+        run_ref: str,
+        *,
+        after: int = 0,
+        limit: int = 64 * 1024,
+    ) -> StageRawOutputPage:
+        """Read exact private stdout for the current Stage provider unit."""
+
+        return self.stage_root_observations.query_raw(
+            run_ref,
+            after=after,
+            limit=limit,
+        )
 
     def validate_telemetry_authorization_request(
         self,
@@ -482,6 +518,7 @@ def build_production_runtime(
     startup_harness_diagnostics: bool = True,
     telemetry_exporter_factory: Callable[[str], TelemetryExporter] | None = None,
 ) -> ProductionRuntime:
+    codex_executable = str(data_root.validated_codex_cli_executable())
     upgrade_database(data_root.database)
     database = Database(data_root.database)
     feed = DurableFeed(database)
@@ -513,7 +550,6 @@ def build_production_runtime(
                 )
             ).scalar_one()
         )
-    codex_executable = str(data_root.codex_cli_executable.absolute())
     codex_provider_runner = _CancellableProcessRunner(
         protected_environment=data_root.codex_environment
     )
@@ -815,6 +851,10 @@ def build_production_runtime(
         agent_runtime=agent_runtime,
         human_collaboration=human_collaboration,
     )
+    stage_root_observations = StageRootObservationReader(
+        data_root.root,
+        scope_lookup=owners.agent_runtime.query_stage_root_observation_scope,
+    )
     autonomous_creation = AutonomousCreationService(
         human_collaboration,
         advancement_engine,
@@ -1089,6 +1129,7 @@ def build_production_runtime(
         },
         runtime_protection=runtime_protection,
         root_operation_diagnostics=root_operation_diagnostics,
+        stage_root_observations=stage_root_observations,
         _database=database,
         _telemetry_exporter_factory=(
             telemetry_exporter_factory

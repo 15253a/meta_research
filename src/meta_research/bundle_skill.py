@@ -1866,7 +1866,12 @@ def _target_plan_review_schema(
                 },
             },
         },
-        "required": ["final_target_plan"],
+        "required": [
+            "reviewer_agent_ref",
+            "findings",
+            "final_target_plan",
+            "dispositions",
+        ],
     }
 
 

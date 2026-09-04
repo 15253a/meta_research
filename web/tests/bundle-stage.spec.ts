@@ -366,9 +366,18 @@ test("Target raw output is bounded, explicit, quiescent when hidden, and isolate
   };
   const requests: RawOutputRequest[] = [];
   const unsafeRequests: string[] = [];
-  const firstA = "target A · first bounded page\n";
-  const secondA = "target A · explicit next page\n";
-  const firstB = "target B · independent live page\n";
+  const firstA = JSON.stringify({
+    type: "item.completed",
+    item: { type: "agent_message", text: "target A · first bounded page" },
+  }) + "\n";
+  const secondA = JSON.stringify({
+    type: "item.started",
+    item: { type: "mcp_tool_call", tool: "experiment.run" },
+  }) + "\n";
+  const firstB = JSON.stringify({
+    type: "turn.started",
+    target: "target B · independent live page",
+  }) + "\n";
   const bytes = (value: string) => new TextEncoder().encode(value).byteLength;
   const firstABytes = bytes(firstA);
   const totalABytes = firstABytes + bytes(secondA);
@@ -441,7 +450,7 @@ test("Target raw output is bounded, explicit, quiescent when hidden, and isolate
   await expect(targetA.getByText("target-run-007-a", { exact: true })).toBeHidden();
   await targetA.getByRole("button", { name: "查看原始输出" }).click();
   let terminal = page.getByRole("dialog", { name: "gap-structure 实验原始输出" });
-  let log = terminal.getByRole("log", { name: /gap-structure.*stdout\/stderr/ });
+  let log = terminal.getByRole("log", { name: /gap-structure.*Provider.*stdout/ });
   await expect(terminal).toBeVisible();
   await expect(log).toContainText(firstA.trim());
   await page.waitForTimeout(150);
@@ -479,7 +488,7 @@ test("Target raw output is bounded, explicit, quiescent when hidden, and isolate
 
   await targetB.getByRole("button", { name: "查看原始输出" }).click();
   terminal = page.getByRole("dialog", { name: "gap-transfer 实验原始输出" });
-  log = terminal.getByRole("log", { name: /gap-transfer.*stdout\/stderr/ });
+  log = terminal.getByRole("log", { name: /gap-transfer.*Provider.*stdout/ });
   await expect(log).toContainText(firstB.trim());
   await expect(log).not.toContainText(/target A/);
   await terminal.getByRole("button", { name: "最小化" }).click();

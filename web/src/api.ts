@@ -1081,6 +1081,64 @@ export type TargetRootObservationPointer = {
   head_cursor: string;
 };
 
+export type StageRootObservation = {
+  event_ref: string;
+  cursor: string;
+  sequence: number;
+  kind: "command_output" | "output_gap";
+  stream: "stdout";
+  text: string;
+  recorded_at: number;
+  redacted: boolean;
+  truncated: boolean;
+  dropped_bytes: number;
+  dropped_events: number;
+};
+
+export type StageRootObservationPage = {
+  run_ref: string;
+  run_kind: string;
+  attempt_ref: string;
+  attempt_generation: number;
+  root_session_ref: string;
+  fence_ref: string;
+  phase: string | null;
+  native_session_ref: string | null;
+  stream_ref: string;
+  status: "live" | "waiting" | "replaced" | "terminal";
+  availability: "ready" | "waiting" | "limited";
+  items: StageRootObservation[];
+  next_cursor: string | null;
+  head_cursor: string | null;
+  has_more: boolean;
+  source_limited: boolean;
+  observation_only: true;
+};
+
+export type StageRawOutputPage = {
+  schema_ref: "meta-research/stage-raw-output-page/v1";
+  run_ref: string;
+  run_kind: string;
+  attempt_ref: string;
+  attempt_generation: number;
+  root_session_ref: string;
+  fence_ref: string;
+  operation_ref: string | null;
+  phase: string | null;
+  native_session_ref: string | null;
+  transport_invocation_hash: string | null;
+  stream_ref: string;
+  status: "live" | "waiting" | "replaced" | "terminal";
+  text: string;
+  offset: number;
+  next_offset: number;
+  source_bytes: number;
+  has_more: boolean;
+  source_caught_up: boolean;
+  exact: true;
+  unredacted: true;
+};
+
 export type TargetRawOutputPage = {
   schema_ref: string;
   target_ref: string;
@@ -2564,6 +2622,84 @@ export function fetchTargetRootObservations(
       + `/root-observations?${parameters}`,
     options.signal,
   );
+}
+
+export async function fetchStageRootObservations(
+  runRef: string,
+  options: {
+    after?: string | null;
+    limit?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<StageRootObservationPage> {
+  const limit = options.limit ?? 128;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+    throw new ProductError("stage_root_observation_limit_invalid");
+  }
+  const parameters = new URLSearchParams({ limit: String(limit) });
+  if (options.after) parameters.set("after", options.after);
+  const response = await fetch(
+    `/api/v1/stage-runs/${encodeURIComponent(runRef)}`
+      + `/root-observations?${parameters}`,
+    {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+      signal: options.signal,
+    },
+  );
+  if (!response.ok) {
+    let code = `request_failed:${response.status}`;
+    try {
+      const payload = (await response.json()) as { detail?: { code?: string } };
+      code = payload.detail?.code ?? code;
+    } catch {
+      // Preserve the status fallback if the authenticated endpoint has no JSON body.
+    }
+    throw new ProductError(code);
+  }
+  return (await response.json()) as StageRootObservationPage;
+}
+
+export async function fetchStageRawOutput(
+  runRef: string,
+  options: {
+    after?: number;
+    limit?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<StageRawOutputPage> {
+  const after = options.after ?? 0;
+  const limit = options.limit ?? 64 * 1024;
+  if (!Number.isSafeInteger(after) || after < 0) {
+    throw new ProductError("stage_raw_output_cursor_invalid");
+  }
+  if (!Number.isSafeInteger(limit) || limit < 4 || limit > 256 * 1024) {
+    throw new ProductError("stage_raw_output_limit_invalid");
+  }
+  const parameters = new URLSearchParams({
+    after: String(after),
+    limit: String(limit),
+  });
+  const response = await fetch(
+    `/api/v1/stage-runs/${encodeURIComponent(runRef)}`
+      + `/raw-output?${parameters}`,
+    {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+      signal: options.signal,
+    },
+  );
+  if (!response.ok) {
+    let code = `request_failed:${response.status}`;
+    try {
+      const payload = (await response.json()) as { detail?: { code?: string } };
+      code = payload.detail?.code ?? code;
+    } catch {
+      // Preserve the status fallback if the authenticated endpoint has no JSON body.
+    }
+    throw new ProductError(code);
+  }
+  return (await response.json()) as StageRawOutputPage;
 }
 
 export async function fetchTargetRawOutput(

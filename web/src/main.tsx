@@ -25,6 +25,7 @@ import {
   fetchLiteratureSnapshot,
   fetchManualQuestionCreation,
   fetchSnapshot,
+  fetchStageRawOutput,
   fetchTargetRawOutput,
   followProjection,
   openManualQuestionCreation,
@@ -52,6 +53,7 @@ import {
   type QuestCompletionView,
   type ReasoningStageProjection,
   type ResearchControlAction,
+  type StageRawOutputPage,
   type TargetRawOutputPage,
   type TargetRootObservationPointer,
   type UnavailableCapability,
@@ -69,6 +71,7 @@ import { QuestionTree } from "./QuestionTree";
 import { ResearchAssetsWorkbench } from "./ResearchAssets";
 import { WritingReportWorkbench } from "./WritingReport";
 import {
+  ForegroundResearchControlShortcut,
   HumanRequestSurface,
   QuestCompanion,
   TelemetryAuthorizationCard,
@@ -1179,14 +1182,257 @@ function activityObservedAt(updatedAt: number | null): string {
   return `更新 ${new Date(milliseconds).toLocaleString()}`;
 }
 
+const stageRawOutputPageSize = 64 * 1024;
+const stageRawOutputPollMilliseconds = 750;
+
+function validateStageRawOutputPage(
+  page: StageRawOutputPage,
+  runRef: string,
+  expectedOffset: number,
+): void {
+  const textBytes = typeof page.text === "string"
+    ? new TextEncoder().encode(page.text).byteLength
+    : -1;
+  if (
+    page.schema_ref !== "meta-research/stage-raw-output-page/v1"
+    || page.run_ref !== runRef
+    || typeof page.run_kind !== "string"
+    || page.run_kind.length === 0
+    || typeof page.attempt_ref !== "string"
+    || page.attempt_ref.length === 0
+    || !Number.isSafeInteger(page.attempt_generation)
+    || page.attempt_generation < 1
+    || typeof page.root_session_ref !== "string"
+    || page.root_session_ref.length === 0
+    || typeof page.fence_ref !== "string"
+    || page.fence_ref.length === 0
+    || (page.operation_ref !== null && !page.operation_ref)
+    || (page.phase !== null && !page.phase)
+    || (page.native_session_ref !== null && !page.native_session_ref)
+    || (
+      page.transport_invocation_hash !== null
+      && !/^[0-9a-f]{64}$/.test(page.transport_invocation_hash)
+    )
+    || typeof page.stream_ref !== "string"
+    || !page.stream_ref.startsWith("stage-raw-output:")
+    || !["live", "waiting", "replaced", "terminal"].includes(page.status)
+    || typeof page.text !== "string"
+    || !Number.isSafeInteger(page.offset)
+    || page.offset !== expectedOffset
+    || !Number.isSafeInteger(page.next_offset)
+    || page.next_offset < page.offset
+    || !Number.isSafeInteger(page.source_bytes)
+    || page.source_bytes < page.next_offset
+    || page.next_offset - page.offset !== textBytes
+    || page.has_more !== (page.next_offset < page.source_bytes)
+    || page.source_caught_up !== !page.has_more
+    || page.exact !== true
+    || page.unredacted !== true
+  ) {
+    throw new ProductError("stage_raw_output_identity_invalid");
+  }
+}
+
+function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
+  const [expanded, setExpanded] = useState(false);
+  const [terminal, setTerminal] = useState<StageRawOutputPage | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [previousOffsets, setPreviousOffsets] = useState<number[]>([]);
+  const [retryEpoch, setRetryEpoch] = useState(0);
+  const [documentVisible, setDocumentVisible] = useState(
+    () => document.visibilityState !== "hidden",
+  );
+  const terminalRef = useRef<StageRawOutputPage | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
+  const logRef = useRef<HTMLPreElement | null>(null);
+
+  const load = useCallback(async (
+    after: number,
+    direction: "reset" | "next" | "previous" | "refresh",
+  ) => {
+    if (activeRequest.current !== null) return;
+    const controller = new AbortController();
+    activeRequest.current = controller;
+    const current = terminalRef.current;
+    setLoading(current === null || direction !== "refresh");
+    try {
+      let next: StageRawOutputPage;
+      try {
+        next = await fetchStageRawOutput(item.ref, {
+          after,
+          limit: stageRawOutputPageSize,
+          signal: controller.signal,
+        });
+      } catch (caught) {
+        if (
+          after === 0
+          || !(caught instanceof ProductError)
+          || caught.code !== "stage_raw_output_cursor_stale"
+        ) throw caught;
+        after = 0;
+        direction = "reset";
+        next = await fetchStageRawOutput(item.ref, {
+          after,
+          limit: stageRawOutputPageSize,
+          signal: controller.signal,
+        });
+      }
+      if (current && next.stream_ref !== current.stream_ref) {
+        if (after !== 0) {
+          after = 0;
+          next = await fetchStageRawOutput(item.ref, {
+            after,
+            limit: stageRawOutputPageSize,
+            signal: controller.signal,
+          });
+        }
+        direction = "reset";
+      }
+      validateStageRawOutputPage(next, item.ref, after);
+      if (controller.signal.aborted) return;
+      if (direction === "next" && current) {
+        setPreviousOffsets((offsets) => [...offsets, current.offset]);
+      } else if (direction === "previous") {
+        setPreviousOffsets((offsets) => offsets.slice(0, -1));
+      } else if (direction === "reset") {
+        setPreviousOffsets([]);
+      }
+      terminalRef.current = next;
+      setTerminal(next);
+      setError(null);
+    } catch (caught) {
+      if ((caught as Error).name === "AbortError") return;
+      setError(caught instanceof ProductError
+        ? caught.code
+        : "stage_raw_output_unavailable");
+    } finally {
+      if (activeRequest.current === controller) {
+        activeRequest.current = null;
+        setLoading(false);
+      }
+    }
+  }, [item.ref]);
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      setDocumentVisible(document.visibilityState !== "hidden");
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, []);
+
+  useEffect(() => {
+    activeRequest.current?.abort();
+    activeRequest.current = null;
+    terminalRef.current = null;
+    setTerminal(null);
+    setPreviousOffsets([]);
+    setError(null);
+  }, [item.ref]);
+
+  useEffect(() => {
+    if (!expanded || !documentVisible) {
+      activeRequest.current?.abort();
+      activeRequest.current = null;
+      setLoading(false);
+      return;
+    }
+    const current = terminalRef.current;
+    void load(current?.offset ?? 0, current ? "refresh" : "reset");
+  }, [documentVisible, expanded, load, retryEpoch]);
+
+  useEffect(() => {
+    if (
+      !expanded
+      || !documentVisible
+      || loading
+      || terminal?.has_more
+      || !(terminal?.status === "live" || terminal?.status === "waiting")
+    ) return;
+    const timer = window.setTimeout(() => {
+      const current = terminalRef.current;
+      void load(current?.offset ?? 0, current ? "refresh" : "reset");
+    }, stageRawOutputPollMilliseconds);
+    return () => window.clearTimeout(timer);
+  }, [documentVisible, expanded, load, loading, terminal]);
+
+  const atHead = Boolean(terminal?.source_caught_up && !terminal.has_more);
+  useEffect(() => {
+    if (atHead && logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [atHead, terminal?.text]);
+
+  return (
+    <details
+      className="lumen-stage-root-observations"
+      data-testid={`stage-root-observations-${item.ref}`}
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+    >
+      <summary>查看原始 Provider stdout</summary>
+      <div>
+        <p>私有输出 · 原始 JSONL 会按写入顺序持续刷新，可能包含敏感信息。</p>
+        {loading && terminal === null ? <p>正在连接 stdout…</p> : null}
+        {error ? (
+          <p className="lumen-stage-root-observation-error" role="alert">
+            原始 stdout 暂不可读 · <code>{error}</code>
+            <button type="button" onClick={() => setRetryEpoch((value) => value + 1)}>
+              重试
+            </button>
+          </p>
+        ) : null}
+        {terminal?.text ? (
+          <pre
+            ref={logRef}
+            className="lumen-stage-root-observation-log"
+            role="log"
+            aria-live="off"
+            aria-label={`${item.label} 原始 Provider stdout`}
+          >{terminal.text}</pre>
+        ) : null}
+        {terminal && !terminal.text && !error ? (
+          <p>当前 stdout 尚无字节；只要该 Provider turn 仍在运行，这里会继续刷新。</p>
+        ) : null}
+        {terminal ? (
+          <footer>
+            <small>
+              {atHead ? "已追到当前 stdout" : "还有后续页"}
+              {` · ${terminal.next_offset} / ${terminal.source_bytes} bytes`}
+            </small>
+            <nav aria-label="Stage 原始 stdout 分页">
+              <button
+                type="button"
+                disabled={loading || previousOffsets.length === 0}
+                onClick={() => {
+                  const previous = previousOffsets.at(-1);
+                  if (previous !== undefined) void load(previous, "previous");
+                }}
+              >返回上一页</button>
+              <code>{terminal.offset}–{terminal.next_offset}</code>
+              <button
+                type="button"
+                disabled={loading || !terminal.has_more}
+                onClick={() => void load(terminal.next_offset, "next")}
+              >读取下一页</button>
+            </nav>
+          </footer>
+        ) : null}
+      </div>
+    </details>
+  );
+}
+
 function ResearchActivityLane({
   name,
   items,
   emptyCopy,
+  enableStageRootObservations = false,
 }: {
   name: string;
   items: ResearchActivityItem[];
   emptyCopy: string;
+  enableStageRootObservations?: boolean;
 }) {
   const pageSize = 3;
   const [page, setPage] = useState(0);
@@ -1210,13 +1456,11 @@ function ResearchActivityLane({
             <li key={`${item.source}:${item.ref}`}>
               <span><b>{item.label}</b><small>{activityStatusCopy(item.status)}</small></span>
               <time>{activityObservedAt(item.updatedAt)}</time>
+              {enableStageRootObservations ? <StageRawOutputFeed item={item} /> : null}
             </li>
           ))}
         </ul>
       ) : <p>{emptyCopy}</p>}
-      <p className="lumen-activity-capture-note">
-        未捕获正文时显示暂无可观察输出；静默不等于根 Agent 已停止。
-      </p>
       {visible.length ? (
         <details className="lumen-activity-technical">
           <summary>查看运行详情</summary>
@@ -1363,6 +1607,7 @@ function ResearchTracePanel({
               : "Stage 主智能体"}
             items={currentStageRuns}
             emptyCopy="当前 Stage 暂无托管运行记录。"
+            enableStageRootObservations
           />
           <ResearchActivityLane
             name="资料获取"
@@ -2784,6 +3029,7 @@ function TargetTerminalDialog({
   const terminalRef = useRef<TargetRawTerminalState | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
   const requestSequence = useRef(0);
+  const terminalLogRef = useRef<HTMLPreElement | null>(null);
   const paused = minimized
     || blockedByHumanRequest
     || activityPaused
@@ -2935,9 +3181,7 @@ function TargetTerminalDialog({
     loading,
     paused,
     targetMayStillProduceOutput,
-    terminal?.has_more,
-    terminal?.offset,
-    terminal?.status,
+    terminal,
     terminalError,
   ]);
 
@@ -2946,6 +3190,11 @@ function TargetTerminalDialog({
     && terminal.source_caught_up
     && !terminal.has_more,
   );
+  useEffect(() => {
+    if (atHead && terminalLogRef.current) {
+      terminalLogRef.current.scrollTop = terminalLogRef.current.scrollHeight;
+    }
+  }, [atHead, terminal?.text]);
 
   return createPortal(
     <section
@@ -2963,7 +3212,7 @@ function TargetTerminalDialog({
     >
       <header>
         <div>
-          <small>PRIVATE PROVIDER SPOOL / RAW STDOUT + STDERR</small>
+          <small>PRIVATE PROVIDER STDOUT / RAW JSONL</small>
           <b>{target.target_key} · 原始输出</b>
         </div>
         <div className="lumen-target-terminal-actions">
@@ -2983,7 +3232,7 @@ function TargetTerminalDialog({
       {!minimized ? (
         <div className="lumen-target-terminal-body">
           <p className="lumen-target-terminal-boundary">
-            这里按原顺序展示未经脱敏的根命令 stdout/stderr，可能包含敏感信息；展示不会修改 Agent workspace，也不决定研究结果。
+            这里按写入顺序展示未经脱敏的 Provider 原始 stdout（JSONL），可能包含敏感信息；展示不会修改 Agent workspace，也不决定研究结果。
           </p>
           {terminal ? (
             <dl className="lumen-target-terminal-identity">
@@ -3012,22 +3261,23 @@ function TargetTerminalDialog({
           ) : null}
           {terminal?.text ? (
             <pre
+              ref={terminalLogRef}
               className="lumen-target-terminal-log"
               role="log"
               aria-live="off"
-              aria-label={`${target.target_key} 未经脱敏的原始 stdout/stderr`}
+              aria-label={`${target.target_key} 未经脱敏的 Provider 原始 stdout`}
             >{terminal.text}</pre>
           ) : null}
           {terminal && terminal.text.length === 0 ? (
             <p className="lumen-target-terminal-empty">
-              当前还没有根命令 stdout/stderr；运行仍在进行时，窗口会继续读取私有 spool。
+              当前 Provider stdout 尚无字节；只要这个 turn 仍在运行，窗口会继续刷新。
             </p>
           ) : null}
           {terminal ? (
             <footer>
               <small>
-                {atHead ? "已追到当前 spool" : "还有后续页，可按需读取"}
-                {` · ${terminal.mapped_bytes} mapped / ${terminal.source_bytes} source bytes`}
+                {atHead ? "已追到当前 stdout" : "还有后续页，可按需读取"}
+                {` · ${terminal.mapped_bytes} / ${terminal.source_bytes} bytes`}
               </small>
               <nav aria-label="原始输出分页">
                 <button
@@ -4913,6 +5163,12 @@ function App() {
             </span>
             {snapshot ? <code>状态 {snapshot.revision}</code> : null}
           </div>
+          <ForegroundResearchControlShortcut
+            control={snapshot?.research_control}
+            commands={snapshot?.human_collaboration?.commands.items}
+            disabled={humanRequestSurfaceOpen}
+            onChanged={() => void reload()}
+          />
         </header>
         <LumenRail
           canCreate={Boolean(canCreate)}

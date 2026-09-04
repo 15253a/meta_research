@@ -5254,11 +5254,21 @@ def _deepfetch_output_schema() -> dict[str, object]:
         "properties": {
             "paper_id": {"type": "string", "minLength": 1, "maxLength": 512},
             "title": {"type": "string", "minLength": 1, "maxLength": 2_000},
-            "doi": {"type": "string", "minLength": 1, "maxLength": 512},
+            "doi": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 512},
+                    {"type": "null"},
+                ]
+            },
             "arxiv_id": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 512,
+                "anyOf": [
+                    {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                    },
+                    {"type": "null"},
+                ]
             },
             "source_urls": {
                 "type": "array",
@@ -5266,7 +5276,7 @@ def _deepfetch_output_schema() -> dict[str, object]:
                 "items": {"type": "string", "minLength": 1, "maxLength": 4_096},
             },
         },
-        "required": ["paper_id", "title", "source_urls"],
+        "required": ["paper_id", "title", "doi", "arxiv_id", "source_urls"],
     }
     acquisition_request = {
         "type": "object",

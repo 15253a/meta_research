@@ -15,6 +15,7 @@ from meta_research.acquisition import (
     aggregate_batch_status,
     freeze_acquisition_item_artifacts,
 )
+from meta_research.bundle_contract import target_execution_authorization_requirement
 from meta_research.bundle_exhaustion import (
     BundleExhaustionOperationResult,
     BundleExhaustionProposal,
@@ -1010,6 +1011,10 @@ def _open_root_agent_human_request(
         command.condition,
         operation_binding=operation_binding,
     )
+    _validate_bound_target_authorization(
+        target_assertion,
+        required_authorization,
+    )
     try:
         request = owner.open_human_request_effect(
             effect_key=effect_key,
@@ -1047,6 +1052,8 @@ def _root_human_request_required_authorization(
 ) -> dict[str, object] | None:
     if authorization is None:
         return None
+    if _valid_bound_target_authorization(authorization):
+        return authorization
     return {
         "capability": authorization["capability"],
         "scope": {
@@ -1131,6 +1138,7 @@ def _root_human_request_command(
         or not business_purpose.strip()
         or not isinstance(condition, dict)
         or not condition
+        or not _valid_root_human_request_condition(condition)
         or not isinstance(acceptance_conditions, list)
         or not acceptance_conditions
         or len(acceptance_conditions) > 32
@@ -1182,7 +1190,7 @@ def _root_human_request_command(
 
 
 def _valid_root_human_request_authorization(value: object) -> bool:
-    return (
+    return _valid_bound_target_authorization(value) or (
         isinstance(value, dict)
         and set(value) == {
             "capability",
@@ -1200,6 +1208,129 @@ def _valid_root_human_request_authorization(value: object) -> bool:
             for item in cast(list[object], value.get("exclusions"))
         )
     )
+
+
+def _valid_root_human_request_condition(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if set(value) == {"impact", "safe_response"}:
+        return all(
+            isinstance(value.get(name), str) and bool(value.get(name))
+            for name in ("impact", "safe_response")
+        )
+    if set(value) != {"schema_ref", "root", "condition"}:
+        return False
+    root = value.get("root")
+    target = value.get("condition")
+    return (
+        value.get("schema_ref")
+        == "meta-research/root-agent-human-request-target/v1"
+        and isinstance(root, dict)
+        and set(root)
+        == {
+            "run_kind",
+            "run_ref",
+            "attempt_ref",
+            "root_session_ref",
+            "fence_ref",
+            "waiter_generation",
+        }
+        and root.get("run_kind") == "bundle_stage"
+        and all(
+            isinstance(root.get(name), str) and bool(root.get(name))
+            for name in (
+                "run_ref",
+                "attempt_ref",
+                "root_session_ref",
+                "fence_ref",
+            )
+        )
+        and isinstance(root.get("waiter_generation"), int)
+        and not isinstance(root.get("waiter_generation"), bool)
+        and cast(int, root.get("waiter_generation")) >= 1
+        and isinstance(target, dict)
+        and set(target)
+        == {
+            "schema_ref",
+            "operation",
+            "quest_ref",
+            "stage_request_ref",
+            "graph_ref",
+            "target_ref",
+            "target_spec_hash",
+            "risk_class",
+        }
+        and target.get("schema_ref")
+        == "meta-research/target-execution-assertion/v1"
+        and target.get("operation") == "execute_target"
+        and target.get("risk_class") == "high"
+        and all(
+            isinstance(target.get(name), str) and bool(target.get(name))
+            for name in (
+                "quest_ref",
+                "stage_request_ref",
+                "graph_ref",
+                "target_ref",
+                "target_spec_hash",
+            )
+        )
+        and len(cast(str, target.get("target_spec_hash"))) == 64
+    )
+
+
+def _valid_bound_target_authorization(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"capability", "scope"}:
+        return False
+    scope = value.get("scope")
+    return (
+        value.get("capability") == "execute_high_risk_target"
+        and isinstance(scope, dict)
+        and set(scope)
+        == {
+            "authorization_mode",
+            "quest_ref",
+            "stage_request_ref",
+            "graph_ref",
+            "target_ref",
+            "target_spec_hash",
+        }
+        and scope.get("authorization_mode") == "single_target"
+        and all(
+            isinstance(scope.get(name), str) and bool(scope.get(name))
+            for name in (
+                "quest_ref",
+                "stage_request_ref",
+                "graph_ref",
+                "target_ref",
+                "target_spec_hash",
+            )
+        )
+        and len(cast(str, scope.get("target_spec_hash"))) == 64
+    )
+
+
+def _validate_bound_target_authorization(
+    target_assertion: dict[str, object],
+    required_authorization: dict[str, object] | None,
+) -> None:
+    target = target_assertion.get("condition")
+    if (
+        target_assertion.get("schema_ref")
+        != "meta-research/root-agent-human-request-target/v1"
+        or not isinstance(target, dict)
+        or target.get("schema_ref")
+        != "meta-research/target-execution-assertion/v1"
+    ):
+        return
+    expected = target_execution_authorization_requirement(
+        quest_ref=cast(str, target["quest_ref"]),
+        stage_request_ref=cast(str, target["stage_request_ref"]),
+        graph_ref=cast(str, target["graph_ref"]),
+        target_ref=cast(str, target["target_ref"]),
+        target_spec_hash=cast(str, target["target_spec_hash"]),
+    )
+    if required_authorization != expected:
+        raise SemanticMcpError("root_agent_human_request_condition_invalid")
 
 
 def _root_human_request_generation(
@@ -1259,6 +1390,30 @@ def _root_human_request_target(
     *,
     operation_binding: dict[str, object],
 ) -> dict[str, object]:
+    if condition.get("schema_ref") == (
+        "meta-research/root-agent-human-request-target/v1"
+    ):
+        expected_root = {
+            "run_kind": scope["run_kind"],
+            "run_ref": context.run_ref,
+            "attempt_ref": context.attempt_ref,
+            "root_session_ref": context.root_session_ref,
+            "fence_ref": context.fence_ref,
+            "waiter_generation": operation_binding["generation"],
+        }
+        target = condition.get("condition")
+        if (
+            context.root_kind != "bundle"
+            or condition.get("root") != expected_root
+            or not isinstance(target, dict)
+            or target.get("schema_ref")
+            != "meta-research/target-execution-assertion/v1"
+            or target.get("operation") != "execute_target"
+            or target.get("quest_ref") != scope.get("quest_ref")
+            or target.get("risk_class") != "high"
+        ):
+            raise SemanticMcpError("root_agent_human_request_condition_invalid")
+        return condition
     root = {
         "run_kind": scope["run_kind"],
         "run_ref": context.run_ref,

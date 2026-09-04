@@ -81,7 +81,7 @@ class CodexChildLedgerReader(Protocol):
 
         ...
 
-CODEX_LOCKED_VERSION = "0.147.0"
+CODEX_LOCKED_VERSION = "0.153.2"
 CLAUDE_LOCKED_VERSION = "2.1.220"
 _MCP_TOKEN_ENV = "META_RESEARCH_MCP_TOKEN"
 _HARNESS_FAMILY_ENV = "META_RESEARCH_HARNESS_FAMILY"
@@ -1613,6 +1613,271 @@ class _TargetRootCommandOutputState:
     )
 
 
+@dataclass(frozen=True)
+class RootCommandOutputProjection:
+    """One redacted, bounded root-command observation without transport scope."""
+
+    kind: Literal["command_output", "output_gap"]
+    stream: Literal["stdout"]
+    text: str
+    redacted: bool
+    truncated: bool
+    dropped_bytes: int = 0
+    dropped_events: int = 0
+
+
+class CodexRootCommandOutputProjector:
+    """Project only a root Codex command's safe output incrementally.
+
+    The caller owns identity, paging, and persistence.  This narrowly owns the
+    state needed to reconcile cumulative Codex command output, redact it before
+    release, and represent any dropped material as a bounded gap.
+    """
+
+    def __init__(
+        self,
+        *,
+        known_root_native_session_ref: str | None = None,
+        require_explicit_root_actor: bool = False,
+    ) -> None:
+        self._root_native_session_ref = known_root_native_session_ref
+        self._require_explicit_root_actor = require_explicit_root_actor
+        self._unscoped_command_events_omitted = False
+        self._command_outputs: dict[str, _TargetRootCommandOutputState] = {}
+        self._pending_bytes = 0
+        self._saturated = False
+        self._output_bytes = 0
+        self._gap_bytes = 0
+        self._gap_events = 0
+        self._gap_tail = ""
+        self._gap_redacted = False
+        self._gap_emissions = 0
+
+    @property
+    def root_native_session_ref(self) -> str | None:
+        return self._root_native_session_ref
+
+    @property
+    def unscoped_command_events_omitted(self) -> bool:
+        """Whether strict projection withheld unknown command provenance."""
+
+        return self._unscoped_command_events_omitted
+
+    def project(
+        self,
+        event: dict[str, object],
+        *,
+        expected_root_native_session_ref: str | None = None,
+    ) -> RootCommandOutputProjection | None:
+        """Return one safe projection, never a prompt/message/reasoning body."""
+
+        self._observe_root_identity(
+            event, expected_root_native_session_ref=expected_root_native_session_ref
+        )
+        root_ref = self._root_native_session_ref
+        if root_ref is None:
+            return None
+        item = event.get("item")
+        actor_ref = (
+            _codex_item_actor(event, item) if isinstance(item, dict) else None
+        )
+        if (
+            event.get("type") not in {"item.updated", "item.completed"}
+            or not isinstance(item, dict)
+            or item.get("type") != "command_execution"
+            or actor_ref is _CODEX_ITEM_ACTOR_CONFLICT
+            or (actor_ref is not None and actor_ref != root_ref)
+        ):
+            return None
+        if actor_ref is None and self._require_explicit_root_actor:
+            # A durable Codex stream may multiplex child output, while native
+            # item envelopes are allowed to omit a thread id.  That omission
+            # is unknown provenance, not proof of root provenance.  Consumers
+            # that turn this into a new public surface must fail closed.
+            self._unscoped_command_events_omitted = True
+            return None
+        output = next(
+            (
+                item.get(name)
+                for name in ("aggregated_output", "output", "stdout")
+                if isinstance(item.get(name), str)
+            ),
+            None,
+        )
+        if not isinstance(output, str):
+            return None
+        command_ref = item.get("id")
+        if isinstance(command_ref, str) and command_ref:
+            text, redacted, overflow_bytes = self._consume_cumulative_output(
+                command_ref,
+                output,
+                final=event.get("type") == "item.completed",
+            )
+        else:
+            ephemeral = _TargetRootCommandOutputState()
+            text, redacted, overflow_bytes = _consume_target_root_output_delta(
+                ephemeral,
+                output,
+                final=True,
+            )
+        if overflow_bytes:
+            self._remember_redacted_output_gap(overflow_bytes)
+        remaining = max(0, _TARGET_ROOT_OUTPUT_TOTAL_LIMIT - self._output_bytes)
+        if remaining > 0 and text:
+            visible, chunk_truncated = _truncate_utf8(
+                text, min(remaining, _TARGET_ROOT_OUTPUT_CHUNK_LIMIT)
+            )
+            self._output_bytes += len(_target_root_output_bytes(visible))
+            if chunk_truncated:
+                self._remember_output_gap(text[len(visible) :], redacted=redacted)
+            return RootCommandOutputProjection(
+                kind="command_output",
+                stream="stdout",
+                text=visible,
+                redacted=redacted,
+                truncated=chunk_truncated,
+            )
+        if text:
+            self._remember_output_gap(text, redacted=redacted)
+            if self._output_gap_is_due():
+                return self._take_output_gap()
+        elif overflow_bytes and self._output_gap_is_due():
+            return self._take_output_gap()
+        return None
+
+    def finish(self) -> RootCommandOutputProjection | None:
+        """Flush one pending gap once the enclosing root turn is terminal."""
+
+        return self._take_output_gap() if self._gap_events else None
+
+    def _observe_root_identity(
+        self,
+        event: dict[str, object],
+        *,
+        expected_root_native_session_ref: str | None,
+    ) -> None:
+        if event.get("type") != "thread.started":
+            return
+        if event.get("parent_thread_id") not in (None, ""):
+            # A child start never establishes the root identity.  It can appear
+            # before the parent in a malformed/partial stream, so ignore it
+            # rather than later treating its unscoped command output as root.
+            return
+        native_ref = event.get("thread_id")
+        if not isinstance(native_ref, str) or not native_ref:
+            return
+        if (
+            expected_root_native_session_ref is not None
+            and native_ref != expected_root_native_session_ref
+        ):
+            raise HarnessAdapterUnavailable("native_session_identity_changed")
+        if self._root_native_session_ref is None:
+            self._root_native_session_ref = native_ref
+        elif self._root_native_session_ref != native_ref:
+            raise HarnessAdapterUnavailable("native_session_identity_changed")
+
+    def _consume_cumulative_output(
+        self,
+        command_ref: str,
+        cumulative_raw: str,
+        *,
+        final: bool,
+    ) -> tuple[str, bool, int]:
+        if self._saturated:
+            return "", True, len(_target_root_output_bytes(cumulative_raw))
+        state = self._command_outputs.get(command_ref)
+        if state is None:
+            if len(self._command_outputs) >= _TARGET_ROOT_COMMAND_STATE_LIMIT:
+                self._saturate()
+                return "", True, len(_target_root_output_bytes(cumulative_raw))
+            state = _TargetRootCommandOutputState()
+            self._command_outputs[command_ref] = state
+
+        previous_pending_bytes = len(
+            _target_root_output_bytes(state.pending + state.ansi_pending)
+        )
+        if (
+            len(cumulative_raw) < state.raw_char_count
+            or hashlib.sha256(
+                _target_root_output_bytes(cumulative_raw[: state.raw_char_count])
+            ).hexdigest()
+            != state.raw_hash
+        ):
+            # A cumulative stream that rewrites prior bytes cannot be safely
+            # differenced: stop projecting it rather than replaying a secret.
+            self._saturate()
+            return "", True, len(_target_root_output_bytes(cumulative_raw))
+
+        delta = cumulative_raw[state.raw_char_count :]
+        state.raw_char_count = len(cumulative_raw)
+        state.raw_hash = hashlib.sha256(
+            _target_root_output_bytes(cumulative_raw)
+        ).hexdigest()
+        text, redacted, overflow_bytes = _consume_target_root_output_delta(
+            state, delta, final=final
+        )
+        current_pending_bytes = len(
+            _target_root_output_bytes(state.pending + state.ansi_pending)
+        )
+        self._pending_bytes += current_pending_bytes - previous_pending_bytes
+        if (
+            current_pending_bytes > _TARGET_ROOT_OUTPUT_PENDING_LIMIT
+            or self._pending_bytes > _STREAM_LIMIT
+        ):
+            self._saturate()
+            return "", True, overflow_bytes + max(
+                current_pending_bytes, len(_target_root_output_bytes(delta))
+            )
+        return text, redacted, overflow_bytes
+
+    def _saturate(self) -> None:
+        self._saturated = True
+        self._command_outputs.clear()
+        self._pending_bytes = 0
+
+    def _remember_output_gap(self, text: str, *, redacted: bool) -> None:
+        if not text:
+            return
+        self._gap_bytes += len(_target_root_output_bytes(text))
+        self._gap_events += 1
+        self._gap_tail = _utf8_tail(text, _TARGET_ROOT_OUTPUT_CHUNK_LIMIT)
+        self._gap_redacted = self._gap_redacted or redacted
+
+    def _remember_redacted_output_gap(self, dropped_bytes: int) -> None:
+        if dropped_bytes <= 0:
+            return
+        marker = "[REDACTED]"
+        self._gap_bytes += dropped_bytes + len(_target_root_output_bytes(marker))
+        self._gap_events += 1
+        self._gap_tail = marker
+        self._gap_redacted = True
+
+    def _output_gap_is_due(self) -> bool:
+        return (
+            self._gap_emissions == 0
+            or self._gap_bytes >= _TARGET_ROOT_OUTPUT_SAMPLE_BYTES
+            or self._gap_events >= _TARGET_ROOT_OUTPUT_SAMPLE_EVENTS
+        )
+
+    def _take_output_gap(self) -> RootCommandOutputProjection:
+        tail_bytes = len(_target_root_output_bytes(self._gap_tail))
+        projection = RootCommandOutputProjection(
+            kind="output_gap",
+            stream="stdout",
+            text=self._gap_tail,
+            redacted=self._gap_redacted,
+            truncated=True,
+            dropped_bytes=max(0, self._gap_bytes - tail_bytes),
+            dropped_events=self._gap_events,
+        )
+        self._gap_bytes = 0
+        self._gap_events = 0
+        self._gap_tail = ""
+        self._gap_redacted = False
+        self._gap_emissions += 1
+        return projection
+
+
 class _TargetRootEventProjector:
     """Derive a bounded display projection without weakening Harness evidence."""
 
@@ -1631,11 +1896,13 @@ class _TargetRootEventProjector:
             native_ref if isinstance(native_ref, str) else None
         )
         self._claude_tools: dict[str, str] = {}
-        self._codex_command_outputs: dict[
-            str, _TargetRootCommandOutputState
-        ] = {}
-        self._codex_pending_bytes = 0
-        self._codex_projection_saturated = False
+        self._codex_command_output_projector = (
+            CodexRootCommandOutputProjector(
+                known_root_native_session_ref=self._root_native_session_ref
+            )
+            if family == "codex"
+            else None
+        )
         self._output_bytes = 0
         self._gap_bytes = 0
         self._gap_events = 0
@@ -1682,20 +1949,24 @@ class _TargetRootEventProjector:
                         }
             if terminal:
                 summary["target_root_terminal"] = True
-        output = self._root_output(event)
         observation: dict[str, object] | None = None
-        if output is not None:
-            output_text, command_ref = output
-            overflow_bytes = 0
-            if self._family == "codex" and command_ref is not None:
-                text, redacted, overflow_bytes = (
-                    self._consume_codex_command_output(
-                        command_ref,
-                        output_text,
-                        final=event.get("type") == "item.completed",
-                    )
-                )
-            else:
+        if self._family == "codex":
+            projector = self._codex_command_output_projector
+            assert projector is not None
+            projected = projector.project(
+                event,
+                expected_root_native_session_ref=self._root_native_session_ref,
+            )
+            if projected is not None:
+                observation = self._command_projection_observation(projected)
+            if terminal and observation is None:
+                projected = projector.finish()
+                if projected is not None:
+                    observation = self._command_projection_observation(projected)
+        else:
+            output = self._root_output(event)
+            if output is not None:
+                output_text, _command_ref = output
                 ephemeral = _TargetRootCommandOutputState()
                 text, redacted, overflow_bytes = (
                     _consume_target_root_output_delta(
@@ -1704,114 +1975,58 @@ class _TargetRootEventProjector:
                         final=True,
                     )
                 )
-            if overflow_bytes:
-                self._remember_redacted_output_gap(overflow_bytes)
-            remaining = max(
-                0, _TARGET_ROOT_OUTPUT_TOTAL_LIMIT - self._output_bytes
-            )
-            if remaining > 0 and text:
-                visible, chunk_truncated = _truncate_utf8(
-                    text,
-                    min(remaining, _TARGET_ROOT_OUTPUT_CHUNK_LIMIT),
+                if overflow_bytes:
+                    self._remember_redacted_output_gap(overflow_bytes)
+                remaining = max(
+                    0, _TARGET_ROOT_OUTPUT_TOTAL_LIMIT - self._output_bytes
                 )
-                self._output_bytes += len(_target_root_output_bytes(visible))
-                observation = {
-                    "schema_ref": "meta-research/target-root-observation/v1",
-                    "scope": self._scope,
-                    "root_native_session_ref": self._root_native_session_ref,
-                    "kind": "command_output",
-                    "stream": "stdout",
-                    "text": visible,
-                    "redacted": redacted,
-                    "truncated": chunk_truncated,
-                }
-                if chunk_truncated:
-                    self._remember_output_gap(
-                        text[len(visible) :], redacted=redacted
+                if remaining > 0 and text:
+                    visible, chunk_truncated = _truncate_utf8(
+                        text,
+                        min(remaining, _TARGET_ROOT_OUTPUT_CHUNK_LIMIT),
                     )
-            elif text:
-                self._remember_output_gap(text, redacted=redacted)
-                if self._output_gap_is_due():
+                    self._output_bytes += len(_target_root_output_bytes(visible))
+                    observation = {
+                        "schema_ref": "meta-research/target-root-observation/v1",
+                        "scope": self._scope,
+                        "root_native_session_ref": self._root_native_session_ref,
+                        "kind": "command_output",
+                        "stream": "stdout",
+                        "text": visible,
+                        "redacted": redacted,
+                        "truncated": chunk_truncated,
+                    }
+                    if chunk_truncated:
+                        self._remember_output_gap(
+                            text[len(visible) :], redacted=redacted
+                        )
+                elif text:
+                    self._remember_output_gap(text, redacted=redacted)
+                    if self._output_gap_is_due():
+                        observation = self._take_output_gap()
+                elif overflow_bytes and self._output_gap_is_due():
                     observation = self._take_output_gap()
-            elif overflow_bytes and self._output_gap_is_due():
+            if terminal and observation is None and self._gap_events:
                 observation = self._take_output_gap()
-        if terminal and observation is None and self._gap_events:
-            observation = self._take_output_gap()
         return summary, capabilities, native_ref, terminal, observation
 
-    def _consume_codex_command_output(
-        self,
-        command_ref: str,
-        cumulative_raw: str,
-        *,
-        final: bool,
-    ) -> tuple[str, bool, int]:
-        """Project one cumulative command stream without retaining its raw body."""
-
-        if self._codex_projection_saturated:
-            return "", True, len(_target_root_output_bytes(cumulative_raw))
-        state = self._codex_command_outputs.get(command_ref)
-        if state is None:
-            if (
-                len(self._codex_command_outputs)
-                >= _TARGET_ROOT_COMMAND_STATE_LIMIT
-            ):
-                self._saturate_codex_projection()
-                return "", True, len(
-                    _target_root_output_bytes(cumulative_raw)
-                )
-            state = _TargetRootCommandOutputState()
-            self._codex_command_outputs[command_ref] = state
-
-        previous_pending_bytes = len(
-            _target_root_output_bytes(state.pending + state.ansi_pending)
-        )
-        if (
-            len(cumulative_raw) < state.raw_char_count
-            or hashlib.sha256(
-                _target_root_output_bytes(
-                    cumulative_raw[: state.raw_char_count]
-                )
-            ).hexdigest()
-            != state.raw_hash
-        ):
-            # A cumulative output that rewrites already-observed bytes cannot
-            # be differenced safely.  Fail closed for the remainder of this
-            # projector instead of replaying a newly formed secret prefix.
-            self._saturate_codex_projection()
-            return "", True, len(_target_root_output_bytes(cumulative_raw))
-
-        delta = cumulative_raw[state.raw_char_count :]
-        state.raw_char_count = len(cumulative_raw)
-        state.raw_hash = hashlib.sha256(
-            _target_root_output_bytes(cumulative_raw)
-        ).hexdigest()
-        text, redacted, overflow_bytes = _consume_target_root_output_delta(
-            state,
-            delta,
-            final=final,
-        )
-        current_pending_bytes = len(
-            _target_root_output_bytes(state.pending + state.ansi_pending)
-        )
-        self._codex_pending_bytes += (
-            current_pending_bytes - previous_pending_bytes
-        )
-        if (
-            current_pending_bytes > _TARGET_ROOT_OUTPUT_PENDING_LIMIT
-            or self._codex_pending_bytes > _STREAM_LIMIT
-        ):
-            self._saturate_codex_projection()
-            return "", True, overflow_bytes + max(
-                current_pending_bytes,
-                len(_target_root_output_bytes(delta)),
-            )
-        return text, redacted, overflow_bytes
-
-    def _saturate_codex_projection(self) -> None:
-        self._codex_projection_saturated = True
-        self._codex_command_outputs.clear()
-        self._codex_pending_bytes = 0
+    def _command_projection_observation(
+        self, projection: RootCommandOutputProjection
+    ) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema_ref": "meta-research/target-root-observation/v1",
+            "scope": self._scope,
+            "root_native_session_ref": self._root_native_session_ref,
+            "kind": projection.kind,
+            "stream": projection.stream,
+            "text": projection.text,
+            "redacted": projection.redacted,
+            "truncated": projection.truncated,
+        }
+        if projection.kind == "output_gap":
+            value["dropped_bytes"] = projection.dropped_bytes
+            value["dropped_events"] = projection.dropped_events
+        return value
 
     def _remember_output_gap(self, text: str, *, redacted: bool) -> None:
         if not text:
@@ -2633,7 +2848,7 @@ def _summarize_codex_event(
     item_type = item.get("type") if isinstance(item, dict) else None
     tool = item.get("tool") if isinstance(item, dict) else None
     server = item.get("server") if isinstance(item, dict) else None
-    # Locked Codex 0.147 JSONL reports only ``thread_id`` on
+    # The locked Codex JSONL reports only ``thread_id`` on
     # ``thread.started``. Feature support is probed separately; never promote
     # a synthetic ``tools`` test field into production inventory evidence.
     if event_type == "item.completed":
@@ -3203,7 +3418,7 @@ def _closed_root_preflight_envelope(value: object) -> dict[str, object] | None:
 def _codex_root_preflight_envelope(item: dict[str, object]) -> dict[str, object] | None:
     if item.get("type") != "agent_message":
         return None
-    # Codex 0.147 uses ``text`` for agent_message.  ``content`` is accepted
+    # Codex JSONL uses ``text`` for agent_message.  ``content`` is accepted
     # only when it is the same closed scalar envelope, never a prose search.
     return _closed_root_preflight_envelope(item.get("text") or item.get("content"))
 

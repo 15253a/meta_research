@@ -749,6 +749,10 @@ def test_authenticated_target_raw_output_keeps_two_streams_isolated_across_recon
         "native_session_ref, command_ref, output = sys.argv[1:]\n"
         "print(json.dumps({'type':'thread.started',"
         "'thread_id':native_session_ref}), flush=True)\n"
+        "print(json.dumps({'type':'turn.started'}), flush=True)\n"
+        "print(json.dumps({'type':'item.completed','item':{"
+        "'type':'agent_message','id':'message-1',"
+        "'text':'visible agent progress'}}), flush=True)\n"
         "print(json.dumps({'type':'item.completed','item':{"
         "'type':'command_execution','id':command_ref,'exit_code':0,"
         "'output':output}}), flush=True)\n"
@@ -850,8 +854,22 @@ def test_authenticated_target_raw_output_keeps_two_streams_isolated_across_recon
         finally:
             first_client.close()
 
-        assert observed_output == outputs["observed"]
-        assert alternate_output == outputs["alternate"]
+        def private_source(pages: list[dict[str, object]]) -> str:
+            invocation_hash = str(pages[0]["transport_invocation_hash"])
+            return (
+                transport_root
+                / "provider-operations"
+                / invocation_hash[:2]
+                / invocation_hash
+                / "stdout.jsonl"
+            ).read_text(encoding="utf-8")
+
+        assert observed_output == private_source(observed_pages)
+        assert alternate_output == private_source(alternate_pages)
+        assert outputs["observed"] in observed_output
+        assert outputs["alternate"] in alternate_output
+        assert '"type": "agent_message"' in observed_output
+        assert "visible agent progress" in observed_output
         assert len(observed_pages) > 1
         assert len(alternate_pages) > 1
         for suffix, pages in (
@@ -901,7 +919,7 @@ def test_authenticated_target_raw_output_keeps_two_streams_isolated_across_recon
         finally:
             reconnected_client.close()
 
-        assert reconnected_output == outputs["observed"]
+        assert reconnected_output == private_source(reconnected_pages)
         assert reconnected_pages[0]["target_ref"] == "target-observed"
         assert reconnected_pages[0]["operation_ref"] == (
             "target-provider-operation-observed"
@@ -912,5 +930,29 @@ def test_authenticated_target_raw_output_keeps_two_streams_isolated_across_recon
         )
         assert feed.current_revision() == public_revision_before
         assert owner_state() == owner_state_before
+
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "UPDATE ar_harness_provider_operations SET status = 'executed', "
+                "outcome_code = 'human_request_wait', completed_at = 2.0 WHERE "
+                "operation_ref = 'target-provider-operation-observed'"
+            )
+            connection.execute(
+                "UPDATE ar_harness_runs SET status = 'suspended', "
+                "failure_code = 'human_request_wait', updated_at = 2.0 WHERE "
+                "run_ref = 'target-run-observed'"
+            )
+            connection.commit()
+        suspended_client = _authenticated_client(runtime)
+        try:
+            suspended = suspended_client.get(
+                "/api/v1/bundle/targets/target-observed/raw-output",
+                params={"after": 0, "limit": 256 * 1024},
+            )
+            assert suspended.status_code == 200, suspended.text
+            assert suspended.json()["text"] == private_source(observed_pages)
+            assert suspended.json()["status"] == "complete"
+        finally:
+            suspended_client.close()
     finally:
         database.close()

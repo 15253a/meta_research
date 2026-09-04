@@ -1,4 +1,10 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import {
+  expect,
+  test,
+  type Page,
+  type Response,
+  type Route,
+} from "@playwright/test";
 import { DeterministicProduct } from "./support/deterministic-product";
 import { attachFixedVisualPair } from "./support/fixed-reference";
 
@@ -369,6 +375,86 @@ async function humanRequestRecoveryDatabaseState(page: Page): Promise<{
     };
   }));
 }
+
+test("the Quest Companion shows the user's message before its reply is ready", async ({
+  page,
+}) => {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  const collaboration = snapshot.human_collaboration as JsonRecord;
+  const humanRequests = collaboration.human_requests as JsonRecord;
+  humanRequests.items = [];
+  const companionProjection = collaboration.companion as JsonRecord;
+  const projectedMessages = companionProjection.messages as JsonRecord[];
+  let posted: JsonRecord | null = null;
+  let releaseResponse!: () => void;
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponse = resolve;
+  });
+  let markResponseFulfilled!: () => void;
+  const responseFulfilled = new Promise<void>((resolve) => {
+    markResponseFulfilled = resolve;
+  });
+  await page.route("**/api/v1/companion/messages", async (route) => {
+    posted = route.request().postDataJSON() as JsonRecord;
+    await responseGate;
+    projectedMessages.push(
+      {
+        message_ref: "msg-optimistic-user",
+        scope_ref: "quest_chrome_1",
+        role: "user",
+        content: posted.message,
+        status: "completed",
+      },
+      {
+        message_ref: "msg-optimistic-assistant",
+        scope_ref: "quest_chrome_1",
+        role: "assistant",
+        content: "这是稍后返回的 Codex 回复。",
+        status: "completed",
+      },
+    );
+    (snapshot as JsonRecord).revision = Number((snapshot as JsonRecord).revision) + 1;
+    await fulfillJson(route, {
+      interaction_ref: "interaction-optimistic",
+      status: "queued",
+    });
+    markResponseFulfilled();
+  });
+  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+
+  const companion = page.getByRole("complementary", { name: "研究助手" });
+  const message = "先立即显示我的这条消息。";
+  const delayedReply = "这是稍后返回的 Codex 回复。";
+  const replyBubble = companion.locator(".lumen-message:not(.me)").filter({
+    hasText: delayedReply,
+  });
+  await companion.getByLabel("给研究助手发消息").fill(message);
+  await companion.getByRole("button", { name: "发送消息" }).click();
+  let snapshotRefresh: Promise<Response> | null = null;
+  try {
+    await expect.poll(() => posted).toEqual({
+      scope_ref: "quest_chrome_1",
+      message,
+    });
+    await expect(
+      companion.locator(".lumen-message.me").filter({ hasText: message }),
+    ).toBeVisible({ timeout: 750 });
+    await expect(companion.getByText("Codex 正在思考…", { exact: true }))
+      .toBeVisible({ timeout: 750 });
+    await expect(replyBubble).toHaveCount(0);
+  } finally {
+    snapshotRefresh = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === "/api/v1/snapshot"
+    );
+    releaseResponse();
+  }
+  await responseFulfilled;
+  await snapshotRefresh;
+  await expect(replyBubble).toBeVisible();
+  await expect(
+    companion.locator(".lumen-message.me").filter({ hasText: message }),
+  ).toHaveCount(1);
+});
 
 test("the persistent Quest Companion sends ordinary conversation without command authority", async ({
   page,

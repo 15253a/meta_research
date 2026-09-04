@@ -428,28 +428,74 @@ test("research activity stays source-separated, names silence honestly, and disa
 }) => {
   const { nonGetRequests } = await openCurrentCycle(page);
   const activity = page.getByRole("region", { name: "研究活动来源" });
+  const rawStdout = [
+    JSON.stringify({ type: "thread.started", thread_id: "reasoning-native-root-143" }),
+    JSON.stringify({ type: "turn.started" }),
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        type: "agent_message",
+        id: "message-143",
+        text: "正在核对当前研究证据。",
+      },
+    }),
+  ].join("\n") + "\n";
+  const rawBytes = new TextEncoder().encode(rawStdout).byteLength;
 
-  await expect.soft(activity).toBeVisible();
-  if (await activity.count()) {
-    const currentStage = activity.getByRole("region", { name: "Stage 主智能体" });
-    const acquisition = activity.getByRole("region", { name: "资料获取" });
-    const bundle = activity.getByRole("region", { name: "Bundle 策略" });
-    const targets = activity.getByRole("region", { name: "实验任务" });
-    await expect(currentStage).toContainText("Reasoning 阶段主智能体");
-    await expect(currentStage).toContainText("正在运行");
-    await expect(currentStage).toContainText(/更新|fresh/i);
-    await expect(acquisition).toContainText("资料获取任务");
-    await expect(acquisition).toContainText("已完成");
-    await expect(acquisition).toContainText("DeepFetch 文献检索");
-    await expect(acquisition).toContainText("正在运行");
-    await expect(acquisition).toContainText("暂无可观察输出");
-    await expect(bundle).toContainText("Bundle 策略主智能体");
-    await expect(targets).toContainText("检验关键假设 A");
-    await expect(targets).toContainText("正在运行");
-    await expect(activity).toContainText("静默不等于根 Agent 已停止");
-    await expect(currentStage.getByText("reasoning-run-143")).toBeHidden();
-    await expect(bundle.getByText("bundle-run-143")).toBeHidden();
-  }
+  await page.route(
+    "**/api/v1/stage-runs/reasoning-run-143/raw-output*",
+    (route) => fulfill(route, {
+      schema_ref: "meta-research/stage-raw-output-page/v1",
+      run_ref: "reasoning-run-143",
+      run_kind: "reasoning_stage",
+      attempt_ref: "reasoning-attempt-143",
+      attempt_generation: 2,
+      root_session_ref: "reasoning-root-session-143",
+      fence_ref: "reasoning-fence-143",
+      operation_ref: "reasoning-operation-143",
+      phase: "primary",
+      native_session_ref: "reasoning-native-root-143",
+      transport_invocation_hash: "c".repeat(64),
+      stream_ref: "stage-raw-output:reasoning-stream-143",
+      status: "live",
+      text: rawStdout,
+      offset: 0,
+      next_offset: rawBytes,
+      source_bytes: rawBytes,
+      has_more: false,
+      source_caught_up: true,
+      exact: true,
+      unredacted: true,
+    }),
+  );
+  const currentStage = activity.getByRole("region", { name: "Stage 主智能体" });
+  const acquisition = activity.getByRole("region", { name: "资料获取" });
+  const bundle = activity.getByRole("region", { name: "Bundle 策略" });
+  const targets = activity.getByRole("region", { name: "实验任务" });
+  await expect(activity).toBeVisible();
+  await expect(currentStage).toContainText("Reasoning 阶段主智能体");
+  await expect(currentStage).toContainText("正在运行");
+  await expect(currentStage).toContainText(/更新|fresh/i);
+  await expect(acquisition).toContainText("资料获取任务");
+  await expect(acquisition).toContainText("已完成");
+  await expect(acquisition).toContainText("DeepFetch 文献检索");
+  await expect(acquisition).toContainText("正在运行");
+  await expect(bundle).toContainText("Bundle 策略主智能体");
+  await expect(targets).toContainText("检验关键假设 A");
+  await expect(targets).toContainText("正在运行");
+  await expect(currentStage.getByText("这不表示根 Agent 已停止")).toBeHidden();
+  await expect(activity).not.toContainText("未捕获正文时显示暂无可观察输出");
+  await expect(currentStage.getByText("reasoning-run-143")).toBeHidden();
+  await expect(bundle.getByText("bundle-run-143")).toBeHidden();
+
+  const observations = currentStage.getByTestId(
+    "stage-root-observations-reasoning-run-143",
+  );
+  await observations.locator("summary").click();
+  await expect(observations).toContainText('"type":"thread.started"');
+  await expect(observations).toContainText('"type":"agent_message"');
+  await expect(observations).toContainText("正在核对当前研究证据。");
+  await expect(observations).not.toContainText("已安全投影");
 
   await page.getByRole("button", { name: "问题树", exact: true }).click();
   await expect(activity).toBeHidden();
@@ -464,4 +510,90 @@ test("research activity stays source-separated, names silence honestly, and disa
   ));
   expect(overviewVisibleByNextPaint).toBe(true);
   await expect(activity).toBeVisible();
+});
+
+test("Stage raw stdout replaces the old phase stream and keeps polling", async ({
+  page,
+}) => {
+  const { nonGetRequests } = await openCurrentCycle(page);
+  let requests = 0;
+  const stagePage = ({
+    streamRef,
+    phase,
+    text,
+  }: {
+    streamRef: string;
+    phase: string;
+    text: string;
+  }) => ({
+    schema_ref: "meta-research/stage-raw-output-page/v1",
+    run_ref: "reasoning-run-143",
+    run_kind: "reasoning_stage",
+    attempt_ref: "reasoning-attempt-143",
+    attempt_generation: 2,
+    root_session_ref: "reasoning-root-session-143",
+    fence_ref: "reasoning-fence-143",
+    operation_ref: `reasoning-operation-${phase}`,
+    phase,
+    native_session_ref: "reasoning-native-root-143",
+    stream_ref: streamRef,
+    transport_invocation_hash: phase === "primary" ? "d".repeat(64) : "e".repeat(64),
+    status: "live",
+    text,
+    offset: 0,
+    next_offset: new TextEncoder().encode(text).byteLength,
+    source_bytes: new TextEncoder().encode(text).byteLength,
+    has_more: false,
+    source_caught_up: true,
+    exact: true,
+    unredacted: true,
+  });
+  await page.route(
+    "**/api/v1/stage-runs/reasoning-run-143/raw-output*",
+    async (route) => {
+      requests += 1;
+      const after = new URL(route.request().url()).searchParams.get("after");
+      expect(after).toBe("0");
+      if (requests === 2) {
+        await fulfill(route, stagePage({
+          streamRef: "stage-raw-output:phase-two",
+          phase: "review",
+          text: "",
+        }));
+        return;
+      }
+      if (requests >= 3) {
+        await fulfill(route, stagePage({
+          streamRef: "stage-raw-output:phase-two",
+          phase: "review",
+          text: JSON.stringify({
+            type: "item.completed",
+            item: { type: "agent_message", text: "新的阶段原始输出。" },
+          }) + "\n",
+        }));
+        return;
+      }
+      await fulfill(route, stagePage({
+        streamRef: "stage-raw-output:phase-one",
+        phase: "primary",
+        text: JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: "旧阶段原始输出。" },
+        }) + "\n",
+      }));
+    },
+  );
+  const activity = page.getByRole("region", { name: "研究活动来源" });
+  const observations = activity.getByTestId(
+    "stage-root-observations-reasoning-run-143",
+  );
+
+  await observations.locator("summary").click();
+  await expect(observations).toContainText("旧阶段原始输出。");
+  await expect(observations).toContainText("新的阶段原始输出。", {
+    timeout: 10_000,
+  });
+  await expect(observations).not.toContainText("旧阶段原始输出。");
+  await expect(observations.getByRole("alert")).toHaveCount(0);
+  expect(nonGetRequests).toEqual([]);
 });

@@ -186,7 +186,7 @@ test("technical details expose Semantic MCP and both locked Harness profiles", a
   await expect(details).toContainText("streamable_http");
   await expect(details.getByText("codex Harness", { exact: true })).toBeVisible();
   await expect(details.getByText("claude Harness", { exact: true })).toBeVisible();
-  await expect(details).toContainText("lock 0.147.0");
+  await expect(details).toContainText("lock 0.153.2");
   await expect(details).toContainText("lock 2.1.220");
   for (const family of ["codex", "claude"]) {
     const row = details.getByText(`${family} Harness`, { exact: true }).locator("..");

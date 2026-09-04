@@ -176,7 +176,7 @@ class BundleStageWorker:
             unit_kinds=("bundle_primary", "bundle_review"),
         ):
             return True
-        current = self._discover_current_cycle()
+        current = self._discover_active_cycle()
         if current is None:
             return False
         foreground = self._advancement_engine.query_foreground(
@@ -1164,14 +1164,26 @@ class BundleStageWorker:
                 )
                 self._transient_error = "target_high_risk_authorization_declined"
                 return None, True
+            authorization_ref = self._target_authorization_receipt(
+                request, requirement
+            )
             provided = tuple(
                 cast(str, response["response_ref"])
                 for response in responses
                 if response.get("decision") == "provided"
                 and isinstance(response.get("response_ref"), str)
-            )
-            authorization_ref = self._target_authorization_receipt(
-                graph.quest_ref, requirement
+                and isinstance(response.get("facts"), dict)
+                and (
+                    cast(dict[str, object], response["facts"]).get(
+                        "authorization_receipt_ref"
+                    )
+                    == authorization_ref
+                    or (
+                        self._is_legacy_target_authorization_request(request)
+                        and "authorization_receipt_ref"
+                        not in cast(dict[str, object], response["facts"])
+                    )
+                )
             )
             if provided and authorization_ref is not None:
                 self._agent_runtime.evaluate_human_request(
@@ -1200,7 +1212,7 @@ class BundleStageWorker:
             run=run,
         )
         authorization_ref = self._target_authorization_receipt(
-            graph.quest_ref, requirement
+            request, requirement
         )
         if current_waiter is None or authorization_ref is None:
             self._transient_error = "target_high_risk_authorization_stale"
@@ -1309,9 +1321,136 @@ class BundleStageWorker:
         return matching[0] if matching else None
 
     def _target_authorization_receipt(
-        self, quest_ref: str, requirement: dict[str, object]
+        self, request: dict[str, object], requirement: dict[str, object]
     ) -> str | None:
         if self._human_collaboration is None:
+            return None
+        request_ref = request.get("request_ref")
+        if not isinstance(request_ref, str) or not request_ref:
+            raise OwnerConflict("target_human_request_invalid")
+        responses = request.get("responses")
+        if not isinstance(responses, list):
+            return None
+        status = request.get("status")
+        selected_responses: list[dict[str, object]]
+        if status == "satisfied":
+            evaluation = request.get("evaluation")
+            if not isinstance(evaluation, dict):
+                return None
+            evaluated_response_refs = evaluation.get("response_refs")
+            evidence_refs = evaluation.get("accepted_evidence_refs")
+            if (
+                evaluation.get("decision") != "satisfied"
+                or not isinstance(evaluated_response_refs, list)
+                or not isinstance(evidence_refs, list)
+                or len(evidence_refs) != 1
+                or not isinstance(evidence_refs[0], str)
+            ):
+                return None
+            receipt_ref = cast(str, evidence_refs[0])
+            selected_responses = [
+                response
+                for response in responses
+                if isinstance(response, dict)
+                and response.get("decision") == "provided"
+                and response.get("response_ref") in evaluated_response_refs
+            ]
+            if not selected_responses:
+                return None
+        elif status == "open":
+            if not responses or not isinstance(responses[-1], dict):
+                return None
+            latest_response = cast(dict[str, object], responses[-1])
+            if (
+                latest_response.get("decision") != "provided"
+                or not isinstance(latest_response.get("response_ref"), str)
+            ):
+                return None
+            selected_responses = [latest_response]
+            latest_facts = latest_response.get("facts")
+            receipt_ref = (
+                None
+                if not isinstance(latest_facts, dict)
+                else latest_facts.get("authorization_receipt_ref")
+            )
+            if receipt_ref is not None and not isinstance(receipt_ref, str):
+                return None
+        else:
+            return None
+
+        selected_receipt_refs = {
+            cast(str, cast(dict[str, object], response["facts"])[
+                "authorization_receipt_ref"
+            ])
+            for response in selected_responses
+            if isinstance(response.get("facts"), dict)
+            and isinstance(
+                cast(dict[str, object], response["facts"]).get(
+                    "authorization_receipt_ref"
+                ),
+                str,
+            )
+        }
+        if selected_receipt_refs:
+            if len(selected_receipt_refs) != 1:
+                raise OwnerConflict("target_authorization_conflict")
+            selected_receipt_ref = next(iter(selected_receipt_refs))
+            if status == "satisfied" and selected_receipt_ref != receipt_ref:
+                return None
+            receipt_ref = selected_receipt_ref
+        else:
+            legacy_receipt_ref = self._legacy_target_authorization_receipt(
+                request, requirement
+            )
+            if legacy_receipt_ref is None:
+                return None
+            if status == "satisfied" and legacy_receipt_ref != receipt_ref:
+                return None
+            receipt_ref = legacy_receipt_ref
+
+        waiters = request.get("direct_waiters")
+        if not isinstance(waiters, list):
+            return None
+        validations = [
+            waiter.get("resume_validation")
+            for waiter in waiters
+            if isinstance(waiter, dict)
+            and isinstance(waiter.get("resume_validation"), dict)
+        ]
+        if any(
+            cast(dict[str, object], validation).get(
+                "authorization_receipt_ref"
+            )
+            != receipt_ref
+            for validation in validations
+        ):
+            return None
+        try:
+            self._human_collaboration.verify_capability_authorization(
+                requirement=requirement,
+                receipt_ref=receipt_ref,
+            )
+        except OwnerConflict:
+            return None
+        return receipt_ref
+
+    def _legacy_target_authorization_receipt(
+        self, request: dict[str, object], requirement: dict[str, object]
+    ) -> str | None:
+        """Resolve only persisted pre-Root request/Quest authorization pairs."""
+
+        if (
+            self._human_collaboration is None
+            or not self._is_legacy_target_authorization_request(request)
+        ):
+            return None
+        assertion = request.get("target_assertion")
+        quest_ref = request.get("quest_ref")
+        if (
+            not isinstance(assertion, dict)
+            or not isinstance(quest_ref, str)
+            or assertion.get("quest_ref") != quest_ref
+        ):
             return None
         projection = self._human_collaboration.query_collaboration_projection(
             (f"quest:{quest_ref}",)
@@ -1328,6 +1467,18 @@ class BundleStageWorker:
         if len(matches) > 1:
             raise OwnerConflict("target_authorization_conflict")
         return None if not matches else cast(str, matches[0]["receipt_ref"])
+
+    @staticmethod
+    def _is_legacy_target_authorization_request(
+        request: dict[str, object],
+    ) -> bool:
+        assertion = request.get("target_assertion")
+        return bool(
+            request.get("open_effect") is None
+            and isinstance(assertion, dict)
+            and assertion.get("schema_ref")
+            == "meta-research/target-execution-assertion/v1"
+        )
 
     def _dispatch_state(
         self,
@@ -3046,24 +3197,9 @@ class BundleStageWorker:
             self._finish_provider_job(job_ref)
 
     def _discover_current_cycle(self) -> _CurrentCycle | None:
-        active: list[_CurrentCycle] = []
-        for foreground in self._advancement_engine.query_active_foregrounds(
-            stage="bundle"
-        ):
-            question = self._research_graph.query_question_by_ref(
-                cast(str, foreground["question_ref"])
-            )
-            if question is None or question.quest_ref != foreground.get("quest_ref"):
-                raise OwnerConflict("bundle_cycle_index_invalid")
-            active.append(
-                _CurrentCycle(
-                    cast(int, foreground["epoch"]),
-                    cast(str, foreground["cycle_ref"]),
-                    question,
-                )
-            )
-        if active:
-            return max(active, key=lambda item: (item.revision, item.cycle_ref))
+        active = self._discover_active_cycle()
+        if active is not None:
+            return active
 
         candidates: dict[str, _CurrentCycle] = {}
         for event in self._feed.read_event_type(_CYCLE_EVENT):
@@ -3092,6 +3228,27 @@ class BundleStageWorker:
         if not candidates:
             return None
         return max(candidates.values(), key=lambda item: item.revision)
+
+    def _discover_active_cycle(self) -> _CurrentCycle | None:
+        active: list[_CurrentCycle] = []
+        for foreground in self._advancement_engine.query_active_foregrounds(
+            stage="bundle"
+        ):
+            question = self._research_graph.query_question_by_ref(
+                cast(str, foreground["question_ref"])
+            )
+            if question is None or question.quest_ref != foreground.get("quest_ref"):
+                raise OwnerConflict("bundle_cycle_index_invalid")
+            active.append(
+                _CurrentCycle(
+                    cast(int, foreground["epoch"]),
+                    cast(str, foreground["cycle_ref"]),
+                    question,
+                )
+            )
+        if active:
+            return max(active, key=lambda item: (item.revision, item.cycle_ref))
+        return None
 
 
 def _not_eligible_projection(
@@ -3301,7 +3458,7 @@ def _target_authorization_command(
             "request_kind": "capability_authorization",
             "obligation": _TARGET_AUTHORIZATION_OBLIGATION,
             "business_purpose": _TARGET_AUTHORIZATION_PURPOSE,
-            "condition": assertion,
+            "condition": _root_target_authorization_assertion(run, assertion),
             "acceptance_conditions": list(
                 _TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS
             ),

@@ -343,7 +343,7 @@ def test_doctor_json_reports_locked_harness_versions_and_missing_reasons(
         "claude",
     ]
     assert [item["locked_version"] for item in doctor["adapters"]] == [
-        "0.147.0",
+        "0.153.2",
         "2.1.220",
     ]
     for item in doctor["adapters"]:

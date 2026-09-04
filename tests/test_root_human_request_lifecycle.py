@@ -34,7 +34,7 @@ class _OperationBoundBundleSkill(_DeterministicBundleSkill):
     def runtime_binding(self) -> BundleRuntimeBinding:
         binding = replace(
             super().runtime_binding(),
-            harness_adapter_ref="codex-cli/0.147.0",
+            harness_adapter_ref="codex-cli/0.153.2",
         )
         if self._authority is None:
             return binding
@@ -406,6 +406,85 @@ def test_non_root_session_opens_all_kinds_and_reconciles_frozen_effect(
             assert forged["structuredContent"]["code"] == (
                 "semantic_input_schema_mismatch"
             )
+        finally:
+            client.close()
+    finally:
+        runtime.close()
+
+
+def test_bundle_root_accepts_exact_target_authorization_command(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "bundle-root-exact-target-authorization")
+    try:
+        run, channel = _bundle_root_channel(runtime)
+        app = create_app(
+            runtime,
+            base_url="http://testserver",
+            control_key="control-key",
+        )
+        client = TestClient(app)
+        try:
+            headers = _initialized_child(client, channel.connection.token)
+            managed = runtime.owners.agent_runtime.query_managed_run(run.run_ref)
+            assert managed is not None
+            target_assertion = {
+                "schema_ref": "meta-research/target-execution-assertion/v1",
+                "operation": "execute_target",
+                "quest_ref": managed["quest_ref"],
+                "stage_request_ref": "stage-request-exact-target",
+                "graph_ref": "target-graph-exact-target",
+                "target_ref": "target-exact-target",
+                "target_spec_hash": "a" * 64,
+                "risk_class": "high",
+            }
+            condition = {
+                "schema_ref": "meta-research/root-agent-human-request-target/v1",
+                "root": {
+                    "run_kind": "bundle_stage",
+                    "run_ref": run.run_ref,
+                    "attempt_ref": run.attempt_ref,
+                    "root_session_ref": run.root_session_ref,
+                    "fence_ref": run.fence_ref,
+                    "waiter_generation": run.attempt_generation,
+                },
+                "condition": target_assertion,
+            }
+            requirement = {
+                "capability": "execute_high_risk_target",
+                "scope": {
+                    "authorization_mode": "single_target",
+                    "quest_ref": managed["quest_ref"],
+                    "stage_request_ref": "stage-request-exact-target",
+                    "graph_ref": "target-graph-exact-target",
+                    "target_ref": "target-exact-target",
+                    "target_spec_hash": "a" * 64,
+                },
+            }
+            result = _tool_call(
+                client,
+                headers,
+                operation_id=ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
+                arguments={
+                    "effect_id": "bundle-exact-target-authorization",
+                    "request_kind": "capability_authorization",
+                    "obligation": "Authorize only this exact high-risk Target.",
+                    "business_purpose": "Resume only this exact Bundle root.",
+                    "condition": condition,
+                    "acceptance_conditions": [
+                        "An exact independent authorization receipt is current."
+                    ],
+                    "required_authorization": requirement,
+                },
+                request_id=70,
+            )
+            value = _structured(result)
+            request = runtime.owners.agent_runtime.query_human_request(
+                str(value["request_ref"])
+            )
+            assert request is not None
+            assert request["target_assertion"] == condition
+            assert request["required_authorization"] == requirement
         finally:
             client.close()
     finally:

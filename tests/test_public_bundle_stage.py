@@ -69,6 +69,10 @@ from test_harness_full_conformance import (
     _FullConformanceAdapter,
     _full_request,
 )
+from test_public_advancement_runtime_control import (
+    _confirmed_control,
+    _execute_control,
+)
 
 
 def _proof_receipt(receipt_ref: str, subject_ref: str) -> dict[str, object]:
@@ -642,6 +646,46 @@ class _HighRiskBundleSkill(_DeterministicBundleSkill):
         return target_plan
 
 
+class _HighRiskWaitingBundleSkill(_HighRiskBundleSkill):
+    def __init__(self) -> None:
+        self.schedule_requests: list[BundleDispatchRequest] = []
+
+    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+        self.schedule_requests.append(request)
+        return BundleDispatchResult(
+            action="wait",
+            selected_target_ref=None,
+            rationale="Wait for the exact high-risk Target authorization.",
+            native_session_ref=request.native_session_ref,
+            adapter_kind="test_high_risk_waiting",
+        )
+
+
+class _RequestScopedHighRiskBundleSkill(_HighRiskBundleSkill):
+    def __init__(self) -> None:
+        self.schedule_requests: list[BundleDispatchRequest] = []
+
+    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+        self.schedule_requests.append(request)
+        dispatchable = [
+            target
+            for target in request.frontier
+            if target.get("dispatch_allowed") is True
+        ]
+        selected = None if not dispatchable else str(dispatchable[-1]["target_ref"])
+        return BundleDispatchResult(
+            action="wait" if selected is None else "dispatch",
+            selected_target_ref=selected,
+            rationale=(
+                "Wait for the exact high-risk Target authorization."
+                if selected is None
+                else "Dispatch the exact authorized high-risk Target."
+            ),
+            native_session_ref=request.native_session_ref,
+            adapter_kind="test_request_scoped_high_risk",
+        )
+
+
 class _NonDispatchingBundleSkill(_DeterministicBundleSkill):
     def __init__(self, action: str) -> None:
         self.action = action
@@ -1173,7 +1217,13 @@ def test_bundle_ready_full_conformance_allows_provider_entry(tmp_path: Path) -> 
         runtime.close()
 
 
-def _grant_request_capability(runtime, request: dict[str, object]) -> dict[str, object]:
+def _grant_request_capability(
+    runtime,
+    request: dict[str, object],
+    *,
+    authorization_scope_ref: str | None = None,
+    bind_response_to_receipt: bool = True,
+) -> dict[str, object]:
     requirement = request["required_authorization"]
     assert isinstance(requirement, dict)
     capability = requirement["capability"]
@@ -1182,15 +1232,11 @@ def _grant_request_capability(runtime, request: dict[str, object]) -> dict[str, 
     assert isinstance(capability, str)
     assert isinstance(capability_scope, dict)
     assert isinstance(quest_ref, str)
-    response = runtime.owners.human_collaboration.respond_to_human_request(
-        request["request_ref"],
-        decision="provided",
-        facts={"authorization_decision": "allow_once"},
-        note="Grant only the exact Target described by this request.",
-        idempotency_key="bundle-high-risk-response",
+    authorization_scope_ref = (
+        authorization_scope_ref or f"human_request:{request['request_ref']}"
     )
     drafted = runtime.owners.human_collaboration.create_command_draft(
-        f"quest:{quest_ref}",
+        authorization_scope_ref,
         {
             "command_kind": "capability_authorization",
             "payload": {
@@ -1216,7 +1262,7 @@ def _grant_request_capability(runtime, request: dict[str, object]) -> dict[str, 
         "bundle-high-risk-command-confirm",
     )
     authorization = runtime.owners.human_collaboration.decide_capability_authorization(
-        f"quest:{quest_ref}",
+        authorization_scope_ref,
         {
             **requirement,
             "decision": "granted",
@@ -1226,8 +1272,114 @@ def _grant_request_capability(runtime, request: dict[str, object]) -> dict[str, 
         },
         "bundle-risk-auth-record",
     )
+    response = runtime.owners.human_collaboration.respond_to_human_request(
+        request["request_ref"],
+        decision="provided",
+        facts=(
+            {"authorization_receipt_ref": authorization["receipt_ref"]}
+            if bind_response_to_receipt
+            else {"authorization_decision": "allow_once"}
+        ),
+        note="Grant only the exact Target described by this request.",
+        idempotency_key="bundle-high-risk-response",
+    )
     assert response["decision"] == "provided"
     return authorization
+
+
+def _open_root_target_authorization_request(
+    runtime,
+    dispatch_request: BundleDispatchRequest,
+) -> dict[str, object]:
+    frontier_target = dispatch_request.frontier[0]
+    command = frontier_target["human_request_command"]
+    assert isinstance(command, dict)
+    arguments = command["arguments"]
+    assert isinstance(arguments, dict)
+    condition = arguments["condition"]
+    requirement = arguments["required_authorization"]
+    assert isinstance(condition, dict)
+    assert isinstance(requirement, dict)
+    run = runtime.owners.agent_runtime.query_bundle_stage_run(
+        dispatch_request.stage_request_ref
+    )
+    assert run is not None
+    channel = runtime.harnesses.issue_resident_mcp_channel(
+        run_ref=run.run_ref,
+        attempt_ref=run.attempt_ref,
+        root_session_ref=run.root_session_ref,
+        fence_ref=run.fence_ref,
+        capability_binding_hash=run.runtime_binding_hash,
+        operation_ids=BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
+        root_kind="bundle",
+        phase="dispatch",
+        subject_policy="operation_tree",
+    )
+    status, payload, _session_id = runtime.harnesses.dispatch_mcp_http(
+        channel.connection.token,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": command["semantic_operation_id"],
+                "arguments": arguments,
+            },
+        },
+        mcp_session_id=None,
+    )
+    assert status == 200
+    assert isinstance(payload, dict)
+    result = payload["result"]
+    assert isinstance(result, dict)
+    assert result["isError"] is False
+    opened = result["structuredContent"]
+    assert isinstance(opened, dict)
+    request = runtime.owners.agent_runtime.query_human_request(
+        str(opened["request_ref"])
+    )
+    assert request is not None
+    assert request["target_assertion"] == condition
+    assert request["required_authorization"] == requirement
+    return request
+
+
+def _open_legacy_target_authorization_request(
+    runtime,
+    dispatch_request: BundleDispatchRequest,
+) -> dict[str, object]:
+    frontier_target = dispatch_request.frontier[0]
+    command = frontier_target["human_request_command"]
+    assert isinstance(command, dict)
+    arguments = command["arguments"]
+    assert isinstance(arguments, dict)
+    root_condition = arguments["condition"]
+    requirement = arguments["required_authorization"]
+    assert isinstance(root_condition, dict)
+    assert isinstance(requirement, dict)
+    condition = root_condition["condition"]
+    assert isinstance(condition, dict)
+    quest_ref = condition["quest_ref"]
+    target_ref = condition["target_ref"]
+    assert isinstance(quest_ref, str)
+    assert isinstance(target_ref, str)
+    return runtime.owners.agent_runtime.open_human_request(
+        request_kind=str(arguments["request_kind"]),
+        obligation=str(arguments["obligation"]),
+        business_purpose=str(arguments["business_purpose"]),
+        target_assertion=condition,
+        acceptance_conditions=tuple(arguments["acceptance_conditions"]),
+        direct_waiter={
+            "waiter_ref": target_ref,
+            "generation": 1,
+            "target_assertion": condition,
+            "wait_scope": "local",
+            "other_blockers": [],
+        },
+        idempotency_key="bundle-legacy-target-authorization-request",
+        quest_ref=quest_ref,
+        required_authorization=requirement,
+    )
 
 
 def test_gap_plan_becomes_publicly_eligible_for_bundle_without_early_truth(
@@ -1266,6 +1418,114 @@ def test_gap_plan_becomes_publicly_eligible_for_bundle_without_early_truth(
             "bundle_report": None,
             "disposition": {"status": "not_attempted"},
             "stage_commit": None,
+        }
+    finally:
+        runtime.close()
+
+
+def test_suspended_bundle_worker_skips_history_but_projection_keeps_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-suspended-history",
+        harness_ready=False,
+        power_inhibitor=_TogglePowerInhibitor(),
+    )
+    try:
+        _prepare_bundle_request(runtime)
+        assert runtime.feed.read_event_type(
+            "advancement_engine.initial_cycle_activated"
+        )
+        (foreground,) = runtime.owners.advancement_engine.query_active_foregrounds(
+            stage="bundle"
+        )
+        assert foreground["status"] == "active"
+
+        pause = _confirmed_control(
+            runtime.owners.human_collaboration,
+            scope_ref=f"quest:{foreground['quest_ref']}",
+            payload={
+                "action": "pause",
+                "target": {
+                    "quest_ref": foreground["quest_ref"],
+                    "cycle_ref": foreground["cycle_ref"],
+                    "question_ref": foreground["question_ref"],
+                    "epoch": foreground["epoch"],
+                },
+                "reason": "operator_requested",
+            },
+            key="bundle-suspended-history",
+        )
+        executed = _execute_control(
+            runtime.owners.human_collaboration,
+            pause,
+            "bundle-suspended-history",
+        )
+        assert executed["executed"] is True
+        suspended = runtime.owners.advancement_engine.query_foreground(
+            foreground["quest_ref"]
+        )
+        assert suspended is not None
+        assert suspended["stage"] == "bundle"
+        assert suspended["status"] == "suspended"
+        assert suspended["grant_status"] == "suspended"
+        assert runtime.owners.advancement_engine.query_active_foregrounds(
+            stage="bundle"
+        ) == ()
+
+        calls: list[str] = []
+        feed_read = runtime.feed.read_event_type
+        query_question = runtime.owners.research_graph.query_question
+        query_question_by_ref = runtime.owners.research_graph.query_question_by_ref
+        query_initial_cycle = runtime.owners.advancement_engine.query_initial_cycle
+
+        def read_event_type(event_type: str):
+            calls.append("feed.read_event_type")
+            return feed_read(event_type)
+
+        def read_question(initialization_id: str):
+            calls.append("research_graph.query_question")
+            return query_question(initialization_id)
+
+        def read_question_by_ref(question_ref: str):
+            calls.append("research_graph.query_question_by_ref")
+            return query_question_by_ref(question_ref)
+
+        def read_initial_cycle(initialization_id: str):
+            calls.append("advancement_engine.query_initial_cycle")
+            return query_initial_cycle(initialization_id)
+
+        monkeypatch.setattr(runtime.feed, "read_event_type", read_event_type)
+        monkeypatch.setattr(
+            runtime.owners.research_graph,
+            "query_question",
+            read_question,
+        )
+        monkeypatch.setattr(
+            runtime.owners.research_graph,
+            "query_question_by_ref",
+            read_question_by_ref,
+        )
+        monkeypatch.setattr(
+            runtime.owners.advancement_engine,
+            "query_initial_cycle",
+            read_initial_cycle,
+        )
+
+        assert runtime.bundle_stage.process_once() is False
+        assert calls == []
+
+        projection = runtime.bundle_stage.query_current()
+        assert calls == [
+            "feed.read_event_type",
+            "research_graph.query_question",
+            "advancement_engine.query_initial_cycle",
+        ]
+        assert projection["eligibility"]["cycle_ref"] == foreground["cycle_ref"]
+        assert projection["eligibility"]["question_ref"] == foreground["question_ref"]
+        assert projection["eligibility"]["reason"] == {
+            "code": "accepted_formal_plan_unavailable"
         }
     finally:
         runtime.close()
@@ -2245,9 +2505,10 @@ def test_bundle_target_batch_restart_reconciles_committed_owner_proposal(
 def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
     tmp_path: Path,
 ) -> None:
+    provider = _RequestScopedHighRiskBundleSkill()
     runtime = _bundle_runtime(
         tmp_path / "bundle-high-risk",
-        bundle_skill_provider=_HighRiskBundleSkill(),
+        bundle_skill_provider=provider,
     )
     try:
         _confirm_direct_quest(runtime)
@@ -2255,38 +2516,60 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         _finish_plan_stage(runtime)
 
         for _step in range(12):
-            changed = runtime.bundle_stage.process_once()
-            current = runtime.bundle_stage.query_current()
-            requests = runtime.owners.agent_runtime.query_human_requests(
-                include_history=True,
-            )
-            if requests:
+            assert runtime.bundle_stage.process_once()
+            if provider.schedule_requests:
                 break
-            assert changed
         else:
-            raise AssertionError("High-risk Target did not open HumanRequest")
+            raise AssertionError("High-risk frontier did not reach Bundle scheduling")
 
         # The request is local to the exact Target and does not create a
         # TargetRun merely because the Quest has broad authorization.
+        current = runtime.bundle_stage.query_current()
         target = current["target_graph"]["targets"][0]
         assert target["status"] == "blocked"
         assert target["blocker"] == {"code": "target_high_risk_authorization_required"}
         assert target["target_run_ref"] is None
-        request = requests[0]
-        assert request["target_assertion"]["target_ref"] == target["target_ref"]
+        request = _open_root_target_authorization_request(
+            runtime,
+            provider.schedule_requests[0],
+        )
+        request_condition = request["target_assertion"]["condition"]
+        assert request_condition["target_ref"] == target["target_ref"]
         projection = runtime.owners.research_graph.query_target_candidate_projection(
             target_ref=target["target_ref"]
         )
         assert projection is not None
-        assert request["target_assertion"]["target_spec_hash"] == (
+        assert request_condition["target_spec_hash"] == (
             projection.projection_digest
         )
 
         assert runtime.owners.agent_runtime.query_target_launch_ack(
             target["target_ref"]
         ) is None
+        runtime.bundle_stage.process_once()
+        assert runtime.owners.agent_runtime.query_target_launch_ack(
+            target["target_ref"]
+        ) is None
+        assert runtime.bundle_stage.transient_error == "bundle_root_waiting"
+
+        invalid_response = (
+            runtime.owners.human_collaboration.respond_to_human_request(
+                request["request_ref"],
+                decision="provided",
+                facts={"authorization_receipt_ref": "authorization_receipt_missing"},
+                note="This deliberately stale receipt must not release the Target.",
+                idempotency_key="bundle-high-risk-stale-response",
+            )
+        )
+        assert invalid_response["decision"] == "provided"
+        runtime.bundle_stage.process_once()
+        assert runtime.owners.agent_runtime.query_target_launch_ack(
+            target["target_ref"]
+        ) is None
+        assert runtime.bundle_stage.transient_error == "bundle_root_waiting"
 
         authorization = _grant_request_capability(runtime, request)
+        assert authorization["scope_ref"] == f"human_request:{request['request_ref']}"
         for _step in range(12):
             runtime.bundle_stage.process_once()
             current = runtime.bundle_stage.query_current()
@@ -2319,19 +2602,159 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
             request["request_ref"]
         )
         assert persisted is not None
+        assert persisted["status"] == "satisfied"
+        assert persisted["evaluation"]["accepted_evidence_refs"] == [
+            authorization["receipt_ref"]
+        ]
         assert persisted["direct_waiters"][0]["status"] == "consumed"
         assert authorization["receipt_ref"] == persisted["direct_waiters"][0][
             "resume_validation"
         ]["authorization_receipt_ref"]
-        assert runtime.owners.agent_runtime.query_target_run_admission(
-            target["target_ref"]
-        ) is None
-        assert runtime.owners.research_graph.query_target_run_binding(
-            target["target_ref"]
-        ) is None
         assert runtime.owners.agent_runtime.query_target_launch_ack(
             target["target_ref"]
         ) == ack
+    finally:
+        runtime.close()
+
+
+def test_legacy_quest_scoped_high_risk_authorization_remains_restartable(
+    tmp_path: Path,
+) -> None:
+    provider = _RequestScopedHighRiskBundleSkill()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-high-risk-legacy-authorization",
+        bundle_skill_provider=provider,
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+
+        for _step in range(12):
+            assert runtime.bundle_stage.process_once()
+            if provider.schedule_requests:
+                break
+        else:
+            raise AssertionError("High-risk frontier did not reach Bundle scheduling")
+
+        request = _open_legacy_target_authorization_request(
+            runtime,
+            provider.schedule_requests[0],
+        )
+        assertion = request["target_assertion"]
+        assert isinstance(assertion, dict)
+        target_ref = assertion["target_ref"]
+        quest_ref = request["quest_ref"]
+        assert isinstance(target_ref, str)
+        assert isinstance(quest_ref, str)
+        runtime.owners.human_collaboration.respond_to_human_request(
+            request["request_ref"],
+            decision="provided",
+            facts={"authorization_receipt_ref": "authorization_receipt_missing"},
+            note="This stale receipt must keep the legacy Target blocked.",
+            idempotency_key="bundle-legacy-stale-response",
+        )
+        for _step in range(12):
+            runtime.bundle_stage.process_once()
+            if (
+                runtime.bundle_stage.transient_error
+                == "target_high_risk_authorization_required"
+            ):
+                break
+        else:
+            raise AssertionError("Stale legacy receipt did not remain a typed wait")
+        assert runtime.owners.agent_runtime.query_target_launch_ack(target_ref) is None
+
+        authorization = _grant_request_capability(
+            runtime,
+            request,
+            authorization_scope_ref=f"quest:{quest_ref}",
+            bind_response_to_receipt=False,
+        )
+
+        for _step in range(12):
+            runtime.bundle_stage.process_once()
+            ack = runtime.owners.agent_runtime.query_target_launch_ack(target_ref)
+            if ack is not None:
+                break
+        else:
+            raise AssertionError("Legacy authorized Target did not resume")
+
+        persisted = runtime.owners.agent_runtime.query_human_request(
+            str(request["request_ref"])
+        )
+        assert persisted is not None
+        assert persisted["status"] == "satisfied"
+        assert persisted["evaluation"]["accepted_evidence_refs"] == [
+            authorization["receipt_ref"]
+        ]
+        assert persisted["direct_waiters"][0]["status"] == "consumed"
+        assert persisted["direct_waiters"][0]["resume_validation"][
+            "authorization_receipt_ref"
+        ] == authorization["receipt_ref"]
+    finally:
+        runtime.close()
+
+
+def test_high_risk_frontier_emits_root_scoped_human_request_command(
+    tmp_path: Path,
+) -> None:
+    provider = _HighRiskWaitingBundleSkill()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-high-risk-root-command",
+        bundle_skill_provider=provider,
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+
+        for _step in range(12):
+            assert runtime.bundle_stage.process_once()
+            if provider.schedule_requests:
+                break
+        else:
+            raise AssertionError("High-risk frontier did not reach Bundle scheduling")
+
+        request = provider.schedule_requests[0]
+        assert len(request.frontier) == 1
+        target = request.frontier[0]
+        assert target["dispatch_allowed"] is False
+        command = target["human_request_command"]
+        assert isinstance(command, dict)
+        arguments = command["arguments"]
+        assert isinstance(arguments, dict)
+        requirement = arguments["required_authorization"]
+        assert isinstance(requirement, dict)
+        requirement_scope = requirement["scope"]
+        assert isinstance(requirement_scope, dict)
+        condition = arguments["condition"]
+        assert condition == {
+            "schema_ref": "meta-research/root-agent-human-request-target/v1",
+            "root": {
+                "run_kind": "bundle_stage",
+                "run_ref": request.run_ref,
+                "attempt_ref": request.attempt_ref,
+                "root_session_ref": request.root_session_ref,
+                "fence_ref": request.fence_ref,
+                "waiter_generation": 1,
+            },
+            "condition": {
+                "schema_ref": "meta-research/target-execution-assertion/v1",
+                "operation": "execute_target",
+                "quest_ref": requirement_scope["quest_ref"],
+                "stage_request_ref": request.stage_request_ref,
+                "graph_ref": request.graph_ref,
+                "target_ref": target["target_ref"],
+                "target_spec_hash": requirement_scope["target_spec_hash"],
+                "risk_class": "high",
+            },
+        }
+        decisions = runtime.owners.agent_runtime.query_bundle_dispatch_decisions(
+            request.run_ref
+        )
+        assert len(decisions) == 1
+        assert decisions[0].action == "wait"
     finally:
         runtime.close()
 

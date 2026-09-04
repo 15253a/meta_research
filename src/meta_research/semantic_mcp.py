@@ -372,7 +372,11 @@ class SemanticMcpGateway:
                 "id": request_id,
                 "result": _tool_error("capability_unavailable"),
             }
-        if not _matches_schema(arguments, operation.input_schema):
+        if not _matches_schema(
+            arguments, operation.input_schema
+        ) and not _matches_bound_target_human_request(
+            operation_id, arguments
+        ):
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -552,6 +556,23 @@ def _matches_schema(value: object, schema: dict[str, object]) -> bool:
     if schema_type == "boolean":
         return isinstance(value, bool)
     return value is None
+
+
+def _matches_bound_target_human_request(
+    operation_id: str, arguments: dict[str, object]
+) -> bool:
+    """Admit the exact Bundle extension while preserving the frozen catalog."""
+
+    condition = arguments.get("condition")
+    authorization = arguments.get("required_authorization")
+    return (
+        operation_id in ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+        and isinstance(condition, dict)
+        and condition.get("schema_ref")
+        == "meta-research/root-agent-human-request-target/v1"
+        and isinstance(authorization, dict)
+        and authorization.get("capability") == "execute_high_risk_target"
+    )
 
 
 def _jsonrpc_error(

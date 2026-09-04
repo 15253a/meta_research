@@ -2749,6 +2749,14 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         # partial-unique repair intent. A restarted daemon safely adopts the
         # durable processing row with a fresh lock.
         self._asset_handoff_lock = threading.RLock()
+        # Literature objects are immutable and content-addressed. Verify their
+        # custody once per process and reuse the frozen accepted projection;
+        # otherwise every Stage/public projection re-reads and hashes large
+        # fulltext payloads.
+        self._literature_snapshot_lock = threading.RLock()
+        self._literature_snapshot_cache: dict[
+            tuple[str, str], AcceptedLiteratureSnapshot
+        ] = {}
         self._recover_asset_intakes()
 
     def _recover_asset_intakes(self) -> None:
@@ -8341,6 +8349,18 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             raise OwnerConflict("literature_snapshot_binding_invalid")
 
     def _accepted_literature_snapshot(self, row) -> AcceptedLiteratureSnapshot:
+        cache_key = (str(row.snapshot_ref), str(row.snapshot_hash))
+        with self._literature_snapshot_lock:
+            cached = self._literature_snapshot_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            accepted = self._accepted_literature_snapshot_uncached(row)
+            self._literature_snapshot_cache[cache_key] = accepted
+            return accepted
+
+    def _accepted_literature_snapshot_uncached(
+        self, row
+    ) -> AcceptedLiteratureSnapshot:
         summary_document = self._read_literature_object(
             row.summary_object_path, row.summary_hash
         )

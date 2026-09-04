@@ -35,6 +35,10 @@ test("Foreground controls require draft preview confirmation and execution in th
   expect(baseResponse.ok()).toBeTruthy();
   const base = await baseResponse.json() as JsonRecord;
   const writes: string[] = [];
+  let resumeExecutionAttempts = 0;
+  let rejectNextConfirmationAsStale = false;
+  let nextPreviewError: string | null = null;
+  let nextExecutionError: string | null = null;
   const target = {
     quest_ref: "quest_control_1",
     cycle_ref: "cycle_control_1",
@@ -43,7 +47,7 @@ test("Foreground controls require draft preview confirmation and execution in th
     target_scope: "cycle",
     target_question_ref: "question_control_branch",
   };
-  const command: JsonRecord = {
+  let command: JsonRecord = {
     intent_id: "intent-control-1",
     scope_ref: "quest:quest_control_1",
     status: "draft",
@@ -200,20 +204,42 @@ test("Foreground controls require draft preview confirmation and execution in th
         target,
         reason: "operator_requested",
       });
-      snapshot.human_collaboration.commands.items = [command];
-      await fulfill(route, command, 201);
-      return;
-    }
-    if (action === "pause") {
+    } else if (action === "pause") {
+      if (body.command.payload.target.target_scope === "run") {
+        expect(body.command.payload).toEqual({
+          action: "pause",
+          target: {
+            quest_ref: "quest_control_1",
+            cycle_ref: "cycle_control_1",
+            question_ref: "question_control_root",
+            epoch: 3,
+            target_scope: "run",
+            run_ref: "idea-run-1",
+          },
+          reason: "operator_requested",
+        });
+      } else {
+        expect(body.command.payload).toEqual({
+          action: "pause",
+          target: {
+            quest_ref: "quest_control_1",
+            cycle_ref: "cycle_control_1",
+            question_ref: "question_control_root",
+            epoch: 3,
+            target_scope: "cycle",
+          },
+          reason: "operator_requested",
+        });
+      }
+    } else if (action === "resume") {
       expect(body.command.payload).toEqual({
-        action: "pause",
+        action: "resume",
         target: {
           quest_ref: "quest_control_1",
           cycle_ref: "cycle_control_1",
           question_ref: "question_control_root",
           epoch: 3,
-          target_scope: "run",
-          run_ref: "idea-run-1",
+          target_scope: "cycle",
         },
         reason: "operator_requested",
       });
@@ -231,7 +257,7 @@ test("Foreground controls require draft preview confirmation and execution in th
         },
         reason: "operator_requested",
       });
-    } else {
+    } else if (action === "prune") {
       expect(body.command.payload).toEqual({
         action: "prune",
         target: {
@@ -244,7 +270,7 @@ test("Foreground controls require draft preview confirmation and execution in th
         reason: "operator_requested",
       });
     }
-    const questionCommand = {
+    command = {
       ...command,
       intent_id: `intent-control-${action}`,
       status: "draft",
@@ -256,15 +282,21 @@ test("Foreground controls require draft preview confirmation and execution in th
       control_execution: null,
     };
     snapshot.human_collaboration.commands.items = [
+      command,
       ...snapshot.human_collaboration.commands.items.filter(
-        (item: JsonRecord) => item.intent_id !== questionCommand.intent_id,
+        (item: JsonRecord) => item.intent_id !== command.intent_id,
       ),
-      questionCommand,
     ];
-    await fulfill(route, questionCommand, 201);
+    await fulfill(route, command, 201);
   });
   await page.route("**/api/v1/human-collaboration/commands/*/previews", async (route) => {
     writes.push("preview");
+    if (nextPreviewError) {
+      const code = nextPreviewError;
+      nextPreviewError = null;
+      await fulfill(route, { detail: { code } }, 503);
+      return;
+    }
     command.status = "previewed";
     command.impact_preview = {
       preview_ref: "control-preview-1",
@@ -295,7 +327,13 @@ test("Foreground controls require draft preview confirmation and execution in th
   });
   await page.route("**/api/v1/human-collaboration/commands/*/confirmations", async (route) => {
     writes.push("confirm");
+    if (rejectNextConfirmationAsStale) {
+      rejectNextConfirmationAsStale = false;
+      await fulfill(route, { detail: { code: "command_preview_stale" } }, 409);
+      return;
+    }
     command.status = "confirmed";
+    command.impact_preview.status = "consumed";
     command.confirmation_receipt = {
       issuer: "human_collaboration",
       kind: "human_confirmation",
@@ -308,6 +346,21 @@ test("Foreground controls require draft preview confirmation and execution in th
   });
   await page.route("**/api/v1/human-collaboration/commands/*/executions", async (route) => {
     writes.push("execute");
+    if (nextExecutionError) {
+      const code = nextExecutionError;
+      nextExecutionError = null;
+      await fulfill(route, { detail: { code } }, 409);
+      return;
+    }
+    if (command.draft.payload.action === "resume") {
+      resumeExecutionAttempts += 1;
+      if (resumeExecutionAttempts === 1) {
+        await fulfill(route, {
+          detail: { code: "runtime_quiescence_pending" },
+        }, 409);
+        return;
+      }
+    }
     command.executed = true;
     command.control_execution = {
       execution_ref: "control-execution-1",
@@ -316,12 +369,20 @@ test("Foreground controls require draft preview confirmation and execution in th
       receipt_ref: "control-execution-receipt-1",
       receipt_hash: "f".repeat(64),
     };
+    if (
+      command.draft.payload.action === "pause"
+      && command.draft.payload.target.target_scope === "cycle"
+    ) {
+      snapshot.research_control.foreground.status = "suspended";
+    } else if (command.draft.payload.action === "resume") {
+      snapshot.research_control.foreground.status = "active";
+    }
     await fulfill(route, command, 201);
   });
 
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(product.baseUrl, { waitUntil: "domcontentloaded" });
-  const companion = page.getByRole("complementary", { name: "Quest Companion" });
+  const companion = page.getByRole("complementary", { name: "研究助手" });
   const composer = companion.getByRole("region", { name: "研究控制" });
   await expect(composer).toContainText("Epoch 3 · idea");
   await expect(composer.getByLabel("控制动作")).not.toBeVisible();
@@ -358,6 +419,127 @@ test("Foreground controls require draft preview confirmation and execution in th
   await branch.getByRole("button", { name: "剪裁 question_control_branch" }).click();
   await expect.poll(() => writes.at(-1)).toBe("draft:prune");
   await expect(companion.locator(".lumen-command").filter({ hasText: "剪裁 Question" }))
+    .toBeVisible();
+
+  const headerControl = page.getByRole("button", { name: "暂停研究", exact: true });
+  await expect(headerControl).toBeVisible();
+  await headerControl.click();
+  const confirmation = page.getByRole("dialog", { name: "暂停当前研究？" });
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation).toContainText("当前界面与 Web 服务保持在线");
+  await expect(confirmation).toContainText("不会提交 Stage");
+  await expect.poll(() => writes.slice(-2)).toEqual(["draft:pause", "preview"]);
+  await confirmation.getByRole("button", { name: "确认并暂停研究" }).click();
+  await expect.poll(() => writes.slice(-4)).toEqual([
+    "draft:pause",
+    "preview",
+    "confirm",
+    "execute",
+  ]);
+  const resumedHeaderControl = page.getByRole("button", {
+    name: "继续研究",
+    exact: true,
+  });
+  await expect(resumedHeaderControl).toBeVisible();
+  for (const viewport of [
+    { width: 800, height: 1000 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expect(resumedHeaderControl).toBeVisible();
+    const geometry = await page.evaluate(() => {
+      const header = document.querySelector(".lumen-header")?.getBoundingClientRect();
+      const control = document.querySelector(".lumen-research-power")?.getBoundingClientRect();
+      if (!header || !control) throw new Error("missing header research control");
+      return {
+        headerRight: header.right,
+        controlRight: control.right,
+        pageWidth: document.documentElement.scrollWidth,
+        viewportWidth: window.innerWidth,
+      };
+    });
+    expect(geometry.controlRight).toBeLessThanOrEqual(geometry.headerRight + 1);
+    expect(geometry.pageWidth).toBeLessThanOrEqual(geometry.viewportWidth);
+  }
+
+  await resumedHeaderControl.click();
+  const resumeConfirmation = page.getByRole("dialog", { name: "继续当前研究？" });
+  await expect(resumeConfirmation).toBeVisible();
+  await resumeConfirmation.getByRole("button", { name: "确认并继续研究" }).click();
+  await expect(resumeConfirmation).toContainText(
+    "Human Confirmation 已记录，执行尚未完成",
+  );
+  await expect(resumeConfirmation).toContainText("不会提交 Stage");
+  await expect(resumeConfirmation.getByRole("button", { name: "重试执行继续" }))
+    .toBeVisible();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const recoveredControl = page.getByRole("button", { name: "完成继续", exact: true });
+  await expect(recoveredControl).toBeVisible();
+  await recoveredControl.click();
+  const recoveredConfirmation = page.getByRole("dialog", { name: "继续当前研究？" });
+  await expect(recoveredConfirmation).toContainText("不会提交 Stage");
+  await recoveredConfirmation.getByRole("button", { name: "重试执行继续" }).click();
+  await expect.poll(() => writes.slice(-5)).toEqual([
+    "draft:resume",
+    "preview",
+    "confirm",
+    "execute",
+    "execute",
+  ]);
+  await expect(page.getByRole("button", { name: "暂停研究", exact: true }))
+    .toBeVisible();
+
+  rejectNextConfirmationAsStale = true;
+  const executeCountBeforeStale = writes.filter((item) => item === "execute").length;
+  await page.getByRole("button", { name: "暂停研究", exact: true }).click();
+  const staleConfirmation = page.getByRole("dialog", { name: "暂停当前研究？" });
+  await staleConfirmation.getByRole("button", { name: "确认并暂停研究" }).click();
+  await expect(staleConfirmation).toContainText("控制尚未确认，也不会执行");
+  await expect(staleConfirmation).toContainText("command_preview_stale");
+  await expect(staleConfirmation.getByRole("button", { name: "重新生成预览" }))
+    .toBeVisible();
+  expect(writes.filter((item) => item === "execute")).toHaveLength(
+    executeCountBeforeStale,
+  );
+  nextPreviewError = "preview_temporarily_unavailable";
+  await staleConfirmation.getByRole("button", { name: "重新生成预览" }).click();
+  await expect(staleConfirmation).toContainText("preview_temporarily_unavailable");
+  await expect(staleConfirmation.getByRole("button", { name: "确认并暂停研究" }))
+    .toHaveCount(0);
+  await staleConfirmation.getByRole("button", { name: "重新生成预览" }).click();
+  await expect(staleConfirmation.getByRole("button", { name: "确认并暂停研究" }))
+    .toBeVisible();
+  await staleConfirmation.getByRole("button", { name: "暂不操作" }).click();
+
+  nextExecutionError = "runtime_control_repreview_required";
+  await page.getByRole("button", { name: "暂停研究", exact: true }).click();
+  const repreviewConfirmation = page.getByRole("dialog", { name: "暂停当前研究？" });
+  await repreviewConfirmation.getByRole("button", { name: "确认并暂停研究" }).click();
+  await expect(repreviewConfirmation).toContainText("当前控制绑定已变化，原确认不会继续执行");
+  await expect(repreviewConfirmation.getByRole("button", { name: "重新读取当前状态" }))
+    .toBeVisible();
+  await expect(repreviewConfirmation.getByRole("button", { name: "重试执行暂停" }))
+    .toHaveCount(0);
+  await repreviewConfirmation.getByRole("button", { name: "暂不操作" }).click();
+  await page.getByRole("button", { name: "完成暂停", exact: true }).click();
+  const reopenedRepreview = page.getByRole("dialog", { name: "暂停当前研究？" });
+  await expect(reopenedRepreview.getByRole("button", { name: "重新读取当前状态" }))
+    .toBeVisible();
+  await expect(reopenedRepreview.getByRole("button", { name: "重试执行暂停" }))
+    .toHaveCount(0);
+  await reopenedRepreview.getByRole("button", { name: "重新读取当前状态" }).click();
+
+  nextExecutionError = "command_preview_stale";
+  await page.getByRole("button", { name: "暂停研究", exact: true }).click();
+  const executionStale = page.getByRole("dialog", { name: "暂停当前研究？" });
+  await executionStale.getByRole("button", { name: "确认并暂停研究" }).click();
+  await expect(executionStale).toContainText("原确认不会继续执行");
+  await expect(executionStale.getByRole("button", { name: "重新读取当前状态" }))
+    .toBeVisible();
+  await expect(executionStale.getByRole("button", { name: "重试执行暂停" }))
+    .toHaveCount(0);
+  await executionStale.getByRole("button", { name: "重新读取当前状态" }).click();
+  await expect(page.getByRole("button", { name: "暂停研究", exact: true }))
     .toBeVisible();
 });
 

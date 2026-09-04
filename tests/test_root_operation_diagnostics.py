@@ -45,7 +45,7 @@ def _pre_turn(
     return codex_feature_diagnostics(
         profile=root_capability_profile(root_kind),
         entry_path="initial",
-        provider_version="0.147.0",
+        provider_version="0.153.2",
         feature_output=_FEATURE_OUTPUT,
         authorized_operation_ids=authorized_operation_ids,
     )

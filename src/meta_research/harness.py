@@ -1731,9 +1731,9 @@ class HarnessRuntime:
         after: int = 0,
         limit: int = 64 * 1024,
     ) -> dict[str, object]:
-        """Read exact root command output from the private provider spool.
+        """Read exact Provider stdout JSONL from the private spool.
 
-        This is a display-only projection.  It never participates in Target
+        This is a display-only view.  It never participates in Target
         acceptance and a missing/corrupt spool must not change the Run.
         """
 
@@ -1772,6 +1772,13 @@ class HarnessRuntime:
                     run.status == "executed"
                     and operation.status == "executed"
                     and run.failure_code is None
+                )
+                or (
+                    run.status == "suspended"
+                    and run.failure_code == TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE
+                    and operation.status == "executed"
+                    and operation.outcome_code
+                    == TARGET_ROOT_HUMAN_REQUEST_WAIT_CODE
                 )
                 or (
                     run.status == "failed"

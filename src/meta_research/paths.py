@@ -79,6 +79,26 @@ class DataRoot:
         return self.codex_home / "archived_sessions"
 
     @property
+    def codex_cache(self) -> Path:
+        return self.codex_home / "cache"
+
+    @property
+    def codex_tmp(self) -> Path:
+        return self.codex_home / "tmp"
+
+    @property
+    def codex_npm_cache(self) -> Path:
+        return self.codex_cache / "npm"
+
+    @property
+    def codex_uv_cache(self) -> Path:
+        return self.codex_cache / "uv"
+
+    @property
+    def codex_pip_cache(self) -> Path:
+        return self.codex_cache / "pip"
+
+    @property
     def provider_tools(self) -> Path:
         return self.root / "provider-tools"
 
@@ -91,12 +111,53 @@ class DataRoot:
         executable = "codex.cmd" if os.name == "nt" else "codex"
         return self.codex_cli_install_root / "node_modules" / ".bin" / executable
 
+    def validated_codex_cli_executable(self) -> Path:
+        """Return the managed CLI path, rejecting an installed link that escapes it."""
+
+        executable = self.codex_cli_executable.absolute()
+        try:
+            executable.lstat()
+        except FileNotFoundError:
+            # Capability probing owns the normal "not installed" result.  The
+            # absolute managed path still prevents a fallback to global PATH.
+            return executable
+        except OSError as error:
+            raise DataRootError(
+                f"cannot inspect managed Codex executable: {executable}"
+            ) from error
+        try:
+            install_root = self.codex_cli_install_root.resolve(strict=True)
+            resolved = executable.resolve(strict=True)
+        except OSError as error:
+            raise DataRootError(
+                f"cannot resolve managed Codex executable: {executable}"
+            ) from error
+        if not resolved.is_relative_to(install_root) or not resolved.is_file():
+            raise DataRootError(
+                f"managed Codex executable escapes its install root: {executable}"
+            )
+        if os.name == "posix" and not os.access(resolved, os.X_OK):
+            raise DataRootError(
+                f"managed Codex executable is not executable: {executable}"
+            )
+        return executable
+
     @property
     def codex_environment(self) -> dict[str, str]:
         managed_home = str(self.codex_home.absolute())
+        managed_cache = str(self.codex_cache.absolute())
+        managed_tmp = str(self.codex_tmp.absolute())
         return {
             "CODEX_HOME": managed_home,
             "CODEX_SQLITE_HOME": managed_home,
+            "XDG_CACHE_HOME": managed_cache,
+            "PIP_CACHE_DIR": str(self.codex_pip_cache.absolute()),
+            "npm_config_cache": str(self.codex_npm_cache.absolute()),
+            "UV_CACHE_DIR": str(self.codex_uv_cache.absolute()),
+            "TMPDIR": managed_tmp,
+            "TEMP": managed_tmp,
+            "TMP": managed_tmp,
+            "SQLITE_TMPDIR": managed_tmp,
         }
 
 
@@ -189,6 +250,11 @@ def prepare_data_root(path: Path) -> DataRoot:
         root.codex_home,
         root.codex_sessions,
         root.codex_archived_sessions,
+        root.codex_cache,
+        root.codex_npm_cache,
+        root.codex_uv_cache,
+        root.codex_pip_cache,
+        root.codex_tmp,
         root.provider_tools,
         root.codex_cli_install_root,
     ):

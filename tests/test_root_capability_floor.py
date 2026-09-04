@@ -43,7 +43,7 @@ class _NoActivityCodexRunner:
         self.calls.append(list(argv))
         if "--version" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, "codex-cli 0.147.0\n", ""
+                argv, 0, "codex-cli 0.153.2\n", ""
             )
         if argv[-2:] == ["features", "list"]:
             # An unavailable optional inventory is diagnostic-only. Do not

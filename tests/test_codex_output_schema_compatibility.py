@@ -13,6 +13,10 @@ from meta_research.bundle_skill import (
     _target_plan_envelope_schema,
     _target_plan_review_schema,
 )
+from meta_research.deepfetch import (
+    _deepfetch_output_schema,
+    _deepfetch_web_evidence_gate_output_schema,
+)
 from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     _CODEX_JSON_OBJECT_STRING_MARKER,
@@ -63,6 +67,12 @@ _FORBIDDEN_PROVIDER_KEYWORDS = frozenset(
 
 
 def _actual_operation_schemas() -> Iterator[tuple[str, dict[str, object]]]:
+    yield (
+        "deepfetch-web-evidence-gate",
+        _deepfetch_web_evidence_gate_output_schema(),
+    )
+    yield "deepfetch", _deepfetch_output_schema()
+
     yield (
         "idea-primary",
         _outcome_envelope_schema("question:template", "context:template"),

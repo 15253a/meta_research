@@ -50,7 +50,7 @@ def _locked_codex_version(
 ) -> subprocess.CompletedProcess[str]:
     del timeout
     return subprocess.CompletedProcess(
-        argv, 0, stdout="codex-cli 0.147.0\n", stderr=""
+        argv, 0, stdout="codex-cli 0.153.2\n", stderr=""
     )
 
 
@@ -219,7 +219,7 @@ def _fake_drafting_codex(path: Path) -> Path:
         "from pathlib import Path\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('codex-cli 0.147.0')\n"
+        "    print('codex-cli 0.153.2')\n"
         "    raise SystemExit(0)\n"
         "sys.stdin.buffer.read()\n"
         "args = sys.argv[1:]\n"
@@ -1110,7 +1110,7 @@ def test_existing_oversized_effect_waits_for_receipt_and_rejects_sealed_output(
         ephemeral=True,
         job_ref=job_ref,
         directory=directory,
-        provider_version="0.147.0",
+        provider_version="0.153.2",
     )
     directory.mkdir(parents=True)
     quest_drafting._write_durable_json(

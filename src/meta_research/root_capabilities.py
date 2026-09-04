@@ -322,7 +322,7 @@ class RootCapabilityProfile:
                 "evidence_refs": list(tool_inventory_evidence_refs),
                 "names": list(tool_inventory_names),
             },
-            # Codex 0.147 exec JSONL does not expose the model-visible tool
+            # Codex exec JSONL does not expose the model-visible tool
             # list. Keep its real, separately probed feature inventory apart
             # from both tool inventory and turn usage instead of fabricating a
             # ``thread.started.tools`` event.
@@ -674,7 +674,7 @@ def project_codex_post_turn_diagnostics(
 ) -> dict[str, object]:
     """Merge a sealed pre-turn probe with actual Codex JSONL turn usage.
 
-    Codex 0.147 does not report a complete model-visible tool inventory.  This
+    Codex does not report a complete model-visible tool inventory.  This
     projector therefore preserves ``tool_inventory=not_reported`` while still
     publishing what the same provider Session demonstrably used.  A successful
     required MCP startup is availability evidence, never evidence of a call.

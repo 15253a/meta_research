@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import threading
@@ -26,7 +25,7 @@ _PAGE_MAX_BYTES = 256 * 1024
 
 
 class TargetRawOutputUnavailable(RuntimeError):
-    """The private display mapping is unavailable; Target execution is unaffected."""
+    """The private stdout view is unavailable; Target execution is unaffected."""
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -71,28 +70,22 @@ class TargetRawOutputPage:
 
 
 @dataclass
-class _CommandState:
-    character_count: int = 0
-    prefix_hash: str = hashlib.sha256(b"").hexdigest()
-
-
-@dataclass
 class _MappingState:
     source_identity: tuple[int, int] | None = None
     source_offset: int = 0
     source_buffer: bytes = b""
     root_native_session_ref: str | None = None
-    commands: dict[str, _CommandState] = field(default_factory=dict)
     mapped: bytearray = field(default_factory=bytearray)
     failure_code: str | None = None
 
 
 class TargetRawOutputStore:
-    """Map private Codex JSONL to exact root command output on demand.
+    """Page the exact private Codex stdout JSONL on demand.
 
-    The mapping is observer-only. It never edits the provider spool or an Agent
-    workspace, and any mapping failure is deliberately isolated from the Target
-    Run. The bounded LRU avoids retaining every historical stream in memory.
+    The reader is observer-only. It validates the bound root stream, but does
+    not summarize or discard Provider events. It never edits the spool or an
+    Agent workspace, and any read failure is isolated from the Target Run. The
+    bounded LRU avoids retaining every historical stream in memory.
     """
 
     def __init__(self, supervisor_workspace: Path) -> None:
@@ -389,17 +382,26 @@ class TargetRawOutputStore:
             state.source_buffer += chunk
         lines = state.source_buffer.split(b"\n")
         state.source_buffer = lines.pop()
+        unterminated: bytes | None = None
         if final and state.source_offset >= int(stat.st_size) and state.source_buffer:
-            lines.append(state.source_buffer)
+            unterminated = state.source_buffer
             state.source_buffer = b""
         for line in lines:
             self._consume_line(
                 state,
                 line,
                 expected_native_session_ref=expected_native_session_ref,
+                terminated=True,
             )
             if state.failure_code is not None:
                 break
+        if unterminated is not None and state.failure_code is None:
+            self._consume_line(
+                state,
+                unterminated,
+                expected_native_session_ref=expected_native_session_ref,
+                terminated=False,
+            )
         return int(stat.st_size)
 
     @staticmethod
@@ -408,6 +410,7 @@ class TargetRawOutputStore:
         line: bytes,
         *,
         expected_native_session_ref: str | None,
+        terminated: bool,
     ) -> None:
         try:
             value = json.loads(line.decode("utf-8"))
@@ -415,18 +418,20 @@ class TargetRawOutputStore:
             state.failure_code = "target_raw_output_event_invalid"
             return
         if not isinstance(value, dict):
+            state.failure_code = "target_raw_output_event_invalid"
             return
         event = cast(dict[str, object], value)
-        if event.get("type") == "thread.started":
+        if state.root_native_session_ref is None:
             native_ref = event.get("thread_id")
-            if not isinstance(native_ref, str) or not native_ref:
+            if (
+                event.get("type") != "thread.started"
+                or event.get("parent_thread_id") not in (None, "")
+                or not isinstance(native_ref, str)
+                or not native_ref
+            ):
                 state.failure_code = "target_raw_output_root_identity_invalid"
                 return
-            if state.root_native_session_ref is None:
-                state.root_native_session_ref = native_ref
-            elif state.root_native_session_ref != native_ref:
-                state.failure_code = "target_raw_output_root_identity_changed"
-                return
+            state.root_native_session_ref = native_ref
         if (
             expected_native_session_ref is not None
             and state.root_native_session_ref is not None
@@ -434,49 +439,9 @@ class TargetRawOutputStore:
         ):
             state.failure_code = "target_raw_output_root_identity_mismatch"
             return
-        item = event.get("item")
-        if (
-            state.root_native_session_ref is None
-            or event.get("type") not in {"item.updated", "item.completed"}
-            or not isinstance(item, dict)
-            or item.get("type") != "command_execution"
-        ):
-            return
-        actor_ref = event.get("thread_id") or item.get("sender_thread_id")
-        if (
-            isinstance(actor_ref, str)
-            and actor_ref != state.root_native_session_ref
-        ):
-            return
-        command_ref = item.get("id")
-        output = next(
-            (
-                item.get(name)
-                for name in ("aggregated_output", "output", "stdout")
-                if isinstance(item.get(name), str)
-            ),
-            None,
-        )
-        if not isinstance(command_ref, str) or not command_ref or not isinstance(output, str):
-            return
-        command = state.commands.setdefault(command_ref, _CommandState())
-        prefix = output[: command.character_count]
-        try:
-            prefix_bytes = prefix.encode("utf-8")
-            output_bytes = output.encode("utf-8")
-        except UnicodeEncodeError:
-            state.failure_code = "target_raw_output_unicode_invalid"
-            return
-        if (
-            len(output) < command.character_count
-            or hashlib.sha256(prefix_bytes).hexdigest() != command.prefix_hash
-        ):
-            state.failure_code = "target_raw_output_non_monotonic"
-            return
-        delta = output[command.character_count :].encode("utf-8")
-        state.mapped.extend(delta)
-        command.character_count = len(output)
-        command.prefix_hash = hashlib.sha256(output_bytes).hexdigest()
+        state.mapped.extend(line)
+        if terminated:
+            state.mapped.extend(b"\n")
 
 
 __all__ = [

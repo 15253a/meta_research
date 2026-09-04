@@ -9,12 +9,18 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from meta_research.composition import build_production_runtime
 from meta_research.migration import upgrade_database
 from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
 from meta_research.web import ReconciliationHealth, _process_target_runs, create_app
+from test_stage_terminal_contract_authority import _provider_evidence
+from test_target_root_finalizer import (
+    _admit_independent_target_root,
+    _current_bundle_runtime,
+)
 from test_target_run_owner import (
     _HarnessAuthority,
     _records,
@@ -75,6 +81,223 @@ def test_restarted_daemon_advances_persistent_frontier_without_bundle_root(
     finally:
         release.set()
         database.close()
+
+
+def test_admitted_target_frontier_survives_bundle_provider_correction(
+    tmp_path: Path,
+) -> None:
+    runtime = _current_bundle_runtime(
+        tmp_path / "target-frontier-after-bundle-correction"
+    )
+    try:
+        target, candidate, formal_plan, _admission, handle = (
+            _admit_independent_target_root(runtime)
+        )
+        owner = runtime.owners.agent_runtime
+        launch = owner.query_admitted_target_launch(target.target_ref)
+        assert launch is not None
+        current = runtime.bundle_stage.query_current()
+        original = owner.query_bundle_stage_run(
+            current["stage_run_request"]["request_ref"]
+        )
+        assert original is not None
+
+        unit_ref = "bundle-review-after-launch-correction"
+        owner.begin_provider_unit(
+            unit_ref=unit_ref,
+            operation_ref=original.review_invocation.operation_ref,
+            run_ref=original.run_ref,
+            attempt_ref=original.attempt_ref,
+            fence_ref=original.fence_ref,
+            unit_kind="bundle_review",
+        )
+        owner.record_stage_provider_hard_ceiling(
+            unit_ref=unit_ref,
+            run_ref=original.run_ref,
+            attempt_ref=original.attempt_ref,
+            fence_ref=original.fence_ref,
+            failure_code="bundle_review_result_contract_invalid",
+            provider_exit=_provider_evidence(
+                failure_code="bundle_review_result_contract_invalid",
+                detail_code="bundle_dispatch_requires_authoritative_blocker",
+            ),
+        )
+        successor = owner.query_bundle_stage_run(original.request_ref)
+        assert successor is not None
+        assert successor.attempt_ref != original.attempt_ref
+
+        lifecycle = runtime.target_root_lifecycle.activate(
+            launch_ref=launch.launch_ref,
+            handle=handle,
+            candidate=candidate,
+            formal_plan=formal_plan,
+            idempotency_key="activate-after-bundle-correction",
+        )
+        assert lifecycle.status == "running"
+        frontier = owner.query_target_frontier_entry(target.target_ref)
+        assert frontier is not None
+        assert frontier.state == "running"
+        assert frontier.current_handle == handle
+        assert owner.list_target_root_work_refs() == (target.target_ref,)
+
+        # A technical replacement is not also a domain successor, and its
+        # current Attempt/Fence statuses must remain an exact Owner pair.
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ar_stage_attempts SET predecessor_attempt_ref = "
+                    ":retired WHERE attempt_ref = :successor"
+                ),
+                {
+                    "retired": original.attempt_ref,
+                    "successor": successor.attempt_ref,
+                },
+            )
+        with pytest.raises(OwnerConflict, match="target_frontier_integrity_invalid"):
+            owner.query_target_frontier_entry(target.target_ref)
+
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ar_stage_attempts SET predecessor_attempt_ref = NULL "
+                    "WHERE attempt_ref = :successor"
+                ),
+                {"successor": successor.attempt_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_execution_fences SET status = 'submitted' WHERE "
+                    "fence_ref = :fence_ref"
+                ),
+                {"fence_ref": successor.fence_ref},
+            )
+        with pytest.raises(OwnerConflict, match="target_frontier_integrity_invalid"):
+            owner.query_target_frontier_entry(target.target_ref)
+    finally:
+        runtime.close()
+
+
+def test_admitted_target_frontier_survives_bundle_daemon_recovery(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "target-frontier-after-bundle-restart"
+    runtime = _current_bundle_runtime(path)
+    try:
+        target, candidate, formal_plan, _admission, handle = (
+            _admit_independent_target_root(runtime)
+        )
+        owner = runtime.owners.agent_runtime
+        launch = owner.query_admitted_target_launch(target.target_ref)
+        assert launch is not None
+        current = runtime.bundle_stage.query_current()
+        original = owner.query_bundle_stage_run(
+            current["stage_run_request"]["request_ref"]
+        )
+        assert original is not None
+        owner.begin_provider_unit(
+            unit_ref="bundle-review-inflight-before-restart",
+            operation_ref=original.review_invocation.operation_ref,
+            run_ref=original.run_ref,
+            attempt_ref=original.attempt_ref,
+            fence_ref=original.fence_ref,
+            unit_kind="bundle_review",
+        )
+    finally:
+        runtime.close()
+
+    restarted = _current_bundle_runtime(path)
+    try:
+        owner = restarted.owners.agent_runtime
+        successor = owner.query_bundle_stage_run(original.request_ref)
+        assert successor is not None
+        assert successor.attempt_ref != original.attempt_ref
+        lifecycle = restarted.target_root_lifecycle.activate(
+            launch_ref=launch.launch_ref,
+            handle=handle,
+            candidate=candidate,
+            formal_plan=formal_plan,
+            idempotency_key="activate-after-bundle-daemon-recovery",
+        )
+        assert lifecycle.status == "running"
+        frontier = owner.query_target_frontier_entry(target.target_ref)
+        assert frontier is not None
+        assert frontier.state == "running"
+        assert frontier.current_handle == handle
+        assert owner.list_target_root_work_refs() == (target.target_ref,)
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "source_stage"),
+    (("forced_switch", None), ("normal_switch", "bundle")),
+)
+def test_admitted_target_frontier_survives_switch_compensation(
+    tmp_path: Path,
+    action: str,
+    source_stage: str | None,
+) -> None:
+    runtime = _current_bundle_runtime(
+        tmp_path / "target-frontier-after-compensation"
+    )
+    try:
+        target, candidate, formal_plan, _admission, handle = (
+            _admit_independent_target_root(runtime)
+        )
+        owner = runtime.owners.agent_runtime
+        launch = owner.query_admitted_target_launch(target.target_ref)
+        assert launch is not None
+        current = runtime.bundle_stage.query_current()
+        request = current["stage_run_request"]
+        question = request["accepted_question_binding"]
+        original = owner.query_bundle_stage_run(request["request_ref"])
+        assert original is not None
+        payload = {
+            "action": action,
+            "target": {
+                "quest_ref": question["quest_ref"],
+                "cycle_ref": request["cycle_ref"],
+                "question_ref": question["question_ref"],
+                "epoch": request["epoch"],
+                "target_question_ref": "question_control_target",
+            },
+            "reason": "target_handoff_revalidation_failed",
+        }
+        _preview, revision = owner.preview_runtime_control(
+            payload,
+            source_stage=source_stage,
+        )
+        operation_ref = f"target-frontier-{action}"
+        owner.apply_runtime_control(
+            operation_ref=operation_ref,
+            payload=payload,
+            expected_revision=revision,
+            idempotency_key=f"target-frontier-{action}-apply",
+            source_stage=source_stage,
+        )
+        owner.compensate_runtime_control(
+            operation_ref=operation_ref,
+            reason_code="target_handoff_revalidation_failed",
+        )
+        successor = owner.query_bundle_stage_run(original.request_ref)
+        assert successor is not None
+        assert successor.attempt_ref != original.attempt_ref
+
+        lifecycle = runtime.target_root_lifecycle.activate(
+            launch_ref=launch.launch_ref,
+            handle=handle,
+            candidate=candidate,
+            formal_plan=formal_plan,
+            idempotency_key=f"activate-after-{action}-compensation",
+        )
+        assert lifecycle.status == "running"
+        frontier = owner.query_target_frontier_entry(target.target_ref)
+        assert frontier is not None
+        assert frontier.state == "running"
+        assert frontier.current_handle == handle
+        assert owner.list_target_root_work_refs() == (target.target_ref,)
+    finally:
+        runtime.close()
 
 
 def test_target_daemon_is_fair_single_flight_without_a_training_deadline() -> None:

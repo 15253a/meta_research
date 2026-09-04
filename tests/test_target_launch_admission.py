@@ -13,12 +13,13 @@ from meta_research.bundle_protocol import ContentBindingProof, ReceiptProof
 from meta_research.migration import upgrade_database
 from meta_research.owners.common import OwnerConflict
 from test_public_bundle_stage import (
-    _HighRiskBundleSkill,
+    _RequestScopedHighRiskBundleSkill,
     _bundle_runtime,
     _confirm_direct_quest,
     _finish_idea_stage,
     _finish_plan_stage,
     _grant_request_capability,
+    _open_root_target_authorization_request,
 )
 from test_plan_stage_migration import _upgrade_to_revision
 
@@ -404,9 +405,10 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    provider = _RequestScopedHighRiskBundleSkill()
     runtime = _bundle_runtime(
         tmp_path / "target-launch-high-risk",
-        bundle_skill_provider=_HighRiskBundleSkill(),
+        bundle_skill_provider=provider,
     )
     try:
         _confirm_direct_quest(runtime)
@@ -414,14 +416,14 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
         _finish_plan_stage(runtime)
         for _step in range(16):
             assert runtime.bundle_stage.process_once()
-            requests = runtime.owners.agent_runtime.query_human_requests(
-                include_history=True
-            )
-            if requests:
+            if provider.schedule_requests:
                 break
         else:
-            raise AssertionError("High-risk Target did not open exact HumanRequest")
-        human_request = requests[0]
+            raise AssertionError("High-risk frontier did not reach Bundle scheduling")
+        human_request = _open_root_target_authorization_request(
+            runtime,
+            provider.schedule_requests[0],
+        )
         authorization = _grant_request_capability(runtime, human_request)
         for _step in range(12):
             runtime.bundle_stage.process_once()
@@ -467,30 +469,16 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
         assert _side_effect_counts(runtime) == before
 
         launch_calls: list[tuple[object, dict[str, object]]] = []
-        target_runtime_calls: list[str] = []
         original_admit = runtime.owners.agent_runtime.admit_target_launch
 
         def observe_admit(launch_request, **kwargs):
             launch_calls.append((launch_request, kwargs))
             return original_admit(launch_request, **kwargs)
 
-        def forbidden_legacy_path(*_args, **_kwargs):
-            raise AssertionError("high-risk launch entered legacy execution")
-
         monkeypatch.setattr(
             runtime.owners.agent_runtime,
             "admit_target_launch",
             observe_admit,
-        )
-        monkeypatch.setattr(
-            runtime.owners.agent_runtime,
-            "admit_target_run",
-            forbidden_legacy_path,
-        )
-        monkeypatch.setattr(
-            runtime.owners.research_graph,
-            "bind_target_run",
-            forbidden_legacy_path,
         )
         assert runtime.bundle_stage.process_once() is True
         assert not hasattr(runtime.bundle_stage, "_target_run_runtime")
@@ -502,8 +490,8 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
             == decisions[-1].decision_ref
         )
         assert launch_kwargs["human_request_ref"] == human_request["request_ref"]
-        assert launch_kwargs["human_waiter_ref"] == target.target_ref
-        assert launch_kwargs["human_waiter_generation"] == 1
+        assert launch_kwargs["human_waiter_ref"] == f"root_run:{run.run_ref}"
+        assert launch_kwargs["human_waiter_generation"] == run.attempt_generation
         assert (
             launch_kwargs["human_authorization_receipt_ref"]
             == authorization["receipt_ref"]
@@ -526,7 +514,6 @@ def test_bundle_worker_passes_exact_high_risk_authorization_to_launch_admission(
                 break
         else:
             raise AssertionError("Bundle did not yield the admitted Target")
-        assert target_runtime_calls == []
         assert len(launch_calls) == 1
         assert _side_effect_counts(runtime) == admitted
         assert runtime.bundle_stage.transient_error == "target_launch_pending"

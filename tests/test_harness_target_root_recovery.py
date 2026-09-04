@@ -80,7 +80,7 @@ class _TargetHumanRequestRunner:
         assert timeout is None or timeout > 0
         if "--version" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, "codex-cli 0.147.0\n", ""
+                argv, 0, "codex-cli 0.153.2\n", ""
             )
         if argv[-2:] == ["features", "list"]:
             return subprocess.CompletedProcess(
