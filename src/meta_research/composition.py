@@ -124,6 +124,7 @@ from meta_research.stage_root_observations import (
     StageRootObservationPage,
     StageRootObservationReader,
 )
+from meta_research.stage_provider_recovery import StoppedStageProviderRecovery
 from meta_research.telemetry import (
     OtlpHttpTelemetryExporter,
     validate_otlp_http_endpoint,
@@ -323,10 +324,19 @@ class ProductionRuntime:
         *,
         after: int = 0,
         limit: int = 64 * 1024,
+        phase: str | None = None,
     ) -> StageRawOutputPage:
         """Read exact private stdout for the current Stage provider unit."""
 
-        return self.stage_root_observations.query_raw(
+        reader = self.stage_root_observations
+        if phase is not None:
+            reader = StageRootObservationReader(
+                self.data_root.root,
+                scope_lookup=lambda ref: self.owners.agent_runtime.query_stage_root_observation_scope(
+                    ref, phase=phase
+                ),
+            )
+        return reader.query_raw(
             run_ref,
             after=after,
             limit=limit,
@@ -1052,6 +1062,7 @@ def build_production_runtime(
         bundle_skill_provider,
         owners.human_collaboration,
         harnesses,
+        stopped_provider_checkpoint=StoppedStageProviderRecovery(stage_root_observations),
     )
     writing = WritingReportService(
         research_graph,
@@ -1082,6 +1093,7 @@ def build_production_runtime(
         quest_completion=quest_completion,
         writing=writing,
         harnesses=harnesses,
+        database=database,
     )
     provider_lifecycles: list[object] = []
     for provider in (

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -145,6 +146,8 @@ class StageRawOutputPage:
     source_bytes: int
     has_more: bool
     source_caught_up: bool
+    source_updated_at: float | None = None
+    observed_at: float = field(default_factory=lambda: time.time())
     exact: bool = True
     unredacted: bool = True
 
@@ -169,6 +172,8 @@ class StageRawOutputPage:
             "source_bytes": self.source_bytes,
             "has_more": self.has_more,
             "source_caught_up": self.source_caught_up,
+            "source_updated_at": self.source_updated_at,
+            "observed_at": self.observed_at,
             "exact": self.exact,
             "unredacted": self.unredacted,
         }
@@ -383,6 +388,9 @@ class StageRootObservationReader:
             source_bytes=source_bytes,
             has_more=next_offset < source_bytes,
             source_caught_up=next_offset >= source_bytes,
+            # Use the same file snapshot as source_bytes. Polling and
+            # an empty spool are not evidence of execution activity.
+            source_updated_at=(float(stat.st_mtime) if source_bytes else None),
         )
 
     def _empty_raw_page(

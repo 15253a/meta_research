@@ -107,13 +107,17 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
     def preflight(
         self, request: AcquisitionPreflightRequest
     ) -> AcquisitionPreflightResult:
+        if type(request.generation) is not int or request.generation < 1:
+            raise AcquisitionUnavailable("acquisition_preflight_generation_invalid")
+        # Preserve the first generation's deployed identity for exact recovery.
+        # A later Owner-admitted preflight must not replay its terminal failure.
+        job_ref = f"acquisition:{request.session_ref}:preflight:{request.config_hash}"
+        if request.generation > 1:
+            job_ref += f":generation:{request.generation}"
         result = self._delegate.preflight(request)
         decision = self._accept_result(
             session_ref=request.session_ref,
-            job_ref=(
-                f"acquisition:{request.session_ref}:preflight:"
-                f"{request.config_hash}"
-            ),
+            job_ref=job_ref,
             phase="preflight",
             observed={
                 "status": result.status,
@@ -199,6 +203,27 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         root_runtime_scope: object,
     ) -> dict[str, object]:
         previous_native_session_ref = self._latest_native_session_ref(session_ref)
+        invocation_path = (
+            self._root._workspace / "provider-operations"
+            / canonical_hash({"job_ref": job_ref})
+            / "acquisition-root-turn" / "invocation.json"
+        )
+        if invocation_path.exists():
+            # A replay keeps its original native-session input even after a
+            # later successful turn advances this Acquisition session.
+            try:
+                _key_path, key = self._root._transport_key()
+                invocation = read_transport_envelope(invocation_path, key)
+                previous = invocation.get("native_session_ref")
+                if (
+                    invocation.get("job_ref") != job_ref
+                    or invocation.get("operation_name") != "acquisition-root-turn"
+                    or (previous is not None and not isinstance(previous, str))
+                ):
+                    raise ProviderSupervisorError("acquisition_invocation_invalid")
+                previous_native_session_ref = previous
+            except (OSError, ProviderSupervisorError) as error:
+                raise AcquisitionUnavailable("acquisition_root_session_invalid") from error
         formal_human_request_available = (
             allow_human_request and root_runtime_scope is not None
         )
@@ -343,8 +368,13 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         phase: str,
     ) -> None:
         existing = self._session_receipts(session_ref)
-        if existing and existing[-1].get("job_ref") == job_ref:
-            if existing[-1].get("native_session_ref") != native_session_ref:
+        replay = next((item for item in existing if item.get("job_ref") == job_ref), None)
+        if replay is not None:
+            if (
+                replay.get("native_session_ref") != native_session_ref
+                or replay.get("previous_native_session_ref") != previous_native_session_ref
+                or replay.get("phase") != phase
+            ):
                 raise AcquisitionUnavailable("acquisition_root_session_conflict")
             return
         directory = self._session_directory(session_ref)

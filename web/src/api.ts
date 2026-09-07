@@ -105,6 +105,7 @@ export type AssetReleaseAssessment = {
 };
 
 export type ResearchAssetsView = {
+  loaded?: boolean;
   status: "ready";
   revision: number;
   inventory_revision: number;
@@ -565,7 +566,7 @@ export type QuestionTreeItem = {
   };
 };
 
-export type QuestionTreeProjection =
+export type QuestionTreeProjection = { loaded?: boolean } & (
   | {
       status: "ready";
       items: QuestionTreeItem[];
@@ -580,7 +581,7 @@ export type QuestionTreeProjection =
       status: "capability_unavailable";
       reason: { code: string; message?: string };
       items: [];
-    };
+    });
 
 export type QuestionHistoryEvent = {
   action: "accepted" | "prune" | "restore";
@@ -1133,6 +1134,8 @@ export type StageRawOutputPage = {
   offset: number;
   next_offset: number;
   source_bytes: number;
+  source_updated_at?: number | null;
+  observed_at?: number;
   has_more: boolean;
   source_caught_up: boolean;
   exact: true;
@@ -1649,6 +1652,7 @@ export type WritingReportView = {
 };
 
 export type WritingOverview = {
+  loaded?: boolean;
   status: "ready";
   document_types: WritingDocumentType[];
   delivery_capabilities?: {
@@ -1800,6 +1804,8 @@ export type HarnessStatus = {
 };
 
 export type PublicSnapshot = {
+  query_warnings?: Array<{ section: string; code: string; target_ref?: string }>;
+  observed_at?: string;
   product: { name: string; version: string };
   revision: number;
   readiness: { status: "ready" | "unavailable"; checks: ReadinessCheck[] };
@@ -1984,16 +1990,14 @@ function adaptManualTurns(
         status: "completed",
       },
     ];
-    if (turn.assistant_content !== null) {
-      rows.push({
-        turn_ref: `${turn.ref}:assistant`,
-        role: "assistant",
-        content: turn.assistant_content,
-        status: ["queued", "running", "completed"].includes(turn.assistant_status)
-          ? turn.assistant_status as "queued" | "running" | "completed"
-          : "failed",
-      });
-    }
+    rows.push({
+      turn_ref: `${turn.ref}:assistant`,
+      role: "assistant",
+      content: turn.assistant_content ?? "",
+      status: ["queued", "running", "completed"].includes(turn.assistant_status)
+        ? turn.assistant_status as "queued" | "running" | "completed"
+        : "failed",
+    });
     return rows;
   });
 }
@@ -2543,16 +2547,56 @@ export class ProductError extends Error {
   }
 }
 
-export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapshot> {
-  const response = await fetch("/api/v1/snapshot", {
-    credentials: "same-origin",
-    headers: { Accept: "application/json" },
-    signal,
-  });
-  if (!response.ok) {
-    throw new ProductError(`snapshot_unavailable:${response.status}`);
+export async function fetchSnapshot(
+  signal?: AbortSignal,
+  sections: { includeAssets?: boolean; includeHistory?: boolean } = {},
+): Promise<PublicSnapshot> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  const timer = window.setTimeout(abort, 22_000);
+  try {
+    for (;;) {
+      const response = await fetch("/api/v1/snapshot", {
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "X-Meta-Research-Snapshot-Assets": sections.includeAssets === false ? "defer" : "include",
+          "X-Meta-Research-Snapshot-History": sections.includeHistory === false ? "defer" : "include",
+        },
+        signal: controller.signal,
+      });
+      if (response.status === 503) {
+        const failure = await response.json().catch(() => null);
+        if (failure?.detail?.code === "snapshot_query_in_progress") {
+          // Another page is using the shared query slot. Keep loading and retry
+          // within the original deadline instead of reporting the service offline.
+          const seconds = Number(response.headers.get("Retry-After") ?? "2");
+          const delay = Number.isFinite(seconds) ? Math.min(5_000, Math.max(250, seconds * 1_000)) : 2_000;
+          await new Promise<void>((resolve, reject) => {
+            const cancel = () => {
+              window.clearTimeout(retryTimer);
+              controller.signal.removeEventListener("abort", cancel);
+              reject(new DOMException("Snapshot request aborted", "AbortError"));
+            };
+            const retryTimer = window.setTimeout(() => {
+              controller.signal.removeEventListener("abort", cancel);
+              resolve();
+            }, delay);
+            controller.signal.addEventListener("abort", cancel, { once: true });
+            if (controller.signal.aborted) cancel();
+          });
+          continue;
+        }
+      }
+      if (!response.ok) throw new ProductError(`snapshot_unavailable:${response.status}`);
+      return (await response.json()) as PublicSnapshot;
+    }
+  } finally {
+    window.clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
   }
-  return (await response.json()) as PublicSnapshot;
 }
 
 export function fetchQuestionHistory(
@@ -2676,6 +2720,7 @@ export async function fetchStageRawOutput(
     after?: number;
     limit?: number;
     signal?: AbortSignal;
+    phase?: "primary" | "review";
   } = {},
 ): Promise<StageRawOutputPage> {
   const after = options.after ?? 0;
@@ -2690,6 +2735,7 @@ export async function fetchStageRawOutput(
     after: String(after),
     limit: String(limit),
   });
+  if (options.phase) parameters.set("phase", options.phase);
   const response = await fetch(
     `/api/v1/stage-runs/${encodeURIComponent(runRef)}`
       + `/raw-output?${parameters}`,
@@ -3695,6 +3741,8 @@ function isPermanentHumanResponseRejection(error: unknown): boolean {
   return error instanceof ProductError && (
     error.code === "human_request_not_current"
     || error.code === "human_request_not_found"
+    || error.code === "root_agent_human_request_scope_stale"
+    || error.code === "root_human_request_scope_stale"
     || error.code === "idempotency_conflict"
   );
 }
@@ -6159,7 +6207,7 @@ export function followProjection(
     if (reloadTimer !== null) return;
     reloadTimer = setTimeout(() => {
       reloadTimer = null;
-      onRevision(cursor);
+      if (!stopped) onRevision(cursor);
     }, 50);
   };
 
@@ -6177,6 +6225,7 @@ export function followProjection(
     const next = new EventSource(`/api/v1/events?after=${cursor}`);
     stream = next;
     next.onopen = () => {
+      if (stopped || stream !== next) return;
       reconnectAttempt = 0;
       onConnection(true);
     };
@@ -6193,6 +6242,7 @@ export function followProjection(
       }, delay);
     };
     const update = (event: Event) => {
+      if (stopped || stream !== next) return;
       if (!acceptCursor(event)) return;
       if (onResearchActivity && event.type === "projection.updated") {
         try {
@@ -6215,7 +6265,7 @@ export function followProjection(
     next.addEventListener(
       "agent_runtime.target_root_observations_available",
       (event) => {
-        if (!onTargetRootObservationsAvailable) return;
+        if (stopped || stream !== next || !onTargetRootObservationsAvailable) return;
         try {
           const payload = JSON.parse((event as MessageEvent<string>).data) as
             Partial<TargetRootObservationPointer>;
@@ -6240,6 +6290,7 @@ export function followProjection(
     next.addEventListener("projection.updated", update);
     for (const eventType of eventTypes) next.addEventListener(eventType, update);
     next.addEventListener("snapshot.required", (event) => {
+      if (stopped || stream !== next) return;
       acceptCursor(event);
       if (reloadTimer !== null) {
         clearTimeout(reloadTimer);

@@ -1492,43 +1492,6 @@ class TargetRunFinalizer:
             artifact_snapshot_hash=snapshot_hash,
         )
 
-    def _verify_result_semantics(
-        self,
-        target_ref: str,
-        handoff: TargetCompletionHandoff,
-        result: TargetRootResultDocument,
-    ) -> None:
-        reader = self._measurement_authority
-        if reader is None:
-            return
-        authority = reader.query_target_measurement_domain_authority(target_ref)
-        contract = getattr(authority, "measurement_contract", None)
-        protocol = getattr(contract, "protocol_version", None)
-        required = getattr(protocol, "required_metric_keys", None)
-        optional = getattr(protocol, "optional_metric_keys", None)
-        checkpoint_policy = getattr(contract, "checkpoint_policy", None)
-        if (
-            authority is None
-            or getattr(authority, "target_ref", None) != target_ref
-            or getattr(contract, "result_schema_ref", None) != result.schema_ref
-            or type(required) is not tuple
-            or type(optional) is not tuple
-            or checkpoint_policy not in {"forbidden", "optional", "required"}
-        ):
-            raise OwnerConflict("target_root_measurement_authority_invalid")
-        metric_keys = set(result.metrics)
-        if not set(required) <= metric_keys or not metric_keys <= set(
-            (*required, *optional)
-        ):
-            raise OwnerConflict("target_root_result_metrics_invalid")
-        checkpoint_count = sum(
-            artifact.role == "checkpoint" for artifact in handoff.artifacts
-        )
-        if (checkpoint_policy == "required" and checkpoint_count == 0) or (
-            checkpoint_policy == "forbidden" and checkpoint_count != 0
-        ):
-            raise OwnerConflict("target_root_checkpoint_policy_invalid")
-
 
 def _system_target_completion_handoff(
     *,

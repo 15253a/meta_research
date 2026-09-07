@@ -244,6 +244,16 @@ class StageCommit:
 
 
 @dataclass(frozen=True)
+class QuestCycleStageHistory:
+    """Stable Cycle identity and exact requests/commits, without live progress."""
+
+    cycle_ref: str
+    question_ref: str
+    requests: tuple[StageRunRequest, ...]
+    commits: tuple[StageCommit, ...]
+
+
+@dataclass(frozen=True)
 class BundleReportDisposition:
     disposition_ref: str
     request_ref: str
@@ -321,6 +331,10 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     def query_snapshot(self) -> OwnerSnapshot: ...
 
     def query_foreground(self, quest_ref: str) -> dict[str, object] | None: ...
+
+    def query_quest_stage_history(
+        self, quest_ref: str
+    ) -> tuple[QuestCycleStageHistory, ...]: ...
 
     def query_reasoning_successor_context(
         self, cycle_ref: str
@@ -2148,6 +2162,83 @@ class SQLiteAdvancementEngine(
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
+
+    def query_quest_stage_history(
+        self, quest_ref: str
+    ) -> tuple[QuestCycleStageHistory, ...]:
+        """Read all accepted epochs, including retired Cycles and route skips.
+
+        Uncommitted Bundle requests are included so consumers can resolve an
+        immutable accepted report before StageCommit. Other in-flight requests
+        and mutable Foreground/worker state do not belong to this fact history.
+        """
+
+        with self._database.read() as connection:
+            cycles = connection.execute(
+                text(
+                    "SELECT cycle_ref, question_ref FROM ae_cycles "
+                    "WHERE quest_ref = :quest_ref ORDER BY created_at, cycle_ref"
+                ),
+                {"quest_ref": quest_ref},
+            ).all()
+            commit_rows = connection.execute(
+                text(
+                    "SELECT commits.* FROM ae_stage_commits commits "
+                    "JOIN ae_cycles cycles ON cycles.cycle_ref = commits.cycle_ref "
+                    "WHERE cycles.quest_ref = :quest_ref "
+                    "ORDER BY commits.epoch, commits.stage, commits.commit_ref"
+                ),
+                {"quest_ref": quest_ref},
+            ).all()
+            request_rows = connection.execute(
+                text(
+                    "SELECT requests.* FROM ae_stage_run_requests requests "
+                    "JOIN ae_cycles cycles ON cycles.cycle_ref = requests.cycle_ref "
+                    "WHERE cycles.quest_ref = :quest_ref AND "
+                    "(requests.stage = 'bundle' OR EXISTS "
+                    "(SELECT 1 FROM ae_stage_commits commits "
+                    "WHERE commits.request_ref = requests.request_ref)) "
+                    "ORDER BY requests.epoch, requests.stage, requests.request_ref"
+                ),
+                {"quest_ref": quest_ref},
+            ).all()
+        cycle_questions = {row.cycle_ref: row.question_ref for row in cycles}
+        requests = {}
+        requests_by_cycle = {ref: [] for ref in cycle_questions}
+        commits_by_cycle = {ref: [] for ref in cycle_questions}
+        for row in request_rows:
+            request = self._stage_request_from_row(row)
+            if (
+                request.accepted_question.quest_ref != quest_ref
+                or request.accepted_question.question_ref
+                != cycle_questions.get(request.cycle_ref)
+            ):
+                raise OwnerConflict("quest_stage_history_binding_invalid")
+            requests[request.request_ref] = request
+            requests_by_cycle[request.cycle_ref].append(request)
+        for row in commit_rows:
+            commit = self._stage_commit_from_row(row)
+            request = requests.get(commit.request_ref)
+            if commit.cycle_ref not in cycle_questions or (
+                commit.request_ref is not None
+                and (
+                    request is None
+                    or request.cycle_ref != commit.cycle_ref
+                    or request.stage != commit.stage
+                    or request.epoch != commit.epoch
+                )
+            ):
+                raise OwnerConflict("quest_stage_history_binding_invalid")
+            commits_by_cycle[commit.cycle_ref].append(commit)
+        return tuple(
+            QuestCycleStageHistory(
+                cycle_ref=row.cycle_ref,
+                question_ref=row.question_ref,
+                requests=tuple(requests_by_cycle[row.cycle_ref]),
+                commits=tuple(commits_by_cycle[row.cycle_ref]),
+            )
+            for row in cycles
+        )
 
     def query_foreground(self, quest_ref: str) -> dict[str, object] | None:
         _control_ref(quest_ref, "quest_ref")
@@ -7960,18 +8051,6 @@ class SQLiteAdvancementEngine(
             raise OwnerConflict("bundle_exhaustion_proposal_integrity_invalid")
         return proposal
 
-    def _query_stage_commit(self, request_ref: str) -> StageCommit | None:
-        with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT * FROM ae_stage_commits WHERE request_ref = :request_ref"
-                ),
-                {"request_ref": request_ref},
-            ).first()
-        if row is None:
-            return None
-        return self._stage_commit_from_row(row)
-
     def _query_stage_commit_position(
         self, *, cycle_ref: str, stage: str, epoch: int
     ) -> StageCommit | None:
@@ -9749,10 +9828,6 @@ def _control_ref(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or len(value) > 128:
         raise OwnerConflict(f"{field}_invalid")
     return value
-
-
-def _question_cycle_ref(question_ref: str) -> str:
-    return f"cycle_question_{canonical_hash({'question_ref': question_ref})[:40]}"
 
 
 def _foreground_row_dict(row) -> dict[str, object]:

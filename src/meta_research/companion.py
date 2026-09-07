@@ -1,12 +1,26 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Callable, cast
 
+from meta_research.chat_progress import (
+    CHAT_REPLY_PROGRESS_INSTRUCTION,
+    preserve_existing_reply_prompt,
+    read_chat_reply,
+)
 from meta_research.codex_runtime import CODEX_MODEL_REF
-from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillUnavailable
+from meta_research.idea_skill import (
+    CodexIdeaSkillAdapter,
+    IdeaSkillUnavailable,
+    _read_operation_invocation,
+)
 from meta_research.owners.common import canonical_hash
+from meta_research.provider_supervisor import (
+    ProviderSupervisorError,
+    read_transport_key_for_operation,
+)
 from meta_research.quest_drafting import (
     INTENT_REPLY_MAX_LENGTH,
     DraftingUnavailable,
@@ -97,6 +111,46 @@ class CodexCompanionAdapter(
             if all((item / "completed.json").is_file() for item in directories)
             else "pending"
         )
+
+    def observe_reply(self, job_ref: str) -> str:
+        """Read only this job's verified Companion turn spool, never other turns."""
+        directory = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": job_ref})
+            / "companion-turn"
+        )
+        try:
+            with (directory / "invocation.json").open("rb") as stream:
+                encoded = stream.read(64 * 1024 + 1)
+            if len(encoded) > 64 * 1024:
+                return ""
+            envelope = json.loads(encoded)
+            invocation = (
+                envelope.get("payload") if isinstance(envelope, dict) else None
+            )
+            if (
+                not isinstance(invocation, dict)
+                or invocation.get("job_ref") != job_ref
+                or invocation.get("operation_name") != "companion-turn"
+            ):
+                return ""
+            _key_path, key = read_transport_key_for_operation(directory)
+            _read_operation_invocation(
+                directory / "invocation.json",
+                key=key,
+                expected_base={
+                    name: value
+                    for name, value in invocation.items()
+                    if name != "transport_mode"
+                },
+            )
+        except (
+            OSError, ValueError, TypeError, IdeaSkillUnavailable,
+            ProviderSupervisorError,
+        ):
+            return ""
+        return read_chat_reply(directory / "stdout.jsonl")
 
     def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
         child_prompt = (
@@ -189,6 +243,7 @@ class CodexCompanionAdapter(
             context_identity = f"initialization_id={request.initialization_id}\n"
         prompt = (
             role_instruction
+            + CHAT_REPLY_PROGRESS_INSTRUCTION
             + "\n\n"
             + context_identity
             + f"current_draft_revision={request.draft_revision}\n"
@@ -196,6 +251,18 @@ class CodexCompanionAdapter(
             f"current_draft={_canonical_json(request.draft)}\n"
             f"user_message={request.message}"
         )
+        if request.job_ref is not None:
+            prompt = preserve_existing_reply_prompt(
+                prompt,
+                invocation_path=(
+                    self._workspace / "provider-operations"
+                    / canonical_hash({"job_ref": request.job_ref})
+                    / "companion-turn" / "invocation.json"
+                ),
+                job_ref=request.job_ref,
+                hash_prompt=canonical_hash,
+                operation_name="companion-turn",
+            )
         try:
             raw, native_session_ref, _stdout = (
                 self._invoke_optional_root_task_operation(

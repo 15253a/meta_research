@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from sqlalchemy.sql.elements import TextClause
@@ -23,11 +22,9 @@ class SQLiteOwnerSnapshot:
         self,
         database: Database,
         query: OwnerSnapshotQuery,
-        additional_facts: Callable[[], dict[str, OwnerFact]] | None = None,
     ) -> None:
         self._database = database
         self._query = query
-        self._additional_facts = additional_facts
 
     def query_snapshot(self) -> OwnerSnapshot:
         with self._database.read() as connection:
@@ -35,8 +32,6 @@ class SQLiteOwnerSnapshot:
         facts: dict[str, OwnerFact] = {
             name: row[name] for name in self._query.fact_names
         }
-        if self._additional_facts is not None:
-            facts.update(self._additional_facts())
         return OwnerSnapshot(
             owner=self._query.owner,
             revision=int(row["revision"]),

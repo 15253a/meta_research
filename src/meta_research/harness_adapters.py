@@ -910,6 +910,21 @@ class _NativeCliHarnessAdapter:
         return "danger-full-access"
 
 
+def _configured_target_sandbox_mode() -> str:
+    """Read the service operator's explicit Target execution policy."""
+    mode = os.environ.get("META_RESEARCH_TARGET_SANDBOX_MODE", "workspace-write")
+    if mode not in {"workspace-write", "danger-full-access"}:
+        raise HarnessAdapterUnavailable("target_sandbox_mode_invalid")
+    return mode
+
+
+def _target_review_sandbox_modes(*, read_only: bool = False) -> frozenset[str]:
+    modes = {"workspace-write", _configured_target_sandbox_mode()}
+    if read_only:
+        modes.add("read-only")
+    return frozenset(modes)
+
+
 class CodexHarnessAdapter(_NativeCliHarnessAdapter):
     family = "codex"
     executable = "codex"
@@ -917,7 +932,7 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
 
     def _sandbox_mode(self, invocation: HarnessInvocation) -> str:
         return (
-            "workspace-write"
+            _configured_target_sandbox_mode()
             if invocation.target_workspace_ref is not None
             else "danger-full-access"
         )
@@ -1434,63 +1449,6 @@ def _verified_failed_native_session_ref(
     ):
         return None
     return native_session_ref
-
-
-class _CodexHomeChildLedgerReader:
-    """Read one child ledger only from the configured CODEX_HOME tree."""
-
-    def __init__(self, codex_home: Path) -> None:
-        if not codex_home.is_absolute() or codex_home.is_symlink():
-            raise ValueError("codex home is not a trusted directory")
-        self._codex_home = codex_home.resolve()
-
-    def read(self, child_session_ref: str) -> tuple[dict[str, object], ...]:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", child_session_ref):
-            raise OSError("child session reference invalid")
-        candidates: list[tuple[Path, tuple[dict[str, object], ...]]] = []
-        for relative in ("sessions", "archived_sessions"):
-            directory = self._codex_home / relative
-            if not directory.exists():
-                continue
-            if directory.is_symlink() or not directory.is_dir():
-                raise OSError("codex ledger directory invalid")
-            for path in directory.rglob(f"*{child_session_ref}*.jsonl"):
-                if path.is_symlink() or not path.is_file():
-                    continue
-                try:
-                    resolved = path.resolve(strict=True)
-                    resolved.relative_to(self._codex_home)
-                    records = _parse_jsonl(resolved.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, ValueError):
-                    continue
-                if _ledger_session_id(records) == child_session_ref:
-                    candidates.append((resolved, records))
-        if len(candidates) != 1:
-            raise OSError("child ledger missing or ambiguous")
-        return candidates[0][1]
-
-    def verify_skill_package(self, skill_path: str, injected_body: str) -> str:
-        path = Path(skill_path)
-        if (
-            not path.is_absolute()
-            or not path.is_file()
-            or not _is_non_symlink_codex_home_descendant(path, self._codex_home)
-        ):
-            raise OSError("child Skill package invalid")
-        try:
-            resolved = path.resolve(strict=True)
-            package_bytes = resolved.read_bytes()
-            package = package_bytes.decode("utf-8")
-        except (OSError, ValueError) as error:
-            raise OSError("child Skill package invalid") from error
-        except UnicodeDecodeError as error:
-            raise OSError("child Skill package invalid") from error
-        if not any(
-            candidate == package
-            for candidate in _skill_body_without_wrapper_newline(injected_body)
-        ):
-            raise OSError("child Skill package content drift")
-        return hashlib.sha256(package_bytes).hexdigest()
 
 
 def _is_non_symlink_codex_home_descendant(path: Path, codex_home: Path) -> bool:
@@ -3015,31 +2973,6 @@ def _claude_content_blocks(
     return [block for block in content if isinstance(block, dict)]
 
 
-def _verified_subagent_evidence_refs(
-    family: HarnessFamily,
-    events: tuple[dict[str, object], ...],
-    *,
-    evidence_refs_by_sequence: dict[int, str],
-    root_session_ref: str,
-    codex_child_ledger_reader: CodexChildLedgerReader | None = None,
-    expected_working_directory: str | None = None,
-) -> tuple[str, ...]:
-    evidence = _verified_subagent_evidence(
-        family,
-        events,
-        evidence_refs_by_sequence=evidence_refs_by_sequence,
-        root_session_ref=root_session_ref,
-        codex_child_ledger_reader=codex_child_ledger_reader,
-        expected_working_directory=expected_working_directory,
-    )
-    if evidence is None:
-        return ()
-    return (
-        str(evidence["spawn_evidence_ref"]),
-        str(evidence["completion_evidence_ref"]),
-    )
-
-
 def _verified_subagent_evidence(
     family: HarnessFamily,
     events: tuple[dict[str, object], ...],
@@ -3539,6 +3472,7 @@ def _verified_codex_child_code_review_evidence(
         child_ref=child_ref,
         root_session_ref=root_session_ref,
         expected_working_directory=expected_working_directory,
+        allowed_sandbox_modes=_target_review_sandbox_modes(),
     )
     skill = _verified_child_code_review_skill(records)
     terminal = _verified_child_terminal_output(records)
@@ -3648,7 +3582,7 @@ def _verified_codex_child_result_review_evidence(
         child_ref=child_ref,
         root_session_ref=root_session_ref,
         expected_working_directory=expected_working_directory,
-        allowed_sandbox_modes=frozenset({"read-only", "workspace-write"}),
+        allowed_sandbox_modes=_target_review_sandbox_modes(read_only=True),
     )
     terminal = _verified_child_terminal_output(records)
     if (

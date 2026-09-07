@@ -53,7 +53,7 @@ def validate_plan_context_pack(
             "accepted_idea_set_binding",
             "evidence_catalog",
             "evidence_reference_revision",
-        },
+        } | ({"evidence_catalog_page"} if "evidence_catalog_page" in context_pack else set()),
         "plan_context_pack_invalid",
     )
     if (
@@ -85,6 +85,28 @@ def validate_plan_context_pack(
     ):
         raise PlanContractError("plan_evidence_catalog_invalid")
 
+    page = context_pack.get("evidence_catalog_page")
+    if page is not None:
+        if not isinstance(page, dict):
+            raise PlanContractError("plan_evidence_page_invalid")
+        _exact_keys(page, {"total_candidates", "candidate_unit", "candidate_count", "scanned_count", "offset", "limit", "next_offset", "question_ref", "selection", "snapshot_hash", "projections"}, "plan_evidence_page_invalid")
+        if (any(type(page.get(key)) is not int or page[key] < 0 for key in
+                ("total_candidates", "candidate_count", "scanned_count", "offset", "limit"))
+                or not 1 <= page["limit"] <= MAX_PLAN_EVIDENCE_REFS
+                or page["candidate_unit"] != "evidence_asset_role"
+                or page["candidate_count"] != len(catalog)
+                or not len(catalog) <= page["scanned_count"] <= page["limit"]
+                or page["scanned_count"] > max(0, page["total_candidates"] - page["offset"])
+                or page["question_ref"] != question_ref
+                or page["selection"] != "current_question_then_recent_active_or_shared"
+                or page["snapshot_hash"] != canonical_hash(catalog)
+                or not isinstance(page["projections"], list)):
+            raise PlanContractError("plan_evidence_page_invalid")
+        next_offset = page["offset"] + page["scanned_count"]
+        expected_next = next_offset if next_offset < page["total_candidates"] else None
+        if page["next_offset"] != expected_next:
+            raise PlanContractError("plan_evidence_page_invalid")
+
     evidence_by_ref: dict[str, dict[str, object]] = {}
     version_refs: set[str] = set()
     for value in catalog:
@@ -96,6 +118,24 @@ def validate_plan_context_pack(
             raise PlanContractError("plan_evidence_catalog_invalid")
         evidence_by_ref[evidence_ref] = evidence
         version_refs.add(version_ref)
+    if page is not None and page["projections"]:
+        projections = page["projections"]
+        if len(projections) != len(catalog):
+            raise PlanContractError("plan_evidence_page_invalid")
+        for evidence, projection in zip(catalog, projections, strict=True):
+            if not isinstance(projection, dict):
+                raise PlanContractError("plan_evidence_page_invalid")
+            if (projection.get("evidence_ref") != evidence["evidence_ref"]
+                    or projection.get("target_commit_ref") != evidence["target_commit_root_ref"]
+                    or projection.get("asset_version_ref") != evidence["asset_version_ref"]
+                    or projection.get("content_hash") != evidence["content_hash"]
+                    or not _text(projection.get("question_ref"))
+                    or not _text(projection.get("cycle_ref"))
+                    or not isinstance(projection.get("target_spec"), dict)
+                    or canonical_hash(projection["target_spec"]) != projection.get("target_spec_hash")
+                    or not isinstance(projection.get("metric_result"), dict)
+                    or projection.get("exact_content_reader") != "research_memory.plan_evidence.read"):
+                raise PlanContractError("plan_evidence_page_invalid")
     return evidence_by_ref
 
 

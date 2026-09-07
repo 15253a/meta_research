@@ -1326,6 +1326,18 @@
   }
 }
 
+/* Keep pending work visible at the control the user just activated. */
+.manual-close-spinner {
+  width: 17px;
+  height: 17px;
+  border: 2px solid #d8d6fa;
+  border-top-color: #625fe7;
+  border-radius: 50%;
+  animation: manual-close-turn 800ms linear infinite;
+}
+
+@keyframes manual-close-turn { to { transform: rotate(360deg); } }
+
 @media (prefers-reduced-motion: reduce) {
   .manual-dialog,
   .manual-dialog::backdrop {

@@ -465,6 +465,11 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         primary_prompt = (
             f"{_plan_skill_instructions()}\n\n"
             f"{human_resume}"
+            "Evidence catalog page metadata reports candidate totals, filtering, and next_offset. "
+            "Use research_graph.plan_evidence.page to browse further candidates and "
+            "research_memory.plan_evidence.read with the exact commit/version/hash/role to read content. "
+            "Additional pages are discovery context; only this ContextPack's frozen evidence_catalog "
+            "may support evidence_reuse_set. Undisplayed candidates are not evidence of absence. "
             "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
             "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是 Plan 主 Agent。只返回 {\"plan\": ...}，其中 plan 是完整、"
@@ -1044,17 +1049,4 @@ def _candidate_refs(idea_set: dict[str, object]) -> list[str]:
         if isinstance(candidate, dict)
         and isinstance(candidate.get("candidate_key"), str)
         and candidate["candidate_key"]
-    ]
-
-
-def _evidence_refs(context_pack: dict[str, object]) -> list[str]:
-    catalog = context_pack.get("evidence_catalog")
-    if not isinstance(catalog, list):
-        return []
-    return [
-        cast(str, evidence["evidence_ref"])
-        for evidence in catalog
-        if isinstance(evidence, dict)
-        and isinstance(evidence.get("evidence_ref"), str)
-        and evidence["evidence_ref"]
     ]

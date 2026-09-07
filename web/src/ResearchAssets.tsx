@@ -73,6 +73,8 @@ export function ResearchAssetsWorkbench({
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const intakeControllerRef = useRef<AbortController | null>(null);
+  const fileReaderRef = useRef<FileReader | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const projectionRevisionRef = useRef(initial.revision);
   const inventoryRevisionRef = useRef(initial.inventory_revision);
   const referenceRevisionRef = useRef(initial.reference_revision);
@@ -90,6 +92,8 @@ export function ResearchAssetsWorkbench({
   const [textContent, setTextContent] = useState("");
   const [sourceLocator, setSourceLocator] = useState("");
   const [fileContent, setFileContent] = useState<string | null>(null);
+  const [readingFile, setReadingFile] = useState<string | null>(null);
+  const [fileReadError, setFileReadError] = useState<string | null>(null);
   const [asynchronous, setAsynchronous] = useState(false);
   const [createNextVersion, setCreateNextVersion] = useState(false);
   const [busy, setBusy] = useState<string | null>(() =>
@@ -259,10 +263,10 @@ export function ResearchAssetsWorkbench({
     ) {
       return;
     }
-    let active = true;
-    void fetchResearchAsset(selectedRef)
+    const controller = new AbortController();
+    void fetchResearchAsset(selectedRef, controller.signal)
       .then((detail) => {
-        if (!active) return;
+        if (controller.signal.aborted) return;
         if (
           detail.revision < projectionRevisionRef.current ||
           detail.inventory_revision !== inventoryRevisionRef.current ||
@@ -301,10 +305,10 @@ export function ResearchAssetsWorkbench({
         }));
       })
       .catch((caught) => {
-        if (active) setError(errorCode(caught));
+        if (!controller.signal.aborted) setError(errorCode(caught));
       });
     return () => {
-      active = false;
+      controller.abort();
     };
   }, [initial.items, initial.revision, selectedRef]);
 
@@ -507,6 +511,9 @@ export function ResearchAssetsWorkbench({
       focusFrame = requestAnimationFrame(focusWhenVisible);
     });
     return () => {
+      const reader = fileReaderRef.current;
+      fileReaderRef.current = null;
+      reader?.abort();
       active = false;
       cancelAnimationFrame(frame);
       if (focusFrame !== null) cancelAnimationFrame(focusFrame);
@@ -515,6 +522,14 @@ export function ResearchAssetsWorkbench({
 
   useEffect(() => {
     if (["text", "file", "link"].includes(sourceKind)) setCustodyMode("managed");
+    if (sourceKind !== "file") {
+      const reader = fileReaderRef.current;
+      fileReaderRef.current = null;
+      reader?.abort();
+      setFileContent(null);
+      setReadingFile(null);
+      setFileReadError(null);
+    }
   }, [sourceKind]);
 
   useEffect(() => {
@@ -528,6 +543,9 @@ export function ResearchAssetsWorkbench({
   }, [selectedRef]);
 
   const close = () => {
+    const reader = fileReaderRef.current;
+    fileReaderRef.current = null;
+    reader?.abort();
     intakeControllerRef.current?.abort();
     intakeControllerRef.current = null;
     const dialog = dialogRef.current;
@@ -676,6 +694,8 @@ export function ResearchAssetsWorkbench({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (busy || pendingJobRef || readingFile
+      || (sourceKind === "file" && fileContent === null)) return;
     const controller = new AbortController();
     intakeControllerRef.current?.abort();
     intakeControllerRef.current = controller;
@@ -716,19 +736,61 @@ export function ResearchAssetsWorkbench({
     }
   };
 
-  const chooseFile = async (file: File | undefined) => {
+  const removeFile = () => {
+    const reader = fileReaderRef.current;
+    fileReaderRef.current = null;
+    reader?.abort();
+    setFileContent(null);
+    setReadingFile(null);
+    setFileReadError(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+      fileInputRef.current.focus();
+    }
+  };
+
+  const chooseFile = (file: File | undefined) => {
+    const previous = fileReaderRef.current;
+    fileReaderRef.current = null;
+    previous?.abort();
+    setFileContent(null);
+    setReadingFile(null);
+    setFileReadError(null);
+    setError(null);
     if (!file) return;
     if (file.size > MAX_ASSET_BYTES) {
-      setFileContent(null);
-      setError("asset_content_too_large");
-      setNotice("文件超过 Research Memory 的 64 MiB 接纳上限；尚未读取本地字节。");
+      setFileReadError("文件超过 64 MiB，请选择更小的文件。");
       return;
     }
-    setError(null);
     setDisplayName(file.name);
     setMediaType(file.type || "application/octet-stream");
-    setFileContent(arrayBufferToBase64(await file.arrayBuffer()));
+    const reader = new FileReader();
+    fileReaderRef.current = reader;
+    setReadingFile(file.name);
+    reader.onload = () => {
+      if (fileReaderRef.current !== reader) return;
+      setFileContent(arrayBufferToBase64(reader.result as ArrayBuffer));
+      setReadingFile(null);
+      fileReaderRef.current = null;
+    };
+    reader.onerror = () => {
+      if (fileReaderRef.current !== reader) return;
+      setFileReadError("无法读取文件，请重新选择后再试。");
+      setReadingFile(null);
+      fileReaderRef.current = null;
+    };
+    reader.readAsArrayBuffer(file);
   };
+
+  const intakeBlocker = readingFile
+    ? `正在读取 ${readingFile}，读取完成后才能提交。`
+    : busy !== null
+      ? "正在处理当前操作，请稍候。"
+      : pendingJobRef !== null
+        ? "上次提交仍在恢复中，请等待结果。"
+        : sourceKind === "file" && fileContent === null
+          ? fileReadError ?? "请先选择一个文件。"
+          : null;
 
   return (
     <dialog
@@ -825,12 +887,24 @@ export function ResearchAssetsWorkbench({
                 <label>
                   <span>本地文件</span>
                   <input
+                    ref={fileInputRef}
                     aria-label="Research Asset 本地文件"
+                    aria-describedby="asset-file-feedback"
                     type="file"
                     disabled={busy !== null}
-                    onChange={(event) => void chooseFile(event.target.files?.[0])}
+                    onChange={(event) => chooseFile(event.target.files?.[0])}
                     required
                   />
+                  <small id="asset-file-feedback" role="status">
+                    {fileReadError ?? (readingFile
+                      ? `正在读取 ${readingFile}…`
+                      : fileContent !== null ? "文件已就绪，可以提交。" : "支持最大 64 MiB 的文件。")}
+                  </small>
+                  {readingFile || fileContent !== null || fileReadError ? (
+                    <button type="button" disabled={busy !== null} onClick={removeFile}>
+                      {readingFile ? "取消读取" : "移除文件"}
+                    </button>
+                  ) : null}
                 </label>
               ) : (
                 <label>
@@ -887,10 +961,12 @@ export function ResearchAssetsWorkbench({
               <button
                 className="asset-primary"
                 type="submit"
-                disabled={busy !== null || pendingJobRef !== null}
+                disabled={intakeBlocker !== null}
+                aria-describedby="asset-intake-help"
               >
                 {busy === "intake" ? "正在接纳…" : "提交 Asset Intake"}
               </button>
+              <small id="asset-intake-help" role="status">{intakeBlocker}</small>
             </form>
           </aside>
 

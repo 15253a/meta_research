@@ -191,7 +191,7 @@ test("an upgraded recovering v1 Quest remains readable through the corrected Web
 });
 
 async function openCreation(page: Page) {
-  const opener = page.getByRole("button", { name: "创建 Quest", exact: true });
+  const opener = page.getByRole("button", { name: "创建研究任务", exact: true });
   await opener.click();
   const dialog = page.getByRole("dialog", {
     name: "创建 Quest，并决定第一个研究问题",
@@ -1295,7 +1295,7 @@ test("compute and Intent stay independent without losing an unsaved draft edit",
   await dialog.getByRole("button", { name: "发送消息" }).click();
   await expect(dialog.getByText("并行解释当前计算配置", { exact: true })).toBeVisible();
 
-  const cancel = dialog.getByRole("button", { name: "取消" });
+  const cancel = dialog.getByRole("button", { name: "放弃创建" });
   await expect(cancel).toBeEnabled();
   await expect(intent).toBeDisabled();
 

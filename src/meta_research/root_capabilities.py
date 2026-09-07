@@ -97,7 +97,7 @@ ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
     "acquisition": (),
     "companion": (),
     "idea": (),
-    "plan": (),
+    "plan": ("research_graph.plan_evidence.page", "research_memory.plan_evidence.read"),
     "bundle": (
         "advancement_engine.bundle_stage_run.observe",
         "advancement_engine.bundle_exhaustion.submit",

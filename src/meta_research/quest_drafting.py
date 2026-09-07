@@ -14,6 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable, Literal, Protocol, cast
 
+from meta_research.chat_progress import (
+    CHAT_REPLY_MAX_LENGTH,
+    CHAT_REPLY_PROGRESS_INSTRUCTION,
+    preserve_existing_reply_prompt,
+    read_chat_reply,
+)
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_CONFIG,
@@ -40,7 +46,7 @@ QUESTION_FIELD_MAX_LENGTHS = {
     "requirements_constraints": 12000,
 }
 INTENT_MESSAGE_MAX_LENGTH = 12000
-INTENT_REPLY_MAX_LENGTH = 12000
+INTENT_REPLY_MAX_LENGTH = CHAT_REPLY_MAX_LENGTH
 PROVIDER_RESULT_MAX_BYTES = 16 * 1024 * 1024
 PROVIDER_STREAM_MAX_BYTES = 64 * 1024 * 1024
 CODEX_DRAFTING_LOCKED_VERSION = "0.153.2"
@@ -372,7 +378,7 @@ class _CancellableProcessRunner:
                 [
                     sys.executable,
                     "-m",
-                    "meta_research.provider_supervisor",
+                    "meta_research.streaming_provider_supervisor",
                     str(supervisor_request_path),
                 ],
                 stdin=subprocess.DEVNULL,
@@ -845,6 +851,18 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             self._verified_stopped_jobs.discard(job_ref)
         _remove_durable_job(self._durable_job_directory(job_ref))
 
+    def observe_reply(self, job_ref: str) -> str:
+        """Read the current Drafting job's answer without accepting its result."""
+        directory = self._durable_job_directory(job_ref)
+        try:
+            invocation = _read_drafting_invocation(directory, job_ref=job_ref)
+        except (OSError, ValueError, TypeError, DraftingUnavailable):
+            return ""
+        # Proposal-only operations must never be projected into a chat preview.
+        if invocation.get("ephemeral") is not False:
+            return ""
+        return read_chat_reply(directory / "stdout.jsonl")
+
     def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
         prompt = _proposal_prompt(request)
         raw, _thread_id = self._invoke(
@@ -892,6 +910,7 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             context_identity = f"initialization_id={request.initialization_id}\n"
         context = (
             role_instruction
+            + CHAT_REPLY_PROGRESS_INSTRUCTION
             + "\n\n"
             + context_identity
             + f"current_draft_revision={request.draft_revision}\n"
@@ -899,6 +918,15 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             f"current_draft={_canonical_json(request.draft)}\n"
             f"user_message={request.message}"
         )
+        if request.job_ref is not None:
+            context = preserve_existing_reply_prompt(
+                context,
+                invocation_path=(
+                    self._durable_job_directory(request.job_ref) / "invocation.json"
+                ),
+                job_ref=request.job_ref,
+                hash_prompt=lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            )
         raw, thread_id = self._invoke(
             context,
             _reply_schema(include_agent_proposal=companion),

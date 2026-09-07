@@ -39,7 +39,7 @@ class DurableFeed:
         self._database = database
 
     def ensure_initialized(self) -> int:
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             row = connection.execute(
                 text(
                     "SELECT revision FROM durable_feed "
@@ -114,32 +114,29 @@ class DurableFeed:
 
     def query_readiness(self) -> FeedReadiness:
         with self._database.read() as connection:
-            database_ready = connection.execute(text("SELECT 1")).scalar_one() == 1
-            current_revision = int(
-                connection.execute(
-                    text("SELECT COALESCE(MAX(revision), 0) FROM durable_feed")
-                ).scalar_one()
-            )
-            projection_revision = int(
-                connection.execute(
-                    text(
-                        "SELECT revision FROM projection_offsets "
-                        "WHERE projection_name = 'public_snapshot'"
-                    )
-                ).scalar_one()
-            )
+            row = connection.execute(
+                text(
+                    "SELECT (SELECT COALESCE(MAX(revision), 0) FROM durable_feed) "
+                    "AS current_revision, revision AS projection_revision "
+                    "FROM projection_offsets WHERE projection_name = 'public_snapshot'"
+                )
+            ).one()
         return FeedReadiness(
-            database_ready=database_ready,
-            current_revision=current_revision,
-            projection_revision=projection_revision,
+            database_ready=True,
+            current_revision=int(row.current_revision),
+            projection_revision=int(row.projection_revision),
         )
 
     def read_after(self, last_revision: int, *, limit: int = 100) -> FeedPage:
         with self._database.read() as connection:
+            # Pysqlite does not start a transaction for SELECT. Keep the bounds
+            # and events in one WAL read snapshot while writers may append.
+            connection.exec_driver_sql("BEGIN")
             bounds = connection.execute(
                 text(
-                    "SELECT COALESCE(MIN(revision), 0) AS minimum, "
-                    "COALESCE(MAX(revision), 0) AS maximum FROM durable_feed"
+                    "SELECT (SELECT COALESCE(MIN(revision), 0) FROM durable_feed) "
+                    "AS minimum, (SELECT COALESCE(MAX(revision), 0) "
+                    "FROM durable_feed) AS maximum"
                 )
             ).one()
             minimum = int(bounds.minimum)

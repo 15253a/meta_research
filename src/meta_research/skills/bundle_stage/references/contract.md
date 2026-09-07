@@ -7,6 +7,7 @@
 
 - [调用闭包](#调用闭包)
 - [滚动策略与 Target](#滚动策略与-target)
+- [风险分类与授权连续性](#风险分类与授权连续性)
 - [测量身份与粒度](#测量身份与粒度)
 - [依赖与复用](#依赖与复用)
 - [Target 根 Session](#target-根-session)
@@ -62,6 +63,37 @@ frontier。一个 Target candidate 获得 TargetRef 时，RG 的 current spec bi
 策略修改只改变尚未提交的候选与内部调度。需要改变 FormalPlan 的 Goal、
 Characteristics、BoundaryConstraints、SemanticDelta、required Metric 或 held-fixed
 条件时，形成 replan_required 候选。
+
+## 风险分类与授权连续性
+
+`risk_class` 根据候选实际动作的副作用和当前 Quest 授权边界分类，每个新候选明确
+填写 `normal` 或 `high`。研究问题、模型名称、所需指标和研究结论的重要程度不决定
+执行风险；继承前一个 Target 的风险标签也不能代替本次判断。
+
+- `normal`：使用已获准的数据与本地资源，在当前 Target workspace 内实现、调试、
+  本地训练、评估、读取结果并保存实验产物，且计算与存储使用保持在已授权范围内。
+  GPU 训练、运行时间长、处理已获准的健康研究数据或生成诊断相关研究指标，本身都
+  不构成额外授权条件。
+- `high`：实际动作包含尚未获准的破坏性修改、对外发布或传输受限数据、变更访问
+  权限、产生新的外部费用，或超出已批准的数据、资源及使用范围。申请时说明具体
+  动作、受影响对象、缺少的权限和最小授权范围。
+- 动作或授权边界不清楚时先核对已接受输入、Quest 授权与资源事实。确实仍缺少的
+  执行条件保持显式 blocker；缺失或未知风险值仍不被接纳。能在已授权范围内完成
+  的部分继续推进，不把所有本地研究工作笼统升级为高风险。
+
+上述分类用于新候选。已接受的 spec、risk_class 和 receipt 保持不可变；既有执行
+按 Owner 保存的 launch、current TargetRun 和授权证据处理。
+
+首次 admission 只处理尚无既有 TargetRun 的 ready Target。已经 claim 的 Target，
+包括 running、recovering 与 finalizing，沿既有 TargetRun 观察、wake 或 reconcile；
+已接纳 TargetCommit 的 Target 直接参与结果收口。Bundle 重启、Attempt／Fence
+轮换、页面刷新和技术重试不增加研究动作或授权范围，因此不产生逐次重新授权的义务。
+Owner 重验同一 Target、spec、Quest 与实际执行范围的授权连续性；明确拒绝、撤销
+或范围变更仍由 Owner 处理。Agent 不自行签发或伪造授权。
+
+当同一 Target 同时出现在 running／completed 事实与待授权 admission frontier 中，
+先请求 Owner reconcile 这项状态冲突，并继续其他 ready 工作；没有其他 ready 工作
+时返回 `wait` 与准确的冲突说明。这种投影冲突本身不构成新的高风险动作或 HumanRequest。
 
 ## 测量身份与粒度
 

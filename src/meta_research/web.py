@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.snapshot_queries import SnapshotQueryCoordinator
+
 import asyncio
 import base64
 import binascii
@@ -39,6 +41,10 @@ from meta_research.owners.research_memory import (
     AssetIntakeRequest,
 )
 from meta_research.projection import SnapshotConsistencyUnavailable
+from meta_research.runtime_status import RuntimeStatusReader
+from meta_research.query_timing import measure_query
+from meta_research.research_overview import ResearchOverviewReader
+from meta_research.experiment_logs import ExperimentLogError, TargetExperimentLogs
 from meta_research.quest_drafting import (
     INTENT_MESSAGE_MAX_LENGTH,
     QUESTION_FIELD_MAX_LENGTHS,
@@ -102,12 +108,6 @@ class ReconciliationHealth:
     status: Literal["ready", "unavailable"] = "ready"
     last_error: str | None = None
     retry_count: int = 0
-
-
-@dataclass(frozen=True)
-class _PendingWorkerRetirement:
-    operation: asyncio.Future[bool]
-    retirement: asyncio.Future[None]
 
 
 @dataclass(frozen=True)
@@ -719,33 +719,23 @@ def create_app(
     runtime.bundle_stage.configure_resident_mcp_endpoint(base_url)
     runtime.reasoning_stage.configure_resident_mcp_endpoint(base_url)
     runtime.target_run_runtime.configure_resident_mcp_endpoint(base_url)
-    harness_conformance_task: asyncio.Task[None] | None = None
-    reconciliation_task: asyncio.Task[None] | None = None
-    drafting_task: asyncio.Task[None] | None = None
-    deepfetch_task: asyncio.Task[None] | None = None
-    idea_stage_task: asyncio.Task[None] | None = None
-    plan_stage_task: asyncio.Task[None] | None = None
-    bundle_stage_task: asyncio.Task[None] | None = None
-    reasoning_stage_task: asyncio.Task[None] | None = None
-    autonomous_creation_task: asyncio.Task[None] | None = None
-    quest_completion_task: asyncio.Task[None] | None = None
-    target_run_task: asyncio.Task[None] | None = None
-    writing_task: asyncio.Task[None] | None = None
-    research_asset_task: asyncio.Task[None] | None = None
-    research_asset_verification_task: asyncio.Task[None] | None = None
-    reconciliation_health = ReconciliationHealth()
-    drafting_health = ReconciliationHealth()
-    deepfetch_health = ReconciliationHealth()
-    idea_stage_health = ReconciliationHealth()
-    plan_stage_health = ReconciliationHealth()
-    bundle_stage_health = ReconciliationHealth()
-    reasoning_stage_health = ReconciliationHealth()
-    autonomous_creation_health = ReconciliationHealth()
-    quest_completion_health = ReconciliationHealth()
-    target_run_health = ReconciliationHealth()
-    writing_health = ReconciliationHealth()
-    research_asset_health = ReconciliationHealth()
-    research_asset_verification_health = ReconciliationHealth()
+    worker_operations = {
+        "quest_reconciliation_worker": _reconcile_quest_initializations,
+        "quest_drafting_worker": _process_quest_drafting,
+        "first_question_deepfetch_worker": _process_first_question_deepfetch,
+        "idea_stage_worker": _process_idea_stage,
+        "plan_stage_worker": _process_plan_stage,
+        "bundle_stage_worker": _process_bundle_stage,
+        "reasoning_stage_worker": _process_reasoning_stage,
+        "autonomous_creation_worker": _process_autonomous_creation,
+        "quest_completion_worker": _process_quest_completion,
+        "target_run_worker": _process_target_runs,
+        "writing_worker": _process_writing,
+        "research_asset_intake_worker": _process_research_assets,
+        "research_asset_verification_worker": _verify_research_assets,
+    }
+    worker_health = {name: ReconciliationHealth() for name in worker_operations}
+    worker_tasks: dict[str, asyncio.Task[None]] = {}
     worker_health_updates = WorkerHealthUpdates()
     asset_intake_slots = asyncio.Semaphore(MAX_CONCURRENT_ASSET_INTAKE_REQUESTS)
     asset_io_slots = asyncio.Semaphore(MAX_CONCURRENT_ASSET_IO_OPERATIONS)
@@ -754,134 +744,23 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        nonlocal harness_conformance_task
-        nonlocal reconciliation_task, drafting_task, deepfetch_task, idea_stage_task
-        nonlocal plan_stage_task, bundle_stage_task, reasoning_stage_task
-        nonlocal autonomous_creation_task, quest_completion_task
-        nonlocal target_run_task
-        nonlocal writing_task
-        nonlocal research_asset_task, research_asset_verification_task
-        harness_conformance_task = _start_background_worker(
+        worker_tasks["harness_conformance_worker"] = _start_background_worker(
             lambda: _process_harness_conformance(runtime, base_url)
         )
-        reconciliation_task = _start_background_worker(
-            lambda: _reconcile_quest_initializations(
-                runtime,
-                reconciliation_health,
-                worker_health_updates.publish,
+        for name, operation in worker_operations.items():
+            worker_tasks[name] = _start_background_worker(
+                lambda operation=operation, name=name: operation(
+                    runtime, worker_health[name], worker_health_updates.publish
+                )
             )
-        )
-        drafting_task = _start_background_worker(
-            lambda: _process_quest_drafting(
-                runtime,
-                drafting_health,
-                worker_health_updates.publish,
-            )
-        )
-        deepfetch_task = _start_background_worker(
-            lambda: _process_first_question_deepfetch(
-                runtime,
-                deepfetch_health,
-                worker_health_updates.publish,
-            )
-        )
-        idea_stage_task = _start_background_worker(
-            lambda: _process_idea_stage(
-                runtime,
-                idea_stage_health,
-                worker_health_updates.publish,
-            )
-        )
-        plan_stage_task = _start_background_worker(
-            lambda: _process_plan_stage(
-                runtime,
-                plan_stage_health,
-                worker_health_updates.publish,
-            )
-        )
-        bundle_stage_task = _start_background_worker(
-            lambda: _process_bundle_stage(
-                runtime,
-                bundle_stage_health,
-                worker_health_updates.publish,
-            )
-        )
-        reasoning_stage_task = _start_background_worker(
-            lambda: _process_reasoning_stage(
-                runtime,
-                reasoning_stage_health,
-                worker_health_updates.publish,
-            )
-        )
-        autonomous_creation_task = _start_background_worker(
-            lambda: _process_autonomous_creation(
-                runtime,
-                autonomous_creation_health,
-                worker_health_updates.publish,
-            )
-        )
-        quest_completion_task = _start_background_worker(
-            lambda: _process_quest_completion(
-                runtime,
-                quest_completion_health,
-                worker_health_updates.publish,
-            )
-        )
-        target_run_task = _start_background_worker(
-            lambda: _process_target_runs(
-                runtime,
-                target_run_health,
-                worker_health_updates.publish,
-            )
-        )
-        writing_task = _start_background_worker(
-            lambda: _process_writing(
-                runtime,
-                writing_health,
-                worker_health_updates.publish,
-            )
-        )
-        research_asset_task = _start_background_worker(
-            lambda: _process_research_assets(
-                runtime,
-                research_asset_health,
-                worker_health_updates.publish,
-            )
-        )
-        research_asset_verification_task = _start_background_worker(
-            lambda: _verify_research_assets(
-                runtime,
-                research_asset_verification_health,
-                worker_health_updates.publish,
-            )
-        )
         try:
             yield
         finally:
-            tasks = tuple(
-                task
-                for task in (
-                    harness_conformance_task,
-                    reconciliation_task,
-                    drafting_task,
-                    deepfetch_task,
-                    idea_stage_task,
-                    plan_stage_task,
-                    bundle_stage_task,
-                    reasoning_stage_task,
-                    autonomous_creation_task,
-                    quest_completion_task,
-                    target_run_task,
-                    writing_task,
-                    research_asset_task,
-                    research_asset_verification_task,
-                )
-                if task is not None
-            )
             try:
                 await asyncio.to_thread(runtime.request_stop)
             except Exception:
                 LOGGER.exception("provider shutdown request failed")
+            tasks = tuple(worker_tasks.values())
             for task in tasks:
                 task.cancel()
             if tasks:
@@ -913,11 +792,9 @@ def create_app(
         and base_url_is_loopback
     )
 
-    def worker_check(
-        name: str,
-        task: asyncio.Task[None] | None,
-        health: ReconciliationHealth,
-    ) -> dict[str, object]:
+    def worker_check(name: str) -> dict[str, object]:
+        task = worker_tasks.get(name)
+        health = worker_health[name]
         running = task is not None and not task.done()
         if running and health.status == "ready":
             return {"name": name, "status": "ready"}
@@ -930,53 +807,30 @@ def create_app(
             "reason": {"code": reason_code},
         }
 
-    def public_snapshot() -> dict[str, object]:
-        snapshot = runtime.projection.query_snapshot()
+    status_reader = RuntimeStatusReader(runtime._database)
+    latest_status_revision: int | None = None
+    snapshot_queries = SnapshotQueryCoordinator(
+        lambda **options: public_snapshot(**options)
+    )
+
+    def worker_health_status() -> dict[str, object]:
+        checks = [runtime.query_target_root_readiness(),
+                  *(worker_check(name) for name in worker_operations)]
+        return {
+            "status": "ready" if all(check["status"] == "ready" for check in checks) else "unavailable",
+            "revision": latest_status_revision,
+            "checks": checks,
+        }
+
+    def public_snapshot(*, include_assets: bool = True, include_history: bool = True) -> dict[str, object]:
+        snapshot = runtime.projection.query_snapshot(
+            include_assets=include_assets, include_history=include_history,
+        )
         readiness = snapshot["readiness"]
         checks = [
             *readiness["checks"],
             runtime.query_target_root_readiness(),
-            worker_check(
-                "quest_reconciliation_worker",
-                reconciliation_task,
-                reconciliation_health,
-            ),
-            worker_check("quest_drafting_worker", drafting_task, drafting_health),
-            worker_check(
-                "first_question_deepfetch_worker",
-                deepfetch_task,
-                deepfetch_health,
-            ),
-            worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
-            worker_check("plan_stage_worker", plan_stage_task, plan_stage_health),
-            worker_check("bundle_stage_worker", bundle_stage_task, bundle_stage_health),
-            worker_check(
-                "reasoning_stage_worker",
-                reasoning_stage_task,
-                reasoning_stage_health,
-            ),
-            worker_check(
-                "autonomous_creation_worker",
-                autonomous_creation_task,
-                autonomous_creation_health,
-            ),
-            worker_check(
-                "quest_completion_worker",
-                quest_completion_task,
-                quest_completion_health,
-            ),
-            worker_check("target_run_worker", target_run_task, target_run_health),
-            worker_check("writing_worker", writing_task, writing_health),
-            worker_check(
-                "research_asset_intake_worker",
-                research_asset_task,
-                research_asset_health,
-            ),
-            worker_check(
-                "research_asset_verification_worker",
-                research_asset_verification_task,
-                research_asset_verification_health,
-            ),
+            *(worker_check(name) for name in worker_operations),
         ]
         core_checks = [
             check
@@ -1230,111 +1084,77 @@ def create_app(
         }
 
     @app.get("/internal/readiness")
-    def internal_readiness() -> dict[str, object]:
-        snapshot = public_snapshot()
-        reconciliation = worker_check(
-            "quest_reconciliation_worker",
-            reconciliation_task,
-            reconciliation_health,
-        )
-        drafting = worker_check("quest_drafting_worker", drafting_task, drafting_health)
-        deepfetch = worker_check(
-            "first_question_deepfetch_worker", deepfetch_task, deepfetch_health
-        )
-        idea_stage = worker_check(
-            "idea_stage_worker", idea_stage_task, idea_stage_health
-        )
-        plan_stage = worker_check(
-            "plan_stage_worker", plan_stage_task, plan_stage_health
-        )
-        bundle_stage = worker_check(
-            "bundle_stage_worker", bundle_stage_task, bundle_stage_health
-        )
-        reasoning_stage = worker_check(
-            "reasoning_stage_worker",
-            reasoning_stage_task,
-            reasoning_stage_health,
-        )
-        autonomous_creation = worker_check(
-            "autonomous_creation_worker",
-            autonomous_creation_task,
-            autonomous_creation_health,
-        )
-        quest_completion = worker_check(
-            "quest_completion_worker",
-            quest_completion_task,
-            quest_completion_health,
-        )
-        target_runs = worker_check(
-            "target_run_worker", target_run_task, target_run_health
-        )
-        research_assets = worker_check(
-            "research_asset_intake_worker",
-            research_asset_task,
-            research_asset_health,
-        )
-        research_asset_verification = worker_check(
-            "research_asset_verification_worker",
-            research_asset_verification_task,
-            research_asset_verification_health,
-        )
-        writing = worker_check("writing_worker", writing_task, writing_health)
+    async def internal_readiness() -> dict[str, object]:
+        health = worker_health_status()
+        reconciliation = worker_check("quest_reconciliation_worker")
+        drafting = worker_check("quest_drafting_worker")
+        deepfetch = worker_check("first_question_deepfetch_worker")
+        idea_stage = worker_check("idea_stage_worker")
+        plan_stage = worker_check("plan_stage_worker")
+        bundle_stage = worker_check("bundle_stage_worker")
+        reasoning_stage = worker_check("reasoning_stage_worker")
+        autonomous_creation = worker_check("autonomous_creation_worker")
+        quest_completion = worker_check("quest_completion_worker")
+        target_runs = worker_check("target_run_worker")
+        research_assets = worker_check("research_asset_intake_worker")
+        research_asset_verification = worker_check("research_asset_verification_worker")
+        writing = worker_check("writing_worker")
         target_root = runtime.query_target_root_readiness()
         return {
-            "status": snapshot["readiness"]["status"],
-            "revision": snapshot["revision"],
+            "status": health["status"],
+            "revision": health["revision"],
             "reconciliation": {
                 "status": reconciliation["status"],
-                "last_error": reconciliation_health.last_error,
+                "last_error": worker_health["quest_reconciliation_worker"].last_error,
             },
             "drafting": {
                 "status": drafting["status"],
-                "last_error": drafting_health.last_error,
+                "last_error": worker_health["quest_drafting_worker"].last_error,
             },
             "deepfetch": {
                 "status": deepfetch["status"],
-                "last_error": deepfetch_health.last_error,
+                "last_error": worker_health["first_question_deepfetch_worker"].last_error,
             },
             "idea_stage": {
                 "status": idea_stage["status"],
-                "last_error": idea_stage_health.last_error,
+                "last_error": worker_health["idea_stage_worker"].last_error,
             },
             "plan_stage": {
                 "status": plan_stage["status"],
-                "last_error": plan_stage_health.last_error,
+                "last_error": worker_health["plan_stage_worker"].last_error,
             },
             "bundle_stage": {
                 "status": bundle_stage["status"],
-                "last_error": bundle_stage_health.last_error,
+                "last_error": worker_health["bundle_stage_worker"].last_error,
             },
             "reasoning_stage": {
                 "status": reasoning_stage["status"],
-                "last_error": reasoning_stage_health.last_error,
+                "last_error": worker_health["reasoning_stage_worker"].last_error,
             },
             "autonomous_creation": {
                 "status": autonomous_creation["status"],
-                "last_error": autonomous_creation_health.last_error,
+                "last_error": worker_health["autonomous_creation_worker"].last_error,
             },
             "quest_completion": {
                 "status": quest_completion["status"],
-                "last_error": quest_completion_health.last_error,
+                "last_error": worker_health["quest_completion_worker"].last_error,
             },
             "target_runs": {
                 "status": target_runs["status"],
-                "last_error": target_run_health.last_error,
+                "last_error": worker_health["target_run_worker"].last_error,
             },
             "writing": {
                 "status": writing["status"],
-                "last_error": writing_health.last_error,
+                "last_error": worker_health["writing_worker"].last_error,
             },
             "target_root": target_root,
             "research_assets": {
                 "status": research_assets["status"],
-                "last_error": research_asset_health.last_error,
+                "last_error": worker_health["research_asset_intake_worker"].last_error,
             },
             "research_asset_verification": {
                 "status": research_asset_verification["status"],
-                "last_error": research_asset_verification_health.last_error,
+                "last_error": worker_health["research_asset_verification_worker"].last_error,
             },
         }
 
@@ -1494,6 +1314,60 @@ def create_app(
                 None
                 if message.view_context is None
                 else message.view_context.model_dump()
+            ),
+        )
+
+    async def conversation_stream(
+        request: Request, query: Callable[[], dict[str, object]]
+    ) -> StreamingResponse:
+        # Resolve the exact Owner identity before committing the HTTP status.
+        initial = await asyncio.to_thread(query)
+        return StreamingResponse(
+            _chat_reply_stream(runtime, request, query, initial),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get("/api/v1/companion/messages/{interaction_ref}/stream")
+    async def stream_companion_reply(
+        interaction_ref: str, request: Request, scope_ref: str
+    ) -> StreamingResponse:
+        return await conversation_stream(
+            request,
+            lambda: runtime.owners.human_collaboration.query_companion_reply(
+                scope_ref, interaction_ref
+            ),
+        )
+
+    @app.get(
+        "/api/v1/quest-initializations/{initialization_id}/intent-session/"
+        "turns/{turn_ref}/stream"
+    )
+    async def stream_intent_reply(
+        initialization_id: str, turn_ref: str, request: Request
+    ) -> StreamingResponse:
+        return await conversation_stream(
+            request,
+            lambda: runtime.owners.human_collaboration.query_intent_reply(
+                initialization_id, turn_ref
+            ),
+        )
+
+    @app.get(
+        "/api/v1/manual-question-creations/{context_ref}/drafting-session/"
+        "turns/{turn_ref}/stream"
+    )
+    async def stream_manual_drafting_reply(
+        context_ref: str, turn_ref: str, request: Request
+    ) -> StreamingResponse:
+        return await conversation_stream(
+            request,
+            lambda: runtime.owners.human_collaboration.query_manual_drafting_reply(
+                context_ref, turn_ref
             ),
         )
 
@@ -2176,6 +2050,27 @@ def create_app(
             initialization_id
         )
 
+    @app.get("/api/v1/quest-initializations/{initialization_id}/proposal-output")
+    def query_proposal_output(
+        initialization_id: str,
+        generation_ref: str,
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=65536, ge=4, le=262144),
+    ) -> JSONResponse:
+        from meta_research.proposal_output import read_proposal_output
+        from meta_research.provider_supervisor import ProviderSupervisorError
+
+        creation = runtime.owners.human_collaboration.query_quest_creation(initialization_id)
+        generation = creation.get("proposal_generation")
+        if not generation or generation["ref"] != generation_ref:
+            return _error(409, "proposal_output_generation_changed")
+        try:
+            page = read_proposal_output(runtime.data_root.root, generation, after, limit)
+        except (OSError, ValueError, ProviderSupervisorError) as error:
+            code = str(error) if isinstance(error, ValueError) else "proposal_output_unavailable"
+            return _error(409 if "cursor" in code else 503, code)
+        return JSONResponse(page, headers={"Cache-Control": "no-store"})
+
     @app.get("/api/v1/quest-initializations/{initialization_id}/intent-session")
     def query_intent_session(initialization_id: str) -> dict[str, object]:
         view = runtime.owners.human_collaboration.query_quest_creation(
@@ -2335,6 +2230,8 @@ def create_app(
         return runtime.projection.query_snapshot(
             asset_offset=offset,
             asset_limit=limit,
+            include_history=False,
+            include_stages=False,
         )["research_assets"]
 
     @app.post("/api/v1/research-assets/intakes")
@@ -2641,9 +2538,53 @@ def create_app(
     def query_question_evidence(question_ref: str) -> dict[str, object]:
         return runtime.projection.query_question_evidence(question_ref)
 
+    @app.get("/api/v1/health")
+    async def query_health() -> dict[str, object]:
+        # Pure in-memory checks also stay responsive if the sync thread pool is busy.
+        return worker_health_status()
+
+    @app.get("/api/v1/status")
+    def query_runtime_status() -> dict[str, object]:
+        nonlocal latest_status_revision
+        result = status_reader.query()
+        latest_status_revision = result["revision"]
+        result["health"] = worker_health_status()
+        return result
+
     @app.get("/api/v1/snapshot")
-    def query_snapshot() -> dict[str, object]:
-        return public_snapshot()
+    async def query_snapshot(
+        request: Request, include_assets: bool = True, include_history: bool = True,
+    ) -> dict[str, object]:
+        include_assets = include_assets and request.headers.get("X-Meta-Research-Snapshot-Assets") != "defer"
+        include_history = include_history and request.headers.get("X-Meta-Research-Snapshot-History") != "defer"
+        try:
+            return await snapshot_queries.query(
+                include_assets=include_assets, include_history=include_history,
+            )
+        except TimeoutError as error:
+            raise HTTPException(status_code=503, detail={"code": "snapshot_query_timeout"}, headers={"Retry-After": "5"}) from error
+
+    @app.get("/api/v1/research-overview")
+    def query_research_overview(
+        quest_ref: str = Query(min_length=1, max_length=128),
+    ) -> dict[str, object]:
+        owners = runtime.owners
+        reader = ResearchOverviewReader(
+            owners.research_graph,
+            owners.advancement_engine,
+            owners.research_memory,
+            owners.agent_runtime,
+        )
+        try:
+            with runtime._database.read_snapshot(), measure_query("research_overview"):
+                return reader._query_once(quest_ref)
+        except OwnerConflict as error:
+            raise HTTPException(
+                status_code=(
+                    404 if error.code == "research_overview_quest_not_found" else 503
+                ),
+                detail={"code": error.code},
+            ) from error
 
     @app.get("/api/v1/writing")
     def query_writing() -> dict[str, object]:
@@ -2974,12 +2915,14 @@ def create_app(
         run_ref: str,
         after: int = Query(default=0, ge=0),
         limit: int = Query(default=64 * 1024, ge=4, le=256 * 1024),
+        phase: Literal["primary", "review"] | None = None,
     ) -> dict[str, object]:
         try:
             page = runtime.query_stage_raw_output(
                 run_ref,
                 after=after,
                 limit=limit,
+                **({"phase": phase} if phase is not None else {}),
             )
         except StageRootObservationError as error:
             status_code = (
@@ -3000,6 +2943,39 @@ def create_app(
                 detail={"code": error.code},
             ) from error
         return page.as_dict()
+
+    experiment_logs = TargetExperimentLogs(
+        runtime.target_run_authorities.agent_runtime,
+        runtime.data_root.run / "target-workspaces",
+    )
+
+    @app.get("/api/v1/bundle/targets/{target_ref}/experiment-logs")
+    def query_target_experiment_logs(
+        target_ref: str,
+        target_run_ref: str | None = Query(default=None, min_length=1, max_length=128),
+    ) -> dict[str, object]:
+        try:
+            return experiment_logs.list(target_ref, target_run_ref=target_run_ref)
+        except ExperimentLogError as error:
+            raise HTTPException(status_code=error.status, detail={"code": error.code}) from error
+
+    @app.get("/api/v1/bundle/targets/{target_ref}/experiment-logs/{log_ref}")
+    def query_target_experiment_log(
+        target_ref: str,
+        log_ref: str,
+        target_run_ref: str | None = Query(default=None, min_length=1, max_length=128),
+        after: int | None = Query(default=None, ge=0),
+        before: int | None = Query(default=None, ge=0),
+        stream_ref: str | None = Query(default=None, min_length=1, max_length=128),
+        limit: int = Query(default=64 * 1024, ge=4, le=256 * 1024),
+    ) -> dict[str, object]:
+        try:
+            return experiment_logs.read(
+                target_ref, log_ref, target_run_ref=target_run_ref,
+                after=after, before=before, stream_ref=stream_ref, limit=limit,
+            )
+        except ExperimentLogError as error:
+            raise HTTPException(status_code=error.status, detail={"code": error.code}) from error
 
     @app.get("/api/v1/bundle/targets/{target_ref}/raw-output")
     def query_target_raw_output(
@@ -3067,6 +3043,45 @@ def create_app(
         return FileResponse(candidate)
 
     return app
+
+
+async def _chat_reply_stream(
+    runtime: ProductionRuntime,
+    request: Request,
+    query: Callable[[], dict[str, object]],
+    initial: dict[str, object],
+) -> AsyncIterator[str]:
+    """Replay the current reply on reconnect, then send real changed snapshots."""
+    current = initial
+    previous: str | None = None
+    last_keepalive = time.monotonic()
+    while True:
+        if await request.is_disconnected():
+            return
+        if not await _sse_session_is_valid(runtime, request):
+            return
+        payload = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
+        if payload != previous:
+            yield f"event: message\ndata: {payload}\n\n"
+            previous = payload
+            last_keepalive = time.monotonic()
+        elif time.monotonic() - last_keepalive >= 10:
+            yield ": keep-alive\n\n"
+            last_keepalive = time.monotonic()
+        if current["status"] not in {"queued", "processing", "running"}:
+            return
+        await asyncio.sleep(0.25)
+        if not await _sse_session_is_valid(runtime, request):
+            return
+        try:
+            current = await asyncio.to_thread(query)
+        except OwnerConflict as error:
+            current = {
+                "turn_ref": initial["turn_ref"],
+                "status": "failed",
+                "text": "",
+                "reason": {"code": error.code},
+            }
 
 
 async def _event_stream(
@@ -3209,37 +3224,15 @@ async def _reconcile_quest_initializations(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.owners.human_collaboration.reconcile_once,
-                health=health,
-                timeout_code="quest_reconciliation_io_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
-            )
-        except Exception as error:
-            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
-                LOGGER.exception("quest reconciliation attempt failed unexpectedly")
-            error_code = (
-                error.code if isinstance(error, OwnerConflict) else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 1.0)
+    await _process_background_operation(
+        runtime.owners.human_collaboration.reconcile_once,
+        health=health,
+        worker_label='quest reconciliation',
+        timeout_code='quest_reconciliation_io_timeout',
+        timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+        idle_delay=1.0,
+    )
 
 
 async def _process_quest_drafting(
@@ -3247,37 +3240,14 @@ async def _process_quest_drafting(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.owners.human_collaboration.process_drafting_once,
-                health=health,
-                timeout_code="quest_drafting_operation_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
-            )
-        except Exception as error:
-            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
-                LOGGER.exception("quest drafting attempt failed unexpectedly")
-            error_code = (
-                error.code if isinstance(error, OwnerConflict) else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 0.2)
+    await _process_background_operation(
+        runtime.owners.human_collaboration.process_drafting_once,
+        health=health,
+        worker_label='quest drafting',
+        timeout_code='quest_drafting_operation_timeout',
+        timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+    )
 
 
 async def _process_first_question_deepfetch(
@@ -3285,33 +3255,14 @@ async def _process_first_question_deepfetch(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    """Advance one durable, authorization-bound first-question DeepFetch run."""
-
-    while True:
-        try:
-            advanced = await _daemon_thread_call(runtime.deepfetch.process_once)
-        except Exception as error:
-            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
-                LOGGER.exception("first-question DeepFetch attempt failed unexpectedly")
-            error_code = (
-                error.code if isinstance(error, OwnerConflict) else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 0.2)
+    await _process_background_operation(
+        runtime.deepfetch.process_once,
+        health=health,
+        worker_label='first-question DeepFetch',
+        timeout_code='first_question_deepfetch_operation_timeout',
+        timeout_seconds=None,
+        on_health_change=on_health_change,
+    )
 
 
 async def _process_writing(
@@ -3321,46 +3272,18 @@ async def _process_writing(
 ) -> None:
     """Advance autonomous Writing independently of any browser connection."""
 
-    quarantined: dict[
-        tuple[str, str, str], _PendingWorkerRetirement | None
-    ] = {}
     pending_deliveries: dict[str, _PendingWorkerOperation] = {}
     delivery_sweep_exclusions: set[str] = set()
     delivery_sweep_error_code: str | None = None
     while True:
         delivery_sweep_restarted = False
         try:
-            for pending_claim, pending in tuple(quarantined.items()):
-                if pending is None:
-                    continue
-                if pending.operation.done():
-                    try:
-                        pending.operation.result()
-                    except Exception:
-                        # The retired Fence prevents any late result from
-                        # crossing a durable Owner boundary.
-                        pass
-                if not pending.retirement.done():
-                    continue
-                try:
-                    pending.retirement.result()
-                except Exception:
-                    # An unexpected retirement failure is fail-closed for this
-                    # process. A new Fence (control/resume) is a different
-                    # claim and remains runnable.
-                    quarantined[pending_claim] = None
-                else:
-                    quarantined.pop(pending_claim, None)
-            claim = await _daemon_thread_call(
-                lambda: runtime.writing.next_runnable_claim(
-                    excluded_claims=frozenset(quarantined)
-                )
-            )
+            claim = await _daemon_thread_call(runtime.writing.next_runnable_claim)
             if claim is None:
                 advanced = False
             else:
                 run_ref, attempt_ref, fence_ref = claim
-                outcome = await _await_monitored_worker_call(
+                advanced = await _await_monitored_worker_call(
                     lambda: runtime.writing.process_once(
                         expected_run_ref=run_ref,
                         expected_attempt_ref=attempt_ref,
@@ -3371,11 +3294,6 @@ async def _process_writing(
                     on_health_change=on_health_change,
                     timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
                 )
-                if isinstance(outcome, _PendingWorkerRetirement):
-                    quarantined[claim] = outcome
-                    advanced = False
-                else:
-                    advanced = outcome
             delivery_advanced = False
             for operation_ref, pending_delivery in tuple(
                 pending_deliveries.items()
@@ -3428,8 +3346,6 @@ async def _process_writing(
                     # duplicated. Quarantine its exact ref while later internal
                     # claims and independently confirmed deliveries advance.
                     pending_deliveries[next_delivery_ref] = delivery_outcome
-                elif isinstance(delivery_outcome, _PendingWorkerRetirement):
-                    raise AssertionError("delivery operation cannot retire")
                 else:
                     delivery_advanced = bool(
                         delivery_outcome or delivery_advanced
@@ -3456,15 +3372,7 @@ async def _process_writing(
             retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
             await asyncio.sleep(retry_delay)
         else:
-            if quarantined:
-                changed = (
-                    health.status != "unavailable"
-                    or health.last_error
-                    != "writing_claim_retirement_pending"
-                )
-                health.status = "unavailable"
-                health.last_error = "writing_claim_retirement_pending"
-            elif pending_deliveries:
+            if pending_deliveries:
                 changed = (
                     health.status != "unavailable"
                     or health.last_error
@@ -3500,39 +3408,15 @@ async def _process_research_assets(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    """Finish durable asynchronous Asset Intake jobs without scan starvation."""
-
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.owners.research_memory.process_asset_intake_once,
-                health=health,
-                timeout_code="asset_intake_io_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
-            )
-        except Exception as error:
-            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
-                LOGGER.exception("research asset intake failed unexpectedly")
-            error_code = (
-                error.code if isinstance(error, OwnerConflict) else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0.05 if advanced else 0.2)
+    await _process_background_operation(
+        runtime.owners.research_memory.process_asset_intake_once,
+        health=health,
+        worker_label='research asset intake',
+        timeout_code='asset_intake_io_timeout',
+        timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+        active_delay=0.05,
+    )
 
 
 async def _verify_research_assets(
@@ -3540,39 +3424,15 @@ async def _verify_research_assets(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    """Advance the bounded durable verifier independently of intake latency."""
-
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.owners.research_memory.verify_asset_inventory_once,
-                health=health,
-                timeout_code="asset_verification_io_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
-            )
-        except Exception as error:
-            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
-                LOGGER.exception("research asset verification failed unexpectedly")
-            error_code = (
-                error.code if isinstance(error, OwnerConflict) else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0.05 if advanced else 0.2)
+    await _process_background_operation(
+        runtime.owners.research_memory.verify_asset_inventory_once,
+        health=health,
+        worker_label='research asset verification',
+        timeout_code='asset_verification_io_timeout',
+        timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+        active_delay=0.05,
+    )
 
 
 async def _await_monitored_worker_call(
@@ -3581,10 +3441,9 @@ async def _await_monitored_worker_call(
     health: ReconciliationHealth,
     timeout_code: str,
     on_health_change: Callable[[], None] | None,
-    on_timeout: Callable[[], None] | None = None,
     retain_operation_on_timeout: bool = False,
     timeout_seconds: float | None,
-) -> bool | _PendingWorkerOperation | _PendingWorkerRetirement:
+) -> bool | _PendingWorkerOperation:
     """Keep worker stalls outside the event loop and expose a watchdog.
 
     Python cannot safely cancel a thread blocked inside an arbitrary FUSE/NFS
@@ -3608,24 +3467,8 @@ async def _await_monitored_worker_call(
     health.status = "unavailable"
     health.last_error = timeout_code
     health.retry_count += 1
-    if on_timeout is not None:
-        retirement = _daemon_thread_call(on_timeout)
-        retired, _pending_retirement = await asyncio.wait(
-            {retirement}, timeout=timeout_seconds
-        )
-        if retired:
-            retirement.result()
-        else:
-            if changed and on_health_change is not None:
-                on_health_change()
-            return _PendingWorkerRetirement(operation, retirement)
     if changed and on_health_change is not None:
         on_health_change()
-    if on_timeout is not None:
-        # The timed-out thread may still return, but the Owner callback has
-        # retired its durable Fence. Let the worker loop continue with the next
-        # runnable Run.
-        return False
     if retain_operation_on_timeout:
         return _PendingWorkerOperation(operation)
     # Existing workers without a durable timeout/Fence seam must not be
@@ -3821,47 +3664,15 @@ async def _process_idea_stage(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    """Advance one verified Idea boundary at a time and retry transient adapters."""
-
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.idea_stage.process_once,
-                health=health,
-                timeout_code="idea_stage_operation_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
-            )
-            transient_error = runtime.idea_stage.transient_error
-            if transient_error is not None:
-                raise _IdeaStageTransientError(transient_error)
-        except Exception as error:
-            if not isinstance(
-                error,
-                (OSError, OwnerConflict, SQLAlchemyError, _IdeaStageTransientError),
-            ):
-                LOGGER.exception("idea stage attempt failed unexpectedly")
-            error_code = (
-                error.code
-                if isinstance(error, (OwnerConflict, _IdeaStageTransientError))
-                else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 0.2)
+    await _process_background_operation(
+        runtime.idea_stage.process_once,
+        health=health,
+        worker_label='idea stage',
+        timeout_code='idea_stage_operation_timeout',
+        timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+        transient_error=lambda: runtime.idea_stage.transient_error,
+    )
 
 
 async def _process_plan_stage(
@@ -3869,47 +3680,15 @@ async def _process_plan_stage(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    """Advance one verified Plan boundary at a time under daemon ownership."""
-
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.plan_stage.process_once,
-                health=health,
-                timeout_code="plan_stage_operation_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
-            )
-            transient_error = runtime.plan_stage.transient_error
-            if transient_error is not None:
-                raise _PlanStageTransientError(transient_error)
-        except Exception as error:
-            if not isinstance(
-                error,
-                (OSError, OwnerConflict, SQLAlchemyError, _PlanStageTransientError),
-            ):
-                LOGGER.exception("plan stage attempt failed unexpectedly")
-            error_code = (
-                error.code
-                if isinstance(error, (OwnerConflict, _PlanStageTransientError))
-                else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 0.2)
+    await _process_background_operation(
+        runtime.plan_stage.process_once,
+        health=health,
+        worker_label='plan stage',
+        timeout_code='plan_stage_operation_timeout',
+        timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+        transient_error=lambda: runtime.plan_stage.transient_error,
+    )
 
 
 async def _process_target_runs(
@@ -4056,55 +3835,19 @@ async def _process_bundle_stage(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    """Advance one verified Bundle boundary at a time under daemon ownership."""
-
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.bundle_stage.process_once,
-                health=health,
-                timeout_code="bundle_stage_operation_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
-            )
-            transient_error = runtime.bundle_stage.transient_error
-            if (
-                transient_error is not None
-                and transient_error not in _BUNDLE_STAGE_HEALTHY_WAIT_CODES
-            ):
-                raise _BundleStageTransientError(transient_error)
-        except Exception as error:
-            if not isinstance(
-                error,
-                (
-                    OSError,
-                    OwnerConflict,
-                    SQLAlchemyError,
-                    _BundleStageTransientError,
-                ),
-            ):
-                LOGGER.exception("bundle stage attempt failed unexpectedly")
-            error_code = (
-                error.code
-                if isinstance(error, (OwnerConflict, _BundleStageTransientError))
-                else type(error).__name__
-            )
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 0.2)
+    await _process_background_operation(
+        runtime.bundle_stage.process_once,
+        health=health,
+        worker_label='bundle stage',
+        timeout_code='bundle_stage_operation_timeout',
+        timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+        transient_error=lambda: (
+            None
+            if runtime.bundle_stage.transient_error in _BUNDLE_STAGE_HEALTHY_WAIT_CODES
+            else runtime.bundle_stage.transient_error
+        ),
+    )
 
 
 async def _process_reasoning_stage(
@@ -4112,66 +3855,15 @@ async def _process_reasoning_stage(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    """Advance one verified Reasoning boundary at a time under daemon ownership."""
-
-    while True:
-        try:
-            advanced = await _await_monitored_worker_call(
-                runtime.reasoning_stage.process_once,
-                health=health,
-                timeout_code="reasoning_stage_operation_timeout",
-                on_health_change=on_health_change,
-                timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
-            )
-            transient_error = runtime.reasoning_stage.transient_error
-            if transient_error is not None:
-                raise _ReasoningStageTransientError(transient_error)
-        except Exception as error:
-            if not isinstance(
-                error,
-                (
-                    OSError,
-                    OwnerConflict,
-                    SQLAlchemyError,
-                    _ReasoningStageTransientError,
-                ),
-            ):
-                LOGGER.exception("reasoning stage attempt failed unexpectedly")
-            error_code = (
-                error.code
-                if isinstance(
-                    error,
-                    (OwnerConflict, _ReasoningStageTransientError),
-                )
-                else type(error).__name__
-            )
-            changed = (
-                health.status != "unavailable"
-                or health.last_error != error_code
-            )
-            health.status = "unavailable"
-            health.last_error = error_code
-            health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            retry_delay = min(
-                2.0,
-                0.2 * (2 ** min(health.retry_count - 1, 4)),
-            )
-            await asyncio.sleep(retry_delay)
-        else:
-            changed = health.status != "ready" or health.last_error is not None
-            health.status = "ready"
-            health.last_error = None
-            health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 0.2)
-
-
-def _advance_autonomous_creation(runtime: ProductionRuntime) -> bool:
-    """Start or advance one automatic post-Reasoning Owner boundary."""
-    return runtime.autonomous_creation.process_once()
+    await _process_background_operation(
+        runtime.reasoning_stage.process_once,
+        health=health,
+        worker_label='reasoning stage',
+        timeout_code='reasoning_stage_operation_timeout',
+        timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
+        on_health_change=on_health_change,
+        transient_error=lambda: runtime.reasoning_stage.transient_error,
+    )
 
 
 async def _process_autonomous_creation(
@@ -4179,11 +3871,12 @@ async def _process_autonomous_creation(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    await _process_reasoning_followup(
-        lambda: _advance_autonomous_creation(runtime),
+    await _process_background_operation(
+        runtime.autonomous_creation.process_once,
         health=health,
-        worker_label="autonomous creation",
-        timeout_code="autonomous_creation_operation_timeout",
+        worker_label='autonomous creation',
+        timeout_code='autonomous_creation_operation_timeout',
+        timeout_seconds=REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
     )
 
@@ -4193,24 +3886,33 @@ async def _process_quest_completion(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    await _process_reasoning_followup(
+    await _process_background_operation(
         runtime.quest_completion.process_once,
         health=health,
-        worker_label="quest completion",
-        timeout_code="quest_completion_operation_timeout",
+        worker_label='quest completion',
+        timeout_code='quest_completion_operation_timeout',
+        timeout_seconds=REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
     )
 
 
-async def _process_reasoning_followup(
+async def _process_background_operation(
     operation: Callable[[], bool],
     *,
     health: ReconciliationHealth,
     worker_label: str,
     timeout_code: str,
+    timeout_seconds: float | None,
     on_health_change: Callable[[], None] | None,
+    idle_delay: float = 0.2,
+    active_delay: float = 0,
+    transient_error: Callable[[], str | None] | None = None,
 ) -> None:
-    """Drive a recoverable follow-up without crossing two Owner writes/tick."""
+    """Share retry and health reporting while each worker owns its operation.
+
+    The watchdog retains a stalled operation instead of launching duplicates.
+    Stage-specific waiting semantics stay with the caller.
+    """
 
     while True:
         try:
@@ -4219,57 +3921,31 @@ async def _process_reasoning_followup(
                 health=health,
                 timeout_code=timeout_code,
                 on_health_change=on_health_change,
-                timeout_seconds=REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS,
+                timeout_seconds=timeout_seconds,
             )
+            error_code = transient_error() if transient_error is not None else None
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("%s attempt failed unexpectedly", worker_label)
             error_code = (
                 error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )
-            changed = (
-                health.status != "unavailable" or health.last_error != error_code
-            )
+
+        if error_code is not None:
+            changed = health.status != "unavailable" or health.last_error != error_code
             health.status = "unavailable"
             health.last_error = error_code
             health.retry_count += 1
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(
-                min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
-            )
+            delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
         else:
             changed = health.status != "ready" or health.last_error is not None
             health.status = "ready"
             health.last_error = None
             health.retry_count = 0
-            if changed and on_health_change is not None:
-                on_health_change()
-            await asyncio.sleep(0 if advanced else 0.2)
-
-
-class _IdeaStageTransientError(RuntimeError):
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-
-class _PlanStageTransientError(RuntimeError):
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-
-class _BundleStageTransientError(RuntimeError):
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-
-class _ReasoningStageTransientError(RuntimeError):
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
+            delay = active_delay if advanced else idle_delay
+        if changed and on_health_change is not None:
+            on_health_change()
+        await asyncio.sleep(delay)
 
 
 def _log_reconciliation_exit(task: asyncio.Task[None]) -> None:

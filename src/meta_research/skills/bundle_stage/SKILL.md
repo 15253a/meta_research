@@ -38,8 +38,10 @@ Session 独占该 Target 的实现、训练、结果驱动修改和最终冻结�
    接受的 TargetCommit／asset 时才建立依赖；共享同一已接受输入的工作可以并行。
 4. 优先搜索并比较可复用实现，保存 exact source/version/license/patch provenance
    与采用或拒绝理由。探索子智能体只提供 candidate、finding 和 provenance。
+5. 按[风险分类与授权连续性](references/contract.md#风险分类与授权连续性)逐个判断
+   候选的实际动作、输入、输出位置与已授权资源范围，明确填写 `risk_class`。
 
-完成标准：首批 Target 有明确冻结语义、输入、完成 cell、复用路线与依赖理由；
+完成标准：首批 Target 有明确冻结语义、输入、完成 cell、复用路线、风险分类与依赖理由；
 未规划义务仍显式可见，Session-local 策略没有冒充 RG 的 Target identity、
 spec、dependency 或 frontier。
 
@@ -47,16 +49,22 @@ spec、dependency 或 frontier。
 
 1. 通过 Owner seam 提交 Target candidate；Research Graph 接受正式 Target
    identity／spec／dependency 后，重新读取 current frontier。
-2. 对 ready Target 请求 daemon claim。请求冻结 TargetRef、current spec binding、
-   accepted inputs、授权与所需 Harness binding。
-3. daemon 只执行 claim、wake、per-Target single-flight、cancel、reconcile 和 event
+2. 先区分未启动、既有 TargetRun 与已接纳完成的 Target。既有 TargetRun 的
+   claimed／running／recovering／finalizing 工作由 Owner 观察、wake 或 reconcile；
+   没有其他 ready 工作时返回 `wait`。已接纳 TargetCommit 直接计入 coverage。
+3. 只对尚无既有 TargetRun 的 ready Target 进入首次 admission，并请求 daemon claim。
+   请求冻结 TargetRef、current spec binding、accepted inputs、授权与所需 Harness
+   binding。只为这次新执行中尚未获授权的具体高风险动作申请 HumanRequest。
+4. daemon 只执行 claim、wake、per-Target single-flight、cancel、reconcile 和 event
    forwarding。它为一个 Target 保持至多一个 current 根 Session，不参与实现、
    训练、结果解释、候选选择或 Owner 接纳。
-4. Bundle 发起后继续其他工作、wait、暂停或重启均可；Target 根 Session 按 durable
-   identity 独立运行。wake 只要求重读权威状态，不携带 Target 结果。
+5. Bundle 发起后继续其他工作、wait、暂停或重启均可；Target 根 Session 按 durable
+   identity 独立运行。Bundle Attempt／Fence 轮换后仍按原 TargetRun 对账；授权连续性
+   由 Owner 重验。若 admission frontier 与 running／completed 事实冲突，返回准确的
+   状态不一致说明，交给 Owner reconcile，再继续可运行的其他 Target。
 
-完成标准：每个在途 Target 只有一个 current 根 Session；Bundle 与 daemon 都没有
-复制其 workspace、内部循环或结果判断。
+完成标准：每个在途 Target 只有一个 current 根 Session；首次 admission、既有执行
+观察与已接纳结果收口各有明确去向，恢复不会重复请求同一执行的授权。
 
 ## 4. 在根 Session 内完成 Target 循环
 

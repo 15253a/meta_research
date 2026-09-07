@@ -1284,8 +1284,14 @@ class TargetCommitEvidenceAuthority(Protocol):
     """
 
     def query_plan_evidence_catalog(
-        self, *, quest_ref: str
+        self, *, quest_ref: str, target_commit_refs: tuple[str, ...] | None = None,
+        current_only: bool = True, role_refs: tuple[str, ...] | None = None,
     ) -> tuple[int, tuple[dict[str, object], ...]]: ...
+
+    def query_plan_evidence_page(
+        self, *, quest_ref: str, question_ref: str | None = None,
+        offset: int = 0, limit: int = 256,
+    ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]: ...
 
     def verify_plan_evidence_catalog(
         self,
@@ -1657,8 +1663,14 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
     ) -> tuple[int, tuple[str, ...]]: ...
 
     def query_plan_evidence_catalog(
-        self, *, quest_ref: str
+        self, *, quest_ref: str, target_commit_refs: tuple[str, ...] | None = None,
+        current_only: bool = True, role_refs: tuple[str, ...] | None = None,
     ) -> tuple[int, tuple[dict[str, object], ...]]: ...
+
+    def query_plan_evidence_page(
+        self, *, quest_ref: str, question_ref: str | None = None,
+        offset: int = 0, limit: int = 256,
+    ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]: ...
 
     def resolve_plan_evidence_reuse_leaves(
         self,
@@ -1673,6 +1685,13 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
         quest_ref: str,
         target_commit_refs: tuple[str, ...],
     ) -> tuple[EvidenceReuseLeaf, ...]: ...
+
+    def query_target_commit_evidence_candidates(
+        self, *, quest_ref: str, question_ref: str | None = None,
+        offset: int = 0, limit: int = 256, current_only: bool = True,
+        target_commit_refs: tuple[str, ...] | None = None,
+        role_refs: tuple[str, ...] | None = None,
+    ) -> tuple[int, tuple[dict[str, object], ...]]: ...
 
     def query_asset_reference_revision(self) -> int: ...
 
@@ -1959,7 +1978,7 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
     def query_target_commits(self, graph_ref: str) -> tuple[TargetCommit, ...]: ...
 
     def query_target_commits_for_quest(
-        self, quest_ref: str
+        self, quest_ref: str, *, target_commit_refs: tuple[str, ...] | None = None
     ) -> tuple[TargetCommit, ...]: ...
 
     def accept_reuse_eligibility(
@@ -3518,12 +3537,24 @@ class SQLiteResearchGraphReceiptVerifier:
         )
 
     def query_plan_evidence_catalog(
-        self, *, quest_ref: str
+        self, *, quest_ref: str, target_commit_refs: tuple[str, ...] | None = None,
+        current_only: bool = True, role_refs: tuple[str, ...] | None = None,
     ) -> tuple[int, tuple[dict[str, object], ...]]:
         authority = self._target_commit_evidence_authority
         if authority is None:
             return 0, ()
-        revision, catalog = authority.query_plan_evidence_catalog(quest_ref=quest_ref)
+        if target_commit_refs == ():
+            return 0, ()
+        if hasattr(authority, "query_plan_evidence_page"):
+            revision, catalog = authority.query_plan_evidence_catalog(
+                quest_ref=quest_ref, target_commit_refs=target_commit_refs,
+                current_only=current_only, role_refs=role_refs,
+            )
+        else:
+            revision, catalog = authority.query_plan_evidence_catalog(quest_ref=quest_ref)
+            if target_commit_refs is not None:
+                catalog = tuple(item for item in catalog if item["target_commit_root_ref"] in target_commit_refs)
+                revision = len(catalog)
         if (
             not isinstance(revision, int)
             or isinstance(revision, bool)
@@ -3533,6 +3564,24 @@ class SQLiteResearchGraphReceiptVerifier:
         ):
             raise OwnerConflict("plan_evidence_catalog_invalid")
         return revision, catalog
+
+    def query_plan_evidence_page(
+        self, *, quest_ref: str, question_ref: str | None = None,
+        offset: int = 0, limit: int = 256,
+    ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
+        authority = self._target_commit_evidence_authority
+        query = getattr(authority, "query_plan_evidence_page", None)
+        if query is not None:
+            return query(quest_ref=quest_ref, question_ref=question_ref, offset=offset, limit=limit)
+        # Compatibility for authorities implementing the original complete
+        # catalog protocol. The production authority always pages in SQL.
+        from meta_research.target_commit_evidence import evidence_catalog_page_metadata
+        total, catalog = self.query_plan_evidence_catalog(quest_ref=quest_ref)
+        selected = catalog[offset:offset + limit]
+        return evidence_catalog_page_metadata(
+            total=total, catalog=selected, scanned=len(selected), offset=offset,
+            limit=limit, question_ref=question_ref, projections=[],
+        ), selected
 
     def query_evidence_state(self, quest_ref: str) -> tuple[int, tuple[str, ...]]:
         return self._query_evidence_state(quest_ref, current=True)
@@ -4472,8 +4521,13 @@ class SQLiteResearchGraphReceiptVerifier:
             outcome_rows = connection.execute(
                 text(
                     "SELECT * FROM rg_reasoning_outcome_decisions WHERE "
-                    "decision = 'accepted' ORDER BY decided_at, outcome_ref"
-                )
+                    "decision = 'accepted' AND "
+                    "json_extract(transition_json, '$.source_quest_ref') = "
+                    ":quest_ref AND "
+                    "json_extract(transition_json, '$.source_question_ref') = "
+                    ":question_ref ORDER BY decided_at, outcome_ref"
+                ),
+                {"quest_ref": quest_ref, "question_ref": question_ref},
             ).fetchall()
 
         parent_bindings: list[dict[str, object]] = []
@@ -5542,8 +5596,6 @@ class SQLiteResearchGraphReceiptVerifier:
             self._execution_verifier.verify_bundle_target_proposal_receipt(
                 proposal_ref=append_row.proposal_ref,
                 run_ref=row.run_ref,
-                attempt_ref=row.attempt_ref,
-                fence_ref=row.fence_ref,
                 graph_ref=graph_ref,
                 base_generation=int(append_row.generation) - 1,
                 base_head_receipt=predecessor,
@@ -6017,6 +6069,22 @@ class SQLiteResearchGraphReceiptVerifier:
                     {"graph_ref": graph_ref},
                 ).all()
             }
+            # Admission is an AR-owned, durable boundary.  Its presence only
+            # permits omission from a NEW launch candidate list; it never
+            # authorizes execution or weakens verification of passed entries.
+            # Include older runtime frontiers that predate launch records.
+            already_admitted = {
+                row.target_ref
+                for row in connection.execute(
+                    text(
+                        "SELECT target_ref FROM ar_target_launches WHERE "
+                        "graph_ref = :graph_ref UNION SELECT f.target_ref FROM "
+                        "ar_target_frontier_entries f JOIN rg_targets t ON "
+                        "t.target_ref = f.target_ref WHERE t.graph_ref = :graph_ref"
+                    ),
+                    {"graph_ref": graph_ref},
+                ).all()
+            }
         try:
             plan_document = (
                 None if plan_row is None else decoded_object(plan_row.plan_document_json)
@@ -6052,6 +6120,14 @@ class SQLiteResearchGraphReceiptVerifier:
         }
         if not passed_set <= set(authoritative_by_ref):
             raise OwnerConflict("bundle_dispatch_frontier_invalid")
+        # Preserve old full-frontier receipts while allowing new dispatches
+        # to omit already admitted work.  Unlaunched Targets still form the
+        # complete candidate list, in RG order, with exact proofs below.
+        authoritative = tuple(
+            target for target in authoritative
+            if target.target_ref in passed_set
+            or target.target_ref not in already_admitted
+        )
         high_risk = tuple(
             target
             for target in authoritative
@@ -6082,8 +6158,8 @@ class SQLiteResearchGraphReceiptVerifier:
                 raise OwnerConflict("bundle_dispatch_frontier_invalid")
             return
 
-        # The current projection carries every RG-owned frontier Target.  Normal
-        # entries stay the exact RG base projection; only high-risk entries may
+        # The current projection carries every remaining launch candidate.
+        # Normal entries stay the exact RG base projection; only high-risk entries may
         # add the closed coordination envelope.  HumanRequest liveness and
         # waiter currentness deliberately remain AR-owned.
         if passed_refs != tuple(target.target_ref for target in authoritative):
@@ -9587,9 +9663,21 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         return self._receipt_verifier.query_evidence_reference_state(quest_ref)
 
     def query_plan_evidence_catalog(
-        self, *, quest_ref: str
+        self, *, quest_ref: str, target_commit_refs: tuple[str, ...] | None = None,
+        current_only: bool = True, role_refs: tuple[str, ...] | None = None,
     ) -> tuple[int, tuple[dict[str, object], ...]]:
-        return self._receipt_verifier.query_plan_evidence_catalog(quest_ref=quest_ref)
+        return self._receipt_verifier.query_plan_evidence_catalog(
+            quest_ref=quest_ref, target_commit_refs=target_commit_refs,
+            current_only=current_only, role_refs=role_refs,
+        )
+
+    def query_plan_evidence_page(
+        self, *, quest_ref: str, question_ref: str | None = None,
+        offset: int = 0, limit: int = 256,
+    ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
+        return self._receipt_verifier.query_plan_evidence_page(
+            quest_ref=quest_ref, question_ref=question_ref, offset=offset, limit=limit
+        )
 
     def resolve_plan_evidence_reuse_leaves(
         self,
@@ -14530,17 +14618,19 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         except (BundleTargetContractError, OwnerConflict) as error:
             raise OwnerConflict(str(error)) from error
         strategy_complete = next_state.strategy.strategy_complete
-        self._execution_verifier.verify_bundle_target_proposal_receipt(
-            proposal_ref=proposal_ref,
-            run_ref=graph.run_ref,
-            attempt_ref=graph.attempt_ref,
-            fence_ref=graph.fence_ref,
-            graph_ref=graph_ref,
-            base_generation=base_generation,
-            base_head_receipt=graph.head_receipt,
-            proposal_hash=proposal_hash,
-            receipt=proposal_receipt,
-            require_checkpoint_current=False,
+        # Resolve the authenticated proposal issuer; the graph retains the
+        # immutable Attempt that created its initial batch.
+        proposal_identity = (
+            self._execution_verifier.verify_bundle_target_proposal_receipt(
+                proposal_ref=proposal_ref,
+                run_ref=graph.run_ref,
+                graph_ref=graph_ref,
+                base_generation=base_generation,
+                base_head_receipt=graph.head_receipt,
+                proposal_hash=proposal_hash,
+                receipt=proposal_receipt,
+                require_checkpoint_current=False,
+            )
         )
         for candidate in update.candidates:
             _verify_target_candidate_owner_proofs(
@@ -14571,8 +14661,8 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                     operation_kind="target_proposal",
                     operation_ref=proposal_ref,
                     run_ref=graph.run_ref,
-                    attempt_ref=graph.attempt_ref,
-                    fence_ref=graph.fence_ref,
+                    attempt_ref=proposal_identity["attempt_ref"],
+                    fence_ref=proposal_identity["fence_ref"],
                 )
                 # The CAS above acquires the SQLite writer lock before this
                 # second issuer verification.  A notice published after the
@@ -14580,8 +14670,8 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                 self._execution_verifier.verify_bundle_target_proposal_receipt(
                     proposal_ref=proposal_ref,
                     run_ref=graph.run_ref,
-                    attempt_ref=graph.attempt_ref,
-                    fence_ref=graph.fence_ref,
+                    attempt_ref=proposal_identity["attempt_ref"],
+                    fence_ref=proposal_identity["fence_ref"],
                     graph_ref=graph_ref,
                     base_generation=base_generation,
                     base_head_receipt=graph.head_receipt,
@@ -15625,19 +15715,108 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         return tuple(_target_commit(row) for row in rows)
 
     def query_target_commits_for_quest(
-        self, quest_ref: str
+        self, quest_ref: str, *, target_commit_refs: tuple[str, ...] | None = None
     ) -> tuple[TargetCommit, ...]:
+        parameters: dict[str, object] = {"quest_ref": quest_ref}
+        selected = ""
+        if target_commit_refs is not None:
+            if not target_commit_refs:
+                return ()
+            if len(target_commit_refs) > 256:
+                raise OwnerConflict("target_commit_query_invalid")
+            refs = {f"commit_{i}": value for i, value in enumerate(target_commit_refs)}
+            parameters.update(refs)
+            selected = "AND c.commit_ref IN (" + ", ".join(":" + key for key in refs) + ") "
         with self._database.read() as connection:
             rows = connection.execute(
                 text(
                     "SELECT c.* FROM rg_target_commits c JOIN rg_targets t ON "
                     "t.target_ref = c.target_ref JOIN rg_target_graphs g ON "
                     "g.graph_ref = t.graph_ref WHERE g.quest_ref = :quest_ref "
-                    "ORDER BY c.committed_at, c.commit_ref"
+                    + selected + "ORDER BY c.committed_at, c.commit_ref"
                 ),
-                {"quest_ref": quest_ref},
+                parameters,
             ).fetchall()
         return tuple(_target_commit(row) for row in rows)
+
+    def query_target_commit_evidence_candidates(
+        self, *, quest_ref: str, question_ref: str | None = None,
+        offset: int = 0, limit: int = 256, current_only: bool = True,
+        target_commit_refs: tuple[str, ...] | None = None,
+        role_refs: tuple[str, ...] | None = None,
+    ) -> tuple[int, tuple[dict[str, object], ...]]:
+        """Page candidate identities before any RM content materialization.
+
+        The count is of eligible role candidates, not a claim that every asset
+        has passed the catalog's subsequent issuer/content verification.
+        An accepted Plan's exact version use keeps shared evidence in the
+        active research world; generic Quest roles do not establish sharing.
+        """
+        if (type(offset) is not int or offset < 0 or type(limit) is not int
+                or not 1 <= limit <= 256 or type(current_only) is not bool):
+            raise OwnerConflict("target_commit_evidence_query_invalid")
+        parameters: dict[str, object] = {
+            "quest_ref": quest_ref, "question_ref": question_ref,
+            "offset": offset, "limit": limit,
+        }
+        clauses = ["g.quest_ref = :quest_ref", "r.quest_ref = g.quest_ref",
+                   "r.role = 'evidence'", "a.media_type = 'application/vnd.meta-research.target-commit-evidence+json'"]
+        if target_commit_refs is not None:
+            if not target_commit_refs:
+                return 0, ()
+            if len(target_commit_refs) > 256:
+                raise OwnerConflict("target_commit_evidence_query_invalid")
+            refs = {f"commit_{i}": ref for i, ref in enumerate(target_commit_refs)}
+            parameters.update(refs)
+            clauses.append("c.commit_ref IN (" + ", ".join(":" + key for key in refs) + ")")
+        if role_refs is not None:
+            if not role_refs:
+                return 0, ()
+            if len(role_refs) > 256:
+                raise OwnerConflict("target_commit_evidence_query_invalid")
+            roles = {f"role_{i}": ref for i, ref in enumerate(role_refs)}
+            parameters.update(roles)
+            clauses.append("r.role_ref IN (" + ", ".join(":" + key for key in roles) + ")")
+        if current_only:
+            clauses.append("""(lifecycle.status = 'active' OR EXISTS (
+                SELECT 1 FROM rg_formal_plan_decisions d
+                JOIN rm_plan_documents p ON p.content_ref = d.plan_content_ref
+                    AND p.plan_document_hash = d.plan_document_hash
+                JOIN rg_question_lifecycle shared ON shared.question_ref = d.question_ref
+                    AND shared.quest_ref = d.quest_ref
+                JOIN ae_stage_run_requests request ON request.request_ref = d.request_ref
+                JOIN json_each(request.context_pack_json, '$.evidence_catalog') frozen
+                JOIN json_each(p.plan_document_json, '$.evidence_reuse_set') reuse
+                WHERE d.quest_ref = g.quest_ref AND d.decision = 'accepted'
+                    AND shared.status = 'active'
+                    AND json_extract(reuse.value, '$.evidence_ref') = json_extract(frozen.value, '$.evidence_ref')
+                    AND json_extract(frozen.value, '$.asset_version_ref') = r.version_ref
+                    AND json_extract(frozen.value, '$.target_commit_root_ref') = c.commit_ref
+            ))""")
+        base = """ FROM rg_target_commits c
+            JOIN rg_targets t ON t.target_ref = c.target_ref
+            JOIN rg_target_graphs g ON g.graph_ref = t.graph_ref
+            JOIN ae_cycles cycle ON cycle.cycle_ref = g.cycle_ref AND cycle.quest_ref = g.quest_ref
+            JOIN rg_question_lifecycle lifecycle ON lifecycle.question_ref = cycle.question_ref
+                AND lifecycle.quest_ref = g.quest_ref
+            JOIN rm_asset_versions a ON json_extract(a.provenance_json, '$.target_commit_root_ref') = c.commit_ref
+            JOIN rg_asset_roles r ON r.version_ref = a.version_ref
+            WHERE """ + " AND ".join(clauses)
+        # Page role candidates before materialization, then deduplicate only
+        # after issuer/content checks. A forged role must not hide a valid one.
+        cte = """WITH candidates AS (SELECT c.commit_ref AS target_commit_ref,
+            cycle.question_ref, g.cycle_ref, t.spec_json, r.version_ref, r.role_ref,
+            c.committed_at
+            """ + base + ") "
+        # Join an outer public read cut when present; standalone pages still
+        # pin their total and rows to a single SQLite WAL snapshot.
+        with self._database.read_snapshot() as connection:
+            total = int(connection.execute(text(cte + "SELECT COUNT(*) FROM candidates"), parameters).scalar_one())
+            rows = connection.execute(text(cte + """SELECT target_commit_ref,
+                question_ref, cycle_ref, spec_json, version_ref, role_ref FROM candidates
+                ORDER BY CASE WHEN question_ref = :question_ref THEN 0 ELSE 1 END,
+                committed_at DESC, target_commit_ref, role_ref LIMIT :limit OFFSET :offset"""), parameters).all()
+        return total, tuple(dict(row._mapping) for row in rows)
 
     def accept_reuse_eligibility(
         self,

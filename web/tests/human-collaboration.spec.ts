@@ -412,14 +412,14 @@ test("the Quest Companion shows the user's message before its reply is ready", a
     await responseGate;
     projectedMessages.push(
       {
-        message_ref: "msg-optimistic-user",
+        message_ref: "interaction-optimistic:user",
         scope_ref: "quest_chrome_1",
         role: "user",
         content: posted.message,
         status: "completed",
       },
       {
-        message_ref: "msg-optimistic-assistant",
+        message_ref: "interaction-optimistic:assistant",
         scope_ref: "quest_chrome_1",
         role: "assistant",
         content: "这是稍后返回的 Codex 回复。",
@@ -451,7 +451,7 @@ test("the Quest Companion shows the user's message before its reply is ready", a
     });
     await expect(
       companion.locator(".lumen-message.me").filter({ hasText: message }),
-    ).toBeVisible({ timeout: 750 });
+    ).toBeInViewport({ timeout: 750 });
     await expect(companion.getByText("Codex 正在思考…", { exact: true }))
       .toBeVisible({ timeout: 750 });
     await expect(replyBubble).toHaveCount(0);
@@ -463,7 +463,7 @@ test("the Quest Companion shows the user's message before its reply is ready", a
   }
   await responseFulfilled;
   await snapshotRefresh;
-  await expect(replyBubble).toBeVisible();
+  await expect(replyBubble).toBeInViewport();
   await expect(
     companion.locator(".lumen-message.me").filter({ hasText: message }),
   ).toHaveCount(1);
@@ -2570,4 +2570,85 @@ test("the HumanRequest workspace preserves order and overflow at 1440/800/390", 
   await expect(railEntry).toBeVisible();
   expect(await page.getByTestId("product-shell").evaluate((element) => (element as HTMLElement).inert))
     .toBe(false);
+});
+
+test("human request Draft echoes immediately while its POST is pending", async ({ page }) => {
+  await installHumanCollaborationSnapshot(page);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let posts = 0;
+  await page.route("**/api/v1/companion/messages", async (route) => {
+    posts += 1;
+    await gate;
+    await route.fulfill({ status: 503, json: { error: { code: "temporarily_unavailable" } } });
+  });
+  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  const input = dialog.getByLabel("就图书馆恢复事项发消息");
+  await input.fill("请立即显示本条讨论消息");
+  await dialog.getByRole("button", { name: "发送消息" }).click();
+  try {
+    await expect.poll(() => posts).toBe(1);
+    await expect(dialog.locator(".hc-draft-transcript .me")).toContainText("请立即显示本条讨论消息", { timeout: 750 });
+    await expect(dialog.locator(".hc-draft-transcript .me")).toBeInViewport();
+    await expect(input).toHaveValue("");
+    await expect(dialog.getByRole("button", { name: "发送消息" })).toBeDisabled();
+  } finally { release(); }
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveValue("请立即显示本条讨论消息");
+  await expect(dialog.locator(".hc-draft-transcript .me")).toHaveCount(0);
+  expect(posts).toBe(1);
+});
+
+test("human request Draft streams before its snapshot and keeps request conversations separate", async ({ page }) => {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  const collaboration = snapshot.human_collaboration as JsonRecord;
+  const companion = collaboration.companion as JsonRecord;
+  const messages = companion.messages as JsonRecord[];
+  await page.addInitScript(() => {
+    const native = window.EventSource;
+    window.replyStreams = new Map();
+    window.EventSource = new Proxy(native, {
+      construct(target, args: ConstructorParameters<typeof EventSource>) {
+        const path = String(args[0]);
+        if (!path.includes("/stream")) return Reflect.construct(target, args);
+        const stream = {
+          closed: false,
+          onmessage: null as null | ((event: MessageEvent<string>) => void),
+          close() { this.closed = true; },
+          emit(value: object) { if (!this.closed) this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(value) })); },
+        };
+        window.replyStreams.set(path, stream);
+        return stream;
+      },
+    });
+  });
+  await page.route("**/api/v1/companion/messages", (route) =>
+    route.fulfill({ json: { interaction_ref: "request-stream", status: "queued" } }));
+  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  await dialog.getByLabel("就图书馆恢复事项发消息").fill("这个事项请分段解释");
+  await dialog.getByRole("button", { name: "发送消息" }).click();
+  await expect.poll(() => page.evaluate(() => [...window.replyStreams.keys()].some((path) => path.includes("request-stream")))).toBe(true);
+  await page.evaluate(() => [...window.replyStreams.values()][0].emit({ text: "第一段事项解释。", status: "processing" }));
+  const reply = dialog.locator(".hc-draft-transcript article:not(.me)").filter({ hasText: "第一段事项解释。" });
+  await expect(reply).toBeInViewport();
+  await page.evaluate(() => [...window.replyStreams.values()][0].emit({ text: "第一段事项解释。\n第二段事项解释。", status: "processing" }));
+  await expect(reply).toContainText("第二段事项解释。");
+  await expect(reply).toBeInViewport();
+  const context = { kind: "human_request", quest_ref: "quest_chrome_1", request_ref: "agent_runtime:HR-27:r1", revision: 1 };
+  messages.push(
+    { message_ref: "request-stream:user", scope_ref: "quest_chrome_1", role: "user", content: "这个事项请分段解释", status: "completed", view_context: context },
+    { message_ref: "request-stream:assistant", scope_ref: "quest_chrome_1", role: "assistant", content: "事项正式完整回答。", status: "completed", view_context: context },
+  );
+  (snapshot as JsonRecord).revision = Number((snapshot as JsonRecord).revision) + 1;
+  await page.evaluate(() => [...window.replyStreams.values()][0].emit({ text: "事项正式完整回答。", status: "completed" }));
+  await expect(dialog.locator(".hc-draft-transcript .me")).toHaveCount(1);
+  await expect(dialog.locator(".hc-draft-transcript article:not(.me)")).toHaveCount(1);
+  await expect(dialog.locator(".hc-draft-transcript")).toContainText("事项正式完整回答。");
+  await expect(dialog.getByText("正在回复…", { exact: true })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "查看下一个待办" }).click();
+  await expect(dialog.getByLabel("就外部材料事项发消息")).toHaveValue("");
+  await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("事项正式完整回答。");
+  await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("这个事项请分段解释");
 });

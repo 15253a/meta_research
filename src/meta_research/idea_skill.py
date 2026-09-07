@@ -19,26 +19,17 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Callable, Protocol, cast
 
-from meta_research.codex_child_review import (
-    CodexChildReviewEvidenceError,
-    SealedReviewOperationEvidence,
-    TrustedChildReviewRequest,
-    TrustedChildReviewVerifier,
-    VerifiedChildReviewProof,
-)
 from meta_research.codex_ledger import (
     CodexHomeLedgerReader,
     CodexSessionLedgerReader,
 )
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
-    CODEX_REASONING_EFFORT,
     CODEX_REASONING_EFFORT_BINDING,
     CODEX_REASONING_EFFORT_CONFIG,
 )
 from meta_research.idea_contract import (
     DISPOSITION_ACTIONS,
-    IDEA_OUTCOME_SCHEMA_REF,
     IDEA_REVIEW_SCHEMA_REF,
     REVIEW_CATEGORIES,
     IdeaContractError as IdeaSkillContractError,
@@ -1031,16 +1022,6 @@ class CodexIdeaSkillAdapter:
         self._codex_ledger_reader = codex_ledger_reader
         if self._codex_ledger_reader is None and codex_home is not None:
             self._codex_ledger_reader = CodexHomeLedgerReader(codex_home)
-        self._child_review_verifier = (
-            TrustedChildReviewVerifier(self._codex_ledger_reader)
-            if self._codex_ledger_reader is not None
-            else None
-        )
-        self._child_review_evidence_mode = (
-            "trusted-codex-ledger-v1"
-            if self._child_review_verifier is not None
-            else "sealed-stdout-compat-v1"
-        )
         self._root_operation_diagnostic_recorder: (
             RootOperationDiagnosticRecorder | None
         ) = None
@@ -1162,135 +1143,6 @@ class CodexIdeaSkillAdapter:
             )
             return
 
-    def _verify_child_review(
-        self,
-        stdout: str,
-        *,
-        job_ref: str | None,
-        operation_name: str,
-        root_session_ref: str,
-        reviewer_agent_ref: str,
-        structured_result: dict[str, object],
-        expected_spawn_message: str | None = None,
-    ) -> VerifiedChildReviewProof | None:
-        """Verify one fresh reviewer without treating lossy stdout as truth."""
-
-        if self._child_review_verifier is None:
-            _verify_child_review_trace(
-                stdout,
-                root_session_ref=root_session_ref,
-                reviewer_agent_ref=reviewer_agent_ref,
-                expected_spawn_prompt=(
-                    expected_spawn_message
-                    if _stdout_child_review_spawn_prompt_visible(stdout)
-                    else None
-                ),
-            )
-            return None
-        if job_ref is None:
-            raise IdeaSkillUnavailable("codex_child_review_operation_invalid")
-        try:
-            operation = self._sealed_review_operation_evidence(
-                job_ref=job_ref,
-                operation_name=operation_name,
-                root_session_ref=root_session_ref,
-            )
-            if operation.stdout != stdout:
-                raise CodexChildReviewEvidenceError(
-                    "codex_child_review_hash_mismatch"
-                )
-            return self._child_review_verifier.verify(
-                TrustedChildReviewRequest(
-                    root_session_ref=root_session_ref,
-                    expected_working_directory=str(
-                        self._agent_workspace.absolute()
-                    ),
-                    expected_cli_version=CODEX_DRAFTING_LOCKED_VERSION,
-                    expected_model_ref=self._model_ref,
-                    expected_reasoning_effort=CODEX_REASONING_EFFORT,
-                    expected_sandbox_mode=self._sandbox_mode,
-                    expected_multi_agent_version="v2",
-                    reviewer_agent_ref=reviewer_agent_ref,
-                    structured_result=structured_result,
-                    operation=operation,
-                    expected_spawn_message=expected_spawn_message,
-                )
-            )
-        except CodexChildReviewEvidenceError as error:
-            raise IdeaSkillUnavailable(error.code) from error
-
-    def _sealed_review_operation_evidence(
-        self,
-        *,
-        job_ref: str,
-        operation_name: str,
-        root_session_ref: str,
-    ) -> SealedReviewOperationEvidence:
-        directory = (
-            self._workspace
-            / "provider-operations"
-            / canonical_hash({"job_ref": job_ref})
-            / operation_name
-        )
-        try:
-            _key_path, transport_key = self._transport_key()
-            invocation = read_transport_envelope(
-                directory / "invocation.json", transport_key
-            )
-            if not isinstance(invocation, dict):
-                raise ValueError("review invocation")
-            invocation_hash = canonical_hash(invocation)
-            transport_limits = _operation_transport_limits(invocation)
-            if (
-                invocation.get("job_ref") != job_ref
-                or invocation.get("operation_name") != operation_name
-                or invocation.get("native_session_ref") != root_session_ref
-                or invocation.get("model_ref") != self._model_ref
-            ):
-                raise ValueError("review invocation identity")
-            result, recovered_session, stdout = _read_completed_operation(
-                directory,
-                invocation_hash=invocation_hash,
-                native_session_ref=root_session_ref,
-                transport_limits=transport_limits,
-            )
-            prompt = _read_spool_text(
-                directory / "prompt.txt", transport_limits.prompt_max_bytes
-            )
-            result_text = _read_idea_result(
-                directory / "last-message.json",
-                result_max_bytes=transport_limits.result_max_bytes,
-            )
-            exit_marker = _verified_success_exit(
-                directory, invocation_hash=invocation_hash
-            )
-            if (
-                recovered_session != root_session_ref
-                or invocation.get("prompt_hash") != canonical_hash(prompt)
-            ):
-                raise ValueError("review operation identity")
-            return SealedReviewOperationEvidence(
-                invocation_hash=invocation_hash,
-                prompt=prompt,
-                stdout=stdout,
-                result_text=result_text,
-                result=result,
-                exit_marker=exit_marker,
-                stdout_hash=canonical_hash(stdout),
-                result_hash=canonical_hash(result),
-                exit_hash=canonical_hash(exit_marker),
-            )
-        except (
-            IdeaSkillUnavailable,
-            OSError,
-            ProviderSupervisorError,
-            TypeError,
-            UnicodeDecodeError,
-            ValueError,
-        ) as error:
-            raise CodexChildReviewEvidenceError(
-                "codex_child_review_operation_invalid"
-            ) from error
 
     def request_stop(self) -> None:
         try:
@@ -3134,25 +2986,6 @@ def _with_failed_native_session(
     )
 
 
-def _verify_primary_phase_trace(stdout: str) -> None:
-    """Reject review collaboration that ran before the draft was frozen."""
-
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "collab_tool_call"
-            and item.get("tool") in {"spawn_agent", "wait"}
-        ):
-            raise IdeaSkillUnavailable("codex_primary_review_phase_invalid")
-
-
 def _verify_child_review_trace(
     stdout: str,
     *,
@@ -3585,21 +3418,6 @@ def _shared_codex_adapter_source_hash() -> str:
     """Hash the shared compiler/transport seam inherited by stage adapters."""
 
     return _file_sha256(Path(__file__).resolve())
-
-
-def _trusted_child_review_source_hash() -> str:
-    """Bind the shared verifier and its trusted ledger reader as one seam."""
-
-    return canonical_hash(
-        {
-            "verifier": _file_sha256(
-                Path(__file__).with_name("codex_child_review.py").resolve()
-            ),
-            "ledger_reader": _file_sha256(
-                Path(__file__).with_name("codex_ledger.py").resolve()
-            ),
-        }
-    )
 
 
 def _idea_skill_resources() -> dict[str, str]:

@@ -936,7 +936,7 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     def query_managed_runs(self, quest_ref: str) -> tuple[dict[str, object], ...]: ...
 
     def query_stage_root_observation_scope(
-        self, run_ref: str
+        self, run_ref: str, *, phase: str | None = None
     ) -> dict[str, object] | None: ...
 
     def register_external_root_task_scope(
@@ -1735,7 +1735,9 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, reader: TargetRootCompletionReader
     ) -> None: ...
 
-    def verify_bundle_target_proposal_receipt(self, **values) -> None: ...
+    def verify_bundle_target_proposal_receipt(
+        self, **values
+    ) -> dict[str, str]: ...
 
     def verify_bundle_inbox_checkpoint(self, **values) -> None: ...
 
@@ -5901,6 +5903,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             return None
         if launch is None or dispatch_row is None or stage_run is None:
             raise OwnerConflict("target_frontier_integrity_invalid")
+        # This mandatory rejection is already known from the same database
+        # read. Do not re-verify the entire Plan on each blocked-worker poll.
+        if not dispatch_lineage_current:
+            raise OwnerConflict("target_frontier_integrity_invalid")
         request = _target_launch_request_from_row(launch)
         _target_launch_ack(launch, request)
         dispatch = _bundle_dispatch_decision(dispatch_row)
@@ -6075,6 +6081,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self._recover_completed_writing_provider_units()
         self._recover_completed_bundle_rolling_provider_units()
         self._recover_interrupted_provider_units()
+        self._recover_daemon_stopped_stage_runs()
         self._recover_interrupted_acquisition()
         self._recover_acquisition_human_requests()
         self._recover_interrupted_deepfetch()
@@ -6275,6 +6282,58 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 attempt_ref=attempt_ref,
                 fence_ref=fence_ref,
             )
+
+    def _recover_daemon_stopped_stage_runs(self) -> None:
+        """Resume only a physically stopped Stage proven to be daemon shutdown.
+
+        A graceful shutdown can finish revoking a provider before startup scans
+        active units. Keep that old Fence closed and mint fresh operations from
+        the accepted checkpoint, within the existing Run and root Session.
+        Explicit controls and non-shutdown ceilings remain suspended.
+        """
+        with self._database.write() as connection:
+            controls = connection.execute(text(
+                "SELECT * FROM ar_run_controls WHERE status = 'suspended_fenced' "
+                "AND terminal_reason = 'codex_operation_stopped' "
+                "AND cleanup_status = 'completed' ORDER BY run_ref"
+            )).all()
+            for control in controls:
+                if not _is_formal_stage_run_kind(control.run_kind):
+                    continue
+                if _prepared_control_affects_run(connection, control.run_ref):
+                    continue
+                evidence = _daemon_stopped_stage_evidence(connection, control)
+                if evidence is None:
+                    continue
+                now = time.time()
+                replacement = self._replace_fenced_managed_attempt(
+                    connection, control, now,
+                    reuse_checkpoint=True,
+                    reuse_operation_refs=False,
+                    preserve_native_session=True,
+                )
+                connection.execute(text(
+                    "UPDATE ar_run_controls SET status = 'running', "
+                    "attempt_ref = :attempt_ref, fence_ref = :fence_ref, "
+                    "control_revision = control_revision + 1, "
+                    "safe_point_ref = NULL, terminal_reason = NULL, "
+                    "cleanup_status = 'none', updated_at = :now "
+                    "WHERE run_ref = :run_ref"
+                ), {"attempt_ref": replacement.attempt_ref,
+                    "fence_ref": replacement.fence_ref, "now": now,
+                    "run_ref": control.run_ref})
+                connection.execute(text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                ))
+                self._feed.record(connection,
+                    "agent_runtime.daemon_stopped_stage_recovered", {
+                        "run_ref": control.run_ref,
+                        "retired_attempt_ref": control.attempt_ref,
+                        "successor_attempt_ref": replacement.attempt_ref,
+                        "safe_point_ref": control.safe_point_ref,
+                        "interruption_ref": evidence,
+                    })
 
     def _recover_interrupted_provider_units(self) -> None:
         """Permanently retire provider Fences left active by a dead daemon.
@@ -8354,7 +8413,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         return values
 
     def query_stage_root_observation_scope(
-        self, run_ref: str
+        self, run_ref: str, *, phase: str | None = None
     ) -> dict[str, object] | None:
         """Resolve one current formal Stage run to its exact provider unit.
 
@@ -8365,6 +8424,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
 
         if not isinstance(run_ref, str) or not run_ref or len(run_ref) > 256:
             raise OwnerConflict("stage_root_observation_run_invalid")
+        if phase not in {None, "primary", "review"}:
+            raise OwnerConflict("stage_root_observation_phase_invalid")
         with self._database.read() as connection:
             control = connection.execute(
                 text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
@@ -8496,7 +8557,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         ):
             raise OwnerConflict("stage_root_observation_scope_invalid")
-        selected = units[0] if units else None
+        # Phase selection stays inside the same current attempt and fence.
+        # Completed primary output remains readable while its review runs.
+        candidates = units if phase is None else [
+            unit for unit in units if str(unit.unit_kind).endswith("_" + phase)
+        ]
+        selected = candidates[0] if candidates else None
         if selected is not None and (
             not isinstance(selected.unit_ref, str)
             or not selected.unit_ref
@@ -8561,7 +8627,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             "attempt_generation": int(attempt_generation),
             "root_session_ref": root_session_ref,
             "fence_ref": fence_ref,
-            "status": str(control.status),
+            "status": (
+                "completed" if selected is not None
+                and selected.status == "completed" else str(control.status)
+            ),
             "unit_ref": None if selected is None else str(selected.unit_ref),
             "operation_ref": (
                 None if selected is None else str(selected.operation_ref)
@@ -13115,6 +13184,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             library_entry_url=library_entry_url,
             private_state_dir=str(private_state),
             previous_browser_context_ref=previous_browser_context_ref,
+            generation=generation,
         )
         protection_effect = _acquisition_preflight_runtime_effect(
             session_ref=session_ref,
@@ -20281,9 +20351,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         return self._stage_run_from_row(run, expected_stage)
 
-    def _idea_stage_run_from_row(self, run) -> IdeaStageRun:
-        return self._stage_run_from_row(run, "idea")
-
     def _stage_run_from_row(self, run, expected_stage: str) -> IdeaStageRun:
         if run.stage != expected_stage:
             raise OwnerConflict("stage_run_integrity_invalid")
@@ -23085,8 +23152,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             **values
         )
 
-    def verify_bundle_target_proposal_receipt(self, **values) -> None:
-        self._receipt_verifier.verify_bundle_target_proposal_receipt(**values)
+    def verify_bundle_target_proposal_receipt(
+        self, **values
+    ) -> dict[str, str]:
+        return self._receipt_verifier.verify_bundle_target_proposal_receipt(**values)
 
     def verify_bundle_inbox_checkpoint(self, **values) -> None:
         self._receipt_verifier.verify_bundle_inbox_checkpoint(**values)
@@ -23481,15 +23550,21 @@ class SQLiteAgentRuntimeReceiptVerifier:
         *,
         proposal_ref: str,
         run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
+        attempt_ref: str | None = None,
+        fence_ref: str | None = None,
         graph_ref: str,
         base_generation: int,
         base_head_receipt: AcceptanceReceipt,
         proposal_hash: str,
         receipt: AcceptanceReceipt,
         require_checkpoint_current: bool = False,
-    ) -> None:
+    ) -> dict[str, str]:
+        """Verify issuance and return its identity, independent of graph origin.
+
+        A rolling proposal may come from a later Attempt of the same Run.
+        Current effects still require the exact current Inbox checkpoint.
+        """
+
         if (
             receipt.issuer != AR_OWNER
             or receipt.kind != BUNDLE_TARGET_PROPOSAL_RECEIPT_KIND
@@ -23533,8 +23608,8 @@ class SQLiteAgentRuntimeReceiptVerifier:
         proposal = _bundle_target_proposal(row)
         if (
             proposal.run_ref != run_ref
-            or proposal.attempt_ref != attempt_ref
-            or proposal.fence_ref != fence_ref
+            or (attempt_ref is not None and proposal.attempt_ref != attempt_ref)
+            or (fence_ref is not None and proposal.fence_ref != fence_ref)
             or proposal.graph_ref != graph_ref
             or proposal.base_generation != base_generation
             or proposal.base_head_receipt != base_head_receipt
@@ -23542,12 +23617,17 @@ class SQLiteAgentRuntimeReceiptVerifier:
             or proposal.receipt != receipt
             or checkpoint is not None
             and (
-                checkpoint.run_ref != run_ref
-                or checkpoint.attempt_ref != attempt_ref
-                or checkpoint.fence_ref != fence_ref
+                checkpoint.run_ref != proposal.run_ref
+                or checkpoint.attempt_ref != proposal.attempt_ref
+                or checkpoint.fence_ref != proposal.fence_ref
             )
         ):
             raise OwnerConflict("bundle_target_proposal_receipt_invalid")
+        return {
+            "run_ref": proposal.run_ref,
+            "attempt_ref": proposal.attempt_ref,
+            "fence_ref": proposal.fence_ref,
+        }
 
     def verify_bundle_inbox_checkpoint(
         self,
@@ -24577,16 +24657,6 @@ def _acquisition_execution_from_row(
         status=str(row.status),
         request=request,
         results=results,
-    )
-
-
-def _failed_acquisition_item(paper_id: str, code: str) -> AcquisitionItemResult:
-    return AcquisitionItemResult(
-        paper_id=paper_id,
-        status="missing",
-        path=None,
-        format=None,
-        failure={"code": code, "detail": "Nature Downloader 未形成可接纳正文。"},
     )
 
 
@@ -30808,6 +30878,7 @@ def _validated_stage_provider_hard_ceiling(
             ),
             "codex_operation_timeout": frozenset({"timeout"}),
             "codex_operation_output_limit": frozenset({"output_limit"}),
+            "codex_operation_stopped": frozenset({"stopped"}),
         }.get(failure_code)
         if legacy_reasons is not None:
             schema_valid = True
@@ -30988,6 +31059,139 @@ def _runtime_control_reservation_document(row) -> dict[str, object]:
         "affected_runs": affected,
         "affected_runs_hash": row.affected_runs_hash,
     }
+
+
+def _daemon_stopped_stage_evidence(connection, control) -> str | None:
+    """Return the exact shutdown proof, never infer it from a stopped exit."""
+    try:
+        saved = _query_managed_safe_point(connection, control)
+    except (OwnerConflict, TypeError, ValueError):
+        return None
+    if saved is None:
+        return None
+    checkpoint = saved["checkpoint"]
+    if not isinstance(checkpoint, dict):
+        return None
+    bindings = {
+        "schema_ref": "meta-research/runtime-safe-point/v1",
+        "action": "provider_hard_ceiling",
+        "run_ref": control.run_ref,
+        "run_kind": control.run_kind,
+        "quest_ref": control.quest_ref,
+        "cycle_ref": control.cycle_ref,
+        "epoch": control.epoch,
+        "run_status": "running",
+        "attempt_ref": control.attempt_ref,
+        "root_session_ref": control.root_session_ref,
+        "fence_ref": control.fence_ref,
+        "control_revision": int(control.control_revision) - 1,
+        "provider_operation_retry_permitted": False,
+        "failure": {"code": "codex_operation_stopped"},
+    }
+    if any(checkpoint.get(key) != value for key, value in bindings.items()):
+        return None
+    try:
+        unit = connection.execute(text(
+            "SELECT * FROM ar_provider_units WHERE unit_ref = :unit_ref"
+        ), {"unit_ref": checkpoint.get("provider_unit_ref")}).first()
+        if unit is None or unit.status != "revoked" or (
+            unit.run_ref, unit.attempt_ref, unit.fence_ref, unit.operation_ref,
+            _PROVIDER_UNIT_RUN_KINDS.get(unit.unit_kind)
+        ) != (control.run_ref, control.attempt_ref, control.fence_ref,
+              checkpoint.get("provider_operation_ref"), control.run_kind):
+            return None
+        _validated_stage_provider_hard_ceiling(
+            unit_kind=unit.unit_kind, failure_code="codex_operation_stopped",
+            provider_exit=checkpoint.get("provider_exit"),
+        )
+    except (OwnerConflict, TypeError, ValueError):
+        return None
+    if connection.execute(text(
+        "SELECT 1 FROM ar_provider_units WHERE run_ref = :run_ref "
+        "AND status IN ('active', 'revocation_pending') LIMIT 1"
+    ), {"run_ref": control.run_ref}).first() is not None:
+        return None
+    stage = connection.execute(text(
+        "SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"
+    ), {"run_ref": control.run_ref}).first()
+    fence = connection.execute(text(
+        "SELECT * FROM ar_execution_fences WHERE fence_ref = :fence_ref"
+    ), {"fence_ref": control.fence_ref}).first()
+    revocation = connection.execute(text(
+        "SELECT * FROM ar_fence_revocations WHERE fence_ref = :fence_ref"
+    ), {"fence_ref": control.fence_ref}).first()
+    if (stage is None or fence is None or revocation is None
+        or stage.status not in {"running", "awaiting_acceptance"}
+        or (stage.current_attempt_ref, stage.current_fence_ref,
+            stage.root_session_ref, stage.stage + "_stage") != (
+            control.attempt_ref, control.fence_ref, control.root_session_ref,
+            control.run_kind)
+        or (fence.run_ref, fence.attempt_ref, fence.status) != (
+            control.run_ref, control.attempt_ref, "rejected")
+        or (revocation.run_ref, revocation.attempt_ref,
+            revocation.operation_ref, revocation.reason_code) != (
+            control.run_ref, control.attempt_ref,
+            checkpoint.get("operation_ref"), "codex_operation_stopped")):
+        return None
+    effect = _provider_runtime_effect(
+        unit_ref=unit.unit_ref, operation_ref=unit.operation_ref,
+        run_ref=unit.run_ref, attempt_ref=unit.attempt_ref,
+        fence_ref=unit.fence_ref, claim_started_at=float(unit.started_at),
+    )
+    identity = {
+        "responsibility_ref": effect.responsibility_ref,
+        "owner_scope": effect.owner_scope,
+        "root_run_ref": effect.root_run_ref,
+        "attempt_ref": effect.attempt_ref,
+        "fence_ref": effect.fence_ref,
+        "operation_ref": effect.operation_ref,
+        "effect_kind": effect.effect_kind,
+    }
+    responsibility = connection.execute(text(
+        "SELECT * FROM ar_execution_responsibilities WHERE responsibility_ref "
+        "= :responsibility_ref"
+    ), {"responsibility_ref": effect.responsibility_ref}).first()
+    if (responsibility is None
+        or any(responsibility._mapping.get(key) != value
+               for key, value in identity.items())
+        or responsibility.correlation_ref != "runtime_correlation_"
+            + canonical_hash(identity)):
+        return None
+    boundary = connection.execute(text(
+        "SELECT * FROM ar_runtime_boundary_receipts WHERE responsibility_ref "
+        "= :responsibility_ref"
+    ), {"responsibility_ref": effect.responsibility_ref}).first()
+    boundary_value = {
+        "schema_ref": "meta-research/runtime-boundary-receipt/v1", **identity,
+        "boundary": "permanent_fence", "checkpoint_ref": None,
+        "owner_evidence_ref": "stage_provider_hard_ceiling_" + saved["checkpoint_hash"],
+    }
+    if (boundary is None or any(boundary._mapping.get(key) != value
+        for key, value in boundary_value.items()
+        if key not in {"schema_ref", "effect_kind"})
+        or boundary.evidence_hash != canonical_hash(boundary_value)):
+        return None
+    interruptions = connection.execute(text(
+        "SELECT * FROM ar_runtime_interruptions WHERE responsibility_ref = "
+        ":responsibility_ref AND interruption_kind = 'daemon' "
+        "AND reason_code = 'daemon_shutdown_requested' ORDER BY recorded_at"
+    ), {"responsibility_ref": effect.responsibility_ref}).all()
+    for interruption in interruptions:
+        proof = {
+            "responsibility_ref": effect.responsibility_ref,
+            "attempt_ref": effect.attempt_ref, "fence_ref": effect.fence_ref,
+            "operation_ref": effect.operation_ref,
+            "checkpoint_ref": interruption.checkpoint_ref,
+        }
+        if ((interruption.old_attempt_ref, interruption.old_fence_ref,
+             interruption.operation_ref) == (
+             effect.attempt_ref, effect.fence_ref, effect.operation_ref)
+            and float(unit.started_at) <= float(interruption.recorded_at)
+                <= saved["created_at"]
+            and interruption.evidence_ref == "runtime_interruption_evidence_"
+                + canonical_hash(proof)):
+            return str(interruption.interruption_ref)
+    return None
 
 
 def _stage_resume_reuses_checkpoint(connection, row) -> bool:
@@ -31234,67 +31438,6 @@ def _provider_operation_for_unit(connection, *, unit_ref: str, run_ref: str) -> 
     if operation_ref is None:
         raise OwnerConflict("runtime_provider_operation_invalid")
     return str(operation_ref)
-
-
-def _close_provider_unit(
-    connection,
-    *,
-    run_ref: str,
-    attempt_ref: str | None,
-    fence_ref: str | None,
-) -> None:
-    now = time.time()
-    operation_ref = connection.execute(
-        text(
-            "SELECT operation_ref FROM ar_provider_units WHERE run_ref = :run_ref AND "
-            "attempt_ref IS :attempt_ref AND fence_ref IS :fence_ref AND status IN "
-            "('active', 'revocation_pending') ORDER BY started_at DESC LIMIT 1"
-        ),
-        {
-            "run_ref": run_ref,
-            "attempt_ref": attempt_ref,
-            "fence_ref": fence_ref,
-        },
-    ).scalar_one_or_none()
-    connection.execute(
-        text(
-            "UPDATE ar_provider_units SET status = CASE WHEN EXISTS (SELECT 1 FROM "
-            "ar_fence_revocations revocations WHERE revocations.fence_ref IS "
-            ":fence_ref AND revocations.run_ref = :run_ref) THEN 'revoked' ELSE "
-            "'completed' END, completed_at = :now "
-            "WHERE run_ref = :run_ref AND attempt_ref IS :attempt_ref AND fence_ref "
-            "IS :fence_ref AND status IN ('active', 'revocation_pending')"
-        ),
-        {
-            "now": now,
-            "run_ref": run_ref,
-            "attempt_ref": attempt_ref,
-            "fence_ref": fence_ref,
-        },
-    )
-    if operation_ref is not None:
-        connection.execute(
-            text(
-                "UPDATE ar_provider_units SET status = 'revoked', completed_at = :now "
-                "WHERE run_ref = :run_ref AND operation_ref = :operation_ref AND "
-                "status = 'revocation_pending'"
-            ),
-            {
-                "now": now,
-                "run_ref": run_ref,
-                "operation_ref": operation_ref,
-            },
-        )
-    connection.execute(
-        text(
-            "UPDATE ar_run_controls SET cleanup_status = 'completed', updated_at = "
-            ":now WHERE run_ref = :run_ref AND cleanup_status = 'pending' AND NOT "
-            "EXISTS (SELECT 1 FROM "
-            "ar_provider_units pending WHERE pending.run_ref = :run_ref AND "
-            "pending.status IN ('active', 'revocation_pending'))"
-        ),
-        {"now": now, "run_ref": run_ref},
-    )
 
 
 def _runtime_control_receipt(row) -> dict[str, object]:

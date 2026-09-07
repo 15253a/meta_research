@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
+
 from dataclasses import dataclass, replace
 import hashlib
 import hmac
@@ -1046,7 +1048,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             conformance,
             required_operation_ids=operation_ids,
         )
-        if rebound != runtime_binding:
+        if not bundle_bindings_compatible(rebound, runtime_binding):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         channel_key = (job_ref or run_ref, operation_name)
         channel = self._resident_mcp_channels.get(channel_key)
@@ -1185,6 +1187,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                     "adapter_source_hash": adapter_source_hash,
                     "shared_adapter_source_hash": shared_adapter_source_hash,
                     "supervisor_source_hash": supervisor_source_hash,
+                    "dispatch_recovery_source_hash": _file_sha256(
+                        Path(__file__).with_name("bundle_dispatch_recovery.py")
+                    ),
                 }
             ),
             model_ref=self._model_ref,
@@ -1213,6 +1218,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             )
             + harness_artifacts
             + (
+                "bundle-execution-contract:policy-refresh/v1",
+                "adapter-source:meta_research.bundle_dispatch_recovery@sha256:"
+                + _file_sha256(Path(__file__).with_name("bundle_dispatch_recovery.py")),
                 "adapter-source:meta_research.bundle_skill@sha256:"
                 f"{adapter_source_hash}",
                 "adapter-source:meta_research.idea_skill@sha256:"
@@ -1254,7 +1262,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
 
     def generate_draft(self, request: BundleSkillRequest) -> BundleSkillDraft:
         _validate_request(request)
-        if request.runtime_binding != self.runtime_binding():
+        if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         lineage = _owner_rejection_prompt(request)
         human_resume = (
@@ -1387,7 +1395,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
     ) -> BundleSkillResult | BundleExhaustionSkillResult:
         _validate_request(request)
         if (
-            request.runtime_binding != self.runtime_binding()
+            not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding())
             or request.native_session_ref != draft.primary_session_ref
         ):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
@@ -1488,7 +1496,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             attempt_ref=request.attempt_ref,
             fence_ref=request.fence_ref,
         )
-        if request.runtime_binding != self.runtime_binding():
+        if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         target_refs = tuple(cast(str, item["target_ref"]) for item in request.frontier)
         prompt = (
@@ -1507,7 +1515,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "请求已打开、已满足或已拒绝时不得再造新请求；返回 wait，"
             "由 Owner 评估 response、重验 authorization 并释放 waiter。绝对不得把 "
             "dispatch_allowed=false 的 Target 返回为 dispatch，也不得因 provider、"
-            "validator 或 readiness 错误自行伪造 HumanRequest。\n"
+            "validator 或 readiness 错误自行伪造 HumanRequest。"
+            "返回 wait 或 replan_required 时，selected_target_ref 必须为 null。\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"run_ref={request.run_ref}\n"
             f"attempt_ref={request.attempt_ref}\n"
@@ -1519,18 +1528,25 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"state={canonical_json(request.state)}"
         )
         operation_name = f"dispatch-{request.generation}"
-        output, session_ref, _stdout = self._invoke_with_resident_mcp(
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding,
-            operation_name=operation_name,
-            prompt=prompt,
-            schema=_dispatch_schema(target_refs),
-            native_session_ref=request.native_session_ref,
-            job_ref=request.job_ref,
-        )
+        try:
+            output, session_ref, _stdout = self._invoke_with_resident_mcp(
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                runtime_binding=request.runtime_binding,
+                operation_name=operation_name,
+                prompt=prompt,
+                schema=_dispatch_schema(target_refs),
+                native_session_ref=request.native_session_ref,
+                job_ref=request.job_ref,
+            )
+        except BundleSkillUnavailable as error:
+            if error.code == "codex_operation_identity_conflict":
+                from meta_research.bundle_dispatch_recovery import recover_rejected_dispatch
+
+                recover_rejected_dispatch(self, request, operation_name)
+            raise
         action = output.get("action")
         selected_target_ref = output.get("selected_target_ref")
         rationale = output.get("rationale")
@@ -1625,7 +1641,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if len(prompt.encode("utf-8")) > BUNDLE_TARGET_BATCH_PROMPT_MAX_BYTES:
             raise BundleSkillUnavailable("bundle_target_batch_prompt_too_large")
-        if request.runtime_binding != self.runtime_binding():
+        if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         operation_name = f"target-batch-{request.base_generation + 1}"
         output, session_ref, _stdout = self._invoke_with_resident_mcp(

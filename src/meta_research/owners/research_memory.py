@@ -1572,19 +1572,24 @@ class SQLiteResearchMemoryReceiptVerifier:
             or row.review_hash != review_hash
             or row.receipt_ref != receipt.receipt_ref
             or row.receipt_hash != receipt.payload_hash
-            or row.receipt_hash != _plan_content_receipt_hash(row)
         ):
+            raise OwnerConflict("plan_content_receipt_invalid")
+        self._verified_plan_document(row)
+
+    def _verified_plan_document(self, row) -> AcceptedPlanDocument:
+        if row.receipt_hash != _plan_content_receipt_hash(row):
             raise OwnerConflict("plan_content_receipt_invalid")
         if self._stage_request_verifier is None:
             raise OwnerConflict("stage_request_verifier_unavailable")
         verified_request = (
             self._stage_request_verifier.query_verified_plan_stage_request(
-                request_ref=request_ref,
+                request_ref=row.request_ref,
                 context_pack_ref=row.context_pack_ref,
             )
         )
-        _verify_plan_object(self._object_store, row)
-        _verify_plan_payload(row, verified_request)
+        accepted = _accepted_plan_document(
+            self._object_store, row, verified_request
+        )
         if self._execution_verifier is not None:
             self._execution_verifier.verify_attempt_execution_receipt(
                 request_ref=row.request_ref,
@@ -1601,6 +1606,7 @@ class SQLiteResearchMemoryReceiptVerifier:
                     payload_hash=row.execution_receipt_hash,
                 ),
             )
+        return accepted
 
     def query_current_question_literature_revision(
         self, question_ref: str
@@ -2349,7 +2355,13 @@ class SQLiteResearchMemoryReceiptVerifier:
                 or plan.receipt_hash != _plan_content_receipt_hash(plan)
             ):
                 raise OwnerConflict("asset_receipt_invalid")
-            _verify_plan_payload(plan, None)
+            # Asset inventory remains available when custody is lost. Verify
+            # the accepted metadata here; full Plan reads verify object bytes.
+            try:
+                projection = decoded_object(plan.plan_document_json)
+            except (TypeError, ValueError) as error:
+                raise OwnerConflict("plan_content_invalid") from error
+            _verify_plan_document_projection(plan, projection)
             if self._execution_verifier is not None:
                 self._execution_verifier.verify_attempt_execution_receipt(
                     request_ref=plan.request_ref,
@@ -6578,8 +6590,6 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             receipt=execution_receipt,
         )
         plan_document_json = canonical_json(plan_document)
-        reviewed_draft_json = canonical_json(reviewed_draft)
-        review_json = canonical_json(review)
         object_path = self._store_plan_content(payload_hash, payload_json)
         bindings = {
             "request_ref": request_ref,
@@ -6649,10 +6659,11 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     for key, value in bindings.items()
                 ):
                     raise OwnerConflict("plan_content_acceptance_conflict")
-                _verify_plan_object(self._object_store, existing)
                 if existing.receipt_hash != _plan_content_receipt_hash(existing):
                     raise OwnerConflict("plan_content_receipt_invalid")
-                return _accepted_plan_document(existing, verified_request)
+                return _accepted_plan_document(
+                    self._object_store, existing, verified_request
+                )
 
             content_ref = new_ref("plan_content")
             receipt_ref = new_ref("rm_plan_content_receipt")
@@ -6675,8 +6686,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     "idea_outcome_receipt_ref, idea_outcome_receipt_hash, "
                     "idea_stage_commit_ref, idea_stage_commit_receipt_ref, "
                     "idea_stage_commit_receipt_hash, plan_document_json, "
-                    "plan_document_hash, answer_contract_hash, reviewed_draft_json, "
-                    "reviewed_draft_hash, review_json, review_hash, payload_json, "
+                    "plan_document_hash, answer_contract_hash, "
+                    "reviewed_draft_hash, review_hash, "
                     "payload_hash, object_path, execution_receipt_ref, "
                     "execution_receipt_hash, receipt_ref, receipt_hash, accepted_at) "
                     "VALUES (:content_ref, :request_ref, :run_ref, :attempt_ref, "
@@ -6691,8 +6702,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     ":idea_stage_commit_receipt_ref, "
                     ":idea_stage_commit_receipt_hash, :plan_document_json, "
                     ":plan_document_hash, :answer_contract_hash, "
-                    ":reviewed_draft_json, :reviewed_draft_hash, :review_json, "
-                    ":review_hash, :payload_json, :payload_hash, :object_path, "
+                    ":reviewed_draft_hash, :review_hash, :payload_hash, :object_path, "
                     ":execution_receipt_ref, :execution_receipt_hash, "
                     ":receipt_ref, :receipt_hash, :accepted_at)"
                 ),
@@ -6700,9 +6710,6 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     **bindings,
                     "content_ref": content_ref,
                     "plan_document_json": plan_document_json,
-                    "reviewed_draft_json": reviewed_draft_json,
-                    "review_json": review_json,
-                    "payload_json": payload_json,
                     "object_path": object_path,
                     "receipt_ref": receipt_ref,
                     "receipt_hash": receipt_hash,
@@ -6770,26 +6777,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             ).first()
         if row is None:
             return None
-        if self._stage_request_verifier is None:
-            raise OwnerConflict("stage_request_verifier_unavailable")
-        verified_request = (
-            self._stage_request_verifier.query_verified_plan_stage_request(
-                request_ref=row.request_ref,
-                context_pack_ref=row.context_pack_ref,
-            )
-        )
-        accepted = _accepted_plan_document(row, verified_request)
-        self._receipt_verifier.verify_plan_content_receipt(
-            request_ref=row.request_ref,
-            submission_ref=row.submission_ref,
-            content_ref=row.content_ref,
-            payload_hash=row.payload_hash,
-            plan_hash=row.plan_document_hash,
-            reviewed_draft_hash=row.reviewed_draft_hash,
-            review_hash=row.review_hash,
-            receipt=accepted.receipt,
-        )
-        return accepted
+        return self._receipt_verifier._verified_plan_document(row)
 
     def verify_plan_content_receipt(self, **values) -> None:
         self._receipt_verifier.verify_plan_content_receipt(**values)
@@ -8262,9 +8250,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 connection.execute(
                     text(
                         "UPDATE research_memory_state SET revision = revision + 1, "
-                        "object_count = object_count + 3, literature_snapshot_count = "
+                        "object_count = :object_count, literature_snapshot_count = "
                         "literature_snapshot_count + 1 WHERE singleton = 'owner'"
-                    )
+                    ),
+                    {"object_count": _managed_object_count(connection)},
                 )
                 self._feed.record(
                     connection,
@@ -11437,6 +11426,11 @@ def _insert_managed_content_asset(
 
 
 def _managed_object_count(connection) -> int:
+    """Count registered content objects, deduplicated by managed object path.
+
+    Literature snapshot objects are outside this registry; their snapshots are
+    represented separately by literature_snapshot_count.
+    """
     return int(
         connection.execute(
             text("SELECT COUNT(*) FROM rm_managed_objects")
@@ -11503,14 +11497,6 @@ def _verify_managed_manifest(
         candidate = _managed_object_candidate(object_store, object_path)
         if not _file_matches(candidate, size, digest):
             raise OwnerConflict("asset_custody_unavailable")
-
-
-def _read_managed_object(object_store: Path, object_path: str) -> bytes:
-    candidate = _managed_object_candidate(object_store, object_path)
-    try:
-        return candidate.read_bytes()
-    except OSError as error:
-        raise OwnerConflict("asset_custody_unavailable") from error
 
 
 def _managed_object_candidate(object_store: Path, object_path: str) -> Path:
@@ -11743,22 +11729,6 @@ def _verify_idea_payload(
     return outcome, reviewed_draft, review
 
 
-def _verify_plan_object(object_store: Path, row) -> None:
-    root = object_store.resolve()
-    candidate = (root / row.object_path).resolve()
-    if not candidate.is_relative_to(root) or not candidate.is_file():
-        raise OwnerConflict("plan_content_custody_unavailable")
-    try:
-        payload = candidate.read_bytes()
-    except OSError as error:
-        raise OwnerConflict("plan_content_custody_unavailable") from error
-    if (
-        hashlib.sha256(payload).hexdigest() != row.payload_hash
-        or payload != row.payload_json.encode("utf-8")
-    ):
-        raise OwnerConflict("plan_content_custody_unavailable")
-
-
 def _selected_plan_evidence_refs(
     plan_document: dict[str, object],
 ) -> frozenset[str]:
@@ -11776,42 +11746,54 @@ def _selected_plan_evidence_refs(
     return frozenset(refs)
 
 
-def _verify_plan_payload(
+def _verify_plan_document_projection(row, plan_document: dict[str, object]) -> None:
+    """Bind the SQL query projection to the accepted Plan and answer contract."""
+    answer_contract = plan_document.get("answer_contract")
+    if (
+        canonical_json(plan_document) != row.plan_document_json
+        or canonical_hash(plan_document) != row.plan_document_hash
+        or not isinstance(answer_contract, dict)
+        or answer_contract.get("answer_contract_hash") != row.answer_contract_hash
+    ):
+        raise OwnerConflict("plan_content_invalid")
+
+
+def _read_verified_plan_payload(
+    object_store: Path,
     row,
     verified_request,
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    _verify_plan_object_path_shape(row)
+    root = object_store.resolve()
+    candidate = (root / row.object_path).resolve()
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        raise OwnerConflict("plan_content_custody_unavailable")
     try:
-        payload = decoded_object(row.payload_json)
-        plan_document = decoded_object(row.plan_document_json)
-        reviewed_draft = decoded_object(row.reviewed_draft_json)
-        review = decoded_object(row.review_json)
+        content = candidate.read_bytes()
+    except OSError as error:
+        raise OwnerConflict("plan_content_custody_unavailable") from error
+    if hashlib.sha256(content).hexdigest() != row.payload_hash:
+        raise OwnerConflict("plan_content_custody_unavailable")
+    try:
+        payload_json = content.decode("utf-8")
+        payload = decoded_object(payload_json)
     except (TypeError, ValueError) as error:
         raise OwnerConflict("plan_content_invalid") from error
+    plan_document = payload.get("outcome")
+    reviewed_draft = payload.get("reviewed_draft")
+    review = payload.get("review")
     if (
-        payload
-        != {
-            "schema_ref": PLAN_ATTEMPT_EXECUTION_SCHEMA,
-            "outcome": plan_document,
-            "reviewed_draft": reviewed_draft,
-            "review": review,
-        }
-        or canonical_json(payload) != row.payload_json
-        or canonical_json(plan_document) != row.plan_document_json
-        or canonical_json(reviewed_draft) != row.reviewed_draft_json
-        or canonical_json(review) != row.review_json
-        or canonical_hash(payload) != row.payload_hash
-        or canonical_hash(plan_document) != row.plan_document_hash
+        set(payload) != {"schema_ref", "outcome", "reviewed_draft", "review"}
+        or payload.get("schema_ref") != PLAN_ATTEMPT_EXECUTION_SCHEMA
+        or not isinstance(plan_document, dict)
+        or not isinstance(reviewed_draft, dict)
+        or not isinstance(review, dict)
+        or canonical_json(payload) != payload_json
         or canonical_hash(reviewed_draft) != row.reviewed_draft_hash
         or canonical_hash(review) != row.review_hash
     ):
         raise OwnerConflict("plan_content_invalid")
-    answer_contract = plan_document.get("answer_contract")
-    if (
-        not isinstance(answer_contract, dict)
-        or answer_contract.get("answer_contract_hash")
-        != row.answer_contract_hash
-    ):
-        raise OwnerConflict("plan_content_invalid")
+    _verify_plan_document_projection(row, plan_document)
     try:
         validate_plan_review(
             review,
@@ -11820,8 +11802,6 @@ def _verify_plan_payload(
         )
     except PlanContractError as error:
         raise OwnerConflict(str(error)) from error
-    if verified_request is None:
-        return plan_document, reviewed_draft, review
     try:
         context_pack = verified_request.context_pack
         question_binding = context_pack.get("accepted_question_binding")
@@ -13054,11 +13034,12 @@ def _accepted_idea_content(row) -> AcceptedIdeaOutcomeContent:
     )
 
 
-def _accepted_plan_document(row, verified_request) -> AcceptedPlanDocument:
-    plan_document, reviewed_draft, review = _verify_plan_payload(
-        row, verified_request
+def _accepted_plan_document(
+    object_store: Path, row, verified_request
+) -> AcceptedPlanDocument:
+    plan_document, reviewed_draft, review = _read_verified_plan_payload(
+        object_store, row, verified_request
     )
-    _verify_plan_object_path_shape(row)
     accepted_question = verified_request.accepted_question
     return AcceptedPlanDocument(
         request_ref=row.request_ref,

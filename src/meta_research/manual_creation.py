@@ -2764,6 +2764,35 @@ class ManualQuestionCreation:
             self._record_recovery_failure(str(context_ref), error.code)
         return True
 
+    def query_drafting_reply(
+        self, context_ref: str, turn_ref: str
+    ) -> dict[str, object]:
+        """Observe this draft's current reply without persisting partial text."""
+        with self._database.read() as connection:
+            creation = self._require_context(connection, context_ref)
+            session = connection.execute(
+                text("SELECT * FROM hc_manual_drafting_sessions "
+                     "WHERE context_ref = :context_ref"),
+                {"context_ref": context_ref},
+            ).first()
+            turns = [] if session is None else list(connection.execute(
+                text("SELECT * FROM hc_manual_drafting_turns "
+                     "WHERE session_ref = :session_ref ORDER BY ordinal"),
+                {"session_ref": session.session_ref},
+            ))
+        turn = next((item for item in turns if item.turn_ref == turn_ref), None)
+        if turn is None:
+            raise OwnerConflict("manual_drafting_turn_not_found")
+        self._verify_drafting_artifacts(creation, session, turns)
+        status = str(turn.assistant_status)
+        content = turn.assistant_content if status == "completed" else ""
+        observe = getattr(self._intent_drafting_provider, "observe_reply", None)
+        if status == "running" and callable(observe):
+            content = observe(self._drafting_job_ref(
+                turn_ref, int(turn.assistant_attempt_count)
+            ))
+        return {"turn_ref": turn_ref, "status": status, "text": content or ""}
+
     def query_current(
         self, *, quest_ref: str, parent_question_ref: str
     ) -> dict[str, object] | None:
@@ -3187,6 +3216,81 @@ class ManualQuestionCreation:
                 content=accepted_content,
                 confirmation=confirmation,
             )
+        if row.research_choice == "deepfetch":
+            with self._database.write() as connection:
+                current = self._require_context(connection, context_ref)
+                if current.question_ref is not None and (
+                    current.question_ref != accepted_question.question_ref
+                    or current.question_receipt_ref
+                    != accepted_question.receipt.receipt_ref
+                    or current.question_receipt_hash
+                    != accepted_question.receipt.payload_hash
+                ):
+                    raise OwnerConflict("manual_question_anchor_conflict")
+                if current.question_ref is None:
+                    connection.execute(
+                        text(
+                            "UPDATE hc_manual_question_creations SET status = "
+                            "'recovering', question_ref = :question_ref, "
+                            "question_receipt_ref = :receipt_ref, "
+                            "question_receipt_hash = :receipt_hash, "
+                            "recovery_first_missing = 'question_literature_revision', "
+                            "recovery_reason_code = NULL, next_retry_at = NULL, "
+                            "updated_at = :now WHERE context_ref = :context_ref"
+                        ),
+                        {
+                            "context_ref": context_ref,
+                            "question_ref": accepted_question.question_ref,
+                            "receipt_ref": accepted_question.receipt.receipt_ref,
+                            "receipt_hash": accepted_question.receipt.payload_hash,
+                            "now": time.time(),
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE human_collaboration_state SET revision = "
+                            "revision + 1 WHERE singleton = 'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "human_collaboration.manual_question_identity_observed",
+                        {
+                            "context_ref": context_ref,
+                            "question_ref": accepted_question.question_ref,
+                        },
+                    )
+                    # Preserve the RG receipt before crossing back to RM.
+                    return
+
+            snapshot = self._research_memory.query_literature_snapshot(
+                str(row.literature_snapshot_ref)
+            )
+            if snapshot is None or (
+                snapshot.snapshot_hash != row.literature_snapshot_hash
+                or snapshot.creation_context_kind != "manual_question_creation"
+                or snapshot.creation_context_ref != context_ref
+                or snapshot.quest_ref != row.quest_ref
+                or snapshot.request_ref != row.deepfetch_request_ref
+            ):
+                raise OwnerConflict("manual_literature_snapshot_binding_invalid")
+            try:
+                self._research_memory.ensure_question_literature_revision(
+                    question_binding=accepted_question.as_binding(),
+                    source_snapshot_binding=snapshot.as_context_binding(),
+                    idempotency_key=(
+                        "manual-question-literature:"
+                        + canonical_hash(
+                            {
+                                "question_ref": accepted_question.question_ref,
+                                "snapshot_ref": snapshot.snapshot_ref,
+                            }
+                        )
+                    ),
+                )
+            except OSError as error:
+                raise OwnerConflict("question_literature_revision_unavailable") from error
+
         with self._database.write() as connection:
             current = self._require_context(connection, context_ref)
             if current.question_ref is not None and (
@@ -3245,6 +3349,8 @@ class ManualQuestionCreation:
                 "question_content"
                 if row.content_ref is None
                 else "question_identity"
+                if row.question_ref is None
+                else "question_literature_revision"
             )
             connection.execute(
                 text(

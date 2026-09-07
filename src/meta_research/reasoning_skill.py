@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from importlib.resources import files
-import json
 from pathlib import Path
 import subprocess
 from typing import Callable, Protocol, cast
@@ -1580,61 +1579,6 @@ def _validate_reasoning_resident_channel(
             raise ReasoningSkillUnavailable(
                 "reasoning_semantic_mcp_reconciliation_unavailable"
             )
-
-
-def _verify_reasoning_semantic_trace(
-    stdout: str,
-    operation_ids: tuple[str, ...],
-) -> None:
-    observed: list[str] = []
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if (
-            not isinstance(item, dict)
-            or item.get("type") != "mcp_tool_call"
-            or item.get("server") != "meta_research"
-        ):
-            continue
-        tool = item.get("tool")
-        result = item.get("result")
-        if (
-            not isinstance(tool, str)
-            or item.get("status") not in {None, "completed", "succeeded"}
-            or isinstance(result, dict)
-            and (result.get("isError") is True or result.get("is_error") is True)
-        ):
-            raise ReasoningSkillUnavailable(
-                "reasoning_semantic_mcp_observation_failed"
-            )
-        observed.append(tool)
-    if not observed or observed[0] != _REASONING_CURRENTNESS_OPERATION_ID:
-        raise ReasoningSkillUnavailable(
-            "reasoning_semantic_mcp_currentness_unobserved"
-        )
-    required_operation_ids = tuple(
-        operation_id
-        for operation_id in operation_ids
-        if operation_id not in ROOT_AGENT_COMMON_OPERATION_IDS
-    )
-    if not set(required_operation_ids) <= set(observed):
-        raise ReasoningSkillUnavailable(
-            "reasoning_semantic_mcp_operation_unobserved"
-        )
-    first_observations = tuple(dict.fromkeys(observed))
-    if (
-        first_observations[: len(required_operation_ids)]
-        != required_operation_ids
-        or not set(first_observations) <= set(operation_ids)
-    ):
-        raise ReasoningSkillUnavailable(
-            "reasoning_semantic_mcp_observation_order_invalid"
-        )
 
 
 def _reasoning_skill_resources() -> dict[str, str]:

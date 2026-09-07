@@ -58,7 +58,16 @@ export function WritingReportWorkbench({
   const [audience, setAudience] = useState("研究负责人");
   const [purpose, setPurpose] = useState("复核当前证据、结论与未知边界");
   const [instructions, setInstructions] = useState("突出可证伪结论与局限。");
-  const [feedback, setFeedback] = useState("");
+  const [feedbackByRun, setFeedbackByRun] = useState<Record<string, string>>({});
+  const feedback = selectedRef ? feedbackByRun[selectedRef] ?? "" : "";
+  const setFeedback = (value: string) => {
+    if (selectedRef) {
+      setFeedbackByRun((current) => ({ ...current, [selectedRef]: value }));
+    }
+  };
+  const selectionEpochRef = useRef(0);
+  const selectionEpoch = selectionEpochRef.current;
+  const isCurrentSelection = () => selectionEpochRef.current === selectionEpoch;
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [comparison, setComparison] = useState<WritingComparison | null>(null);
@@ -97,7 +106,8 @@ export function WritingReportWorkbench({
     });
     setPending((current) => {
       if (current) {
-        return initial.runs.find((item) => item.intent_id === current.intent_id) ?? current;
+        const updated = initial.runs.find((item) => item.intent_id === current.intent_id) ?? current;
+        return updated.run ? null : updated;
       }
       return initial.runs.find((item) => !item.run) ?? null;
     });
@@ -217,30 +227,20 @@ export function WritingReportWorkbench({
   ) ? comparison : null;
 
   const replaceReport = (next: WritingReportView) => {
-    if (!next.run) {
-      setPending(next);
-      setSelectedRef(next.intent_id);
-      setOverview((current) => ({
-        ...current,
-        runs: [
-          next,
-          ...current.runs.filter((item) => item.intent_id !== next.intent_id),
-        ],
-      }));
-      return;
-    }
     setOverview((current) => ({
       ...current,
       runs: [
         next,
         ...current.runs.filter(
           (item) => item.intent_id !== next.intent_id
-            && item.run?.run_ref !== next.run?.run_ref,
+            && (!next.run || item.run?.run_ref !== next.run.run_ref),
         ),
       ],
     }));
-    setPending(null);
-    setSelectedRef(next.run.run_ref);
+    // A late response updates history without undoing the user's navigation.
+    if (!isCurrentSelection()) return;
+    setPending(next.run ? null : next);
+    setSelectedRef(next.run?.run_ref ?? next.intent_id);
   };
 
   const create = async (event: FormEvent) => {
@@ -262,7 +262,7 @@ export function WritingReportWorkbench({
       replaceReport(await previewWritingIntent(drafted.intent_id));
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -276,7 +276,7 @@ export function WritingReportWorkbench({
       replaceReport(await previewWritingIntent(pending.intent_id));
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -291,7 +291,7 @@ export function WritingReportWorkbench({
       replaceReport(next);
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -333,7 +333,7 @@ export function WritingReportWorkbench({
       }
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -344,9 +344,10 @@ export function WritingReportWorkbench({
     setBusy("cancel-preview");
     setError(null);
     try {
-      setCancellation(await previewWritingCancellation(selected.run.run_ref));
+      const preview = await previewWritingCancellation(selected.run.run_ref);
+      if (isCurrentSelection()) setCancellation(preview);
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -363,7 +364,7 @@ export function WritingReportWorkbench({
       setCancellation(null);
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -380,7 +381,7 @@ export function WritingReportWorkbench({
       setFeedback("");
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -399,7 +400,7 @@ export function WritingReportWorkbench({
         ),
       );
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -415,7 +416,7 @@ export function WritingReportWorkbench({
         run_ref: selected.run.run_ref,
       });
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -439,12 +440,14 @@ export function WritingReportWorkbench({
         },
         output_format: deliveryFormat || defaultDeliveryFormat,
       });
-      setDeliveryDraft(drafted);
-      setSelectedDeliveryId(drafted.intent_id);
-      setDeliveryCreatingNew(false);
+      if (isCurrentSelection()) {
+        setDeliveryDraft(drafted);
+        setSelectedDeliveryId(drafted.intent_id);
+        setDeliveryCreatingNew(false);
+      }
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -456,11 +459,13 @@ export function WritingReportWorkbench({
     setError(null);
     try {
       const previewed = await previewWritingDeliveryIntent(selectedDelivery.intent_id);
-      setDeliveryDraft(previewed);
-      setSelectedDeliveryId(previewed.intent_id);
+      if (isCurrentSelection()) {
+        setDeliveryDraft(previewed);
+        setSelectedDeliveryId(previewed.intent_id);
+      }
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
@@ -472,17 +477,20 @@ export function WritingReportWorkbench({
     setError(null);
     try {
       const confirmed = await confirmWritingDeliveryIntent(selectedDelivery);
-      setDeliveryDraft(confirmed);
-      setSelectedDeliveryId(confirmed.intent_id);
+      if (isCurrentSelection()) {
+        setDeliveryDraft(confirmed);
+        setSelectedDeliveryId(confirmed.intent_id);
+      }
       onChanged();
     } catch (caught) {
-      setError(errorCode(caught));
+      if (isCurrentSelection()) setError(errorCode(caught));
     } finally {
       setBusy(null);
     }
   };
 
   const resetDelivery = () => {
+    selectionEpochRef.current += 1;
     setDeliveryDraft(null);
     setDeliveryCreatingNew(true);
     setDeliveryPath("");
@@ -590,6 +598,8 @@ export function WritingReportWorkbench({
                   aria-pressed={(item.run?.run_ref ?? item.intent_id) === selectedRef}
                   key={item.run?.run_ref ?? item.intent_id}
                   onClick={() => {
+                    selectionEpochRef.current += 1;
+                    setError(null);
                     setSelectedRef(item.run?.run_ref ?? item.intent_id);
                     setPending(item.run ? null : item);
                     setCancellation(null);
@@ -646,7 +656,7 @@ export function WritingReportWorkbench({
                 </dl>
                 {selected.citation.status === "accepted" ? (
                   <div className="writing-feedback">
-                    <label>反馈形成 successor revision<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="写下必须修改的内容；历史版本不会被覆盖。" /></label>
+                    <label>反馈形成 successor revision<textarea value={feedback} disabled={busy !== null} onChange={(event) => setFeedback(event.target.value)} placeholder="写下必须修改的内容；历史版本不会被覆盖。" /></label>
                     <button type="button" disabled={!feedback.trim() || busy !== null} onClick={() => void revise()}>提交修订</button>
                     <a href={writingRenderUrl(selected.run.run_ref, undefined, selected.renderer.default_format)} download>
                       下载确定性 {renderFormatLabel(selected.renderer.default_format)}
@@ -692,6 +702,7 @@ export function WritingReportWorkbench({
                                 aria-pressed={!deliveryCreatingNew
                                   && selectedDelivery?.intent_id === item.intent_id}
                                 onClick={() => {
+                                  selectionEpochRef.current += 1;
                                   setDeliveryDraft(item);
                                   setSelectedDeliveryId(item.intent_id);
                                   setDeliveryCreatingNew(false);
@@ -963,7 +974,7 @@ export function WritingReportWorkbench({
         </div>
         <footer className="writing-footer" aria-live="polite">
           <span>execution ≠ deliverable acceptance ≠ citation acceptance ≠ render</span>
-          {error ? <b>{error}</b> : <small>关闭此窗口不会停止 daemon Writing Run。</small>}
+          {error ? <b>{error}</b> : <small>{busy ? "正在完成已提交的操作；你可以继续查看其他写作记录。" : "关闭此窗口不会停止 daemon Writing Run。"}</small>}
         </footer>
       </div>
     </dialog>

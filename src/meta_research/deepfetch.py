@@ -4926,50 +4926,6 @@ def _validated_turn_evidence_part(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _verified_reader_agent_refs(
-    evidence_parts: tuple[dict[str, object], ...],
-    *,
-    ledger_reader: CodexSessionLedgerReader | None = None,
-    root_session_ref: str | None = None,
-    expected_working_directory: str | None = None,
-) -> _VerifiedReaderAgentTrace:
-    spawned = [
-        cast(str, reader_ref)
-        for part in evidence_parts
-        for reader_ref in cast(list[object], part["spawned_reader_agent_refs"])
-    ]
-    terminal = [
-        cast(str, reader_ref)
-        for part in evidence_parts
-        for reader_ref in cast(list[object], part["terminal_reader_agent_refs"])
-    ]
-    if (
-        len(set(spawned)) != len(spawned)
-        or len(set(terminal)) != len(terminal)
-        or set(spawned) != set(terminal)
-    ):
-        raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
-    ledger_trace: _VerifiedReaderAgentTrace | None = None
-    if (
-        ledger_reader is not None
-        and root_session_ref is not None
-        and expected_working_directory is not None
-    ):
-        ledger_trace = _verified_codex_reader_ledger_refs(
-            ledger_reader,
-            root_session_ref=root_session_ref,
-            expected_working_directory=expected_working_directory,
-        )
-        if spawned and set(spawned) not in (
-            set(ledger_trace.refs),
-            set(ledger_trace.native_thread_refs),
-        ):
-            raise DeepFetchUnavailable("deepfetch_reader_agent_trace_invalid")
-    if ledger_trace is not None:
-        return ledger_trace
-    return _VerifiedReaderAgentTrace(tuple(spawned), "native_thread")
-
-
 def _verified_codex_reader_ledger_refs(
     reader: CodexSessionLedgerReader,
     *,

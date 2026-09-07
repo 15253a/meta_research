@@ -58,6 +58,7 @@ class AcquisitionPreflightRequest:
     library_entry_url: str
     private_state_dir: str
     previous_browser_context_ref: str | None = None
+    generation: int = 1
 
 
 @dataclass(frozen=True)

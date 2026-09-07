@@ -1816,6 +1816,25 @@
   }
 }
 
+/* Keep pending work visible at the control the user just activated. */
+.quest-close-spinner {
+  width: 17px;
+  height: 17px;
+  border: 2px solid #d8d6fa;
+  border-top-color: #625fe7;
+  border-radius: 50%;
+  animation: quest-close-turn 800ms linear infinite;
+}
+
+@keyframes quest-close-turn { to { transform: rotate(360deg); } }
+
+.quest-compose-shortcut {
+  display: block;
+  margin-top: 7px;
+  color: var(--quest-muted);
+  font-size: 11px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .quest-dialog,
   .quest-dialog::backdrop {

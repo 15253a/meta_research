@@ -11,6 +11,8 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
+import { StatusHome } from "./StatusHome";
+import { ResearchIcon, spectrumStage } from "./Spectrum";
 import {
   acknowledgeAssetIntake,
   adaptManualQuestionCreation,
@@ -77,14 +79,20 @@ import {
   TelemetryAuthorizationCard,
 } from "./HumanCollaboration";
 import "./shell.css";
+import { ResearchOverview, StageHistoryStrip, cycleOrdinalLabel, useResearchOverview } from "./ResearchOverview";
+import { StageReadableOutput, TargetCommandOutput } from "./ReadableOutput";
+import { ExperimentLogs } from "./ExperimentLogs";
+import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
+import "./research-interaction.css";
+import "./spectrum-workspace.css";
 
 const capabilityLabels: Record<string, string> = {
-  accepted_material_basis: "Research Asset",
-  first_question_deepfetch: "首问题 DeepFetch",
-  quest_creation: "创建 Quest",
-  quest_companion: "Quest Companion",
-  stage_execution: "Stage 执行",
-  writing: "Writing",
+  accepted_material_basis: "研究资料",
+  first_question_deepfetch: "文献检索",
+  quest_creation: "创建研究任务",
+  quest_companion: "研究助手",
+  stage_execution: "研究执行",
+  writing: "报告写作",
 };
 
 const ownerLabels: Record<string, string> = {
@@ -550,20 +558,22 @@ function restorableQuestCreation(
 function RailButton({
   label,
   glyph,
+  caption = label,
   active = false,
   unavailable = false,
   unavailableReason = "capability_unavailable",
   buttonRef,
-  attention = false,
+  attentionCount = 0,
   onClick,
 }: {
   label: string;
   glyph: string;
+  caption?: string;
   active?: boolean;
   unavailable?: boolean;
   unavailableReason?: string;
   buttonRef?: Ref<HTMLButtonElement>;
-  attention?: boolean;
+  attentionCount?: number;
   onClick?: () => void;
 }) {
   return (
@@ -572,29 +582,29 @@ function RailButton({
       type="button"
       className={active ? "lumen-rail-button active" : "lumen-rail-button"}
       aria-label={label}
+      aria-current={active ? "page" : undefined}
       title={unavailable
         ? `${label} · ${unavailableReason}`
-        : attention
-          ? `${label} · needs you`
+        : attentionCount > 0
+          ? `${label} · ${attentionCount} 项待处理`
           : label}
       disabled={unavailable}
       onClick={onClick}
     >
-      <span aria-hidden="true">{glyph}</span>
-      {unavailable || attention ? <i aria-hidden="true" /> : null}
+      <ResearchIcon glyph={glyph} />
+      <small aria-hidden="true">{caption}</small>
+      {attentionCount > 0 ? <i aria-label={`${attentionCount} 项待处理`}>{attentionCount}</i> : null}
     </button>
   );
 }
 
 function LumenRail({
+  activeSection,
   canCreate,
   canBrowseAssets,
   canBrowseQuestions,
-  questionsActive,
   canBrowseHistory,
-  historyActive,
   canBrowseWriting,
-  writingOpen,
   questionUnavailableReason,
   questionButtonRef,
   historyButtonRef,
@@ -603,28 +613,24 @@ function LumenRail({
   onBrowseHistory,
   canBrowseHumanRequests,
   humanRequestCount,
-  humanRequestsOpen,
   onCreate,
   onBrowseAssets,
   onBrowseWriting,
   onBrowseHumanRequests,
   onOverview,
 }: {
+  activeSection: "overview" | "questions" | "assets" | "writing" | "history" | "requests" | "creation";
   canCreate: boolean;
   canBrowseAssets: boolean;
   canBrowseQuestions: boolean;
-  questionsActive: boolean;
   canBrowseHistory: boolean;
-  historyActive: boolean;
   canBrowseWriting: boolean;
-  writingOpen: boolean;
   questionUnavailableReason: string;
   questionButtonRef: Ref<HTMLButtonElement>;
   historyButtonRef: Ref<HTMLButtonElement>;
   writingButtonRef: Ref<HTMLButtonElement>;
   canBrowseHumanRequests: boolean;
   humanRequestCount: number;
-  humanRequestsOpen: boolean;
   onCreate: () => void;
   onBrowseAssets: () => void;
   onBrowseWriting: () => void;
@@ -636,15 +642,16 @@ function LumenRail({
   return (
     <nav className="lumen-rail" aria-label="主导航" data-shell-region="rail">
       <RailButton
-        label="Quest 总览"
+        label="研究总览"
+        caption="总览"
         glyph="⌂"
-        active={!questionsActive && !writingOpen}
+        active={activeSection === "overview"}
         onClick={onOverview}
       />
       <RailButton
         label="问题树"
         glyph="树"
-        active={questionsActive && !historyActive}
+        active={activeSection === "questions"}
         unavailable={!canBrowseQuestions}
         unavailableReason={questionUnavailableReason}
         buttonRef={questionButtonRef}
@@ -652,6 +659,7 @@ function LumenRail({
       />
       <RailButton
         label="研究资料"
+        active={activeSection === "assets"}
         glyph="▤"
         unavailable={!canBrowseAssets}
         onClick={onBrowseAssets}
@@ -659,7 +667,7 @@ function LumenRail({
       <RailButton
         label="写作"
         glyph="✎"
-        active={writingOpen}
+        active={activeSection === "writing"}
         unavailable={!canBrowseWriting}
         buttonRef={writingButtonRef}
         onClick={onBrowseWriting}
@@ -667,7 +675,7 @@ function LumenRail({
       <RailButton
         label="历史"
         glyph="↺"
-        active={historyActive}
+        active={activeSection === "history"}
         unavailable={!canBrowseHistory}
         unavailableReason="当前 Quest 没有可下钻的已接纳 Question"
         buttonRef={historyButtonRef}
@@ -676,19 +684,19 @@ function LumenRail({
       <RailButton
         label="需要你"
         glyph="!"
-        active={humanRequestsOpen}
+        active={activeSection === "requests"}
         unavailable={!canBrowseHumanRequests}
-        attention={humanRequestCount > 0}
+        attentionCount={humanRequestCount}
         onClick={onBrowseHumanRequests}
       />
       <RailButton
-        label="创建 Quest"
+        label="创建研究任务"
+        active={activeSection === "creation"}
+        caption="新建任务"
         glyph="＋"
         unavailable={!canCreate}
         onClick={onCreate}
       />
-      <span className="lumen-rail-spacer" aria-hidden="true" />
-      <RailButton label="用户入口" glyph="M" unavailable />
     </nav>
   );
 }
@@ -896,10 +904,10 @@ function stagePositionCopy(state: StagePositionState): string {
   return {
     current: "当前研究位置",
     result: "已有正式结果",
-    skipped: "本 Cycle 明确跳过",
+    skipped: "本轮明确跳过",
     recorded: "已有运行记录",
-    "not-entered": "本 Cycle 尚未进入",
-    "no-record": "本 Cycle 没有记录",
+    "not-entered": "本轮尚未进入",
+    "no-record": "本轮没有记录",
     unavailable: "事实暂不可用",
   }[state];
 }
@@ -1142,11 +1150,11 @@ type ResearchActivityItem = {
 };
 
 const managedActivityKinds = {
-  idea_stage: { lane: "stage", label: "Idea 阶段主智能体" },
-  plan_stage: { lane: "stage", label: "Plan 阶段主智能体" },
-  bundle_stage: { lane: "bundle", label: "Bundle 策略主智能体" },
-  reasoning_stage: { lane: "stage", label: "Reasoning 阶段主智能体" },
-  deepfetch: { lane: "acquisition", label: "DeepFetch 文献检索" },
+  idea_stage: { lane: "stage", label: "研究思路" },
+  plan_stage: { lane: "stage", label: "验证计划" },
+  bundle_stage: { lane: "bundle", label: "实验策略" },
+  reasoning_stage: { lane: "stage", label: "研究判断" },
+  deepfetch: { lane: "acquisition", label: "文献检索" },
   acquisition: { lane: "acquisition", label: "资料获取任务" },
 } as const;
 
@@ -1261,19 +1269,36 @@ function validateStageRawOutputPage(
   }
 }
 
+type OutputChunk = { offset: number; text: string };
+function collectOutputPages(chunks: OutputChunk[], next: {offset: number; text: string}, reset: boolean): OutputChunk[] {
+  const result = reset ? [next] : [...chunks.filter(chunk => chunk.offset < next.offset), next];
+  let bytes = result.reduce((total, chunk) => total + new TextEncoder().encode(chunk.text).length, 0);
+  while (bytes > 8 * 1024 * 1024 && result.length > 1) {
+    bytes -= new TextEncoder().encode(result.shift()!.text).length;
+  }
+  return result;
+}
+
 function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
-  const [expanded, setExpanded] = useState(false);
+  const [selectedPhase, setSelectedPhase] = useState<"current" | "primary" | "review">("current");
+  const [followLive, setFollowLive] = useState(true);
+  const expanded = true;
+  const [chunks, setChunks] = useState<OutputChunk[]>([]);
   const [terminal, setTerminal] = useState<StageRawOutputPage | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [previousOffsets, setPreviousOffsets] = useState<number[]>([]);
   const [retryEpoch, setRetryEpoch] = useState(0);
+  const [executionClock, setExecutionClock] = useState<ExecutionClockSample | null>(null);
+  const [previousOutput, setPreviousOutput] = useState<{ page: StageRawOutputPage; chunks: OutputChunk[] } | null>(null);
   const [documentVisible, setDocumentVisible] = useState(
     () => document.visibilityState !== "hidden",
   );
   const terminalRef = useRef<StageRawOutputPage | null>(null);
+  const chunksRef = useRef<OutputChunk[]>([]);
+  const failuresRef = useRef(0);
   const activeRequest = useRef<AbortController | null>(null);
-  const logRef = useRef<HTMLPreElement | null>(null);
+  const logRef = useRef<HTMLDivElement | null>(null);
 
   const load = useCallback(async (
     after: number,
@@ -1283,7 +1308,12 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
     const controller = new AbortController();
     activeRequest.current = controller;
     const current = terminalRef.current;
-    setLoading(current === null || direction !== "refresh");
+    setLoading(true);
+    let timedOut = false;
+    const deadline = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 8_000);
     try {
       let next: StageRawOutputPage;
       try {
@@ -1291,6 +1321,7 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
           after,
           limit: stageRawOutputPageSize,
           signal: controller.signal,
+          phase: selectedPhase === "current" ? undefined : selectedPhase,
         });
       } catch (caught) {
         if (
@@ -1304,6 +1335,7 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
           after,
           limit: stageRawOutputPageSize,
           signal: controller.signal,
+          phase: selectedPhase === "current" ? undefined : selectedPhase,
         });
       }
       if (current && next.stream_ref !== current.stream_ref) {
@@ -1313,12 +1345,16 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
             after,
             limit: stageRawOutputPageSize,
             signal: controller.signal,
+            phase: selectedPhase === "current" ? undefined : selectedPhase,
           });
         }
         direction = "reset";
       }
       validateStageRawOutputPage(next, item.ref, after);
       if (controller.signal.aborted) return;
+      if (current && next.stream_ref !== current.stream_ref && chunksRef.current.some(chunk => chunk.text)) {
+        setPreviousOutput({ page: current, chunks: chunksRef.current });
+      }
       if (direction === "next" && current) {
         setPreviousOffsets((offsets) => [...offsets, current.offset]);
       } else if (direction === "previous") {
@@ -1326,21 +1362,38 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
       } else if (direction === "reset") {
         setPreviousOffsets([]);
       }
+      const collected = collectOutputPages(chunksRef.current, next, direction === "reset" || direction === "previous");
+      chunksRef.current = collected;
+      setChunks(collected);
       terminalRef.current = next;
       setTerminal(next);
+      const observedAt = next.observed_at;
+      const sourceUpdatedAt = next.source_updated_at;
+      if (typeof observedAt === "number" && Number.isFinite(observedAt) && observedAt > 0) {
+        setExecutionClock(previous => {
+          const source = typeof sourceUpdatedAt === "number" && Number.isFinite(sourceUpdatedAt) && sourceUpdatedAt > 0
+            ? Math.max(sourceUpdatedAt, previous?.sourceUpdatedAt ?? 0) : previous?.sourceUpdatedAt;
+          // A delayed poll must not rewind a clock already ticking for this record.
+          if (previous && source === previous.sourceUpdatedAt) return previous;
+          return source === undefined ? null : { sourceUpdatedAt: source, observedAt, receivedAt: performance.now() };
+        });
+      }
+      failuresRef.current = 0;
       setError(null);
     } catch (caught) {
-      if ((caught as Error).name === "AbortError") return;
-      setError(caught instanceof ProductError
+      if (controller.signal.aborted && !timedOut) return;
+      failuresRef.current += 1;
+      setError(timedOut ? "stage_raw_output_timeout" : caught instanceof ProductError
         ? caught.code
         : "stage_raw_output_unavailable");
     } finally {
+      window.clearTimeout(deadline);
       if (activeRequest.current === controller) {
         activeRequest.current = null;
         setLoading(false);
       }
     }
-  }, [item.ref]);
+  }, [item.ref, selectedPhase]);
 
   useEffect(() => {
     const handleVisibility = () => {
@@ -1354,10 +1407,19 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
     activeRequest.current?.abort();
     activeRequest.current = null;
     terminalRef.current = null;
+    chunksRef.current = [];
+    failuresRef.current = 0;
     setTerminal(null);
+    setChunks([]);
+    setPreviousOutput(null);
+    setFollowLive(true);
     setPreviousOffsets([]);
     setError(null);
-  }, [item.ref]);
+    return () => {
+      activeRequest.current?.abort();
+      activeRequest.current = null;
+    };
+  }, [item.ref, selectedPhase]);
 
   useEffect(() => {
     if (!expanded || !documentVisible) {
@@ -1367,87 +1429,85 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
       return;
     }
     const current = terminalRef.current;
-    void load(current?.offset ?? 0, current ? "refresh" : "reset");
-  }, [documentVisible, expanded, load, retryEpoch]);
+    if (followLive || !current) void load(current?.offset ?? 0, current ? "refresh" : "reset");
+  }, [documentVisible, expanded, followLive, load, retryEpoch, item.status, item.updatedAt]);
 
   useEffect(() => {
     if (
       !expanded
       || !documentVisible
+      || !followLive
       || loading
-      || terminal?.has_more
-      || !(terminal?.status === "live" || terminal?.status === "waiting")
     ) return;
     const timer = window.setTimeout(() => {
       const current = terminalRef.current;
-      void load(current?.offset ?? 0, current ? "refresh" : "reset");
-    }, stageRawOutputPollMilliseconds);
+      if (current?.has_more && current.next_offset > current.offset) {
+        void load(current.next_offset, "next");
+      } else {
+        void load(current?.offset ?? 0, current ? "refresh" : "reset");
+      }
+    }, error ? Math.min(10_000, stageRawOutputPollMilliseconds * 2 ** Math.min(4, failuresRef.current - 1))
+      : terminal?.has_more ? 150 : terminal?.status === "terminal" || terminal?.status === "replaced" ? 3_000
+        : stageRawOutputPollMilliseconds);
     return () => window.clearTimeout(timer);
-  }, [documentVisible, expanded, load, loading, terminal]);
+  }, [documentVisible, error, expanded, followLive, load, loading, terminal]);
 
   const atHead = Boolean(terminal?.source_caught_up && !terminal.has_more);
+  const phaseLabel = terminal?.phase === "review" ? "审查"
+    : terminal?.phase === "primary" ? "主任务"
+      : terminal?.phase === "autonomous-resume" ? "审查后续处理"
+        : terminal?.phase?.startsWith("target-batch-") ? `第 ${terminal.phase.slice(13)} 批实验调度`
+          : terminal?.phase?.startsWith("dispatch-") ? `第 ${terminal.phase.slice(9)} 次调度`
+            : terminal?.phase ?? (selectedPhase === "review" ? "审查与后续" : selectedPhase === "primary" ? "主任务" : "当前任务");
   useEffect(() => {
-    if (atHead && logRef.current) {
+    if (followLive && atHead && logRef.current) {
       logRef.current.scrollTop = logRef.current.scrollHeight;
     }
-  }, [atHead, terminal?.text]);
+  }, [atHead, followLive, terminal?.text]);
 
   return (
-    <details
-      className="lumen-stage-root-observations"
-      data-testid={`stage-root-observations-${item.ref}`}
-      onToggle={(event) => setExpanded(event.currentTarget.open)}
-    >
-      <summary>查看原始 Provider stdout</summary>
-      <div>
-        <p>私有输出 · 原始 JSONL 会按写入顺序持续刷新，可能包含敏感信息。</p>
-        {loading && terminal === null ? <p>正在连接 stdout…</p> : null}
-        {error ? (
-          <p className="lumen-stage-root-observation-error" role="alert">
-            原始 stdout 暂不可读 · <code>{error}</code>
-            <button type="button" onClick={() => setRetryEpoch((value) => value + 1)}>
-              重试
-            </button>
-          </p>
-        ) : null}
-        {terminal?.text ? (
-          <pre
-            ref={logRef}
-            className="lumen-stage-root-observation-log"
-            role="log"
-            aria-live="off"
-            aria-label={`${item.label} 原始 Provider stdout`}
-          >{terminal.text}</pre>
-        ) : null}
-        {terminal && !terminal.text && !error ? (
-          <p>当前 stdout 尚无字节；只要该 Provider turn 仍在运行，这里会继续刷新。</p>
-        ) : null}
-        {terminal ? (
-          <footer>
-            <small>
-              {atHead ? "已追到当前 stdout" : "还有后续页"}
-              {` · ${terminal.next_offset} / ${terminal.source_bytes} bytes`}
-            </small>
-            <nav aria-label="Stage 原始 stdout 分页">
-              <button
-                type="button"
-                disabled={loading || previousOffsets.length === 0}
-                onClick={() => {
-                  const previous = previousOffsets.at(-1);
-                  if (previous !== undefined) void load(previous, "previous");
-                }}
-              >返回上一页</button>
-              <code>{terminal.offset}–{terminal.next_offset}</code>
-              <button
-                type="button"
-                disabled={loading || !terminal.has_more}
-                onClick={() => void load(terminal.next_offset, "next")}
-              >读取下一页</button>
-            </nav>
-          </footer>
-        ) : null}
+    <section className="research-conversation" data-testid={`stage-root-observations-${item.ref}`}>
+      <header className="research-output-toolbar">
+        <div role="group" aria-label="选择输出">
+          {([['current', '当前输出'], ['primary', '主任务输出'], ['review', '审查输出']] as const).map(([phase, label]) => (
+            <button key={phase} type="button" aria-pressed={selectedPhase === phase}
+              onClick={() => setSelectedPhase(phase)}>{phase === "review" && item.source === "bundle_stage" ? "审查与调度" : label}</button>
+          ))}
+        </div>
+        <span>{activityStatusCopy(item.status)}</span>
+      </header>
+      <div className="research-output-context">
+        <div className="research-output-meta">
+          <span>{phaseLabel} · {error ? "读取中断 · 自动重试" : terminal?.status === "terminal" ? "本次输出结束" : terminal?.status === "replaced" ? "本次输出已替换" : loading && !terminal ? "正在读取" : "按实际记录更新"}</span>
+          <ExecutionElapsed sample={executionClock} />
+        </div>
+        <details><summary>来源</summary><p>运行 {item.ref}</p><p>执行 {terminal?.operation_ref ?? "等待绑定"}</p><p>流 {terminal?.stream_ref ?? "等待记录"}</p></details>
       </div>
-    </details>
+      <div className="research-conversation-scroll" role="log" aria-live="off" aria-label={`${item.label} 对话输出`}>
+        {loading && !terminal ? <p className="research-output-empty">正在读取主智能体的工作记录…</p> : null}
+        {error ? <div className="research-output-error" role="status">工作记录暂时无法读取，已保留上次内容。{followLive ? "正在自动重试。" : "继续跟随后会自动重试。"}<button onClick={() => { setFollowLive(true); setRetryEpoch(value => value + 1); }}>立即重试</button><details><summary>错误详情</summary><code>{error}</code></details></div> : null}
+        {terminal && chunks.some(chunk => chunk.text) ? <div data-testid="stage-current-output"><StageReadableOutput rawText={terminal.text} chunks={chunks} startOffset={terminal.offset}
+          streamKey={terminal.stream_ref} rootNativeSessionRef={terminal.native_session_ref}
+          isTerminal={terminal.status === "terminal"} scrollRef={logRef} followLive={followLive} onPauseFollow={() => setFollowLive(false)} /></div> : null}
+        {terminal && !chunks.some(chunk => chunk.text) && !error ? <p className="research-output-empty">{terminal.status === "terminal" ? "这次执行没有留下公开输出。" : previousOutput ? "新的执行已切换，等待新记录；上一次输出保留在下方。" : "等待主智能体发布工作记录，系统会自动检查更新。"}</p> : null}
+        {previousOutput ? <details className="research-previous-output" data-testid="stage-previous-output" open={!terminal?.source_bytes}>
+          <summary>上一次执行的输出 · {previousOutput.page.phase ?? "工作记录"}</summary>
+          <p>执行 <code>{previousOutput.page.operation_ref}</code></p>
+          <StageReadableOutput rawText={previousOutput.page.text} chunks={previousOutput.chunks}
+            startOffset={previousOutput.page.offset} streamKey={previousOutput.page.stream_ref}
+            rootNativeSessionRef={previousOutput.page.native_session_ref} isTerminal={previousOutput.page.status === "terminal"} />
+        </details> : null}
+      </div>
+      <footer className="research-output-footer">
+        <button type="button" aria-pressed={followLive} onClick={() => setFollowLive(value => !value)}>{followLive ? "跟随最新 ✓" : "继续跟随 ↓"}</button>
+        <span>{!followLive ? "已暂停跟随，可以安心回看" : error ? "连接恢复后会自动补读" : terminal?.status === "terminal" ? "本次输出结束，继续检查后续执行" : atHead ? "已显示当前记录" : "正在读取后续记录"}</span>
+        {terminal ? <details><summary>记录分页</summary><nav aria-label="Stage 原始 stdout 分页">
+          <button disabled={loading || !previousOffsets.length} onClick={() => { setFollowLive(false); const previous = previousOffsets.at(-1); if (previous !== undefined) void load(previous, "previous"); }}>返回上一页</button>
+          <code>{chunks[0]?.offset ?? terminal.offset}–{terminal.next_offset} / {terminal.source_bytes} bytes</code>
+          <button disabled={loading || !terminal.has_more} onClick={() => {setFollowLive(false); void load(terminal.next_offset, "next");}}>读取下一页</button>
+        </nav></details> : null}
+      </footer>
+    </section>
   );
 }
 
@@ -1521,150 +1581,49 @@ function ResearchActivityLane({
   );
 }
 
-function ResearchTracePanel({
-  snapshot,
-  latestActivity,
-  observedSince,
-  connected,
-}: {
-  snapshot: PublicSnapshot;
-  latestActivity: ResearchActivitySignal | null;
-  observedSince: number;
-  connected: boolean;
-}) {
+function ActivityElapsed({ observedAt }: { observedAt: number }) {
   const [clock, setClock] = useState(() => Date.now());
-  const stage = currentStageSurface(snapshot);
-  const work = researchWorkCopy(stage);
-  const product = researchProductCopy(stage);
-  const lastObservedAt = latestActivity?.observedAt ?? observedSince;
-  const foreground = snapshot.research_control.foreground;
-  const scopedRuns = foreground
-    ? snapshot.research_control.managed_runs.filter((run) => (
-        run.quest_ref === foreground.quest_ref
-        && run.cycle_ref === foreground.cycle_ref
-      ))
-    : [];
-  const managedActivity = scopedRuns
-    .map(managedRunActivity)
-    .filter((item): item is ResearchActivityItem => item !== null);
-  const foregroundPosition = foreground?.stage.toLowerCase() as StagePosition | undefined;
-  const foregroundRunKind = foregroundPosition
-    ? stageManagedRunKinds[foregroundPosition]
-    : undefined;
-  const currentStageRuns = managedActivity.filter(
-    (item) => item.source === foregroundRunKind,
-  );
-  const acquisitionRuns = managedActivity.filter((item) => item.lane === "acquisition");
-  const bundleStrategyRuns = managedActivity.filter((item) => item.lane === "bundle");
-  const bundleSurface = allStageSurfaces(snapshot).find(
-    (candidate) => candidate.kind === "Bundle",
-  );
-  const targetRuns = bundleSurface?.kind === "Bundle"
-    ? bundleSurface.projection.target_graph.targets.map(targetActivity)
-    : [];
-  const bundleIsCurrentStage = foregroundRunKind === "bundle_stage";
-  const sortActivity = (left: ResearchActivityItem, right: ResearchActivityItem) => (
-    (right.updatedAt ?? -1) - (left.updatedAt ?? -1)
-    || left.ref.localeCompare(right.ref)
-  );
-  currentStageRuns.sort(sortActivity);
-  acquisitionRuns.sort(sortActivity);
-  bundleStrategyRuns.sort(sortActivity);
-  targetRuns.sort(sortActivity);
-
   useEffect(() => {
-    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
+    let timer: number | undefined;
+    const updateVisibility = () => {
+      window.clearInterval(timer);
+      if (document.visibilityState === "hidden") return;
+      setClock(Date.now());
+      timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    };
+    updateVisibility();
+    document.addEventListener("visibilitychange", updateVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", updateVisibility);
+    };
   }, []);
+  return <b>{elapsedCopy(clock - observedAt)}</b>;
+}
 
-  return (
-    <section
-      className="lumen-research-trace"
-      aria-labelledby="research-trace-title"
-      data-work-state={work.state}
-    >
-      <header>
-        <div>
-          <small>RESEARCH TRACE · 真实事件，不估算百分比</small>
-          <h2 id="research-trace-title">研究正在发生</h2>
-        </div>
-        <span className="lumen-trace-live" data-connected={connected ? "true" : "false"}>
-          <i aria-hidden="true" />
-          {connected ? "持续观察中" : "等待重新连接"}
-        </span>
-      </header>
-      <div className="lumen-trace-line" role="list" aria-label="当前研究轨迹">
-        <article role="listitem" data-trace-kind="agent">
-          <span aria-hidden="true">根</span>
-          <div><small>根 Agent 正在做什么</small><b>{work.title}</b><p>{work.detail}</p></div>
-        </article>
-        <article role="listitem" data-trace-kind="activity">
-          <span aria-hidden="true">脉</span>
-          <div>
-            <small>最近真实活动</small>
-            <b>{latestActivity
-              ? researchEventCopy(latestActivity.eventType)
-              : "本页尚未观察到新的运行事件"}</b>
-            <p>{latestActivity
-              ? `于 ${new Date(latestActivity.observedAt).toLocaleTimeString()} 被本页观察到。`
-              : "已载入当前事实；静默不等于根 Agent 已停止。"}</p>
-          </div>
-        </article>
-        <article role="listitem" data-trace-kind="product">
-          <span aria-hidden="true">稿</span>
-          <div><small>已经形成的研究产物</small><b>{product.title}</b><p>{product.detail}</p></div>
-        </article>
-        <article role="listitem" data-trace-kind="silence">
-          <span aria-hidden="true">静</span>
-          <div>
-            <small>距最近一次本页可观察活动</small>
-            <b>{elapsedCopy(clock - lastObservedAt)}</b>
-            <p>这是可观察静默时长，不是超时、失败或剩余时间。</p>
-          </div>
-        </article>
-      </div>
-      <section className="lumen-activity-sources" aria-label="研究活动来源">
-        <header>
-          <b>按来源查看研究活动</b>
-          <small>各来源保留自己的边界，不建立跨来源总顺序</small>
-        </header>
-        <div>
-          <ResearchActivityLane
-            name={bundleIsCurrentStage
-              ? "Bundle 策略（当前 Stage 主智能体）"
-              : "Stage 主智能体"}
-            items={currentStageRuns}
-            emptyCopy="当前 Stage 暂无托管运行记录。"
-            enableStageRootObservations
-          />
-          <ResearchActivityLane
-            name="资料获取"
-            items={acquisitionRuns}
-            emptyCopy="DeepFetch / Acquisition 暂无托管运行记录。"
-          />
-          {!bundleIsCurrentStage ? (
-            <ResearchActivityLane
-              name="Bundle 策略"
-              items={bundleStrategyRuns}
-              emptyCopy="当前 Cycle 暂无 Bundle 策略托管运行记录。"
-            />
-          ) : null}
-          <ResearchActivityLane
-            name="实验任务"
-            items={targetRuns}
-            emptyCopy="当前 Cycle 暂无 Target 托管运行记录。"
-          />
-        </div>
-      </section>
-      <details className="lumen-trace-technical">
-        <summary>查看系统核验细节</summary>
-        <ReturnSummary snapshot={snapshot} />
-        {latestActivity ? (
-          <code>{latestActivity.eventType} · revision {latestActivity.revision}</code>
-        ) : null}
-      </details>
-    </section>
-  );
+function ResearchTracePanel({snapshot, connected}: {
+  snapshot: PublicSnapshot; latestActivity: ResearchActivitySignal | null; observedSince: number; connected: boolean;
+}) {
+  const foreground = snapshot.research_control.foreground;
+  const [selectedRef, setSelectedRef] = useState<string | null>(null);
+  const items = snapshot.research_control.managed_runs
+    .filter(run => run.quest_ref === foreground?.quest_ref && run.cycle_ref === foreground?.cycle_ref)
+    .map(managedRunActivity).filter((item): item is ResearchActivityItem => item !== null)
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || a.ref.localeCompare(b.ref));
+  const currentKind = stageManagedRunKinds[foreground?.stage.toLowerCase() as StagePosition];
+  const current = items.find(item => item.source === currentKind) ?? null;
+  const selected = items.find(item => item.ref === selectedRef) ?? current;
+  useEffect(() => setSelectedRef(null), [foreground?.cycle_ref, foreground?.stage]);
+  return <section className="research-flow" id="research-activity" tabIndex={-1} aria-labelledby="research-trace-title">
+    <header className="research-flow-heading">
+      <h2 id="research-trace-title">研究过程</h2>
+    {items.length > 1 ? <label className="research-source-picker">查看记录 <select aria-label="研究记录来源" value={selected?.ref ?? ""} onChange={event => setSelectedRef(event.currentTarget.value)}>
+      {items.map(item => <option key={item.ref} value={item.ref}>{item.ref === current?.ref ? "当前 · " : ""}{item.label} · {activityStatusCopy(item.status)}</option>)}
+    </select>{selected?.ref !== current?.ref ? <button onClick={() => setSelectedRef(null)}>返回当前工作 ↗</button> : null}</label> : null}
+      <span className="research-connection" data-connected={connected}><i />{connected ? "实时连接" : "连接中断 · 保留上次记录"}</span>
+    </header>
+    {selected ? <StageRawOutputFeed key={selected.ref} item={selected} /> : <p className="research-output-empty">本阶段还没有公开的主智能体记录。产生后会自动显示在这里。</p>}
+  </section>;
 }
 
 function CurrentCycleOverview({ snapshot }: { snapshot: PublicSnapshot }) {
@@ -1692,14 +1651,16 @@ function CurrentCycleOverview({ snapshot }: { snapshot: PublicSnapshot }) {
       data-cycle-ref={foreground.cycle_ref}
       data-question-ref={foreground.question_ref}
     >
-      <p className="lumen-eyebrow">当前 Cycle · 可信研究现场</p>
+      <p className="lumen-eyebrow">当前攻克 · 本轮研究</p>
       <h1 id="workspace-title">
         {question?.title ?? question?.unknown_statement ?? "当前研究问题"}<br />
         <em>{currentPurpose}</em>
       </h1>
-      <p>
-        当前攻克 <b>{foreground.question_ref}</b> · Cycle <b>{foreground.cycle_ref}</b>
-      </p>
+      <p>围绕同一个研究问题展开；以下四类工作按实际需要进入或跳过。</p>
+      <details className="lumen-cycle-identity">
+        <summary>查看本轮研究标识</summary>
+        <p>Question <code>{foreground.question_ref}</code> · Cycle <code>{foreground.cycle_ref}</code></p>
+      </details>
       <ol
         className="lumen-cycle-stage-map"
         aria-label="当前 Cycle 的四个可能 Stage"
@@ -1719,7 +1680,7 @@ function CurrentCycleOverview({ snapshot }: { snapshot: PublicSnapshot }) {
               data-stage-state={state}
               data-cycle-ref={foreground.cycle_ref}
             >
-              <small>{kind} · 可能位置</small>
+              <small>{kind}</small>
               <b>{stagePositionCopy(state)}</b>
               <span>{purpose}</span>
               {surface ? (
@@ -1744,8 +1705,7 @@ function CurrentCycleOverview({ snapshot }: { snapshot: PublicSnapshot }) {
 function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
   const ready = snapshot.readiness.status === "ready";
   const empty = snapshot.research_space.status === "empty";
-  const creation = snapshot.quest_creation.current;
-  const stageSurface = currentStageSurface(snapshot);
+  const creation = restorableQuestCreation(snapshot.quest_creation.current, null);
 
   if (!ready) {
     const failedChecks = snapshot.readiness.checks
@@ -1777,12 +1737,12 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
         <h1 id="workspace-title">
           {creation ? "第一个研究任务正在形成。" : "这里还没有研究任务。"}
           <br />
-          <em>{creation ? "从同一个草案继续。" : "从一个清楚的问题开始。"}</em>
+          <em>{creation ? "从同一个草案继续。" : "从一个问题开始。"}</em>
         </h1>
         <p>
           {creation
-            ? "当前草案已经保存；使用左侧 ＋ 回到连续创建窗口。"
-            : "使用左侧固定的 ＋ 创建入口，设定目标并决定第一个研究问题。"}
+            ? "草案已自动保存，可以继续完善研究目标与第一个问题。"
+            : "设定研究目标，提供已有线索，让研究从第一个问题展开。"}
         </p>
         <div className="lumen-inline-state ready" role="status">
           <span aria-hidden="true">✓</span>
@@ -1800,42 +1760,6 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
     && snapshot.research_control.foreground
   ) {
     return <CurrentCycleOverview snapshot={snapshot} />;
-  }
-
-  if (stageSurface?.kind === "Reasoning") {
-    return (
-      <ReasoningStageHero
-        reasoningStage={stageSurface.projection}
-        question={reasoningQuestion(stageSurface.projection, snapshot)}
-      />
-    );
-  }
-
-  if (stageSurface?.kind === "Bundle") {
-    return (
-      <BundleStageHero
-        bundleStage={stageSurface.projection}
-        question={bundleQuestion(stageSurface.projection, snapshot)}
-      />
-    );
-  }
-
-  if (stageSurface?.kind === "Plan") {
-    return (
-      <PlanStageHero
-        planStage={stageSurface.projection}
-        question={planQuestion(stageSurface.projection, snapshot)}
-      />
-    );
-  }
-
-  if (stageSurface?.kind === "Idea") {
-    return (
-      <IdeaStageHero
-        ideaStage={stageSurface.projection}
-        question={ideaQuestion(stageSurface.projection, snapshot)}
-      />
-    );
   }
 
   return (
@@ -1892,121 +1816,19 @@ function currentIdeaStageState(ideaStage: IdeaStageProjection): IdeaStageState {
   return "eligibility";
 }
 
-function ideaQuestion(
-  ideaStage: IdeaStageProjection,
+function stageQuestion(
+  stage: CurrentStageSurface["projection"],
   snapshot?: PublicSnapshot,
 ): IdeaQuestionSummary {
   const creation = snapshot?.quest_creation.current;
   return {
     quest_ref: creation?.quest_ref,
-    question_ref: ideaStage.eligibility.question_ref ?? creation?.question_ref,
+    question_ref: stage.eligibility.question_ref ?? creation?.question_ref,
     graph_revision: snapshot?.owners.research_graph?.revision,
     ...(creation?.proposal?.content ?? {}),
-    ...(ideaStage.stage_run_request?.accepted_question_binding ?? {}),
+    ...(stage.stage_run_request?.accepted_question_binding ?? {}),
     ...(snapshot?.research_space.current_question ?? {}),
   };
-}
-
-function planQuestion(
-  planStage: PlanStageProjection,
-  snapshot?: PublicSnapshot,
-): IdeaQuestionSummary {
-  const creation = snapshot?.quest_creation.current;
-  return {
-    quest_ref: creation?.quest_ref,
-    question_ref: planStage.eligibility.question_ref ?? creation?.question_ref,
-    graph_revision: snapshot?.owners.research_graph?.revision,
-    ...(creation?.proposal?.content ?? {}),
-    ...(planStage.stage_run_request?.accepted_question_binding ?? {}),
-    ...(snapshot?.research_space.current_question ?? {}),
-  };
-}
-
-function bundleQuestion(
-  bundleStage: BundleStageProjection,
-  snapshot?: PublicSnapshot,
-): IdeaQuestionSummary {
-  const creation = snapshot?.quest_creation.current;
-  return {
-    quest_ref: creation?.quest_ref,
-    question_ref: bundleStage.eligibility.question_ref ?? creation?.question_ref,
-    graph_revision: snapshot?.owners.research_graph?.revision,
-    ...(creation?.proposal?.content ?? {}),
-    ...(bundleStage.stage_run_request?.accepted_question_binding ?? {}),
-    ...(snapshot?.research_space.current_question ?? {}),
-  };
-}
-
-function reasoningQuestion(
-  reasoningStage: ReasoningStageProjection,
-  snapshot?: PublicSnapshot,
-): IdeaQuestionSummary {
-  const creation = snapshot?.quest_creation.current;
-  return {
-    quest_ref: creation?.quest_ref,
-    question_ref: reasoningStage.eligibility.question_ref
-      ?? creation?.question_ref,
-    graph_revision: snapshot?.owners.research_graph?.revision,
-    ...(creation?.proposal?.content ?? {}),
-    ...(reasoningStage.stage_run_request?.accepted_question_binding ?? {}),
-    ...(snapshot?.research_space.current_question ?? {}),
-  };
-}
-
-function ResearchStageHero({
-  question,
-  stage,
-  committed,
-}: {
-  question: IdeaQuestionSummary;
-  stage: CurrentStageSurface["kind"];
-  committed: boolean;
-}) {
-  const activity = stage === "Idea"
-    ? "形成候选解释"
-    : stage === "Plan"
-      ? "设计验证路线"
-      : stage === "Bundle"
-        ? "运行实验并收集证据"
-        : "综合证据并形成判断";
-  return (
-    <>
-      <p className="lumen-eyebrow">ROOT AGENT · 研究现场</p>
-      <h1 id="workspace-title">
-        {committed ? "一段真实研究已经收口。" : "根 Agent 正在工作。"}<br />
-        <em>{committed ? "产物已保存，等待下一段研究。" : activity}</em>
-      </h1>
-      <p>{question.unknown_statement ?? question.title ?? "当前研究问题正在被持续推进。"}</p>
-    </>
-  );
-}
-
-function IdeaStageHero({ ideaStage, question }: {
-  ideaStage: IdeaStageProjection;
-  question: IdeaQuestionSummary;
-}) {
-  return <ResearchStageHero stage="Idea" question={question} committed={Boolean(ideaStage.stage_commit)} />;
-}
-
-function PlanStageHero({ planStage, question }: {
-  planStage: PlanStageProjection;
-  question: IdeaQuestionSummary;
-}) {
-  return <ResearchStageHero stage="Plan" question={question} committed={Boolean(planStage.stage_commit)} />;
-}
-
-function BundleStageHero({ bundleStage, question }: {
-  bundleStage: BundleStageProjection;
-  question: IdeaQuestionSummary;
-}) {
-  return <ResearchStageHero stage="Bundle" question={question} committed={Boolean(bundleStage.stage_commit)} />;
-}
-
-function ReasoningStageHero({ reasoningStage, question }: {
-  reasoningStage: ReasoningStageProjection;
-  question: IdeaQuestionSummary;
-}) {
-  return <ResearchStageHero stage="Reasoning" question={question} committed={Boolean(reasoningStage.stage_commit)} />;
 }
 
 function CurrentQuestionCard({
@@ -2031,13 +1853,6 @@ function CurrentQuestionCard({
           {graphRevision === undefined ? "已同步" : `已同步 · 版本 ${graphRevision}`}
         </small>
       </header>
-      <div className="lumen-question-path" aria-label="当前研究问题与根 Agent 工作路径">
-        <span className="quest"><small>研究空间</small><b>{question.quest_ref ?? "当前"}</b></span>
-        <i aria-hidden="true" />
-        <span className="question"><small>研究问题</small><b>{questionRef}</b></span>
-        <i aria-hidden="true" />
-        <span className={stage.toLowerCase()}><small>根 Agent</small><b>工作中</b></span>
-      </div>
       <div className="lumen-question-copy">
         <small>未知点 · 回答形式 · 适用范围</small>
         <h2>{question.unknown_statement ?? question.title ?? "当前已接纳 Question"}</h2>
@@ -2047,6 +1862,10 @@ function CurrentQuestionCard({
             ?? "根 Agent 围绕这个问题读取已有材料、形成产物并接受核验。"}
         </p>
       </div>
+      <details className="lumen-cycle-identity">
+        <summary>查看问题标识</summary>
+        <p>研究任务 <code>{question.quest_ref ?? "未记录"}</code> · 问题 <code>{questionRef}</code> · {stage}</p>
+      </details>
     </section>
   );
 }
@@ -3048,6 +2867,8 @@ function TargetTerminalDialog({
   onClose: () => void;
 }) {
   const [terminal, setTerminal] = useState<TargetRawTerminalState | null>(null);
+  const [chunks, setChunks] = useState<OutputChunk[]>([]);
+  const [followLive, setFollowLive] = useState(true);
   const [loading, setLoading] = useState(false);
   const [terminalError, setTerminalError] = useState<string | null>(null);
   const [previousOffsets, setPreviousOffsets] = useState<number[]>([]);
@@ -3057,7 +2878,8 @@ function TargetTerminalDialog({
   const terminalRef = useRef<TargetRawTerminalState | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
   const requestSequence = useRef(0);
-  const terminalLogRef = useRef<HTMLPreElement | null>(null);
+  const terminalLogRef = useRef<HTMLDivElement | null>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
   const paused = minimized
     || blockedByHumanRequest
     || activityPaused
@@ -3121,6 +2943,7 @@ function TargetTerminalDialog({
       } else if (direction === "reset") {
         setPreviousOffsets([]);
       }
+      setChunks(chunks => collectOutputPages(chunks, page, direction === "reset" || direction === "previous"));
       terminalRef.current = page;
       setTerminal(page);
       setTerminalError(null);
@@ -3150,6 +2973,8 @@ function TargetTerminalDialog({
   useEffect(() => {
     terminalRef.current = null;
     setTerminal(null);
+    setChunks([]);
+    setFollowLive(true);
     setPreviousOffsets([]);
     setTerminalError(null);
     return () => {
@@ -3157,7 +2982,7 @@ function TargetTerminalDialog({
       activeRequest.current?.abort();
       activeRequest.current = null;
     };
-  }, [target.target_ref]);
+  }, [target.target_ref, target.target_run_ref]);
 
   useEffect(() => {
     if (paused) {
@@ -3195,17 +3020,22 @@ function TargetTerminalDialog({
   useEffect(() => {
     if (
       paused
+      || !followLive
       || loading
-      || terminal?.has_more
-      || !(terminal?.status === "live" || (!terminal && targetMayStillProduceOutput))
+      || !(terminal?.has_more || terminal?.status === "live" || (!terminal && targetMayStillProduceOutput))
     ) return;
     const timer = window.setTimeout(() => {
       const current = terminalRef.current;
-      void loadRawOutput(current?.offset ?? 0, current ? "refresh" : "reset");
-    }, targetRawOutputPollMilliseconds);
+      if (current?.has_more && current.next_offset > current.offset) {
+        void loadRawOutput(current.next_offset, "next");
+      } else {
+        void loadRawOutput(current?.offset ?? 0, current ? "refresh" : "reset");
+      }
+    }, terminal?.has_more ? 150 : targetRawOutputPollMilliseconds);
     return () => window.clearTimeout(timer);
   }, [
     loadRawOutput,
+    followLive,
     loading,
     paused,
     targetMayStillProduceOutput,
@@ -3219,14 +3049,16 @@ function TargetTerminalDialog({
     && !terminal.has_more,
   );
   useEffect(() => {
-    if (atHead && terminalLogRef.current) {
+    if (followLive && atHead && terminalLogRef.current) {
       terminalLogRef.current.scrollTop = terminalLogRef.current.scrollHeight;
     }
-  }, [atHead, terminal?.text]);
+  }, [atHead, followLive, terminal?.text]);
 
+  useEffect(() => { if (!minimized && !blockedByHumanRequest) closeRef.current?.focus(); }, [minimized, blockedByHumanRequest]);
   return createPortal(
     <section
       id="target-output-dialog"
+      onKeyDown={event => {if (event.key === "Escape") {event.stopPropagation(); onClose();}}}
       className="lumen-target-terminal lumen-target-terminal-dialog"
       role="dialog"
       aria-modal="false"
@@ -3240,8 +3072,8 @@ function TargetTerminalDialog({
     >
       <header>
         <div>
-          <small>PRIVATE PROVIDER STDOUT / RAW JSONL</small>
-          <b>{target.target_key} · 原始输出</b>
+          <small>实验日志 · 原始命令输出</small>
+          <b>{target.target_key}</b>
         </div>
         <div className="lumen-target-terminal-actions">
           <span data-live={terminal?.status === "live" ? "true" : "false"}>
@@ -3249,25 +3081,25 @@ function TargetTerminalDialog({
               ? "读取中"
               : terminal?.status === "live"
                 ? "持续更新"
-                : terminal?.status ?? "等待输出"}
+                : terminal?.status === "complete" ? "本次执行结束" : "等待输出"}
           </span>
           <button type="button" onClick={onMinimize}>
             {minimized ? "展开" : "最小化"}
           </button>
-          <button type="button" onClick={onClose} aria-label="关闭原始输出窗口">×</button>
+          <button ref={closeRef} type="button" onClick={onClose} aria-label="关闭实验日志窗口">×</button>
         </div>
       </header>
       {!minimized ? (
         <div className="lumen-target-terminal-body">
           <p className="lumen-target-terminal-boundary">
-            这里按写入顺序展示未经脱敏的 Provider 原始 stdout（JSONL），可能包含敏感信息；展示不会修改 Agent workspace，也不决定研究结果。
+            训练与评估共用此窗口，按实际执行命令查看。关闭窗口后实验继续运行。
           </p>
           {terminal ? (
-            <dl className="lumen-target-terminal-identity">
+            <details className="research-terminal-source"><summary>执行来源</summary><dl className="lumen-target-terminal-identity">
               <div><dt>Target run</dt><dd>{terminal.target_run_ref ?? target.target_run_ref ?? "正在绑定"}</dd></div>
               <div><dt>Provider operation</dt><dd>{terminal.operation_ref}</dd></div>
               <div><dt>Transport</dt><dd>{terminal.transport_invocation_hash.slice(0, 16)}</dd></div>
-            </dl>
+            </dl></details>
           ) : null}
           {terminalError ? (
             <div className="lumen-target-terminal-error" role="alert">
@@ -3287,22 +3119,28 @@ function TargetTerminalDialog({
               </button>
             </div>
           ) : null}
-          {terminal?.text ? (
-            <pre
-              ref={terminalLogRef}
-              className="lumen-target-terminal-log"
-              role="log"
-              aria-live="off"
-              aria-label={`${target.target_key} 未经脱敏的 Provider 原始 stdout`}
-            >{terminal.text}</pre>
+          {terminal && !terminalError ? (
+            <div ref={terminalLogRef} className="research-terminal-scroll" onScroll={event => {
+              const view = event.currentTarget;
+              if (view.scrollHeight - view.scrollTop - view.clientHeight > 48) setFollowLive(false);
+            }}>
+              <TargetCommandOutput rawText={terminal.text} chunks={chunks} startOffset={terminal.offset} streamKey={terminal.stream_ref}
+                rootNativeSessionRef={terminal.native_session_ref ?? terminal.root_native_session_ref} isTerminal={terminal.status !== "live"}
+                followLive={followLive} onPauseFollow={() => setFollowLive(false)} />
+            </div>
           ) : null}
           {terminal && terminal.text.length === 0 ? (
             <p className="lumen-target-terminal-empty">
-              当前 Provider stdout 尚无字节；只要这个 turn 仍在运行，窗口会继续刷新。
+              {terminal.status === "live"
+                ? "当前 Target 尚未产生 stdout，自动刷新中。"
+                : "当前 Target 输出已结束，没有可读取的 stdout。"}
             </p>
           ) : null}
           {terminal ? (
             <footer>
+              <button type="button" aria-pressed={followLive} onClick={() => setFollowLive(value => !value)}>
+                {followLive ? "实时跟随中" : "跟随最新输出"}
+              </button>
               <small>
                 {atHead ? "已追到当前 stdout" : "还有后续页，可按需读取"}
                 {` · ${terminal.mapped_bytes} / ${terminal.source_bytes} bytes`}
@@ -3312,6 +3150,7 @@ function TargetTerminalDialog({
                   type="button"
                   disabled={loading || previousOffsets.length === 0}
                   onClick={() => {
+                    setFollowLive(false);
                     const previous = previousOffsets.at(-1);
                     if (previous !== undefined) {
                       void loadRawOutput(previous, "previous");
@@ -3322,7 +3161,7 @@ function TargetTerminalDialog({
                 <button
                   type="button"
                   disabled={loading || !terminal.has_more}
-                  onClick={() => void loadRawOutput(terminal.next_offset, "next")}
+                  onClick={() => { setFollowLive(false); void loadRawOutput(terminal.next_offset, "next"); }}
                 >读取下一页</button>
               </nav>
             </footer>
@@ -4105,6 +3944,31 @@ function ReasoningFollowupDock({
   );
 }
 
+function ExperimentLogLauncher({snapshot, blocked, paused}: {
+  snapshot: PublicSnapshot; blocked: boolean; paused: boolean;
+}) {
+  const foreground = snapshot.research_control.foreground;
+  const bundle = allStageSurfaces(snapshot).find(surface => surface.kind === "Bundle");
+  const targets = bundle?.kind === "Bundle" ? bundle.projection.target_graph.targets : [];
+  const available = targets.filter(target => target.target_run_ref);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const [minimized, setMinimized] = useState(false);
+  const opener = useRef<HTMLButtonElement>(null);
+  const target = available.find(item => item.target_ref === selected) ?? available.find(item => item.status === "running") ?? available[0];
+  useEffect(() => {setOpen(false); setSelected(null);}, [foreground?.cycle_ref]);
+  const close = () => {setOpen(false); opener.current?.focus();};
+  return <div className="research-experiment-entry">
+    <button ref={opener} type="button" className="research-log-button" aria-haspopup="dialog" disabled={!target}
+      onClick={() => {setOpen(true); setMinimized(false);}}>⌘ 实验日志 <span>↗</span></button>
+    {available.length > 1 ? <select aria-label="选择实验任务" value={target?.target_ref ?? ""} onChange={event => {setSelected(event.currentTarget.value); setMinimized(false);}}>
+      {available.map(item => <option key={item.target_ref} value={item.target_ref}>{item.target_key} · {activityStatusCopy(item.status)}</option>)}
+    </select> : <small>{target ? `${target.target_key} · ${activityStatusCopy(target.status)}` : targets.length ? "实验尚未开始执行" : "本轮尚无实验日志"}</small>}
+    {open && target ? <ExperimentLogs key={`${target.target_ref}:${target.target_run_ref}`} target={target}
+      minimized={minimized} blockedByHumanRequest={blocked} activityPaused={paused} onMinimize={() => setMinimized(value => !value)} onClose={close} /> : null}
+  </div>;
+}
+
 function WorkspaceMain({
   snapshot,
   state,
@@ -4117,6 +3981,11 @@ function WorkspaceMain({
   targetRootObservationPointers,
   humanRequestModalOpen,
   retry,
+  onCreate,
+  onBrowseQuestions,
+  onBrowseAssets,
+  onBrowseWriting,
+  onBrowseHumanRequests,
 }: {
   snapshot: PublicSnapshot | null;
   state: ShellState;
@@ -4129,8 +3998,19 @@ function WorkspaceMain({
   targetRootObservationPointers: Record<string, TargetRootObservationPointer>;
   humanRequestModalOpen: boolean;
   retry: () => void;
+  onCreate: () => void;
+  onBrowseQuestions: () => void;
+  onBrowseAssets: () => void;
+  onBrowseWriting: () => void;
+  onBrowseHumanRequests: (requestRef?: string) => void;
 }) {
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [stageResultsRequested, setStageResultsRequested] = useState(() => Boolean(spectrumStage(new URLSearchParams(window.location.search).get("stage"))));
+  const overview = useResearchOverview(snapshot, !hidden && Boolean(snapshot?.research_control.foreground), historyOpen || stageResultsRequested);
   const unavailable = uniqueCapabilities(snapshot);
+  const foreground = snapshot?.research_control.foreground;
+  const currentQuestion = snapshot ? exactForegroundQuestion(snapshot) : null;
+  const requests = snapshot ? currentOpenHumanRequests(snapshot) : [];
   const stageSurface = snapshot?.research_space.status === "active"
     ? currentStageSurface(snapshot)
     : null;
@@ -4156,15 +4036,9 @@ function WorkspaceMain({
       onChanged={retry}
     />
   ) : null;
-  const question = reasoningStage
-    ? reasoningQuestion(reasoningStage, snapshot ?? undefined)
-    : bundleStage
-    ? bundleQuestion(bundleStage, snapshot ?? undefined)
-    : planStage
-    ? planQuestion(planStage, snapshot ?? undefined)
-    : ideaStage
-      ? ideaQuestion(ideaStage, snapshot ?? undefined)
-      : null;
+  const question = stageSurface
+    ? stageQuestion(stageSurface.projection, snapshot ?? undefined)
+    : null;
   return (
     <main
       id={hidden ? undefined : "main-content"}
@@ -4175,56 +4049,92 @@ function WorkspaceMain({
       aria-labelledby="workspace-title"
       aria-busy={state === "loading"}
     >
+      {snapshot?.query_warnings?.length ? (
+        <div className="lumen-reconnect-warning" role="status" data-testid="workspace-partial-warning">
+          <span aria-hidden="true">!</span>
+          <div>
+            <p>
+            <b>部分执行状态暂不可用</b>
+            <small>研究内容已载入。可以继续查看阶段成果、历史和研究资料。</small>
+            </p>
+            <details><summary>查看受影响的状态</summary>
+              {snapshot.query_warnings.map((warning, index) => <div key={`${warning.section}-${index}`}>
+                {warning.section === "bundle_stage" ? "Bundle · 实验与证据" : warning.section} · {warning.code}
+              </div>)}
+            </details>
+          </div>
+        </div>
+      ) : null}
       {(error || streamInterrupted) && snapshot ? (
         <div className="lumen-reconnect-warning" role="alert">
           <span aria-hidden="true">↺</span>
           <p>
-            <b>研究活动连接中断，正在重连。</b>
-            <small>页面继续显示最后一次确认的研究状态 · {snapshot.revision}</small>
+            <b>{error ? "详细状态刷新失败，正在重试。" : "研究活动连接中断，正在重连。"}</b>
+            <small>保留上次成功读取的状态 · {snapshot.observed_at ? new Date(snapshot.observed_at).toLocaleString("zh-CN", { hour12: false }) : "查询时间未记录"} · 版本 {snapshot.revision} · <a href="/">查看运行摘要</a></small>
           </p>
         </div>
       ) : null}
 
       <section
-        className={`lumen-hero ${state}`}
+        className={`lumen-hero ${state}${snapshot?.research_space.status === "active" ? " has-research" : ""}`}
         role={state === "first-error" ? "alert" : undefined}
       >
         <span className="lumen-glow" aria-hidden="true" />
         <span className="lumen-comet" aria-hidden="true" />
         {state === "loading" ? <LoadingHero /> : null}
         {state === "first-error" ? <FirstErrorHero retry={retry} /> : null}
-        {snapshot ? <SnapshotHero snapshot={snapshot} /> : null}
-        {snapshot?.research_space.status === "active" && !hidden ? (
-          <ResearchTracePanel
-            snapshot={snapshot}
-            latestActivity={latestActivity}
-            observedSince={observedSince}
-            connected={connected}
-          />
+        {snapshot && foreground ? <div className="research-current-heading" data-testid="current-cycle-overview" data-cycle-ref={foreground.cycle_ref} data-question-ref={foreground.question_ref}>
+          <div className="research-current-topline">
+            <p className="lumen-eyebrow">当前研究问题</p>
+            <div className="research-cycle-badge" aria-live="polite" data-cycle-ref={foreground.cycle_ref}>
+              <span>当前 Cycle</span>
+              <b>{overview.data ? cycleOrdinalLabel(overview.data.cycle_ordinal) : overview.error ? "轮次暂不可用" : "正在读取轮次…"}</b>
+              {overview.error && !overview.data ? <button type="button" onClick={overview.retry} aria-label="重新读取 Cycle 轮次">↻</button> : null}
+            </div>
+          </div>
+          <h1 id="workspace-title">{currentQuestion?.title ?? currentQuestion?.unknown_statement ?? "当前研究问题"}</h1>
+          <StageHistoryStrip snapshot={snapshot} overview={overview.data} error={overview.error} loading={overview.loading} onRetry={overview.retry} onRequestOverview={() => setStageResultsRequested(true)} />
+          <button className="research-history-toggle" aria-expanded={historyOpen} onClick={() => setHistoryOpen(open => !open)}>{historyOpen ? "收起本轮记录与历史结果" : "查看本轮记录与历史结果"}<span aria-hidden="true">{historyOpen ? "−" : "+"}</span></button>
+        </div> : snapshot ? <SnapshotHero snapshot={snapshot} /> : null}
+        {snapshot && !foreground && state !== "loading" && state !== "first-error" ? (
+          <div className="lumen-workspace-actions" aria-label="研究快捷操作">
+            {snapshot.research_space.status === "empty" ? (
+              <button className="lumen-primary" type="button" disabled={!questCreationReady(snapshot)} onClick={onCreate}>
+                {restorableQuestCreation(snapshot.quest_creation.current, null) ? "继续草稿" : "开始研究"}
+                <span aria-hidden="true">↗</span>
+              </button>
+            ) : (
+              <button className="lumen-primary" type="button" disabled={snapshot.question_tree.status !== "ready"} onClick={onBrowseQuestions}>
+                查看问题树 <span aria-hidden="true">↗</span>
+              </button>
+            )}
+            <button className="lumen-secondary" type="button" disabled={snapshot.research_assets.status !== "ready"} onClick={onBrowseAssets}>
+              查看研究资料
+            </button>
+            {snapshot.research_space.status === "active" ? (
+              <button className="lumen-secondary" type="button" onClick={() => {
+                const activity = document.getElementById("research-activity");
+                activity?.focus({ preventScroll: true });
+                activity?.scrollIntoView({ block: "start" });
+              }}>查看本轮活动 ↓</button>
+            ) : null}
+          </div>
         ) : null}
       </section>
 
+      {snapshot && foreground ? <>
+        {historyOpen ? <ResearchOverview snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} onOpenWriting={onBrowseWriting} connected={connected} /> : null}
+        <div className="research-primary-actions">
+          <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} />
+          <div><button onClick={onBrowseAssets}>研究资料 ↗</button><button onClick={onBrowseQuestions}>问题树 ↗</button></div>
+        </div>
+        {requests.length ? <button className="research-human-request" onClick={() => onBrowseHumanRequests(requests[0].request_ref)}><span><b>需要你回应 · {requests.length} 项</b><span>{requests[0].obligation}</span></span><b>查看并回应 ↗</b></button> : null}
+      </> : null}
+      {snapshot?.research_space.status === "active" && !hidden ? <ResearchTracePanel snapshot={snapshot} latestActivity={latestActivity} observedSince={observedSince} connected={connected} /> : null}
+      <details className="research-existing-details"><summary>研究材料与阶段详情</summary>
       <div className="lumen-lower">
-        {reasoningStage ? (
-          <CurrentQuestionCard
-            stage="Reasoning"
-            question={question!}
-          />
-        ) : bundleStage ? (
-          <CurrentQuestionCard
-            stage="Bundle"
-            question={question!}
-          />
-        ) : planStage ? (
-          <CurrentQuestionCard
-            stage="Plan"
-            question={question!}
-          />
-        ) : ideaStage ? (
-          <CurrentQuestionCard
-            stage="Idea"
-            question={question!}
-          />
+        {stageSurface && question ? (
+          <CurrentQuestionCard stage={stageSurface.kind} question={question} />
         ) : (
           <section className="lumen-card lumen-next-card" aria-labelledby="next-title">
             <header className="lumen-card-head">
@@ -4236,8 +4146,8 @@ function WorkspaceMain({
               <i />
               <span className="destination">＋</span>
             </div>
-            <h2>{state === "ready-empty" ? "第一个研究任务从左侧入口开始" : "这里只显示已经确认的研究事实"}</h2>
-            <p>单纯浏览不会改变研究；创建、授权与接纳都需要明确操作。</p>
+            <h2>{state === "ready-empty" ? "设定目标，逐步形成研究问题" : "这里只显示已经确认的研究事实"}</h2>
+            <p>描述想解决的问题、预期成果与可用资料，即可开始一项研究。</p>
           </section>
         )}
 
@@ -4271,7 +4181,7 @@ function WorkspaceMain({
         ) : (
           <section className="lumen-card lumen-availability" aria-labelledby="availability-title">
             <header className="lumen-card-head">
-              <b id="availability-title">能力可用性</b>
+              <b id="availability-title">研究服务</b>
               <small>当前研究服务</small>
             </header>
             {unavailable.length ? (
@@ -4279,7 +4189,9 @@ function WorkspaceMain({
                 {unavailable.map((item) => (
                   <li key={item.capability} data-capability={item.capability}>
                     <span>{capabilityLabels[item.capability] ?? item.capability}</span>
-                    <code>{item.status}</code>
+                    <span className="lumen-service-status" data-status={item.status}>
+                      {item.status === "ready" ? "可使用" : "暂不可用"}
+                    </span>
                   </li>
                 ))}
               </ul>
@@ -4294,6 +4206,9 @@ function WorkspaceMain({
                 <dl>
                   <div><dt>版本</dt><dd>{snapshot.product.version}</dd></div>
                   <div><dt>Readiness</dt><dd>{snapshot.readiness.status}</dd></div>
+                  {unavailable.map((item) => (
+                    <div key={item.capability}><dt>{item.capability}</dt><dd>{item.status}</dd></div>
+                  ))}
                   {snapshot.runtime_observability?.inhibitor ? (
                     <>
                       <div>
@@ -4381,6 +4296,7 @@ function WorkspaceMain({
           </section>
         )}
       </div>
+      </details>
       {snapshot ? (
         <ReasoningFollowupDock
           reasoningStage={snapshot.reasoning_stage ?? null}
@@ -4394,11 +4310,65 @@ function WorkspaceMain({
 }
 
 function App() {
+  const parameters = new URLSearchParams(window.location.search);
+  const detailsRequested = parameters.has("workspace") || parameters.has("panel")
+    || parameters.has("view") || parameters.has("inspector") || parameters.has("companion");
+  return detailsRequested ? <DetailedApp /> : <StatusHome />;
+}
+
+function DetailedApp() {
   const initialParameters = useMemo(
     () => new URLSearchParams(window.location.search),
     [],
   );
+  const [compactLayout, setCompactLayout] = useState(
+    () => window.matchMedia("(max-width: 880px)").matches,
+  );
+  const [companionOpen, setCompanionOpen] = useState(() => initialParameters.get("companion") === "1");
+  const companionReturnFocusRef = useRef<HTMLElement | null>(null);
+  const companionScrollRef = useRef(0);
+  const companionToggleRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 880px)");
+    const update = () => setCompactLayout(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  const showCompanion = compactLayout && companionOpen;
+  const toggleCompanion = () => {
+    if (showCompanion) {
+      setCompanionOpen(false);
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: companionScrollRef.current });
+        const target = companionReturnFocusRef.current;
+        if (target?.isConnected && target.getClientRects().length) {
+          target.focus({ preventScroll: true });
+        } else companionToggleRef.current?.focus({ preventScroll: true });
+      });
+    } else {
+      companionReturnFocusRef.current = document.activeElement instanceof HTMLElement
+        ? document.activeElement : null;
+      companionScrollRef.current = window.scrollY;
+      setCompanionOpen(true);
+    }
+  };
   const [snapshot, setSnapshot] = useState<PublicSnapshot | null>(null);
+  useEffect(() => {
+    if (!showCompanion) return;
+    window.scrollTo({ top: 0 });
+    const frame = requestAnimationFrame(() => {
+      const input = document.querySelector<HTMLTextAreaElement>(
+        "[aria-label='给研究助手发消息']",
+      );
+      if (input && !input.disabled) input.focus({ preventScroll: true });
+      else document.querySelector<HTMLElement>(".lumen-companion")?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [
+    showCompanion,
+    snapshot?.human_collaboration?.companion.status,
+    snapshot?.human_collaboration?.companion.scope_ref,
+  ]);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [streamInterrupted, setStreamInterrupted] = useState(false);
@@ -4465,8 +4435,15 @@ function App() {
   const [targetRootObservationPointers, setTargetRootObservationPointers] =
     useState<Record<string, TargetRootObservationPointer>>({});
   const [snapshotRetrySequence, setSnapshotRetrySequence] = useState(0);
-  const reloadInFlight = useRef(false);
+  const reloadRequest = useRef<Promise<void> | null>(null);
+  const reloadController = useRef<AbortController | null>(null);
   const reloadQueued = useRef(false);
+  const snapshotSections = useRef({ includeAssets: false, includeHistory: false });
+  const requestedSections = useRef<{ includeAssets: boolean; includeHistory: boolean } | null>(null);
+  const includeAssets = assetsOpen || creationMode !== null || manualPanel !== null;
+  const includeHistory = questionTreeOpen || writingOpen || showCompanion;
+  snapshotSections.current = { includeAssets, includeHistory };
+  const eventRefreshTimer = useRef<number | null>(null);
   const observedSinceRef = useRef(Date.now());
   const streamCursorRef = useRef<number | null>(null);
   const manualDetailSequence = useRef(0);
@@ -4524,17 +4501,19 @@ function App() {
     ));
   }, []);
 
-  const reload = useCallback(async (signal?: AbortSignal) => {
-    if (reloadInFlight.current) {
-      reloadQueued.current = true;
-      return;
-    }
-    reloadInFlight.current = true;
-    try {
+  const reload = useCallback((): Promise<void> => {
+    const controller = reloadController.current;
+    if (!controller || controller.signal.aborted) return Promise.resolve();
+    reloadQueued.current = true;
+    if (reloadRequest.current) return reloadRequest.current;
+    const request = (async () => {
       do {
         reloadQueued.current = false;
         try {
-          const next = await fetchSnapshot(signal);
+          const sections = snapshotSections.current;
+          requestedSections.current = sections;
+          const next = await fetchSnapshot(controller.signal, sections);
+          if (controller.signal.aborted) return;
           setSnapshot((current) =>
             current && current.revision > next.revision ? current : next,
           );
@@ -4546,22 +4525,36 @@ function App() {
           setSnapshotRetrySequence(0);
           setError(null);
         } catch (caught) {
-          if ((caught as Error).name !== "AbortError") {
+          if (!controller.signal.aborted) {
             setSnapshotRetrySequence((current) => current + 1);
-            setError("无法读取本地 Snapshot。请确认 daemon 仍在运行，然后刷新页面。");
+            setError("详细状态刷新失败，页面保留上次结果；可返回首页查看运行摘要。");
           }
         }
-      } while (reloadQueued.current && !signal?.aborted);
-    } finally {
-      reloadInFlight.current = false;
-      if (reloadQueued.current && !signal?.aborted) void reload();
-    }
+        if (reloadQueued.current && !controller.signal.aborted) {
+          await new Promise<void>(resolve => {
+            const done = () => { window.clearTimeout(timer); controller.signal.removeEventListener("abort", done); resolve(); };
+            const timer = window.setTimeout(done, 2_000);
+            controller.signal.addEventListener("abort", done, { once: true });
+          });
+        }
+      } while (reloadQueued.current && !controller.signal.aborted);
+    })().finally(() => {
+      if (reloadRequest.current === request) reloadRequest.current = null;
+    });
+    reloadRequest.current = request;
+    return request;
   }, []);
 
   useEffect(() => {
     const controller = new AbortController();
-    void reload(controller.signal);
-    return () => controller.abort();
+    reloadController.current = controller;
+    void reload();
+    return () => {
+      controller.abort();
+      reloadController.current = null;
+      reloadRequest.current = null;
+      reloadQueued.current = false;
+    };
   }, [reload]);
 
   useEffect(() => {
@@ -4569,18 +4562,36 @@ function App() {
     const exponent = Math.min(snapshotRetrySequence - 1, 4);
     const timer = window.setTimeout(
       () => void reload(),
-      Math.min(250 * 2 ** exponent, 4_000),
+      Math.min(5_000 * 2 ** exponent, 30_000),
     );
     return () => window.clearTimeout(timer);
   }, [error, reload, snapshotRetrySequence]);
+
+  useEffect(() => {
+    const requested = requestedSections.current;
+    if (requested && (requested.includeAssets !== includeAssets || requested.includeHistory !== includeHistory)) {
+      void reload();
+    }
+  }, [includeAssets, includeHistory, reload]);
+
+  const scheduleEventReload = useCallback(() => {
+    if (eventRefreshTimer.current !== null) return;
+    eventRefreshTimer.current = window.setTimeout(() => {
+      eventRefreshTimer.current = null;
+      void reload();
+    }, 2_000);
+  }, [reload]);
+  useEffect(() => () => {
+    if (eventRefreshTimer.current !== null) window.clearTimeout(eventRefreshTimer.current);
+  }, []);
 
   const streamReady = streamCursor !== null;
   useEffect(() => {
     if (!streamReady) return;
     return followProjection(
       streamCursor ?? 0,
-      () => void reload(),
-      () => void reload(),
+      scheduleEventReload,
+      scheduleEventReload,
       handleConnection,
       () => streamCursorRef.current,
       (pointer) => setTargetRootObservationPointers((current) => ({
@@ -4592,7 +4603,7 @@ function App() {
     // followProjection advances its own monotonic cursor. Reconnecting this
     // long-lived stream for every Snapshot revision can briefly occupy every
     // browser connection slot and starve an Owner command.
-  }, [handleConnection, handleResearchActivity, reload, streamReady]);
+  }, [handleConnection, handleResearchActivity, scheduleEventReload, streamReady]);
 
   const manualContextRef = manualPanel?.raw.context_ref ?? null;
   useEffect(() => {
@@ -4707,7 +4718,7 @@ function App() {
   ) ?? [];
   const historyQuestionRef = scopedHistoryQuestions.find(
     (item) => item.question_ref === projectedCurrentQuestionRef,
-  )?.question_ref ?? scopedHistoryQuestions[0]?.question_ref ?? null;
+  )?.question_ref ?? scopedHistoryQuestions[0]?.question_ref ?? projectedCurrentQuestionRef ?? null;
   const canBrowseHistory = Boolean(canBrowseQuestions && historyQuestionRef);
   const canBrowseWriting = snapshot?.writing.status === "ready";
   const manualCreationReady =
@@ -4733,6 +4744,7 @@ function App() {
     (check) => check.name === "research_asset_verification_worker",
   )?.status === "ready";
   const openOverview = () => {
+    setCompanionOpen(false);
     setCreationMode(null);
     setAssetsOpen(false);
     setWritingOpen(false);
@@ -4752,6 +4764,7 @@ function App() {
     window.history.replaceState(null, "", "/");
   };
   const openCreation = () => {
+    setCompanionOpen(false);
     if (!canCreate) return;
     const currentCreation = restorableQuestCreation(
       snapshot?.quest_creation.current ?? null,
@@ -4798,6 +4811,7 @@ function App() {
     void reload();
   }, [reload]);
   const openAssets = () => {
+    setCompanionOpen(false);
     if (!canBrowseAssets) return;
     setQuestCompletionLanding(null);
     setCreationMode(null);
@@ -4813,6 +4827,7 @@ function App() {
     setAssetsOpen(false);
   };
   const openQuestionTree = () => {
+    setCompanionOpen(false);
     if (!canBrowseQuestions) return;
     setQuestCompletionLanding(null);
     questionTreeReturnFocusRef.current = questionTreeButtonRef.current;
@@ -4848,6 +4863,7 @@ function App() {
   };
 
   const openQuestionHistory = () => {
+    setCompanionOpen(false);
     if (!canBrowseHistory || !historyQuestionRef) return;
     setQuestCompletionLanding(null);
     questionTreeReturnFocusRef.current = historyButtonRef.current;
@@ -4912,8 +4928,11 @@ function App() {
 
   const discussQuestionWithCompanion = useCallback((
     question: QuestionTreeItem,
-    _opener: HTMLButtonElement,
+    opener: HTMLButtonElement,
   ) => {
+    companionReturnFocusRef.current = opener;
+    companionScrollRef.current = window.scrollY;
+    setCompanionOpen(true);
     setSelectedQuestionContext(question);
     setQuestionRouteNodeRef(question.question_ref);
     window.history.replaceState(
@@ -4940,6 +4959,7 @@ function App() {
   }, [questionRouteNodeRef]);
 
   const openWriting = () => {
+    setCompanionOpen(false);
     if (!canBrowseWriting || !snapshot) return;
     setQuestCompletionLanding(null);
     setCreationMode(null);
@@ -5173,16 +5193,18 @@ function App() {
 
   return (
     <>
-      <a className="lumen-skip" href="#main-content" data-hc-background>跳到主要内容</a>
-      <div className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-hc-background>
+      <a className="lumen-skip" href={showCompanion ? "#research-companion" : "#main-content"} data-hc-background>
+        {showCompanion ? "跳到研究助手" : "跳到主要内容"}
+      </a>
+      <div className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-companion-open={showCompanion} data-hc-background>
         <header className="lumen-header" data-shell-region="header">
-          <div className="lumen-brand" aria-label="Meta-research">
+          <a className="lumen-brand" aria-label="Meta-research 首页" href="/" style={{ color: "inherit", textDecoration: "none" }}>
             <span className="lumen-logo" aria-hidden="true">MR</span>
             <div><b>Meta Research</b><small>Lumen workspace</small></div>
-          </div>
+          </a>
           <div className="lumen-quest-context">
             <small>{snapshot?.research_space.status === "active" ? "当前研究" : "新的研究空间"}</small>
-            <b>{snapshot?.research_space.status === "active" ? "根 Agent 研究现场" : "等待第一个研究问题"}</b>
+            <b>{snapshot ? exactForegroundQuestion(snapshot)?.title ?? (snapshot.research_space.status === "active" ? "当前研究现场" : "等待第一个研究问题") : "正在读取研究空间"}</b>
           </div>
           <div className={`lumen-connection ${connected ? "connected" : ""}`} aria-live="polite">
             <i aria-hidden="true" />
@@ -5199,14 +5221,17 @@ function App() {
           />
         </header>
         <LumenRail
+          activeSection={humanRequestSurfaceOpen ? "requests"
+            : creationMode ? "creation"
+            : assetsOpen ? "assets"
+            : writingOpen ? "writing"
+            : questionTreeOpen ? questionInspectorMode === "history" ? "history" : "questions"
+            : "overview"}
           canCreate={Boolean(canCreate)}
           canBrowseAssets={canBrowseAssets}
           canBrowseQuestions={canBrowseQuestions}
-          questionsActive={questionTreeOpen}
           canBrowseHistory={canBrowseHistory && manualPanel === null}
-          historyActive={questionTreeOpen && questionInspectorMode === "history"}
           canBrowseWriting={Boolean(canBrowseWriting)}
-          writingOpen={writingOpen}
           questionUnavailableReason={questionUnavailableReason}
           questionButtonRef={questionTreeButtonRef}
           historyButtonRef={historyButtonRef}
@@ -5215,7 +5240,6 @@ function App() {
           onBrowseHistory={openQuestionHistory}
           canBrowseHumanRequests={canBrowseHumanRequests}
           humanRequestCount={humanRequestCount}
-          humanRequestsOpen={humanRequestSurfaceOpen}
           onCreate={openCreation}
           onBrowseAssets={openAssets}
           onBrowseWriting={openWriting}
@@ -5230,12 +5254,20 @@ function App() {
           connected={connected}
           latestActivity={latestResearchActivity}
           observedSince={observedSinceRef.current}
-          hidden={Boolean(questionTreeOpen && snapshot)}
+          hidden={Boolean((questionTreeOpen && snapshot) || showCompanion)}
           targetRootObservationPointers={targetRootObservationPointers}
           humanRequestModalOpen={humanRequestSurfaceOpen}
           retry={() => void reload()}
+          onCreate={openCreation}
+          onBrowseQuestions={openQuestionTree}
+          onBrowseAssets={openAssets}
+          onBrowseWriting={openWriting}
+          onBrowseHumanRequests={(requestRef) => openHumanRequests(requestRef ?? null)}
         />
-        {questionTreeOpen && snapshot ? (
+        {questionTreeOpen && snapshot?.question_tree.loaded === false ? (
+          <main className="lumen-main" role="status"><p>{error ? "问题树读取失败，保留当前运行摘要。" : "正在读取问题树与历史…"}</p><button onClick={() => void reload()}>刷新详情</button> <a href="/">返回运行摘要</a></main>
+        ) : null}
+        {questionTreeOpen && snapshot && snapshot.question_tree.loaded !== false ? (
           <QuestionTree
             items={questionTreeItems}
             graphRevision={snapshot.owners.research_graph?.revision ?? null}
@@ -5258,6 +5290,7 @@ function App() {
             onControlQuestion={controlQuestionLifecycle}
           />
         ) : null}
+        <div id="research-companion" className="lumen-companion-panel" tabIndex={-1}>
         <QuestCompanion
           state={state}
           collaboration={snapshot?.human_collaboration}
@@ -5269,8 +5302,25 @@ function App() {
           onChanged={() => void reload()}
           onOpenRequest={(requestRef) => openHumanRequests(requestRef)}
         />
+        </div>
+        {!creationMode && !assetsOpen && !writingOpen && !manualPanel && !humanRequestSurfaceOpen ? (
+          <button
+            ref={companionToggleRef}
+            className="lumen-companion-toggle"
+            type="button"
+            aria-controls="research-companion"
+            aria-expanded={showCompanion}
+            onClick={toggleCompanion}
+          >
+            <span aria-hidden="true">{showCompanion ? "←" : "✦"}</span>
+            {showCompanion ? "返回研究" : "研究助手"}
+          </button>
+        ) : null}
       </div>
-      {creationMode && snapshot ? (
+      {((creationMode && snapshot?.research_assets.loaded === false) || (writingOpen && snapshot?.writing.loaded === false)) ? (
+        <div className="lumen-reconnect-warning" role="status"><p>{error ? "详情读取失败，请重试。" : "正在读取所需的研究资料…"}</p><button onClick={() => void reload()}>刷新详情</button></div>
+      ) : null}
+      {creationMode && snapshot && snapshot.research_assets.loaded !== false ? (
         <QuestCreationWorkbench
           current={restorableQuestCreation(
             snapshot.quest_creation.current,
@@ -5291,7 +5341,7 @@ function App() {
           onChanged={() => void reload()}
         />
       ) : null}
-      {writingOpen && snapshot ? (
+      {writingOpen && snapshot && snapshot.writing.loaded !== false ? (
         <WritingReportWorkbench
           initial={snapshot.writing}
           questRef={
@@ -5379,7 +5429,22 @@ function App() {
               expected_basis_hash,
               message,
             );
-            await applyManualRaw(raw, manualPanel);
+            // The accepted turn starts its reply stream immediately. Snapshot
+            // refresh errors must not turn a successful send into a retry.
+            manualDetailSequence.current += 1;
+            setManualPanel((current) => current?.raw.context_ref === creation_id
+              ? { ...current, raw }
+              : current);
+            void reload();
+          }}
+          onRefreshDraftSession={async () => {
+            const contextRef = manualPanel.raw.context_ref;
+            const sequence = ++manualDetailSequence.current;
+            const raw = await fetchManualQuestionCreation(contextRef);
+            if (sequence !== manualDetailSequence.current) return;
+            setManualPanel((current) => current?.raw.context_ref === contextRef
+              ? { ...current, raw }
+              : current);
           }}
           onSaveProposal={async ({
             creation_id,

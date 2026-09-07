@@ -1,0 +1,61 @@
+.experiment-log-window { position: fixed; z-index: 70; right: clamp(16px, 3vw, 42px); bottom: 18px; width: min(920px, calc(100vw - 32px)); height: min(570px, calc(100dvh - 36px)); display: flex; flex-direction: column; min-height: 0; overflow: hidden; margin: 0; color: #d5deed; background: #10131b; border: 1px solid #414960; border-radius: 14px; box-shadow: 0 24px 72px rgba(10, 13, 22, .42); }
+.experiment-log-header { display: flex; flex: 0 0 auto; justify-content: space-between; align-items: center; gap: 16px; padding: 13px 16px; border-bottom: 1px solid #2e3548; background: #191e2b; }
+.experiment-log-header > div:first-child { min-width: 0; }
+.experiment-log-header small { display: block; color: #a1adc5; font-size: 11px; line-height: 1.6; }
+.experiment-log-header b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e2e8f5; font-size: 14px; font-weight: 550; line-height: 1.7; }
+.experiment-log-window-actions { display: flex; align-items: center; gap: 7px; flex: 0 0 auto; }
+.experiment-log-window button { cursor: pointer; border: 1px solid #48516d; border-radius: 6px; background: #252c3e; color: #d7dff1; font-size: 12px; line-height: 1.5; padding: 4px 9px; min-height: 30px; }
+.experiment-log-window button:hover { background: #343b52; border-color: #77729e; }
+.experiment-log-window button:focus-visible, .experiment-log-window select:focus-visible, .experiment-log-text:focus-visible { outline: 2px solid #aaa3ef; outline-offset: 2px; }
+.experiment-log-window-actions button:last-child { width: 30px; padding: 0; font-size: 19px; }
+.experiment-log-body { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; padding: 13px 16px 12px; gap: 10px; }
+.experiment-log-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 20px; font-size: 12px; color: #b2bdd2; }
+.experiment-log-history { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 5px; }
+.experiment-log-window button:disabled { opacity: .48; cursor: default; }
+.experiment-log-select { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+.experiment-log-select select { min-width: 0; flex: 1; height: 33px; border: 1px solid #414b65; border-radius: 6px; padding: 4px 8px; background: #1b2130; color: #e0e7f3; font: 12px var(--utility, ui-monospace, monospace); }
+.experiment-log-select select:disabled { color: #98a5bd; opacity: 1; }
+.experiment-log-wrap { display: flex; align-items: center; gap: 5px; white-space: nowrap; cursor: pointer; }
+.experiment-log-wrap input { accent-color: #aaa3ef; }
+.experiment-log-states { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 20px; font-size: 11px; line-height: 1.6; color: #a5b1c8; }
+.experiment-log-states i { display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: #9187cc; vertical-align: 1px; }
+.experiment-log-states [data-connection="connected"] i { background: #65baaa; }
+.experiment-log-states [data-connection="error"] i { background: #dc997a; }
+.experiment-log-states [data-connection="paused"] i { background: #8b96ab; }
+.experiment-log-file-facts { flex: 0 0 auto; display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 3px 15px; color: #8393ae; font-size: 11px; line-height: 1.6; }
+.experiment-log-file-facts code { min-width: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #b5c1d6; font: 11px/1.6 var(--utility, ui-monospace, monospace); }
+.experiment-log-notice { display: flex; flex: 0 0 auto; align-items: center; flex-wrap: wrap; gap: 5px 10px; max-height: 85px; overflow: auto; font-size: 12px; line-height: 1.6; color: #aab9d4; background: #1d2434; padding: 7px 10px; border-radius: 5px; }
+.experiment-log-notice > span { flex: 1; min-width: 180px; }
+.experiment-log-notice.is-error { color: #e0b295; background: #302721; }
+.experiment-log-notice button { min-height: 24px; padding: 2px 7px; }
+.experiment-log-notice details { font-size: 11px; }
+.experiment-log-notice summary { cursor: pointer; }
+.experiment-log-notice details code { overflow-wrap: anywhere; }
+.experiment-log-text { flex: 1 1 auto; min-width: 0; min-height: 80px; width: 100%; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 9px 4px; color: #d5ded9; background: #10131b; font: 12px/1.7 var(--utility, ui-monospace, monospace); white-space: pre; tab-size: 4; }
+.experiment-log-text[data-wrap="true"] { white-space: pre-wrap; overflow-wrap: anywhere; }
+.experiment-log-text:focus-visible { outline-offset: -2px; }
+.experiment-log-empty { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; min-height: 90px; padding: 15px; color: #a4b1c8; font-size: 12px; line-height: 1.8; }
+.experiment-log-empty > span { font-size: 27px; color: #7c86a2; margin-bottom: 12px; }
+.experiment-log-empty b { color: #c7d1e3; font-size: 14px; font-weight: 500; }
+.experiment-log-empty p { max-width: 500px; margin: 8px 0 0; }
+.experiment-log-empty-file { flex: 0 0 auto; font-size: 12px; color: #99a8c1; margin: 0; }
+.experiment-log-footer { flex: 0 0 auto; border-top: 1px solid #30384c; padding-top: 10px; }
+.experiment-log-follow-state { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; min-height: 30px; font-size: 12px; color: #adbcd4; }
+.experiment-log-follow-state button { border-color: #686296; color: #d0c9fc; background: #2b2943; }
+.experiment-log-footer small { display: block; color: #7e8fa9; font-size: 10px; line-height: 1.6; margin-top: 3px; }
+.experiment-log-window[data-minimized="true"] { width: min(510px, calc(100vw - 32px)); height: auto; }
+.experiment-log-minimized { padding: 7px 16px; margin: 0; font-size: 11px; line-height: 1.5; color: #9eadc7; }
+@media (max-width: 600px) {
+  .experiment-log-window { right: 8px; bottom: 10px; width: calc(100vw - 16px); height: min(610px, calc(100dvh - 20px)); border-radius: 12px; }
+  .experiment-log-header { padding: 10px 12px; gap: 10px; }
+  .experiment-log-header b { font-size: 12px; }
+  .experiment-log-header small { font-size: 10px; }
+  .experiment-log-body { padding: 11px 12px; }
+  .experiment-log-toolbar { flex-wrap: wrap; gap: 8px; }
+  .experiment-log-select { flex-basis: 100%; gap: 8px; }
+  .experiment-log-wrap { margin-left: auto; font-size: 11px; }
+  .experiment-log-states { gap: 10px; }
+  .experiment-log-file-facts { flex-direction: column; }
+  .experiment-log-text { font-size: 11px; }
+  .experiment-log-window[data-minimized="true"] { width: calc(100vw - 16px); }
+}

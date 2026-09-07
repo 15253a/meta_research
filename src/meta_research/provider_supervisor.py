@@ -1430,8 +1430,11 @@ def _bounded_stdout_drain(
     errors: list[BaseException],
 ) -> None:
     written = 0
+    # BufferedReader.read(n) waits for n bytes or EOF, hiding short live replies.
+    # read1 consumes the bytes currently available without filling the buffer.
+    read_available = getattr(stream, "read1", stream.read)
     try:
-        while chunk := stream.read(64 * 1024):
+        while chunk := read_available(64 * 1024):
             remaining = maximum_bytes - written
             if remaining > 0:
                 accepted = chunk[:remaining]

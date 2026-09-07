@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from meta_research import __version__
+from meta_research.database import Database
+from meta_research.query_timing import measure_query, query_section, record_attempt
 from meta_research.feed import DurableFeed
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
@@ -59,7 +63,9 @@ class PublicProjection:
         quest_completion: QuestCompletionService | None = None,
         writing: WritingReportService | None = None,
         harnesses: HarnessRuntime | None = None,
+        database: Database | None = None,
     ) -> None:
+        self._database = database
         self._feed = feed
         self._object_store = object_store
         self._human_collaboration = human_collaboration
@@ -361,142 +367,176 @@ class PublicProjection:
         *,
         asset_offset: int = 0,
         asset_limit: int = ASSET_PROJECTION_PAGE_SIZE,
+        include_assets: bool = True,
+        include_history: bool = True,
+        include_stages: bool = True,
+    ) -> dict[str, object]:
+        cut = self._database.read_snapshot() if self._database else nullcontext()
+        with measure_query("snapshot") as timing, cut:
+            snapshot = self._query_snapshot(
+                asset_offset=asset_offset, asset_limit=asset_limit,
+                include_assets=include_assets, include_history=include_history,
+                include_stages=include_stages,
+            )
+            snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
+            snapshot["query_diagnostics"] = timing.public()
+            return snapshot
+
+    def _query_snapshot(
+        self,
+        *,
+        asset_offset: int,
+        asset_limit: int,
+        include_assets: bool,
+        include_history: bool,
+        include_stages: bool,
     ) -> dict[str, object]:
         if asset_offset < 0 or not 1 <= asset_limit <= ASSET_PROJECTION_MAX_PAGE_SIZE:
             raise ValueError("asset_projection_page_invalid")
         snapshot_consistent = False
-        for _attempt in range(_MAX_SNAPSHOT_ATTEMPTS):
+        for _attempt in range(1 if self._database else _MAX_SNAPSHOT_ATTEMPTS):
+            record_attempt()
+            query_warnings = []
+
+            def query_stage(name, worker):
+                if worker is None or not include_stages:
+                    return None
+                try:
+                    return worker.query_current()
+                except OwnerConflict as error:
+                    query_warnings.append({"section": name, "code": error.code})
+                    return None
+
             feed_before = self._feed.query_readiness()
-            owner_snapshots = {}
-            for name, owner in self._interfaces.items():
-                projection_query = getattr(owner, "query_projection_snapshot", None)
-                owner_snapshots[name] = (
-                    projection_query()
-                    if callable(projection_query)
-                    else owner.query_snapshot()
+            with query_section("owners"):
+                owner_snapshots = {}
+                for name, owner in self._interfaces.items():
+                    projection_query = getattr(owner, "query_projection_snapshot", None)
+                    owner_snapshots[name] = (
+                        projection_query()
+                        if callable(projection_query)
+                        else owner.query_snapshot()
+                    )
+            with query_section("runtime_and_collaboration_scope"):
+                runtime_observability_query = getattr(
+                    self._agent_runtime, "query_runtime_observability", None
                 )
-            runtime_observability_query = getattr(
-                self._agent_runtime, "query_runtime_observability", None
-            )
-            runtime_observability = (
-                runtime_observability_query()
-                if callable(runtime_observability_query)
-                else {
-                    "schema_ref": "meta-research/runtime-observability/v1",
-                    "status": "unavailable",
-                    "reason": {"code": "runtime_protection_unavailable"},
-                }
-            )
-            current_quest_creation = (
-                self._human_collaboration.query_current_quest_creation()
-            )
-            collaboration_scope_query = getattr(
-                self._human_collaboration, "query_collaboration_scope", None
-            )
-            collaboration_scope = (
-                collaboration_scope_query()
-                if callable(collaboration_scope_query)
-                else _collaboration_scope(current_quest_creation)
-            )
-            control_quest_ref = (
-                collaboration_scope.removeprefix("quest:")
-                if collaboration_scope.startswith("quest:")
-                else None
-            )
-            foreground_query = getattr(
-                self._advancement_engine, "query_foreground", None
-            )
-            foregrounds_by_quest: dict[str, dict[str, object] | None] = {}
-            if control_quest_ref is not None and callable(foreground_query):
-                foregrounds_by_quest[control_quest_ref] = foreground_query(
-                    control_quest_ref
+                runtime_observability = (
+                    runtime_observability_query()
+                    if callable(runtime_observability_query)
+                    else {
+                        "schema_ref": "meta-research/runtime-observability/v1",
+                        "status": "unavailable",
+                        "reason": {"code": "runtime_protection_unavailable"},
+                    }
                 )
-            managed_runs_query = getattr(
-                self._agent_runtime, "query_managed_runs", None
-            )
-            prune_records_query = getattr(
-                self._research_graph, "query_restorable_prune_records", None
-            )
-            research_control = (
-                {
-                    "status": "ready",
-                    "quest_ref": control_quest_ref,
-                    "foreground": foregrounds_by_quest[control_quest_ref],
-                    "managed_runs": list(managed_runs_query(control_quest_ref)),
-                    "recovery_records": (
-                        list(prune_records_query(control_quest_ref))
-                        if callable(prune_records_query)
-                        else []
-                    ),
-                    "actions": [
-                        "pause",
-                        "resume",
-                        "normal_switch",
-                        "forced_switch",
-                        "cancel",
-                        "abandon",
-                        "prune",
-                        "restore",
-                    ],
-                }
-                if control_quest_ref is not None
-                and callable(foreground_query)
-                and callable(managed_runs_query)
-                else {
-                    "status": "capability_unavailable",
-                    "quest_ref": control_quest_ref,
-                    "foreground": None,
-                    "managed_runs": [],
-                    "recovery_records": [],
-                    "actions": [],
-                }
-                if control_quest_ref is not None
-                else {
-                    "status": "idle",
-                    "quest_ref": None,
-                    "foreground": None,
-                    "managed_runs": [],
-                    "recovery_records": [],
-                    "actions": [],
-                }
-            )
-            current_quest = _query_current_quest_goal(
-                self._research_graph,
-                control_quest_ref,
-            )
-            current_foreground = (
-                foregrounds_by_quest.get(control_quest_ref)
-                if control_quest_ref is not None
-                else None
-            )
-            successor_context_query = getattr(
-                self._advancement_engine,
-                "query_reasoning_successor_context",
-                None,
-            )
-            successor_context = (
-                successor_context_query(current_foreground["cycle_ref"])
-                if isinstance(current_foreground, dict)
-                and isinstance(current_foreground.get("cycle_ref"), str)
-                and callable(successor_context_query)
-                else None
-            )
-            idea_stage = (
-                None if self._idea_stage is None else self._idea_stage.query_current()
-            )
-            plan_stage = (
-                None if self._plan_stage is None else self._plan_stage.query_current()
-            )
-            bundle_stage = (
-                None
-                if self._bundle_stage is None
-                else self._bundle_stage.query_current()
-            )
-            reasoning_stage = (
-                None
-                if self._reasoning_stage is None
-                else self._reasoning_stage.query_current()
-            )
+                current_quest_creation = (
+                    self._human_collaboration.query_current_quest_creation()
+                )
+                collaboration_scope_query = getattr(
+                    self._human_collaboration, "query_collaboration_scope", None
+                )
+                collaboration_scope = (
+                    collaboration_scope_query()
+                    if callable(collaboration_scope_query)
+                    else _collaboration_scope(current_quest_creation)
+                )
+                control_quest_ref = (
+                    collaboration_scope.removeprefix("quest:")
+                    if collaboration_scope.startswith("quest:")
+                    else None
+                )
+            with query_section("research_control"):
+                foreground_query = getattr(
+                    self._advancement_engine, "query_foreground", None
+                )
+                foregrounds_by_quest: dict[str, dict[str, object] | None] = {}
+                if control_quest_ref is not None and callable(foreground_query):
+                    foregrounds_by_quest[control_quest_ref] = foreground_query(
+                        control_quest_ref
+                    )
+                managed_runs_query = getattr(
+                    self._agent_runtime, "query_managed_runs", None
+                )
+                prune_records_query = getattr(
+                    self._research_graph, "query_restorable_prune_records", None
+                )
+                research_control = (
+                    {
+                        "status": "ready",
+                        "quest_ref": control_quest_ref,
+                        "foreground": foregrounds_by_quest[control_quest_ref],
+                        "managed_runs": list(managed_runs_query(control_quest_ref)),
+                        "recovery_records": (
+                            list(prune_records_query(control_quest_ref))
+                            if include_history and callable(prune_records_query)
+                            else []
+                        ),
+                        "actions": [
+                            "pause",
+                            "resume",
+                            "normal_switch",
+                            "forced_switch",
+                            "cancel",
+                            "abandon",
+                            "prune",
+                            "restore",
+                        ],
+                    }
+                    if control_quest_ref is not None
+                    and callable(foreground_query)
+                    and callable(managed_runs_query)
+                    else {
+                        "status": "capability_unavailable",
+                        "quest_ref": control_quest_ref,
+                        "foreground": None,
+                        "managed_runs": [],
+                        "recovery_records": [],
+                        "actions": [],
+                    }
+                    if control_quest_ref is not None
+                    else {
+                        "status": "idle",
+                        "quest_ref": None,
+                        "foreground": None,
+                        "managed_runs": [],
+                        "recovery_records": [],
+                        "actions": [],
+                    }
+                )
+                current_quest = _query_current_quest_goal(
+                    self._research_graph,
+                    control_quest_ref,
+                )
+                current_foreground = (
+                    foregrounds_by_quest.get(control_quest_ref)
+                    if control_quest_ref is not None
+                    else None
+                )
+                successor_context_query = getattr(
+                    self._advancement_engine,
+                    "query_reasoning_successor_context",
+                    None,
+                )
+                successor_context = (
+                    successor_context_query(current_foreground["cycle_ref"])
+                    if isinstance(current_foreground, dict)
+                    and isinstance(current_foreground.get("cycle_ref"), str)
+                    and callable(successor_context_query)
+                    else None
+                )
+            with query_section("idea_stage"):
+                idea_stage = query_stage("idea_stage", self._idea_stage)
+            with query_section("plan_stage"):
+                plan_stage = query_stage("plan_stage", self._plan_stage)
+            with query_section("bundle_stage"):
+                bundle_stage = query_stage("bundle_stage", self._bundle_stage)
+            with query_section("reasoning_stage"):
+                reasoning_stage = query_stage("reasoning_stage", self._reasoning_stage)
+            if isinstance(bundle_stage, dict):
+                graph_view = bundle_stage.get("target_graph", {})
+                for warning in graph_view.get("observation_errors", []):
+                    query_warnings.append({"section": "bundle_stage", **warning})
             idea_stage = _with_typed_stage_skip(
                 idea_stage,
                 stage="idea",
@@ -531,207 +571,205 @@ class PublicProjection:
                 if self._quest_completion is None
                 else self._quest_completion.query_current()
             )
-            current_question = _query_foreground_question(
-                self._research_graph,
-                self._research_memory,
-                current_foreground,
-                graph_revision=owner_snapshots["research_graph"].revision,
-            )
-            furthest_accepted_stage_result = _furthest_accepted_stage_result(
-                current_foreground,
-                idea_stage=idea_stage,
-                plan_stage=plan_stage,
-                bundle_stage=bundle_stage,
-                reasoning_stage=reasoning_stage,
-            )
-            writing = (
-                {
-                    "status": "unavailable",
-                    "document_types": ["report"],
-                    "runs": [],
-                    "reason": {"code": "writing_capability_not_configured"},
-                }
-                if self._writing is None
-                else self._writing.query_overview()
-            )
-            harnesses = (
-                {
-                    "status": "capability_unavailable",
-                    "reason": {"code": "harness_runtime_unavailable"},
-                    "gateway": None,
-                    "adapters": [],
-                }
-                if self._harnesses is None
-                else self._harnesses.query_status()
-            )
-            question_tree_items: list[dict[str, object]] = []
-            question_tree_reason: dict[str, str] | None = None
-            query_question_tree = getattr(
-                self._research_graph, "query_question_tree", None
-            )
-            if callable(query_question_tree) and control_quest_ref is not None:
-                try:
-                    for question in query_question_tree(control_quest_ref):
-                        content = self._research_memory.read_question_content(
-                            question.content_ref, question.content_hash
-                        )
-                        query_lifecycle = getattr(
-                            self._research_graph, "query_question_lifecycle", None
-                        )
-                        lifecycle = (
-                            query_lifecycle(question.question_ref)
-                            if callable(query_lifecycle)
-                            else {"status": "unavailable", "revision": None}
-                        )
-                        question_item: dict[str, object] = {
-                            "question_ref": question.question_ref,
-                            "quest_ref": question.quest_ref,
-                            "parent_question_ref": question.parent_question_ref,
-                            "title": content.get("title"),
-                            "unknown_statement": content.get("unknown_statement"),
-                            "content_ref": question.content_ref,
-                            "content_hash": question.content_hash,
-                            "schema_ref": question.schema_ref,
-                            "question_receipt_ref": question.receipt.receipt_ref,
-                            "lifecycle_status": lifecycle["status"],
-                            "lifecycle_revision": lifecycle["revision"],
-                            "cycle_binding": _query_question_cycle_binding(
-                                foreground_query,
-                                foregrounds_by_quest,
-                                quest_ref=question.quest_ref,
-                                question_ref=question.question_ref,
-                            ),
-                        }
-                        if _is_exact_foreground_question(
-                            current_foreground,
-                            quest_ref=question.quest_ref,
-                            question_ref=question.question_ref,
-                        ):
-                            question_item["furthest_accepted_stage_result"] = (
-                                furthest_accepted_stage_result
-                            )
-                        question_tree_items.append(question_item)
-                except OwnerConflict as error:
-                    question_tree_items = []
-                    question_tree_reason = {"code": str(error)}
-            human_requests = tuple(
-                request
-                for owner in (
+            with query_section("history_and_writing"):
+                current_question = _query_foreground_question(
                     self._research_graph,
                     self._research_memory,
-                    self._agent_runtime,
-                    self._advancement_engine,
+                    current_foreground,
+                    graph_revision=owner_snapshots["research_graph"].revision,
                 )
-                for request in owner.query_human_requests()
-            )
-            for question in question_tree_items:
-                cycle_binding = question["cycle_binding"]
-                assert isinstance(cycle_binding, dict)
-                cycle_ref = cycle_binding.get("cycle_ref")
-                question["related_human_requests"] = _related_human_requests(
-                    human_requests,
-                    quest_ref=str(question["quest_ref"]),
-                    question_ref=str(question["question_ref"]),
-                    cycle_ref=cycle_ref if isinstance(cycle_ref, str) else None,
+                furthest_accepted_stage_result = _furthest_accepted_stage_result(
+                    current_foreground,
+                    idea_stage=idea_stage,
+                    plan_stage=plan_stage,
+                    bundle_stage=bundle_stage,
+                    reasoning_stage=reasoning_stage,
                 )
-            collaboration_scopes = tuple(
-                dict.fromkeys(
-                    [
-                        collaboration_scope,
-                        "runtime:telemetry",
-                        *(
-                            scope_ref
-                            for item in human_requests
-                            for scope_ref in (
-                                str(item["request_ref"]),
-                                f"human_request:{item['request_ref']}",
+                writing = (
+                    {
+                        "status": "unavailable",
+                        "document_types": ["report"],
+                        "runs": [],
+                        "reason": {"code": "writing_capability_not_configured"},
+                    }
+                    if self._writing is None
+                    else self._writing.query_overview() if include_history
+                    else {"status": "ready", "document_types": ["report"], "runs": [], "reason": None, "loaded": False}
+                )
+                harnesses = (
+                    {
+                        "status": "capability_unavailable",
+                        "reason": {"code": "harness_runtime_unavailable"},
+                        "gateway": None,
+                        "adapters": [],
+                    }
+                    if self._harnesses is None
+                    else self._harnesses.query_status()
+                )
+                question_tree_items: list[dict[str, object]] = []
+                question_tree_reason: dict[str, str] | None = None
+                query_question_tree = getattr(
+                    self._research_graph, "query_question_tree", None
+                )
+                if include_history and callable(query_question_tree) and control_quest_ref is not None:
+                    try:
+                        for question in query_question_tree(control_quest_ref):
+                            content = self._research_memory.read_question_content(
+                                question.content_ref, question.content_hash
                             )
-                        ),
-                    ]
+                            query_lifecycle = getattr(
+                                self._research_graph, "query_question_lifecycle", None
+                            )
+                            lifecycle = (
+                                query_lifecycle(question.question_ref)
+                                if callable(query_lifecycle)
+                                else {"status": "unavailable", "revision": None}
+                            )
+                            question_item: dict[str, object] = {
+                                "question_ref": question.question_ref,
+                                "quest_ref": question.quest_ref,
+                                "parent_question_ref": question.parent_question_ref,
+                                "title": content.get("title"),
+                                "unknown_statement": content.get("unknown_statement"),
+                                "content_ref": question.content_ref,
+                                "content_hash": question.content_hash,
+                                "schema_ref": question.schema_ref,
+                                "question_receipt_ref": question.receipt.receipt_ref,
+                                "lifecycle_status": lifecycle["status"],
+                                "lifecycle_revision": lifecycle["revision"],
+                                "cycle_binding": _query_question_cycle_binding(
+                                    foreground_query,
+                                    foregrounds_by_quest,
+                                    quest_ref=question.quest_ref,
+                                    question_ref=question.question_ref,
+                                ),
+                            }
+                            if _is_exact_foreground_question(
+                                current_foreground,
+                                quest_ref=question.quest_ref,
+                                question_ref=question.question_ref,
+                            ):
+                                question_item["furthest_accepted_stage_result"] = (
+                                    furthest_accepted_stage_result
+                                )
+                            question_tree_items.append(question_item)
+                    except OwnerConflict as error:
+                        question_tree_items = []
+                        question_tree_reason = {"code": str(error)}
+            with query_section("human_collaboration"):
+                human_requests = tuple(
+                    request
+                    for owner in (
+                        self._research_graph,
+                        self._research_memory,
+                        self._agent_runtime,
+                        self._advancement_engine,
+                    )
+                    for request in owner.query_human_requests()
                 )
-            )
-            collaboration = _query_collaboration_pages(
-                self._human_collaboration,
-                collaboration_scopes,
-            )
-            companion_session = self._human_collaboration.query_companion(
-                collaboration_scope
-            )
-            safe_runnable_basis = _safe_meaningful_runnable_basis(
-                self._agent_runtime,
-                collaboration_scope,
-                human_requests,
-            )
-            projection_inventory = getattr(
-                self._research_memory,
-                "query_asset_projection_inventory",
-                None,
-            )
-            research_assets = (
-                _query_bounded_inventory(
-                    projection_inventory,
-                    offset=asset_offset,
-                    limit=asset_limit,
+                for question in question_tree_items:
+                    cycle_binding = question["cycle_binding"]
+                    assert isinstance(cycle_binding, dict)
+                    cycle_ref = cycle_binding.get("cycle_ref")
+                    question["related_human_requests"] = _related_human_requests(
+                        human_requests,
+                        quest_ref=str(question["quest_ref"]),
+                        question_ref=str(question["question_ref"]),
+                        cycle_ref=cycle_ref if isinstance(cycle_ref, str) else None,
+                    )
+                collaboration_scopes = tuple(
+                    dict.fromkeys(
+                        [
+                            collaboration_scope,
+                            "runtime:telemetry",
+                            *(
+                                scope_ref
+                                for item in human_requests
+                                for scope_ref in (
+                                    str(item["request_ref"]),
+                                    f"human_request:{item['request_ref']}",
+                                )
+                            ),
+                        ]
+                    )
                 )
-                if callable(projection_inventory)
-                else self._research_memory.query_asset_inventory()[
-                    asset_offset : asset_offset + asset_limit
-                ]
-            )
-            if any(item.integrity != "verified" for item in research_assets):
-                research_memory_snapshot = owner_snapshots["research_memory"]
-                owner_snapshots["research_memory"] = OwnerSnapshot(
-                    owner=research_memory_snapshot.owner,
-                    revision=research_memory_snapshot.revision,
-                    facts={
-                        **research_memory_snapshot.facts,
-                        "asset_integrity": "failed",
-                    },
-                    status="unavailable",
+                collaboration = _query_collaboration_pages(
+                    self._human_collaboration,
+                    collaboration_scopes,
                 )
-            version_refs = tuple(item.version_ref for item in research_assets)
-            asset_custodies = _query_related(
-                self._research_memory.query_asset_custodies,
-                version_refs,
-                parameter="memory_refs",
-            )
-            projection_roles = getattr(
-                self._research_graph,
-                "query_asset_projection_roles",
-                self._research_graph.query_asset_roles,
-            )
-            asset_roles = _query_related(
-                projection_roles,
-                version_refs,
-                parameter="version_refs",
-                limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
-            )
-            inventory_by_ref = {item.version_ref: item for item in research_assets}
-            for asset_role in asset_roles:
-                asset_item = inventory_by_ref.get(asset_role.version_ref)
-                if asset_item is None or (
-                    asset_role.asset_ref != asset_item.asset_ref
-                    or asset_role.asset_hash != asset_item.content_hash
-                    or asset_role.manifest_hash != asset_item.manifest_hash
-                    or asset_role.asset_receipt != asset_item.receipt
-                ):
-                    raise OwnerConflict("asset_role_binding_invalid")
-            asset_holds = _query_related(
-                self._research_memory.query_asset_holds,
-                version_refs,
-                parameter="memory_refs",
-                limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
-            )
-            release_assessments = _query_related(
-                self._research_memory.query_release_eligibility_assessments,
-                version_refs,
-                parameter="memory_refs",
-                limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
-            )
-            asset_reference_revision = (
-                self._research_graph.query_asset_reference_revision()
-            )
-            feed_readiness = self._feed.query_readiness()
+                companion_session = self._human_collaboration.query_companion(
+                    collaboration_scope
+                )
+                safe_runnable_basis = _safe_meaningful_runnable_basis(
+                    self._agent_runtime,
+                    collaboration_scope,
+                    human_requests,
+                )
+            with query_section("research_assets"):
+                if include_assets:
+                    projection_inventory = getattr(
+                        self._research_memory,
+                        "query_asset_projection_inventory",
+                        None,
+                    )
+                    research_assets = (
+                        projection_inventory(offset=asset_offset, limit=asset_limit)
+                        if callable(projection_inventory)
+                        else self._research_memory.query_asset_inventory()[
+                            asset_offset : asset_offset + asset_limit
+                        ]
+                    )
+                    if any(item.integrity != "verified" for item in research_assets):
+                        research_memory_snapshot = owner_snapshots["research_memory"]
+                        owner_snapshots["research_memory"] = OwnerSnapshot(
+                            owner=research_memory_snapshot.owner,
+                            revision=research_memory_snapshot.revision,
+                            facts={
+                                **research_memory_snapshot.facts,
+                                "asset_integrity": "failed",
+                            },
+                            status="unavailable",
+                        )
+                    version_refs = tuple(item.version_ref for item in research_assets)
+                    asset_custodies = self._research_memory.query_asset_custodies(
+                        memory_refs=version_refs
+                    )
+                    projection_roles = getattr(
+                        self._research_graph,
+                        "query_asset_projection_roles",
+                        self._research_graph.query_asset_roles,
+                    )
+                    asset_roles = projection_roles(
+                        version_refs=version_refs,
+                        limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
+                    )
+                    inventory_by_ref = {item.version_ref: item for item in research_assets}
+                    for asset_role in asset_roles:
+                        asset_item = inventory_by_ref.get(asset_role.version_ref)
+                        if asset_item is None or (
+                            asset_role.asset_ref != asset_item.asset_ref
+                            or asset_role.asset_hash != asset_item.content_hash
+                            or asset_role.manifest_hash != asset_item.manifest_hash
+                            or asset_role.asset_receipt != asset_item.receipt
+                        ):
+                            raise OwnerConflict("asset_role_binding_invalid")
+                    asset_holds = self._research_memory.query_asset_holds(
+                        memory_refs=version_refs,
+                        limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
+                    )
+                    release_assessments = (
+                        self._research_memory.query_release_eligibility_assessments(
+                            memory_refs=version_refs,
+                            limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
+                        )
+                    )
+                    asset_reference_revision = (
+                        self._research_graph.query_asset_reference_revision()
+                    )
+                else:
+                    research_assets = asset_custodies = asset_roles = asset_holds = release_assessments = ()
+                    asset_reference_revision = owner_snapshots["research_graph"].revision
+            feed_readiness = feed_before if self._database else self._feed.query_readiness()
             if feed_before.current_revision == feed_readiness.current_revision:
                 snapshot_consistent = True
                 break
@@ -813,6 +851,7 @@ class PublicProjection:
                 },
             },
             "question_tree": {
+                "loaded": include_history,
                 "status": ("ready" if question_tree_reason is None else "unavailable"),
                 "items": question_tree_items,
                 "reason": question_tree_reason,
@@ -824,6 +863,7 @@ class PublicProjection:
                 "explicit_waiver": {"status": "ready"},
             },
             "research_assets": {
+                "loaded": include_assets,
                 "status": "ready",
                 "revision": revision,
                 "inventory_revision": research_memory.revision,
@@ -851,6 +891,7 @@ class PublicProjection:
             "writing": writing,
             "harnesses": harnesses,
             "runtime_observability": runtime_observability,
+            "query_warnings": query_warnings,
             "unavailable": _release_capabilities(),
         }
         for name, stage_projection in (
@@ -1329,10 +1370,6 @@ def _question_binding_document(
     }
 
 
-def _query_bounded_inventory(query, *, offset: int, limit: int):
-    return query(offset=offset, limit=limit)
-
-
 def _query_collaboration_pages(
     owner: HumanCollaborationInterface,
     scopes: tuple[str, ...],
@@ -1358,19 +1395,6 @@ def _query_collaboration_pages(
                     seen[name].add(identity)
                     combined[name].append(item)
     return combined
-
-
-def _query_related(
-    query,
-    version_refs: tuple[str, ...],
-    *,
-    parameter: str,
-    limit_per_version: int | None = None,
-):
-    kwargs: dict[str, object] = {parameter: version_refs}
-    if limit_per_version is not None:
-        kwargs["limit_per_version"] = limit_per_version
-    return query(**kwargs)
 
 
 def _collaboration_scope(

@@ -637,15 +637,15 @@ class AttemptExecutionReceiptVerifier(Protocol):
         *,
         proposal_ref: str,
         run_ref: str,
-        attempt_ref: str,
-        fence_ref: str,
+        attempt_ref: str | None = None,
+        fence_ref: str | None = None,
         graph_ref: str,
         base_generation: int,
         base_head_receipt: AcceptanceReceipt,
         proposal_hash: str,
         receipt: AcceptanceReceipt,
         require_checkpoint_current: bool = False,
-    ) -> None: ...
+    ) -> dict[str, str]: ...
 
     def verify_deepfetch_execution_receipt(
         self,
@@ -983,3 +983,91 @@ def decoded_object(value: str) -> dict[str, object]:
 
 def new_ref(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def accepted_idea_set_binding_from_public(
+    value: dict[str, object],
+) -> AcceptedIdeaSetBinding:
+    """Decode public lineage; the receiving Owner still verifies its authority."""
+
+    expected_fields = {
+        "outcome_ref",
+        "outcome_kind",
+        "content_ref",
+        "payload_hash",
+        "outcome_hash",
+        "content_receipt",
+        "outcome_receipt",
+        "stage_commit_ref",
+        "stage_commit_receipt",
+        "idea_set",
+    }
+    try:
+        idea_set = value["idea_set"]
+        if set(value) != expected_fields or not isinstance(idea_set, dict):
+            raise TypeError("accepted_idea_set")
+        refs = {
+            field: value[field]
+            for field in (
+                "outcome_ref",
+                "content_ref",
+                "payload_hash",
+                "outcome_hash",
+                "stage_commit_ref",
+            )
+        }
+        if any(not isinstance(item, str) or not item for item in refs.values()):
+            raise TypeError("accepted_idea_set")
+        binding = AcceptedIdeaSetBinding(
+            outcome_ref=cast(str, refs["outcome_ref"]),
+            outcome_kind=str(value["outcome_kind"]),
+            content_ref=cast(str, refs["content_ref"]),
+            payload_hash=cast(str, refs["payload_hash"]),
+            outcome_hash=cast(str, refs["outcome_hash"]),
+            content_receipt=acceptance_receipt_from_public(
+                value["content_receipt"]
+            ),
+            outcome_receipt=acceptance_receipt_from_public(
+                value["outcome_receipt"]
+            ),
+            stage_commit_ref=cast(str, refs["stage_commit_ref"]),
+            stage_commit_receipt=acceptance_receipt_from_public(
+                value["stage_commit_receipt"]
+            ),
+            idea_set=idea_set,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise OwnerConflict("accepted_idea_set_lineage_invalid") from error
+    if binding.as_dict() != value:
+        raise OwnerConflict("accepted_idea_set_lineage_invalid")
+    return binding
+
+
+def acceptance_receipt_from_public(value: object) -> AcceptanceReceipt:
+    """Decode the exact public receipt shape without asserting issuer trust."""
+
+    expected_fields = {
+        "status",
+        "issuer",
+        "kind",
+        "receipt_ref",
+        "subject_ref",
+        "payload_hash",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_fields
+        or value.get("status") != "accepted"
+        or any(
+            not isinstance(value.get(field), str) or not value.get(field)
+            for field in expected_fields - {"status"}
+        )
+    ):
+        raise TypeError("receipt")
+    return AcceptanceReceipt(
+        issuer=cast(str, value["issuer"]),
+        kind=cast(str, value["kind"]),
+        receipt_ref=cast(str, value["receipt_ref"]),
+        subject_ref=cast(str, value["subject_ref"]),
+        payload_hash=cast(str, value["payload_hash"]),
+    )

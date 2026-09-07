@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from typing import cast
-
 from meta_research.bundle_protocol import projection_plain_value
-from meta_research.owners.advancement_engine import AdvancementEngineInterface
+from meta_research.owners.advancement_engine import (
+    AdvancementEngineInterface,
+    StageCommit,
+    StageRunRequest,
+)
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.owners.research_graph import ResearchGraphInterface
 from meta_research.owners.research_memory import ResearchMemoryInterface
+from meta_research.target_commit_evidence import TARGET_COMMIT_EVIDENCE_MEDIA_TYPE
 from meta_research.writing_contract import WRITING_RESEARCH_SNAPSHOT_SCHEMA
 
 
@@ -78,6 +81,7 @@ class WritingResearchSnapshotReader:
                 }
             )
         sources: list[dict[str, object]] = []
+        target_roles: list[tuple[str, str]] = []
         for role in self._research_graph.query_asset_roles(quest_ref=quest_ref):
             asset = self._research_memory.query_asset_version(role.version_ref)
             if asset is None:
@@ -89,6 +93,13 @@ class WritingResearchSnapshotReader:
                 manifest_hash=asset.manifest_hash,
                 receipt=asset.receipt,
             )
+            root_ref = asset.provenance.get("target_commit_root_ref")
+            if (
+                role.role == "evidence"
+                and asset.media_type == TARGET_COMMIT_EVIDENCE_MEDIA_TYPE
+                and isinstance(root_ref, str)
+            ):
+                target_roles.append((role.role_ref, root_ref))
             sources.append(
                 {
                     "role": role.role,
@@ -103,6 +114,8 @@ class WritingResearchSnapshotReader:
                     "role_receipt": role.receipt.as_public_dict(),
                 }
             )
+        excluded_roles = self._excluded_target_source_roles(quest_ref, target_roles)
+        sources = [source for source in sources if source["role_ref"] not in excluded_roles]
         payload: dict[str, object] = {
             "schema_ref": WRITING_RESEARCH_SNAPSHOT_SCHEMA,
             "quest_ref": quest_ref,
@@ -115,7 +128,11 @@ class WritingResearchSnapshotReader:
             },
             "questions": questions,
             "accepted_sources": sources,
-            "advancement": self._advancement_snapshot(quest.initialization_id),
+            "advancement": self._advancement_snapshot(
+                quest_ref,
+                quest.initialization_id,
+                {str(question["question_ref"]) for question in questions},
+            ),
             "owner_revisions": owner_revisions,
         }
         basis_hash = canonical_hash(payload)
@@ -125,41 +142,123 @@ class WritingResearchSnapshotReader:
         }
         return {**snapshot, "snapshot_hash": canonical_hash(snapshot)}
 
+    def _excluded_target_source_roles(
+        self, quest_ref: str, target_roles: list[tuple[str, str]],
+    ) -> set[str]:
+        """Exclude only verified Target evidence outside the active research cut.
+
+        Generic human evidence has no implied Question lineage. Candidate SQL
+        establishes the active/shared boundary; the existing catalog verifies
+        each precise historical role before it can be removed from Writing.
+        """
+        excluded: set[str] = set()
+        for offset in range(0, len(target_roles), 256):
+            chunk = target_roles[offset:offset + 256]
+            role_refs = tuple(role_ref for role_ref, _root in chunk)
+            roots = tuple(dict.fromkeys(root for _role_ref, root in chunk))
+            _, historical = self._research_graph.query_target_commit_evidence_candidates(
+                quest_ref=quest_ref, target_commit_refs=roots,
+                role_refs=role_refs, current_only=False,
+            )
+            _, current = self._research_graph.query_target_commit_evidence_candidates(
+                quest_ref=quest_ref, target_commit_refs=roots,
+                role_refs=role_refs, current_only=True,
+            )
+            current_roles = {row["role_ref"] for row in current}
+            for row in historical:
+                if row["role_ref"] in current_roles:
+                    continue
+                _, verified = self._research_graph.query_plan_evidence_catalog(
+                    quest_ref=quest_ref,
+                    target_commit_refs=(str(row["target_commit_ref"]),),
+                    role_refs=(str(row["role_ref"]),), current_only=False,
+                )
+                if any(
+                    item["role_ref"] == row["role_ref"]
+                    and item["asset_version_ref"] == row["version_ref"]
+                    for item in verified
+                ):
+                    excluded.add(str(row["role_ref"]))
+        return excluded
+
     def _advancement_snapshot(
         self,
+        quest_ref: str,
         initialization_id: str,
+        question_refs: set[str],
     ) -> dict[str, object]:
-        cycle = self._advancement_engine.query_initial_cycle(initialization_id)
-        if cycle is None:
-            return {
-                "cycle": None,
-                "stages": self._empty_stages(),
-            }
-
-        stages = self._empty_stages()
-        for stage in ("idea", "plan"):
-            value = self._stage_value(cycle.cycle_ref, stage)
-            stages[stage] = {
-                "status": "accepted" if value is not None else "not_accepted",
-                "accepted": value,
-            }
-        bundle = self._bundle_stage_value(cycle.cycle_ref)
-        if bundle is not None:
-            stages["bundle"] = {
-                "status": (
-                    "accepted"
-                    if bundle["commit"] is not None
-                    else "report_accepted"
-                ),
-                "accepted": bundle,
-            }
-        return {
-            "cycle": {
+        initial = self._advancement_engine.query_initial_cycle(initialization_id)
+        cycles: list[dict[str, object]] = []
+        for cycle in self._advancement_engine.query_quest_stage_history(quest_ref):
+            if cycle.question_ref not in question_refs:
+                continue
+            requests = {request.request_ref: request for request in cycle.requests}
+            committed_requests = {commit.request_ref for commit in cycle.commits}
+            entries: list[tuple[StageRunRequest | None, StageCommit | None]] = [
+                (requests.get(commit.request_ref), commit) for commit in cycle.commits
+            ]
+            entries.extend(
+                (request, None)
+                for request in cycle.requests
+                if request.stage == "bundle"
+                and request.request_ref not in committed_requests
+            )
+            entries.sort(key=self._history_entry_order)
+            stages = self._empty_stages()
+            history: list[dict[str, object]] = []
+            for request, commit in entries:
+                fact = commit or request
+                assert fact is not None
+                if fact.stage == "bundle" and request is not None:
+                    value = self._bundle_stage_value(request, commit)
+                elif commit is None:
+                    continue
+                elif commit.disposition != "completed":
+                    value = {**self._commit_value(commit), "result": None}
+                elif request is None:
+                    raise OwnerConflict("writing_stage_request_missing")
+                elif fact.stage == "reasoning":
+                    value = self._reasoning_stage_value(request, commit)
+                else:
+                    value = self._stage_value(request, commit)
+                if value is None:
+                    continue
+                status = (
+                    "report_accepted"
+                    if commit is None
+                    else "accepted"
+                    if commit.disposition == "completed"
+                    else commit.disposition
+                )
+                stage_value = {"status": status, "accepted": value}
+                stages[fact.stage] = stage_value
+                history.append(
+                    {"stage": fact.stage, "epoch": fact.epoch, **stage_value}
+                )
+            identity: dict[str, object] = {
                 "cycle_ref": cycle.cycle_ref,
-                "receipt": cycle.receipt.as_public_dict(),
-            },
-            "stages": stages,
+                "question_ref": cycle.question_ref,
+            }
+            if initial is not None and initial.cycle_ref == cycle.cycle_ref:
+                identity["receipt"] = initial.receipt.as_public_dict()
+            cycles.append(
+                {"cycle": identity, "stages": stages, "stage_history": history}
+            )
+        # The summary is only the newest Cycle. The history remains the complete
+        # frozen research basis, including earlier epochs of the same Stage.
+        return {
+            "cycle": None if not cycles else cycles[-1]["cycle"],
+            "stages": self._empty_stages() if not cycles else cycles[-1]["stages"],
+            "cycles": cycles,
         }
+
+    @staticmethod
+    def _history_entry_order(
+        entry: tuple[StageRunRequest | None, StageCommit | None],
+    ) -> tuple[int, int]:
+        fact = entry[1] or entry[0]
+        assert fact is not None
+        return fact.epoch, ("idea", "plan", "bundle", "reasoning").index(fact.stage)
 
     @staticmethod
     def _empty_stages() -> dict[str, dict[str, object]]:
@@ -171,22 +270,9 @@ class WritingResearchSnapshotReader:
         }
 
     def _stage_value(
-        self, cycle_ref: str, stage: str
-    ) -> dict[str, object] | None:
-        request = (
-            self._advancement_engine.query_idea_stage_request(cycle_ref)
-            if stage == "idea"
-            else self._advancement_engine.query_plan_stage_request(cycle_ref)
-        )
-        if request is None:
-            return None
-        commit = (
-            self._advancement_engine.query_idea_stage_commit(request.request_ref)
-            if stage == "idea"
-            else self._advancement_engine.query_plan_stage_commit(request.request_ref)
-        )
-        if commit is None:
-            return None
+        self, request: StageRunRequest, commit: StageCommit
+    ) -> dict[str, object]:
+        stage = request.stage
         stage_run = (
             self._agent_runtime.query_idea_stage_run(request.request_ref)
             if stage == "idea"
@@ -237,18 +323,64 @@ class WritingResearchSnapshotReader:
                 "content_receipt": plan.receipt.as_public_dict(),
                 "acceptance_receipt": decision.receipt.as_public_dict(),
             }
+        return {**self._commit_value(commit), "result": result}
+
+    def _reasoning_stage_value(
+        self, request: StageRunRequest, commit: StageCommit
+    ) -> dict[str, object]:
+        run = self._agent_runtime.query_reasoning_stage_run(request.request_ref)
+        if (
+            run is None
+            or run.execution is None
+            or run.completion is None
+            or run.run_ref != commit.run_ref
+            or run.completion.receipt != commit.run_completion_receipt
+        ):
+            raise OwnerConflict("writing_reasoning_result_missing")
+        submission_ref = run.execution.submission_ref
+        content = self._research_memory.query_reasoning_content(submission_ref)
+        decision = self._research_graph.query_reasoning_outcome_decision(submission_ref)
+        if (
+            content is None
+            or decision is None
+            or decision.decision != "accepted"
+            or content.request_ref != request.request_ref
+            or content.cycle_ref != request.cycle_ref
+            or content.foreground_epoch != request.epoch
+            or content.run_ref != commit.run_ref
+            or content.stage_request_receipt != request.receipt
+            or content.outcome_hash != decision.outcome_hash
+            or content.content_ref != decision.content_ref
+            or content.transition_hash != decision.transition_hash
+            or decision.request_ref != request.request_ref
+            or decision.run_ref != commit.run_ref
+            or decision.outcome_ref != commit.outcome_ref
+            or decision.receipt != commit.outcome_receipt
+            or run.completion.outcome_ref != commit.outcome_ref
+            or run.completion.decision_receipt != decision.receipt
+        ):
+            raise OwnerConflict("writing_reasoning_result_invalid")
         return {
-            "commit_ref": commit.commit_ref,
-            "request_ref": request.request_ref,
-            "epoch": request.epoch,
-            "outcome_ref": commit.outcome_ref,
-            "outcome_kind": commit.outcome_kind,
-            "disposition": commit.disposition,
-            "receipt": commit.receipt.as_public_dict(),
-            "result": result,
+            **self._commit_value(commit),
+            "result": {
+                "content_ref": content.content_ref,
+                "content_hash": content.payload_hash,
+                "outcome_hash": content.outcome_hash,
+                "outcome": content.outcome,
+                "transition_kind": content.transition_kind,
+                "transition_ref": content.transition_ref,
+                "transition_hash": content.transition_hash,
+                "frozen_evidence_closure": projection_plain_value(
+                    content.frozen_evidence_closure
+                ),
+                "content_receipt": content.receipt.as_public_dict(),
+                "acceptance_receipt": decision.receipt.as_public_dict(),
+            },
         }
 
-    def _bundle_stage_value(self, cycle_ref: str) -> dict[str, object] | None:
+    def _bundle_stage_value(
+        self, request: StageRunRequest, commit: StageCommit | None
+    ) -> dict[str, object] | None:
         """Read only immutable Bundle acceptances from public AE/AR seams.
 
         The AR StageRun is used solely as a stable request-to-run lookup and,
@@ -257,9 +389,7 @@ class WritingResearchSnapshotReader:
         become Writing input.
         """
 
-        request = self._advancement_engine.query_bundle_stage_request(cycle_ref)
-        if request is None:
-            return None
+        cycle_ref = request.cycle_ref
         accepted_plan = request.accepted_formal_plan
         if (
             request.stage != "bundle"
@@ -327,9 +457,6 @@ class WritingResearchSnapshotReader:
             ):
                 raise OwnerConflict("writing_bundle_result_invalid")
 
-        commit = self._advancement_engine.query_bundle_stage_commit(
-            request.request_ref
-        )
         if commit is None and report is None:
             return None
         if commit is not None and (
@@ -426,7 +553,7 @@ class WritingResearchSnapshotReader:
                     "receipt": run_completion.receipt.as_public_dict(),
                 }
             ),
-            "commit": None if commit is None else self._bundle_commit_value(commit),
+            "commit": None if commit is None else self._commit_value(commit),
         }
 
     @staticmethod
@@ -471,7 +598,7 @@ class WritingResearchSnapshotReader:
         }
 
     @staticmethod
-    def _bundle_commit_value(commit) -> dict[str, object]:
+    def _commit_value(commit) -> dict[str, object]:
         return {
             "commit_ref": commit.commit_ref,
             "request_ref": commit.request_ref,

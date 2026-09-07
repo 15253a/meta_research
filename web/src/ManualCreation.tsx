@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
 } from "react";
 
+import { useReplyStream } from "./chatReplyStream";
 import "./ManualCreation.css";
 
 
@@ -188,6 +189,7 @@ export type ManualCreationProps = {
     expected_basis_hash: string;
     message: string;
   }) => void | Promise<void>;
+  onRefreshDraftSession?: () => void | Promise<void>;
   onSaveProposal: (
     input: ManualCreationProposalSaveInput,
   ) => ManualQuestionProposalView | Promise<ManualQuestionProposalView>;
@@ -419,6 +421,7 @@ export function ManualCreation({
   onStartDeepFetch,
   onConfirmWaiver,
   onSendDraftMessage,
+  onRefreshDraftSession,
   onSaveProposal,
   onConfirmProposal,
   onMaterialDraftChange,
@@ -427,6 +430,7 @@ export function ManualCreation({
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const seedInputRef = useRef<HTMLTextAreaElement>(null);
   const sessionInputRef = useRef<HTMLTextAreaElement>(null);
+  const sessionTranscriptRef = useRef<HTMLDivElement>(null);
   const firstMissingFieldRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
   const researchActionRef = useRef<HTMLButtonElement>(null);
   const errorRef = useRef<HTMLDivElement>(null);
@@ -437,6 +441,7 @@ export function ManualCreation({
   const mountedRef = useRef(true);
   const savePromiseRef = useRef<Promise<ManualQuestionProposalView | null> | null>(null);
   const busyActionRef = useRef<BusyAction | null>(null);
+  const closingRef = useRef(false);
   const proposalDraftRef = useRef<ManualQuestionContent>(
     cloneContent(view.proposal?.content ?? view.seed.value?.fields ?? blankQuestion),
   );
@@ -463,9 +468,50 @@ export function ManualCreation({
             : "later",
   );
   const [messageDraft, setMessageDraft] = useState("");
+  const [pendingMessage, setPendingMessage] = useState<{
+    content: string;
+    previousTurnRefs: Set<string>;
+  } | null>(null);
+  const pendingMessageProjected = Boolean(pendingMessage && view.drafting_session.turns.some(
+    (turn) => turn.role === "user" && turn.content === pendingMessage.content
+      && !pendingMessage.previousTurnRefs.has(turn.turn_ref),
+  ));
+  const pendingReply = [...view.drafting_session.turns].reverse().find(
+    (turn) => turn.role === "assistant" && ["queued", "running"].includes(turn.status ?? ""),
+  );
+  const replyPath = pendingReply
+    ? `/api/v1/manual-question-creations/${encodeURIComponent(view.creation_id)}/drafting-session/turns/${encodeURIComponent(pendingReply.turn_ref.replace(/:assistant$/, ""))}/stream`
+    : null;
+  const refreshDraftRef = useRef(onRefreshDraftSession);
+  const draftRefreshPendingRef = useRef(false);
+  refreshDraftRef.current = onRefreshDraftSession;
+  const refreshDraft = useCallback(() => {
+    if (draftRefreshPendingRef.current) return;
+    draftRefreshPendingRef.current = true;
+    void Promise.resolve().then(() => refreshDraftRef.current?.()).catch(() => {
+      // The next projection refresh retries without turning an accepted send into a failure.
+    }).finally(() => { draftRefreshPendingRef.current = false; });
+  }, []);
+  const replyPreview = useReplyStream(replyPath, refreshDraft);
+
+  useEffect(() => {
+    if (pendingMessageProjected) setPendingMessage(null);
+  }, [pendingMessageProjected]);
+
+  useEffect(() => {
+    if (!replyPath) return;
+    const timer = window.setInterval(refreshDraft, 1500);
+    return () => window.clearInterval(timer);
+  }, [replyPath, refreshDraft]);
+
+  useEffect(() => {
+    const transcript = sessionTranscriptRef.current;
+    if (transcript) transcript.scrollTop = transcript.scrollHeight;
+  }, [view.drafting_session.turns, pendingMessage, replyPreview?.text]);
   const [proposalEditing, setProposalEditing] = useState(false);
   const [busyAction, setBusyAction] = useState<BusyAction | null>(null);
   const [proposalSaving, setProposalSaving] = useState(false);
+  const [closing, setClosing] = useState(false);
   const [seedConfirmationDispatched, setSeedConfirmationDispatched] = useState(false);
   const [researchActionDispatched, setResearchActionDispatched] = useState<
     "deepfetch" | "waiver" | null
@@ -496,7 +542,7 @@ export function ManualCreation({
   const proposalConfirmationPending =
     proposalConfirmationDispatched && !proposalConfirmed;
   const acceptedMaterialBindings = view.seed.value?.accepted_material_bindings ?? [];
-  const isBusy = busyAction !== null || proposalSaving;
+  const isBusy = busyAction !== null || proposalSaving || closing;
   const authoritativeProposal = savedProposal ?? view.proposal;
   const proposalDirty = !authoritativeProposal || !contentEquals(
     proposalDraft,
@@ -687,8 +733,9 @@ export function ManualCreation({
 
   useEffect(() => {
     if (!visibleFailure) return;
-    requestAnimationFrame(() => errorRef.current?.focus());
-  }, [visibleFailure]);
+    const frame = requestAnimationFrame(() => errorRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [visibleFailure?.code, visibleFailure?.message]);
 
   const finalizeClose = useCallback(() => {
     if (closeTimerRef.current !== null) return;
@@ -820,7 +867,9 @@ export function ManualCreation({
     const expectedBasisHash = view.research.basis_hash ?? view.seed.hash;
     const message = messageDraft.trim();
     const sessionRef = view.drafting_session.session_ref;
-    if (!seedConfirmed || !expectedBasisHash || !message || !sessionRef) return;
+    if (!seedConfirmed || !expectedBasisHash || !message || !sessionRef
+      || busyActionRef.current !== null || pendingMessage || !sessionReady
+      || terminal || writesUnavailable || proposalConfirmationPending) return;
     if (message.length > draftingMessageMaxLength) {
       setLocalFailure({
         code: "manual_drafting_message_too_long",
@@ -829,14 +878,23 @@ export function ManualCreation({
       sessionInputRef.current?.focus();
       return;
     }
+    const originalDraft = messageDraft;
+    setPendingMessage({
+      content: message,
+      previousTurnRefs: new Set(view.drafting_session.turns.map((turn) => turn.turn_ref)),
+    });
+    setMessageDraft("");
     const sent = await runAction("message", () => onSendDraftMessage({
       creation_id: view.creation_id,
       session_ref: sessionRef,
       expected_basis_hash: expectedBasisHash,
       message,
     }));
-    if (sent && mountedRef.current) {
-      setMessageDraft("");
+    if (mountedRef.current) {
+      if (!sent) {
+        setPendingMessage(null);
+        setMessageDraft((current) => current || originalDraft);
+      }
       requestAnimationFrame(() => sessionInputRef.current?.focus());
     }
   };
@@ -917,6 +975,27 @@ export function ManualCreation({
     view.research.basis_hash,
     writesUnavailable,
   ]);
+
+  const closePreservingProposal = async () => {
+    if (closingRef.current) return;
+    if (
+      !seedConfirmed || !researchSatisfied || !view.research.basis_hash ||
+      terminal || writesUnavailable || proposalConfirmed ||
+      !questionComplete(proposalDraftRef.current)
+    ) {
+      finalizeClose();
+      return;
+    }
+    closingRef.current = true;
+    setClosing(true);
+    const saved = await persistProposal();
+    if (saved) {
+      finalizeClose();
+    } else {
+      closingRef.current = false;
+      if (mountedRef.current) setClosing(false);
+    }
+  };
 
   const confirmProposal = async () => {
     const issue = contentIssue(proposalDraft, true);
@@ -1078,7 +1157,9 @@ export function ManualCreation({
           : proposalIsCurrent
             ? "当前精确 Proposal 已保存 · 可以确认最终问题"
             : "当前 Proposal 会先保存精确 identity，再提交确认";
-  const pendingActionLabel = proposalSaving
+  const pendingActionLabel = closing
+    ? "正在保存问题草案并关闭…"
+    : proposalSaving
     ? "正在保存 Proposal…"
     : seedConfirmationDispatched && !seedConfirmed
       ? "Seed confirmation 已提交 · 等待独立 HC receipt"
@@ -1100,10 +1181,10 @@ export function ManualCreation({
       onKeyDown={trapFocus}
       onCancel={(event) => {
         event.preventDefault();
-        finalizeClose();
+        void closePreservingProposal();
       }}
       onClick={(event) => {
-        if (event.target === event.currentTarget) finalizeClose();
+        if (event.target === event.currentTarget) void closePreservingProposal();
       }}
     >
       <section className="manual-window">
@@ -1123,10 +1204,12 @@ export function ManualCreation({
             className="manual-close"
             type="button"
             aria-label="关闭创建 Question 窗口"
-            onClick={finalizeClose}
+            onClick={() => void closePreservingProposal()}
+            aria-busy={closing}
+            title={closing ? "正在保存问题草案…" : "关闭窗口；完整的问题草案会先保存"}
             autoFocus
           >
-            ×
+            {closing ? <span className="manual-close-spinner" aria-hidden="true" /> : "×"}
           </button>
         </header>
 
@@ -1279,7 +1362,7 @@ export function ManualCreation({
                   }
                 >
                   <legend>还需要系统补充检索吗？</legend>
-                  <p>这里先记录 browser draft 偏好；Seed 确认后仍需单独执行 DeepFetch 或确认 waiver。</p>
+                  <p>先选择检索偏好；确认研究描述后，再决定是否启动文献检索。</p>
                   <div className="manual-fetch-options">
                     <button
                       type="button"
@@ -1343,7 +1426,7 @@ export function ManualCreation({
                     disabled:
                       proposalConfirmed || terminal || writesUnavailable ||
                       seedConfirmationPending || proposalConfirmationPending ||
-                      busyAction === "confirm",
+                      busyAction === "confirm" || closing,
                     placeholder: field.placeholder,
                     onChange: (
                       event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
@@ -1484,17 +1567,33 @@ export function ManualCreation({
                   )}
                 </section>
 
-                <div className="manual-session-transcript" aria-live="polite">
+                <div className="manual-session-transcript" ref={sessionTranscriptRef} aria-live="polite">
                   {view.drafting_session.turns.length ? view.drafting_session.turns.map((turn) => (
                     <article className={`manual-message ${turn.role}`} key={turn.turn_ref}>
                       <small>{turn.role === "user" ? "你" : "Draft Agent"} · {turn.status ?? "completed"}</small>
-                      {turn.content}
+                      <div style={{ whiteSpace: "pre-wrap" }}>{
+                        turn.turn_ref === pendingReply?.turn_ref
+                          ? replyPreview?.text || turn.content || "正在准备回复…"
+                          : turn.content || (turn.status === "failed" ? "回复未能完成，请重试。" : "")
+                      }</div>
                     </article>
-                  )) : (
+                  )) : !pendingMessage ? (
                     <p className="manual-session-empty">
                       Session 只消费已确认 Seed；讨论不会改写 Seed、确认 Proposal 或创建 Question。
                     </p>
-                  )}
+                  ) : null}
+                  {pendingMessage && !pendingMessageProjected ? (
+                    <>
+                      <article className="manual-message user">
+                        <small>你</small>
+                        <div style={{ whiteSpace: "pre-wrap" }}>{pendingMessage.content}</div>
+                      </article>
+                      <article className="manual-message assistant">
+                        <small>Draft Agent</small>
+                        <div>正在准备回复…</div>
+                      </article>
+                    </>
+                  ) : null}
                 </div>
 
                 <div className="manual-session-compose">
@@ -1507,7 +1606,7 @@ export function ManualCreation({
                       value={messageDraft}
                       maxLength={draftingMessageMaxLength}
                       disabled={
-                        !sessionReady || terminal || writesUnavailable || isBusy ||
+                        !sessionReady || terminal || writesUnavailable || isBusy || Boolean(pendingMessage) ||
                         proposalConfirmationPending
                       }
                       placeholder="讨论未知、答案形态、适用范围，或询问 DeepFetch 状态……"
@@ -1518,7 +1617,7 @@ export function ManualCreation({
                       type="button"
                       aria-label="发送消息"
                       disabled={
-                        !sessionReady || terminal || writesUnavailable || isBusy ||
+                        !sessionReady || terminal || writesUnavailable || isBusy || Boolean(pendingMessage) ||
                         proposalConfirmationPending || !messageDraft.trim() ||
                         messageDraft.trim().length > draftingMessageMaxLength
                       }
@@ -1590,7 +1689,9 @@ export function ManualCreation({
               }
               onClick={() => void confirmSeed()}
             >
-              确认当前 Seed，开始讨论
+              {seedConfirmationPending || busyAction === "seed"
+                ? "正在确认研究描述…"
+                : "确认当前 Seed，开始讨论"}
             </button>
           ) : (
             <button
@@ -1600,7 +1701,7 @@ export function ManualCreation({
               disabled={!canConfirmProposal}
               onClick={() => void confirmProposal()}
             >
-              {proposalConfirmed ? "问题已确认" : "确认最终问题"}
+              {proposalConfirmed ? "问题已确认" : proposalConfirmationPending || busyAction === "confirm" ? "正在确认问题…" : "确认最终问题"}
             </button>
           )}
         </footer>

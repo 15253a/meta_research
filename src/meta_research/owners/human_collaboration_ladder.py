@@ -35,7 +35,7 @@ from meta_research.runtime_protection import (
 )
 from meta_research.writing_contract import (
     WRITING_DOCUMENT_TYPES,
-    WRITING_RESEARCH_SNAPSHOT_SCHEMA,
+    SUPPORTED_WRITING_RESEARCH_SNAPSHOT_SCHEMAS,
     normalize_writing_intent,
     validate_writing_execution_budget,
 )
@@ -1211,6 +1211,40 @@ class SQLiteHumanCollaborationLadder:
             "status": "ready" if session is None else session.status,
             "turns": [_public_turn(item) for item in turns],
         }
+
+    def query_companion_reply(
+        self, scope_ref: str, interaction_ref: str
+    ) -> dict[str, object]:
+        """Observe an in-flight reply without making it an accepted Owner fact."""
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT turns.*, sessions.scope_ref, controls.control_revision "
+                    "FROM hc_companion_turns AS turns JOIN hc_companion_sessions AS "
+                    "sessions ON sessions.session_ref = turns.session_ref LEFT JOIN "
+                    "ar_run_controls AS controls ON controls.run_ref = "
+                    "turns.interaction_ref AND controls.run_kind = 'companion' AND "
+                    "controls.root_session_ref = sessions.session_ref AND "
+                    "controls.attempt_generation = turns.attempt_count WHERE "
+                    "turns.interaction_ref = :interaction_ref AND "
+                    "sessions.scope_ref = :scope_ref"
+                ),
+                {"interaction_ref": interaction_ref, "scope_ref": scope_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("companion_interaction_not_found")
+        turn = _public_turn(row)
+        status = str(turn["assistant_status"])
+        content = turn["assistant_content"] if status == "completed" else ""
+        observe = getattr(self._drafting_provider, "observe_reply", None)
+        if status == "processing" and callable(observe):
+            job_ref = _companion_operation_ref(interaction_ref)
+            if row.control_revision is not None and int(row.control_revision) > 1:
+                job_ref = _companion_continuation_job_ref(
+                    interaction_ref, int(row.control_revision)
+                )
+            content = observe(job_ref)
+        return {"turn_ref": interaction_ref, "status": status, "text": content or ""}
 
     def query_projection(
         self, scope_refs: tuple[str, ...]
@@ -2662,7 +2696,8 @@ class SQLiteHumanCollaborationLadder:
             snapshot_without_hash = dict(snapshot)
             embedded_hash = snapshot_without_hash.pop("snapshot_hash", None)
             if (
-                snapshot.get("schema_ref") != WRITING_RESEARCH_SNAPSHOT_SCHEMA
+                not isinstance(snapshot.get("schema_ref"), str)
+                or snapshot.get("schema_ref") not in SUPPORTED_WRITING_RESEARCH_SNAPSHOT_SCHEMAS
                 or snapshot.get("quest_ref") != payload["quest_ref"]
                 or snapshot.get("snapshot_ref") != payload["snapshot_ref"]
                 or embedded_hash != payload["snapshot_hash"]

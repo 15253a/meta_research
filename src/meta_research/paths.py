@@ -71,6 +71,22 @@ class DataRoot:
         return self.provider_homes / "codex"
 
     @property
+    def codex_user_home(self) -> Path:
+        return self.codex_home / "home"
+
+    @property
+    def codex_config(self) -> Path:
+        return self.codex_home / "config"
+
+    @property
+    def codex_data(self) -> Path:
+        return self.codex_home / "data"
+
+    @property
+    def codex_state(self) -> Path:
+        return self.codex_home / "state"
+
+    @property
     def codex_sessions(self) -> Path:
         return self.codex_home / "sessions"
 
@@ -150,7 +166,13 @@ class DataRoot:
         return {
             "CODEX_HOME": managed_home,
             "CODEX_SQLITE_HOME": managed_home,
+            "HOME": str(self.codex_user_home.absolute()),
+            "USERPROFILE": str(self.codex_user_home.absolute()),
+            "XDG_CONFIG_HOME": str(self.codex_config.absolute()),
+            "XDG_DATA_HOME": str(self.codex_data.absolute()),
+            "XDG_STATE_HOME": str(self.codex_state.absolute()),
             "XDG_CACHE_HOME": managed_cache,
+            "NODE_PATH": "",
             "PIP_CACHE_DIR": str(self.codex_pip_cache.absolute()),
             "npm_config_cache": str(self.codex_npm_cache.absolute()),
             "UV_CACHE_DIR": str(self.codex_uv_cache.absolute()),
@@ -248,6 +270,10 @@ def prepare_data_root(path: Path) -> DataRoot:
     for directory in (
         root.provider_homes,
         root.codex_home,
+        root.codex_user_home,
+        root.codex_config,
+        root.codex_data,
+        root.codex_state,
         root.codex_sessions,
         root.codex_archived_sessions,
         root.codex_cache,

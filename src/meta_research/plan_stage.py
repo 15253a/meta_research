@@ -21,6 +21,7 @@ from meta_research.owners.common import (
     AcceptanceReceipt,
     OwnerConflict,
     canonical_hash,
+    accepted_idea_set_binding_from_public,
 )
 from meta_research.owners.research_graph import (
     AcceptedQuestion,
@@ -194,7 +195,6 @@ class PlanStageWorker:
 
         run = self._agent_runtime.query_plan_stage_run(request.request_ref)
         if run is None:
-            provider_safe = True
             try:
                 runtime_binding = self._provider.runtime_binding()
             except PlanSkillUnavailable as error:
@@ -843,7 +843,7 @@ class PlanStageWorker:
             raw_binding = successor.get("accepted_idea_set_binding")
             if not isinstance(raw_binding, dict):
                 raise OwnerConflict("accepted_idea_set_lineage_invalid")
-            binding = _accepted_idea_set_binding_from_public(raw_binding)
+            binding = accepted_idea_set_binding_from_public(raw_binding)
             if binding.idea_set.get("question_ref") != current.question.question_ref:
                 raise OwnerConflict("accepted_idea_set_lineage_invalid")
             self._research_graph.verify_accepted_idea_set_binding(binding)
@@ -923,10 +923,9 @@ class PlanStageWorker:
 
     def _context_pack(self, eligible: _EligiblePlan) -> dict[str, object]:
         current = eligible.current
-        evidence_revision, evidence_catalog = (
-            self._research_graph.query_plan_evidence_catalog(
-                quest_ref=current.question.quest_ref
-            )
+        evidence_page, evidence_catalog = self._research_graph.query_plan_evidence_page(
+            quest_ref=current.question.quest_ref,
+            question_ref=current.question.question_ref,
         )
 
         return {
@@ -935,7 +934,8 @@ class PlanStageWorker:
             "accepted_question_binding": current.question.as_binding().as_dict(),
             "accepted_idea_set_binding": eligible.accepted_idea_set.as_dict(),
             "evidence_catalog": [dict(item) for item in evidence_catalog],
-            "evidence_reference_revision": evidence_revision,
+            "evidence_reference_revision": len(evidence_catalog),
+            "evidence_catalog_page": evidence_page,
         }
 
     def _assert_request_eligibility(
@@ -1058,87 +1058,6 @@ class PlanStageWorker:
 
 def _operation_key(prefix: str, *values: str) -> str:
     return f"{prefix}:{canonical_hash(list(values))}"
-
-
-def _accepted_idea_set_binding_from_public(
-    value: dict[str, object],
-) -> AcceptedIdeaSetBinding:
-    expected_fields = {
-        "outcome_ref",
-        "outcome_kind",
-        "content_ref",
-        "payload_hash",
-        "outcome_hash",
-        "content_receipt",
-        "outcome_receipt",
-        "stage_commit_ref",
-        "stage_commit_receipt",
-        "idea_set",
-    }
-    try:
-        idea_set = value["idea_set"]
-        if set(value) != expected_fields or not isinstance(idea_set, dict):
-            raise TypeError("accepted_idea_set")
-        refs = {
-            field: value[field]
-            for field in (
-                "outcome_ref",
-                "content_ref",
-                "payload_hash",
-                "outcome_hash",
-                "stage_commit_ref",
-            )
-        }
-        if any(not isinstance(item, str) or not item for item in refs.values()):
-            raise TypeError("accepted_idea_set")
-        binding = AcceptedIdeaSetBinding(
-            outcome_ref=cast(str, refs["outcome_ref"]),
-            outcome_kind=str(value["outcome_kind"]),
-            content_ref=cast(str, refs["content_ref"]),
-            payload_hash=cast(str, refs["payload_hash"]),
-            outcome_hash=cast(str, refs["outcome_hash"]),
-            content_receipt=_acceptance_receipt_from_public(
-                value["content_receipt"]
-            ),
-            outcome_receipt=_acceptance_receipt_from_public(
-                value["outcome_receipt"]
-            ),
-            stage_commit_ref=cast(str, refs["stage_commit_ref"]),
-            stage_commit_receipt=_acceptance_receipt_from_public(
-                value["stage_commit_receipt"]
-            ),
-            idea_set=idea_set,
-        )
-    except (KeyError, TypeError, ValueError) as error:
-        raise OwnerConflict("accepted_idea_set_lineage_invalid") from error
-    if binding.as_dict() != value:
-        raise OwnerConflict("accepted_idea_set_lineage_invalid")
-    return binding
-
-
-def _acceptance_receipt_from_public(value: object) -> AcceptanceReceipt:
-    if not isinstance(value, dict) or value.get("status") != "accepted":
-        raise TypeError("receipt")
-    fields = {
-        "status",
-        "issuer",
-        "kind",
-        "receipt_ref",
-        "subject_ref",
-        "payload_hash",
-    }
-    if set(value) != fields:
-        raise TypeError("receipt")
-    for field in fields - {"status"}:
-        if not isinstance(value.get(field), str) or not value.get(field):
-            raise TypeError("receipt")
-    return AcceptanceReceipt(
-        issuer=cast(str, value["issuer"]),
-        kind=cast(str, value["kind"]),
-        receipt_ref=cast(str, value["receipt_ref"]),
-        subject_ref=cast(str, value["subject_ref"]),
-        payload_hash=cast(str, value["payload_hash"]),
-    )
 
 
 def _not_attempted_acceptance() -> dict[str, object]:

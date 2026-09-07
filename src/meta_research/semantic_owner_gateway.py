@@ -70,11 +70,7 @@ from meta_research.target_run_semantic import (
     TARGET_RUN_SEMANTIC_OPERATION_IDS,
     target_run_semantic_operations,
 )
-from meta_research.owners.target_run_runtime import (
-    SQLiteTargetRunAgentAuthority,
-    SQLiteTargetRunGraphAuthority,
-    SQLiteTargetRunMemoryAuthority,
-)
+from meta_research.owners.target_run_runtime import SQLiteTargetRunAgentAuthority
 
 
 ROOT_AGENT_SEMANTIC_OPERATION_IDS: dict[
@@ -347,6 +343,10 @@ def create_semantic_owner_gateway(
                     research_memory=research_memory,
                     agent_runtime=agent_runtime,
                 ),
+                *_plan_evidence_operations(
+                    advancement_engine=advancement_engine, agent_runtime=agent_runtime,
+                    research_graph=research_graph, research_memory=research_memory,
+                ),
                 *_reasoning_operations(
                     advancement_engine=advancement_engine,
                     agent_runtime=agent_runtime,
@@ -361,6 +361,127 @@ def create_semantic_owner_gateway(
             )
         )
     return SemanticMcpGateway(tuple(operations))
+
+
+def _plan_evidence_operations(
+    *, advancement_engine: AdvancementEngineInterface,
+    agent_runtime: AgentRuntimeInterface, research_graph: ResearchGraphInterface,
+    research_memory: ResearchMemoryInterface,
+) -> tuple[SemanticOperation, ...]:
+    return (
+        SemanticOperation(
+            semantic_operation_id="research_graph.plan_evidence.page",
+            owning_module="research_graph",
+            description="Browse current Quest evidence candidates in bounded pages. Only the request's frozen EvidenceRefs may support this Plan; other pages are discovery context.",
+            input_schema={"type": "object", "properties": {
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 256},
+            }, "required": ["offset", "limit"], "additionalProperties": False},
+            output_schema={"type": "object", "properties": {
+                "context_pack_ref": _string(), "page": {"type": "object"},
+                "evidence_catalog": {"type": "array", "items": {"type": "object"}},
+                "frozen_evidence_refs": _string_array(),
+            }, "required": ["context_pack_ref", "page", "evidence_catalog", "frozen_evidence_refs"], "additionalProperties": False},
+            handler=lambda context, arguments: _read_plan_evidence_page(
+                advancement_engine, agent_runtime, research_graph, context, arguments
+            ),
+        ),
+        SemanticOperation(
+            semantic_operation_id="research_memory.plan_evidence.read",
+            owning_module="research_memory",
+            description="Read an exact evidence asset version and hash in bounded text chunks within the current Plan Quest; historical reads require a frozen request binding.",
+            input_schema={"type": "object", "properties": {
+                "target_commit_ref": _string(max_length=256),
+                "asset_version_ref": _string(max_length=256), "content_hash": _hash_schema(),
+                "role_ref": _string(max_length=256),
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 32768},
+            }, "required": ["target_commit_ref", "asset_version_ref", "content_hash", "role_ref", "offset", "limit"], "additionalProperties": False},
+            output_schema={"type": "object", "properties": {
+                "context_pack_ref": _string(), "source_binding": {"type": "object"},
+                "frozen_for_plan": {"type": "boolean"}, "text": {"type": "string"},
+                "total_characters": {"type": "integer"},
+                "next_offset": {"type": "integer"},
+            }, "required": ["context_pack_ref", "source_binding", "frozen_for_plan", "text", "total_characters"], "additionalProperties": False},
+            handler=lambda context, arguments: _read_plan_evidence_content(
+                advancement_engine, agent_runtime, research_graph, research_memory,
+                context, arguments,
+            ),
+        ),
+    )
+
+
+def _plan_evidence_request(advancement_engine, agent_runtime, context):
+    if context.root_kind != "plan":
+        raise SemanticMcpError("semantic_call_scope_stale")
+    try:
+        agent_runtime.verify_root_agent_runtime_scope(
+            root_kind="plan", run_ref=context.run_ref, attempt_ref=context.attempt_ref,
+            root_session_ref=context.root_session_ref, fence_ref=context.fence_ref,
+            runtime_binding_hash=context.capability_binding_hash,
+        )
+    except OwnerConflict as error:
+        raise SemanticMcpError("semantic_call_scope_stale") from error
+    managed = agent_runtime.query_managed_run(context.run_ref)
+    if managed is None or managed.get("run_kind") != "plan_stage":
+        raise SemanticMcpError("semantic_call_scope_stale")
+    request = advancement_engine.query_plan_stage_request(managed["cycle_ref"])
+    run = None if request is None else agent_runtime.query_plan_stage_run(request.request_ref)
+    if run is None or (run.run_ref != context.run_ref or run.attempt_ref != context.attempt_ref
+            or run.root_session_ref != context.root_session_ref or run.fence_ref != context.fence_ref
+            or run.runtime_binding_hash != context.capability_binding_hash):
+        raise SemanticMcpError("semantic_call_scope_stale")
+    return request
+
+
+def _read_plan_evidence_page(advancement_engine, agent_runtime, research_graph, context, arguments):
+    request = _plan_evidence_request(advancement_engine, agent_runtime, context)
+    page, catalog = research_graph.query_plan_evidence_page(
+        quest_ref=request.accepted_question.quest_ref,
+        question_ref=request.accepted_question.question_ref,
+        offset=arguments["offset"], limit=arguments["limit"],
+    )
+    return {
+        "context_pack_ref": request.context_pack_ref, "page": page,
+        "evidence_catalog": list(catalog),
+        "frozen_evidence_refs": [item["evidence_ref"] for item in request.context_pack["evidence_catalog"]],
+    }
+
+
+def _read_plan_evidence_content(advancement_engine, agent_runtime, research_graph, research_memory, context, arguments):
+    request = _plan_evidence_request(advancement_engine, agent_runtime, context)
+    if (type(arguments.get("offset")) is not int or arguments["offset"] < 0
+            or type(arguments.get("limit")) is not int or not 1 <= arguments["limit"] <= 32768):
+        raise SemanticMcpError("plan_evidence_query_invalid")
+    def exact(item):
+        return (item["target_commit_root_ref"] == arguments["target_commit_ref"]
+                and item["asset_version_ref"] == arguments["asset_version_ref"]
+                and item["content_hash"] == arguments["content_hash"]
+                and item["role_ref"] == arguments["role_ref"])
+    frozen = next((item for item in request.context_pack["evidence_catalog"] if exact(item)), None)
+    # Query only issuer-backed roots in this Quest. An arbitrary RM version
+    # supplied by the caller never grants content access.
+    _revision, catalog = research_graph.query_plan_evidence_catalog(
+        quest_ref=request.accepted_question.quest_ref,
+        target_commit_refs=(arguments["target_commit_ref"],), current_only=frozen is None,
+        role_refs=(arguments["role_ref"],),
+    )
+    binding = next((item for item in catalog if exact(item)), None)
+    if binding is None:
+        raise SemanticMcpError("plan_evidence_ref_unbound")
+    materialized = research_memory.materialize_asset(str(binding["asset_version_ref"]))
+    import hashlib
+    if hashlib.sha256(materialized.content).hexdigest() != binding["content_hash"]:
+        raise SemanticMcpError("plan_evidence_content_mismatch")
+    body = materialized.content.decode("utf-8")
+    offset, limit = arguments["offset"], arguments["limit"]
+    next_offset = offset + limit
+    return {
+        "context_pack_ref": request.context_pack_ref, "source_binding": binding,
+        "frozen_for_plan": frozen is not None, "text": body[offset:next_offset],
+        "total_characters": len(body),
+        **({"next_offset": next_offset} if next_offset < len(body) else {}),
+    }
 
 
 def _bundle_target_operations(
@@ -3464,13 +3585,6 @@ def _target_frontier_output_schema() -> dict[str, object]:
             "entry": _frontier_schema(),
         },
         required=("status",),
-    )
-
-
-def _present_target_frontier_output_schema() -> dict[str, object]:
-    return _closed_object(
-        {"status": _string(enum=("current",)), "entry": _frontier_schema()},
-        required=("status", "entry"),
     )
 
 

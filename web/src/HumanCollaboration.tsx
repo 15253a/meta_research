@@ -7,6 +7,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
+import { useReplyStream } from "./chatReplyStream";
 import {
   acknowledgeAssetIntake,
   authorizeHumanCommand,
@@ -117,7 +118,7 @@ const fallbackCompanionCopy: Record<CompanionShellState, {
   },
   "ready-empty": {
     label: "研究空间已就绪",
-    message: "这里还没有 Quest。使用左侧 ＋ 后，我会继续留在这个位置。",
+    message: "可以从“开始研究”设定目标；我会在这里协助你理解进展与讨论下一步。",
   },
   "ready-active": {
     label: "跟随当前研究",
@@ -142,6 +143,11 @@ function documentText(
 
 function reasonCode(error: unknown): string {
   return error instanceof Error ? error.message : "request_failed";
+}
+
+function humanRequestScopeStale(code: string): boolean {
+  return code === "root_agent_human_request_scope_stale"
+    || code === "root_human_request_scope_stale";
 }
 
 function submitTextareaOnEnter(
@@ -179,6 +185,76 @@ function optimisticMessageIsProjected(
     && message.scope_ref === optimistic.scopeRef
     && messageText(message) === optimistic.content
   ).length > optimistic.matchingProjectedMessagesAtSend;
+}
+
+function optimisticReplyIsProjected(
+  optimistic: OptimisticCompanionMessage,
+  messages: readonly CompanionMessage[],
+): boolean {
+  if (optimistic.interactionRef) return messages.some((message) =>
+    message.message_ref === `${optimistic.interactionRef}:assistant`
+  );
+  return false;
+}
+
+function optimisticTurnIsProjected(
+  optimistic: OptimisticCompanionMessage,
+  messages: readonly CompanionMessage[],
+): boolean {
+  return optimisticMessageIsProjected(optimistic, messages)
+    && optimisticReplyIsProjected(optimistic, messages);
+}
+
+function scrollToConversationMessage(element: HTMLElement | null) {
+  const chat = element?.closest<HTMLElement>(".lumen-chat, .hc-draft-transcript");
+  const article = element?.closest<HTMLElement>("article");
+  if (!chat || !article) return;
+  // Action cards can follow the transcript. Scroll to the message itself,
+  // otherwise scrolling to scrollHeight hides new replies above those cards.
+  chat.scrollTop += article.getBoundingClientRect().bottom
+    - chat.getBoundingClientRect().bottom + 18;
+}
+
+function PendingCompanionReply({ message, onChanged }: {
+  message: OptimisticCompanionMessage;
+  onChanged: () => void;
+}) {
+  return <CompanionReplyContent
+    message={{
+      message_ref: message.interactionRef ? `${message.interactionRef}:assistant` : undefined,
+      scope_ref: message.scopeRef,
+      role: "assistant",
+      status: "queued",
+      content: "",
+    }}
+    scopeRef={message.scopeRef}
+    onChanged={onChanged}
+  />;
+}
+
+function CompanionReplyContent({ message, scopeRef, onChanged }: {
+  message: CompanionMessage;
+  scopeRef: string | null;
+  onChanged: () => void;
+}) {
+  const pending = ["queued", "processing", "running"].includes(message.status ?? "");
+  const interactionRef = message.message_ref?.endsWith(":assistant")
+    ? message.message_ref.slice(0, -":assistant".length)
+    : null;
+  const preview = useReplyStream(pending && interactionRef && scopeRef
+    ? `/api/v1/companion/messages/${encodeURIComponent(interactionRef)}/stream?scope_ref=${encodeURIComponent(scopeRef)}`
+    : null, onChanged);
+  const content = pending && preview?.text ? preview.text : messageText(message);
+  const replying = pending && (!preview || ["queued", "processing", "running"].includes(preview.status));
+  const contentRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    scrollToConversationMessage(contentRef.current);
+  }, [content]);
+  return <span ref={contentRef} style={{ whiteSpace: "pre-wrap" }}>{content}{replying ? (
+    <span className="lumen-message-state" role="status">
+      {content ? "正在回复…" : "Codex 正在思考…"}
+    </span>
+  ) : null}</span>;
 }
 
 function openRequests(projection?: HumanCollaborationProjection): HumanRequestItem[] {
@@ -229,6 +305,7 @@ export function QuestCompanion({
   const canSend = ready && Boolean(companion.scope_ref);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [optimisticMessages, setOptimisticMessages] = useState<
     OptimisticCompanionMessage[]
@@ -259,6 +336,9 @@ export function QuestCompanion({
   const visibleOptimisticMessages = optimisticMessages.filter((message) =>
     message.scopeRef === scopeRef
     && !optimisticMessageIsProjected(message, messages)
+  );
+  const unprojectedReplies = optimisticMessages.filter((message) =>
+    message.scopeRef === scopeRef && !optimisticReplyIsProjected(message, messages)
   );
   const softConstraints = scopeRef
     ? companion?.soft_constraints.filter((item) => item.scope_ref === scopeRef) ?? []
@@ -298,7 +378,8 @@ export function QuestCompanion({
   useEffect(() => {
     const chat = chatRef.current;
     if (!chat) return;
-    chat.scrollTop = chat.scrollHeight;
+    const latest = chat.querySelectorAll<HTMLElement>(".lumen-message");
+    scrollToConversationMessage(latest.item(latest.length - 1));
   }, [newestMessageRef, scopeRef]);
   const optimisticProjectionKey = optimisticMessages.map((message) =>
     `${message.localRef}:${message.interactionRef ?? "pending"}`
@@ -306,7 +387,7 @@ export function QuestCompanion({
   useEffect(() => {
     setOptimisticMessages((current) => {
       const remaining = current.filter((message) =>
-        !optimisticMessageIsProjected(message, messages)
+        !optimisticTurnIsProjected(message, messages)
       );
       return remaining.length === current.length ? current : remaining;
     });
@@ -314,7 +395,8 @@ export function QuestCompanion({
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const message = draft.trim();
-    if (!canSend || !scopeRef || !message || sending) return;
+    if (!canSend || !scopeRef || !message || sendingRef.current) return;
+    sendingRef.current = true;
     const localRef = optimisticSequence.current + 1;
     optimisticSequence.current = localRef;
     const pending: OptimisticCompanionMessage = {
@@ -365,6 +447,7 @@ export function QuestCompanion({
       setDraft((current) => current || message);
       setError(reasonCode(caught));
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   };
@@ -435,20 +518,22 @@ export function QuestCompanion({
                     ? "SYSTEM · STATUS"
                     : "COMPANION · READ-ONLY EXPLANATION"}
               </small>
-              {messageText(message)}
-              {pending ? (
+              {message.role === "assistant" ? (
+                <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
+              ) : messageText(message)}
+              {pending && message.role !== "assistant" ? (
                 <span className="lumen-message-state" role="status">
                   {message.role === "user" ? "消息正在发送…" : "Codex 正在思考…"}
                 </span>
               ) : null}
             </article>
           );
-        }) : (
+        }) : !visibleOptimisticMessages.length ? (
           <article className="lumen-message">
             <small>{fallbackCompanionCopy[state].label}</small>
             {fallbackCompanionCopy[state].message}
           </article>
-        )}
+        ) : null}
         {visibleOptimisticMessages.map((message) => (
           <article
             key={`optimistic-${message.localRef}`}
@@ -462,15 +547,16 @@ export function QuestCompanion({
             </span>
           </article>
         ))}
-        {visibleOptimisticMessages.length ? (
+        {unprojectedReplies.map((message) => (
           <article
+            key={`reply-${message.localRef}`}
             className="lumen-message lumen-companion-thinking"
             data-message-status="processing"
           >
-            <small>COMPANION · THINKING</small>
-            <span className="lumen-message-state" role="status">Codex 正在思考…</span>
+            <small>COMPANION · READ-ONLY EXPLANATION</small>
+            <PendingCompanionReply message={message} onChanged={onChanged} />
           </article>
-        ) : null}
+        ))}
         {ready ? softConstraints.map((constraint, index) => (
           <SoftConstraintCard
             key={constraint.constraint_ref ?? `constraint-${index}`}
@@ -1418,13 +1504,18 @@ function BroadResearchAuthorizationCard({
   };
   return (
     <article className="lumen-command lumen-broad-authorization">
-      <small>BROAD RESEARCH AUTHORIZATION · CURRENT GRANT</small>
-      <b>ordinary reversible local research · granted</b>
-      <p>Quest · {questRef}</p>
-      <code>receipt · {authorization.receipt_ref}</code>
-      <p>撤销必须先建立精确 Command Draft，再经过 Owner Impact Preview、human confirmation 与独立 authorization。</p>
+      <small>当前研究授权</small>
+      <b>常规、可撤销的本地研究已授权</b>
+      <p>如需撤销，先查看影响并确认后才会生效。</p>
+      <details>
+        <summary>查看授权详情</summary>
+        <dl>
+          <div><dt>研究任务</dt><dd>{questRef}</dd></div>
+          <div><dt>授权凭证</dt><dd>{authorization.receipt_ref}</dd></div>
+        </dl>
+      </details>
       <button type="button" disabled={pending || created} onClick={() => void createRevokeDraft()}>
-        {created ? "revoke Command Draft 已建立" : "建立 revoke Command Draft"}
+        {created ? "撤销草案已建立，请审阅" : pending ? "正在准备撤销草案…" : "申请撤销授权"}
       </button>
       {error ? <small role="alert">{error}</small> : null}
     </article>
@@ -2177,6 +2268,7 @@ function HumanRequestView({
           <RequestDetails request={request} otherBlockers={waiting?.other_blockers ?? []} />
         </main>
         <IntentDraftingSession
+          key={`${request.request_ref}:${request.revision}`}
           request={request}
           scopeRef={collaboration?.companion.scope_ref ?? null}
           messages={collaboration?.companion.messages ?? []}
@@ -2344,6 +2436,10 @@ function IntentDraftingSession({
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
+  const [optimisticMessages, setOptimisticMessages] = useState<OptimisticCompanionMessage[]>([]);
+  const optimisticSequence = useRef(0);
+  const transcriptRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const questRef = typeof request.quest_ref === "string" && request.quest_ref
     ? request.quest_ref
@@ -2356,24 +2452,55 @@ function IntentDraftingSession({
     && message.view_context.revision === request.revision,
   );
 
+  const visibleOptimisticMessages = optimisticMessages.filter((message) =>
+    !optimisticMessageIsProjected(message, scoped)
+  );
+  const unprojectedReplies = optimisticMessages.filter((message) =>
+    !optimisticReplyIsProjected(message, scoped)
+  );
+  const projectionKey = scoped.map((message) => `${message.message_ref}:${message.status}`).join("|");
+  useEffect(() => {
+    setOptimisticMessages((current) => {
+      const remaining = current.filter((message) => !optimisticTurnIsProjected(message, scoped));
+      return remaining.length === current.length ? current : remaining;
+    });
+  }, [projectionKey]);
+  useEffect(() => {
+    const transcript = transcriptRef.current;
+    if (transcript) scrollToConversationMessage(transcript.lastElementChild as HTMLElement | null);
+  }, [projectionKey, optimisticMessages]);
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const message = draft.trim();
-    if (!message || sending || !scopeRef || !questRef) return;
+    if (!message || sendingRef.current || !scopeRef || !questRef) return;
+    sendingRef.current = true;
+    const localRef = ++optimisticSequence.current;
+    setOptimisticMessages((current) => [...current, {
+      localRef, scopeRef, content: message, interactionRef: null,
+      matchingProjectedMessagesAtSend: scoped.filter((item) => item.role === "user" && messageText(item) === message).length,
+      status: "sending",
+    }]);
+    setDraft("");
     setSending(true);
     setError(null);
     try {
-      await sendCompanionMessage(message, scopeRef, {
+      const queued = await sendCompanionMessage(message, scopeRef, {
         kind: "human_request",
         quest_ref: questRef,
         request_ref: request.request_ref,
         revision: request.revision,
       });
-      setDraft("");
+      setOptimisticMessages((current) => current.map((item) => item.localRef === localRef
+        ? { ...item, interactionRef: typeof queued.interaction_ref === "string" ? queued.interaction_ref : null, status: "queued" }
+        : item));
       onChanged();
     } catch (caught) {
+      setOptimisticMessages((current) => current.filter((item) => item.localRef !== localRef));
+      setDraft((current) => current || message);
       setError(reasonCode(caught));
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   };
@@ -2384,8 +2511,8 @@ function IntentDraftingSession({
         <span className="hc-draft-orb" aria-hidden="true" />
         <div><small>询问与协商</small><b>和研究助手聊一聊</b><span>只讨论当前事项</span></div>
       </header>
-      <div className="hc-draft-transcript" aria-live="polite">
-        {!scoped.length ? (
+      <div className="hc-draft-transcript" aria-live="polite" ref={transcriptRef}>
+        {!scoped.length && !optimisticMessages.length ? (
           <article>
             <small>当前事项</small>
             <p>你可以询问当前状态，或讨论替代路线。</p>
@@ -2393,9 +2520,18 @@ function IntentDraftingSession({
         ) : scoped.map((message, index) => (
           <article className={message.role === "user" ? "me" : ""} key={message.message_ref ?? index}>
             <small>{message.role === "user" ? "你" : "研究助手"}</small>
-            <p>{messageText(message)}</p>
+            <p>{message.role === "assistant"
+              ? <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
+              : messageText(message)}</p>
           </article>
         ))}
+        {visibleOptimisticMessages.map((message) => <article className="me" key={`user-${message.localRef}`}>
+          <small>你</small><p>{message.content}</p>
+          <span>{message.status === "sending" ? "消息正在发送…" : "消息已发送"}</span>
+        </article>)}
+        {unprojectedReplies.map((message) => <article key={`reply-${message.localRef}`}>
+          <small>研究助手</small><p><PendingCompanionReply message={message} onChanged={onChanged} /></p>
+        </article>)}
       </div>
       <form className="hc-draft-compose" onSubmit={(event) => void submit(event)}>
         <label>
@@ -2611,7 +2747,11 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
       }
       markResponseRecorded();
     } catch (caught) {
-      setError(reasonCode(caught));
+      const code = reasonCode(caught);
+      setError(humanRequestScopeStale(code)
+        ? "任务已更新，这次回应未提交。正在刷新当前待办，请在更新后重新选择。"
+        : code);
+      if (humanRequestScopeStale(code)) onChanged();
     } finally {
       setPending(false);
     }
@@ -2734,14 +2874,12 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           >重试</button>
         )
       ) : null}
-      {error || request.kind !== "library_reconnect" ? (
+      {error || !["library_reconnect", "capability_authorization"].includes(request.kind) ? (
       <div className="hc-response-boundary" role="status">
         {error ? (
           <><b>{request.kind === "system_operation_help" ? "重试未成功" : "回应没有记录"}</b><br />{error}</>
         ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
           <><b>提交只表示人的回应已接纳</b><br />这不代表材料充分、实验成功或研究结论为真；负责当前请求的 Agent 会解释回应并决定下一步。</>
-        ) : request.kind === "capability_authorization" ? (
-          <><b>文本提交不会授权</b><br />只有“接受”后的当前影响预览、精确确认与独立授权票据才会授权。</>
         ) : request.kind === "system_operation_help" ? (
           <><b>只重试当前绑定的失败操作</b><br />成功后只恢复它的精确依赖；失败会保留同一操作链并显示新修订。</>
         ) : (
@@ -2899,6 +3037,7 @@ function NaturalLanguageMaterialForm({
 }) {
   const [localPath, setLocalPath] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const condition = isRecord(request.target_assertion?.condition)
     ? request.target_assertion.condition
     : {};
@@ -2933,6 +3072,7 @@ function NaturalLanguageMaterialForm({
           <label className="hc-file-picker full">
             浏览器文件 · 可选
             <input
+              ref={fileInputRef}
               type="file"
               aria-label="回应文件"
               disabled={disabled || Boolean(localPath.trim())}
@@ -2942,6 +3082,15 @@ function NaturalLanguageMaterialForm({
               }}
             />
             <small>{file ? `待接纳 · ${file.name}` : "尚未选择文件"}</small>
+            {file ? (
+              <button type="button" disabled={disabled} onClick={() => {
+                setFile(null);
+                if (fileInputRef.current) {
+                  fileInputRef.current.value = "";
+                  fileInputRef.current.focus();
+                }
+              }}>移除回应文件</button>
+            ) : null}
           </label>
           <label className="full">
             绝对本地文件或目录路径 · 可选
@@ -2992,12 +3141,11 @@ function PermissionForm({
   disabled: boolean;
   onChanged: () => void;
 }) {
-  const [decision, setDecision] = useState<"allow_once" | null>(null);
   const [recordedCommand, setRecordedCommand] = useState<HumanCommand | null>(null);
   const [recordedAuthorization, setRecordedAuthorization] = useState<HumanCapabilityAuthorization | null>(null);
   const [authorizationPending, setAuthorizationPending] = useState(false);
   const [authorizationError, setAuthorizationError] = useState<string | null>(null);
-  const [reviewedPreviewRef, setReviewedPreviewRef] = useState<string | null>(null);
+  const accepting = useRef(false);
   const authorization = request.required_authorization ?? {};
   const authorizationScope = isRecord(authorization.scope)
     ? authorization.scope
@@ -3013,154 +3161,122 @@ function PermissionForm({
       && item.draft.payload.decision === "granted"
       && stringify(item.draft.payload.scope) === stringify(authorizationScope),
   ) ?? null;
-  const command = projectedCommand ?? recordedCommand;
+  // The snapshot can lag behind an API response. Keep the exact command that
+  // advanced locally instead of replacing it with an older projected draft.
+  const command = recordedCommand ?? projectedCommand;
   const projectedAuthorization = authorizations.find((item) =>
     item.confirmation_receipt_ref === command?.confirmation_receipt?.receipt_ref
       && item.decision === "granted"
       && item.is_current !== false
       && stringify(item.requirement) === stringify(authorization),
   ) ?? null;
-  const authorizationReceipt = projectedAuthorization ?? recordedAuthorization;
+  const authorizationReceipt = projectedAuthorization ?? (
+    recordedAuthorization && !authorizations.some((item) =>
+      item.receipt_ref === recordedAuthorization.receipt_ref && item.is_current === false,
+    ) ? recordedAuthorization : null
+  );
   const preview = command?.impact_preview;
-  const currentPreview = preview?.status === "current"
-    && preview.draft_revision === command?.draft_revision
-    && preview.draft_hash === command?.draft_hash;
 
   useEffect(() => {
-    setDecision(null);
     setRecordedCommand(null);
     setRecordedAuthorization(null);
     setAuthorizationPending(false);
     setAuthorizationError(null);
-    setReviewedPreviewRef(null);
+    accepting.current = false;
   }, [request.request_ref]);
 
-  const runAuthorizationStep = async (
-    operation: () => Promise<HumanCommand | HumanCapabilityAuthorization>,
-  ) => {
-    if (authorizationPending || disabled) return;
+  const rememberCommand = (result: HumanCommand): HumanCommand => {
+    if (
+      result.scope_ref !== commandScopeRef
+      || result.draft.command_kind !== "capability_authorization"
+      || result.draft.payload.capability !== capability
+      || result.draft.payload.decision !== "granted"
+      || stringify(result.draft.payload.scope) !== stringify(authorizationScope)
+    ) throw new ProductError("capability_authorization_command_invalid");
+    setRecordedCommand(result);
+    return result;
+  };
+
+  const accept = async () => {
+    if (accepting.current || disabled || !capability) return;
+    accepting.current = true;
     setAuthorizationPending(true);
     setAuthorizationError(null);
     try {
-      const result = await operation();
-      if ("intent_id" in result) {
-        if (
-          result.scope_ref !== commandScopeRef
-          || result.draft.command_kind !== "capability_authorization"
-          || result.draft.payload.capability !== capability
-          || result.draft.payload.decision !== "granted"
-          || stringify(result.draft.payload.scope)
-            !== stringify(authorizationScope)
-        ) {
-          throw new Error("capability_authorization_command_invalid");
+      let current = command ? rememberCommand(command) : null;
+      let receipt = authorizationReceipt;
+      if (!receipt) {
+        if (!current) {
+          current = rememberCommand(await createHumanCommand(commandScopeRef, {
+            command_kind: "capability_authorization",
+            payload: { capability, decision: "granted", scope: authorizationScope },
+          }));
         }
-        setRecordedCommand(result);
-      } else {
-        if (
-          result.decision !== "granted"
-          || result.is_current === false
-          || stringify(result.requirement) !== stringify(authorization)
-          || result.confirmation_receipt_ref
-            !== command?.confirmation_receipt?.receipt_ref
-        ) {
-          throw new Error("capability_authorization_invalid");
+        if (!current.confirmation_receipt) {
+          const basis = current.impact_preview;
+          if (basis?.status !== "current"
+            || basis.draft_revision !== current.draft_revision
+            || basis.draft_hash !== current.draft_hash) {
+            current = rememberCommand(await previewHumanCommand(current));
+          }
+          // The user's Accept click is the confirmation. The service still
+          // binds its receipt to the exact current draft and Owner preview.
+          current = rememberCommand(await confirmHumanCommand(current));
         }
-        setRecordedAuthorization(result);
+        receipt = await authorizeHumanCommand(current);
       }
-      onChanged();
+      if (receipt.decision !== "granted"
+        || receipt.is_current === false
+        || stringify(receipt.requirement) !== stringify(authorization)
+        || !current?.confirmation_receipt
+        || receipt.confirmation_receipt_ref !== current.confirmation_receipt.receipt_ref) {
+        throw new ProductError("capability_authorization_invalid");
+      }
+      // Retain the issued receipt if response delivery fails; a retry only
+      // delivers that same response through the existing idempotent recovery.
+      setRecordedAuthorization(receipt);
+      await submit({ authorization_receipt_ref: receipt.receipt_ref }, "provided");
     } catch (caught) {
-      setAuthorizationError(reasonCode(caught));
+      const code = reasonCode(caught);
+      setAuthorizationError(humanRequestScopeStale(code)
+        ? "任务已更新，正在刷新当前待办，请在更新后重新选择。"
+        : `接受未完成 · ${code}。可再次点击“接受”重试。`);
+      onChanged();
     } finally {
+      accepting.current = false;
       setAuthorizationPending(false);
     }
   };
 
   return (
     <>
-      {request.impact_preview ? <ImpactPreview preview={request.impact_preview} /> : (
-        <p className="hc-preview-missing">影响说明尚未提供；提交只记录回应，不代表动作已经执行。</p>
-      )}
-      <OptionalNote value={note} onChange={setNote} placeholder="写下限制、疑问或建议的替代方案。" />
-      <div className="hc-permission-actions">
-        <button type="button" disabled={disabled} onClick={() => void submit({}, "deferred")}>提交</button>
-        <button type="button" disabled={disabled} onClick={() => void submit({}, "declined")}>拒绝</button>
-        <button type="button" className="allow" disabled={disabled} aria-pressed={decision === "allow_once"} onClick={() => setDecision("allow_once")}>接受</button>
+      <p className="hc-permission-summary">点击“接受”即提交本次授权，系统核对后继续对应任务。</p>
+      <div className="hc-permission-actions" aria-busy={authorizationPending || disabled}>
+        <button type="button" className="allow" disabled={disabled || authorizationPending || !capability} onClick={() => void accept()}>
+          {authorizationPending ? "正在提交…" : "接受"}
+        </button>
+        <button type="button" disabled={disabled || authorizationPending} onClick={() => void submit({}, "declined")}>拒绝</button>
+        <button type="button" disabled={disabled || authorizationPending} onClick={() => void submit({}, "deferred")}>稍后处理</button>
       </div>
-      {decision === "allow_once" ? (
-        <section className="lumen-command" data-command-status={command?.status ?? "required"}>
-          <small>本次精确授权</small>
-          {!command ? (
-            <button
-              type="button"
-              disabled={disabled || authorizationPending || !capability}
-              onClick={() => void runAuthorizationStep(() => createHumanCommand(
-                commandScopeRef,
-                {
-                  command_kind: "capability_authorization",
-                  payload: {
-                    capability,
-                    decision: "granted",
-                    scope: authorizationScope,
-                  },
-                },
-              ))}
-            >建立授权草案</button>
-          ) : null}
-          {command && !currentPreview && !command.confirmation_receipt ? (
-            <button
-              type="button"
-              disabled={disabled || authorizationPending}
-              onClick={() => void runAuthorizationStep(() => previewHumanCommand(command))}
-            >生成并核对影响说明</button>
-          ) : null}
-          {command && currentPreview && preview && !command.confirmation_receipt ? (
-            <>
-              <details onToggle={(event) => {
-                if (event.currentTarget.open) {
-                  setReviewedPreviewRef(preview.preview_ref);
-                }
-              }}>
-                <summary>查看本次授权会发生什么</summary>
-                <div className="lumen-owner-previews">
-                  {preview.owner_previews.map((owner) => (
-                    <section key={owner.digest}>
-                      <b>会发生</b><p>{owner.will_happen.join("；")}</p>
-                      <b>不会发生</b><p>{owner.will_not_happen.join("；")}</p>
-                      <b>风险与失效条件</b><p>{[...owner.risks, ...owner.stale_conditions].join("；")}</p>
-                    </section>
-                  ))}
-                </div>
-              </details>
-              <button
-                type="button"
-                disabled={disabled || authorizationPending || reviewedPreviewRef !== preview.preview_ref}
-                onClick={() => void runAuthorizationStep(() => confirmHumanCommand(command))}
-              >确认当前草案与影响说明</button>
-            </>
-          ) : null}
-          {command?.confirmation_receipt && !authorizationReceipt ? (
-            <button
-              type="button"
-              disabled={disabled || authorizationPending}
-              onClick={() => void runAuthorizationStep(() => authorizeHumanCommand(command))}
-            >签发仅限本次任务的授权</button>
-          ) : null}
-          {authorizationReceipt ? (
-            <p role="status">本次授权已记录；提交回应后，系统还会独立核对并决定是否继续任务。</p>
-          ) : null}
-          {authorizationError ? <em role="alert">授权步骤失败 · {authorizationError}</em> : null}
-        </section>
-      ) : null}
-      {decision === "allow_once" && authorizationReceipt ? (
-        <button
-          className="hc-submit"
-          type="button"
-          disabled={disabled || authorizationPending}
-          onClick={() => void submit(
-            { authorization_receipt_ref: authorizationReceipt.receipt_ref },
-            "provided",
-          )}
-        >提交授权回应</button>
+      {authorizationError ? <p className="hc-response-boundary" role="alert">{authorizationError}</p> : null}
+      {!capability ? <p className="hc-response-boundary">授权范围尚未提供，暂时无法接受。</p> : null}
+      <details className="hc-permission-note">
+        <summary>添加备注（可选）</summary>
+        <OptionalNote value={note} onChange={setNote} placeholder="写下限制、疑问或建议的替代方案。" />
+      </details>
+      {request.impact_preview ? <ImpactPreview preview={request.impact_preview} /> : preview ? (
+        <details className="hc-permission-note">
+          <summary>查看影响说明（可选）</summary>
+          <div className="lumen-owner-previews">
+            {preview.owner_previews.map((owner) => (
+              <section key={owner.digest}>
+                <b>会发生</b><p>{owner.will_happen.join("；")}</p>
+                <b>不会发生</b><p>{owner.will_not_happen.join("；")}</p>
+                <b>风险与失效条件</b><p>{[...owner.risks, ...owner.stale_conditions].join("；")}</p>
+              </section>
+            ))}
+          </div>
+        </details>
       ) : null}
     </>
   );

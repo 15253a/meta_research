@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typing import cast
 
 from meta_research.experiment_contract import AcceptedExperimentAssetRole
@@ -138,6 +140,24 @@ def _target_commit_metric_document(commit: TargetCommit) -> dict[str, object]:
     raise OwnerConflict("target_commit_evidence_metric_invalid")
 
 
+def evidence_catalog_page_metadata(
+    *, total: int, catalog: tuple[dict[str, object], ...], scanned: int,
+    offset: int, limit: int, question_ref: str | None,
+    projections: list[dict[str, object]],
+) -> dict[str, object]:
+    next_offset = offset + scanned
+    return {
+        "total_candidates": total, "candidate_unit": "evidence_asset_role",
+        "candidate_count": len(catalog),
+        "scanned_count": scanned, "offset": offset, "limit": limit,
+        "next_offset": next_offset if next_offset < total else None,
+        "question_ref": question_ref,
+        "selection": "current_question_then_recent_active_or_shared",
+        "snapshot_hash": canonical_hash(list(catalog)),
+        "projections": projections,
+    }
+
+
 class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
     """Expose only RM/RG evidence leaves rooted in real TargetCommits."""
 
@@ -150,18 +170,82 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
         self._research_memory = research_memory
 
     def query_plan_evidence_catalog(
-        self, *, quest_ref: str
+        self, *, quest_ref: str, target_commit_refs: tuple[str, ...] | None = None,
+        current_only: bool = True, role_refs: tuple[str, ...] | None = None,
     ) -> tuple[int, tuple[dict[str, object], ...]]:
+        """Read exact roots, or a complete small catalog without truncation."""
+        if target_commit_refs is not None:
+            catalog = self._catalog_for_refs(
+                quest_ref=quest_ref, target_commit_refs=target_commit_refs,
+                current_only=current_only, role_refs=role_refs,
+            )
+        else:
+            page, catalog = self.query_plan_evidence_page(quest_ref=quest_ref)
+            if page["next_offset"] is not None:
+                raise OwnerConflict("plan_evidence_catalog_pagination_required")
+        return len(catalog), catalog
+
+    def query_plan_evidence_page(
+        self, *, quest_ref: str, question_ref: str | None = None,
+        offset: int = 0, limit: int = 256,
+    ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
+        total, candidates = self._research_graph.query_target_commit_evidence_candidates(
+            quest_ref=quest_ref, question_ref=question_ref, offset=offset, limit=limit
+        )
+        projection_by_ref: dict[str, dict[str, object]] = {}
+        catalog = self._catalog_for_candidates(
+            quest_ref=quest_ref, candidates=candidates, projections=projection_by_ref
+        )
+        projections = [projection_by_ref[str(item["evidence_ref"])] for item in catalog]
+        return evidence_catalog_page_metadata(
+            total=total, catalog=catalog, scanned=len(candidates), offset=offset,
+            limit=limit, question_ref=question_ref, projections=projections,
+        ), catalog
+
+    def _catalog_for_refs(
+        self, *, quest_ref: str, target_commit_refs: tuple[str, ...],
+        current_only: bool, role_refs: tuple[str, ...] | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        accepted: dict[str, dict[str, object]] = {}
+        offset = 0
+        while True:
+            total, candidates = self._research_graph.query_target_commit_evidence_candidates(
+                quest_ref=quest_ref, target_commit_refs=target_commit_refs,
+                current_only=current_only, role_refs=role_refs, offset=offset,
+            )
+            for item in self._catalog_for_candidates(quest_ref=quest_ref, candidates=candidates):
+                ref = str(item["evidence_ref"])
+                previous = accepted.get(ref)
+                if previous is None or str(item["role_ref"]) < str(previous["role_ref"]):
+                    accepted[ref] = item
+            offset += len(candidates)
+            if not candidates or offset >= total:
+                break
+        return tuple(accepted[ref] for ref in sorted(accepted))
+
+    def _catalog_for_candidates(
+        self, *, quest_ref: str, candidates: tuple[dict[str, object], ...],
+        projections: dict[str, dict[str, object]] | None = None,
+    ) -> tuple[dict[str, object], ...]:
         commits = {
             commit.commit_ref: commit
-            for commit in self._research_graph.query_target_commits_for_quest(quest_ref)
+            for commit in self._research_graph.query_target_commits_for_quest(
+                quest_ref,
+                target_commit_refs=tuple(str(row["target_commit_ref"]) for row in candidates),
+            )
         }
+        if not candidates:
+            return ()
         accepted: dict[str, dict[str, object]] = {}
         roles = self._research_graph.query_asset_roles(
             quest_ref=quest_ref,
             role="evidence",
+            version_refs=tuple(str(row["version_ref"]) for row in candidates),
         )
+        selected_roles = {str(row["role_ref"]) for row in candidates}
         for role in roles:
+            if role.role_ref not in selected_roles:
+                continue
             asset = self._research_memory.query_asset_version(role.version_ref)
             if asset is None:
                 raise OwnerConflict("target_commit_evidence_asset_missing")
@@ -223,13 +307,28 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
                 str, previous["role_ref"]
             ):
                 accepted[commit.commit_ref] = candidate
+                if projections is not None:
+                    source = next(row for row in candidates if row["role_ref"] == role.role_ref)
+                    spec = json.loads(str(source["spec_json"]))
+                    if canonical_hash(spec) != commit.target_spec_hash:
+                        raise OwnerConflict("target_commit_evidence_spec_mismatch")
+                    projections[evidence_ref] = {
+                        "evidence_ref": evidence_ref,
+                        "question_ref": source["question_ref"], "cycle_ref": source["cycle_ref"],
+                        "target_commit_ref": commit.commit_ref,
+                        "asset_version_ref": asset.version_ref, "content_hash": asset.content_hash,
+                        "target_spec": spec, "target_spec_hash": commit.target_spec_hash,
+                        "metric_result": _target_commit_metric_document(commit),
+                        "result_disposition": commit.result_disposition,
+                        "exact_content_reader": "research_memory.plan_evidence.read",
+                    }
         catalog = tuple(
             sorted(
                 accepted.values(),
                 key=lambda item: cast(str, item["evidence_ref"]),
             )
         )
-        return len(catalog), catalog
+        return catalog
 
     def verify_plan_evidence_catalog(
         self,
@@ -253,13 +352,13 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             )
         ):
             raise OwnerConflict("plan_evidence_catalog_invalid")
-        current_revision, current_catalog = self.query_plan_evidence_catalog(
-            quest_ref=quest_ref
+        if len(evidence_catalog) != expected_reference_revision or len(evidence_catalog) > 256:
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+        root_refs = tuple(str(item.get("target_commit_root_ref", "")) for item in evidence_catalog)
+        current_catalog = self._catalog_for_refs(
+            quest_ref=quest_ref, target_commit_refs=root_refs, current_only=require_current,
+            role_refs=tuple(str(item.get("role_ref", "")) for item in evidence_catalog),
         )
-        if expected_reference_revision > current_revision:
-            raise OwnerConflict("plan_evidence_catalog_invalid")
-        if len(evidence_catalog) != expected_reference_revision:
-            raise OwnerConflict("plan_evidence_catalog_invalid")
         current_by_ref = {
             cast(str, item["evidence_ref"]): item for item in current_catalog
         }
@@ -274,16 +373,10 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             ):
                 raise OwnerConflict("plan_evidence_catalog_invalid")
             supplied_refs.append(evidence_ref)
-        if require_current and (
-            expected_reference_revision != current_revision
-            or tuple(evidence_catalog) != current_catalog
-        ):
-            raise OwnerConflict("plan_evidence_catalog_stale")
-        if (
-            require_complete
-            and require_current
-            and tuple(evidence_catalog) != current_catalog
-        ):
+        # A Plan freezes its selected page, not the entire growing Quest.
+        # New candidates cannot stale a valid cut; current membership still
+        # fails closed when a selected source loses eligibility after pruning.
+        if require_complete and len(current_by_ref) != len(evidence_catalog):
             raise OwnerConflict("plan_evidence_catalog_invalid")
         if selected_evidence_refs is not None and not selected_evidence_refs.issubset(
             supplied_refs
@@ -331,7 +424,8 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
         commits = {
             commit.commit_ref: commit
             for commit in self._research_graph.query_target_commits_for_quest(
-                quest_ref
+                quest_ref,
+                target_commit_refs=tuple(str(catalog_by_ref[ref]["target_commit_root_ref"]) for ref in selected_refs),
             )
         }
         leaves: list[EvidenceReuseLeaf] = []
@@ -408,8 +502,16 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             raise OwnerConflict("reasoning_target_evidence_closure_invalid")
         if not target_commit_refs:
             return ()
-        _revision, catalog = self.query_plan_evidence_catalog(
-            quest_ref=quest_ref
+        if len(target_commit_refs) > 256:
+            return tuple(
+                leaf
+                for offset in range(0, len(target_commit_refs), 256)
+                for leaf in self.resolve_reasoning_target_evidence_leaves(
+                    quest_ref=quest_ref, target_commit_refs=target_commit_refs[offset:offset + 256]
+                )
+            )
+        catalog = self._catalog_for_refs(
+            quest_ref=quest_ref, target_commit_refs=target_commit_refs, current_only=False
         )
         catalog_by_commit = {
             cast(str, value["target_commit_root_ref"]): value
@@ -418,7 +520,7 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
         commits = {
             commit.commit_ref: commit
             for commit in self._research_graph.query_target_commits_for_quest(
-                quest_ref
+                quest_ref, target_commit_refs=target_commit_refs
             )
         }
         leaves: list[EvidenceReuseLeaf] = []

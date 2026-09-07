@@ -253,6 +253,18 @@ class HumanCollaborationInterface(Protocol):
 
     def query_companion(self, scope_ref: str) -> dict[str, object]: ...
 
+    def query_companion_reply(
+        self, scope_ref: str, interaction_ref: str
+    ) -> dict[str, object]: ...
+
+    def query_manual_drafting_reply(
+        self, context_ref: str, turn_ref: str
+    ) -> dict[str, object]: ...
+
+    def query_intent_reply(
+        self, initialization_id: str, turn_ref: str
+    ) -> dict[str, object]: ...
+
     def query_collaboration_projection(
         self, scope_refs: tuple[str, ...]
     ) -> dict[str, list[dict[str, object]]]: ...
@@ -1004,12 +1016,52 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
                 ),
                 {"receipt_ref": receipt_ref},
             ).first()
-            if row is not None:
-                verify_authorization_currentness(connection, row)
-            confirmation = (
-                None
-                if row is None
-                else connection.execute(
+            if row is None:
+                raise OwnerConflict("capability_authorization_receipt_invalid")
+            # Keep the one monotonic head and every immutable receipt unchanged.
+            verify_authorization_currentness(connection, row)
+            rows = [row]
+            if not bool(row.is_current):
+                scope = requirement.get("scope")
+                if (
+                    _expected_decision != "granted"
+                    or row.authorization_kind != "capability"
+                    or not row.scope_ref.startswith("human_request:")
+                    or requirement.get("capability") != "execute_high_risk_target"
+                    or not isinstance(scope, dict)
+                    or scope.get("authorization_mode") != "single_target"
+                    or set(scope) != {
+                        "authorization_mode", "quest_ref", "stage_request_ref",
+                        "graph_ref", "target_ref", "target_spec_hash",
+                    }
+                    or any(not isinstance(value, str) or not value for value in scope.values())
+                ):
+                    raise OwnerConflict("capability_authorization_receipt_invalid")
+                # A repeated grant for this exact Target reaffirms its authority.
+                # Verify EVERY intervening receipt and confirmation: a denial,
+                # revocation, changed scope, or damaged proof breaks continuity,
+                # even if a later decision grants the original scope again.
+                rows = connection.execute(
+                    text(
+                        "SELECT * FROM hc_capability_authorizations WHERE "
+                        "authorization_kind = 'capability' AND scope_ref = "
+                        ":scope_ref AND capability = :capability AND revision >= "
+                        ":revision ORDER BY revision"
+                    ),
+                    {
+                        "scope_ref": row.scope_ref,
+                        "capability": row.capability,
+                        "revision": row.revision,
+                    },
+                ).all()
+                if (
+                    not rows
+                    or rows[0].receipt_ref != receipt_ref
+                    or not bool(rows[-1].is_current)
+                ):
+                    raise OwnerConflict("capability_authorization_receipt_invalid")
+            for authorization_row in rows:
+                confirmation = connection.execute(
                     text(
                         "SELECT confirmations.*, previews.owner_previews_json, "
                         "previews.owner_previews_hash, "
@@ -1021,24 +1073,19 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
                         "confirmations.confirmation_ref = "
                         ":basis_confirmation_ref"
                     ),
-                    {"basis_confirmation_ref": row.basis_confirmation_ref},
+                    {"basis_confirmation_ref": authorization_row.basis_confirmation_ref},
                 ).first()
-            )
-            current_ref = (
-                None
-                if row is None
-                else connection.execute(
-                    text(
-                        "SELECT receipt_ref FROM hc_capability_authorizations WHERE "
-                        "authorization_kind = 'capability' AND scope_ref = "
-                        ":scope_ref AND capability = :capability ORDER BY revision "
-                        "DESC LIMIT 1"
-                    ),
-                    {"scope_ref": row.scope_ref, "capability": row.capability},
-                ).scalar_one_or_none()
-            )
-        if row is None:
-            raise OwnerConflict("capability_authorization_receipt_invalid")
+                self._verify_capability_authorization_record(
+                    row=authorization_row,
+                    confirmation=confirmation,
+                    requirement=requirement,
+                    _expected_decision=_expected_decision,
+                )
+
+    @staticmethod
+    def _verify_capability_authorization_record(
+        *, row, confirmation, requirement: dict[str, object], _expected_decision: str
+    ) -> None:
         authorization = public_authorization_from_row(row)
         try:
             owner_previews = (
@@ -1096,9 +1143,7 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         if (
             authorization["authorization_kind"] != "capability"
             or authorization["status"] != _expected_decision
-            or not authorization["is_current"]
             or authorization["requirement"] != requirement
-            or current_ref != receipt_ref
             or confirmation is None
             or confirmation.receipt_hash != row.basis_confirmation_hash
             or confirmation.preview_ref != row.basis_preview_ref
@@ -1942,6 +1987,45 @@ class SQLiteHumanCollaboration:
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
         return self._collaboration_ladder.query_companion(scope_ref)
+
+    def query_companion_reply(
+        self, scope_ref: str, interaction_ref: str
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.query_companion_reply(
+            scope_ref, interaction_ref
+        )
+
+    def query_manual_drafting_reply(
+        self, context_ref: str, turn_ref: str
+    ) -> dict[str, object]:
+        return self._manual_creation.query_drafting_reply(context_ref, turn_ref)
+
+    def query_intent_reply(
+        self, initialization_id: str, turn_ref: str
+    ) -> dict[str, object]:
+        """Keep partial provider output separate from the durable transcript."""
+        with self._database.read() as connection:
+            turn = connection.execute(
+                text(
+                    "SELECT turns.* FROM hc_intent_drafting_turns AS turns JOIN "
+                    "hc_intent_drafting_sessions AS sessions ON "
+                    "sessions.session_ref = turns.session_ref WHERE "
+                    "sessions.initialization_id = :initialization_id AND "
+                    "turns.turn_ref = :turn_ref"
+                ),
+                {"initialization_id": initialization_id, "turn_ref": turn_ref},
+            ).first()
+        if turn is None:
+            raise OwnerConflict("intent_turn_not_found")
+        _require_intent_turn_artifact_integrity(turn)
+        status = str(turn.assistant_status)
+        content = turn.assistant_content if status == "completed" else ""
+        observe = getattr(self._intent_drafting_provider, "observe_reply", None)
+        if status in {"processing", "running"} and callable(observe):
+            content = observe(
+                _intent_provider_job_ref(turn_ref, int(turn.assistant_attempt_count))
+            )
+        return {"turn_ref": turn_ref, "status": status, "text": content or ""}
 
     def query_collaboration_projection(
         self, scope_refs: tuple[str, ...]
@@ -3868,108 +3952,6 @@ class SQLiteHumanCollaboration:
         )
         self._reconcile_issuing_owner_human_request(request_ref)
         return response
-
-    def _record_human_response_rejection(
-        self,
-        request: dict[str, object],
-        *,
-        idempotency_key: str,
-    ) -> dict[str, object]:
-        """Persist only a sanitized receipt for a rejected secret-bearing input."""
-
-        request_identity = {
-            "request_ref": request["request_ref"],
-            "issuer": request["issuer"],
-            "request_id": request["request_id"],
-            "request_revision": request["revision"],
-        }
-        request_identity_hash = canonical_hash(request_identity)
-        idempotency_hash = canonical_hash(
-            {
-                "kind": "human_response_rejection",
-                "idempotency_key": idempotency_key,
-            }
-        )
-        with self._database.write() as connection:
-            accepted = connection.execute(
-                text(
-                    "SELECT response_ref FROM hc_human_request_responses WHERE "
-                    "idempotency_key = :idempotency_key"
-                ),
-                {"idempotency_key": idempotency_key},
-            ).first()
-            if accepted is not None:
-                raise OwnerConflict("idempotency_conflict")
-            existing = connection.execute(
-                text(
-                    "SELECT * FROM hc_human_request_response_rejections WHERE "
-                    "idempotency_hash = :idempotency_hash"
-                ),
-                {"idempotency_hash": idempotency_hash},
-            ).first()
-            if existing is not None:
-                if (
-                    existing.request_ref != request["request_ref"]
-                    or existing.issuer != request["issuer"]
-                    or existing.request_id != request["request_id"]
-                    or int(existing.request_revision) != int(request["revision"])
-                    or existing.request_identity_hash != request_identity_hash
-                ):
-                    raise OwnerConflict("idempotency_conflict")
-                return _public_human_response_rejection(existing)
-            rejection_ref = new_ref("human_response_rejection")
-            receipt_ref = new_ref("hc_receipt")
-            payload = {
-                "schema_ref": HUMAN_RESPONSE_REJECTION_RECEIPT_SCHEMA,
-                "rejection_ref": rejection_ref,
-                **request_identity,
-                "reason_code": "human_response_secret_forbidden",
-                "request_identity_hash": request_identity_hash,
-                "idempotency_hash": idempotency_hash,
-            }
-            receipt_hash = canonical_hash(payload)
-            now = time.time()
-            connection.execute(
-                text(
-                    "INSERT INTO hc_human_request_response_rejections "
-                    "(rejection_ref, request_ref, issuer, request_id, "
-                    "request_revision, reason_code, request_identity_hash, "
-                    "idempotency_hash, receipt_ref, receipt_hash, created_at) "
-                    "VALUES (:rejection_ref, :request_ref, :issuer, :request_id, "
-                    ":request_revision, :reason_code, :request_identity_hash, "
-                    ":idempotency_hash, :receipt_ref, :receipt_hash, :created_at)"
-                ),
-                {
-                    **payload,
-                    "receipt_ref": receipt_ref,
-                    "receipt_hash": receipt_hash,
-                    "created_at": now,
-                },
-            )
-            connection.execute(
-                text(
-                    "UPDATE human_collaboration_state SET revision = revision + 1 "
-                    "WHERE singleton = 'owner'"
-                )
-            )
-            self._feed.record(
-                connection,
-                "human_collaboration.human_response_rejected",
-                {
-                    "rejection_ref": rejection_ref,
-                    "request_ref": request["request_ref"],
-                    "issuer": request["issuer"],
-                    "reason_code": "human_response_secret_forbidden",
-                },
-            )
-            row = connection.execute(
-                text(
-                    "SELECT * FROM hc_human_request_response_rejections WHERE "
-                    "rejection_ref = :rejection_ref"
-                ),
-                {"rejection_ref": rejection_ref},
-            ).one()
-        return _public_human_response_rejection(row)
 
     def _query_issuing_owner_request(self, request_ref: str) -> dict[str, object]:
         for owner in (

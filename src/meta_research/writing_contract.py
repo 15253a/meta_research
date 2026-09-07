@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 from dataclasses import dataclass
 import hashlib
 from importlib.resources import files
@@ -15,7 +17,10 @@ WRITING_PAPER_INTENT_SCHEMA = "meta-research/writing-paper-intent/v1"
 WRITING_PRESENTATION_INTENT_SCHEMA = (
     "meta-research/writing-presentation-intent/v1"
 )
-WRITING_RESEARCH_SNAPSHOT_SCHEMA = "meta-research/writing-research-snapshot/v1"
+WRITING_RESEARCH_SNAPSHOT_SCHEMA = "meta-research/writing-research-snapshot/v2"
+SUPPORTED_WRITING_RESEARCH_SNAPSHOT_SCHEMAS = frozenset(
+    {"meta-research/writing-research-snapshot/v1", WRITING_RESEARCH_SNAPSHOT_SCHEMA}
+)
 WRITING_RUNTIME_BINDING_SCHEMA = "meta-research/writing-runtime-binding/v1"
 WRITING_EXECUTION_BUDGET_SCHEMA = "meta-research/writing-execution-budget/v1"
 WRITING_CHILD_REVIEW_TASK_SCHEMA = "meta-research/writing-child-review-task/v1"
@@ -738,7 +743,8 @@ def _validate_writing_snapshot_shape(snapshot: dict[str, object]) -> None:
     revisions = snapshot.get("owner_revisions")
     if (
         set(snapshot) != required
-        or snapshot.get("schema_ref") != WRITING_RESEARCH_SNAPSHOT_SCHEMA
+        or not isinstance(snapshot.get("schema_ref"), str)
+        or snapshot.get("schema_ref") not in SUPPORTED_WRITING_RESEARCH_SNAPSHOT_SCHEMAS
         or not isinstance(snapshot.get("quest"), dict)
         or not isinstance(snapshot.get("questions"), list)
         or not isinstance(snapshot.get("accepted_sources"), list)
@@ -756,6 +762,89 @@ def _validate_writing_snapshot_shape(snapshot: dict[str, object]) -> None:
         )
     ):
         raise OwnerConflict("writing_snapshot_invalid")
+    if snapshot["schema_ref"] == WRITING_RESEARCH_SNAPSHOT_SCHEMA:
+        _validate_writing_history(snapshot)
+
+
+def _validate_writing_history(snapshot: dict[str, object]) -> None:
+    advancement = cast(dict[str, object], snapshot["advancement"])
+    questions = cast(list[dict[str, object]], snapshot["questions"])
+    if (
+        set(advancement) != {"cycle", "stages", "cycles"}
+        or not isinstance(advancement["cycles"], list)
+        or any(
+            not isinstance(question, dict)
+            or not isinstance(question.get("question_ref"), str)
+            for question in questions
+        )
+    ):
+        raise OwnerConflict("writing_snapshot_history_invalid")
+    question_refs = {question.get("question_ref") for question in questions}
+    stages = ("idea", "plan", "bundle", "reasoning")
+    cycle_refs: set[str] = set()
+    latest_cycle = None
+    latest_stages = {
+        stage: {"status": "not_accepted", "accepted": None} for stage in stages
+    }
+    for cycle in advancement["cycles"]:
+        if (
+            not isinstance(cycle, dict)
+            or set(cycle) != {"cycle", "stages", "stage_history"}
+            or not isinstance(cycle["cycle"], dict)
+            or not isinstance(cycle["stage_history"], list)
+        ):
+            raise OwnerConflict("writing_snapshot_history_invalid")
+        identity = cycle["cycle"]
+        cycle_ref = identity.get("cycle_ref")
+        if (
+            not isinstance(cycle_ref, str)
+            or not cycle_ref
+            or cycle_ref in cycle_refs
+            or not isinstance(identity.get("question_ref"), str)
+            or identity["question_ref"] not in question_refs
+        ):
+            raise OwnerConflict("writing_snapshot_history_invalid")
+        cycle_refs.add(cycle_ref)
+        current_stages = {
+            stage: {"status": "not_accepted", "accepted": None} for stage in stages
+        }
+        seen = set()
+        for entry in cycle["stage_history"]:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"stage", "epoch", "status", "accepted"}
+                or entry["stage"] not in stages
+                or type(entry["epoch"]) is not int
+                or entry["epoch"] < 1
+                or entry["status"] not in (
+                    "accepted", "report_accepted", "skipped", "exhausted"
+                )
+                or not isinstance(entry["accepted"], dict)
+            ):
+                raise OwnerConflict("writing_snapshot_history_invalid")
+            stage_epoch = (entry["stage"], entry["epoch"])
+            accepted = entry["accepted"]
+            binding = accepted.get("request", accepted)
+            if (
+                stage_epoch in seen
+                or not isinstance(binding, dict)
+                or binding.get("cycle_ref") != cycle_ref
+                or binding.get("epoch") != entry["epoch"]
+            ):
+                raise OwnerConflict("writing_snapshot_history_invalid")
+            seen.add(stage_epoch)
+            current_stages[entry["stage"]] = {
+                "status": entry["status"],
+                "accepted": accepted,
+            }
+        if cycle["stages"] != current_stages:
+            raise OwnerConflict("writing_snapshot_history_invalid")
+        latest_cycle, latest_stages = identity, current_stages
+    if (
+        advancement["cycle"] != latest_cycle
+        or advancement["stages"] != latest_stages
+    ):
+        raise OwnerConflict("writing_snapshot_history_invalid")
 
 
 def validate_frozen_writing_snapshot(snapshot: dict[str, object]) -> None:

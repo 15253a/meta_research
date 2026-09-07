@@ -34,6 +34,14 @@ import {
   type QuestDraft,
 } from "./api";
 import "./quest-creation.css";
+import { ProposalOutput } from "./ProposalOutput";
+import { useReplyStream } from "./chatReplyStream";
+
+type PendingIntentMessage = {
+  content: string;
+  basisRevision: number;
+  knownTurnRefs: string[];
+};
 
 const QUEST_MATERIAL_LIMIT = 100;
 const QUEST_MATERIAL_MAX_BYTES = 64 * 1024 * 1024;
@@ -281,6 +289,8 @@ export function QuestCreationWorkbench({
   const [inFlight, setInFlight] = useState<InFlightOperations>(idleOperations);
   const [error, setError] = useState<ProductFailure | null>(null);
   const [intentText, setIntentText] = useState("");
+  const [pendingIntent, setPendingIntent] = useState<PendingIntentMessage | null>(null);
+  const intentSendingRef = useRef(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [materialAssets, setMaterialAssets] = useState(researchAssets);
   const [materialDirectory, setMaterialDirectory] = useState("");
@@ -544,6 +554,58 @@ export function QuestCreationWorkbench({
     throw new ProductError("quest_initialization_poll_timeout");
   }, [applyView]);
 
+  const settleAcquisitionSession = useCallback(async (
+    basis: QuestCreationView,
+  ): Promise<QuestCreationView> => {
+    const deadline = Date.now() + 190_000;
+    let next = basis;
+    let joinedExisting = false;
+    while (mountedRef.current && Date.now() < deadline) {
+      if (creationIsLocked(next)) {
+        throw new ProductError(
+          ["completed", "cancelled"].includes(next.status)
+            ? "quest_initialization_is_terminal"
+            : "quest_initialization_unavailable",
+        );
+      }
+      if (acquisitionIsBusy(next)) {
+        next = await pollCreation(
+          next.initialization_id,
+          (view) => creationIsLocked(view) || !acquisitionIsBusy(view),
+          Math.max(1, deadline - Date.now()),
+        );
+        joinedExisting = true;
+        continue;
+      }
+      // A completed attempt for the current configuration is authoritative,
+      // including an unavailable/waiting-user result. A stale configuration
+      // instead needs its own preparation after the occupied slot is released.
+      if (
+        next.acquisition_session?.status === "cancelled" ||
+        joinedExisting && next.acquisition_session?.freshness === "current"
+      ) return next;
+      try {
+        next = await prepareAcquisitionSession(next);
+        if (!acquisitionIsBusy(next)) return next;
+        joinedExisting = true;
+      } catch (caught) {
+        if (!(caught instanceof ProductError) || caught.code !== "acquisition_session_busy") {
+          throw caught;
+        }
+        // Another request may claim the slot after the projection was read.
+        // Recover through the durable read path before considering another POST.
+        next = await fetchQuestCreation(next.initialization_id);
+        if (!mountedRef.current) break;
+        applyView(next, { notify: false });
+        joinedExisting = true;
+        if (!acquisitionIsBusy(next)) await delay(300);
+      }
+    }
+    throw new ProductError(mountedRef.current
+      ? "quest_initialization_poll_timeout"
+      : "quest_initialization_poll_cancelled");
+  }, [applyView, pollCreation]);
+
   const resumeExecution = useCallback((basis: QuestCreationView) => {
     const proposalIsPending = basis.status === "proposal_generating";
     if (!executionIsPending(basis) && !proposalIsPending) return;
@@ -682,7 +744,7 @@ export function QuestCreationWorkbench({
           saved.acquisition_session.freshness !== "current"
         ) {
           try {
-            next = await prepareAcquisitionSession(saved);
+            next = await settleAcquisitionSession(saved);
           } catch (caught) {
             // The DraftRevision is already durable. Keep that truth visible
             // even if the independent environment probe could not return.
@@ -765,7 +827,7 @@ export function QuestCreationWorkbench({
       return persist();
     }
     return result;
-  }, [applyView, hasEditedDraft, showError]);
+  }, [applyView, hasEditedDraft, settleAcquisitionSession, showError]);
 
   const persistProposal = useCallback(async function persistQuestion(): Promise<QuestCreationView | null> {
     if (Boolean(writeConflictRef.current)) return null;
@@ -1269,7 +1331,7 @@ export function QuestCreationWorkbench({
     try {
       const basis = await persistDraft();
       if (!basis || !operationIsCurrent("acquisition", token)) return;
-      const next = await prepareAcquisitionSession(basis);
+      const next = await settleAcquisitionSession(basis);
       if (!operationIsCurrent("acquisition", token)) return;
       applyView(next, {
         syncDraft: true,
@@ -1314,13 +1376,16 @@ export function QuestCreationWorkbench({
           basis.acquisition_session.status !== "ready"
         )
       ) {
-        basis = await prepareAcquisitionSession(basis);
+        basis = await settleAcquisitionSession(basis);
         if (!operationIsCurrent("generating", token)) return;
         applyView(basis, {
           syncDraft: true,
           syncProposal: !proposalDirtyRef.current,
         });
-        if (basis.acquisition_session?.status !== "ready") {
+        if (
+          basis.acquisition_session?.status !== "ready" ||
+          basis.acquisition_session.freshness !== "current"
+        ) {
           showError(new ProductError(
             basis.acquisition_session?.reason?.code ??
               "acquisition_session_not_ready",
@@ -1381,16 +1446,25 @@ export function QuestCreationWorkbench({
 
   const submitIntent = async () => {
     const message = intentText.trim();
-    if (!message) return;
+    if (!message || !creation || sessionInteractionLocked || intentSendingRef.current) return;
+    intentSendingRef.current = true;
+    setPendingIntent({
+      content: message,
+      basisRevision: creation.quest_draft.revision,
+      knownTurnRefs: creation.intent_session?.turns.map((turn) => turn.ref) ?? [],
+    });
+    setIntentText("");
     const token = beginOperation("intent");
+    let accepted = false;
     setError(null);
     try {
       const basis = await persistDraft();
       if (!basis || !operationIsCurrent("intent", token)) return;
       const queued = await sendIntentMessage(basis, message);
+      accepted = true;
       if (!operationIsCurrent("intent", token)) return;
-      setIntentText("");
       applyView(queued);
+      setPendingIntent(null);
       const turnRef = queued.intent_session?.turns.at(-1)?.ref;
       const next = await pollCreation(
         queued.initialization_id,
@@ -1407,6 +1481,11 @@ export function QuestCreationWorkbench({
     } catch (caught) {
       if (operationIsCurrent("intent", token)) showError(caught);
     } finally {
+      intentSendingRef.current = false;
+      if (operationIsCurrent("intent", token)) {
+        setPendingIntent(null);
+        if (!accepted) setIntentText((current) => current || message);
+      }
       finishOperation("intent", token);
     }
   };
@@ -1616,7 +1695,7 @@ export function QuestCreationWorkbench({
           <div className="quest-modal-title">
             <small>CREATE QUEST · FIRST QUESTION BUNDLE</small>
             <h2 id="quest-creation-title">创建 Quest，并决定第一个研究问题</h2>
-            <p>同一个 durable 草案 · 同一次确认 · 首问题由生产 Drafter 起草</p>
+            <p>填写目标与边界后，系统会协助起草；最终创建需要你确认。</p>
           </div>
           <div className="quest-modal-meta">
             <span className="quest-modal-chip">首次创建专用</span>
@@ -1628,9 +1707,11 @@ export function QuestCreationWorkbench({
             type="button"
             aria-label="关闭创建 Quest 窗口"
             onClick={() => void closePreservingDraft()}
+            aria-busy={inFlight.closing}
+            title={inFlight.closing ? "正在保存草案…" : "保存草案并关闭"}
             autoFocus
           >
-            ×
+            {inFlight.closing ? <span className="quest-close-spinner" aria-hidden="true" /> : "×"}
           </button>
         </header>
 
@@ -2110,6 +2191,12 @@ export function QuestCreationWorkbench({
                   <b id="quest-proposal-title">系统起草的第一个研究问题</b>
                   <small>六字段持续可编辑</small>
                 </div>
+                {creation?.proposal_generation ? <ProposalOutput
+                  key={creation.proposal_generation.ref}
+                  initializationId={creation.initialization_id}
+                  generationRef={creation.proposal_generation.ref}
+                  status={creation.proposal_generation.status}
+                /> : null}
                 <div className="quest-proposal">
                   <div className="quest-question-sourcebar">
                     <b>可编辑 QuestionProposal</b>
@@ -2282,6 +2369,8 @@ export function QuestCreationWorkbench({
             </main>
 
             <IntentDraftingSession
+              pendingMessage={pendingIntent}
+              onReplySettled={onChanged}
               creation={creation}
               value={intentText}
               disabled={!creation || sessionInteractionLocked}
@@ -2303,7 +2392,7 @@ export function QuestCreationWorkbench({
             disabled={!creation || terminal || inFlight.confirming || inFlight.cancelling || inFlight.closing}
             onClick={() => void explicitCancel()}
           >
-            取消
+            {inFlight.cancelling ? "正在放弃…" : "放弃创建"}
           </button>
           <button
             className="confirm"
@@ -2311,7 +2400,7 @@ export function QuestCreationWorkbench({
             disabled={!canConfirm}
             onClick={() => void submitConfirmation()}
           >
-            确认创建 Quest 与第一个问题
+            {inFlight.confirming ? "正在确认创建…" : "确认创建 Quest 与第一个问题"}
           </button>
         </footer>
       </section>
@@ -2320,12 +2409,16 @@ export function QuestCreationWorkbench({
 }
 
 function IntentDraftingSession({
+  pendingMessage,
+  onReplySettled,
   creation,
   value,
   disabled,
   onChange,
   onSubmit,
 }: {
+  pendingMessage: PendingIntentMessage | null;
+  onReplySettled: () => void;
   creation: QuestCreationView | null;
   value: string;
   disabled: boolean;
@@ -2334,10 +2427,14 @@ function IntentDraftingSession({
 }) {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const turns = creation?.intent_session?.turns ?? [];
+  const visiblePendingMessage = pendingMessage && !turns.some((turn) =>
+    !pendingMessage.knownTurnRefs.includes(turn.ref)
+    && turn.user_content === pendingMessage.content
+  ) ? pendingMessage : null;
 
   useEffect(() => {
     if (transcriptRef.current) transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
-  }, [turns]);
+  }, [turns, visiblePendingMessage]);
 
   return (
     <aside
@@ -2354,7 +2451,7 @@ function IntentDraftingSession({
         </div>
       </header>
       <div className="quest-intent-transcript" ref={transcriptRef} aria-live="polite">
-        {!turns.length ? (
+        {!turns.length && !visiblePendingMessage ? (
           <p className="quest-intent-empty">
             我会在这里解释配置、讨论是否需要 DeepFetch，并帮助缩小第一问；左侧字段仍只由你编辑。
           </p>
@@ -2362,18 +2459,26 @@ function IntentDraftingSession({
           <div key={turn.ref}>
             <article className="quest-intent-message user">
               <small>你 · draft r{turn.basis_revision}</small>
-              {turn.user_content}
+              <span>{turn.user_content}</span>
             </article>
             <article className={`quest-intent-message${turn.basis_hash !== creation?.quest_draft.hash ? " stale" : ""}`}>
               <small>Drafting Session · {turn.assistant_status}</small>
-              {turn.assistant_content ?? (
-                turn.reason
-                  ? `capability_unavailable · ${turn.reason.code}`
-                  : "正在准备回复…"
-              )}
+              <IntentReplyContent initializationId={creation!.initialization_id} turn={turn} onSettled={onReplySettled} />
             </article>
           </div>
         ))}
+        {visiblePendingMessage ? (
+          <div>
+            <article className="quest-intent-message user" data-message-status="sending">
+              <small>你 · draft r{visiblePendingMessage.basisRevision}</small>
+              <span>{visiblePendingMessage.content}</span>
+            </article>
+            <article className="quest-intent-message" data-message-status="queued">
+              <small>Drafting Session · queued</small>
+              <span role="status">正在准备回复…</span>
+            </article>
+          </div>
+        ) : null}
       </div>
       <div className="quest-session-compose">
         <label htmlFor="quest-intent-message">继续讨论</label>
@@ -2387,7 +2492,7 @@ function IntentDraftingSession({
             placeholder="询问配置含义、讨论是否需要 DeepFetch，或要求解释第一问……"
             onChange={(event) => onChange(event.target.value)}
             onKeyDown={(event) => {
-              if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && value.trim()) {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && value.trim()) {
                 event.preventDefault();
                 onSubmit();
               }
@@ -2403,6 +2508,7 @@ function IntentDraftingSession({
             ↑
           </button>
         </div>
+        <small className="quest-compose-shortcut">Enter 发送 · Shift+Enter 换行</small>
       </div>
       <div className="quest-intent-status">
         <span>{creation?.intent_session?.status ?? "opening"}</span>
@@ -2413,6 +2519,26 @@ function IntentDraftingSession({
       </div>
     </aside>
   );
+}
+
+function IntentReplyContent({ initializationId, turn, onSettled }: {
+  initializationId: string;
+  turn: IntentSessionTurn;
+  onSettled: () => void;
+}) {
+  const pending = ["queued", "running"].includes(turn.assistant_status);
+  const preview = useReplyStream(pending
+    ? `/api/v1/quest-initializations/${encodeURIComponent(initializationId)}/intent-session/turns/${encodeURIComponent(turn.ref)}/stream`
+    : null, onSettled);
+  const content = pending && preview?.text ? preview.text : turn.assistant_content;
+  const contentRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    const transcript = contentRef.current?.closest(".quest-intent-transcript");
+    if (transcript) transcript.scrollTop = transcript.scrollHeight;
+  }, [content]);
+  return <span ref={contentRef}>{content || (turn.reason
+    ? `capability_unavailable · ${turn.reason.code}`
+    : "正在准备回复…")}{pending && content ? <span role="status"> · 正在回复…</span> : null}</span>;
 }
 
 function ImpactSummary({ creation }: { creation: QuestCreationView | null }) {
@@ -3136,6 +3262,10 @@ function questCompletionHandoff(
     cycleRef: creation.cycle_ref,
     questionTitle,
   };
+}
+
+function acquisitionIsBusy(creation: QuestCreationView): boolean {
+  return ["probing", "acquiring"].includes(creation.acquisition_session?.status ?? "");
 }
 
 function creationIsLocked(creation: QuestCreationView): boolean {

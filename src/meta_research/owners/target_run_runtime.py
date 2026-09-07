@@ -59,6 +59,7 @@ from meta_research.bundle_target_contract import (
     normalized_completion_contract_to_dict,
 )
 from meta_research.database import Database
+from meta_research.read_snapshot_cache import snapshot_cached
 from meta_research.experiment_contract import EXPERIMENT_RESULT_DISPOSITIONS
 from meta_research.feed import DurableFeed
 from meta_research.owners.agent_runtime_harness import (
@@ -1984,6 +1985,7 @@ class SQLiteTargetRunGraphAuthority:
             raise OwnerConflict("target_formal_plan_projection_missing_after_commit")
         return accepted
 
+    @snapshot_cached
     def query_formal_plan_projection(
         self, *, graph_ref: str
     ) -> AcceptedTargetFormalPlanProjection | None:
@@ -2275,6 +2277,7 @@ class SQLiteTargetRunGraphAuthority:
             raise OwnerConflict("target_candidate_projection_missing_after_commit")
         return accepted
 
+    @snapshot_cached
     def query_candidate_projection(
         self, *, target_ref: str
     ) -> AcceptedTargetCandidateProjection | None:
