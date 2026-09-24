@@ -5497,7 +5497,10 @@ class SQLiteAdvancementEngine(
             reusable = bool(
                 successor is not None
                 and successor.get("entry_stage") in {PLAN_STAGE, BUNDLE_STAGE}
-                and successor.get("source_cycle_ref") == commit.cycle_ref
+                # The immediate predecessor can itself have reused this Idea.
+                # Its authenticated successor context proves the exact retained
+                # binding and skip receipt, irrespective of the original Cycle.
+                and successor.get("cycle_ref") == cycle_ref
                 and successor.get("accepted_idea_set_binding")
                 == binding.as_dict()
             )

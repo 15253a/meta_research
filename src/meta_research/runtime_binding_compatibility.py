@@ -1,9 +1,9 @@
 """Execution compatibility without freezing Bundle's revisable stage guidance.
 
 Historical binding equality, admission hashes and receipts remain exact. Only
-execution gates normalize reviewed transport repairs and the two policy prose
-resources. Models, capabilities, tools, executable artifacts and output schemas
-are still compared exactly.
+execution gates normalize reviewed transport/conditions repairs and the two
+policy prose resources. Models, capabilities, tools, executable artifacts and
+output schemas are still compared exactly.
 """
 from typing import TYPE_CHECKING
 
@@ -34,11 +34,30 @@ _REVIEWED_BUNDLE_TRANSPORT_REVISIONS = frozenset({
     ),
 })
 _BUNDLE_SOURCE = "adapter-source:meta_research.bundle_skill@sha256:"
+_SHARED_BUNDLE_SOURCE = "adapter-source:meta_research.idea_skill@sha256:"
 _SUPERVISOR_SOURCE = "adapter-source:meta_research.provider_supervisor@sha256:"
 _RECOVERY_SOURCE = "adapter-source:meta_research.bundle_dispatch_recovery@sha256:"
 _POLICY_CONTRACT = "bundle-execution-contract:policy-refresh/v1"
 _POLICY_PACKAGE = "package:meta_research.skills.bundle_stage/"
 _POLICY_RESOURCES = ("SKILL.md", "references/contract.md")
+
+# 09e0ac7 adds current Quest conditions to new calls and retains the sealed
+# conditions/prompt for durable replays. These exact aggregate instruction and
+# two source hashes were checked against the admitted 8768 Bundle and release.
+# This is execution-only: all remaining fields, resources, schemas and the
+# per-deployment transport key must still be identical, with no receipt rewrite.
+_REVIEWED_BUNDLE_CONDITIONS_REVISIONS = frozenset({
+    (
+        "67c1c3d4005ab5a73e8c0eaa7a45c9eee10bdacb8b0481dd819af6a50a4a02b4",
+        "ffea3bacb7082e8cfbf7b3948780d6ded827c05811cdfab45245b3ea5ae820ec",
+        "3c3b6e2cfd827981ec5cbd79c166b00f005849a9c9880d05d19cd9954255d5ad",
+    ),
+    (
+        "9762d6d048f08186f950a010bd489f6a1a113b2511821698409629da3d391a96",
+        "a68b18ac34873d2cb3357938bbdf23a5b9d7c3e54926b6806b396cff2ce0246e",
+        "653e4374f2440a6b93ad40b520db472dd9c8b5b6dde80a707a59c380ff3e0a25",
+    ),
+})
 
 # Complete bindings captured from the actual 8767 CLI and its copied transport
 # key. Every prior operation binding is identical; the catalog adds only the
@@ -178,6 +197,25 @@ def _same_execution_policy_value(binding: "BundleRuntimeBinding") -> dict[str, o
     return value
 
 
+def _reviewed_conditions_execution_value(binding: "BundleRuntimeBinding") -> dict[str, object] | None:
+    source = _single_resource(binding, _BUNDLE_SOURCE)
+    shared = _single_resource(binding, _SHARED_BUNDLE_SOURCE)
+    contracts = [entry for entry in binding.resource_bindings if entry.startswith("bundle-execution-contract:")]
+    if source is None or shared is None or contracts != [_POLICY_CONTRACT]:
+        return None
+    revision = (binding.instruction_set_hash, source[len(_BUNDLE_SOURCE):], shared[len(_SHARED_BUNDLE_SOURCE):])
+    if revision not in _REVIEWED_BUNDLE_CONDITIONS_REVISIONS:
+        return None
+    value = binding.as_dict()
+    value["instruction_set_hash"] = "reviewed-bundle-conditions-20260924"
+    replacements = {
+        source: _BUNDLE_SOURCE + "reviewed-conditions-20260924",
+        shared: _SHARED_BUNDLE_SOURCE + "reviewed-conditions-20260924",
+    }
+    value["resource_bindings"] = [replacements.get(entry, entry) for entry in binding.resource_bindings]
+    return value
+
+
 def bundle_bindings_compatible(left: "BundleRuntimeBinding", right: "BundleRuntimeBinding") -> bool:
     from meta_research.owners.agent_runtime import BundleRuntimeBinding
     from meta_research.owners.common import canonical_hash
@@ -185,6 +223,10 @@ def bundle_bindings_compatible(left: "BundleRuntimeBinding", right: "BundleRunti
     if type(left) is not BundleRuntimeBinding or type(right) is not BundleRuntimeBinding:
         return False
     if left == right:
+        return True
+    before = _reviewed_conditions_execution_value(left)
+    after = _reviewed_conditions_execution_value(right)
+    if before is not None and after is not None and before == after:
         return True
     before = _same_execution_policy_value(left)
     after = _same_execution_policy_value(right)

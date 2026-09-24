@@ -26,6 +26,9 @@ from meta_research.codex_ledger import (
     CodexSessionLedgerReader,
 )
 from meta_research.system_prompt import read_output_language
+from meta_research.runtime_conditions import (
+    compose_runtime_prompt, render_runtime_conditions, split_runtime_prompt,
+)
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
@@ -1834,6 +1837,7 @@ class CodexIdeaSkillAdapter:
                 native_session_ref=native_session_ref,
                 job_ref=job_ref,
                 sandbox_read_root=sandbox_read_root,
+                run_ref=run_ref,
             )
         if run_ref is None or attempt_ref is None or fence_ref is None:
             raise IdeaSkillUnavailable("semantic_mcp_scope_invalid")
@@ -1866,6 +1870,7 @@ class CodexIdeaSkillAdapter:
                 semantic_mcp_protected_environment=True,
                 authorized_operation_ids=access.operation_ids,
                 sandbox_read_root=sandbox_read_root,
+                run_ref=run_ref,
             )
         except IdeaSkillUnavailable as error:
             if error.code != "codex_operation_reconciliation_pending":
@@ -1961,6 +1966,7 @@ class CodexIdeaSkillAdapter:
         semantic_mcp_protected_environment: bool = False,
         authorized_operation_ids: tuple[str, ...] = (),
         sandbox_read_root: Path | None = None,
+        run_ref: str | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
@@ -2011,8 +2017,13 @@ class CodexIdeaSkillAdapter:
                 authorized_operation_ids=authorized_operation_ids,
                 sandbox_read_root=sandbox_read_root,
                 transport_limits=transport_limits,
+                run_ref=run_ref,
             )
         else:
+            prompt = compose_runtime_prompt(
+                prompt, render_runtime_conditions(self._workspace, run_ref=run_ref)
+            )
+            _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
             pre_turn_diagnostics = self._root_capability_diagnostics(
                 entry_path=entry_path,
                 authorized_operation_ids=authorized_operation_ids,
@@ -2080,8 +2091,28 @@ class CodexIdeaSkillAdapter:
         authorized_operation_ids: tuple[str, ...],
         sandbox_read_root: Path | None,
         transport_limits: ProviderTransportLimits,
+        run_ref: str | None = None,
     ) -> tuple[dict[str, object], str | None, str, dict[str, object]]:
         directory.mkdir(parents=True, exist_ok=True)
+        invocation_path = directory / "invocation.json"
+        if invocation_path.exists():
+            try:
+                persisted_prompt = _read_spool_text(
+                    directory / "prompt.txt", transport_limits.prompt_max_bytes
+                )
+                _conditions, original_prompt = split_runtime_prompt(persisted_prompt)
+            except (OSError, UnicodeDecodeError, ValueError) as error:
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+            if original_prompt != prompt:
+                raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            # The signed invocation below still verifies the entire stored
+            # prompt and every operation binding before this input is used.
+            prompt = persisted_prompt
+        else:
+            prompt = compose_runtime_prompt(
+                prompt, render_runtime_conditions(self._workspace, run_ref=run_ref)
+            )
+        _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
         capability_profile = root_capability_profile(self._root_agent_kind)
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
@@ -2117,7 +2148,6 @@ class CodexIdeaSkillAdapter:
         _key_path, transport_key = self._transport_key()
         invocation_json = _sealed_operation_invocation(invocation, transport_key)
         invocation_hash = canonical_hash(invocation)
-        invocation_path = directory / "invocation.json"
         if not invocation_path.exists() and any(directory.iterdir()):
             raise IdeaSkillUnavailable("codex_operation_spool_invalid")
         created = _write_exclusive(invocation_path, invocation_json)

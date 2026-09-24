@@ -35,6 +35,7 @@ def upgrade():
         sa.Column("question_ref", sa.String(96), sa.ForeignKey("rg_question_lifecycle.question_ref"), nullable=False),
         *_fact_columns())
     op.create_index("ix_rg_environment_references_question", "rg_environment_references", ["question_ref"])
+    op.create_index("ix_rg_environment_references_environment", "rg_environment_references", ["environment_ref"])
     op.create_table("rg_environment_commands",
         sa.Column("idempotency_key", sa.String(128), primary_key=True),
         sa.Column("operation", sa.String(32), nullable=False),

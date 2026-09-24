@@ -20,6 +20,9 @@ from urllib.parse import parse_qsl, urlsplit
 
 from meta_research.acquisition import DEEPFETCH_PROTOTYPE_COMMIT
 from meta_research.system_prompt import read_output_language
+from meta_research.runtime_conditions import (
+    compose_runtime_prompt, render_runtime_conditions, split_runtime_prompt,
+)
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
@@ -2804,6 +2807,12 @@ class CodexDeepFetchAdapter:
             root_job_ref,
             canonical_hash(request.runtime_binding.as_dict()),
         )
+        prompt = compose_runtime_prompt(
+            prompt, render_runtime_conditions(
+                self._workspace, run_ref=request.run_ref,
+                initialization_id=request.initialization_id,
+            ),
+        )
         with tempfile.TemporaryDirectory(
             prefix="deepfetch-", dir=self._workspace
         ) as raw_directory:
@@ -3044,6 +3053,25 @@ class CodexDeepFetchAdapter:
         access: RootResidentMcpAccess | None = None,
     ) -> tuple[str, dict[str, object] | None, str, str | None]:
         directory.mkdir(parents=True, exist_ok=True)
+        invocation_path = directory / "invocation.json"
+        if invocation_path.exists():
+            try:
+                persisted_prompt = (directory / "prompt.txt").read_text(encoding="utf-8")
+                _conditions, original_prompt = split_runtime_prompt(persisted_prompt)
+            except (OSError, UnicodeDecodeError, ValueError) as error:
+                raise DeepFetchUnavailable("deepfetch_provider_spool_invalid") from error
+            if original_prompt != prompt:
+                raise DeepFetchUnavailable("deepfetch_provider_identity_conflict")
+            # The existing signed invocation comparison below verifies the
+            # full frozen prompt hash, scope, schema and native identity.
+            prompt = persisted_prompt
+        else:
+            prompt = compose_runtime_prompt(
+                prompt, render_runtime_conditions(
+                    self._workspace, run_ref=request.run_ref,
+                    initialization_id=request.initialization_id,
+                ),
+            )
         schema = output_schema
         capability_profile = root_capability_profile("deepfetch")
         entry_path: RootCapabilityEntryPath = (
@@ -3076,7 +3104,6 @@ class CodexDeepFetchAdapter:
                 }
             )
         invocation_hash = canonical_hash(invocation)
-        invocation_path = directory / "invocation.json"
         envelope = {
             "payload": invocation,
             "seal": hmac.new(

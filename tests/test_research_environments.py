@@ -189,16 +189,16 @@ def test_real_root_mcp_blocks_foreign_resources_content_and_question_writes(runt
     graph, agent = runtime.owners.research_graph, runtime.owners.agent_runtime
     one, two = _quest(runtime, "scope-one"), _quest(runtime, "scope-two")
     own = _environment(graph, key="own", quest_ref=one.quest_ref)
-    foreign = _environment(graph, key="foreign", quest_ref=two.quest_ref)
     foreign_asset = _asset(runtime)
     graph.accept_asset_role(binding=foreign_asset, role="evidence", quest_ref=two.quest_ref, idempotency_key="foreign-origin")
+    foreign = _environment(graph, key="foreign", quest_ref=two.quest_ref, asset_bindings=[foreign_asset])
     gateway = SemanticMcpGateway(environment_operations(graph, agent))
     channel = _channel(gateway, _scope(runtime, quest_ref=one.quest_ref))
     assert _accepted(_call(gateway, channel, "read", environment_ref=own["environment_ref"])) == own
     assert _call(gateway, channel, "read", environment_ref=foreign["environment_ref"])["structuredContent"]["status"] == "not_found"
     assert _call(gateway, channel, "page")["structuredContent"]["items"] == [own]
     cases = (
-        ("reference", dict(environment_ref=foreign["environment_ref"], question_ref=one.question_ref), "environment_quest_scope_invalid"),
+        ("reference", dict(environment_ref=foreign["environment_ref"], question_ref=one.question_ref), "asset_quest_scope_invalid"),
         ("reference", dict(environment_ref=own["environment_ref"], question_ref=two.question_ref), "environment_question_scope_invalid"),
         ("register", dict(source_environment_ref=foreign["environment_ref"]), "environment_source_not_found"),
         ("register", dict(asset_bindings=[foreign_asset.as_dict()]), "asset_quest_scope_invalid"),
@@ -212,6 +212,87 @@ def test_real_root_mcp_blocks_foreign_resources_content_and_question_writes(runt
     assert graph.query_environments(question_ref=one.question_ref)["total"] == 0
     assert graph.query_environments(question_ref=two.question_ref)["total"] == 0
     assert graph.query_environments()["total"] == 2
+
+
+def test_real_root_can_adopt_exact_equipment_from_another_quest_without_new_assets(runtime):
+    graph, agent = runtime.owners.research_graph, runtime.owners.agent_runtime
+    origin, destination = _quest(runtime, "equipment-origin"), _quest(runtime, "equipment-adopter")
+    equipment = _environment(graph, quest_ref=origin.quest_ref)
+    assets_before = {item.version_ref for item in runtime.owners.research_memory.query_asset_inventory()}
+    gateway = SemanticMcpGateway(environment_operations(graph, agent))
+    channel = _channel(gateway, _scope(runtime, quest_ref=destination.quest_ref))
+
+    assert _call(gateway, channel, "page")["structuredContent"]["items"] == []
+    assert _call(gateway, channel, "read", environment_ref=equipment["environment_ref"])["structuredContent"]["status"] == "not_found"
+    usage = _accepted(_call(gateway, channel, "reference", effect_id="adopt-equipment",
+        environment_ref=equipment["environment_ref"], question_ref=destination.question_ref,
+        purpose="Reuse the same recording station, subject to booking and calibration."))
+
+    assert usage["environment_ref"] == equipment["environment_ref"]
+    assert _accepted(_call(gateway, channel, "read", environment_ref=equipment["environment_ref"])) == equipment
+    assert _call(gateway, channel, "page")["structuredContent"]["items"] == [equipment]
+    assert graph.query_environment(equipment["environment_ref"], quest_ref=origin.quest_ref) == equipment
+    assert graph.query_environments()["total"] == 1
+    assert {item.version_ref for item in runtime.owners.research_memory.query_asset_inventory()} == assets_before
+
+
+def test_cross_quest_digital_adoption_needs_every_binding_and_keeps_exact_shared_content(runtime):
+    from meta_research.research_content import read_content
+
+    graph, memory, agent = runtime.owners.research_graph, runtime.owners.research_memory, runtime.owners.agent_runtime
+    origin, destination = _quest(runtime, "digital-origin"), _quest(runtime, "digital-adopter")
+    bindings = [_asset(runtime, content=content, key=key) for key, content in
+                (("simulator", b"Original simulator"), ("configuration", b"Original configuration"))]
+    for index, binding in enumerate(bindings):
+        graph.accept_asset_role(binding=binding, role="evidence", quest_ref=origin.quest_ref,
+            idempotency_key=f"digital-origin-{index}")
+    environment = _environment(graph, quest_ref=origin.quest_ref, asset_bindings=bindings)
+    assets_before = {item.version_ref for item in memory.query_asset_inventory()}
+    gateway = SemanticMcpGateway(environment_operations(graph, agent))
+    channel = _channel(gateway, _scope(runtime, quest_ref=destination.quest_ref))
+    payload = dict(effect_id="adopt-digital", environment_ref=environment["environment_ref"],
+        question_ref=destination.question_ref, purpose="Use the accepted original simulator and configuration")
+    graph.accept_asset_role(binding=bindings[0], role="evidence", quest_ref=destination.quest_ref,
+        idempotency_key="adopt-first-binding")
+    rejected = _call(gateway, channel, "reference", **payload)
+    assert rejected.get("isError") and "asset_quest_scope_invalid" in str(rejected)
+    assert graph.query_environments(question_ref=destination.question_ref)["total"] == 0
+    with pytest.raises(OwnerConflict, match="asset_quest_scope_invalid"):
+        graph.reference_environment(**{key: value for key, value in payload.items() if key != "effect_id"},
+            idempotency_key="direct-incomplete-adoption")
+    graph.accept_asset_role(binding=bindings[1], role="evidence", quest_ref=destination.quest_ref,
+        idempotency_key="adopt-second-binding")
+    with pytest.raises(OwnerConflict, match="content_source_unbound"):
+        read_content(graph, memory, quest_ref=destination.quest_ref,
+            source_ref=environment["environment_ref"], version_ref=bindings[0].version_ref)
+    accepted = _call(gateway, channel, "reference", **payload)
+    _accepted(accepted)
+    assert _call(gateway, channel, "reference", **payload)["structuredContent"] == accepted["structuredContent"]
+    assert _accepted(_call(gateway, channel, "read", environment_ref=environment["environment_ref"])) == environment
+    for binding, expected in zip(bindings, ("Original simulator", "Original configuration")):
+        page = read_content(graph, memory, quest_ref=destination.quest_ref,
+            source_ref=environment["environment_ref"], version_ref=binding.version_ref)
+        assert page["asset_binding"] == binding.as_dict()
+        assert page["text"] == expected
+    assert graph.query_environments()["items"] == [environment]
+    assert {item.version_ref for item in memory.query_asset_inventory()} == assets_before
+
+
+def test_damaged_reference_cannot_make_another_quests_resource_visible(runtime):
+    graph = runtime.owners.research_graph
+    origin, destination = _quest(runtime, "proof-origin"), _quest(runtime, "proof-adopter")
+    environment = _environment(graph, quest_ref=origin.quest_ref)
+    usage = graph.reference_environment(environment_ref=environment["environment_ref"],
+        question_ref=destination.question_ref, idempotency_key="proof-adoption")
+    with runtime._database.write() as connection:
+        connection.execute(text("UPDATE rg_environment_references SET receipt_hash=:hash "
+            "WHERE environment_reference_ref=:ref"),
+            {"hash": "0" * 64, "ref": usage["environment_reference_ref"]})
+    with pytest.raises(OwnerConflict, match="environment_receipt_invalid"):
+        graph.query_environment(environment["environment_ref"], quest_ref=destination.quest_ref)
+    with pytest.raises(OwnerConflict, match="environment_receipt_invalid"):
+        graph.query_environments(quest_ref=destination.quest_ref)
+    assert graph.query_environment(environment["environment_ref"], quest_ref=origin.quest_ref) == environment
 
 
 def test_recovered_real_root_reconciles_both_effect_families_without_duplicate_snapshots(runtime):

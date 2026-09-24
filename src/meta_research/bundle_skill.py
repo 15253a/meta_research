@@ -1100,6 +1100,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 mcp_scope_binding_hash=scope_binding_hash,
                 semantic_mcp_protected_environment=True,
                 authorized_operation_ids=operation_ids,
+                run_ref=run_ref,
             )
         except BundleSkillUnavailable as error:
             if error.code != "codex_operation_reconciliation_pending":

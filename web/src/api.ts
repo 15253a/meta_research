@@ -2547,6 +2547,54 @@ export class ProductError extends Error {
   }
 }
 
+export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string };
+
+export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSignal): Promise<QuestRuntimeConditions> {
+  return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);
+}
+
+export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string): Promise<QuestRuntimeConditions> {
+  return writeJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, "PUT", {
+    text, expected_revision: expectedRevision,
+  });
+}
+
+export async function fetchQuestRuntimeDevices(
+  questRef: string,
+  questionRef: string,
+  signal?: AbortSignal,
+): Promise<ComputeDevice[]> {
+  const history = await fetchQuestionHistory(questionRef, { limit: 1, signal });
+  const question = history.question;
+  if (history.status !== "ready" || history.question_ref !== questionRef
+    || question?.question_ref !== questionRef || question.quest_ref !== questRef
+    || typeof question.initialization_id !== "string" || !question.initialization_id) {
+    throw new ProductError("runtime_conditions_identity_invalid");
+  }
+  // Even a later Question carries its original Quest initialization identity.
+  // This catalog survives deselection; mutable conditions contain only choices.
+  const creation = await fetchQuestCreation(question.initialization_id, signal);
+  if (creation.initialization_id !== question.initialization_id || creation.quest_ref !== questRef) {
+    throw new ProductError("runtime_conditions_identity_invalid");
+  }
+  const compute = creation.compute;
+  if (!compute || compute.status !== "ready" || !Array.isArray(compute.devices)) {
+    throw new ProductError("runtime_conditions_devices_unavailable");
+  }
+  if (creation.resource_envelope && compute.snapshot_ref !== creation.resource_envelope.host_snapshot_ref) {
+    throw new ProductError("runtime_conditions_devices_invalid");
+  }
+  const devices = compute.devices;
+  if (devices.some(device => !device || typeof device.uuid !== "string" || !device.uuid
+    || typeof device.name !== "string" || !device.name
+    || typeof device.memory_total_mib !== "number" || !Number.isFinite(device.memory_total_mib)
+    || device.memory_total_mib < 0)
+    || new Set(devices.map(device => device.uuid)).size !== devices.length) {
+    throw new ProductError("runtime_conditions_devices_invalid");
+  }
+  return devices.map(({ uuid, name, memory_total_mib }) => ({ uuid, name, memory_total_mib }));
+}
+
 export async function fetchSnapshot(
   signal?: AbortSignal,
   sections: { includeAssets?: boolean; includeHistory?: boolean } = {},
@@ -6317,10 +6365,11 @@ export function followProjection(
 
 export type OutputLanguage = "zh" | "en";
 export type ResearchLibraryEntry = "questions" | "baselines" | "datasets" | "literature" | "human" | "environments";
-export type ResearchContentReader = { source_ref: string; version_ref?: string | null; entry_path?: string; ref?: string; operation?: string };
+export type ResearchContentReader = { source_ref?: string; version_ref?: string | null; entry_path?: string; ref?: string; operation?: string; question_ref?: string };
 export type ResearchLibraryItem = Record<string, unknown> & {
   ref?: string; title?: string; name?: string; summary?: string; status?: string;
   reader?: ResearchContentReader | null;
+  history_reader?: ResearchContentReader | null;
 };
 export type ResearchLibraryPage = { items: ResearchLibraryItem[]; next_offset: number | null; total_count?: number; request_next_cursor?: string | null };
 export type ResearchContentPage = {
@@ -6354,6 +6403,7 @@ export function fetchResearchLibrary(entry: ResearchLibraryEntry, questRef: stri
   return readResearchJson<ResearchLibraryPage>(`/api/v1/research-library/${entry}?${parameters}`, signal);
 }
 export function fetchResearchContent(questRef: string, reader: ResearchContentReader, offset: number, signal?: AbortSignal) {
+  if (!reader.source_ref || !reader.version_ref) throw new ProductError("research_content_reference_invalid");
   const parameters = new URLSearchParams({ quest_ref: questRef, source_ref: reader.source_ref, offset: String(offset), limit: "16384" });
   if (reader.version_ref) parameters.set("version_ref", reader.version_ref);
   if (reader.entry_path) parameters.set("entry_path", reader.entry_path);

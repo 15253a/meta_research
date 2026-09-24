@@ -1,0 +1,42 @@
+.runtime-conditions-entry { padding: 9px 13px; border: 1px solid #d8deea; border-radius: 10px; background: #fff; color: #35405b; font: inherit; font-size: 13px; white-space: nowrap; cursor: pointer; }
+.runtime-conditions-entry:disabled { opacity: .5; cursor: default; }
+.runtime-conditions-dialog { box-sizing: border-box; width: min(720px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; overscroll-behavior: contain; padding: 0; border: 1px solid #d8deea; border-radius: 18px; color: #172033; background: #fff; box-shadow: 0 24px 90px #15213c40; }
+.runtime-conditions-dialog::backdrop { background: #17203366; }
+.runtime-conditions-dialog form { display: grid; gap: 18px; padding: 24px; }
+.runtime-conditions-dialog header, .runtime-conditions-dialog footer { display: flex; align-items: center; gap: 12px; }
+.runtime-conditions-dialog header { justify-content: space-between; }
+.runtime-conditions-dialog h2 { margin: 0; font-size: 21px; }
+.runtime-conditions-dialog p { margin: 0; color: #66718a; font-size: 14px; line-height: 1.6; }
+.runtime-conditions-dialog label { display: grid; min-width: 0; gap: 10px; font-size: 14px; }
+.runtime-conditions-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.runtime-conditions-fields select { box-sizing: border-box; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #cbd3e2; border-radius: 9px; color: #172033; background: #fff; font: inherit; }
+.runtime-conditions-fields select:disabled { color: #66718a; background: #f4f6fa; }
+.runtime-conditions-exclusions { grid-column: 1 / -1; }
+.runtime-conditions-dialog textarea { box-sizing: border-box; width: 100%; min-height: 230px; max-height: 52dvh; resize: vertical; padding: 14px; border: 1px solid #cbd3e2; border-radius: 10px; background: #fafbff; color: #172033; font: 14px/1.7 system-ui, sans-serif; }
+.runtime-conditions-dialog .runtime-conditions-exclusions textarea { min-height: 78px; padding: 10px 12px; }
+.runtime-conditions-dialog textarea:focus, .runtime-conditions-fields select:focus { outline: 2px solid #625fe7; outline-offset: 2px; }
+.runtime-conditions-devices { min-width: 0; margin: 0; padding: 14px; border: 1px solid #d8deea; border-radius: 10px; }
+.runtime-conditions-devices legend { padding: 0 6px; font-size: 14px; }
+.runtime-conditions-device-list { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin: 12px 0; }
+.runtime-conditions-dialog .runtime-conditions-device { display: flex; align-items: flex-start; gap: 10px; padding: 10px; border: 1px solid #e0e5ee; border-radius: 8px; background: #fafbff; cursor: pointer; }
+.runtime-conditions-device input { flex: 0 0 auto; margin: 3px 0 0; accent-color: #625fe7; }
+.runtime-conditions-device span { min-width: 0; }
+.runtime-conditions-device strong { display: block; font-weight: 500; line-height: 1.5; }
+.runtime-conditions-device small { display: block; margin-top: 4px; color: #66718a; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.runtime-conditions-devices:disabled .runtime-conditions-device { opacity: .6; cursor: default; }
+.runtime-conditions-dialog .runtime-conditions-note { font-size: 13px; }
+.runtime-conditions-advanced { border-top: 1px solid #e0e5ee; padding-top: 14px; }
+.runtime-conditions-advanced summary { color: #56617a; font-size: 13px; cursor: pointer; }
+.runtime-conditions-advanced label { margin-top: 14px; }
+.runtime-conditions-dialog button { padding: 9px 15px; border: 1px solid #d8deea; border-radius: 9px; background: #fff; color: #35405b; font: inherit; font-size: 14px; cursor: pointer; }
+.runtime-conditions-dialog header button { padding: 4px 11px; font-size: 23px; }
+.runtime-conditions-dialog footer { justify-content: flex-end; flex-wrap: wrap; }
+.runtime-conditions-dialog .runtime-conditions-save { color: #fff; border-color: #625fe7; background: #625fe7; }
+.runtime-conditions-dialog button:disabled { opacity: .45; cursor: default; }
+.runtime-conditions-dialog .runtime-conditions-error { color: #a82e3d; }
+.runtime-conditions-dialog .runtime-conditions-saved { color: #16745c; }
+@media (max-width: 600px) {
+  .runtime-conditions-entry { padding: 7px 10px; font-size: 12px; }
+  .runtime-conditions-dialog form { padding: 18px; gap: 14px; }
+  .runtime-conditions-fields, .runtime-conditions-device-list { grid-template-columns: 1fr; }
+}

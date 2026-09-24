@@ -4,6 +4,8 @@ status: accepted
 
 # 科研资产按研究含义组织，并共用精确内容引用
 
+2026-09-24 补充：[ADR 0006](0006-environment-as-reusable-research-index.md) 新增 Environment 直接索引入口，将下述五入口扩展为六入口；既有 Baseline 执行与存储层级及本记录其他决定保留。
+
 2026-09-22，用户明确本次优化以理顺 RG／RM 资产归属和读写为中心。RG、RM、AE、AR、HC 的深模块架构保留；RG 以 Question、Baseline、Dataset、Literature、HumanRequest／人类输入为五个研究入口。此记录确认设计约束，不表示实现或部署已经完成。
 
 Baseline → Variant → VariantRun 表达方法、具体方案与真实实施；Variant → Evaluation → EvaluationAttempt → MetricResult 表达关联精确 ProtocolVersion 的评价及其实际结果。Target 的真实工作有对应实施记录，所保留的科研产物按含义进入上述层级；未开展评价不制造评估实施或结果。Target／TargetCommit 可保留执行与交接出处，仅挂在其下不算完成科研资产归类。具有独立数据复用价值的产物还可登记为 Dataset，关联原实施和同一内容。

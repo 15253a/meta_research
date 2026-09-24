@@ -728,6 +728,12 @@ class OutputLanguagePreference(BaseModel):
     output_language: Literal["zh","en"]
 
 
+class RuntimeConditionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=24000)
+    expected_revision: str = Field(min_length=64, max_length=64)
+
+
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
@@ -2256,6 +2262,17 @@ def create_app(
         from meta_research.system_prompt import read_output_language
         return {"output_language":read_output_language(runtime.data_root.root)}
 
+    @app.get("/api/v1/quests/{quest_ref}/runtime-conditions")
+    def get_runtime_conditions(quest_ref: str) -> dict[str, str]:
+        from meta_research.runtime_conditions import read_runtime_conditions
+        return read_runtime_conditions(runtime.data_root.root, quest_ref)
+
+    @app.put("/api/v1/quests/{quest_ref}/runtime-conditions")
+    def put_runtime_conditions(quest_ref: str, conditions: RuntimeConditionsRequest) -> dict[str, str]:
+        from meta_research.runtime_conditions import save_runtime_conditions
+        return save_runtime_conditions(runtime.data_root.root, quest_ref,
+                                       **conditions.model_dump())
+
     @app.put("/api/v1/preferences")
     def set_preferences(preference: OutputLanguagePreference) -> dict[str, object]:
         payload = preference.model_dump()
@@ -2309,13 +2326,25 @@ def create_app(
     @app.get("/api/v1/research-library/{entry}")
     def query_research_library(entry: str,quest_ref: str,query: str="",offset: int=Query(default=0,ge=0),
             limit: int=Query(default=12,ge=1,le=100),dataset_ref: str|None=None,environment_ref: str|None=None,
-            baseline_ref: str|None=None,variant_ref: str|None=None,
+            baseline_ref: str|None=None,variant_ref: str|None=None,question_ref: str|None=None,
             request_cursor: str|None=Query(default=None,max_length=512)) -> dict[str,object]:
         from meta_research.research_content import discover_questions,discover_literature
         graph=runtime.owners.research_graph;memory=runtime.owners.research_memory
         if graph.query_quest_by_ref(quest_ref) is None:raise OwnerConflict("research_library_quest_invalid")
         args={"quest_ref":quest_ref,"query":query,"offset":offset,"limit":limit}
-        if entry=="questions":return discover_questions(graph,memory,**args)
+        if entry=="questions":
+            if question_ref:
+                question=graph.query_question_history_by_ref(question_ref)
+                if question is None or question.quest_ref!=quest_ref:
+                    raise OwnerConflict("research_history_source_unbound")
+                page=graph.query_question_research_history(quest_ref=quest_ref,question_ref=question_ref,
+                                                          offset=offset,limit=min(limit,12))
+                page["items"]=[{**item,"ref":item["source_ref"],"name":question_ref,
+                    "summary":item.get("claim",{}).get("text",""),
+                    "reader":{"source_ref":item["source_ref"],"version_ref":item["source_ref"]}}
+                    for item in page["items"]]
+                return page
+            return discover_questions(graph,memory,**args)
         if entry=="literature":return discover_literature(graph,memory,**args)
         if entry=="baselines":
             if baseline_ref:

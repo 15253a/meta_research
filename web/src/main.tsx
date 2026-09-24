@@ -89,6 +89,7 @@ import { StageReadableOutput, TargetCommandOutput } from "./ReadableOutput";
 import { ExperimentLogs, ExperimentOutputViews } from "./ExperimentLogs";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
 import { RootConversations, StageRootSessions, useRootConversations } from "./RootConversations";
+import { RuntimeConditions } from "./RuntimeConditions";
 import "./research-interaction.css";
 import "./spectrum-workspace.css";
 
@@ -828,6 +829,14 @@ function currentStageSurface(snapshot: PublicSnapshot): CurrentStageSurface | nu
   return candidates.find(
     (candidate) => candidate.kind.toLowerCase() === foreground.stage.toLowerCase(),
   ) ?? null;
+}
+
+function runtimeConditionsQuestionRef(snapshot: PublicSnapshot | null): string | null {
+  const questRef = overviewQuestRef(snapshot);
+  const question = snapshot?.research_space.current_question;
+  if (questRef && question?.quest_ref === questRef) return question.question_ref ?? null;
+  const foreground = snapshot?.research_control.foreground;
+  return questRef && foreground?.quest_ref === questRef ? foreground.question_ref : null;
 }
 
 function exactForegroundQuestion(snapshot: PublicSnapshot): IdeaQuestionSummary | null {
@@ -5306,6 +5315,7 @@ function DetailedApp() {
             </span>
             {snapshot ? <code>状态 {snapshot.revision}</code> : null}
           </div>
+          <RuntimeConditions questRef={overviewQuestRef(snapshot)} questionRef={runtimeConditionsQuestionRef(snapshot)} disabled={humanRequestSurfaceOpen || detailsScopeChanged} />
           <ForegroundResearchControlShortcut
             control={snapshot?.research_control}
             commands={snapshot?.human_collaboration?.commands.items}

@@ -25,4 +25,4 @@ status: accepted
 
 现成环境可以按已有持久目录、安装状态或服务及其使用说明直接登记，不要求先完成跨机器打包或完整重建配方。用户明确：在其他机器上使用时需要的适配或修复属于新 Target 的工作，不影响原模拟器的入库资格。新 Target 沿既有 Baseline 层级保留其实际工作和结果，关联原环境作为来源；若实际内容改变，继续沿已有精确内容与版本原则处理，索引归类粒度仍由 Agent 判断。
 
-本记录扩展 [ADR 0005](0005-research-assets-and-shared-content.md) 的五入口为六入口，其余方法层级、RG／RM 分工、Agent 自主归类及共用内容原则保留。本轮范围和职责边界已确认；此决定不表示 Environment 已实现或部署。
+本记录扩展 [ADR 0005](0005-research-assets-and-shared-content.md) 的五入口为六入口，其余方法层级、RG／RM 分工、Agent 自主归类及共用内容原则保留。本轮范围和职责边界已确认，讨论过程见[记录](../environment-asset-design-questions.md)；此决定不表示 Environment 已实现或部署。

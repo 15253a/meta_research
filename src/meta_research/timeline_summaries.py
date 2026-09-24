@@ -23,10 +23,12 @@ MAX_BATCH_BYTES = 240_000
 GENERATION_TIMEOUT_SECONDS = 900
 DEFAULT_SCAN_SECONDS = 300
 MAX_SCAN_SECONDS = 7200
+MAX_SESSION_JOBS = 8
+MAX_SESSION_INPUT_BYTES = 240_000
 # Version the prose policy independently from scheduling instructions. Preserve
 # the original policy hash so a cadence-only update does not regenerate history.
 # Change this value when the factual summarization policy itself changes.
-SUMMARY_CONTENT_VERSION = '8e2dd45bb4551a37755fd8e60b7bcbfb9f2e00eda2fa1f90c0bf78c6eae16834'
+SUMMARY_CONTENT_VERSION = 'research-recorder-clear-professional-20260924'
 
 
 def _scan_interval(value):
@@ -85,6 +87,13 @@ class TimelineSummaryStore:
                         db.execute('UPDATE quests SET next_scan_at=observed_at+300 WHERE observed_at>0')
                     if 'scan_decision_observed_at' not in columns:
                         db.execute('ALTER TABLE quests ADD COLUMN scan_decision_observed_at REAL NOT NULL DEFAULT -1')
+                    if 'session_jobs' not in columns:
+                        db.execute('ALTER TABLE quests ADD COLUMN session_jobs INTEGER NOT NULL DEFAULT 0')
+                        # The old session has no reliable retained input budget.
+                        # Recover any active job unchanged, then start a bounded session.
+                        db.execute('UPDATE quests SET session_jobs=? WHERE native_session_ref IS NOT NULL', (MAX_SESSION_JOBS,))
+                    if 'session_input_bytes' not in columns:
+                        db.execute('ALTER TABLE quests ADD COLUMN session_input_bytes INTEGER NOT NULL DEFAULT 0')
                     self._initialized = True
                 yield db
 
@@ -149,8 +158,17 @@ class TimelineSummaryStore:
                     break
                 selected.append(node)
                 size += node_size
-            quest = db.execute('SELECT native_session_ref,observed_at FROM quests WHERE quest_ref=?', (quest_ref,)).fetchone()
-            request = {'nodes': selected, 'native_session_ref': quest['native_session_ref'],
+            quest = db.execute('SELECT * FROM quests WHERE quest_ref=?', (quest_ref,)).fetchone()
+            native = quest['native_session_ref']
+            jobs, input_bytes = quest['session_jobs'], quest['session_input_bytes']
+            if native is None or jobs >= MAX_SESSION_JOBS or input_bytes + size > MAX_SESSION_INPUT_BYTES:
+                native, jobs, input_bytes = None, 0, 0
+            # Count claims (including failed calls), never recovery reads. Each
+            # job carries the complete current basis and prior summary, so a new
+            # session loses no research evidence. Old native logs remain intact.
+            db.execute('UPDATE quests SET native_session_ref=?,session_jobs=?,session_input_bytes=? WHERE quest_ref=?',
+                       (native, jobs + 1, input_bytes + size, quest_ref))
+            request = {'nodes': selected, 'native_session_ref': native,
                        'observed_at': quest['observed_at'], 'output_language': language}
             job_ref = 'timeline-summary-' + uuid.uuid4().hex
             db.execute("INSERT INTO jobs(job_ref,quest_ref,request_json,status,created_at) VALUES (?,?,?,'active',?)",

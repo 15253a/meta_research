@@ -105,10 +105,9 @@ class ResearchEnvironmentOwnerMixin:
             environment = self.query_environment(payload["environment_ref"])
             if environment is None:
                 raise OwnerConflict("environment_not_found")
-            # Trusted callers may register a global external resource without a
-            # Quest. Scoped roots always register with their own origin Quest.
-            if environment["origin_quest_ref"] is not None:
-                self.verify_environment_quest_scope(payload["environment_ref"], quest_ref=question.quest_ref)
+            # Origin records provenance, not an exclusive resource owner. An
+            # exact snapshot may be adopted by another Quest, but its digital
+            # bindings must already have independent accepted source facts there.
             for binding in environment["asset_bindings"]:
                 self.verify_asset_quest_scope(binding["version_ref"], quest_ref=question.quest_ref)
             if payload["research_ref"] is not None:
@@ -120,7 +119,7 @@ class ResearchEnvironmentOwnerMixin:
                content_hash=binding.content_hash, manifest_hash=binding.manifest_hash, receipt=binding.receipt)
 
     def verify_environment_quest_scope(self, environment_ref, *, quest_ref):
-        record = self.query_environment(environment_ref, quest_ref=quest_ref)
+        record = self.query_environment(environment_ref)
         if record is None:
             raise OwnerConflict("environment_quest_scope_invalid")
         for binding in record["asset_bindings"]:
@@ -188,7 +187,27 @@ class ResearchEnvironmentOwnerMixin:
         with self._database.read_snapshot() as connection:
             row = connection.execute(text(f"SELECT * FROM {table} WHERE {key}=:ref{clause}"),
                                      {"ref": ref, "quest": quest_ref}).first()
-            return None if row is None else self._environment_record(operation, row)
+            if row is None:
+                return None
+            result = self._environment_record(operation, row)
+            if operation == "register" and quest_ref is not None:
+                self._verify_environment_visibility(result, quest_ref=quest_ref)
+            return result
+
+    def _verify_environment_visibility(self, environment, *, quest_ref):
+        if environment["origin_quest_ref"] == quest_ref:
+            return
+        # The SQL index only finds a candidate. Verify the accepting reference
+        # before letting it make another Quest's resource visible to a reader.
+        with self._database.read() as connection:
+            row = connection.execute(text("SELECT r.* FROM rg_environment_references r "
+                "JOIN rg_question_lifecycle q ON q.question_ref=r.question_ref "
+                "WHERE r.environment_ref=:ref AND q.quest_ref=:quest "
+                "ORDER BY r.accepted_at,r.environment_reference_ref LIMIT 1"),
+                {"ref": environment["environment_ref"], "quest": quest_ref}).first()
+        if row is None:
+            raise OwnerConflict("environment_quest_scope_invalid")
+        self._environment_record("reference", row)
 
     def _environment_record(self, operation, row):
         _, key, indexed = _FACTS[operation]
@@ -248,6 +267,9 @@ class ResearchEnvironmentOwnerMixin:
             total = connection.execute(text(f"SELECT count(*) FROM {table}{where}"), params).scalar_one()
             rows = connection.execute(text(f"SELECT * FROM {table}{where} ORDER BY accepted_at,{key} LIMIT :limit OFFSET :offset"), params).all()
             items = [self._environment_record(operation, row) for row in rows]
+            if operation == "register" and quest_ref is not None:
+                for item in items:
+                    self._verify_environment_visibility(item, quest_ref=quest_ref)
         return {"kind": operation, "items": items, "total": total, "offset": offset, "limit": limit,
                 "next_offset": offset + len(items) if offset + len(items) < total else None}
 

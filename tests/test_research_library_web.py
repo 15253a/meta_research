@@ -33,6 +33,10 @@ def test_authenticated_user_can_explicitly_add_input_and_choose_output_language(
   assert leaf["kind"]=="HumanInput" and leaf["content_hash"]==value["content_hash"]
   questions=client.get("/api/v1/research-library/questions",params={"quest_ref":q.quest_ref}).json()
   assert questions["items"][0]["question_ref"]==q.question_ref
+  history=client.get("/api/v1/research-library/questions",params={"quest_ref":q.quest_ref,"question_ref":q.question_ref})
+  assert history.status_code==200 and history.json()["items"]==[]
+  assert client.get("/api/v1/research-library/questions",params={"quest_ref":q.quest_ref,"question_ref":other.question_ref}).status_code==409
+  assert client.get("/api/v1/research-library/questions",params={"quest_ref":q.quest_ref,"question_ref":"missing"}).status_code==409
  finally:r.close()
 
 def test_input_material_and_generic_evidence_keep_exact_receipts(tmp_path):

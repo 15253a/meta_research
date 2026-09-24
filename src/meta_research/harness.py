@@ -8,7 +8,7 @@ import re
 import secrets
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Callable, Literal, Protocol
 from urllib.parse import urlsplit
 
 from meta_research.bundle_protocol import TargetWorkHandle
@@ -75,6 +75,7 @@ from meta_research.target_raw_output import (
     TargetRawOutputUnavailable,
 )
 from meta_research.target_run_runtime_contract import TargetCompletionHandoff
+from meta_research.runtime_conditions import compose_runtime_prompt, render_runtime_conditions
 
 
 LOGGER = logging.getLogger(__name__)
@@ -2045,6 +2046,13 @@ class HarnessRuntime:
         workspace_ref, working_directory = self._target_workspace_for(
             admission, request
         )
+        if isinstance(request, TargetHarnessRequest) and working_directory is not None:
+            # Only a new operation gets current conditions. Reconciliation below
+            # verifies and replays the original sealed prompt, including its conditions.
+            prompt = compose_runtime_prompt(prompt, render_runtime_conditions(
+                working_directory, run_ref=admission.run.run_ref,
+                target_ref=request.target_ref,
+            ))
         invocation_material = _turn_invocation_material(
             admission,
             request,
@@ -2169,6 +2177,19 @@ class HarnessRuntime:
                     ))
                 except HarnessAdapterUnavailable as error:
                     raise HarnessAdmissionError(error.code) from error
+            terminal_replay_only = frozen_prompt is not None
+            if (
+                frozen_prompt is None
+                and isinstance(request, TargetHarnessRequest)
+                and working_directory is not None
+            ):
+                # A crash may precede transport spool creation. Reconstruct
+                # only a candidate; the complete original Owner hash below
+                # must match before continuing this same operation.
+                frozen_prompt = compose_runtime_prompt(prompt, render_runtime_conditions(
+                    working_directory, run_ref=admission.run.run_ref,
+                    target_ref=request.target_ref,
+                ))
             if not isinstance(frozen_prompt, str) or not frozen_prompt:
                 raise HarnessAdmissionError("harness_operation_conflict")
             frozen_hash = canonical_hash(_turn_invocation_material(
@@ -2179,7 +2200,6 @@ class HarnessRuntime:
             if frozen_hash != operation.invocation_hash:
                 raise HarnessAdmissionError("harness_operation_conflict")
             prompt = frozen_prompt
-            terminal_replay_only = True
         reconciliation_generation = self._begin_operation_reconciliation(
             operation_ref
         )
@@ -2544,14 +2564,33 @@ class HarnessRuntime:
             ),
             "status": "executed",
         }
-        previous_profile = self._profile_for_run(admission.run.run_ref)
-        profile = _merge_capability_profiles(
-            previous_profile,
-            turn_profile,
-            operation_ref=operation_ref,
-            resumed=resume,
-            allow_unprofiled_resume=human_request_continuation,
-        )
+        try:
+            previous_profile = self._profile_for_run(admission.run.run_ref)
+            profile = _merge_capability_profiles(
+                previous_profile,
+                turn_profile,
+                operation_ref=operation_ref,
+                resumed=resume,
+                allow_unprofiled_resume=human_request_continuation,
+                expected_native_session_ref=admission.run.native_session_ref,
+                verify_transport_receipt=(
+                    self._target_raw_output_store.verify_signed_transport_receipt
+                    if self._target_raw_output_store is not None else None
+                ),
+            )
+        except HarnessAdmissionError as error:
+            # The provider has returned. Keep its exact sealed operation
+            # replayable if local profile acceptance failed; never dispatch
+            # another turn or overwrite a concurrent Owner pause/cancel.
+            try:
+                self._owner.record_operation_failure(
+                    operation_ref, "provider_outcome_unknown",
+                    durable_outcome="unknown",
+                    expected_running_run_ref=admission.run.run_ref,
+                )
+            except AgentRuntimeHarnessError as cause:
+                raise error from cause
+            raise
         if isinstance(request, TargetHarnessRequest):
             diagnostics = result.profile.get("root_capability_diagnostics")
             recorder = self._root_operation_diagnostic_recorder
@@ -3640,6 +3679,8 @@ def _merge_capability_profiles(
     operation_ref: str,
     resumed: bool,
     allow_unprofiled_resume: bool = False,
+    expected_native_session_ref: str | None = None,
+    verify_transport_receipt: Callable[[str, object], dict[str, object]] | None = None,
 ) -> dict[str, object]:
     current_capabilities = current.get("capabilities")
     if not isinstance(current_capabilities, dict):
@@ -3648,6 +3689,13 @@ def _merge_capability_profiles(
         if resumed and not allow_unprofiled_resume:
             raise HarnessAdmissionError("native_session_resume_unavailable")
         return current
+
+    if previous.get("schema_ref") == "meta-research/harness-failed-transport-profile/v1":
+        return _first_profile_after_stopped_turn(
+            previous, current, operation_ref=operation_ref, resumed=resumed,
+            expected_native_session_ref=expected_native_session_ref,
+            verify_transport_receipt=verify_transport_receipt,
+        )
 
     for identity_field in (
         "schema_ref",
@@ -3752,6 +3800,69 @@ def _merge_capability_profiles(
             *current_subagent_evidence,
         ],
     }
+
+
+def _first_profile_after_stopped_turn(
+    previous: dict[str, object], current: dict[str, object], *,
+    operation_ref: str, resumed: bool, expected_native_session_ref: str | None,
+    verify_transport_receipt: Callable[[str, object], dict[str, object]] | None,
+) -> dict[str, object]:
+    """A stopped turn retained provenance, but established no capabilities."""
+    if (
+        set(previous) != {"schema_ref", "harness_family", "run_ref", "provider_transport_receipts"}
+        or not resumed
+        or not expected_native_session_ref
+        or current.get("schema_ref") != "meta-research/harness-capability-profile/v1"
+        or current.get("native_session_ref") != expected_native_session_ref
+        or previous.get("harness_family") != "codex"
+        or previous.get("harness_family") != current.get("harness_family")
+        or not isinstance(current.get("run_ref"), str)
+        or previous.get("run_ref") != current.get("run_ref")
+        or current.get("provider_operation_ref") != operation_ref
+    ):
+        raise HarnessAdmissionError("harness_profile_identity_conflict")
+    capabilities = current.get("capabilities")
+    continuation = [capabilities.get(name) for name in ("native_session", "stream")]
+    continuation_refs = list(dict.fromkeys(ref
+        for item in continuation if isinstance(item, dict) and item.get("status") == "available"
+        for ref in item.get("evidence_refs", []) if isinstance(ref, str) and ref))
+    if not continuation_refs:
+        raise HarnessAdmissionError("native_session_resume_unavailable")
+    history = previous.get("provider_transport_receipts")
+    incoming = current.get("provider_transport_receipts")
+    prefix = str(current["run_ref"]) + ":harness_turn:"
+    generation = operation_ref.removeprefix(prefix)
+    if (not operation_ref.startswith(prefix) or not generation.isdigit() or int(generation) < 2
+            or not isinstance(history, list) or not history
+            or not isinstance(incoming, list) or len(incoming) != 1):
+        raise HarnessAdmissionError("harness_profile_corrupt")
+    if verify_transport_receipt is None:
+        raise HarnessAdmissionError("target_raw_output_unavailable")
+    seen = set()
+    for index, row in enumerate([*history, *incoming]):
+        if not isinstance(row, dict):
+            raise HarnessAdmissionError("harness_profile_corrupt")
+        ref = row.get("provider_operation_ref")
+        prior = index < len(history)
+        suffix = ref.removeprefix(prefix) if isinstance(ref, str) else ""
+        if (not isinstance(ref, str) or not ref.startswith(prefix) or not suffix.isdigit()
+                or ref in seen or (prior and not 0 < int(suffix) < int(generation))
+                or (not prior and ref != operation_ref)
+                or row.get("termination_reason") != ("stopped" if prior else "completed")
+                or (not prior and row.get("provider_returncode") != 0)):
+            raise HarnessAdmissionError("harness_profile_corrupt")
+        seen.add(ref)
+        receipt = {key: value for key, value in row.items() if key != "provider_operation_ref"}
+        try:
+            verified = verify_transport_receipt(ref, receipt)
+        except (TargetRawOutputUnavailable, OSError) as cause:
+            raise HarnessAdmissionError("harness_profile_transport_unverified") from cause
+        if verified != receipt:
+            raise HarnessAdmissionError("harness_profile_transport_unverified")
+    return {**current, "provider_transport_receipts": [*history, *incoming],
+            "capabilities": {**capabilities, "resume": {
+                "status": "available", "evidence_refs": continuation_refs,
+            }}}
 
 
 def _probe_run_from_owner(

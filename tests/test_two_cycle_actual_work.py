@@ -55,8 +55,15 @@ class _Plan(_MultiRunPlanSkill):
         data=read_content(graph,memory,quest_ref=quest,source_ref=version['dataset_version_ref'],
             version_ref=binding['version_ref'])
         assert '36' in data['text']
+        environments=graph.query_environments(quest_ref=quest)
+        environment,=environments['items']
+        environment_binding=environment['asset_bindings'][0]
+        environment_read=read_content(graph,memory,quest_ref=quest,
+            source_ref=environment['environment_ref'],version_ref=environment_binding['version_ref'])
+        assert environment_binding==binding and environment_read['text']==data['text']
         self.discoveries.append({'question':questions,'source_ref':ref,'baseline':baselines,
-            'dataset':version,'outcome_read':read,'dataset_read':data})
+            'dataset':version,'outcome_read':read,'dataset_read':data,
+            'environment':environment,'environment_read':environment_read})
         entry={'schema_ref':'meta-research/evidence-source-ref/v1','evidence_ref':ref,
             'source_kind':'ScientificOutcome','source_ref':ref}
         self.no_gap=True
@@ -172,6 +179,12 @@ def test_two_cycles_publish_actual_run_reuse_synthesis_and_rediscover_libraries(
             meaning='Six squared equals thirty-six.',asset_bindings=[binding],notes='One bounded observation.',idempotency_key='t13-version')
         graph.reference_dataset(dataset_version_ref=version['dataset_version_ref'],question_ref=quest['question_ref'],
             purpose='Retain the actual execution observation.',notes='Current Question input for later discovery.',idempotency_key='t13-reference')
+        environment=graph.register_environment(semantic_key='t13:retained-simulation',
+            name='Retained simulation fixture',meaning='A reusable exact fixture from the completed work.',
+            source=completed.target_commit_ref,asset_bindings=[binding],quest_ref=quest['quest_ref'],
+            idempotency_key='t13-environment')
+        graph.reference_environment(environment_ref=environment['environment_ref'],question_ref=quest['question_ref'],
+            purpose='Reuse the retained simulation fixture.',idempotency_key='t13-environment-use')
         first_bundle=_finish_stage(runtime,'bundle')
         first_reasoning=_finish_stage(runtime,'reasoning')
         first_request=first_reasoning['stage_run_request']['request_ref']
@@ -192,6 +205,20 @@ def test_two_cycles_publish_actual_run_reuse_synthesis_and_rediscover_libraries(
         leaves=graph.resolve_plan_evidence_reuse_leaves(quest_ref=quest['quest_ref'],accepted_formal_plan=accepted)
         assert len(leaves)==1 and leaves[0].role=='ScientificOutcome' and leaves[0].evidence_ref==source
         assert leaves[0].source_binding['owner_acceptance_receipt_ref']==first_commit.outcome_receipt.receipt_ref
+        from fastapi.testclient import TestClient
+        from meta_research.web import create_app
+        client=TestClient(create_app(runtime,base_url='http://testserver',control_key='isolated-history-test'))
+        auth=client.post('/auth/bootstrap',headers={'Origin':'http://testserver'},
+            json={'token':runtime.authentication.issue_bootstrap_token()})
+        assert auth.status_code==200
+        history=client.get('/api/v1/research-library/questions',params={
+            'quest_ref':quest['quest_ref'],'question_ref':quest['question_ref']})
+        assert history.status_code==200,history.text
+        item=next(item for item in history.json()['items'] if item['source_ref']==first_commit.outcome_ref)
+        assert item['summary'] and item['reader']['version_ref']==item['source_ref']
+        outcome_body=client.get('/api/v1/research-content',params={'quest_ref':quest['quest_ref'],**item['reader']})
+        assert outcome_body.status_code==200,outcome_body.text
+        assert 'claim' in outcome_body.json()['text']
         library=discover_literature(graph,runtime.owners.research_memory,quest_ref=quest['quest_ref'])
         shared=next(item for item in library['items'] if {j['question_ref'] for j in item['judgments']} >= {quest['question_ref'],sibling.question_ref})
         for judgment in shared['judgments']:
@@ -208,6 +235,7 @@ def test_two_cycles_publish_actual_run_reuse_synthesis_and_rediscover_libraries(
             'cycle_refs':[quest['cycle_ref'],foreground['cycle_ref']],'target_commit_ref':completed.target_commit_ref,
             'manifest_ref':manifest.manifest_ref,'accepted_outcomes':[first_commit.outcome_ref,second_commit.outcome_ref],
             'plan_selected_source':source,'dataset_version_ref':version['dataset_version_ref'],
+            'environment_ref':environment['environment_ref'],'history_api_readback':True,
             'shared_literature_ref':shared['record_ref'],'counts':counts,'stage_commits':{
                 'first_plan':first_plan['stage_commit'],'first_bundle':first_bundle['stage_commit'],
                 'first_reasoning':first_reasoning['stage_commit'],'second_plan':second_plan['stage_commit'],

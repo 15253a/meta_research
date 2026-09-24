@@ -387,7 +387,9 @@ def test_existing_recorder_database_adopts_cadence_without_immediate_rescan(tmp_
     assert store.query('quest-1')['next_scan_at'] == 400
     now[0] = 400
     assert service.process_once()
-    assert provider.calls[0]['native_session_ref'] == 'preserved-native'
+    # Old sessions have no measured input budget; start fresh at the next due
+    # scan while retaining their old logs and all persisted summaries.
+    assert provider.calls[0]['native_session_ref'] is None
 
 
 def test_failed_publication_read_cannot_bypass_scan_cadence(recorder):

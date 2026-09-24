@@ -63,7 +63,9 @@ Run 可选字段包括 `variant_ref`、`baseline_forward_contract`、`variant_re
 
 ## 可复用 Dataset 与 Environment 候选
 
-有独立数据或环境复用价值的已保存产物，在结果中分别列 `dataset_candidates`／`environment_candidates`，每项含 `artifact_path`、`name`、`purpose`。Dataset 使用 `outputs/data/` 或 `outputs/analysis/` 内的实际精确文件或目录；Environment 也可引用既有 `implementation/` 实现快照、checkpoint 或日志条目，保存环境代码、配置、运行说明或已知条件。现成持久目录、安装或服务具备可用说明即有登记资格，跨机器适配不构成入库前提。
+有独立数据或环境复用价值的已保存产物，在结果中分别列 `dataset_candidates`／`environment_candidates`，每项含 `artifact_path`、`name`、`purpose`。Dataset 使用 `outputs/data/` 或 `outputs/analysis/` 内的实际精确文件或目录；Environment 也可引用既有 `implementation/` 实现快照、checkpoint 或日志条目，保存环境代码、配置、运行说明或已知条件。候选名称与用途对应所选精确范围；环境说明写清资源位置、实际构建或改动、已知使用条件及尚未核实的事项，供后继登记和采用。
+
+已有资源的直接登记按根系统提示的 Environment 规则执行；本 Target 新建或改动的成果先走这里的候选交接。现成持久目录、安装或服务的跨机器适配不构成入库前提；设备说明与使用记录作为数字材料保存，设备本体按真实来源表达。
 
 系统在 data／analysis 内按候选边界冻结资产并保留相邻产物；其余角色选已有保存条目，`implementation_paths` 可选择完整实现目录快照，内部文件沿精确版本按需读取。候选须归属真实 Run／Evaluation：多生产者或显式 `artifact_paths` 时使用相同精确路径，实现快照归属选择它的实际 Run。两类入口可指同一精确条目并共用原件；候选之间的父子范围应改为不重叠边界。收尾反馈后保留已有成果，在同一 Session 修正声明后再次交接。
 

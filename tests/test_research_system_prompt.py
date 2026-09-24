@@ -19,7 +19,10 @@ def test_real_root_adapter_passes_human_request_instructions(tmp_path, root_kind
     assert len(instructions) == 1
     actual = tomllib.loads(instructions[0])["developer_instructions"]
     assert actual.startswith(RESEARCH_SYSTEM_PROMPT)
-    assert "Output language for this turn: zh." in actual
+    language_instructions = actual[len(RESEARCH_SYSTEM_PROMPT):]
+    assert "本回合输出语言：zh。" in language_instructions
+    assert "直接使用中文" in language_instructions
+    assert "委派时传递同一语言要求" in language_instructions
     assert "human_request.open.reconcile" in RESEARCH_SYSTEM_PROMPT
 
 
