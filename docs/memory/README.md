@@ -8,7 +8,7 @@
 - [当前运行反馈](runtime-memory-feedback.md)
 - [基线验证与两项已知失败](baseline-verification.md)
 
-GitHub 地图链接在建图后写入本页。地图与原生子 issue 是后续决策状态的权威入口；这些文档记录 2026-09-24 的调查证据，不作为另一套待办状态。
+GitHub 地图：[记忆系统设计地图：入库、存储、索引与使用（8768 → v1）](https://github.com/15253a/meta_research/issues/148)。首张待讨论票：[记忆对象、身份和版本：哪些是事实，哪些是派生内容？](https://github.com/15253a/meta_research/issues/149)。地图与原生子 issue 是后续决策状态的权威入口；这些文档记录 2026-09-24 的调查证据，不作为另一套待办状态。
 
 ## Wayfinding operations
 

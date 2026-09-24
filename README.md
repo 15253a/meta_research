@@ -12,3 +12,5 @@ This branch preserves the source installed in the backend listening on port 8768
 The repository contains source, tests, pinned Python and frontend dependencies, and the packaged frontend served by the backend. It does not contain research databases, research files, credentials, virtual environments or caches. Restoring code alone does not restore research data.
 
 Use Python 3.11–3.13 and the checked-in `uv.lock` for the Python environment. The frontend source and npm lockfile live in `web/`; the deployed static assets live in `src/meta_research/web_dist/`. The source-preservation and design pass does not restart or migrate the running service.
+
+Current design work: [memory-system map](https://github.com/15253a/meta_research/issues/148) and [evidence documents](docs/memory/README.md).
