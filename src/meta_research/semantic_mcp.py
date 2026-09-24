@@ -32,6 +32,14 @@ ROOT_AGENT_DATASET_OPERATION_IDS = (
     "research_graph.datasets.derive",
     "research_graph.datasets.derive.reconcile",
 )
+ROOT_AGENT_ENVIRONMENT_OPERATION_IDS = (
+    "research_graph.environments.page",
+    "research_graph.environments.read",
+    "research_graph.environments.register",
+    "research_graph.environments.register.reconcile",
+    "research_graph.environments.reference",
+    "research_graph.environments.reference.reconcile",
+)
 ROOT_AGENT_COMMON_OPERATION_IDS = (
     "research_graph.questions.page",
     "research_memory.literature.page",
@@ -46,6 +54,7 @@ ROOT_AGENT_COMMON_OPERATION_IDS = (
     "research_graph.artifact_roles.adjust",
     "research_graph.artifact_roles.adjust.reconcile",
     *ROOT_AGENT_DATASET_OPERATION_IDS,
+    *ROOT_AGENT_ENVIRONMENT_OPERATION_IDS,
     *ROOT_AGENT_ACQUISITION_OPERATION_IDS,
     *ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
 )
@@ -90,14 +99,19 @@ class SemanticCallContext:
 
     def dataset_effect_key(self, effect_id: str) -> str:
         """Keep a Dataset effect discoverable after a technical Root recovery."""
+        return self._research_index_effect_key(effect_id, "datasets", ROOT_AGENT_DATASET_OPERATION_IDS)
+
+    def environment_effect_key(self, effect_id: str) -> str:
+        """Keep an Environment effect discoverable after a technical Root recovery."""
+        return self._research_index_effect_key(effect_id, "environments", ROOT_AGENT_ENVIRONMENT_OPERATION_IDS)
+
+    def _research_index_effect_key(self, effect_id: str, family_name: str, operations: tuple[str, ...]) -> str:
         if not isinstance(effect_id, str) or not effect_id or len(effect_id) > 128:
             raise SemanticMcpError("semantic_effect_id_invalid")
         family = self.operation_id.removesuffix(".reconcile")
-        if family not in {
-            "research_graph.datasets.register", "research_graph.datasets.register_version",
-            "research_graph.datasets.reference", "research_graph.datasets.derive",
-        }:
-            raise SemanticMcpError("dataset_effect_operation_invalid")
+        if family + ".reconcile" not in operations:
+            prefix = "dataset" if family_name == "datasets" else "environment"
+            raise SemanticMcpError(prefix + "_effect_operation_invalid")
         return "mcp-effect:" + canonical_hash({
             "run_ref": self.run_ref, "root_session_ref": self.root_session_ref,
             "root_kind": self.root_kind, "phase": self.phase,

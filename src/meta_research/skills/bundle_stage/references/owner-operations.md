@@ -6,7 +6,7 @@
 
 AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan、Target／依赖／frontier、方法、Run／评价及领域接纳；RM 管不可变内容、AssetVersion、保管和完整性；AR 管执行、根会话、Fence、single-flight 和恢复；Harness 运行原生工具与子智能体。Bundle 管候选、范围、顺序和跨 Target 依赖，Target 根管实际实施与最终交接。
 
-子智能体在明确任务及所授权限内读取、分析、实施或整理，按文件／对象划分写入，返回结果、精确来源和自由格式反馈。整理已接纳材料可沿已授 Dataset 接口登记；未接纳 Target 中间产物仍留工作区，不提前进入 RM／RG 正式内容链。
+子智能体在明确任务及所授权限内读取、分析、实施或整理，按文件／对象划分写入，返回结果、精确来源和自由格式反馈。整理已接纳材料可沿已授 Dataset／Environment 接口登记；未接纳 Target 中间产物仍留工作区，不提前进入 RM／RG 正式内容链。
 
 ## 正常流程
 

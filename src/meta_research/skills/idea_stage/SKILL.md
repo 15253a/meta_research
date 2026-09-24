@@ -7,7 +7,7 @@ description: 根据当前研究状态形成供 Plan 选择的构想或有依据�
 
 理解当前 Question 和研究交接，提出值得投入的方向。候选可以针对广泛缺口或具体假设；让 Plan 看清为什么此刻值得研究、什么证据会改变判断。数量服从实质区别与研究需要。
 
-输入和交接查[输入／输出契约](references/io-contract.md)；构造结果或 ExhaustionProposal 时查[候选与闭包契约](references/contract.md)。按本根系统提示的五入口、预算、人类输入和语言偏好执行，用户可见内容直接用所选语言，委派时传递同一要求。
+输入和交接查[输入／输出契约](references/io-contract.md)；构造结果或 ExhaustionProposal 时查[候选与闭包契约](references/contract.md)。按本根系统提示的六入口、预算、人类输入和语言偏好执行，用户可见内容直接用所选语言，委派时传递同一要求。
 
 ## 1. 读取与形成候选
 

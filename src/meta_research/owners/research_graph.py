@@ -138,6 +138,7 @@ from meta_research.owners.human_requests import (
     HumanResponseVerifier,
 )
 from meta_research.owners.research_datasets import ResearchDatasetOwnerInterface, ResearchDatasetOwnerMixin
+from meta_research.owners.research_environments import ResearchEnvironmentOwnerInterface, ResearchEnvironmentOwnerMixin
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
 from meta_research.target_execution_legacy import (
     TargetExecutionRequest,
@@ -1373,7 +1374,7 @@ class TargetCandidateOwnerProofVerifier(Protocol):
         receipt: ReceiptProof,
     ) -> None: ...
 
-class ResearchGraphInterface(ResearchDatasetOwnerInterface, HumanRequestOwnerInterface, Protocol):
+class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetOwnerInterface, HumanRequestOwnerInterface, Protocol):
     def query_baseline(self, baseline_ref: str) -> dict[str, object] | None: ...
 
     def query_baselines(self, *, query: str = "", method_contract_hash: str | None = None,
@@ -6561,7 +6562,7 @@ class SQLiteResearchGraphReceiptVerifier:
 
 
 
-class SQLiteResearchGraph(BaselineIdentityQueries, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
+class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,
@@ -10470,6 +10471,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchDatasetOwnerMixin, Qu
                 + [f"formal-question:{item.question_ref}" for item in questions]
                 + [f"idea-outcome:{item.decision_ref}" for item in decisions]
                 + list(self.query_dataset_asset_references(version_ref))
+                + list(self.query_environment_asset_references(version_ref))
             )
         )
         return revision, references

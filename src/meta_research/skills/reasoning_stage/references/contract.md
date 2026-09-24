@@ -33,7 +33,7 @@ RG 在 transition 接纳时重验 QuestionAnchor、present／open 和各依据�
 
 ## 独立审阅与技术边界
 
-审阅按[主 Skill](../SKILL.md)执行。权限以当前 catalog 及配对 reconcile 为准，primary／review 名称不额外收窄已授 Dataset 效果。缺 scoped authority／endpoint／credential、必要操作或相应绑定时，在相应执行前保留技术阻塞；内容 hash、source binding、封闭 schema 或 native Session 不一致时不形成有效交接。未知 provider 结果对账原 operation，不重放。
+审阅按[主 Skill](../SKILL.md)执行。权限以当前 catalog 及配对 reconcile 为准，primary／review 名称不额外收窄已授 Dataset／Environment 效果。缺 scoped authority／endpoint／credential、必要操作或相应绑定时，在相应执行前保留技术阻塞；内容 hash、source binding、封闭 schema 或 native Session 不一致时不形成有效交接。未知 provider 结果对账原 operation，不重放。
 
 技术问题不改写为 `insufficient_evidence`；该 disposition 只描述来源可核验时科学支持仍不足。
 

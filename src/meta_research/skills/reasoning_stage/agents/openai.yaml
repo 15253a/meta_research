@@ -1,4 +1,4 @@
 interface:
   display_name: "研究综合"
-  short_description: "综合真实来源、沉积可复用数据并判断下一步"
-  default_prompt: "使用 $reasoning-stage 综合当前研究，读回需保留的数据积累，形成诚实科学结果与唯一后继候选。"
+  short_description: "综合真实来源、整理可复用资源并判断下一步"
+  default_prompt: "使用 $reasoning-stage 综合当前研究，核对可复用资源登记与用途，形成诚实科学结果与唯一后继候选。"

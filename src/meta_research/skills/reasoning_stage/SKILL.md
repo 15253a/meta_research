@@ -7,7 +7,7 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 在本轮检查点判断当前 Question：现在如何理解，依据是什么，下一步为什么继续、改变或等待。可以没有新发现或保持原认识，说明其原因和投入含义；Cycle 收口不表示 Question 已回答。
 
-输出和来源见[语义契约](references/contract.md)；权限与接纳见[Owner 操作](references/owner-operations.md)。遵循根系统提示的五入口、预算、人类输入和语言偏好，委派时传递范围及直接输出语言。输入已有正文无需为固定顺序重复读取。
+输出和来源见[语义契约](references/contract.md)；权限与接纳见[Owner 操作](references/owner-operations.md)。遵循根系统提示的六入口、预算、人类输入和语言偏好，委派时传递范围及直接输出语言。输入已有正文无需为固定顺序重复读取。
 
 ## 1. 综合真实来源
 
@@ -21,11 +21,11 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 聚焦阅读、历史召回和比较可委派独立子智能体，根抽查关键原文后综合。人类指导按真实内容影响判断，普通意见不自动成为授权或完成确认。完成条件：关键判断能追溯到实际来源，已有认识、局限和缺口明确，技术阻塞没有被写成科学结论。
 
-## 2. 交接前沉积已接纳 Target 数据
+## 2. 交接前整理已接纳 Target 资源
 
-读取已接纳 Target 的 `dataset_candidates` 和精确 completion manifest，沿 `artifact_path` 找到已冻结条目的真实 RM binding，判断独立复用价值。决定保留的候选在本次 Reasoning 交接前，通过当前 catalog 授予的 datasets.register／register_version／reference 登记 Dataset、精确版本和当前 Question 的实际用途；真实派生关系用 derive。Target 已正式接纳即满足这些原件的发布前提，primary／draft 阶段可做，不等本次 ScientificOutcome 接纳。
+在同一整理核验环节读取已接纳 Target 的 `dataset_candidates`、`environment_candidates` 和精确 completion manifest，沿 `artifact_path` 找真实 RM binding，判断独立复用价值。交接前用 datasets.register／register_version／reference 登记数据版本与用途，真实派生用 derive；用 environments.register／reference 登记环境含义、真实来源、原件 binding、当前 Question 及原 Target／Run 的用途关系。Target 已正式接纳即满足这些原件的发布前提，primary／draft 阶段可做，不等本次 ScientificOutcome 接纳。现有设备、设施、持久目录、安装或服务可按真实来源直接登记，无须补造 Target。
 
-最后一个 Target 后 Bundle 若不再运行，由 Reasoning 承接。先发现或对账既有登记，再复用身份和原件；未知效果沿同一 `effect_id` reconcile。可委派明确资产范围的子智能体登记，根在交接前独立查回精确版本、用途引用、派生关系及原件。无保留价值时说明判断；外部条件阻塞时记录未完成步骤和继续条件；暂存、未接纳材料仍在工作区。
+最后一个 Target 后 Bundle 若不再运行，由 Reasoning 承接。先发现或对账既有登记，再复用身份和原件；未知效果沿同一 `effect_id` reconcile。可委派明确资源范围的子智能体登记，根在交接前独立查回资源记录与用途关系；有数字材料时核实精确版本及原件，有真实数据派生时核实派生关系。无保留价值时说明判断；外部条件阻塞时记录未完成步骤和继续条件；暂存、未接纳材料仍在工作区。
 
 完成条件：值得保留且当前可登记的候选已登记并读回；其余有真实取舍或具体阻塞说明，不把空 Dataset 身份当作已有版本，也不把登记当作新实验结果。
 

@@ -6316,7 +6316,7 @@ export function followProjection(
 
 
 export type OutputLanguage = "zh" | "en";
-export type ResearchLibraryEntry = "questions" | "baselines" | "datasets" | "literature" | "human";
+export type ResearchLibraryEntry = "questions" | "baselines" | "datasets" | "literature" | "human" | "environments";
 export type ResearchContentReader = { source_ref: string; version_ref?: string | null; entry_path?: string; ref?: string; operation?: string };
 export type ResearchLibraryItem = Record<string, unknown> & {
   ref?: string; title?: string; name?: string; summary?: string; status?: string;

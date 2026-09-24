@@ -54,6 +54,12 @@ def read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pat
             raise OwnerConflict("content_version_unbound")
         graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
         return {**memory.read_asset_content_page(version_ref,entry_path=entry_path,offset=offset,limit=limit),"source_ref":source_ref}
+    environment = graph.query_environment(source_ref, quest_ref=quest_ref)
+    if environment is not None:
+        if version_ref not in {binding["version_ref"] for binding in environment["asset_bindings"]}:
+            raise OwnerConflict("content_version_unbound")
+        graph.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
+        return {**memory.read_asset_content_page(version_ref,entry_path=entry_path,offset=offset,limit=limit),"source_ref":source_ref}
     question = graph.query_question_history_by_ref(source_ref)
     if question is not None:
         if question.quest_ref != quest_ref or version_ref != question.content_ref:
@@ -184,7 +190,7 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
     operations=[SemanticOperation(semantic_operation_id="research_memory.content.read",owning_module="research_memory",
-        description="Read an exact source found in this Quest's five research entries. Pass the returned source_ref/version_ref and continue with next_offset. Assets stream from managed or linked_local custody without making an export; text pages use byte offsets, binary pages are base64, directory entries use entry offsets. A hash names complete content, not just the page. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
+        description="Read an exact source found in this Quest's six research entries. Pass the returned source_ref/version_ref and continue with next_offset. Assets stream from managed or linked_local custody without making an export; text pages use byte offsets, binary pages are base64, directory entries use entry offsets. A hash names complete digital content, not a physical resource or its verified condition. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
         input_schema={"type":"object","properties":{
             "source_ref":{"type":"string","minLength":1,"maxLength":1024},
             "version_ref":{"type":"string","minLength":1,"maxLength":1024},

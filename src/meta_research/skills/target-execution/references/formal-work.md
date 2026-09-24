@@ -61,12 +61,12 @@ Run 可选字段包括 `variant_ref`、`baseline_forward_contract`、`variant_re
 
 生产者须在 `artifact_paths` 或 `checkpoint_paths` 声明该路径。最终交接冻结后，RG 解析为精确 RM 版本；前向引用和循环被拒绝。既有已接纳输入继续用 `input_refs`。
 
-## 可复用 Dataset 候选
+## 可复用 Dataset 与 Environment 候选
 
-有独立数据复用价值的产物，在结果中列 `dataset_candidates`，每项含 `artifact_path`、`name`、`purpose`。`artifact_path` 使用工作区中 `outputs/data/` 或 `outputs/analysis/` 下实际存在的精确文件或目录路径；系统按这些候选边界冻结独立资产，同时保留相邻的其他产物。候选的名称与用途应对应这个精确范围，不能用包含其他数据的父目录代替原来的子数据集。
+有独立数据或环境复用价值的已保存产物，在结果中分别列 `dataset_candidates`／`environment_candidates`，每项含 `artifact_path`、`name`、`purpose`。Dataset 使用 `outputs/data/` 或 `outputs/analysis/` 内的实际精确文件或目录；Environment 也可引用既有 `implementation/` 实现快照、checkpoint 或日志条目，保存环境代码、配置、运行说明或已知条件。现成持久目录、安装或服务具备可用说明即有登记资格，跨机器适配不构成入库前提。
 
-候选条目仍须归属于实际生产者；存在多个 Run／Evaluation 或显式设置 `artifact_paths` 时，将相同的精确候选路径分配给对应生产者。候选之间不要重叠选择父目录及其子路径，分别选择可独立保存的范围。若收到收尾修正反馈，保留已有研究成果，在同一 Session 修正候选或归属声明后再次交接。
+系统在 data／analysis 内按候选边界冻结资产并保留相邻产物；其余角色选已有保存条目，`implementation_paths` 可选择完整实现目录快照，内部文件沿精确版本按需读取。候选须归属真实 Run／Evaluation：多生产者或显式 `artifact_paths` 时使用相同精确路径，实现快照归属选择它的实际 Run。两类入口可指同一精确条目并共用原件；候选之间的父子范围应改为不重叠边界。收尾反馈后保留已有成果，在同一 Session 修正声明后再次交接。
 
-Target 接纳前只提供候选；接纳后 Bundle 或 Reasoning 沿 completion manifest 解析精确 RM 版本，登记 Dataset、版本和当前 Question 的真实用途引用。有真实派生关系时登记 derive；最后一个 Target 的候选由 Reasoning 承接，并在综合交接前处理。已有登记先发现／对账，复用身份和原件。
+Target 先沿 Baseline → Variant → VariantRun 保存实际工作、产物和适用评价，接纳前只交候选；接纳后由 Bundle／Reasoning 在同一整理核验环节选择入口，关联原工作和精确 RM binding。Dataset 登记版本及用途，有真实派生时 derive；Environment 用 environments.register／reference 保存含义、真实来源及用途，适配成果可用 `source_environment_ref` 关联原环境。最后一个 Target 的候选由 Reasoning 在综合交接前承接；先发现／对账，复用已有身份与原件。
 
 正式发布核实并超过保留期后，系统可回收完成的临时工作区。把需保留的科学产物完整选入交接，`linked_local` 原件放在已登记的稳定位置；后续使用正式精确版本。

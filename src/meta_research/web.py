@@ -2308,7 +2308,7 @@ def create_app(
 
     @app.get("/api/v1/research-library/{entry}")
     def query_research_library(entry: str,quest_ref: str,query: str="",offset: int=Query(default=0,ge=0),
-            limit: int=Query(default=12,ge=1,le=100),dataset_ref: str|None=None,
+            limit: int=Query(default=12,ge=1,le=100),dataset_ref: str|None=None,environment_ref: str|None=None,
             baseline_ref: str|None=None,variant_ref: str|None=None,
             request_cursor: str|None=Query(default=None,max_length=512)) -> dict[str,object]:
         from meta_research.research_content import discover_questions,discover_literature
@@ -2336,6 +2336,21 @@ def create_app(
                 if bindings:
                     item["reader"]={"source_ref":item["dataset_version_ref"],"version_ref":bindings[0]["version_ref"]}
                     item["readers"]=[{"source_ref":item["dataset_version_ref"],"version_ref":b["version_ref"]} for b in bindings]
+            return page
+        if entry=="environments":
+            if environment_ref:args={**args,"environment_ref":environment_ref,"query":""}
+            page=graph.query_environments(**args)
+            for item in page["items"]:
+                if "environment_reference_ref" in item:
+                    item["summary"]=item["purpose"]
+                    item["ref"]=item["environment_reference_ref"]
+                    continue
+                item["summary"]=item["meaning"]
+                item["ref"]=item["environment_ref"]
+                item["readers"]=[{"source_ref":item["environment_ref"],"version_ref":binding["version_ref"]}
+                                 for binding in item["asset_bindings"]]
+                if item["readers"]:
+                    item["reader"]=item["readers"][0]
             return page
         if entry=="human":
             hc=runtime.owners.human_collaboration

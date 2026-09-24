@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from meta_research.stage_context_access import stage_context_operations
+from meta_research.environment_operations import environment_operations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -307,6 +308,7 @@ def create_semantic_owner_gateway(
             ),
         ),
         *_dataset_operations(research_graph, agent_runtime),
+        *environment_operations(research_graph, agent_runtime),
         *_baseline_operations(research_graph, agent_runtime),
         *_root_agent_human_request_operations(
             agent_runtime=agent_runtime,

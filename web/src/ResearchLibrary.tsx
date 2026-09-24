@@ -6,10 +6,18 @@ import {
 } from "./api";
 import { useOutputLanguage } from "./OutputLanguage";
 
-const entries: ResearchLibraryEntry[] = ["questions", "baselines", "datasets", "literature", "human"];
+const entries: ResearchLibraryEntry[] = ["questions", "baselines", "datasets", "literature", "human", "environments"];
 const labels = {
-  zh: ["研究问题", "研究方法", "数据集", "文献", "人类输入"],
-  en: ["Questions", "Methods", "Datasets", "Literature", "Human input"],
+  zh: ["研究问题", "研究方法", "数据集", "文献", "人类输入", "环境与资源"],
+  en: ["Questions", "Methods", "Datasets", "Literature", "Human input", "Environments"],
+};
+const purposes: Record<ResearchLibraryEntry, { zh: string; en: string }> = {
+  questions: { zh: "查看问题关系、已做工作、当前认识、未解决事项与后续方向。", en: "Review question relationships, completed work, current understanding, open issues, and next directions." },
+  baselines: { zh: "沿方法、变体和真实实施，复用具体研究工作的过程、输入与结果。", en: "Follow methods, variants, and actual runs to reuse research processes, inputs, and results." },
+  datasets: { zh: "查找已有或研究中产生的数据资源，按精确内容版本读取。", en: "Find existing data and data produced by research, with exact content versions." },
+  literature: { zh: "复用文献原文及不同研究问题中有价值的阅读认识。", en: "Reuse literature and valuable reading insights from different research questions." },
+  human: { zh: "查看协作请求、尝试、答复、主动指导和采用背景，复用人类协作经验。", en: "Review requests, attempts, responses, proactive guidance, and adoption context to reuse human collaboration experience." },
+  environments: { zh: "查找交互与仿真环境、计算运行环境，以及已有设备、设施和场地；查看来源与已知使用条件。", en: "Find interaction, simulation, and computing environments, along with existing equipment, facilities, and sites; review their sources and known conditions for use." },
 };
 function text(value: unknown): string { return typeof value === "string" ? value : ""; }
 function itemName(item: ResearchLibraryItem, fallback: string): string {
@@ -111,14 +119,15 @@ export function ResearchLibrary({ questRef, questionRef }: { questRef: string | 
     } catch (caught) { setInputError(String(caught instanceof Error ? caught.message : caught)); }
     finally { setInputBusy(false); }
   }
-  return <section className="research-library" aria-label={t("五大研究入口", "Research library")}>
+  return <section className="research-library" aria-label={t("六大研究入口", "Research library")}>
     <div className="library-intro"><h3>{t("找到材料，继续研究", "Find material and continue research")}</h3>
-      <p>{t("在当前研究项目内发现已有问题、方法、原文和指导。保存的材料可供后续问题与研究轮次再次使用。", "Discover questions, methods, original material, and guidance in this project. Saved material remains available to later questions and research cycles.")}</p>
+      <p>{t("在当前研究项目内查看研究进展，发现可复用的方法、材料、指导与环境资源。", "Review research progress and discover reusable methods, material, guidance, and environments in this project.")}</p>
       <small>{t("语言设置用于新生成的内容；已保存的原文保持原貌。", "The language setting applies to new content. Saved originals remain unchanged.")}</small></div>
     {!questRef ? <p role="status">{t("先创建或选择研究项目，再浏览项目的研究积累。下方仍可保存资料。", "Create or select a research project to browse its knowledge. You can still save files below.")}</p> : <>
       <div className="library-tabs" role="tablist" aria-label={t("研究入口", "Research entries")}>
         {entries.map((key, index) => <button type="button" role="tab" key={key} aria-selected={entry === key} onClick={() => { setEntry(key); setQueryDraft(queries[key] ?? ""); }}>{labels[language][index]}</button>)}
       </div>
+      <p>{purposes[entry][language]}</p>
       <form className="library-search" onSubmit={event => { event.preventDefault(); setQueries(value => ({ ...value, [entry]: queryDraft.trim() })); setOffsets(value => ({ ...value, [entry]: [0] })); setScopes(value => ({ ...value, [entry]: [] })); setRevision(value => value + 1); }}>
         <input aria-label={t("查找研究材料", "Find research material")} value={queryDraft} onChange={event => setQueryDraft(event.target.value)} placeholder={t("输入问题、名称或研究线索", "A question, name, or research clue")} />
         <button disabled={busy} type="submit">{t("查找", "Search")}</button>
@@ -139,20 +148,30 @@ export function ResearchLibrary({ questRef, questionRef }: { questRef: string | 
           {error ? <div role="alert"><p>{t("暂时无法读取此入口。请重试。", "This entry could not be loaded. Please retry.")}</p><button onClick={() => setRevision(value => value + 1)}>{t("重试", "Retry")}</button><details><summary>{t("技术详情", "Technical details")}</summary><code>{error}</code></details></div> : null}
           {page && page.items.length === 0 ? <p>{t("没有找到匹配材料。试试其他线索或入口。", "No matching material. Try another clue or entry.")}</p> : null}
           {page?.items.map((item, index) => {
-            const name = itemName(item, item.variant_ref ? t("方法变体", "Method variant") : t("研究记录", "Research record"));
+            const isEnvironmentReference = entry === "environments" && Boolean(item.environment_reference_ref);
+            const name = itemName(item, isEnvironmentReference ? t("研究采用记录", "Research use") : item.variant_ref ? t("方法变体", "Method variant") : t("研究记录", "Research record"));
             const reader = item.reader;
             const judgments = Array.isArray(item.judgments) ? item.judgments as ResearchLibraryItem[] : [];
             return <article className="library-card" key={text(item.ref) || text(item.question_ref) || text(item.record_ref) || String(index)}>
               <h4>{name}</h4>{text(item.summary) ? <p>{text(item.summary)}</p> : null}
+              {entry === "environments" ? <>
+                {isEnvironmentReference ? <>
+                  <p><b>{t("研究问题：", "Question: ")}</b>{text(item.question_ref)}</p>
+                  {text(item.research_ref) ? <p><b>{t("相关研究工作：", "Related research work: ")}</b>{text(item.research_ref)}</p> : null}
+                </> : <p><b>{t("位置与来源：", "Location and source: ")}</b>{text(item.source)}</p>}
+                {text(item.notes) ? <p>{text(item.notes)}</p> : null}
+                {item.metadata && typeof item.metadata === "object" && Object.keys(item.metadata).length > 0 ? <details><summary>{t("能力与已知使用条件", "Capabilities and known conditions")}</summary><pre>{JSON.stringify(item.metadata, null, 2)}</pre></details> : null}
+                {!isEnvironmentReference ? <button onClick={() => expand(name, { environment_ref: text(item.environment_ref) })}>{t("查看用途与研究关联", "View uses and related research")}</button> : null}
+              </> : null}
               {entry === "datasets" && item.dataset_ref && !item.dataset_version_ref ? <button onClick={() => expand(name, { dataset_ref: text(item.dataset_ref) })}>{t("查看数据版本", "View data versions")}</button> : null}
               {entry === "baselines" && item.baseline_ref && !item.variant_ref ? <button onClick={() => expand(name, { baseline_ref: text(item.baseline_ref) })}>{t("查看方法变体", "View method variants")}</button> : null}
               {entry === "baselines" && item.variant_ref && !Array.isArray(item.runs) ? <button onClick={() => expand(name, { baseline_ref: text(item.baseline_ref), variant_ref: text(item.variant_ref) })}>{t("查看实施与评价", "View runs and evaluations")}</button> : null}
-              {reader?.source_ref ? <button type="button" onClick={() => void read(reader, name)}>{t("阅读原文", "Read original")}</button> : <p className="library-muted">{t("展开详情查看版本与关联。", "Expand details for versions and relationships.")}</p>}
+              {reader?.source_ref ? <button type="button" onClick={() => void read(reader, name)}>{entry === "environments" ? t("阅读说明或材料", "Read documentation or material") : t("阅读原文", "Read original")}</button> : isEnvironmentReference ? null : <p className="library-muted">{entry === "environments" ? t("这是资源信息，未关联数字材料。可根据位置、来源与使用条件采用。", "This is resource information without attached digital material. Refer to its location, source, and conditions for use.") : t("展开详情查看版本与关联。", "Expand details for versions and relationships.")}</p>}
               {item.history_reader && typeof item.history_reader === "object" ? <button onClick={() => void read(item.history_reader as ResearchContentReader, name)}>{t("阅读研究历史", "Read research history")}</button> : null}
-              {Array.isArray(item.readers) && item.readers.length > 1 ? <details><summary>{t("此版本的所有材料", "All material in this version")}</summary>{(item.readers as ResearchContentReader[]).map((value, idx) => <button key={idx} onClick={() => void read(value, name)}>{t("读取材料", "Read material")} {idx + 1}</button>)}</details> : null}
+              {Array.isArray(item.readers) && item.readers.length > 1 ? <details><summary>{entry === "environments" ? t("此环境关联的所有材料", "All material for this environment") : t("此版本的所有材料", "All material in this version")}</summary>{(item.readers as ResearchContentReader[]).map((value, idx) => <button key={idx} onClick={() => void read(value, name)}>{t("读取材料", "Read material")} {idx + 1}</button>)}</details> : null}
               {Array.isArray(item.runs) ? <section className="library-runs"><h5>{t("实际实施", "Runs")}</h5>{(item.runs as ResearchLibraryItem[]).map((run, idx) => <div key={idx}><b>{itemName(run, t("实施", "Run") + " " + (idx + 1))}</b>{text(run.summary) ? <p>{text(run.summary)}</p> : null}{run.reader?.source_ref ? <button onClick={() => void read(run.reader!, name)}>{t("阅读实施记录", "Read run")}</button> : run.reader?.ref ? <button onClick={() => expand(itemName(run, t("实施产物", "Run artifacts")), { formal_ref: run.reader!.ref! })}>{t("查看实施产物", "View run artifacts")}</button> : null}<details><summary>{t("实施与产物详情", "Run and artifact details")}</summary><pre>{JSON.stringify(run, null, 2)}</pre></details></div>)}</section> : null}
               {judgments.length ? <details><summary>{t("不同问题的阅读判断", "Readings for different questions")} ({judgments.length})</summary>{judgments.map((judgment, idx) => <div key={idx}><p>{text(judgment.summary)}</p>{judgment.reader ? <button onClick={() => void read(judgment.reader!, name)}>{t("阅读完整判断", "Read full judgment")}</button> : null}</div>)}</details> : null}
-              <details><summary>{t("版本与关联详情", "Version and relationship details")}</summary><pre>{JSON.stringify(item, null, 2)}</pre></details>
+              <details><summary>{isEnvironmentReference ? t("用途与研究关联详情", "Use and research relationship details") : entry === "environments" ? t("资源与关联详情", "Resource and relationship details") : t("版本与关联详情", "Version and relationship details")}</summary><pre>{JSON.stringify(item, null, 2)}</pre></details>
             </article>;
           })}
           {entry === "human" && page?.request_next_cursor ? <button disabled={requestBusy || busy} onClick={() => void moreRequests()}>{requestBusy ? t("正在读取回复…", "Reading responses…") : t("更多请求回复", "More request responses")}</button> : null}

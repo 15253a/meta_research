@@ -5,7 +5,7 @@ description: 在已接纳 FormalPlan 内组织并启用 Target，滚动安排材
 
 # Bundle：组织实际研究
 
-负责本轮工作范围、真实依赖与滚动安排；Target 根 Session 负责实施、检查、局部修订和结果交接。保持 Plan 承诺与 Idea 来源，在新结果出现时补充判断依据。按根系统提示执行五入口、预算、人类输入和语言偏好，子智能体继承范围及语言。
+负责本轮工作范围、真实依赖与滚动安排；Target 根 Session 负责实施、检查、局部修订和结果交接。保持 Plan 承诺与 Idea 来源，在新结果出现时补充判断依据。按根系统提示执行六入口、预算、人类输入和语言偏好，子智能体继承范围及语言。
 
 粒度、风险、正式工作与依赖查[Bundle 契约](references/contract.md)；调用与反馈查[Owner 操作](references/owner-operations.md)。Target 按运行时注入的 target-execution Skill、measurement_contract、result_schema 执行，Bundle 不重建另一套交接协议。
 
@@ -25,7 +25,7 @@ cells 表达应实施及报告的责任，允许负结果、失败原因和未�
 
 给 Target 留出方法复用／新建、实际归属（含跨 Baseline）、实现和补充检查空间。保持 FormalPlan 的 Goal、Characteristics、BoundaryConstraints、SemanticDelta、required Metric 和 held-fixed 条件；实质变化交给 Reasoning 与后继 Cycle，同一 Cycle 不回 Plan。
 
-## 3. 保存认识和可复用数据
+## 3. 保存认识和可复用资源
 
 用已接纳工作的真实结果更新覆盖，既可有测量，也可为无评价工作。负、零、不显著、不确定和缺测保持各自含义；准备审计只支持准备事实，不代替承诺中的实质研究。
 
@@ -33,7 +33,9 @@ cells 表达应实施及报告的责任，允许负结果、失败原因和未�
 
 已接纳 Target 的 `research_notes` 保存当时说明和最终发言。先读摘要，必要时沿 `research_notes_reader`／`research_memory.research_notes.read` 分页；精确正文用 `source=research_note_body`、`source_ref=version_ref`。上一 Question 的入口使用 `predecessor_research_notes_readers`，正文保留对应 `predecessor_ref`。说明有助理解，不替代完整合同与冻结输入。
 
-Target 正式接纳后，读取 `dataset_candidates` 和 completion manifest，沿 `artifact_path` 找真实 RM binding。按独立复用价值选择，通过当前授予的 datasets.register／register_version／reference 登记并关联当前 Question；有真实派生关系时 derive。先发现或对账已有登记，复用身份和原件。可委派明确范围的整理，根独立查回精确版本、用途关系和正文。最后一个 Target 后 Bundle 若不再运行，由 Reasoning 在其综合交接前承接；暂存和未接纳产物留工作区。
+Target 正式接纳后，在同一整理核验环节读取 `dataset_candidates`、`environment_candidates` 和 completion manifest，沿 `artifact_path` 找真实 RM binding 并判断复用价值。Dataset 用 datasets.register／register_version／reference，真实派生用 derive；Environment 用 environments.register 记录含义、真实来源和相同原件 binding，再用 reference 关联当前 Question、原 Target／Run 和用途。六入口按复用目的组织，同一内容可供多个入口引用。
+
+先发现或对账已有登记，复用身份和原件；可委派明确范围的整理，根独立查回记录、用途关系及适用的精确内容。最后一个 Target 后 Bundle 若不再运行，由 Reasoning 在其综合交接前承接；暂存和未接纳产物留工作区。已有设备、设施、持久目录、安装或服务按真实来源可直接登记，详见根系统提示的 Environment 语义。
 
 ## 4. 复核与收口
 

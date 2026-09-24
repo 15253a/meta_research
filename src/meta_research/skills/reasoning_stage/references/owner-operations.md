@@ -9,13 +9,13 @@
 | `research_graph.reasoning_context.read` | 读取已接纳 Question／Quest／Goal 与领域上下文。 |
 | `research_graph.target_formal_results.read` | 按 target_ref 展开 VariantRun、适用评价和 MetricResult，包括已交接但尚未评价的 Run。 |
 
-共享五入口及分页 reader 用于发现同 Quest 历史，不把首批目录当作全集。人类输入沿 `human_request.read` 读真实原话及材料，意见、授权、HumanRequest satisfied 与 Quest 完成确认分别核对。
+共享六入口及分页 reader 用于发现同 Quest 历史，不把首批目录当作全集。人类输入沿 `human_request.read` 读真实原话及材料，意见、授权、HumanRequest satisfied 与 Quest 完成确认分别核对。
 
-## 写入权限与数据沉积
+## 写入权限与资源登记
 
-Reasoning 阶段专用写入是 `research_graph.question_relations.record`；共享 catalog 还授予 Dataset 的 register、register_version、reference、derive 及各自 reconcile。按实际研究与当前 scope 使用；执行前核实 currentness 和原件正式接纳，未知效果用原 `effect_id` 对账。数据沉积的完成条件和时序以[主 Skill 的交接前沉积步骤](../SKILL.md)为准，阶段名称不额外增加等待 ScientificOutcome 的条件。
+Reasoning 阶段专用写入是 `research_graph.question_relations.record`；共享 catalog 还授予 Dataset 的 register、register_version、reference、derive 和 Environment 的 register、reference 及各自 reconcile。按实际研究与当前 scope 使用；执行前核实 currentness，绑定数字材料时核实原件已正式接纳，未知效果用原 `effect_id` 对账。资源整理的完成条件和时序以[主 Skill 的交接前整理步骤](../SKILL.md)为准，阶段名称不额外增加等待 ScientificOutcome 的条件。
 
-可委派已接纳材料的有限登记任务，根最终独立读回精确版本、用途、派生关系与原件。登记复用内容保管，不代替正式执行输入绑定，也不形成新的科学测量。
+可委派明确范围的资源登记任务，根按主 Skill 的完成条件独立读回核验。数字材料沿用已有保管与版本，登记不代替正式执行输入绑定，也不形成新的科学测量。
 
 ## Owner 分工及恢复
 

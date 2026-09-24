@@ -60,7 +60,7 @@ daemon 仅 claim、wake、single-flight、cancel、reconcile 和事件转发。c
 
 冻结前满足：候选对应实际实现，命令与写入已对账，合同／输入／spec 仍可验证，独立审阅和根自查已完成，所选路径稳定。中间产物留可恢复工作区，正式发布发生在 completion handoff 之后。root 不生成 Owner 身份或 receipt。
 
-AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据冻结合同和 `formal_runs` 登记真实方法、Run、评价／待评价事实及产物角色，再接纳 TargetCommit。可有多个实际测量，也可没有评价；不要求每个 Target 都产生唯一 MetricResult。Bundle 重读接纳事实后更新 coverage。结果已接纳但 Dataset 尚未登记时，按主 Skill 的沉积步骤处理并读回，不重复实施。
+AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据冻结合同和 `formal_runs` 登记真实方法、Run、评价／待评价事实及产物角色，再接纳 TargetCommit。可有多个实际测量，也可没有评价；不要求每个 Target 都产生唯一 MetricResult。Bundle 重读接纳事实后更新 coverage。结果已接纳但 Dataset／Environment 尚未登记时，按主 Skill 的整理步骤处理并读回，不重复实施。
 
 ## Bundle 收口
 

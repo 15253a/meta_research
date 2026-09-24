@@ -8,7 +8,7 @@ ContextPack 提供创建时 evidence_catalog 及版本。`research_graph.plan_ev
 
 TargetCommit 来源经现有验证接缝核查，包括有指标测量和无测量的观察、分析、负结果。科学含义由 Plan 说明，capability 与 provenance 如实记录，不能为可引用而补造测量。空目录不推导全库无证据，索引摘要不替代实际采用正文。
 
-HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 先从当前 Quest 的 Question 历史、文献、数据集或人类输入入口发现，再沿返回 reader 读精确正文。额外来源采用：
+HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 按系统提示中的研究入口在当前 Quest 内发现，再沿返回 reader 读精确正文。额外来源采用：
 
 ```json
 {
@@ -21,7 +21,7 @@ HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 先从当前 
 
 `source_kind` 选实际单一类别，不写四类拼接值；coverage 的 evidence use 使用同一 ref。Target 证据使用工具返回的完整 EvidenceRef。`additional_evidence_bindings` 只提交本轮读过并实际采用的条目，最多 32 项；adapter 写入 `source_bindings.selected_evidence_catalog`，RG 重验真实接纳事实、同 Quest 范围和内容，并供后续读回。
 
-Dataset 的登记与用途关系帮助发现；实际实施仍需 Bundle 绑定所需 AssetVersion。人类意见可供判断，不能替代执行授权或 HumanRequest 已满足事实。
+Dataset／Environment 的登记与用途关系帮助发现；实际实施需要数字材料时，由 Bundle 绑定所需 AssetVersion；实体资源与现成服务按真实来源及已知使用条件安排。人类意见可供判断，不能替代执行授权或 HumanRequest 已满足事实。
 
 ## 职责与顺序
 

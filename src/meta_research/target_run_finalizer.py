@@ -1752,10 +1752,11 @@ def _declared_artifact_boundaries(document, relative_path, role):
             declared = producer.get('artifact_paths')
             if isinstance(declared, list) and len(declared) <= 100:
                 selected.extend(declared)
-    candidates = document.get('dataset_candidates', [])
-    if role in {'data', 'analysis'} and isinstance(candidates, list) and len(candidates) <= 100:
-        selected.extend(candidate.get('artifact_path') for candidate in candidates
-                        if isinstance(candidate, dict))
+    for field in ('dataset_candidates', 'environment_candidates'):
+        candidates = document.get(field, [])
+        if role in {'data', 'analysis'} and isinstance(candidates, list) and len(candidates) <= 100:
+            selected.extend(candidate.get('artifact_path') for candidate in candidates
+                            if isinstance(candidate, dict))
     paths = set()
     for path in selected:
         try:

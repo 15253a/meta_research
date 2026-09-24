@@ -1318,66 +1318,86 @@ def verify_retained_products(document, entries):
             + canonical_json(missing) + '. Assign these exact frozen paths with artifact_paths or '
             'checkpoint_paths in formal_runs. Preserve the existing work; correct its handoff attribution.')
         raise error
-    candidates = document.get('dataset_candidates', [])
-    if not isinstance(candidates, list) or len(candidates) > 100:
-        error = OwnerConflict('target_root_commit_domain_invalid')
-        error.feedback = ('dataset_candidates must be a list of at most 100 declarations, each with '
-            'nonempty artifact_path, name and purpose. Preserve the retained research products, '
-            'correct this declaration in the result document and finish another normal root turn.')
-        raise error
-    for candidate in candidates:
-        if (not isinstance(candidate, dict) or any(not isinstance(candidate.get(key), str)
-                or not candidate[key].strip() for key in ('artifact_path', 'name', 'purpose'))):
+    implementation = [entry['declared_relative_path'] for entry in entries
+                      if entry['role'] == 'implementation']
+    for item in items:
+        if not item['reuse_variant_run']:
+            paths = item.get('implementation_paths')
+            assigned.update(path for path in implementation
+                            if (paths is None and len(implementation) == 1)
+                            or (isinstance(paths, list) and path in paths))
+    _verify_reusable_candidates(document, entries, assigned)
+
+
+def _verify_reusable_candidates(document, entries, assigned):
+    """Index candidates refer to the same exact, attributed completion assets."""
+    from meta_research.target_implementation_bundle import (
+        TargetImplementationBundleError, validate_bundle_relative_path,
+    )
+
+    declarations = []
+    for field, label, roles in (
+        ('dataset_candidates', 'Dataset', {'data', 'analysis'}),
+        ('environment_candidates', 'Environment', {'data', 'analysis', 'implementation', 'checkpoint', 'log'}),
+    ):
+        candidates = document.get(field, [])
+        if not isinstance(candidates, list) or len(candidates) > 100:
             error = OwnerConflict('target_root_commit_domain_invalid')
-            error.feedback = ('Each dataset_candidates entry needs nonempty artifact_path, name and '
-                'purpose. Preserve the retained research products, correct the incomplete declaration '
-                'and finish another normal root turn.')
+            error.feedback = (field + ' must be a list of at most 100 declarations, each with '
+                'nonempty artifact_path, name and purpose. Preserve the retained research products, '
+                'correct this declaration in the result document and finish another normal root turn.')
             raise error
-        from meta_research.target_implementation_bundle import (
-            TargetImplementationBundleError, validate_bundle_relative_path,
-        )
-        try:
-            validate_bundle_relative_path(candidate['artifact_path'])
-        except TargetImplementationBundleError as cause:
-            error = OwnerConflict('target_root_commit_domain_invalid')
-            error.feedback = ('Dataset candidate artifact_path must be a canonical relative workspace '
-                'path without traversal, absolute prefixes or unsupported characters: '
-                + repr(candidate['artifact_path']) + '. Correct the declaration to the existing exact '
-                'data or analysis path, preserve all files and finish another normal root turn.')
-            raise error from cause
-    paths = [candidate['artifact_path'] for candidate in candidates]
+        for candidate in candidates:
+            if (not isinstance(candidate, dict) or any(not isinstance(candidate.get(key), str)
+                    or not candidate[key].strip() for key in ('artifact_path', 'name', 'purpose'))):
+                error = OwnerConflict('target_root_commit_domain_invalid')
+                error.feedback = ('Each ' + field + ' entry needs nonempty artifact_path, name and '
+                    'purpose. Preserve the retained research products, correct the incomplete declaration '
+                    'and finish another normal root turn.')
+                raise error
+            try:
+                validate_bundle_relative_path(candidate['artifact_path'])
+            except TargetImplementationBundleError as cause:
+                error = OwnerConflict('target_root_commit_domain_invalid')
+                error.feedback = (label + ' candidate artifact_path must be a canonical relative workspace '
+                    'path without traversal, absolute prefixes or unsupported characters: '
+                    + repr(candidate['artifact_path']) + '. Correct the declaration to an existing exact '
+                    'retained path, preserve all files and finish another normal root turn.')
+                raise error from cause
+            declarations.append((field, label, roles, candidate))
+    paths = [candidate['artifact_path'] for _, _, _, candidate in declarations]
     overlap = next(((parent, child) for parent in paths for child in paths
                     if child.startswith(parent + '/')), None)
     if overlap is not None:
         error = OwnerConflict('target_root_commit_domain_invalid')
-        error.feedback = ('dataset_candidates contains overlapping parent and child boundaries: '
-            + canonical_json(overlap) + '. Choose non-overlapping exact dataset boundaries according '
-            'to the intended research meaning. Preserve all files and correct the declarations before '
-            'finishing another normal root turn; do not broaden a subdataset to its parent.')
+        error.feedback = ('dataset_candidates / environment_candidates contain overlapping parent and child boundaries: '
+            + canonical_json(overlap) + '. Choose non-overlapping exact candidate boundaries according '
+            'to the intended research meaning. Equal paths may share one retained asset across both indexes. '
+            'Preserve all files and correct the declarations before finishing another normal root turn; '
+            'do not broaden a selected resource to its parent.')
         raise error
-    for candidate in candidates:
-        if (candidate['artifact_path'] not in assigned
-                or not any(entry['declared_relative_path'] == candidate['artifact_path']
-                           and entry['role'] in {'data', 'analysis'} for entry in entries)):
-            path = candidate['artifact_path']
+    for field, label, roles, candidate in declarations:
+        path = candidate['artifact_path']
+        if (path not in assigned or not any(entry['declared_relative_path'] == path
+                                           and entry['role'] in roles for entry in entries)):
             parents = [entry['declared_relative_path'] for entry in entries
-                       if entry['role'] in {'data', 'analysis'} and isinstance(path, str)
+                       if entry['role'] in {'data', 'analysis'}
                        and path.startswith(entry['declared_relative_path'] + '/')]
             error = OwnerConflict('target_root_commit_domain_invalid')
             error.feedback = (
-                'Dataset candidate ' + canonical_json(path) + ' must name its exact retained data '
-                'or analysis artifact and actual Run or Evaluation owner, with nonempty name and '
-                'purpose. '
+                label + ' candidate ' + canonical_json(path) + ' must name its exact retained artifact '
+                'and actual Run or Evaluation owner, with nonempty name and purpose. '
                 + ('The existing immutable completion froze the containing collection at '
                    + canonical_json(parents) + '. First confirm that the exact candidate path exists '
                    'in the workspace and identifies the intended contents. If that subpath is correct, '
-                   'keep dataset_candidates unchanged and finish another normal root '
-                   'turn; the host will freeze the new completion at the declared dataset boundary. '
-                   'Do not broaden this dataset to its parent, download it again or rerun the research. '
+                   'keep ' + field + ' unchanged and finish another normal root '
+                   'turn; the host will freeze the new completion at the declared candidate boundary. '
+                   'Do not broaden this resource to its parent, download it again or rerun the research. '
                    if parents else
-                   'Check the exact workspace path and its artifact_paths attribution. Choose '
-                   'non-overlapping dataset boundaries, preserve existing results and correct the '
-                   'declaration before finishing another normal root turn. ')
+                   'Check the exact workspace path and its actual producer attribution. For implementation, '
+                   'checkpoint and log candidates, select an existing manifest entry; implementation_paths '
+                   'selects the actual Run snapshot. Choose non-overlapping boundaries, preserve existing '
+                   'results and correct the declaration before finishing another normal root turn. ')
                 + 'The previous manifest and accepted content remain unchanged.'
             )
             raise error
