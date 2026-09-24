@@ -136,7 +136,6 @@ def _formal_candidate(
         == experiment_key
     )
     implementation_ref = f"implementation:{label}"
-    implementation_hash = canonical_hash({"implementation": label})
     part_keys = [f"part:{label}:first", f"part:{label}:second"]
     return {
         "schema_ref": FORMAL_TARGET_CANDIDATE_SCHEMA_REF,
@@ -147,44 +146,6 @@ def _formal_candidate(
             "held_fixed_bindings": [],
             "implementation_revision_ref": implementation_ref,
             "code_changed": False,
-            "reuse_trace": {
-                "tier_decisions": [
-                    {
-                        "tier": "self-implementation",
-                        "disposition": "selected",
-                        "reason_ref": f"reuse-reason:{label}",
-                        "source_proofs": [
-                            {
-                                "source_ref": f"source:{label}",
-                                "exact_version_ref": f"source-version:{label}",
-                                "implementation_revision_ref": implementation_ref,
-                                "eligible_tier": "self-implementation",
-                                "verification_receipt": _proof_receipt(
-                                    f"source-receipt:{label}",
-                                    f"source-version:{label}",
-                                ),
-                                "implementation_binding": {
-                                    "subject_ref": implementation_ref,
-                                    "content_hash_ref": implementation_hash,
-                                },
-                                "implementation_acceptance_receipt": (
-                                    _proof_receipt(
-                                        f"implementation-receipt:{label}",
-                                        implementation_hash,
-                                    )
-                                ),
-                                "eligibility_anchor_ref": None,
-                                "eligibility_binding": None,
-                                "eligibility_receipt": None,
-                                "license_ref": None,
-                                "content_hash_ref": None,
-                                "patch_ref": None,
-                            }
-                        ],
-                    }
-                ],
-                "greenfield_exception": "simple-implementation",
-            },
             "routes": [
                 {
                     "route_ref": f"route:{label}",
@@ -200,9 +161,13 @@ def _formal_candidate(
             "experiment_keys": [experiment_key],
             "measurement_unit_key": cell,
             "baseline_forward_contract": {
-                "schema_ref": "test/baseline-forward/v1",
-                "input_role": "accepted baseline",
-                "output_role": "frozen prediction",
+                "method_key": "test/accepted-baseline-prediction",
+                "method_version": "1",
+                "method_contract": {
+                    "schema_ref": "test/baseline-forward/v1",
+                    "input_role": "accepted baseline",
+                    "output_role": "frozen prediction",
+                },
             },
             "variant_recipe": {
                 "schema_ref": "test/variant-recipe/v1",
@@ -1992,8 +1957,8 @@ def test_bundle_root_session_selects_from_the_durable_parallel_frontier(
         runtime.close()
 
 
-@pytest.mark.parametrize("action", ("wait", "replan_required"))
-def test_bundle_rejects_non_dispatch_decisions_for_an_executable_frontier(
+@pytest.mark.parametrize("action", ("wait",))
+def test_bundle_persists_research_wait_without_dispatch_or_busy_loop(
     tmp_path: Path,
     action: str,
 ) -> None:
@@ -2022,21 +1987,25 @@ def test_bundle_rejects_non_dispatch_decisions_for_an_executable_frontier(
         for _step in range(4):
             changed = runtime.bundle_stage.process_once()
             if bundle_provider.schedule_calls:
-                assert not changed
+                assert changed
                 break
             assert changed
         else:
             raise AssertionError("Bundle root did not evaluate its frontier")
         assert bundle_provider.schedule_calls == 1
-        assert (
-            runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
-            == ()
-        )
-
-        # Free-text wait/replan output is not a durable blocker. The same root
-        # Session re-evaluates without creating launch or execution authority.
+        decisions = runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+        assert len(decisions) == 1
+        assert decisions[0].action == 'wait'
+        assert decisions[0].created_at > 0
+        from meta_research.runtime_status import RuntimeStatusReader
+        visible = RuntimeStatusReader(runtime._database).query()
+        assert visible['state'] == 'waiting'
+        assert visible['waiting_reason'] == decisions[0].rationale
         assert not runtime.bundle_stage.process_once()
-        assert bundle_provider.schedule_calls == 2
+        assert bundle_provider.schedule_calls == 1
+        from meta_research.bundle_stage import _research_wait_recheck_due
+        assert not _research_wait_recheck_due(decisions[0], decisions[0].frontier, now=decisions[0].created_at + 299)
+        assert _research_wait_recheck_due(decisions[0], decisions[0].frontier, now=decisions[0].created_at + 300)
         after_retry = runtime.bundle_stage.query_current()
         assert (
             after_retry["target_graph"]["frontier"]

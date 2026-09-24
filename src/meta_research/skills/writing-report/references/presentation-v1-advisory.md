@@ -1,37 +1,19 @@
-# Presentation profile (`presentation-v1`)
+# 演示文稿类型：`presentation-v1`
 
-This request is a presentation, not a report renamed to `.pptx`. The shared
-Writing rules above still govern evidence, citation markers, the frozen
-Snapshot, lineage, and root advisory finalization. Interpret every occurrence
-of “report” in the shared compatibility core as “candidate document” for this
-request only. Keep the same root native Session; do not start a deck-specific
-top-level Session.
+形成适合演示的候选，遵循主 Skill 的冻结 Snapshot、引用标记、lineage 和定稿流程，保持同一根 native Session。主 Skill 中的“文档”在此指演示文稿；不新增演示专属顶层会话。
 
-## Canonical semantic source
+## 语义结构
 
-The H1 is the deck title. Define between 2 and 40 content-bearing slides. Each
-slide starts with the shared structure marker followed by one sequential H2:
+H1 为整套标题，包含 2–40 页有实际内容的幻灯片。每页先用共享结构标记，再用顺序 H2；`Slide` 和编号格式是当前解析协议，标题正文可中文或英文：
 
-`## Slide <1-based number>: <unique slide title>`
+```text
+## Slide <1-based number>: <unique slide title>
+```
 
-Every slide must then contain at least one shared claim-classification block.
-Give each slide one primary rhetorical job and a clear takeaway. Use multiple
-slides, speaker-ready wording, and deliberate narrative progression; do not
-compress a paper outline into a single wall of bullets. Preserve qualifiers,
-counterevidence, legends, units, and source meaning when simplifying content.
-If the snapshot cannot support a needed visual or claim, use an evidence-gap or
-uncertainty block rather than a decorative substitute.
+每页至少包含一个共享主张分类块，聚焦一个主要表达目的和清楚结论。按讲述顺序分配多页，采用适合讲解的文字；简化时保留限定、反证、图例、单位和来源含义。快照无法支持的图或主张使用缺口／不确定性块，不用装饰替代证据。
 
-The renderer will turn these stable slide boundaries into editable PowerPoint
-text shapes. Do not emit OOXML, base64, image-only slides, arbitrary template
-paths, or a download link. Rendering and external delivery happen after formal
-acceptance and are not actions this Skill may take.
+渲染器把这些稳定边界生成可编辑 PowerPoint 文本形状；此阶段交接语义 Markdown，不输出 OOXML、base64、纯图片页、任意模板路径或下载链接。渲染与外部交付在正式接纳后的独立流程进行。
 
-## Type-specific review
+## 演示复核
 
-In addition to the shared rubric, the root advisory finalization checks the
-narrative spine, one-job-per-slide discipline, claim-to-slide placement,
-density risk, qualifier retention, title/takeaway agreement, and whether the
-deck's requested decision is justified for the exact audience and purpose.
-Structural conformance does not constitute visual QA, RG citation acceptance,
-or external delivery success.
+除共享标准外，核对叙述顺序、每页表达目的、主张位置、信息密度、限定保留、标题与要点一致性，以及对目标读者和用途的决策支持是否充分。结构通过不等于视觉 QA、引用接纳或外部交付成功。

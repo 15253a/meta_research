@@ -225,10 +225,10 @@ class _ExhaustionBundleSkill(_DeterministicBundleSkill):
             reviewed_assessment_hash=assessment_hash,
             findings=(),
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref=reviewer,
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
-            review_trace=trace,
+            review_trace=trace if self._corrupt_trace_seal else None,
         )
 
     def verify_bundle_exhaustion_review_trace(
@@ -306,7 +306,7 @@ def _advance_to_rg_rejection(runtime):
             )
             if rejection is not None:
                 return request, run, rejection
-        assert runtime.bundle_stage.process_once()
+        assert runtime.bundle_stage.process_once(), runtime.bundle_stage.transient_error
     raise AssertionError("RG did not durably reject the first TargetPlan")
 
 
@@ -407,9 +407,9 @@ def test_real_rg_rejection_successor_restarts_then_commits_exhaustion(
         data_root,
         bundle_skill_provider=_RejectedThenExhaustionBundleSkill(),
     )
-    runtime.owners.research_graph._target_candidate_proof_verifier = (  # type: ignore[attr-defined]
-        _RejectingTargetCandidateProofVerifier()
-    )
+    # A normal formal TargetPlan still requires a bound Owner proof authority.
+    # Exercise its real durable rejection, without relying on retired reuse mode.
+    runtime.owners.research_graph._target_candidate_proof_verifier = None  # type: ignore[attr-defined]
     request, first_run, rejection = _advance_to_rg_rejection(runtime)
     assert first_run.execution is not None
     assert rejection.submission_ref == first_run.execution.submission_ref
@@ -481,9 +481,9 @@ def test_tampered_rg_rejection_cannot_create_bundle_successor(
         data_root,
         bundle_skill_provider=_RejectedThenExhaustionBundleSkill(),
     )
-    runtime.owners.research_graph._target_candidate_proof_verifier = (  # type: ignore[attr-defined]
-        _RejectingTargetCandidateProofVerifier()
-    )
+    # A normal formal TargetPlan still requires a bound Owner proof authority.
+    # Exercise its real durable rejection, without relying on retired reuse mode.
+    runtime.owners.research_graph._target_candidate_proof_verifier = None  # type: ignore[attr-defined]
     request, first_run, rejection = _advance_to_rg_rejection(runtime)
     runtime.close()
 
@@ -606,7 +606,7 @@ def test_legacy_external_operation_claim_is_not_target_root_authority(
     (
         (
             _ExhaustionBundleSkill(corrupt_trace_seal=True),
-            "bundle_exhaustion_review_trace_seal_invalid",
+            "bundle_exhaustion_advisory_review_invalid",
         ),
         (
             _ExhaustionBundleSkill(claim_fake_rejection=True),
@@ -624,8 +624,13 @@ def test_fake_review_or_rejection_evidence_has_zero_ar_write(
         _prepare_bundle_request(runtime)
         assert runtime.bundle_stage.process_once()  # Run admission.
         assert runtime.bundle_stage.process_once()  # Primary assessment.
-        with pytest.raises(OwnerConflict, match=error_code):
-            runtime.bundle_stage.process_once()  # Independent review acceptance.
+        if provider._corrupt_trace_seal:
+            assert runtime.bundle_stage.process_once()
+            rejection = runtime.bundle_stage.query_current()["run"]["completion_rejection"]
+            assert rejection["reason"]["detail"] == error_code
+        else:
+            with pytest.raises(OwnerConflict, match=error_code):
+                runtime.bundle_stage.process_once()
         with runtime._database.read() as connection:
             assert connection.exec_driver_sql(
                 "SELECT COUNT(*) FROM ar_bundle_exhaustion_evidence"

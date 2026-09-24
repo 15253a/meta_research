@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from meta_research import cli
+from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.composition import build_production_runtime
 from meta_research.harness import (
     FULL_CONFORMANCE_OPERATION_IDS,
@@ -121,7 +122,7 @@ def _runtime(tmp_path: Path, *, codex_missing: str | None = None):
 
 def _full_request() -> FullConformanceRequest:
     return FullConformanceRequest(
-        codex_model_ref="gpt-5.6-sol",
+        codex_model_ref=CODEX_MODEL_REF,
         codex_auth_profile_ref="harness-profile:codex-default",
         claude_model_ref="claude-conformance",
         claude_auth_profile_ref="harness-profile:claude-default",

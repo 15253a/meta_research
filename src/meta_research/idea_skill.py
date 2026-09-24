@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.context_presentation import stage_context_view
+
 import base64
 import hashlib
 import hmac
@@ -23,10 +25,11 @@ from meta_research.codex_ledger import (
     CodexHomeLedgerReader,
     CodexSessionLedgerReader,
 )
+from meta_research.system_prompt import read_output_language
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
-    CODEX_REASONING_EFFORT_CONFIG,
+    CODEX_ROOT_REASONING_PRESET_CONFIG,
 )
 from meta_research.idea_contract import (
     DISPOSITION_ACTIONS,
@@ -34,12 +37,14 @@ from meta_research.idea_contract import (
     REVIEW_CATEGORIES,
     IdeaContractError as IdeaSkillContractError,
     accepted_evidence_refs,
+    idea_validation_evidence_refs,
     material_outcome_hash,
     validate_advisory_review,
     validate_idea_outcome,
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.research_guidance import shared_research_guidance
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES,
@@ -664,7 +669,10 @@ def _schema_may_match(value: object, schema: dict[str, object]) -> bool:
         return False
     if isinstance(value, dict):
         required = schema.get("required")
-        if isinstance(required, list) and not set(required) <= set(value):
+        # Notes were added to the provider contract after immutable legacy
+        # results existed. Decode their absent field without inserting text;
+        # new strict provider schemas still request a notes string.
+        if isinstance(required, list) and not (set(required) - {"notes"}) <= set(value):
             return False
         properties = schema.get("properties")
         if isinstance(properties, dict):
@@ -771,8 +779,6 @@ class IdeaSkillRequest:
 class IdeaSkillResult:
     reviewed_draft: dict[str, object]
     final_outcome: dict[str, object]
-    findings: tuple[dict[str, str], ...]
-    dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
     reviewer_agent_ref: str | None
@@ -829,7 +835,7 @@ def validate_idea_skill_draft(
             result.draft,
             question_ref=request.question_ref,
             context_pack_ref=request.context_pack_ref,
-            accepted_evidence_refs=accepted_evidence_refs(request.context_pack),
+            accepted_evidence_refs=idea_validation_evidence_refs(request.context_pack),
         )
     except IdeaSkillContractError as error:
         raise RecoverableIdeaSkillCandidateError(str(error)) from error
@@ -866,7 +872,7 @@ def validate_idea_skill_result(
     ):
         raise RecoverableIdeaSkillCandidateError("idea_review_mode_invalid")
 
-    evidence_refs = accepted_evidence_refs(request.context_pack)
+    evidence_refs = idea_validation_evidence_refs(request.context_pack)
     try:
         draft_hash = validate_idea_outcome(
             result.reviewed_draft,
@@ -906,14 +912,8 @@ def validate_idea_skill_result(
 
     review_payload = {
         "schema_ref": IDEA_REVIEW_SCHEMA_REF,
-        "review_mode": result.review_mode,
-        "reviewer_agent_ref": result.reviewer_agent_ref,
         "reviewed_draft_hash": draft_hash,
-        "findings": list(result.findings),
-        "dispositions": list(result.dispositions),
         "final_outcome_hash": outcome_hash,
-        "independent": False,
-        "advisory_only": True,
     }
     try:
         review_hash = validate_advisory_review(
@@ -932,14 +932,8 @@ def review_record(
 ) -> dict[str, object]:
     return {
         "schema_ref": IDEA_REVIEW_SCHEMA_REF,
-        "review_mode": result.review_mode,
-        "reviewer_agent_ref": result.reviewer_agent_ref,
         "reviewed_draft_hash": draft_hash,
-        "findings": list(result.findings),
-        "dispositions": list(result.dispositions),
         "final_outcome_hash": outcome_hash,
-        "independent": False,
-        "advisory_only": True,
     }
 
 
@@ -1078,7 +1072,7 @@ class CodexIdeaSkillAdapter:
         if callable(run_command):
             argv = [
                 self._executable,
-                *profile.codex_arguments(entry_path=entry_path),
+                *profile.codex_arguments(entry_path=entry_path, output_language=read_output_language(self._workspace)),
                 "features",
                 "list",
             ]
@@ -1664,7 +1658,7 @@ class CodexIdeaSkillAdapter:
             "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是 Idea 主 Agent。只返回 {\"outcome\": ...}，其中 outcome 是一个完整 "
             "IdeaSet 或 NoViableCandidate。"
-            "不得创建 Question、Plan、Run、receipt、selected Idea 或 StageCommit。"
+            "不得创建 Question、Plan、Run、receipt、selected Idea 或 StageCommit。v4 的证据引用页只是发现目录；可用 stage_context.read 的 evidence_index 继续读后页，在既有 evidence_boundary 中引用实际使用的精确 asset version refs（合计最多100），RG 将独立核验同 Quest 角色与内容来源。"
             f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"question_ref={request.question_ref}\n"
@@ -1672,7 +1666,7 @@ class CodexIdeaSkillAdapter:
             f"context_pack_hash={request.context_pack_hash}\n"
             f"runtime_binding={canonical_json(request.runtime_binding.as_dict())}\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
-            f"context_pack={canonical_json(request.context_pack)}"
+            f"provider_context_view={canonical_json(stage_context_view('idea', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}"
         )
         primary_output, primary_session, _primary_stdout = (
             self._invoke_root_operation(
@@ -1722,15 +1716,10 @@ class CodexIdeaSkillAdapter:
         lineage = _idea_owner_rejection_prompt(request)
         reviewer_prompt = (
             f"{skill}\n\n"
-            "本回合是同一个根 Idea Agent 的 Review phase。针对下方 exact frozen "
-            "reviewed_draft，重新检查 Question 对齐、实质重复、证据边界、可证伪性与 "
-            "Plan 可用性；这次 advisory finalization 不批准 Outcome、不评分、不选择 "
-            "winner，也不调用 Owner 写入。必须形成 bounded findings，并对每条 finding "
-            "逐条给出 revised | "
-            "not_adopted disposition，并在同一个 resumed turn 返回最终完整 Outcome。"
-            "revised 必须实际改变 Outcome；没有 finding 时返回空 findings/dispositions。"
-            "只返回 findings、final_outcome、dispositions。不得声称根 Agent 拥有 Owner "
-            "接纳权。"
+            "本回合在原根 Session 中完成独立审查后的修订。使用原生子智能体审查完整草稿和必要原文，"
+            "让它独立核查来源、推理、研究边界及后继选择。根据反馈和你的判断修订；没有发现问题也可改稿。"
+            "根负责最终研究判断和交接，子智能体使用已授予的工具与当前 fence。"
+            "审查反馈保留在原生执行记录中。只返回final_outcome 的完整内容。"
             f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"question_ref={request.question_ref}\n"
@@ -1754,13 +1743,9 @@ class CodexIdeaSkillAdapter:
         )
         if resumed_session != draft.primary_session_ref:
             raise IdeaSkillUnavailable("codex_primary_session_changed")
-        findings_value = reviewed.get("findings")
         final_value = reviewed.get("final_outcome")
-        disposition_value = reviewed.get("dispositions")
         if (
-            not isinstance(findings_value, list)
-            or not isinstance(final_value, dict)
-            or not isinstance(disposition_value, list)
+            not isinstance(final_value, dict)
         ):
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
@@ -1773,16 +1758,10 @@ class CodexIdeaSkillAdapter:
         # The structured result remains contract-validated below.  The sealed
         # stdout/ledger and verifier remain available for diagnostics, but are
         # deliberately not an acceptance gate.
-        findings = tuple(cast(dict[str, str], item) for item in findings_value)
-        dispositions = tuple(
-            cast(dict[str, str], item) for item in disposition_value
-        )
 
         result = IdeaSkillResult(
             reviewed_draft=draft.draft,
             final_outcome=cast(dict[str, object], final_value),
-            findings=findings,
-            dispositions=dispositions,
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
@@ -2287,7 +2266,7 @@ class CodexIdeaSkillAdapter:
         argv = [
             self._executable,
             "exec",
-            *capability_profile.codex_arguments(),
+            *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
             "--skip-git-repo-check",
             "--strict-config",
             "--config",
@@ -2315,7 +2294,7 @@ class CodexIdeaSkillAdapter:
             "--config",
             'approval_policy="never"',
             "--config",
-            CODEX_REASONING_EFFORT_CONFIG,
+            CODEX_ROOT_REASONING_PRESET_CONFIG,
             *(
                 (
                     "--config",
@@ -3429,8 +3408,11 @@ def _idea_skill_resources() -> dict[str, str]:
     )
     try:
         return {
-            name: resource.read_text(encoding="utf-8")
-            for name, resource in resources
+            "research-guidance.md": shared_research_guidance(),
+            **{
+                name: resource.read_text(encoding="utf-8")
+                for name, resource in resources
+            },
         }
     except (FileNotFoundError, ModuleNotFoundError) as error:
         raise IdeaSkillUnavailable("idea_skill_resource_unavailable") from error
@@ -3484,9 +3466,16 @@ def _outcome_schema(question_ref: str, context_pack_ref: str) -> dict[str, objec
         },
         "required": ["candidate_key", "direction", "rationale", "assumptions", "risks", "evidence_boundary", "falsification_hint", "material_difference"],
     }
+    # Research detail lives in free notes; legacy detailed candidates remain readable.
+    for field in ("assumptions", "risks", "falsification_hint", "material_difference"):
+        candidate["properties"].pop(field)
+        candidate["required"].remove(field)
+    candidate["properties"]["notes"] = {"type": "string"}
+    candidate["required"].append("notes")
     base = {
         "question_ref": {"type": "string", "const": question_ref},
         "context_pack_ref": {"type": "string", "const": context_pack_ref},
+        "notes": {"type": "string"},
     }
     return {
         "anyOf": [
@@ -3509,7 +3498,7 @@ def _outcome_schema(question_ref: str, context_pack_ref: str) -> dict[str, objec
                         ]
                     },
                 },
-                "required": ["kind", "question_ref", "context_pack_ref", "candidates", "recommendation"],
+                "required": ["kind", "question_ref", "context_pack_ref", "candidates", "recommendation", "notes"],
             },
             {
                 "type": "object",
@@ -3536,7 +3525,7 @@ def _outcome_schema(question_ref: str, context_pack_ref: str) -> dict[str, objec
                     "overturn_conditions": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
                     "why_plan_cannot_proceed": {"type": "string", "minLength": 1},
                 },
-                "required": ["kind", "question_ref", "context_pack_ref", "exploration_scope", "candidate_families_considered", "evidence_boundary", "overturn_conditions", "why_plan_cannot_proceed"],
+                "required": ["kind", "question_ref", "context_pack_ref", "exploration_scope", "candidate_families_considered", "evidence_boundary", "overturn_conditions", "why_plan_cannot_proceed", "notes"],
             },
         ]
     }
@@ -3555,47 +3544,5 @@ def _outcome_envelope_schema(
     }
 
 
-def _review_finalization_schema(
-    question_ref: str, context_pack_ref: str
-) -> dict[str, object]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "findings": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "finding_id": {"type": "string", "minLength": 1},
-                        "category": {
-                            "type": "string",
-                            "enum": sorted(REVIEW_CATEGORIES),
-                        },
-                        "message": {"type": "string", "minLength": 1},
-                    },
-                    "required": ["finding_id", "category", "message"],
-                },
-            },
-            "final_outcome": _outcome_schema(question_ref, context_pack_ref),
-            "dispositions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "finding_id": {"type": "string", "minLength": 1},
-                        "action": {"type": "string", "enum": sorted(DISPOSITION_ACTIONS)},
-                        "rationale": {"type": "string", "minLength": 1},
-                    },
-                    "required": ["finding_id", "action", "rationale"],
-                },
-            },
-        },
-        "required": [
-            "findings",
-            "final_outcome",
-            "dispositions",
-        ],
-    }
+def _review_finalization_schema(question_ref: str, context_pack_ref: str) -> dict[str, object]:
+    return {"type": "object", "additionalProperties": False, "properties": {"final_outcome": _outcome_schema(question_ref, context_pack_ref)}, "required": ["final_outcome"]}

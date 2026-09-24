@@ -1,12 +1,14 @@
-# Plan Stage 语义合同
+# Plan 语义契约
 
-## Invocation closure
+## 调用闭包
 
-`PlanStageRunRequest` 冻结 request、cycle、epoch、Execution Fence、runtime binding、ContextPack ref/hash、accepted Question binding/content、accepted IdeaSet binding/content 和 Evidence reference revision。Plan 只消费完整的 accepted `IdeaSet`；accepted `NoViableCandidate` 是交给 Reasoning 的负向结果，不能制造空 Plan。
+`PlanStageRunRequest` 冻结 request、Cycle、epoch、Execution Fence、运行绑定、ContextPack ref／hash、已接纳 Question 与 IdeaSet 的绑定和正文，以及证据引用版本。Plan 消费完整 `IdeaSet`；`NoViableCandidate` 交给 Reasoning，不能生成空 Plan。
 
-`AcceptedQuestionBinding` 包含精确 Question/Quest/content ref、content hash/schema 与 RM/RG receipts。`AcceptedIdeaSetBinding` 包含精确 IdeaSet ref、content ref/hash、RM/RG receipts、Idea StageCommit ref/receipt 与完整 IdeaSet data。任一 binding 不完整、receipt 无法验证或 hash 不一致时 fail closed。
+Question 绑定含精确 Question／Quest／内容 ref、hash／schema 与 RM／RG receipts。IdeaSet 绑定还含 Idea StageCommit 及完整正文。绑定缺失、receipt 不可验证或 hash 不符时保留技术阻塞。
 
 ## AnswerContract
+
+obligations 是本轮选择承担的调查责任和复盘条件，不是保证研究成功。后继 Plan 根据新证据与上轮综合重新判断；旧 Plan 保持当时不可变语义，其覆盖和 Brief 不随引用自动更新。局部开工条件仅约束真正依赖它的工作。
 
 ```text
 AnswerContract
@@ -16,19 +18,19 @@ AnswerContract
     obligation_key
     statement
     minimum_support
-    question_trace = answer_shape + unknown_statement|applicability_scope
-    idea_relevance[exactly every IdeaCandidate]
+    question_trace[1..3] = unknown_statement | answer_shape | applicability_scope
+    idea_relevance[实际有关的候选]
       idea_ref
       role = query_lens | experiment_lens | not_relevant
       rationale
   answer_contract_hash
 ```
 
-每个 obligation 必须追溯到 Question；每个 obligation 必须恰好交代完整 IdeaSet 中的每个候选。所有 `idea_ref` 逐字使用 accepted IdeaSet 的 `candidate_key`，不得添加 IdeaSet 前缀、生成新 identity 或改写 key。Idea 只能收紧证据要求、比较结构、条件或证伪边界，不能扩张 Question。`answer_contract_hash` 在使用 Evidence 前冻结。
+每项义务追溯到 Question；`idea_ref` 逐字使用已接纳 IdeaSet 的 `candidate_key`，每个引用唯一并说明影响，无关候选无需逐项列出。Idea 可细化证据、比较、条件或证伪边界，义务仍保持当前 Question 范围。`answer_contract_hash` 在使用 Evidence 前冻结。
 
-## Evidence 与 coverage
+## 证据与覆盖
 
-精确 `EvidenceRef` 绑定不可变 AssetVersion、content/manifest hash、TargetCommit root、provenance closure、capabilities、RM integrity/availability receipt 与 RG eligibility/currentness receipt。Card、preview、rank、动态 URL、mutable view、本地路径和未接纳搜索发现只用于导航。
+Target 来源的 `EvidenceRef` 绑定精确 AssetVersion、内容／manifest hash、TargetCommit、真实生产者及 RM／RG 接纳事实；有测量时保留实际评价来源，无评价工作保持 WorkProduct 来源，不补造测量。HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 采用各自精确来源绑定，详见[Owner 操作](owner-operations.md)。目录卡片、摘要、排序、动态 URL 和本地路径用于导航，不代替原文或接纳链。
 
 ```text
 EvidenceUse
@@ -45,25 +47,14 @@ CoverageDecision
   insufficiency | null
 ```
 
-每个 obligation 恰好出现一次。`covered` 至少有一个 EvidenceUse、`insufficiency = null`，并对应零个 ExperimentBrief。`gap` 必须记录 insufficiency，可以保留部分 evidence use，并至少由一个 ExperimentBrief 收口。成功的空查询可证明 gap；stale、unavailable、receipt/hash mismatch 或 outcome unknown 是技术阻塞。
+每项义务恰出现一次。`covered` 至少有一个实际 EvidenceUse，`insufficiency=null`，没有对应 Brief。`gap` 说明不足，可保留部分 evidence use，至少由一个 Brief 覆盖。明确检索范围内证据不足可支持 gap；空分页或未展示条目不证明全库不存在。来源不可用、receipt／hash 冲突和未知结果先作为技术问题处理。
 
-## ExperimentBrief 与 disposition
+## Brief 与后继
 
-ExperimentBrief 包含 Plan 内唯一 `experiment_key`、一个或多个 gap obligation keys、goal、characteristics、boundary constraints、semantic delta 与 contributing Idea refs。全部且只有 gap 必须由 Brief 覆盖。Plan 不形成 Target identity/spec、DAG、文件计划、Worker、Provider、资源或调度。
+每个 Brief 有 Plan 内唯一 `experiment_key`、一个或多个 gap obligation keys、goal、characteristics、boundary constraints、semantic delta 和实际 Idea 来源。全部且只有 gap 需被 Brief 覆盖。Plan 不形成 Target 身份、执行 DAG、Worker 或调度。
 
-Disposition 只按内容派生：
+全部 covered 且无 Brief → `no_new_experiment_required`；存在 gap 且均有 Brief → `experiments_required`。前者只给 Bundle skip 候选，由 AE 核验后形成 `StageCommit(Skipped)`。
 
-```text
-all obligations covered + no briefs -> no_new_experiment_required
-any gap + every gap covered by briefs -> experiments_required
-```
+## 接纳交接
 
-无 gap 只产生 Bundle skip basis candidate；Advancement Engine 决定是否形成 Bundle `StageCommit(Skipped)`。Plan Skill 不创建 Bundle Run。
-
-## Advisory review
-
-Owner 保存 primary draft 后，根 Agent 在同一 managed native Session 的第二个 provider turn 对 exact frozen closure 与 draft 执行 advisory finalization。记录 `review_mode = advisory_unobserved`、`reviewer_agent_ref = null`、`independent = false`、reviewed draft hash、findings、每条 finding 唯一的 `revised | not_adopted` disposition 与 final Plan hash。该 turn 没有 RM/RG/AE authority；有 `revised` 当且仅当最终 Plan 实质改变。
-
-## Accepted handoff
-
-Research Memory 先接受不可变 PlanDocument；Research Graph 再形成 FormalPlan identity 与接受/拒绝 receipt。RM accepted 而 RG rejected 时保留未绑定内容，并在同一根 Session 中按正式 feedback 形成新 content identity。只有精确的 RM receipt、RG receipt、AR execution receipt 与当前 AE request/epoch 同时可验证时，AE 才能提交 Plan StageCommit。
+独立审阅按[主 Skill](../SKILL.md)执行。RM 保存不可变 PlanDocument，RG 接纳为 FormalPlan 或返回结构反馈。RM 已接纳而 RG 拒绝时保留该内容，在同一根 Session 修订成新内容身份。RM／RG／AR receipts 与当前 AE request／epoch 均可验证后，由 AE 提交 StageCommit。

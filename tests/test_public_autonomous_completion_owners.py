@@ -228,6 +228,7 @@ def test_hc_autonomous_context_is_idempotent_restart_safe_and_receipted(
             human.form_autonomous_question_proposal(
                 str(prepared["context_ref"]),
                 literature_snapshot_ref="literature-snapshot:not-accepted",
+                candidate=None,  # A missing exact snapshot rejects before candidate use.
                 idempotency_key="hc-autonomous-proposal",
             )
         assert unavailable_snapshot.value.code == (

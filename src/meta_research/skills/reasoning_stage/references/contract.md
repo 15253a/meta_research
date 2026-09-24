@@ -1,12 +1,14 @@
-# Reasoning Stage 生产语义合同
+# Reasoning 语义契约
 
-## Invocation closure
+## 调用闭包
 
-`ReasoningSkillRequest` 绑定 current StageRunRequest、Run、Attempt、Fence、root Session、Cycle、Question、Quest、Goal revision、Foreground epoch、ContextPack ref/hash、完整 frozen evidence closure 与 ReasoningRuntimeBinding。ContextPack 保持 AE 签发的 accepted Question binding、`QuestionLiteratureRevision | none`、Idea→Plan→Bundle StageCommit closure、`Plan evidence | none`、accepted TargetCommit closures 和 research context。Accepted Plan evidence 恰含 FormalPlan binding、原样 `evidence_reuse_set` 与逐 EvidenceRef 的 `EvidenceReuseLeaf/v1`；每个 leaf 绑定 exact catalog entry/use hashes、MetricResult、EvaluationAttempt、TargetCommit 以及 RM asset、RG role/formal-measurement/TargetCommit receipts。
+`ReasoningSkillRequest` 绑定当前 StageRunRequest、Run、Attempt、Fence、根 Session、Cycle、Question、Quest、Goal revision、epoch、ContextPack ref／hash、冻结证据和运行绑定。ContextPack 包含已接纳 Question、文献版本或 none、Idea→Plan→Bundle StageCommit、Plan 证据或 none、TargetCommit 及研究上下文。
 
-Adapter 在启动 provider 前验证静态 identity/hash/closure；provider 必须通过 scoped Semantic MCP 重新观察 current AR/AE scope。未知 currentness 不等于 current。
+Plan 复用保持精确 FormalPlan 和原样 `evidence_reuse_set`，各 `EvidenceReuseLeaf/v1` 绑定 catalog entry／use hashes 与真实来源：测量叶保留实际 MetricResult、EvaluationAttempt、Run／Commit 及 RM／RG receipts；无评价 WorkProduct 保留真实 Run／Commit，不补 EvaluationAttempt；HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 使用各自核实的 `source_binding`，不强加 Target 测量身份。
 
-## Closed output
+adapter 先核验静态 identity／hash／closure，provider 通过获授 scoped MCP 核实当前 AR／AE 范围。未知 currentness 不能当作 current。
+
+## 封闭输出
 
 顶层恰含：
 
@@ -17,34 +19,24 @@ next_cycle_proposal: NextCycleProposal | null
 candidate_completion: CandidateCompletion | null
 ```
 
-后二者恰有一项非 null。ScientificOutcomeCandidate 与 transition 都绑定同一个 source StageRunRequest、Cycle、Question、Quest、Foreground epoch 和 scientific outcome identity，并且 `is_authoritative=false`。
+后两项恰好一项非 null。科学结果与 transition 绑定同一 request、Cycle、Question、Quest、epoch 和 outcome identity，`is_authoritative=false`。
 
-Scientific evidence citation 恰含 `kind + ref + finding`，只能引用 frozen closure 中同 ref、同角色的 leaf。Plan reuse 引用 leaf 内 `metric_result_ref`，不能引用 EvidenceRef、AssetVersion 或诊断 receipt。`affirmed | denied | uncertain` 至少有 LiteratureRecord 或 MetricResult；诊断资产不能替代它们。disposition 的 claim／missing／uncertainty 形状由 `reasoning_contract.py` 的公开 closed validator 统一裁决。
+每项科学引用恰含 `kind + ref + finding`，引用冻结闭包、Plan 精确复用或同 Quest 可核验历史。Owner 逐条检查精确版本、范围和来源；引用类别、数量和是否测量不预设科研资格。纯理论可零外部引用，仍说明推导和局限。disposition 对 claim、missing 和 uncertainty 的具体形状由当前 `reasoning_contract.py` 校验。
 
-ScientificOutcome 还闭合 `support_scope`、`limitations`、`causal_interpretation` 和四尺度 `research_synthesis`。AE 冻结 RG public issuer seam 返回的 graph revision、active Question refs、完整 parent chain 与 current Question 的 prior accepted outcomes，并同时冻结 current Cycle、Quest Goal revision、三项 upstream StageCommit 及 Target causality refs。provider schema 固定这些 identity/集合；RM 与 RG 都用同一 validator 重验，禁止在恢复时改读 latest。
+`support_scope`、`limitations`、`causal_interpretation` 和四尺度 `research_synthesis` 表达认识和继续／改变／等待理由，允许认识未变。AE 冻结 graph revision、活动问题、父链、当前 Question 历史页、Goal revision、上游 Commit 和 Target 来源；有界历史页含总量与继续入口，不代表完整历史。正文按当前冻结版本核验，恢复不切换 latest。
 
-`NextCycleProposal/v1` 还必须闭合 `entry_stage = idea | plan | bundle | reasoning` 与 `typed_skip_basis_refs_by_stage`：map 的 key 恰好是 entry 之前的 Stage，每个 value 是非空、去重的 typed basis ref 列表。最终 proposal 的 route 必须逐项复用 Autonomous checkpoint 已审查的 route；RG 在接纳 transition 时重验 target Question 的 issuer-owned Anchor、present/open facts 与每个 basis。Reasoning scientific outcome 只授权 autonomous absent-input skip；不能替代目标 Question 的 AcceptedIdeaSet 或 FormalPlan。
+## NextCycleProposal
 
-## Closed review
+`entry_stage=idea | plan | reasoning`。`typed_skip_basis_refs_by_stage` 恰覆盖入口前的阶段，每项为非空去重依据：idea 无 skip；plan 用已接纳 IdeaSet 覆盖 Idea；reasoning 的 Idea、Plan、Bundle 三项均为 `[source ScientificOutcome outcome_ref]`，由 AE 形成 absent-input skip Commit，不复用旧 Plan／Bundle。Bundle 不是合法后继入口。
 
-Review response 恰含 schema ref、findings、完整 final output 与 dispositions。持久化 review 使用 `advisory_unobserved`、null reviewer 与 `independent=false`。每条 finding 恰有一条同 id disposition；`revised` 当且仅当 final output hash 与 reviewed draft hash 不同。Review advisory-only，不能批准科学语义。
+RG 在 transition 接纳时重验 QuestionAnchor、present／open 和各依据。ScientificOutcome 只支持上述 absent-input skip，不替代目标 Question 的 IdeaSet 或 FormalPlan。自主创建取得新信息后可重新决定目标、入口及 skip，仍按实际已接纳资产验证。
 
-## Fail-closed matrix
+## 独立审阅与技术边界
 
-| 观察 | 结果 |
-| --- | --- |
-| 无 resident MCP authority/endpoint/credential | provider 前停止 |
-| full-conformance 缺任一 Reasoning operation | provider 前停止 |
-| channel operation binding 缺失或与 catalog 不同 | provider 前停止 |
-| `reasoning_stage_run.observe` 缺失或不是 read/verify | provider 前停止 |
-| 任一未来 effect 缺 matching reconcile binding | effect 前停止；本版本不授予 Agent-callable effect |
-| provider trace 未先观察 currentness，或未完成三项 read | 不接纳 provider output |
-| ContextPack/evidence hash、source binding 或 closed schema 不一致 | 不形成 Skill result |
-| primary/review native Session 改变或第二个 provider turn 不闭合 | 不形成 Skill result |
-| durable provider outcome unknown | 保留原 operation/channel 进入 reconciliation，不重放 |
+审阅按[主 Skill](../SKILL.md)执行。权限以当前 catalog 及配对 reconcile 为准，primary／review 名称不额外收窄已授 Dataset 效果。缺 scoped authority／endpoint／credential、必要操作或相应绑定时，在相应执行前保留技术阻塞；内容 hash、source binding、封闭 schema 或 native Session 不一致时不形成有效交接。未知 provider 结果对账原 operation，不重放。
 
-技术 blocker 不得重写成 `insufficient_evidence`。后者只表示所有冻结输入均有效且终态，但科学覆盖仍不足。
+技术问题不改写为 `insufficient_evidence`；该 disposition 只描述来源可核验时科学支持仍不足。
 
-## Prototype Delta
+## AutonomousCreation 与恢复
 
-固定 commit `f2d3f3f0d77a6f50ab535d50d6d404a525c09757` 的 fixture 使用了开放式 synthesis、causal interpretation、selection facts 与 fake semantic ports 来验证行为。生产实现保留其科学语义，但把 synthesis/causal 字段收敛为 `reasoning_contract.py` 已版本化的 closed ScientificOutcome，并把每个尺度绑定到 AE 冻结、RG issuer-verified 的 context；AE/RM/RG 三项真实 read 替代 fake currentness；同一 native root Session 的第二个 advisory finalization turn 替代 fixture reviewer session。AutonomousCreation 的高层 effect 与 Quest-ending 写链由对应 Owner/daemon 独立完成，Reasoning adapter 只在拿到已接纳 QuestionAnchor 后输出 NextCycleProposal，也不把部分 creation state 暴露成第二分支。
+初始 AR checkpoint 保存执行草稿和 hash；DeepFetch summary 接纳后，同一 native Session 读回并决定 create／decline，failed／cancelled 无 summary 时还可 retry。create 修订后才接纳唯一 ScientificOutcome，再经 HC／RM／AE／RG 创建 Question 并挂文献；decline 直接完成普通综合。最终同一 Session 可选择当前、已有或新 Question。原 checkpoint、科学内容、DeepFetch 尝试及决定不可变，重启按已有事实继续，不重复 summary、候选或 Question。

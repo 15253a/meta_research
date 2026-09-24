@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.context_presentation import stage_context_view
+
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
 
 from dataclasses import dataclass, replace
@@ -242,6 +244,7 @@ class BundleSkillRequest:
     owner_rejection_kind: str | None = None
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
+    provider_feedback: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -291,6 +294,7 @@ class BundleDispatchRequest:
     runtime_binding: BundleRuntimeBinding
     inbox_checkpoint: dict[str, object]
     job_ref: str | None = None
+    provider_feedback: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -323,6 +327,7 @@ class BundleTargetBatchRequest:
     runtime_binding: BundleRuntimeBinding
     inbox_checkpoint: dict[str, object]
     job_ref: str | None = None
+    provider_feedback: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -389,13 +394,6 @@ def validate_bundle_dispatch_result(
         for item in request.frontier
         if item.get("target_ref") == result.selected_target_ref
     ]
-    dispatchable = [
-        item
-        for item in request.frontier
-        if item.get("dispatch_allowed", True) is True
-    ]
-    if dispatchable and result.action != "dispatch":
-        raise BundleSkillContractError("bundle_dispatch_requires_authoritative_blocker")
     if (
         result.action not in {"dispatch", "wait", "replan_required"}
         or (
@@ -1274,31 +1272,48 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
+            f"{_provider_correction_prompt(request.provider_feedback)}\n"
             f"{human_resume}"
-            "本回合仅执行 Primary draft phase。根据内容复杂度可选使用 "
-            "collaboration；child 仅能返回 advisory material，不获得 Owner "
-            "authority，也不以 child 数量、拓扑、顺序或本回合未使用 "
-            "collaboration 判定成败。返回 frozen TargetPlan 或 exhaustion "
-            "assessment。TargetPlan 由 "
-            "Skill 结构/domain validator 接纳，不再要求第二个 completion wrapper；"
-            "exhaustion assessment 直接进入 Owner inventory/frontier/currentness 重验。"
+            "本回合形成可提交的 TargetPlan 或 exhaustion_assessment。普通研究、检索、"
+            "整理和实施任务按需要委派；子智能体在明确授予的任务范围内使用当前 catalog "
+            "与 fence 完成操作，根负责最终判断、核实及交接，正式接纳由 Owner 负责。"
+            "返回前按 Skill 完成独立审阅：委派原生独立子智能体检查完整候选和必要原文，"
+            "取得自由格式反馈后由根核对并自主修订；同根自查不替代独立审阅。"
+            "反馈保留在原生执行记录中，不要求审查表单、固定反馈数量或审阅者身份证明。"
+            "返回冻结后的完整候选；此后系统沿 Owner 接纳流程核验，不另设模型审阅回合。"
+            "TargetPlan 由结构与领域校验器核验；exhaustion_assessment 另由 Owner "
+            "重验工作清单、frontier 和当前有效性。"
             '你是 Bundle 根 Agent。返回且只返回下列两个闭合分支之一：'
             '{"target_plan": ...} 的 formal v3，或固定合同中的 '
             '{"exhaustion_assessment": ...}。不得同时返回、混合或扩展两分支。'
             "target_plan 分支必须是 formal v3："
-            "直接序列化完整 NormalizedCompletionContract 与 initial StrategyUpdate，"
-            "不得输出 legacy v2 targets/gap-count 切片。先从全部 ExperimentBrief 的 "
+            "直接序列化完整 NormalizedCompletionContract 与初始 StrategyUpdate。"
+            "先从全部 ExperimentBrief 的 "
             "Goal、Characteristics、BoundaryConstraints、SemanticDelta 与 "
             "required_measurement_unit_keys 冻结所有 measurement completion cells；候选列表"
-            "不能反向缩小这份合同。每个 formal TargetCandidate 必须恰含一个 cell、完整 "
-            "reuse tier/source/version/content/license/patch/eligibility（按层级适用）、"
+            "不能反向缩小这份合同。每个 formal TargetCandidate 必须恰含一个 cell、"
+            "精确 implementation_revision_ref（声明实际采用的材料及其用途与实际修改；"
+            "外部来源、license 与使用限制由 research_memory.implementation_content "
+            "内容 receipt 携带）、"
             "held-fixed slot revision、语义保持 route、真实 dependency/direct accepted asset "
             "refs。canonical TargetCandidate 本体不扩展；"
             "formal wrapper 另以必填 risk_class=normal|high 冻结 Owner admission metadata，"
             "缺失或未知风险必须 fail closed，绝不能默认 normal。"
             "同一 formal wrapper 还必须冻结完整纯领域 measurement_contract，且其 "
             "ExperimentKeys 与唯一 measurement cell 必须和 canonical candidate exact 一致。"
-            "合同完整携带 baseline forward、variant recipe、evaluation protocol lineage，"
+            "baseline_forward_contract 表达稳定研究方法和输入到产出语义；"
+            "先用 research_graph.baselines.page 检索，并按需用 baselines.read 读取候选的完整方法；"
+            "复用时该字段提交 {baseline_ref: 已读取的精确引用}。新方法提交 "
+            "{method_key: 稳定方法名, method_version: 明确版本, method_contract: 稳定方法含义与输入输出约定}。"
+            "同一名称和版本的内容哈希只校验一致性，不能用备注改写原版本或依语义相似自动合并。"
+            "本次数据版本、上游 Commit、临时路径与实现放在 run_bindings 或正式执行输入绑定，"
+            "研究解释放 notes/研究说明资产，均不要放入 method_contract；改变这些信息不新增 Baseline。"
+            "Variant recipe 保留具体方法与参数配方；ProtocolVersion 保留评价规则与指标定义。"
+            "implementation 可为非代码方法材料，required_metrics 可表达定性判据；纯报告评价可为空，"
+            "由实际 EvaluationAttempt 保存检查报告。下载与整理数据可作为 Target 的实际研究工作，"
+            "Baseline/Variant 描述来源与获取/处理方法，VariantRun 保存实际工作与数据产物。"
+            "按真实研究方法声明湿实验、数据、文字、辅助材料、分析或推导，不预设模型训练。"
+            "合同完整携带 baseline 方法、variant 方法配方、evaluation protocol lineage，"
             "以及包含 evaluation data、split、preprocessing 的 ProtocolVersion candidate；"
             "required/optional ordered Metric definitions 必须按声明顺序逐项携带 MetricKey "
             "与非空完整 definition，"
@@ -1306,10 +1321,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "rule ref 与完整 rule content，无 parts 则禁止 aggregation。每条 preregistered stop "
             "rule 同样冻结 ref 与完整 content，并冻结 checkpoint policy、result schema ref 与完整"
             " result schema content。这四类领域文档和规则不得在根层携带 provider、adapter、"
-            "image、command 或 execution 路由。微型均值 runner 只是兼容样例，不是 Target "
-            "类型，也不是正式 Bundle 合同。TargetPlan 不选择 provider、adapter "
-            "或 execution payload；实际执行只能由后续 TargetRun 根 Agent 在代码、自检、"
-            "fresh child code review 与 Owner admission 后调用单一通用执行端口。"
+            "image、command 或 execution 路由。TargetPlan 不选择 provider、adapter "
+            "或 execution payload；后续 TargetRun 根 Agent 根据冻结执行合同与既有授权，"
+            "自主获取材料、实现、自检、使用已授权原生工具运行，并提交可核验结果。"
             "当前 initial StrategyUpdate revision=1、"
             "requires_accepted_labels=[]、candidates 非空；若该批已精确覆盖全部 frozen "
             "cells，可在同一 update 令 strategy_complete=true，否则为 false。后续同样可在"
@@ -1344,7 +1358,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"{canonical_hash(list(request.predecessor_rejections))}\n"
             "predecessor_rejections="
             f"{canonical_json(list(request.predecessor_rejections))}\n"
-            f"plan_document={canonical_json(request.plan_document)}"
+            f"provider_context_view={canonical_json(stage_context_view('bundle', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}"
         )
         output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
             run_ref=request.run_ref,
@@ -1501,12 +1515,17 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         target_refs = tuple(cast(str, item["target_ref"]) for item in request.frontier)
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
+            f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续使用当前 Bundle 根 Session。先读取这次 durable frontier 与 "
             "TargetCommit/blocker 摘要，再自主选择下一项可调度 Target。选择体现当前 "
             "优先级、依赖、已实现结果与局部阻塞；不得把 Agent tree 当成 Target DAG，"
-            "不得选择 frontier 之外的 Target，也不得伪造 Owner receipt。有可执行 "
-            "Target 时返回 dispatch；只有技术/授权等待返回 wait；只有冻结语义确需 "
-            "改变才返回 replan_required。frontier 中的高风险 Target 若 "
+            "选择 frontier 内有当前启动权限且值得投入的 Target 时返回 dispatch。"
+            "需要等待证据、依赖或重新评估研究优先级时可返回 wait，并在 rationale "
+            "说明等待条件；技术可启动不代表研究上必须立即启动。冻结语义确需 "
+            "改变时返回 replan_required，说明已有证据与需由后继 Cycle 承接的修订，"
+            "并在这次终态交接前委派原生独立子智能体审阅完整判断和必要原文，根根据"
+            "自由格式反馈自主修订；同根自查不替代独立审阅。"
+            "保留真实 Owner receipt。frontier 中的高风险 Target 若 "
             "dispatch_allowed=false，它是本次 Bundle 根 Agent 的授权协作义务，"
             "不是可调度 Target。human_request_status=not_open 时，必须原样使用 "
             "human_request_command.semantic_operation_id 和 arguments 调用 resident semantic "
@@ -1521,6 +1540,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"run_ref={request.run_ref}\n"
             f"attempt_ref={request.attempt_ref}\n"
             f"fence_ref={request.fence_ref}\n"
+            f"root_session_ref={request.root_session_ref}\n"
+            f"runtime_binding_hash={canonical_hash(request.runtime_binding.as_dict())}\n"
             f"graph_ref={request.graph_ref}\n"
             f"generation={request.generation}\n"
             f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
@@ -1602,6 +1623,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "run_ref": request.run_ref,
             "attempt_ref": request.attempt_ref,
             "fence_ref": request.fence_ref,
+            "root_session_ref": request.root_session_ref,
+            "runtime_binding_hash": canonical_hash(request.runtime_binding.as_dict()),
             "graph_ref": request.graph_ref,
             "formal_plan_ref": request.formal_plan_ref,
             "context_pack_ref": request.context_pack_ref,
@@ -1618,15 +1641,23 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "formal_plan": request.plan_document,
             "current_targets": list(request.current_targets),
             "target_commits": list(request.target_commits),
+            "provider_feedback": request.provider_feedback,
         }
         prompt = (
             f"{_bundle_skill_instructions()}\n\n"
+            f"{_provider_correction_prompt(request.provider_feedback)}\n"
             "继续使用同一个 Bundle 根 Session。当前 batch 的全部 Target 已形成正式 "
             "TargetCommit。基于冻结 FormalPlan、当前 append-only Target 集和真实 commit "
             "closure，直接返回下一份 FormalStrategyUpdate。若仍需新的独立 measurement "
             "closure，update.candidates 非空且通常 strategy_complete=false；若该追加批次"
             "恰好补齐 immutable NormalizedCompletionContract 的全部 cells，可在同一非空 "
             "update 原子 seal；空 candidates 只允许作为 complete=true 的最终 seal。"
+            "普通研究任务按需要委派；新的重要策略按 Skill 审阅。无论是否追加候选，"
+            "最终封口前都委派原生独立子智能体审阅完整策略、已接纳结果和必要原文，"
+            "根根据自由格式反馈核对并自主修订，同根自查不替代独立审阅。"
+            "资产整理可由子智能体在明确授予的范围与当前 fence 内完成，根按 Skill "
+            "独立读回所登记版本及关系。审阅反馈保留在原生执行记录中，"
+            "返回字段遵循当前 schema。"
             "revision 必须恰为当前 revision+1；"
             "requires_accepted_labels 只引用真实已接纳 label，并同时进入每个自适应候选的 "
             "depends_on_labels。不得改写旧 Target/Commit，不得把 Agent tree 当 Target DAG，"
@@ -1635,8 +1666,8 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "preprocessing、parts 与完整 aggregation rule、完整 preregistered stop rules、"
             "checkpoint policy 及 result schema 均不可缩水、改成名字列表或换成运行时路由。"
             "不得编造 Owner ref，也不得在 TargetPlan 中选择 provider/adapter 或伪造"
-            "execution operation；后续 TargetRun 只能在 Owner 接受 exact implementation "
-            "revision 后调用单一通用执行端口。\n"
+            "execution operation；Target 按系统提供的冻结执行合同与现有授权，"
+            "自主实现、获取材料、自检、运行并提交可核验的结果。\n"
             f"canonical_batch_context={canonical_json(prompt_context)}"
         )
         if len(prompt.encode("utf-8")) > BUNDLE_TARGET_BATCH_PROMPT_MAX_BYTES:
@@ -1644,18 +1675,25 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         if not bundle_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
         operation_name = f"target-batch-{request.base_generation + 1}"
-        output, session_ref, _stdout = self._invoke_with_resident_mcp(
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding,
-            operation_name=operation_name,
-            prompt=prompt,
-            schema=_target_batch_schema(request),
-            native_session_ref=request.native_session_ref,
-            job_ref=request.job_ref,
-        )
+        try:
+            output, session_ref, _stdout = self._invoke_with_resident_mcp(
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                runtime_binding=request.runtime_binding,
+                operation_name=operation_name,
+                prompt=prompt,
+                schema=_target_batch_schema(request),
+                native_session_ref=request.native_session_ref,
+                job_ref=request.job_ref,
+            )
+        except BundleSkillUnavailable as error:
+            if error.code == "codex_operation_identity_conflict":
+                from meta_research.bundle_dispatch_recovery import recover_rejected_target_batch
+
+                recover_rejected_target_batch(self, request, operation_name)
+            raise
         strategy_update = output.get("strategy_update")
         rationale = output.get("rationale")
         if (
@@ -1692,6 +1730,17 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         return result
 
 
+def _provider_correction_prompt(feedback: dict[str, object] | None) -> str:
+    if not feedback:
+        return ""
+    return (
+        "上一份输出未被接纳。继续当前 native Session，结合保留的上一份输出和下列 "
+        "Owner 反馈作局部修正，保留已接纳的 Target/Commit 与冻结研究合同。"
+        "修复事实或引用，不通过改称已完成来避开失败。\n"
+        f"provider_correction_feedback={canonical_json(feedback)}"
+    )
+
+
 def _bundle_skill_resources() -> dict[str, str]:
     package = files("meta_research.skills.bundle_stage")
     resources = (
@@ -1703,8 +1752,11 @@ def _bundle_skill_resources() -> dict[str, str]:
         ),
     )
     try:
+        from .research_guidance import shared_research_guidance
+
         return {
-            name: resource.read_text(encoding="utf-8") for name, resource in resources
+            "research-guidance.md": shared_research_guidance(),
+            **{name: resource.read_text(encoding="utf-8") for name, resource in resources},
         }
     except (FileNotFoundError, ModuleNotFoundError) as error:
         raise BundleSkillUnavailable("bundle_skill_resource_unavailable") from error
@@ -2100,6 +2152,7 @@ def _target_plan_schema(
         "properties": {
             "schema_ref": {"const": TARGET_PLAN_SCHEMA_REF},
             "kind": {"const": "TargetPlan"},
+            "notes": {"type": "string"},
             "formal_plan_ref": {"const": request.formal_plan_ref},
             "context_pack_ref": {"const": request.context_pack_ref},
             "completion_contract": _normalized_completion_contract_schema(request),
@@ -2129,6 +2182,7 @@ def _target_plan_schema(
         "required": [
             "schema_ref",
             "kind",
+            "notes",
             "formal_plan_ref",
             "context_pack_ref",
             "completion_contract",
@@ -2237,8 +2291,10 @@ def _formal_strategy_update_schema(
             },
             "requires_accepted_labels": _ref_array_schema(min_items=0),
             "strategy_complete": {"type": "boolean"},
+            "notes": {"type": "string"},
         },
         "required": [
+            "notes",
             "schema_ref",
             "revision",
             "candidates",
@@ -2280,7 +2336,6 @@ def _formal_target_candidate_schema(
                     },
                     "implementation_revision_ref": text,
                     "code_changed": {"type": "boolean"},
-                    "reuse_trace": _reuse_trace_schema(),
                     "routes": {
                         "type": "array",
                         "minItems": 1,
@@ -2299,7 +2354,6 @@ def _formal_target_candidate_schema(
                     "held_fixed_bindings",
                     "implementation_revision_ref",
                     "code_changed",
-                    "reuse_trace",
                     "routes",
                     "depends_on_labels",
                     "direct_accepted_input_asset_refs",
@@ -2347,6 +2401,7 @@ def _measurement_contract_schema() -> dict[str, object]:
             "checkpoint_policy": {
                 "type": "string",
                 "enum": ["forbidden", "optional", "required"],
+                "description": "既有保存建议；Target Agent 按研究价值、未来复用与存储成本自主选择实际保存的状态与粒度。",
             },
             "result_schema_ref": _ref_schema(),
             "result_schema": _domain_document_schema(),
@@ -2378,7 +2433,7 @@ def _protocol_version_candidate_schema() -> dict[str, object]:
             "preprocessing": _domain_document_schema(),
             "required_metrics": {
                 "type": "array",
-                "minItems": 1,
+                "minItems": 0,
                 "maxItems": 64,
                 "uniqueItems": True,
                 "items": _metric_definition_schema(),
@@ -2476,115 +2531,6 @@ def _route_schema() -> dict[str, object]:
             "known_external_operation_refs": _ref_array_schema(min_items=0),
         },
         "required": ["route_ref", "known_external_operation_refs"],
-    }
-
-
-def _reuse_trace_schema() -> dict[str, object]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "tier_decisions": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 5,
-                "uniqueItems": True,
-                "items": _reuse_tier_decision_schema(),
-            },
-            "greenfield_exception": {
-                "anyOf": [
-                    {
-                        "type": "string",
-                        "enum": [
-                            "simple-implementation",
-                            "implementation-is-semantic-delta",
-                        ],
-                    },
-                    {"type": "null"},
-                ]
-            },
-        },
-        "required": ["tier_decisions", "greenfield_exception"],
-    }
-
-
-def _reuse_tier_decision_schema() -> dict[str, object]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "tier": {
-                "type": "string",
-                "enum": [
-                    "accepted-local",
-                    "related-history",
-                    "global-baseline-pool",
-                    "mature-external",
-                    "self-implementation",
-                ],
-            },
-            "disposition": {
-                "type": "string",
-                "enum": ["selected", "rejected", "not_found", "not_applicable"],
-            },
-            "reason_ref": _ref_schema(),
-            "source_proofs": {
-                "type": "array",
-                "uniqueItems": True,
-                "items": _reuse_source_proof_schema(),
-            },
-        },
-        "required": ["tier", "disposition", "reason_ref", "source_proofs"],
-    }
-
-
-def _reuse_source_proof_schema() -> dict[str, object]:
-    optional_ref = {"anyOf": [_ref_schema(), {"type": "null"}]}
-    optional_binding = {
-        "anyOf": [_content_binding_schema(), {"type": "null"}]
-    }
-    optional_receipt = {"anyOf": [_receipt_schema(), {"type": "null"}]}
-    properties = {
-        "source_ref": _ref_schema(),
-        "exact_version_ref": _ref_schema(),
-        "implementation_revision_ref": _ref_schema(),
-        "eligible_tier": {
-            "type": "string",
-            "enum": [
-                "accepted-local",
-                "related-history",
-                "global-baseline-pool",
-                "mature-external",
-                "self-implementation",
-            ],
-        },
-        "verification_receipt": _receipt_schema(),
-        "implementation_binding": _content_binding_schema(),
-        "implementation_acceptance_receipt": _receipt_schema(),
-        "eligibility_anchor_ref": optional_ref,
-        "eligibility_binding": optional_binding,
-        "eligibility_receipt": optional_receipt,
-        "license_ref": optional_ref,
-        "content_hash_ref": optional_ref,
-        "patch_ref": optional_ref,
-    }
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": properties,
-        "required": list(properties),
-    }
-
-
-def _content_binding_schema() -> dict[str, object]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "subject_ref": _ref_schema(),
-            "content_hash_ref": _sha256_schema(),
-        },
-        "required": ["subject_ref", "content_hash_ref"],
     }
 
 

@@ -43,12 +43,15 @@ function SpectrumChart({ current }: { current: SpectrumStage | null }) {
   </svg>;
 }
 
-export function SpectrumStages({ current, labels, onSelect, compact = false, stale = false }: {
+export function SpectrumStages({ current, labels, onSelect, compact = false, stale = false, stageContent, selected, onResult }: {
   current: SpectrumStage | null;
   labels?: Partial<Record<SpectrumStage, string>>;
   onSelect?: (stage: SpectrumStage) => void;
   compact?: boolean;
   stale?: boolean;
+  stageContent?: (stage: SpectrumStage) => ReactNode;
+  selected?: SpectrumStage | null;
+  onResult?: (stage: SpectrumStage) => void;
 }) {
   return <section className={`research-spectrum${compact ? " is-compact" : ""}`} aria-label="研究光谱">
     <div className="spectrum-caption"><span>RESEARCH SPECTRUM <i /> 研究光谱</span><small>四个阶段 · 随研究推进</small></div>
@@ -60,6 +63,11 @@ export function SpectrumStages({ current, labels, onSelect, compact = false, sta
         <span className="spectrum-stage-name">{stage.name}<span aria-hidden="true">↗</span></span>
         <span className="spectrum-stage-label">{stage.label}</span><span className="spectrum-stage-description">{stage.description}</span></>;
       const props = { className: "spectrum-stage", "data-stage": stage.id, "data-current": active, "aria-current": active ? "step" as const : undefined, "aria-label": `${stage.name} · ${stage.label}，${label}` };
+      if (stageContent) return <div key={stage.id} {...props} className="spectrum-stage has-root-sessions" data-selected={selected === stage.id}>
+        <button type="button" className="spectrum-stage-open" aria-label={props["aria-label"]} aria-pressed={selected === stage.id} onClick={() => onSelect?.(stage.id)}>{content}</button>
+        {stageContent(stage.id)}
+        {onResult ? <button type="button" className="spectrum-stage-result" onClick={() => onResult(stage.id)} aria-label={`查看 ${stage.name} 结果与历史`}>查看结果 ↗</button> : null}
+      </div>;
       return onSelect ? <button key={stage.id} type="button" {...props} onClick={() => onSelect(stage.id)}>{content}</button>
         : <a key={stage.id} {...props} href={`/?workspace=1&stage=${stage.id}`}>{content}</a>;
     })}</nav>

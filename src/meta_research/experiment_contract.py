@@ -35,6 +35,7 @@ class ProtocolExperimentIntent:
     evaluation_protocol_lineage: dict[str, object]
     protocol_version: dict[str, object]
     execution: dict[str, object]
+    # Preserve the accepted planning preference; output retention is Agent-owned.
     checkpoint_policy: Literal["forbidden", "optional", "required"]
     request_kind: Literal["new_variant", "remeasure"] = "new_variant"
     source_variant_run_ref: str | None = None
@@ -82,8 +83,6 @@ class ProtocolExperimentIntent:
         else:
             if not self.source_variant_run_ref:
                 raise OwnerConflict("experiment_source_variant_run_required")
-            if self.checkpoint_policy != "forbidden":
-                raise OwnerConflict("experiment_checkpoint_policy_invalid")
         if (
             self.source_variant_run_ref is not None
             and len(self.source_variant_run_ref) > 96
@@ -114,7 +113,6 @@ class ProtocolExperimentIntent:
         optional = self.protocol_version.get("optional_metrics", [])
         if (
             not isinstance(required, list)
-            or not required
             or len(required) > 64
             or not all(
                 isinstance(value, str) and bool(value.strip()) and len(value) <= 128

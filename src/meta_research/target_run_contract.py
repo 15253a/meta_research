@@ -13,9 +13,7 @@ import hashlib
 from collections.abc import Sequence
 
 from meta_research.bundle_completion import (
-    reuse_trace_audit_refs,
     verify_candidate,
-    verify_reuse_trace,
 )
 from meta_research.bundle_protocol import (
     ALLOWED_BUNDLE_ESCALATION_SCOPES,
@@ -294,10 +292,6 @@ def validate_target_run_activation_scope(
         _fail("FormalPlan repeats an ExperimentKey")
     try:
         verify_candidate(candidate, briefs_by_key)
-        verify_reuse_trace(
-            candidate.reuse_trace,
-            candidate.implementation_revision_ref,
-        )
     except ValueError as error:
         raise TargetRunContractError(
             "Target candidate is invalid for the FormalPlan"
@@ -365,25 +359,12 @@ def validate_target_run_activation_scope(
         or initial_review_scope.semantic_deltas != expected_semantic_deltas
         or initial_review_scope.held_fixed_bindings != candidate.held_fixed_bindings
         or initial_review_scope.accepted_input_refs != expected_inputs
-        or initial_review_scope.reuse_provenance_refs
-        != tuple(sorted(reuse_trace_audit_refs(candidate.reuse_trace)))
     ):
         _fail("initial review scope drifted Candidate, FormalPlan, or accepted inputs")
     if accepted_input_asset_refs != tuple(
         sorted(candidate.direct_accepted_input_asset_refs)
     ):
         _fail("accepted input assets differ from the complete Target candidate")
-    selected_sources = tuple(
-        source
-        for decision in candidate.reuse_trace.tier_decisions
-        if decision.disposition == "selected"
-        for source in decision.source_proofs
-    )
-    if not selected_sources or any(
-        source.implementation_revision_ref != candidate.implementation_revision_ref
-        for source in selected_sources
-    ):
-        _fail("initial review revision differs from selected reuse implementation")
 
     receipt_subjects: dict[str, str] = {}
     receipts = [handle.execution_input_binding_receipt]
@@ -1148,7 +1129,10 @@ def _validate_target_root_completion_handoff_notice(
         or terminal.execution_attempt_ref
         != final_handle.execution_attempt_ref
         or terminal.execution_fence_ref != final_handle.execution_fence_ref
-        or terminal.formal_measurement_accepted is not True
+        or (terminal.formal_measurement_accepted is not True and not (
+            terminal.formal_measurement_accepted is False
+            and terminal.root_completion_receipt is not None and not terminal.metric_values
+        ))
         or terminal.currentness_known is not True
         or terminal.current is not True
     ):

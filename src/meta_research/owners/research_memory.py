@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import codecs
+import functools
 import hashlib
 import io
 import json
@@ -13,9 +15,10 @@ import threading
 import time
 import unicodedata
 import zipfile
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Literal, Protocol, cast
+from typing import Callable, Iterator, Literal, Protocol, cast
 from urllib.parse import quote, unquote, urlsplit
 
 from pypdf import PdfReader
@@ -23,6 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from meta_research.database import Database
+from meta_research.owners.research_literature_content import LiteratureContentPageReader, store_body, validate_body
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import IdeaContractError, validate_idea_content
@@ -32,6 +36,7 @@ from meta_research.plan_contract import (
     validate_plan_document,
     validate_plan_review,
 )
+from meta_research.read_snapshot_cache import snapshot_cached
 from meta_research.reasoning_contract import (
     AUTONOMOUS_QUESTION_PROPOSAL_SCHEMA_REF,
     REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF,
@@ -101,6 +106,13 @@ class ResearchGraphReferenceReader(AssetReferenceReader, Protocol):
         accepted_formal_plan: AcceptedFormalPlanBinding,
     ) -> tuple[EvidenceReuseLeaf, ...]: ...
 
+    def resolve_reasoning_historical_evidence_leaf(
+        self,
+        *,
+        quest_ref: str,
+        ref: str,
+    ) -> dict[str, object] | None: ...
+
 
 QUESTION_CONTENT_SCHEMA = "meta-research/formal-question-content/v1"
 ASSET_MANIFEST_SCHEMA = "meta-research/asset-manifest/v1"
@@ -150,6 +162,7 @@ ASSET_CUSTODY_ESTABLISHED_RECEIPT_KIND = "asset_custody_established"
 ASSET_CUSTODY_LOCATOR_MIGRATED_RECEIPT_KIND = (
     "asset_custody_locator_migrated"
 )
+# Inline payload and bytes-materialization budget; managed paths stream separately.
 MAX_ASSET_BYTES = 64 * 1024 * 1024
 MAX_ASSET_FILES = 10_000
 MAX_ASSET_PROVENANCE_BYTES = 64 * 1024
@@ -173,6 +186,22 @@ ASSET_INTAKE_LEASE_SECONDS = 3600.0
 ASSET_INTAKE_MAX_ATTEMPTS = 5
 ASSET_INTAKE_RETRY_BASE_SECONDS = 1.0
 ASSET_VERIFICATION_INTERVAL_SECONDS = 300.0
+
+
+def _next_verification_interval(byte_count: int) -> float:
+    """Scale the deep re-verification cadence with corpus size.
+
+    Managed objects are immutable and content-addressed; re-hashing a
+    multi-gigabyte version every ASSET_VERIFICATION_INTERVAL_SECONDS
+    keeps the verification worker permanently behind and saturates the
+    object store with perpetual full-file hashing. Large versions keep
+    the same amortized per-byte cadence as small ones, capped at one
+    week between deep passes.
+    """
+    multiples = max(1, byte_count // MAX_ASSET_BYTES)
+    return min(
+        ASSET_VERIFICATION_INTERVAL_SECONDS * multiples, 7 * 24 * 3600.0
+    )
 TRANSIENT_ASSET_INTAKE_CONFLICTS = {
     "asset_source_unavailable",
     "asset_source_changed_during_intake",
@@ -353,6 +382,54 @@ class MaterializedAsset:
     file_name: str
     media_type: str
     content: bytes
+
+
+@dataclass(frozen=True)
+class AssetExportEntry:
+    path: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
+class AssetExportDescription:
+    """Exact accepted metadata; host paths and asset bytes stay inside RM."""
+
+    memory_ref: str
+    file_name: str
+    media_type: str
+    kind: Literal["file", "directory"]
+    content_hash: str
+    manifest_hash: str
+    byte_count: int
+    directories: tuple[str, ...]
+    entries: tuple[AssetExportEntry, ...]
+
+
+@dataclass(frozen=True)
+class ExportedAsset:
+    description: AssetExportDescription
+    path: Path
+
+
+class _AssetByteSink(Protocol):
+    def write(self, value: bytes) -> int: ...
+
+
+class _Utf8AssetText:
+    """Collector reserved for an explicit request for complete text."""
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        self._output = io.StringIO()
+
+    def write(self, value: bytes) -> int:
+        self._output.write(self._decoder.decode(value))
+        return len(value)
+
+    def value(self) -> str:
+        self._output.write(self._decoder.decode(b"", final=True))
+        return self._output.getvalue()
 
 
 @dataclass(frozen=True)
@@ -802,7 +879,6 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     def verify_reuse_source_version(
         self,
         *,
-        tier: str,
         source_ref: str,
         exact_version_ref: str,
         implementation_revision_ref: str,
@@ -873,6 +949,18 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     ) -> AssetInventoryItem | None: ...
 
     def materialize_asset(self, memory_ref: str) -> MaterializedAsset: ...
+
+    def read_asset_content_page(self, memory_ref: str, *, entry_path: str | None = None,
+                                offset: int = 0, limit: int = 8192) -> dict[str, object]: ...
+
+    def describe_asset_export(self, memory_ref: str) -> AssetExportDescription: ...
+
+    def export_asset(self, memory_ref: str, destination: Path) -> ExportedAsset: ...
+
+    def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str: ...
+
+    def export_asset_entry(self, memory_ref: str, destination: Path,
+                           *, entry_path: str | None = None) -> Path: ...
 
     def handoff_asset_to_managed(
         self, memory_ref: str, *, idempotency_key: str
@@ -1202,6 +1290,10 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
 
     def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]: ...
 
+    def read_literature_snapshot_metadata(self, snapshot_ref: str) -> dict[str, object]: ...
+
+    def read_literature_content_page(self, snapshot_ref: str, *, record_ref: str | None = None, evidence_basis_ref: str | None = None, entry_path: str | None = None, offset: int = 0, limit: int = 8192) -> dict[str, object]: ...
+
     def read_literature_proposal_evidence(
         self, snapshot_ref: str
     ) -> dict[str, object]: ...
@@ -1276,6 +1368,167 @@ class SQLiteResearchMemoryReceiptVerifier:
         self._stage_request_verifier = stage_request_verifier
         self._reasoning_scientific_decision_verifier = None
         self._plan_evidence_reuse_verifier = None
+        self._reference_reader = None
+
+    def bind_reference_reader(self, reference_reader) -> None:
+        """Attach the RG handle used to resolve Quest history revalidation."""
+        current = self._reference_reader
+        if current is not None and current is not reference_reader:
+            raise OwnerConflict("reference_reader_already_bound")
+        self._reference_reader = reference_reader
+
+    def _asset_export_source(self, memory_ref: str):
+        with self._database.read() as connection:
+            row = connection.execute(
+                text("SELECT * FROM rm_asset_versions WHERE version_ref = :ref"),
+                {"ref": memory_ref},
+            ).first()
+            custodies = connection.execute(
+                text(
+                    "SELECT * FROM rm_asset_custodies WHERE version_ref = :ref "
+                    "ORDER BY custody_mode"
+                ),
+                {"ref": memory_ref},
+            ).all()
+        if row is None:
+            raise OwnerConflict("asset_not_found")
+        accepted = _accepted_asset(row, custodies)
+        if row.acceptance_kind != ASSET_RECEIPT_KIND:
+            self.verify_asset_receipt(
+                asset_ref=accepted.asset_ref,
+                version_ref=accepted.version_ref,
+                content_hash=accepted.content_hash,
+                manifest_hash=accepted.manifest_hash,
+                receipt=accepted.receipt,
+            )
+        manifest, _ = _verify_asset_metadata(row, custodies)
+        if manifest["kind"] == "file" and len(manifest["entries"]) != 1:
+            raise OwnerConflict("asset_manifest_invalid")
+        description = AssetExportDescription(
+            memory_ref=memory_ref,
+            file_name=(
+                str(manifest["entries"][0]["path"])
+                if manifest["kind"] == "file" else row.display_name
+            ),
+            media_type=row.media_type,
+            kind=manifest["kind"],
+            content_hash=row.content_hash,
+            manifest_hash=row.manifest_hash,
+            byte_count=int(row.byte_count),
+            directories=tuple(manifest.get("directories", [])),
+            entries=tuple(
+                AssetExportEntry(
+                    path=str(entry["path"]),
+                    sha256=str(entry["sha256"]),
+                    size=int(entry["size"]),
+                )
+                for entry in manifest["entries"]
+            ),
+        )
+        return description, row, custodies, manifest
+
+    @snapshot_cached
+    def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
+        """Read exact accepted metadata without scanning corpus bytes."""
+
+        return self._asset_export_source(memory_ref)[0]
+
+    def export_asset(self, memory_ref: str, destination: Path) -> ExportedAsset:
+        """Stream a verified copy to a new path, publishing only when complete."""
+
+        try:
+            return self._export_asset(memory_ref, destination)
+        except OSError as error:
+            raise OwnerConflict("asset_export_destination_unavailable") from error
+
+    def _export_asset(self, memory_ref: str, destination: Path) -> ExportedAsset:
+        description, row, custodies, manifest = self._asset_export_source(memory_ref)
+        destination = Path(destination)
+        if destination.exists() or destination.is_symlink():
+            raise OwnerConflict("asset_export_destination_exists")
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(
+            prefix=".asset-export-", dir=destination.parent
+        ) as temporary_directory:
+            staged = Path(temporary_directory) / "content"
+            if description.kind == "directory":
+                staged.mkdir(mode=0o700)
+                for directory in description.directories:
+                    (staged / directory).mkdir(parents=True, exist_ok=True, mode=0o700)
+            for entry in manifest["entries"]:
+                output_path = (
+                    staged / str(entry["path"])
+                    if description.kind == "directory" else staged
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _export_asset_entry(
+                    self._object_store, row, custodies, manifest, entry, output_path
+                )
+            if destination.exists() or destination.is_symlink():
+                raise OwnerConflict("asset_export_destination_exists")
+            if description.kind == "file":
+                try:
+                    os.link(staged, destination)
+                except FileExistsError as error:
+                    raise OwnerConflict("asset_export_destination_exists") from error
+                staged.unlink()
+            else:
+                os.rename(staged, destination)
+        return ExportedAsset(description=description, path=destination)
+
+    def _selected_export_entry(self, memory_ref: str, entry_path: str | None):
+        description, row, custodies, manifest = self._asset_export_source(memory_ref)
+        if description.kind == "file" and entry_path is None:
+            entry = manifest["entries"][0]
+        else:
+            matches = [entry for entry in manifest["entries"]
+                       if entry["path"] == entry_path]
+            if len(matches) != 1:
+                raise OwnerConflict("asset_export_entry_not_found")
+            entry = matches[0]
+        return row, custodies, manifest, entry
+
+    def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str:
+        """Explicit full-text read; verify exact bytes and UTF-8 before returning."""
+
+        row, custodies, manifest, entry = self._selected_export_entry(memory_ref, entry_path)
+        for candidate in _asset_entry_sources(self._object_store, row, custodies, manifest, entry):
+            collector = _Utf8AssetText()
+            try:
+                _copy_exact_file(
+                    candidate, collector, int(entry["size"]), str(entry["sha256"]),
+                    unavailable_code="asset_custody_unavailable",
+                    mismatch_code="asset_custody_unavailable",
+                )
+                return collector.value()
+            except (OSError, OwnerConflict, UnicodeDecodeError):
+                continue
+        raise OwnerConflict("asset_text_unavailable")
+
+    def export_asset_entry(self, memory_ref: str, destination: Path,
+                           *, entry_path: str | None = None) -> Path:
+        """Export a single exact entry without copying its containing dataset."""
+
+        try:
+            return self._export_asset_entry(memory_ref, destination, entry_path=entry_path)
+        except OSError as error:
+            raise OwnerConflict("asset_export_destination_unavailable") from error
+
+    def _export_asset_entry(self, memory_ref: str, destination: Path,
+                           *, entry_path: str | None = None) -> Path:
+        row, custodies, manifest, entry = self._selected_export_entry(memory_ref, entry_path)
+        destination = Path(destination)
+        if destination.exists() or destination.is_symlink():
+            raise OwnerConflict("asset_export_destination_exists")
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix=".asset-entry-", dir=destination.parent) as staging:
+            output_path = Path(staging) / "content"
+            _export_asset_entry(self._object_store, row, custodies, manifest, entry, output_path)
+            try:
+                os.link(output_path, destination)
+            except FileExistsError as error:
+                raise OwnerConflict("asset_export_destination_exists") from error
+        return destination
 
     def bind_reasoning_scientific_decision_verifier(self, verifier) -> None:
         method = getattr(verifier, "verify_reasoning_scientific_decision", None)
@@ -1302,7 +1555,6 @@ class SQLiteResearchMemoryReceiptVerifier:
     def verify_reuse_source_version(
         self,
         *,
-        tier: str,
         source_ref: str,
         exact_version_ref: str,
         implementation_revision_ref: str,
@@ -1312,12 +1564,13 @@ class SQLiteResearchMemoryReceiptVerifier:
         receipt_ref: str,
         receipt_subject_ref: str,
     ) -> None:
-        _validate_reuse_tier_metadata(
-            tier=tier,
-            license_ref=license_ref,
-            source_content_hash_ref=source_content_hash_ref,
-            patch_ref=patch_ref,
+        # License/source/patch metadata stay free-form receipt metadata; the
+        # tier-specific requirements retired with the five-tier machinery.
+        _optional_reuse_ref(license_ref, "reuse_license_ref_invalid")
+        _optional_sha256(
+            source_content_hash_ref, "reuse_source_content_hash_ref_invalid"
         )
+        _optional_reuse_ref(patch_ref, "reuse_patch_ref_invalid")
         row = self._query_implementation_row(
             source_ref=source_ref,
             exact_version_ref=exact_version_ref,
@@ -1481,6 +1734,20 @@ class SQLiteResearchMemoryReceiptVerifier:
         ):
             raise OwnerConflict("manual_question_content_receipt_invalid")
         _verify_object(self._object_store, row)
+
+    def query_idea_outcome_content(self, submission_ref):
+        """Exact accepted-content read for RG's selected evidence reauthentication."""
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT * FROM rm_idea_outcome_contents WHERE submission_ref=:submission_ref"
+            ), {"submission_ref": submission_ref}).first()
+        if row is None:
+            return None
+        accepted = _accepted_idea_content(row)
+        self.verify_idea_content_receipt(request_ref=row.request_ref, submission_ref=row.submission_ref,
+            content_ref=row.content_ref, payload_hash=row.payload_hash, outcome_hash=row.outcome_hash,
+            reviewed_draft_hash=row.reviewed_draft_hash, review_hash=row.review_hash, receipt=accepted.receipt)
+        return accepted
 
     def verify_idea_content_receipt(
         self,
@@ -1774,7 +2041,12 @@ class SQLiteResearchMemoryReceiptVerifier:
         _verify_reasoning_payload(
             row,
             revision_verifier=self.verify_question_literature_revision,
+            revision_reader=self.query_question_literature_revision_ref,
+            reference_reader=self._reference_reader,
         )
+        # The scientific source and its final consuming execution can belong
+        # to different Attempts after an AR completion retry. Their exact
+        # source and execution receipts are authenticated independently.
         if row.scientific_candidate_content_ref is not None:
             with self._database.read() as connection:
                 staged_row = connection.execute(
@@ -1791,8 +2063,6 @@ class SQLiteResearchMemoryReceiptVerifier:
                 or staged_row.context_pack_ref != row.context_pack_ref
                 or staged_row.context_pack_hash != row.context_pack_hash
                 or staged_row.run_ref != row.run_ref
-                or staged_row.attempt_ref != row.attempt_ref
-                or staged_row.fence_ref != row.fence_ref
                 or staged_row.scientific_outcome_ref
                 != row.scientific_outcome_ref
                 or staged_row.outcome_hash != row.outcome_hash
@@ -1855,6 +2125,47 @@ class SQLiteResearchMemoryReceiptVerifier:
                 ),
             )
 
+    def query_reasoning_history_source(self, submission_ref: str) -> dict[str, object] | None:
+        """Read one immutable scientific source without replaying its historical asset chain.
+
+        RG authenticates acceptance separately. RM authenticates its exact receipt,
+        scientific/transition hashes, and stored source bytes on every read.
+        """
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT * FROM rm_reasoning_contents WHERE submission_ref=:submission_ref"
+            ), {"submission_ref": submission_ref}).first()
+        if row is None:
+            return None
+        if row.receipt_hash != _reasoning_content_receipt_hash(row):
+            raise OwnerConflict("reasoning_content_receipt_invalid")
+        _verify_reasoning_object(self._object_store, row)
+        try:
+            payload = decoded_object(row.payload_json)
+            outcome = decoded_object(row.outcome_json)
+            scientific = decoded_object(row.scientific_outcome_json)
+            transition = decoded_object(row.transition_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("reasoning_content_invalid") from error
+        if (canonical_json(payload) != row.payload_json
+            or canonical_hash(payload) != row.payload_hash
+            or payload.get("outcome") != outcome
+            or outcome.get("scientific_outcome") != scientific
+            or canonical_json(scientific) != row.scientific_outcome_json
+            or canonical_hash(scientific) != row.outcome_hash
+            or canonical_json(transition) != row.transition_json
+            or canonical_hash(transition) != row.transition_hash
+            or outcome.get(row.transition_kind) != transition
+            or scientific.get("outcome_ref") != row.scientific_outcome_ref
+            or scientific.get("cycle_ref") != row.cycle_ref
+            or scientific.get("stage_run_request_ref") != row.request_ref):
+            raise OwnerConflict("reasoning_content_invalid")
+        return {"scientific_outcome": scientific, "transition": transition,
+                "cycle_ref": row.cycle_ref, "request_ref": row.request_ref,
+                "content_ref": row.content_ref, "payload_hash": row.payload_hash,
+                "outcome_hash": row.outcome_hash, "transition_hash": row.transition_hash,
+                "receipt_ref": row.receipt_ref, "receipt_hash": row.receipt_hash}
+
     def query_reasoning_content(
         self, submission_ref: str
     ) -> AcceptedReasoningContent | None:
@@ -1870,7 +2181,11 @@ class SQLiteResearchMemoryReceiptVerifier:
             ).first()
         if row is None:
             return None
-        accepted = _accepted_reasoning_content(row)
+        accepted = _accepted_reasoning_content(
+            row,
+            revision_reader=self.query_question_literature_revision_ref,
+            reference_reader=self._reference_reader,
+        )
         self.verify_reasoning_content_receipt(
             request_ref=row.request_ref,
             submission_ref=row.submission_ref,
@@ -2037,6 +2352,8 @@ class SQLiteResearchMemoryReceiptVerifier:
         _verify_reasoning_scientific_candidate_payload(
             row,
             revision_verifier=self.verify_question_literature_revision,
+            revision_reader=self.query_question_literature_revision_ref,
+            reference_reader=self._reference_reader,
         )
         verifier = getattr(
             self._execution_verifier,
@@ -2152,7 +2469,11 @@ class SQLiteResearchMemoryReceiptVerifier:
             != "autonomous_question_creation"
             or snapshot.context_basis_hash
             != _autonomous_question_source_basis_hash(
-                _accepted_reasoning_scientific_candidate(candidate)
+                _accepted_reasoning_scientific_candidate(
+                    candidate,
+                    revision_reader=self.query_question_literature_revision_ref,
+                    reference_reader=self._reference_reader,
+                ), self._execution_verifier,
             )
         ):
             raise OwnerConflict("autonomous_question_content_receipt_invalid")
@@ -2195,7 +2516,12 @@ class SQLiteResearchMemoryReceiptVerifier:
             execution_verifier=self._execution_verifier,
         )
         _verify_autonomous_question_content_object(self._object_store, row)
-        _verify_autonomous_question_content_payload(row, candidate)
+        _verify_autonomous_question_content_payload(
+            row,
+            candidate,
+            revision_reader=self.query_question_literature_revision_ref,
+            reference_reader=self._reference_reader,
+        )
 
     def query_plan_selected_evidence_refs(
         self,
@@ -2234,6 +2560,48 @@ class SQLiteResearchMemoryReceiptVerifier:
         ):
             raise OwnerConflict("plan_content_invalid")
         return _selected_plan_evidence_refs(plan_document)
+
+    def query_plan_selected_evidence_catalog(
+        self,
+        *,
+        submission_ref: str,
+        content_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> list[dict[str, object]]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_plan_documents WHERE content_ref = "
+                    ":content_ref AND submission_ref = :submission_ref"
+                ),
+                {"content_ref": content_ref, "submission_ref": submission_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("plan_content_receipt_invalid")
+        self.verify_plan_content_receipt(
+            request_ref=row.request_ref,
+            submission_ref=row.submission_ref,
+            content_ref=row.content_ref,
+            payload_hash=row.payload_hash,
+            plan_hash=row.plan_document_hash,
+            reviewed_draft_hash=row.reviewed_draft_hash,
+            review_hash=row.review_hash,
+            receipt=receipt,
+        )
+        try:
+            plan_document = decoded_object(row.plan_document_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("plan_content_invalid") from error
+        if (
+            canonical_json(plan_document) != row.plan_document_json
+            or canonical_hash(plan_document) != row.plan_document_hash
+        ):
+            raise OwnerConflict("plan_content_invalid")
+        bindings = plan_document.get("source_bindings", {})
+        selected = bindings.get("selected_evidence_catalog", [])
+        if not isinstance(selected, list) or not all(isinstance(item, dict) for item in selected):
+            raise OwnerConflict("plan_selected_evidence_invalid")
+        return selected
 
     def verify_asset_receipt(
         self,
@@ -2393,6 +2761,8 @@ class SQLiteResearchMemoryReceiptVerifier:
             _verify_reasoning_scientific_candidate_payload(
                 candidate,
                 revision_verifier=self.verify_question_literature_revision,
+                revision_reader=self.query_question_literature_revision_ref,
+                reference_reader=self._reference_reader,
             )
             verifier = getattr(
                 self._execution_verifier,
@@ -2432,6 +2802,8 @@ class SQLiteResearchMemoryReceiptVerifier:
             _verify_reasoning_payload(
                 reasoning,
                 revision_verifier=self.verify_question_literature_revision,
+                revision_reader=self.query_question_literature_revision_ref,
+                reference_reader=self._reference_reader,
             )
             if self._execution_verifier is not None:
                 self._execution_verifier.verify_attempt_execution_receipt(
@@ -2473,7 +2845,7 @@ class SQLiteResearchMemoryReceiptVerifier:
         if row is None:
             raise OwnerConflict("asset_receipt_invalid")
         integrity, availability = _asset_current_state(
-            self._object_store, row, custodies
+            self._object_store, row, custodies, allow_large_linked=True
         )
         if integrity != "verified" or availability != "available":
             raise OwnerConflict("asset_custody_unavailable")
@@ -2727,6 +3099,15 @@ class SQLiteResearchMemoryReceiptVerifier:
         ):
             raise OwnerConflict("plan_evidence_binding_invalid")
 
+    def query_question_literature_revision_ref(self, *, question_ref, revision_ref):
+        with self._database.read() as connection:
+            row=connection.execute(text("SELECT * FROM rm_question_literature_revisions WHERE question_ref=:question_ref AND revision_ref=:revision_ref"),{"question_ref":question_ref,"revision_ref":revision_ref}).first()
+        if row is None:
+            return None
+        binding=_question_literature_revision_binding(row)
+        self.verify_question_literature_revision(binding)
+        return binding
+
 
 class SQLiteResearchMemory(HumanRequestOwnerMixin):
     def __init__(
@@ -2751,6 +3132,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         self._receipt_verifier = receipt_verifier
         self._execution_verifier = execution_verifier
         self._reference_reader = reference_reader
+        # The receipt verifier revalidates the same reasoning documents with
+        # the same Quest-scoped history resolver RM itself uses.
+        receipt_verifier.bind_reference_reader(reference_reader)
         self._manual_confirmation_verifier = manual_confirmation_verifier
         self._configure_human_request_owner(
             database, feed, RM_OWNER, human_response_verifier
@@ -2763,14 +3147,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         # partial-unique repair intent. A restarted daemon safely adopts the
         # durable processing row with a fresh lock.
         self._asset_handoff_lock = threading.RLock()
-        # Literature objects are immutable and content-addressed. Verify their
-        # custody once per process and reuse the frozen accepted projection;
-        # otherwise every Stage/public projection re-reads and hashes large
-        # fulltext payloads.
-        self._literature_snapshot_lock = threading.RLock()
-        self._literature_snapshot_cache: dict[
-            tuple[str, str], AcceptedLiteratureSnapshot
-        ] = {}
+        from meta_research.owners.research_asset_content import AssetContentPageReader
+        self._asset_content_pages = AssetContentPageReader(object_store, receipt_verifier)
+        self._literature_content_pages = LiteratureContentPageReader(self._object_store)
         self._recover_asset_intakes()
 
     def _recover_asset_intakes(self) -> None:
@@ -3245,7 +3624,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                         else float(observation.observed_at)
                     ),
                     "next_verify_at": (
-                        completed_at + ASSET_VERIFICATION_INTERVAL_SECONDS
+                        completed_at
+                        + _next_verification_interval(int(row.byte_count))
                     ),
                 },
             )
@@ -3523,7 +3903,28 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             )
             entries: list[dict[str, object]] = []
             byte_count = 0
-            if directory_source and streaming_link:
+            if custody_mode == "managed":
+                if directory_source:
+                    source_directories, entries = _scan_directory_content(
+                        source,
+                        ignored_top_level=(".git",) if source_kind == "repository" else (),
+                        enforce_limits=False,
+                        store_file=self._store_asset_file,
+                    )
+                else:
+                    size = source.stat().st_size
+                    digest, object_path = self._store_asset_file(source, size)
+                    source_directories = ()
+                    entries = [
+                        {
+                            "path": _safe_asset_name(str(request["display_name"])),
+                            "sha256": digest,
+                            "size": size,
+                            "object_path": object_path,
+                        }
+                    ]
+                byte_count = sum(int(entry["size"]) for entry in entries)
+            elif directory_source and streaming_link:
                 source_directories, scanned_entries = _scan_directory_content(
                     source,
                     ignored_top_level=(".git",) if source_kind == "repository" else (),
@@ -3566,14 +3967,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                         _read_bounded_source_file(source),
                     ),
                 )
-            if not streaming_link:
+            if custody_mode != "managed" and not streaming_link:
                 for relative_path, content in source_files:
                     content_hash = hashlib.sha256(content).hexdigest()
                     object_path: str | None = None
-                    if custody_mode == "managed":
-                        object_path = self._store_asset_object(
-                            content_hash, content
-                        )
                     entries.append(
                         {
                             "path": relative_path,
@@ -4003,6 +4400,53 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             return None
         return self._verified_accepted_asset(row, custodies)
 
+    def query_research_notes_for_target(self, target_ref: str):
+        from meta_research.research_notes import query_target_research_notes
+        return query_target_research_notes(self._database, self, target_ref)
+
+    def query_target_input_research_notes(self, *, quest_ref: str, target_ref: str,
+                                        upstream_commit_refs, input_version_refs,
+                                        offset: int = 0, version_ref: str | None = None):
+        from meta_research.research_notes import query_target_input_research_notes
+        return query_target_input_research_notes(self._database, self, quest_ref=quest_ref,
+            target_ref=target_ref, upstream_commit_refs=upstream_commit_refs,
+            input_version_refs=input_version_refs, offset=offset, version_ref=version_ref)
+
+    def query_question_research_notes(self, *, quest_ref: str, question_ref: str, offset: int = 0):
+        if type(offset) is not int or offset < 0:
+            raise OwnerConflict("research_note_page_invalid")
+        with self._database.read() as connection:
+            rows = connection.execute(text(
+                "SELECT t.target_ref FROM rg_targets t JOIN rg_target_graphs g ON g.graph_ref=t.graph_ref "
+                "JOIN ae_stage_run_requests r ON r.request_ref=g.request_ref "
+                "WHERE g.quest_ref=:quest AND r.question_ref=:question AND EXISTS ("
+                "SELECT 1 FROM rm_target_root_completion_manifests m WHERE m.target_ref=t.target_ref) "
+                "ORDER BY t.accepted_at DESC, t.target_ref LIMIT 13 OFFSET :offset"),
+                {"quest": quest_ref, "question": question_ref, "offset": offset}).all()
+        return {"summary_only": True, "offset": offset, "limit": 12,
+            "next_offset": offset + 12 if len(rows) > 12 else None,
+            "items": [note for row in rows[:12]
+                      for note in self.query_research_notes_for_target(row.target_ref)]}
+
+    def read_question_research_note(self, *, quest_ref: str, question_ref: str, version_ref: str):
+        from meta_research.research_notes import query_target_research_notes, read_note_body
+        with self._database.read() as connection:
+            rows = connection.execute(text(
+                "SELECT DISTINCT t.target_ref FROM rg_targets t "
+                "JOIN rg_target_graphs g ON g.graph_ref=t.graph_ref "
+                "JOIN ae_stage_run_requests r ON r.request_ref=g.request_ref "
+                "WHERE g.quest_ref=:quest AND r.question_ref=:question AND (EXISTS ("
+                "SELECT 1 FROM rm_target_research_notes n WHERE n.target_ref=t.target_ref AND n.version_ref=:version) "
+                "OR EXISTS (SELECT 1 FROM rm_target_root_completion_manifests m, json_each(m.entries_json) e "
+                "WHERE m.target_ref=t.target_ref AND json_extract(e.value,'$.binding.version_ref')=:version))"),
+                {"quest": quest_ref, "question": question_ref, "version": version_ref}).all()
+        if len(rows) != 1:
+            raise OwnerConflict("research_note_source_unbound")
+        notes = query_target_research_notes(self._database, self, rows[0].target_ref, version_ref=version_ref)
+        if len(notes) != 1:
+            raise OwnerConflict("research_note_source_unbound")
+        return {"reference": notes[0], "body": read_note_body(self, notes[0])}
+
     def query_asset_inventory(self) -> tuple[AssetInventoryItem, ...]:
         with self._database.read() as connection:
             rows = connection.execute(
@@ -4333,6 +4777,25 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             content=content,
         )
 
+    def read_asset_content_page(self, memory_ref: str, *, entry_path: str | None = None,
+                                offset: int = 0, limit: int = 8192) -> dict[str, object]:
+        """Read an exact bounded page in original custody after receipt verification."""
+        return self._asset_content_pages.read_page(
+            memory_ref, entry_path=entry_path, offset=offset, limit=limit)
+
+    def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
+        return self._receipt_verifier.describe_asset_export(memory_ref)
+
+    def export_asset(self, memory_ref: str, destination: Path) -> ExportedAsset:
+        return self._receipt_verifier.export_asset(memory_ref, destination)
+
+    def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str:
+        return self._receipt_verifier.read_asset_entry_text(memory_ref, entry_path=entry_path)
+
+    def export_asset_entry(self, memory_ref: str, destination: Path,
+                           *, entry_path: str | None = None) -> Path:
+        return self._receipt_verifier.export_asset_entry(memory_ref, destination, entry_path=entry_path)
+
     def handoff_asset_to_managed(
         self, memory_ref: str, *, idempotency_key: str
     ) -> AcceptedAssetCustody:
@@ -4374,8 +4837,6 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             ).all()
         if row is None:
             raise OwnerConflict("asset_not_found")
-        if int(row.byte_count) > MAX_ASSET_BYTES:
-            raise OwnerConflict("asset_custody_unavailable")
         self._verified_accepted_asset(row, custodies)
         manifest = decoded_object(row.manifest_json)
         existing_managed = next(
@@ -4400,17 +4861,12 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             if repair_status != "missing":
                 raise OwnerConflict("asset_repair_command_invalid")
             integrity, availability = _asset_current_state(
-                self._object_store, row, custodies
+                self._object_store, row, custodies, allow_large_linked=True
             )
             if integrity != "verified" or availability != "available":
                 raise OwnerConflict("asset_custody_unavailable")
             for entry in manifest["entries"]:
-                content = _materialized_entry_content(
-                    self._object_store, row, custodies, manifest, entry
-                )
-                self._store_asset_object(
-                    str(entry["sha256"]), content
-                )
+                self._store_asset_entry(row, custodies, manifest, entry)
             _verify_managed_manifest(self._object_store, manifest)
         else:
             if (
@@ -4423,7 +4879,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             except OwnerConflict:
                 linked_sources = _receipt_bound_asset_sources(row, custodies)
                 if not any(
-                    _linked_source_matches(manifest, source)
+                    _linked_source_matches(manifest, source, enforce_limits=False)
                     for source in linked_sources
                     if source.exists() and not source.is_symlink()
                 ):
@@ -4448,10 +4904,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     repair_status = "processing"
                     repair_custody_ref = existing_managed.custody_ref
                 for entry in manifest["entries"]:
-                    content = _materialized_entry_content(
-                        self._object_store, row, custodies, manifest, entry
-                    )
-                    self._replace_asset_object(str(entry["sha256"]), content)
+                    self._store_asset_entry(row, custodies, manifest, entry)
                 _verify_managed_manifest(self._object_store, manifest)
 
         with self._database.write() as connection:
@@ -5567,6 +6020,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
     def verify_asset_binding(self, **values) -> None:
         self._receipt_verifier.verify_asset_binding(**values)
 
+    @snapshot_cached
     def verify_asset_projection_binding(self, **values) -> None:
         """Verify an exact receipt against the last durable custody observation."""
 
@@ -5617,6 +6071,56 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         finally:
             os.close(directory_descriptor)
         return str(destination.relative_to(self._object_store))
+
+    def _store_asset_entry(self, row, custodies, manifest, entry) -> None:
+        for candidate in _asset_entry_sources(
+            self._object_store, row, custodies, manifest, entry
+        ):
+            try:
+                self._store_asset_file(
+                    candidate, int(entry["size"]), str(entry["sha256"])
+                )
+                return
+            except (OSError, OwnerConflict):
+                continue
+        raise OwnerConflict("asset_custody_unavailable")
+
+    def _store_asset_file(
+        self, source: Path, size: int, expected_hash: str | None = None
+    ) -> tuple[str, str]:
+        """Snapshot file bytes with bounded memory before publishing its hash."""
+
+        staging = self._object_store / "assets"
+        staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".intake-", dir=staging)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                digest = _copy_exact_file(
+                    source, output, size, expected_hash,
+                    unavailable_code="asset_source_unavailable",
+                    mismatch_code="asset_source_changed_during_intake",
+                )
+                output.flush()
+                os.fsync(output.fileno())
+            temporary.chmod(0o600)
+            directory = staging / digest[:2]
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            destination = directory / digest
+            if destination.is_file() and _file_matches(destination, size, digest):
+                temporary.unlink()
+            else:
+                os.replace(temporary, destination)
+            directory_descriptor = os.open(
+                directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+            return digest, str(destination.relative_to(self._object_store))
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _replace_asset_object(self, object_hash: str, content: bytes) -> str:
         if hashlib.sha256(content).hexdigest() != object_hash:
@@ -5674,6 +6178,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     revision_verifier=(
                         self._receipt_verifier.verify_question_literature_revision
                     ),
+                    revision_reader=self.query_question_literature_revision_ref,
+                    reference_reader=self._reference_reader,
                 )
             with self._database.read() as connection:
                 asset_rows = connection.execute(
@@ -6832,7 +7338,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             or canonical_hash(context_pack) != context_pack_hash
             or checkpoint_receipt.issuer != "agent_runtime"
             or checkpoint_receipt.kind
-            != REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND
+            != "reasoning_autonomous_decision"
             or checkpoint_receipt.subject_ref != checkpoint_ref
         ):
             raise OwnerConflict("reasoning_scientific_candidate_lineage_invalid")
@@ -6867,6 +7373,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             revision_verifier=(
                 self._receipt_verifier.verify_question_literature_revision
             ),
+            revision_reader=self.query_question_literature_revision_ref,
+            cited_documents=(checkpoint,),
         )
         if not isinstance(checkpoint, dict) or set(checkpoint) != {
             "schema_ref",
@@ -6880,6 +7388,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             autonomous_scope, dict
         ):
             raise OwnerConflict("reasoning_autonomous_checkpoint_invalid")
+        historical_resolver = _historical_evidence_resolver(
+            self._reference_reader, scientific_outcome.get("quest_ref")
+        )
         try:
             checkpoint_hash, outcome_hash, autonomous_scope_hash = (
                 validate_reasoning_autonomous_checkpoint(
@@ -6888,6 +7399,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    historical_resolver=historical_resolver,
                 )
             )
             if validate_autonomous_question_scope(
@@ -6903,6 +7415,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 frozen_research_context=cast(
                     dict[str, object], context_pack["research_context"]
                 ),
+                historical_resolver=historical_resolver,
             ) != outcome_hash:
                 raise ReasoningContractError("scientific_outcome_invalid")
             reviewed_draft_hash = review.get("reviewed_draft_hash")
@@ -6946,6 +7459,15 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             review_hash=review_hash,
             receipt=checkpoint_receipt,
         )
+        continuation = self._execution_verifier.query_reasoning_autonomous_decision(checkpoint_ref)
+        if continuation is None or continuation["receipt"] != checkpoint_receipt.as_public_dict():
+            raise OwnerConflict("reasoning_continuation_receipt_invalid")
+        snapshot = self.query_literature_snapshot(continuation["facts"]["snapshot_ref"])
+        if (snapshot is None or snapshot.snapshot_hash != continuation["facts"]["snapshot_hash"]
+            or snapshot.quest_ref != scientific_outcome["quest_ref"]
+            or snapshot.request_ref != continuation["facts"]["request_ref"]
+            or snapshot.context_basis_hash != continuation["facts"]["context_basis_hash"]):
+            raise OwnerConflict("reasoning_summary_binding_invalid")
         context_pack_json = canonical_json(context_pack)
         checkpoint_json = canonical_json(checkpoint)
         scientific_outcome_json = canonical_json(scientific_outcome)
@@ -7006,6 +7528,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     revision_verifier=(
                         self._receipt_verifier.verify_question_literature_revision
                     ),
+                    revision_reader=self.query_question_literature_revision_ref,
+                    reference_reader=self._reference_reader,
                 )
                 if existing.receipt_hash != (
                     _reasoning_scientific_candidate_receipt_hash(existing)
@@ -7013,7 +7537,11 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     raise OwnerConflict(
                         "reasoning_scientific_candidate_receipt_invalid"
                     )
-                return _accepted_reasoning_scientific_candidate(existing)
+                return _accepted_reasoning_scientific_candidate(
+                    existing,
+                    revision_reader=self.query_question_literature_revision_ref,
+                    reference_reader=self._reference_reader,
+                )
             content_ref = new_ref("reasoning_scientific_candidate")
             receipt_ref = new_ref("rm_reasoning_scientific_candidate_receipt")
             receipt_hash = _receipt_hash(
@@ -7159,7 +7687,11 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             ).first()
         if row is None:
             return None
-        accepted = _accepted_reasoning_scientific_candidate(row)
+        accepted = _accepted_reasoning_scientific_candidate(
+            row,
+            revision_reader=self.query_question_literature_revision_ref,
+            reference_reader=self._reference_reader,
+        )
         self._receipt_verifier.verify_reasoning_scientific_candidate_receipt(
             request_ref=row.request_ref,
             submission_ref=row.submission_ref,
@@ -7227,7 +7759,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         )
         if not isinstance(accepted_question, dict):
             raise OwnerConflict("autonomous_question_source_invalid")
-        source_basis_hash = _autonomous_question_source_basis_hash(candidate)
+        source_basis_hash = _autonomous_question_source_basis_hash(candidate, self._execution_verifier)
         if snapshot is None or (
             snapshot.creation_context_kind != "autonomous_question_creation"
             or not snapshot.creation_context_ref
@@ -7333,6 +7865,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     )
                 return _accepted_autonomous_question_content(
                     existing, candidate
+                ,
+                    revision_reader=self.query_question_literature_revision_ref,
+                    reference_reader=self._reference_reader,
                 )
             content_ref = new_ref("autonomous_question_content")
             receipt_ref = new_ref("rm_autonomous_question_content_receipt")
@@ -7479,7 +8014,14 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         if candidate_row is None:
             raise OwnerConflict("autonomous_question_content_invalid")
         accepted = _accepted_autonomous_question_content(
-            row, _accepted_reasoning_scientific_candidate(candidate_row)
+            row,
+            _accepted_reasoning_scientific_candidate(
+                candidate_row,
+                revision_reader=self.query_question_literature_revision_ref,
+                reference_reader=self._reference_reader,
+            ),
+            revision_reader=self.query_question_literature_revision_ref,
+            reference_reader=self._reference_reader,
         )
         self._receipt_verifier.verify_autonomous_question_content_receipt(
             context_ref=row.context_ref,
@@ -7575,6 +8117,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             revision_verifier=(
                 self._receipt_verifier.verify_question_literature_revision
             ),
+            revision_reader=self.query_question_literature_revision_ref,
+            cited_documents=(outcome, reviewed_draft),
         )
         staged_resume = (
             scientific_candidate_content_receipt is not None
@@ -7584,6 +8128,15 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             scientific_candidate_content_receipt is None
         ) != (scientific_candidate_domain_receipt is None):
             raise OwnerConflict("reasoning_scientific_candidate_binding_invalid")
+        cited_outcome = outcome.get("scientific_outcome")
+        # One Quest scope covers the final outcome and its reviewed draft:
+        # both must bind to this pack's single frozen research context.
+        historical_resolver = _historical_evidence_resolver(
+            self._reference_reader,
+            cited_outcome.get("quest_ref")
+            if isinstance(cited_outcome, dict)
+            else None,
+        )
         try:
             expected_completion_basis = (
                 completion_milestone_basis_refs(context_pack)
@@ -7601,9 +8154,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),
+                    historical_resolver=historical_resolver,
                 )
             )
-            if staged_resume:
+            if reviewed_draft.get("schema_ref") == REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA:
                 (
                     reviewed_draft_hash,
                     _draft_outcome_hash,
@@ -7614,6 +8168,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    historical_resolver=historical_resolver,
                 )
             else:
                 (
@@ -7629,6 +8184,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),
+                    historical_resolver=historical_resolver,
                 )
             review_hash = _validate_reasoning_review(
                 review,
@@ -7683,7 +8239,11 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 or scientific_candidate_domain_receipt is None
             ):
                 raise OwnerConflict("reasoning_scientific_candidate_required")
-            staged = _accepted_reasoning_scientific_candidate(staged_row)
+            staged = _accepted_reasoning_scientific_candidate(
+                staged_row,
+                revision_reader=self.query_question_literature_revision_ref,
+                reference_reader=self._reference_reader,
+            )
             self._receipt_verifier.verify_reasoning_scientific_candidate_receipt(
                 request_ref=staged.request_ref,
                 submission_ref=staged.submission_ref,
@@ -7711,6 +8271,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 outcome_ref=staged.scientific_outcome_ref,
                 receipt=scientific_candidate_domain_receipt,
             )
+            # AR may consume this immutable checkpoint from a replacement
+            # Attempt. Preserve its source identity while independently
+            # verifying the final execution receipt below.
             if (
                 staged.request_ref != request_ref
                 or staged.cycle_ref != cycle_ref
@@ -7718,10 +8281,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 or staged.context_pack_ref != context_pack_ref
                 or staged.context_pack_hash != context_pack_hash
                 or staged.run_ref != run_ref
-                or staged.attempt_ref != attempt_ref
-                or staged.fence_ref != fence_ref
-                or staged.checkpoint != reviewed_draft
-                or staged.checkpoint_hash != reviewed_draft_hash
+                or staged.reviewed_draft_hash != reviewed_draft_hash
                 or staged.scientific_outcome != scientific_outcome
                 or canonical_json(staged.scientific_outcome)
                 != canonical_json(scientific_outcome)
@@ -7836,12 +8396,18 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     revision_verifier=(
                         self._receipt_verifier.verify_question_literature_revision
                     ),
+                    revision_reader=self.query_question_literature_revision_ref,
+                    reference_reader=self._reference_reader,
                 )
                 if existing.receipt_hash != _reasoning_content_receipt_hash(
                     existing
                 ):
                     raise OwnerConflict("reasoning_content_receipt_invalid")
-                return _accepted_reasoning_content(existing)
+                return _accepted_reasoning_content(
+                    existing,
+                    revision_reader=self.query_question_literature_revision_ref,
+                    reference_reader=self._reference_reader,
+                )
 
             content_ref = new_ref("reasoning_content")
             receipt_ref = new_ref("rm_reasoning_content_receipt")
@@ -7957,6 +8523,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             raise OwnerConflict("reasoning_content_missing_after_commit")
         return accepted
 
+    def query_reasoning_history_source(self, submission_ref):
+        return self._receipt_verifier.query_reasoning_history_source(submission_ref)
+
     def query_reasoning_content(
         self, submission_ref: str
     ) -> AcceptedReasoningContent | None:
@@ -7970,7 +8539,11 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             ).first()
         if row is None:
             return None
-        accepted = _accepted_reasoning_content(row)
+        accepted = _accepted_reasoning_content(
+            row,
+            revision_reader=self.query_question_literature_revision_ref,
+            reference_reader=self._reference_reader,
+        )
         self._receipt_verifier.verify_reasoning_content_receipt(
             request_ref=row.request_ref,
             submission_ref=row.submission_ref,
@@ -8071,9 +8644,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 return existing
 
         summary_document = {
-            "schema_ref": "meta-research/literature-summary/v1",
+            "schema_ref": "meta-research/literature-summary/v2",
             "request_ref": request.request_ref,
-            "summary": result["summary"],
+            "body": store_body(self._object_store, result["summary"]),
         }
         if result.get("papers_ledger") is None:
             papers_document = {
@@ -8089,9 +8662,11 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 "display_papers": result["papers"],
             }
         fulltexts_document = {
-            "schema_ref": "meta-research/fulltext-collection/v1",
+            "schema_ref": "meta-research/fulltext-index/v2",
             "request_ref": request.request_ref,
-            "fulltexts": result["fulltexts"],
+            "fulltexts": [{"paper_url": item["paper_url"], "media_type": item["media_type"],
+                           "content_hash": item["content_hash"], "body": store_body(self._object_store, item["content"])}
+                          for item in result["fulltexts"]],
         }
         summary_hash = canonical_hash(summary_document)
         papers_hash = canonical_hash(papers_document)
@@ -8378,14 +8953,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             raise OwnerConflict("literature_snapshot_binding_invalid")
 
     def _accepted_literature_snapshot(self, row) -> AcceptedLiteratureSnapshot:
-        cache_key = (str(row.snapshot_ref), str(row.snapshot_hash))
-        with self._literature_snapshot_lock:
-            cached = self._literature_snapshot_cache.get(cache_key)
-            if cached is not None:
-                return cached
-            accepted = self._accepted_literature_snapshot_uncached(row)
-            self._literature_snapshot_cache[cache_key] = accepted
-            return accepted
+        # Revalidate authority and the small indexes on every public query.
+        # Source-body verification belongs to exact reads, not discovery.
+        return self._accepted_literature_snapshot_uncached(row)
 
     def _accepted_literature_snapshot_uncached(
         self, row
@@ -8417,6 +8987,15 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             or not isinstance(fulltexts_document.get("fulltexts"), list)
         ):
             raise OwnerConflict("literature_snapshot_invalid")
+        if summary_document.get("schema_ref") != "meta-research/literature-summary/v2" or set(summary_document) != {"schema_ref", "request_ref", "body"}:
+            raise OwnerConflict("literature_snapshot_invalid")
+        validate_body(summary_document["body"])
+        if fulltexts_document.get("schema_ref") != "meta-research/fulltext-index/v2" or set(fulltexts_document) != {"schema_ref", "request_ref", "fulltexts"}:
+            raise OwnerConflict("literature_snapshot_invalid")
+        for item in fulltexts_document["fulltexts"]:
+            if not isinstance(item, dict) or set(item) != {"paper_url", "media_type", "content_hash", "body"}:
+                raise OwnerConflict("literature_snapshot_invalid")
+            validate_body(item["body"])
         paper_count = _validated_stored_papers_document(
             papers_document, str(row.request_ref)
         )
@@ -8571,48 +9150,85 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             quest_ref=quest_ref,
         )
 
-    def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]:
+    def read_literature_snapshot_metadata(self, snapshot_ref: str) -> dict[str, object]:
         with self._database.read() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT * FROM rm_literature_snapshots WHERE "
-                    "snapshot_ref = :snapshot_ref"
-                ),
-                {"snapshot_ref": snapshot_ref},
-            ).first()
+            row = connection.execute(text("SELECT * FROM rm_literature_snapshots WHERE snapshot_ref = :ref"), {"ref": snapshot_ref}).first()
         if row is None:
             raise OwnerConflict("literature_snapshot_not_found")
         accepted = self._accepted_literature_snapshot(row)
-        summary = self._read_literature_object(
-            row.summary_object_path, row.summary_hash
-        )["summary"]
-        papers_document = self._read_literature_object(
-            row.papers_object_path, row.papers_hash
-        )
-        _validated_stored_papers_document(papers_document, str(row.request_ref))
-        if papers_document.get("schema_ref") == "meta-research/papers-ledger/v2":
-            papers = papers_document["display_papers"]
-            papers_ledger = papers_document["ledger"]
-        else:
-            papers = papers_document["papers"]
-            papers_ledger = None
-        fulltexts = self._read_literature_object(
-            row.fulltexts_object_path, row.fulltexts_hash
-        )["fulltexts"]
-        try:
-            web_evidence = json.loads(row.web_evidence_json)
-        except json.JSONDecodeError as error:
-            raise OwnerConflict("literature_snapshot_invalid") from error
-        if canonical_hash(web_evidence) != row.web_evidence_hash:
-            raise OwnerConflict("literature_snapshot_invalid")
+        summary = self._read_literature_object(row.summary_object_path, row.summary_hash)
+        papers = self._read_literature_object(row.papers_object_path, row.papers_hash)
+        fulltexts = self._read_literature_object(row.fulltexts_object_path, row.fulltexts_hash)
+        return {**accepted.as_public_dict(), "summary_body": summary["body"],
+                "papers": papers.get("display_papers", papers.get("papers")),
+                "papers_ledger": papers.get("ledger"), "fulltexts": fulltexts["fulltexts"],
+                "web_evidence": json.loads(row.web_evidence_json)}
+
+    def read_literature_content_page(
+        self, snapshot_ref: str, *, record_ref: str | None = None,
+        evidence_basis_ref: str | None = None, entry_path: str | None = None,
+        offset: int = 0, limit: int = 8192,
+    ) -> dict[str, object]:
+        from meta_research.context_presentation import context_read_page
+
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 65536:
+            raise OwnerConflict("content_page_invalid")
+        metadata = self.read_literature_snapshot_metadata(snapshot_ref)
+        paper = None
+        selected = None
+        if record_ref is not None:
+            paper = next(
+                (item for item in metadata["papers"]
+                 if record_ref == ("doi:" + item["doi"].strip().lower()
+                                   if item.get("doi") else "url:" + canonical_hash(item["url"].strip())[:32])),
+                None,
+            )
+            if paper is None:
+                raise OwnerConflict("content_source_unbound")
+            selected = next(
+                (item for item in metadata["fulltexts"] if item["paper_url"] == paper["url"]),
+                None,
+            )
+            expected_path = None if selected is None else "fulltexts/" + selected["content_hash"]
+            if entry_path is not None and entry_path != expected_path:
+                raise OwnerConflict("content_entry_invalid")
+            if selected is None:
+                if evidence_basis_ref not in {None, record_ref}:
+                    raise OwnerConflict("content_source_unbound")
+                return {
+                    **context_read_page(paper, path=[], offset=offset, limit=min(limit, 16384)),
+                    "paper": paper,
+                }
+            if evidence_basis_ref is not None and evidence_basis_ref != selected["content_hash"]:
+                raise OwnerConflict("content_source_unbound")
+        elif entry_path not in {None, "summary.md"}:
+            selected = next(
+                (item for item in metadata["fulltexts"]
+                 if entry_path == "fulltexts/" + item["content_hash"]),
+                None,
+            )
+            if selected is None:
+                raise OwnerConflict("content_entry_invalid")
+            paper = next(
+                (item for item in metadata["papers"] if item["url"] == selected["paper_url"]),
+                None,
+            )
+        body = metadata["summary_body"] if selected is None else selected["body"]
+        result = self._literature_content_pages.read_page(body, offset=offset, limit=limit)
         return {
-            **accepted.as_public_dict(),
-            "summary": summary,
-            "papers": papers,
-            "papers_ledger": papers_ledger,
-            "fulltexts": fulltexts,
-            "web_evidence": web_evidence,
+            **result, "source_ref": record_ref or snapshot_ref, "version_ref": snapshot_ref,
+            "content_hash": metadata["summary_hash"] if selected is None else selected["content_hash"],
+            "snapshot_hash": metadata["snapshot_hash"], "paper": paper,
+            "entry_path": "summary.md" if selected is None else "fulltexts/" + selected["content_hash"],
         }
+
+    def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]:
+        metadata = self.read_literature_snapshot_metadata(snapshot_ref)
+        summary_body = metadata.pop("summary_body")
+        return {**metadata, "summary": self._literature_content_pages.read_all(summary_body),
+                "fulltexts": [{"paper_url": item["paper_url"], "media_type": item["media_type"],
+                               "content_hash": item["content_hash"], "content": self._literature_content_pages.read_all(item["body"])}
+                              for item in metadata["fulltexts"]]}
 
     def read_literature_proposal_evidence(
         self, snapshot_ref: str
@@ -8683,7 +9299,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             raise OwnerConflict("question_literature_source_snapshot_invalid")
         if source.quest_ref is not None and source.quest_ref != question_binding.quest_ref:
             raise OwnerConflict("question_literature_source_snapshot_foreign")
-        snapshot_document = self.read_literature_snapshot(source.snapshot_ref)
+        snapshot_document = self.read_literature_snapshot_metadata(source.snapshot_ref)
         records = _question_literature_records(snapshot_document)
         records_json = canonical_json(records)
         records_hash = canonical_hash(records)
@@ -9042,6 +9658,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         finally:
             os.close(directory_descriptor)
         return str(destination.relative_to(self._object_store))
+
+    def query_question_literature_revision_ref(self, *, question_ref, revision_ref):
+        return self._receipt_verifier.query_question_literature_revision_ref(question_ref=question_ref,revision_ref=revision_ref)
 
 
 def _validated_literature_result(
@@ -10266,6 +10885,7 @@ def _valid_portable_asset_name(value: str) -> bool:
     return "/" not in value and _valid_portable_asset_path(value)
 
 
+@functools.lru_cache(maxsize=65536)
 def _valid_portable_asset_path(value: str) -> bool:
     if not value or "\\" in value or "\x00" in value:
         return False
@@ -10301,8 +10921,8 @@ def _parse_writing_source_locator(
     return located.group(2), path, int(located.group(3))
 
 
-def _valid_portable_asset_component(value: str) -> bool:
-    reserved = {
+_WINDOWS_RESERVED_COMPONENT_NAMES = frozenset(
+    {
         "CON",
         "PRN",
         "AUX",
@@ -10310,6 +10930,12 @@ def _valid_portable_asset_component(value: str) -> bool:
         *(f"COM{index}" for index in range(1, 10)),
         *(f"LPT{index}" for index in range(1, 10)),
     }
+)
+
+
+@functools.lru_cache(maxsize=262144)
+def _valid_portable_asset_component(value: str) -> bool:
+    reserved = _WINDOWS_RESERVED_COMPONENT_NAMES
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -10466,6 +11092,7 @@ def _scan_directory_content(
     *,
     ignored_top_level: tuple[str, ...] = (),
     enforce_limits: bool = True,
+    store_file: Callable[[Path, int], tuple[str, str]] | None = None,
 ) -> tuple[list[str], list[dict[str, object]]]:
     directories: list[str] = []
     entries: list[dict[str, object]] = []
@@ -10479,12 +11106,17 @@ def _scan_directory_content(
     ):
         root_path = Path(root)
         retained_directories: list[str] = []
+        portable_names: set[str] = set()
         for name in sorted(directory_names):
             candidate = root_path / name
             if name in ignored_top_level:
                 continue
             if candidate.is_symlink():
                 raise OwnerConflict("asset_source_symlink_unsupported")
+            portable_key = unicodedata.normalize("NFC", name).casefold()
+            if portable_key in portable_names:
+                raise OwnerConflict("asset_source_entry_unsupported")
+            portable_names.add(portable_key)
             retained_directories.append(name)
             relative_directory = candidate.relative_to(source).as_posix()
             if not _valid_portable_asset_path(relative_directory):
@@ -10502,6 +11134,10 @@ def _scan_directory_content(
                 raise OwnerConflict("asset_source_symlink_unsupported")
             if not candidate.is_file():
                 raise OwnerConflict("asset_source_entry_unsupported")
+            portable_key = unicodedata.normalize("NFC", name).casefold()
+            if portable_key in portable_names:
+                raise OwnerConflict("asset_source_entry_unsupported")
+            portable_names.add(portable_key)
             entry_count += 1
             try:
                 size = candidate.stat().st_size
@@ -10512,20 +11148,24 @@ def _scan_directory_content(
                 or size > MAX_ASSET_BYTES - total_bytes
             ):
                 raise OwnerConflict("asset_source_too_large")
-            entries.append(
-                {
-                    "path": candidate.relative_to(source).as_posix(),
-                    "sha256": _sha256_exact_file(
-                        candidate,
-                        size,
-                        unavailable_code="asset_source_unavailable",
-                        mismatch_code="asset_source_changed_during_intake",
-                    ),
-                    "size": size,
-                }
-            )
-            if not _valid_portable_asset_path(str(entries[-1]["path"])):
+            relative_path = candidate.relative_to(source).as_posix()
+            if not _valid_portable_asset_path(relative_path):
                 raise OwnerConflict("asset_source_entry_unsupported")
+            if store_file is None:
+                digest = _sha256_exact_file(
+                    candidate,
+                    size,
+                    unavailable_code="asset_source_unavailable",
+                    mismatch_code="asset_source_changed_during_intake",
+                )
+                entry = {"path": relative_path, "sha256": digest, "size": size}
+            else:
+                digest, object_path = store_file(candidate, size)
+                entry = {
+                    "path": relative_path, "sha256": digest,
+                    "size": size, "object_path": object_path,
+                }
+            entries.append(entry)
             total_bytes += size
     directories.sort()
     entries.sort(key=lambda entry: str(entry["path"]))
@@ -10536,9 +11176,31 @@ def _raise_asset_walk_error(error: OSError) -> None:
     raise OwnerConflict("asset_source_unavailable") from error
 
 
+_OBJECT_FINGERPRINT_LIMIT = 32768
+_object_fingerprints: dict[str, tuple[int, int, int, str]] = {}
+
+
 def _file_matches(path: Path, expected_size: int, expected_hash: str) -> bool:
+    """Exact content check with a process-local stat fingerprint.
+
+    A managed object this process already deep-verified for the same
+    expected size, hash and mtime cannot change on disk without the
+    stat fingerprint changing first, so repeat reads stat instead of
+    re-hashing; any drift falls straight back to the full content
+    hash. Corruption keeps failing immediately either way.
+    """
     try:
-        return (
+        status = path.stat()
+    except OSError:
+        return False
+    fingerprint = (
+        status.st_size, status.st_mtime_ns, expected_size, expected_hash
+    )
+    key = str(path)
+    if _object_fingerprints.get(key) == fingerprint:
+        return status.st_size == expected_size
+    try:
+        matched = (
             _sha256_exact_file(
                 path,
                 expected_size,
@@ -10549,6 +11211,11 @@ def _file_matches(path: Path, expected_size: int, expected_hash: str) -> bool:
         )
     except (OSError, OwnerConflict):
         return False
+    if matched:
+        if len(_object_fingerprints) >= _OBJECT_FINGERPRINT_LIMIT:
+            _object_fingerprints.clear()
+        _object_fingerprints[key] = fingerprint
+    return matched
 
 
 def _sha256_exact_file(
@@ -10576,6 +11243,53 @@ def _sha256_exact_file(
         raise
     except OSError as error:
         raise OwnerConflict(unavailable_code) from error
+    return digest.hexdigest()
+
+
+def _copy_exact_file(
+    path: Path,
+    output: _AssetByteSink,
+    expected_size: int,
+    expected_hash: str | None = None,
+    *,
+    unavailable_code: str,
+    mismatch_code: str,
+    output_unavailable_code: str | None = None,
+) -> str:
+    digest = hashlib.sha256()
+    try:
+        with _open_asset_regular_file(path, unavailable_code) as source:
+            before = os.fstat(source.fileno())
+            if before.st_size != expected_size:
+                raise OwnerConflict(mismatch_code)
+            remaining = expected_size
+            while remaining:
+                chunk = source.read(min(ASSET_HASH_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise OwnerConflict(mismatch_code)
+                try:
+                    output.write(chunk)
+                except OSError as error:
+                    if output_unavailable_code is not None:
+                        raise OwnerConflict(output_unavailable_code) from error
+                    raise
+                digest.update(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(source.fileno())
+            if source.read(1) or (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            ) != (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            ):
+                raise OwnerConflict(mismatch_code)
+    except OwnerConflict:
+        raise
+    except OSError as error:
+        raise OwnerConflict(unavailable_code) from error
+    if expected_hash is not None and digest.hexdigest() != expected_hash:
+        raise OwnerConflict(mismatch_code)
     return digest.hexdigest()
 
 
@@ -10797,7 +11511,59 @@ def _accepted_release_assessment(row) -> ReleaseEligibilityAssessment:
     )
 
 
+_ASSET_METADATA_MEMO_LIMIT = 4096
+_asset_metadata_memo: dict[
+    tuple[object, ...], tuple[dict[str, object], dict[str, object]]
+] = {}
+
+
 def _verify_asset_metadata(
+    row,
+    custodies,
+    *,
+    require_portable_paths: bool = True,
+    summarize_oversized_provenance: bool = False,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Serve immutable accepted metadata from a content-keyed memo.
+
+    Every verification input is part of the stored receipt binding:
+    the full version row, the full custody rows, and the flags. Rows
+    are append-only once accepted, so an equal key implies an equal
+    verified result; any column change produces a fresh full
+    verification. Only successes are memoized, and every caller
+    receives its own copy.
+    """
+    try:
+        key = (
+            tuple(row),
+            tuple(tuple(custody) for custody in custodies),
+            require_portable_paths,
+            summarize_oversized_provenance,
+        )
+        hash(key)
+    except TypeError:
+        return _verify_asset_metadata_exact(
+            row,
+            custodies,
+            require_portable_paths=require_portable_paths,
+            summarize_oversized_provenance=summarize_oversized_provenance,
+        )
+    cached = _asset_metadata_memo.get(key)
+    if cached is None:
+        cached = _verify_asset_metadata_exact(
+            row,
+            custodies,
+            require_portable_paths=require_portable_paths,
+            summarize_oversized_provenance=summarize_oversized_provenance,
+        )
+        if len(_asset_metadata_memo) >= _ASSET_METADATA_MEMO_LIMIT:
+            _asset_metadata_memo.clear()
+        _asset_metadata_memo[key] = deepcopy(cached)
+        return cached
+    return deepcopy(cached)
+
+
+def _verify_asset_metadata_exact(
     row,
     custodies,
     *,
@@ -11069,8 +11835,11 @@ def _asset_current_state(
     entry_count = len(manifest["entries"]) + len(manifest.get("directories", []))
     oversized = int(row.byte_count) > MAX_ASSET_BYTES or entry_count > MAX_ASSET_FILES
     if oversized and not (
-        allow_large_linked
-        and any(custody.custody_mode == "linked_local" for custody in custodies)
+        any(custody.custody_mode == "managed" for custody in custodies)
+        or (
+            allow_large_linked
+            and any(custody.custody_mode == "linked_local" for custody in custodies)
+        )
     ):
         return "unknown", "unavailable"
     entries = manifest["entries"]
@@ -11239,6 +12008,63 @@ def _materialized_entry_content(
             )
         except (OSError, OwnerConflict):
             continue
+    raise OwnerConflict("asset_custody_unavailable")
+
+
+def _asset_entry_sources(
+    object_store: Path, row, custodies,
+    manifest: dict[str, object], entry: dict[str, object],
+) -> Iterator[Path]:
+    if any(custody.custody_mode == "managed" for custody in custodies):
+        object_path = entry.get("object_path")
+        if not isinstance(object_path, str):
+            object_path = _managed_asset_object_path(str(entry["sha256"]))
+        try:
+            yield _managed_object_candidate(object_store, object_path)
+        except (OSError, OwnerConflict):
+            pass
+    for source in _receipt_bound_asset_sources(row, custodies):
+        try:
+            if source.is_symlink():
+                continue
+            if manifest["kind"] == "file":
+                candidate = source
+            else:
+                root = source.resolve(strict=True)
+                candidate = root / str(entry["path"])
+                if candidate.is_symlink():
+                    continue
+                candidate = candidate.resolve(strict=True)
+                if not candidate.is_relative_to(root):
+                    continue
+            if not candidate.is_symlink() and candidate.is_file():
+                yield candidate
+        except (OSError, OwnerConflict):
+            continue
+
+
+def _export_asset_entry(
+    object_store: Path, row, custodies,
+    manifest: dict[str, object], entry: dict[str, object], output_path: Path,
+) -> None:
+    for candidate in _asset_entry_sources(object_store, row, custodies, manifest, entry):
+        try:
+            with output_path.open("wb") as output:
+                _copy_exact_file(
+                    candidate, output, int(entry["size"]), str(entry["sha256"]),
+                    unavailable_code="asset_custody_unavailable",
+                    mismatch_code="asset_custody_unavailable",
+                    output_unavailable_code="asset_export_destination_unavailable",
+                )
+                output.flush()
+                os.fsync(output.fileno())
+            output_path.chmod(0o600)
+            return
+        except OwnerConflict as error:
+            if error.code not in {
+                "asset_custody_unavailable", "asset_source_entry_unsupported",
+            }:
+                raise
     raise OwnerConflict("asset_custody_unavailable")
 
 
@@ -11900,44 +12726,15 @@ def _read_verified_plan_payload(
 
 
 def _frozen_reasoning_evidence_closure(
-    context_pack: dict[str, object],
-    *,
-    revision_verifier,
+    context_pack: dict[str, object], *, revision_verifier,
+    revision_reader=None, cited_documents=None,
 ) -> list[dict[str, object]]:
-    literature_input = context_pack.get("question_literature_input")
-    if not isinstance(literature_input, dict) or literature_input.get(
-        "kind"
-    ) not in {"none", "revision"}:
-        raise OwnerConflict("reasoning_literature_binding_invalid")
-    evidence: list[dict[str, object]] = []
-    if literature_input.get("kind") == "none":
-        if set(literature_input) != {"kind"}:
-            raise OwnerConflict("reasoning_literature_binding_invalid")
-    else:
-        if set(literature_input) != {"kind", "revision_ref", "binding"}:
-            raise OwnerConflict("reasoning_literature_binding_invalid")
-        revision = literature_input.get("binding")
-        if (
-            not isinstance(revision, dict)
-            or revision.get("revision_ref")
-            != literature_input.get("revision_ref")
-        ):
-            raise OwnerConflict("question_literature_revision_invalid")
-        revision_verifier(revision)
-        records = revision.get("records")
-        if not isinstance(records, list):
-            raise OwnerConflict("reasoning_literature_binding_invalid")
-        for record in records:
-            if not isinstance(record, dict):
-                raise OwnerConflict("reasoning_literature_binding_invalid")
-            evidence.append(
-                {
-                    "kind": "LiteratureRecord",
-                    "ref": record.get("ref"),
-                    "evidence_basis": record.get("evidence_basis"),
-                    "evidence_basis_ref": record.get("evidence_basis_ref"),
-                }
-            )
+    from meta_research.reasoning_literature import reasoning_literature_leaves
+    evidence = reasoning_literature_leaves(context_pack,
+        revision_reader=revision_reader,
+        revision_verifier=revision_verifier,
+        cited_documents=cited_documents,
+    )
     try:
         evidence.extend(plan_evidence_reuse_metric_leaves(context_pack))
     except ReasoningContractError as error:
@@ -11948,6 +12745,30 @@ def _frozen_reasoning_evidence_closure(
     for closure in target_closures:
         if not isinstance(closure, dict):
             raise OwnerConflict("reasoning_target_closure_invalid")
+        # Completed research work can await assessment or retain a failed one.
+        # Its accepted closure and RM assets remain in the ContextPack; neither
+        # supplies a MetricResult citation until an assessment actually exists.
+        # Since ADR 0005 the unmeasured commit itself is adoptable as work
+        # evidence through a WorkProduct leaf grounded on its commit receipt.
+        if closure.get("formal_measurement_accepted") is False:
+            commit_ref = closure.get("target_commit_ref")
+            work_run_ref = closure.get("variant_run_ref")
+            target_receipt_ref = (
+                closure.get("rg_target_commit_receipt", {}).get("receipt_ref")
+                if isinstance(closure.get("rg_target_commit_receipt"), dict)
+                else None
+            )
+            if (not isinstance(commit_ref, str) or not commit_ref
+                    or not isinstance(work_run_ref, str) or not work_run_ref
+                    or not isinstance(target_receipt_ref, str) or not target_receipt_ref):
+                raise OwnerConflict("reasoning_target_closure_invalid")
+            evidence.append({
+                "kind": "WorkProduct",
+                "ref": commit_ref,
+                "source_subject_ref": work_run_ref,
+                "owner_acceptance_receipt_ref": target_receipt_ref,
+            })
+            continue
         metric_ref = closure.get("metric_result_ref")
         attempt_ref = closure.get("evaluation_attempt_ref")
         target_receipt = closure.get("rg_target_commit_receipt")
@@ -12050,96 +12871,15 @@ def _verify_reasoning_plan_evidence_reuse_authority(
         raise OwnerConflict("reasoning_plan_evidence_closure_invalid")
 
 
-def _validate_reasoning_review(
-    review: dict[str, object],
-    *,
-    reviewed_draft_hash: str,
-    final_output_hash: str,
-) -> str:
-    if not isinstance(review, dict) or set(review) != {
-        "schema_ref",
-        "review_mode",
-        "reviewer_agent_ref",
-        "reviewed_draft_hash",
-        "findings",
-        "dispositions",
-        "final_output_hash",
-        "independent",
-        "advisory_only",
-    } or (
-        review.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
-        or review.get("reviewed_draft_hash") != reviewed_draft_hash
+def _validate_reasoning_review(review: dict[str, object], *, final_output_hash: str, reviewed_draft_hash: str) -> str:
+    """Bind draft and final bytes; review feedback is part of native execution."""
+    if (not isinstance(review, dict) or set(review) != {"schema_ref", "reviewed_draft_hash", "final_output_hash"}
+        or review.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
         or review.get("final_output_hash") != final_output_hash
-        or review.get("advisory_only") is not True
-    ):
-        raise ReasoningContractError("reasoning_review_invalid")
-    review_mode = review.get("review_mode")
-    reviewer_agent_ref = review.get("reviewer_agent_ref")
-    if review_mode == "advisory_unobserved":
-        if reviewer_agent_ref is not None or review.get("independent") is not False:
-            raise ReasoningContractError("reasoning_review_invalid")
-    elif review_mode == "harness_child_agent":
-        # Immutable historical AR receipts remain readable. AR's current write
-        # gate no longer permits this provenance shape.
-        if (
-            not isinstance(reviewer_agent_ref, str)
-            or not reviewer_agent_ref.strip()
-            or review.get("independent") is not True
-        ):
-            raise ReasoningContractError("reasoning_review_invalid")
-    else:
-        raise ReasoningContractError("reasoning_review_invalid")
-    findings = review.get("findings")
-    dispositions = review.get("dispositions")
-    if not isinstance(findings, list) or not isinstance(dispositions, list):
-        raise ReasoningContractError("reasoning_review_invalid")
-    categories = {
-        "source_binding",
-        "evidence_boundary",
-        "disposition_boundary",
-        "transition_boundary",
-        "owner_boundary",
-        "research_synthesis",
-    }
-    finding_ids: list[str] = []
-    for finding in findings:
-        if not isinstance(finding, dict) or set(finding) != {
-            "finding_id",
-            "category",
-            "message",
-        } or (
-            not isinstance(finding.get("finding_id"), str)
-            or not finding["finding_id"]
-            or finding.get("category") not in categories
-            or not isinstance(finding.get("message"), str)
-            or not finding["message"]
-        ):
-            raise ReasoningContractError("reasoning_review_finding_invalid")
-        finding_ids.append(finding["finding_id"])
-    if len(finding_ids) != len(set(finding_ids)):
-        raise ReasoningContractError("reasoning_review_finding_invalid")
-    disposition_ids: list[str] = []
-    revised = False
-    for disposition in dispositions:
-        if not isinstance(disposition, dict) or set(disposition) != {
-            "finding_id",
-            "action",
-            "rationale",
-        } or (
-            not isinstance(disposition.get("finding_id"), str)
-            or disposition.get("action") not in {"revised", "not_adopted"}
-            or not isinstance(disposition.get("rationale"), str)
-            or not disposition["rationale"]
-        ):
-            raise ReasoningContractError(
-                "reasoning_review_disposition_invalid"
-            )
-        disposition_ids.append(disposition["finding_id"])
-        revised = revised or disposition["action"] == "revised"
-    if disposition_ids != finding_ids or (
-        reviewed_draft_hash != final_output_hash
-    ) != revised:
-        raise ReasoningContractError("reasoning_review_disposition_invalid")
+        or not isinstance(review.get("reviewed_draft_hash"), str)
+        or len(review["reviewed_draft_hash"]) != 64
+        or (reviewed_draft_hash is not None and review["reviewed_draft_hash"] != reviewed_draft_hash)):
+        raise ReasoningContractError("reasoning_review_binding_invalid")
     return canonical_hash(review)
 
 
@@ -12161,10 +12901,39 @@ def _verify_reasoning_scientific_candidate_object(object_store: Path, row) -> No
         raise OwnerConflict("reasoning_scientific_candidate_custody_unavailable")
 
 
+def _historical_evidence_resolver(
+    reference_reader,
+    quest_ref: object,
+) -> Callable[[str], dict[str, object] | None] | None:
+    """Bind the Quest-scoped resolver for verified earlier-cycle citations.
+
+    The RG-side reader is reached defensively so handles without the method
+    keep their exact previous behavior, and a non-text quest_ref resolves
+    nothing: the validators then still fail the citation exactly as before.
+    """
+
+    resolve_leaf = getattr(
+        reference_reader, "resolve_reasoning_historical_evidence_leaf", None
+    )
+    if (
+        not callable(resolve_leaf)
+        or not isinstance(quest_ref, str)
+        or not quest_ref
+    ):
+        return None
+
+    def resolve(cited_ref: str) -> dict[str, object] | None:
+        return resolve_leaf(quest_ref=quest_ref, ref=cited_ref)
+
+    return resolve
+
+
 def _verify_reasoning_scientific_candidate_payload(
     row,
     *,
     revision_verifier,
+    revision_reader=None,
+    reference_reader=None,
 ) -> tuple[
     dict[str, object],
     dict[str, object],
@@ -12209,15 +12978,20 @@ def _verify_reasoning_scientific_candidate_payload(
         or scientific_outcome.get("foreground_epoch")
         != int(row.foreground_epoch)
         or row.checkpoint_receipt_kind
-        != REASONING_AUTONOMOUS_CHECKPOINT_RECEIPT_KIND
+        != "reasoning_autonomous_decision"
     ):
         raise OwnerConflict("reasoning_scientific_candidate_invalid")
     rebuilt_closure = _frozen_reasoning_evidence_closure(
         context_pack,
         revision_verifier=revision_verifier,
+        revision_reader=revision_reader,
+        cited_documents=(checkpoint,),
     )
     if rebuilt_closure != evidence_closure:
         raise OwnerConflict("reasoning_evidence_closure_invalid")
+    historical_resolver = _historical_evidence_resolver(
+        reference_reader, scientific_outcome.get("quest_ref")
+    )
     try:
         checkpoint_hash, outcome_hash, scope_hash = (
             validate_reasoning_autonomous_checkpoint(
@@ -12226,6 +13000,7 @@ def _verify_reasoning_scientific_candidate_payload(
                 frozen_research_context=cast(
                     dict[str, object], context_pack["research_context"]
                 ),
+                historical_resolver=historical_resolver,
             )
         )
         if validate_autonomous_question_scope(
@@ -12277,6 +13052,8 @@ def _verify_reasoning_payload(
     row,
     *,
     revision_verifier,
+    revision_reader=None,
+    reference_reader=None,
 ) -> tuple[
     dict[str, object],
     dict[str, object],
@@ -12345,9 +13122,16 @@ def _verify_reasoning_payload(
     rebuilt_closure = _frozen_reasoning_evidence_closure(
         context_pack,
         revision_verifier=revision_verifier,
+        revision_reader=revision_reader,
+        cited_documents=(outcome, reviewed_draft),
     )
     if rebuilt_closure != evidence_closure:
         raise OwnerConflict("reasoning_evidence_closure_invalid")
+    # One Quest scope covers the final outcome and its reviewed draft: both
+    # must bind to this pack's single frozen research context.
+    historical_resolver = _historical_evidence_resolver(
+        reference_reader, scientific_outcome.get("quest_ref")
+    )
     try:
         expected_completion_basis = (
             completion_milestone_basis_refs(context_pack)
@@ -12365,9 +13149,10 @@ def _verify_reasoning_payload(
                 expected_completion_milestone_basis_refs=(
                     expected_completion_basis
                 ),
+                historical_resolver=historical_resolver,
             )
         )
-        if row.scientific_candidate_content_ref is not None:
+        if reviewed_draft.get("schema_ref") == REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA:
             draft_hash, _draft_outcome_hash, _draft_scope_hash = (
                 validate_reasoning_autonomous_checkpoint(
                     reviewed_draft,
@@ -12375,6 +13160,7 @@ def _verify_reasoning_payload(
                     frozen_research_context=cast(
                         dict[str, object], context_pack["research_context"]
                     ),
+                    historical_resolver=historical_resolver,
                 )
             )
         else:
@@ -12388,6 +13174,7 @@ def _verify_reasoning_payload(
                     expected_completion_milestone_basis_refs=(
                         expected_completion_basis
                     ),
+                    historical_resolver=historical_resolver,
                 )
             )
         review_hash = _validate_reasoning_review(
@@ -12623,32 +13410,6 @@ def _reuse_idempotency_key(value: str) -> str:
     return value
 
 
-def _validate_reuse_tier_metadata(
-    *,
-    tier: str,
-    license_ref: str | None,
-    source_content_hash_ref: str | None,
-    patch_ref: str | None,
-) -> None:
-    if tier not in {
-        "accepted-local",
-        "related-history",
-        "global-baseline-pool",
-        "mature-external",
-        "self-implementation",
-    }:
-        raise OwnerConflict("reuse_tier_invalid")
-    _optional_reuse_ref(license_ref, "reuse_license_ref_invalid")
-    _optional_sha256(
-        source_content_hash_ref, "reuse_source_content_hash_ref_invalid"
-    )
-    _optional_reuse_ref(patch_ref, "reuse_patch_ref_invalid")
-    if tier == "mature-external" and (
-        license_ref is None or source_content_hash_ref is None
-    ):
-        raise OwnerConflict("mature_external_source_proof_incomplete")
-
-
 def _content_receipt_hash(row) -> str:
     return _receipt_hash(
         CONTENT_RECEIPT_KIND,
@@ -12822,19 +13583,13 @@ def _reasoning_scientific_candidate_receipt_hash(row) -> str:
     )
 
 
-def _autonomous_question_source_basis_hash(
-    candidate: AcceptedReasoningScientificCandidate,
-) -> str:
-    return canonical_hash(
-        {
-            "reasoning_checkpoint_ref": candidate.checkpoint_ref,
-            "reasoning_checkpoint_hash": candidate.checkpoint_hash,
-            "source_scientific_outcome_ref": (
-                candidate.scientific_outcome_ref
-            ),
-            "autonomous_scope_hash": candidate.autonomous_scope_hash,
-        }
-    )
+def _autonomous_question_source_basis_hash(candidate: AcceptedReasoningScientificCandidate, execution_verifier) -> str:
+    decision = execution_verifier.query_reasoning_autonomous_decision(candidate.checkpoint_ref)
+    if (decision is None or decision["decision"]["action"] != "create"
+        or decision["receipt"] != candidate.checkpoint_receipt.as_public_dict()
+        or decision["decision"]["final_output"] != candidate.checkpoint):
+        raise OwnerConflict("autonomous_question_continuation_invalid")
+    return decision["facts"]["context_basis_hash"]
 
 
 def _autonomous_question_content_bindings(row) -> dict[str, object]:
@@ -13108,6 +13863,8 @@ def _accepted_plan_document(
 
 def _accepted_reasoning_scientific_candidate(
     row,
+    revision_reader=None,
+    reference_reader=None,
 ) -> AcceptedReasoningScientificCandidate:
     (
         checkpoint,
@@ -13118,6 +13875,8 @@ def _accepted_reasoning_scientific_candidate(
     ) = _verify_reasoning_scientific_candidate_payload(
         row,
         revision_verifier=lambda _binding: None,
+        revision_reader=revision_reader,
+        reference_reader=reference_reader,
     )
     _verify_reasoning_scientific_candidate_object_path_shape(row)
     return AcceptedReasoningScientificCandidate(
@@ -13172,6 +13931,8 @@ def _accepted_reasoning_scientific_candidate(
 def _verify_autonomous_question_content_payload(
     row,
     candidate_row,
+    revision_reader=None,
+    reference_reader=None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     try:
         proposal = decoded_object(row.proposal_json)
@@ -13181,7 +13942,11 @@ def _verify_autonomous_question_content_payload(
     candidate = (
         candidate_row
         if isinstance(candidate_row, AcceptedReasoningScientificCandidate)
-        else _accepted_reasoning_scientific_candidate(candidate_row)
+        else _accepted_reasoning_scientific_candidate(
+            candidate_row,
+            revision_reader=revision_reader,
+            reference_reader=reference_reader,
+        )
     )
     try:
         expected_proposal = autonomous_question_proposal_from_scope(
@@ -13217,9 +13982,14 @@ def _verify_autonomous_question_content_payload(
 def _accepted_autonomous_question_content(
     row,
     candidate: AcceptedReasoningScientificCandidate,
+    revision_reader=None,
+    reference_reader=None,
 ) -> AcceptedAutonomousQuestionContent:
     proposal, question = _verify_autonomous_question_content_payload(
         row, candidate
+    ,
+        revision_reader=revision_reader,
+        reference_reader=reference_reader,
     )
     _verify_autonomous_question_content_object_path_shape(row)
     return AcceptedAutonomousQuestionContent(
@@ -13275,7 +14045,11 @@ def _accepted_autonomous_question_content(
     )
 
 
-def _accepted_reasoning_content(row) -> AcceptedReasoningContent:
+def _accepted_reasoning_content(
+    row,
+    revision_reader=None,
+    reference_reader=None,
+) -> AcceptedReasoningContent:
     (
         outcome,
         scientific_outcome,
@@ -13286,6 +14060,8 @@ def _accepted_reasoning_content(row) -> AcceptedReasoningContent:
     ) = _verify_reasoning_payload(
         row,
         revision_verifier=lambda _binding: None,
+        revision_reader=revision_reader,
+        reference_reader=reference_reader,
     )
     _verify_reasoning_object_path_shape(row)
     return AcceptedReasoningContent(

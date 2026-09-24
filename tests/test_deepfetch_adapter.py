@@ -1677,8 +1677,11 @@ def test_codex_deepfetch_retires_signed_gate_ack_loss_without_new_effect(
     with pytest.raises(DeepFetchUnavailable) as failure:
         adapter.execute(replace(request, reconcile_only=True))
 
-    assert failure.value.code == "deepfetch_provider_reconciliation_pending"
-    assert failure.value.durable_outcome == "pending"
+    # A verified completed gate is terminal; continuing it would dispatch a
+    # new old-binding effect. MCP invocation metadata must not hide that fact.
+    assert failure.value.code == "deepfetch_runtime_binding_transition_required"
+    assert failure.value.durable_outcome == "terminal"
+    assert failure.value.native_session_ref == "native-many-durable-segments"
     assert tuple(runner.calls) == calls_before
     assert acquisition.calls == []
     assert checkpoint_path.read_bytes() == checkpoint_before
@@ -3342,7 +3345,7 @@ def test_codex_deepfetch_uses_live_web_in_a_dedicated_full_access_root_session(
     ]
     assert "mcp_servers={}" not in config_values
     assert 'approval_policy="never"' in config_values
-    assert 'model_reasoning_effort="max"' in config_values
+    assert 'model_reasoning_effort="ultra"' in config_values
     assert 'web_search="live"' in config_values
     enabled = {
         argv[index + 1]
@@ -3350,19 +3353,19 @@ def test_codex_deepfetch_uses_live_web_in_a_dedicated_full_access_root_session(
         if value == "--enable"
     }
     assert {"multi_agent", "plugins", "remote_plugin", "hooks"} <= enabled
-    assert argv[argv.index("--model") + 1] == "gpt-5.6-sol"
+    assert argv[argv.index("--model") + 1] == "gpt-6-sol"
     assert gate_argv[-1] == "-"
     assert gate_timeout is None
     assert "web_evidence_gate=v1" in gate_prompt
     assert "Codex 默认工具能力保持可用" in gate_prompt
     assert "禁止使用 shell" not in gate_prompt
-    assert gate_argv[gate_argv.index("--model") + 1] == "gpt-5.6-sol"
+    assert gate_argv[gate_argv.index("--model") + 1] == "gpt-6-sol"
     gate_config_values = [
         gate_argv[index + 1]
         for index, value in enumerate(gate_argv)
         if value == "--config"
     ]
-    assert 'model_reasoning_effort="max"' in gate_config_values
+    assert 'model_reasoning_effort="ultra"' in gate_config_values
     assert "mcp_servers={}" not in gate_config_values
     assert argv[-3:] == ["resume", result.native_session_ref, "-"]
     assert "draft_revision=3" in prompt
@@ -3376,9 +3379,10 @@ def test_codex_deepfetch_uses_live_web_in_a_dedicated_full_access_root_session(
         "web-search-live",
     )
     assert (
-        "codex-config:model_reasoning_effort=max"
+        "codex-config:model_reasoning_effort=ultra"
         in adapter.runtime_binding().capability_bindings
     )
+    assert "codex-effective:reasoning.effort=max" in adapter.runtime_binding().capability_bindings
     assert "root-capability-floor:v3" in (
         adapter.runtime_binding().capability_bindings
     )
@@ -3790,8 +3794,8 @@ else:
         for index, value in enumerate(durable_argv)
         if value == "--config"
     ]
-    assert 'model_reasoning_effort="max"' in durable_config_values
-    assert durable_argv[durable_argv.index("--model") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="ultra"' in durable_config_values
+    assert durable_argv[durable_argv.index("--model") + 1] == "gpt-6-sol"
 
 
 def test_durable_stop_before_thread_start_allows_a_new_provider_operation(

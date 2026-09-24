@@ -11,9 +11,6 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 
 from meta_research.bundle_protocol import (
-    GREENFIELD_EXCEPTIONS,
-    REUSE_TIER_ORDER,
-    REUSE_TIERS,
     AcceptedMeasurementClosure,
     BundleProtocolError,
     BundleReport,
@@ -22,7 +19,6 @@ from meta_research.bundle_protocol import (
     FormalPlan,
     HeldFixedBinding,
     ReceiptProof,
-    ReuseTrace,
     SemanticBarrier,
     StageRunRequest,
     TargetCandidate,
@@ -31,14 +27,6 @@ from meta_research.bundle_protocol import (
     validate_bundle_report,
     validate_closed_bundle_projection,
     validate_receipt_proof,
-)
-
-
-_OWNER_ELIGIBLE_REUSE_TIERS = frozenset(
-    {"accepted-local", "related-history", "global-baseline-pool"}
-)
-_REUSE_DISPOSITIONS = frozenset(
-    {"selected", "rejected", "not_found", "not_applicable"}
 )
 
 
@@ -118,189 +106,6 @@ def _binding_map(bindings: tuple[HeldFixedBinding, ...]) -> dict[str, str]:
     return result
 
 
-def _verify_reuse_trace(
-    trace: ReuseTrace,
-    expected_implementation_revision_ref: str,
-) -> tuple[str, ...]:
-    _validate_projection(trace, "ReuseTrace")
-    if not trace.tier_decisions:
-        raise BundleProtocolError("implementation reuse has no tier decision")
-    tiers = tuple(decision.tier for decision in trace.tier_decisions)
-    if not set(tiers) <= REUSE_TIERS:
-        raise BundleProtocolError("implementation reuse contains an unknown tier")
-    if len(tiers) != len(set(tiers)):
-        raise BundleProtocolError("implementation reuse repeats a tier")
-
-    selected_provenance_refs: list[str] = []
-    for decision in trace.tier_decisions:
-        if decision.disposition not in _REUSE_DISPOSITIONS:
-            raise BundleProtocolError("implementation reuse has an unknown disposition")
-        _require_ref(decision.reason_ref, "reuse tier reason")
-        if decision.disposition in {"not_found", "not_applicable"} and (
-            decision.source_proofs
-        ):
-            raise BundleProtocolError(
-                "implementation reuse absence disposition carries a source proof"
-            )
-        if len(decision.source_proofs) != len(set(decision.source_proofs)):
-            raise BundleProtocolError("implementation reuse repeats a source proof")
-        for source in decision.source_proofs:
-            _require_ref(source.source_ref, "reuse source")
-            _require_ref(source.exact_version_ref, "reuse source version")
-            _require_ref(
-                source.implementation_revision_ref,
-                "reuse Implementation Revision",
-            )
-            if source.eligible_tier != decision.tier:
-                raise BundleProtocolError("reuse source is eligible for another tier")
-            if source.implementation_binding.subject_ref != (
-                source.implementation_revision_ref
-            ):
-                raise BundleProtocolError(
-                    "reuse implementation binding points at another revision"
-                )
-            _require_ref(
-                source.implementation_binding.content_hash_ref,
-                "reuse implementation content hash",
-            )
-            _validate_receipt(
-                source.verification_receipt,
-                source.exact_version_ref,
-                "reuse source verification receipt",
-            )
-            _validate_receipt(
-                source.implementation_acceptance_receipt,
-                source.implementation_binding.content_hash_ref,
-                "reuse implementation acceptance receipt",
-            )
-            if source.eligible_tier == "mature-external" and (
-                source.license_ref is None or source.content_hash_ref is None
-            ):
-                raise BundleProtocolError(
-                    "mature external reuse lacks license or selected content hash"
-                )
-            eligibility = (
-                source.eligibility_anchor_ref,
-                source.eligibility_binding,
-                source.eligibility_receipt,
-            )
-            if source.eligible_tier in _OWNER_ELIGIBLE_REUSE_TIERS:
-                if any(value is None for value in eligibility):
-                    raise BundleProtocolError(
-                        "accepted reuse source lacks Owner eligibility evidence"
-                    )
-                assert source.eligibility_anchor_ref is not None
-                assert source.eligibility_binding is not None
-                assert source.eligibility_receipt is not None
-                _require_ref(
-                    source.eligibility_anchor_ref,
-                    "reuse eligible TargetCommit",
-                )
-                _require_ref(
-                    source.eligibility_binding.subject_ref,
-                    "reuse eligibility binding",
-                )
-                _require_ref(
-                    source.eligibility_binding.content_hash_ref,
-                    "reuse eligibility content hash",
-                )
-                _validate_receipt(
-                    source.eligibility_receipt,
-                    source.eligibility_binding.content_hash_ref,
-                    "reuse eligibility receipt",
-                )
-            elif any(value is not None for value in eligibility):
-                raise BundleProtocolError(
-                    "external or self implementation carries pool eligibility"
-                )
-            if decision.disposition == "selected":
-                if source.implementation_revision_ref != (
-                    expected_implementation_revision_ref
-                ):
-                    raise BundleProtocolError(
-                        "selected reuse source is not the executed revision"
-                    )
-                selected_provenance_refs.extend(
-                    (
-                        source.source_ref,
-                        source.exact_version_ref,
-                        source.verification_receipt.receipt_ref,
-                        source.implementation_revision_ref,
-                        source.implementation_binding.content_hash_ref,
-                        source.implementation_acceptance_receipt.receipt_ref,
-                    )
-                )
-
-    selected = tuple(
-        decision
-        for decision in trace.tier_decisions
-        if decision.disposition == "selected"
-    )
-    if len(selected) != 1 or not selected[0].source_proofs:
-        raise BundleProtocolError(
-            "implementation reuse lacks one selected exact source"
-        )
-    selected_tier = selected[0].tier
-    if trace.greenfield_exception is not None:
-        if (
-            selected_tier != "self-implementation"
-            or trace.greenfield_exception not in GREENFIELD_EXCEPTIONS
-        ):
-            raise BundleProtocolError("implementation reuse has an invalid exception")
-    else:
-        required_prior_tiers = set(
-            REUSE_TIER_ORDER[: REUSE_TIER_ORDER.index(selected_tier)]
-        )
-        if not required_prior_tiers <= set(tiers):
-            raise BundleProtocolError(
-                "implementation reuse skipped a nearer tier without a reason"
-            )
-    return tuple(dict.fromkeys(selected_provenance_refs))
-
-
-def _reuse_trace_audit_refs(trace: ReuseTrace) -> tuple[str, ...]:
-    """Return the fixed prototype's complete review-scope provenance refs."""
-
-    refs: list[str] = []
-    for decision in trace.tier_decisions:
-        refs.append(decision.reason_ref)
-        for source in decision.source_proofs:
-            refs.extend(
-                (
-                    source.source_ref,
-                    source.exact_version_ref,
-                    source.verification_receipt.receipt_ref,
-                    source.implementation_revision_ref,
-                    source.implementation_binding.content_hash_ref,
-                    source.implementation_acceptance_receipt.receipt_ref,
-                )
-            )
-            for value in (
-                source.eligibility_anchor_ref,
-                (
-                    source.eligibility_binding.subject_ref
-                    if source.eligibility_binding is not None
-                    else None
-                ),
-                (
-                    source.eligibility_binding.content_hash_ref
-                    if source.eligibility_binding is not None
-                    else None
-                ),
-                (
-                    source.eligibility_receipt.receipt_ref
-                    if source.eligibility_receipt is not None
-                    else None
-                ),
-                source.license_ref,
-                source.content_hash_ref,
-                source.patch_ref,
-            ):
-                if value is not None:
-                    refs.append(value)
-    return tuple(dict.fromkeys(refs))
-
-
 def _verify_candidate(
     candidate: TargetCandidate,
     briefs_by_key: Mapping[str, ExperimentBrief],
@@ -350,11 +155,10 @@ def _verify_candidate(
         raise BundleProtocolError(
             "Target candidate does not bind every held-fixed slot exactly once"
         )
-    implementation_revision_ref = _require_ref(
+    _require_ref(
         candidate.implementation_revision_ref,
         "ImplementationRevisionRef",
     )
-    _verify_reuse_trace(candidate.reuse_trace, implementation_revision_ref)
 
     route_refs = tuple(route.route_ref for route in candidate.routes)
     if not route_refs or len(route_refs) != len(set(route_refs)):
@@ -515,8 +319,6 @@ def _verify_accepted_closure(
         ("VariantRunRef", closure.variant_run_ref),
         ("EvaluationRef", closure.evaluation_ref),
         ("ProtocolVersionRef", closure.protocol_version_ref),
-        ("EvaluationAttemptRef", closure.evaluation_attempt_ref),
-        ("MetricResultRef", closure.metric_result_ref),
         ("AssetManifestRef", closure.asset_manifest_ref),
         ("ExecutionAttemptRef", closure.execution_attempt_ref),
         ("ExecutionFenceRef", closure.execution_fence_ref),
@@ -525,13 +327,27 @@ def _verify_accepted_closure(
     ):
         _require_ref(value, name)
     if (
-        closure.formal_measurement_accepted is not True
+        (closure.formal_measurement_accepted is not True and not (
+            closure.formal_measurement_accepted is False
+            and closure.root_completion_receipt is not None and not closure.metric_values
+        ))
         or closure.currentness_known is not True
         or closure.current is not True
     ):
         raise BundleProtocolError("measurement closure is unaccepted, stale, or unknown")
-    if not closure.metric_values:
-        raise BundleProtocolError("accepted EvaluationAttempt has no Metric values")
+    if closure.formal_measurement_accepted:
+        _require_ref(closure.evaluation_attempt_ref, "EvaluationAttemptRef")
+        _require_ref(closure.metric_result_ref, "MetricResultRef")
+        if ((not closure.metric_values and closure.root_completion_receipt is None)
+                or closure.rg_formal_measurement_receipt is None):
+            raise BundleProtocolError("accepted EvaluationAttempt has no Metric values or receipt")
+    elif (closure.metric_result_ref is not None or closure.metric_values
+          or closure.rg_formal_measurement_receipt is not None):
+        raise BundleProtocolError("unmeasured work cannot claim a MetricResult or measurement receipt")
+    if (closure.evaluation_attempt_ref is None) != (closure.evaluation_attempt_input_binding is None):
+        raise BundleProtocolError("EvaluationAttempt and its input binding must exist together")
+    if closure.evaluation_attempt_ref is not None:
+        _require_ref(closure.evaluation_attempt_ref, "EvaluationAttemptRef")
     if not closure.experiment_keys or len(closure.experiment_keys) != len(
         set(closure.experiment_keys)
     ):
@@ -600,6 +416,10 @@ def _verify_accepted_closure(
             "EvaluationAttempt input binding",
         ),
     ):
+        if binding is None:
+            if subject_ref is None:
+                continue
+            raise BundleProtocolError(f"{name} is absent")
         _require_ref(binding.binding_ref, name)
         if binding.subject_ref != subject_ref:
             raise BundleProtocolError(f"{name} points at another subject")
@@ -608,11 +428,11 @@ def _verify_accepted_closure(
             binding.binding_ref,
             f"{name} receipt",
         )
-    if closure.variant_run_input_binding.binding_ref == (
+    if closure.evaluation_attempt_input_binding is not None and closure.variant_run_input_binding.binding_ref == (
         closure.evaluation_attempt_input_binding.binding_ref
     ):
         raise BundleProtocolError("execution subjects share one input binding")
-    if closure.variant_run_input_binding.acceptance_receipt.receipt_ref == (
+    if closure.evaluation_attempt_input_binding is not None and closure.variant_run_input_binding.acceptance_receipt.receipt_ref == (
         closure.evaluation_attempt_input_binding.acceptance_receipt.receipt_ref
     ):
         raise BundleProtocolError("execution input bindings share one receipt")
@@ -635,6 +455,8 @@ def _verify_accepted_closure(
             "TargetCommit receipt",
         ),
     ):
+        if receipt is None and name == "Formal Measurement receipt" and not closure.formal_measurement_accepted:
+            continue
         _validate_receipt(receipt, subject_ref, name)
 
     review = closure.result_review
@@ -743,6 +565,8 @@ def _result_sets(
             ("EvaluationAttempt", closure.evaluation_attempt_ref),
             ("MetricResult", closure.metric_result_ref),
         ):
+            if value is None:
+                continue
             if value in identities[name]:
                 raise BundleProtocolError(f"two Targets selected one {name}")
             identities[name].add(value)
@@ -1066,12 +890,14 @@ def _build_report(
             {
                 closure.rm_asset_receipt.receipt_ref,
                 closure.ar_execution_receipt.receipt_ref,
-                closure.rg_formal_measurement_receipt.receipt_ref,
                 closure.rg_target_commit_receipt.receipt_ref,
                 closure.variant_run_input_binding.acceptance_receipt.receipt_ref,
-                closure.evaluation_attempt_input_binding.acceptance_receipt.receipt_ref,
             }
         )
+        if closure.rg_formal_measurement_receipt is not None:
+            owner_receipt_refs.add(closure.rg_formal_measurement_receipt.receipt_ref)
+        if closure.evaluation_attempt_input_binding is not None:
+            owner_receipt_refs.add(closure.evaluation_attempt_input_binding.acceptance_receipt.receipt_ref)
         if closure.root_completion_receipt is not None:
             owner_receipt_refs.add(
                 closure.root_completion_receipt.receipt_ref
@@ -1090,10 +916,10 @@ def _build_report(
             sorted(closure.target_commit_ref for closure in closures)
         ),
         accepted_evaluation_attempt_refs=tuple(
-            sorted(closure.evaluation_attempt_ref for closure in closures)
+            sorted(closure.evaluation_attempt_ref for closure in closures if closure.evaluation_attempt_ref is not None)
         ),
         metric_result_refs=tuple(
-            sorted(closure.metric_result_ref for closure in closures)
+            sorted(closure.metric_result_ref for closure in closures if closure.metric_result_ref is not None)
         ),
         execution_attempt_refs=tuple(
             sorted(closure.execution_attempt_ref for closure in closures)
@@ -1196,21 +1022,6 @@ def verify_candidate(
     """Public production seam for prototype candidate verification."""
 
     return _verify_candidate(candidate, briefs_by_key)
-
-
-def verify_reuse_trace(
-    trace: ReuseTrace,
-    expected_implementation_revision_ref: str,
-) -> tuple[str, ...]:
-    """Validate reuse and return the selected implementation provenance refs."""
-
-    return _verify_reuse_trace(trace, expected_implementation_revision_ref)
-
-
-def reuse_trace_audit_refs(trace: ReuseTrace) -> tuple[str, ...]:
-    """Return the complete fixed review-scope audit refs for a valid trace."""
-
-    return _reuse_trace_audit_refs(trace)
 
 
 def verify_accepted_closure(

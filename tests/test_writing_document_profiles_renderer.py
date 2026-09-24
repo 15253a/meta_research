@@ -283,8 +283,8 @@ def test_skill_request_binds_document_type_and_profile_without_new_session() -> 
     assert fields["profile_ref"].default == "report-v1"
     paper_instructions = _writing_skill_instructions("paper")
     presentation_instructions = _writing_skill_instructions("presentation")
-    assert "Paper profile" in paper_instructions
-    assert "Presentation profile" in presentation_instructions
+    assert "论文类型：`paper-v1`" in paper_instructions
+    assert "演示文稿类型：`presentation-v1`" in presentation_instructions
     assert paper_instructions != presentation_instructions
     assert set(_writing_skill_resources("report")) == {
         "SKILL.md",

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from meta_research.owners.common import canonical_hash
+from meta_research.owners.common import canonical_hash, OwnerConflict
+from meta_research.context_history import validate_history_page
+
+HistoricalEvidenceResolver = Callable[[str], "dict[str, object] | None"]
 
 
 SCIENTIFIC_OUTCOME_SCHEMA_REF = "meta-research/scientific-outcome-candidate/v1"
@@ -20,6 +24,7 @@ AUTONOMOUS_QUESTION_PROPOSAL_SCHEMA_REF = (
 )
 NEXT_CYCLE_PROPOSAL_SCHEMA_REF = "meta-research/next-cycle-proposal/v1"
 CANDIDATE_COMPLETION_SCHEMA_REF = "meta-research/candidate-completion/v1"
+REASONING_SUCCESSOR_ENTRY_STAGES = ("idea", "plan", "reasoning")
 SCIENTIFIC_OUTCOMES = frozenset(
     {"affirmed", "denied", "uncertain", "insufficient_evidence"}
 )
@@ -60,7 +65,17 @@ _LITERATURE_EVIDENCE_BASES = {
     "verified_fulltext",
 }
 _SCIENTIFIC_FINDINGS = {"supporting", "negative", "partial", "context"}
-_SUBSTANTIVE_EVIDENCE_KINDS = {"LiteratureRecord", "MetricResult"}
+_SUBSTANTIVE_EVIDENCE_KINDS = {
+    "LiteratureRecord",
+    "MetricResult",
+    # Accepted TargetCommit work (observation, analysis, negative
+    # results) is adoptable as a basis without a manufactured
+    # measurement; the Agent explains basis, scope and uncertainty.
+    "WorkProduct",
+    # A verified HumanRequest response (professional human opinion) is
+    # adoptable the same way, cited as its exact response identity.
+    "HumanInput",
+}
 _DIAGNOSTIC_EVIDENCE_KINDS = {"LogAsset", "AnalysisAsset", "CheckpointArtifact"}
 _EVIDENCE_REUSE_LEAF_FIELDS = {
     "schema_ref",
@@ -145,6 +160,18 @@ class ReasoningContractError(ValueError):
     """A Reasoning candidate or one of its frozen bindings is invalid."""
 
 
+def validate_new_reasoning_successor_entry(output: dict[str, object]) -> None:
+    """Apply current entry policy to new outputs, not immutable history reads."""
+
+    for field in ("next_cycle_proposal", "autonomous_scope"):
+        route = output.get(field)
+        if (
+            isinstance(route, dict)
+            and route.get("entry_stage") not in REASONING_SUCCESSOR_ENTRY_STAGES
+        ):
+            raise ReasoningContractError("reasoning_next_cycle_entry_stage_forbidden")
+
+
 @dataclass(frozen=True)
 class VerifiedReasoningCompletionLineage:
     """RM-verified immutable lineage for one completion transition."""
@@ -170,8 +197,7 @@ def plan_evidence_reuse_leaves(
     The ContextPack carries the exact accepted FormalPlan uses and a typed
     issuer-owned leaf for every role selected from each EvidenceRef's exact
     TargetCommit.  Consumers cite the role identity, never the catalog
-    identity.  Diagnostic roles remain contextual; only the MetricResult leaf
-    is substantive.
+    identity. Source types locate their Owner and do not limit scientific use.
     """
 
     plan_input = context_pack.get("plan_evidence_input")
@@ -225,16 +251,15 @@ def plan_evidence_reuse_leaves(
             )
         _exact_keys(
             value,
-            _EVIDENCE_REUSE_LEAF_FIELDS,
+            _EVIDENCE_REUSE_LEAF_FIELDS | ({"source_binding"} if "source_binding" in value else set()),
             "reasoning_plan_evidence_closure_invalid",
         )
         if (
             value.get("schema_ref")
             != "meta-research/evidence-reuse-leaf/v1"
             or value.get("kind") != "EvidenceReuseLeaf"
-            or value.get("role")
-            not in _SUBSTANTIVE_EVIDENCE_KINDS | _DIAGNOSTIC_EVIDENCE_KINDS
-            or value.get("role") == "LiteratureRecord"
+            or not isinstance(value.get("role"), str)
+            or not value.get("role")
         ):
             raise ReasoningContractError(
                 "reasoning_plan_evidence_closure_invalid"
@@ -248,6 +273,31 @@ def plan_evidence_reuse_leaves(
             value.get("evidence_item_ref"),
             "reasoning_plan_evidence_closure_invalid",
         )
+        if "source_binding" in value:
+            from meta_research.plan_contract import EVIDENCE_SOURCE_REF_SCHEMA, GENERIC_EVIDENCE_KINDS
+            source = value["source_binding"]
+            if not isinstance(source, dict) or role not in GENERIC_EVIDENCE_KINDS:
+                raise ReasoningContractError("reasoning_plan_evidence_closure_invalid")
+            _validated_closure_leaf(source)
+            compact = {"schema_ref": EVIDENCE_SOURCE_REF_SCHEMA, "evidence_ref": item_ref,
+                       "source_kind": role, "source_ref": item_ref}
+            if (source.get("kind") != role or source.get("ref") != item_ref or evidence_ref != item_ref
+                    or value.get("source_subject_kind") != role
+                    or value.get("source_subject_ref") != source.get("source_subject_ref", item_ref)
+                    or value.get("asset_version_ref") != (item_ref if role == "AssetVersion" else None)
+                    or value.get("evidence_catalog_entry_hash") != canonical_hash(compact)
+                    or value.get("evidence_use_hashes") != [canonical_hash(use) for use in uses_by_ref.get(evidence_ref, [])]
+                    or not uses_by_ref.get(evidence_ref)
+                    or any(value.get(key) is not None for key in (
+                        "source_role_ref", "source_variant_run_ref", "source_evaluation_attempt_ref",
+                        "target_commit_ref", "evidence_asset_receipt", "evidence_role_receipt",
+                        "formal_measurement_acceptance_receipt", "target_commit_acceptance_receipt"))):
+                raise ReasoningContractError("reasoning_plan_evidence_closure_invalid")
+            normalized.append(source)
+            evidence_refs.append(evidence_ref)
+            item_refs.append(item_ref)
+            roles_by_evidence_ref.setdefault(evidence_ref, []).append(role)
+            continue
         role_ref = _require_text(
             value.get("source_role_ref"),
             "reasoning_plan_evidence_closure_invalid",
@@ -256,10 +306,18 @@ def plan_evidence_reuse_leaves(
             value.get("source_variant_run_ref"),
             "reasoning_plan_evidence_closure_invalid",
         )
-        attempt_ref = _require_text(
-            value.get("source_evaluation_attempt_ref"),
-            "reasoning_plan_evidence_closure_invalid",
-        )
+        attempt_ref_value = value.get("source_evaluation_attempt_ref")
+        if role == "WorkProduct":
+            if attempt_ref_value is not None:
+                raise ReasoningContractError(
+                    "reasoning_plan_evidence_closure_invalid"
+                )
+            attempt_ref = None
+        else:
+            attempt_ref = _require_text(
+                attempt_ref_value,
+                "reasoning_plan_evidence_closure_invalid",
+            )
         target_commit_ref = _require_text(
             value.get("target_commit_ref"),
             "reasoning_plan_evidence_closure_invalid",
@@ -297,16 +355,23 @@ def plan_evidence_reuse_leaves(
             ),
             subject_ref=role_ref,
         )
-        formal_receipt = _validate_reasoning_owner_receipt(
-            value.get("formal_measurement_acceptance_receipt"),
-            issuer="research_graph",
-            kind="formal_measurement_acceptance",
-            subject_ref=attempt_ref,
-        )
+        if role == "WorkProduct":
+            if value.get("formal_measurement_acceptance_receipt") is not None:
+                raise ReasoningContractError(
+                    "reasoning_plan_evidence_closure_invalid"
+                )
+            formal_receipt = None
+        else:
+            formal_receipt = _validate_reasoning_owner_receipt(
+                value.get("formal_measurement_acceptance_receipt"),
+                issuer="research_graph",
+                kind="formal_measurement_acceptance",
+                subject_ref=attempt_ref,
+            )
         target_receipt = _validate_reasoning_owner_receipt(
             value.get("target_commit_acceptance_receipt"),
             issuer="research_graph",
-            kind="target_commit",
+            kind=frozenset({"target_commit", "target_commit_accepted"}),
             subject_ref=target_commit_ref,
         )
         source_subject_kind = value.get("source_subject_kind")
@@ -325,7 +390,7 @@ def plan_evidence_reuse_leaves(
             source_subject_ref != expected_subject_ref
             or role == "MetricResult"
             and source_subject_kind != "EvaluationAttempt"
-            or role == "CheckpointArtifact"
+            or role in {"WorkProduct", "CheckpointArtifact"}
             and source_subject_kind != "VariantRun"
             or role in {"LogAsset", "AnalysisAsset"}
             and source_subject_kind not in {"VariantRun", "EvaluationAttempt"}
@@ -371,7 +436,7 @@ def plan_evidence_reuse_leaves(
         or len(item_refs) != len(set(item_refs))
         or set(evidence_refs) != set(uses_by_ref)
         or any(
-            roles.count("MetricResult") != 1
+            sum(roles.count(kind) for kind in ("MetricResult", "WorkProduct", "HumanInput", "ScientificOutcome", "AssetVersion", "LiteratureSnapshot")) != 1
             for roles in roles_by_evidence_ref.values()
         )
     ):
@@ -395,14 +460,20 @@ def current_target_evidence_leaves(
         frozen_leaves, list
     ):
         raise ReasoningContractError("reasoning_target_evidence_closure_invalid")
-    expected_target_refs = {
+    all_target_refs = {
         value.get("target_commit_ref")
         for value in target_closures
         if isinstance(value, dict)
         and isinstance(value.get("target_commit_ref"), str)
     }
-    if len(expected_target_refs) != len(target_closures):
+    if len(all_target_refs) != len(target_closures):
         raise ReasoningContractError("reasoning_target_evidence_closure_invalid")
+    # Every accepted TargetCommit of this Cycle contributes evidence: a
+    # measured commit through its MetricResult leaf, an unmeasured one through
+    # its WorkProduct leaf (ADR 0005).
+    expected_target_refs = {
+        value["target_commit_ref"] for value in target_closures
+    }
     if not frozen_leaves:
         if expected_target_refs:
             raise ReasoningContractError(
@@ -440,6 +511,9 @@ def current_target_evidence_leaves(
         value["evidence_use_hashes"] = [
             use_hashes[cast(str, value["evidence_ref"])]
         ]
+    # Current Targets are frozen in Target order. Normalize only this adapter's
+    # copy to the evidence order required by the shared Plan reuse validator.
+    copied.sort(key=lambda value: cast(str, value["evidence_ref"]))
     try:
         return plan_evidence_reuse_leaves(
             {
@@ -519,6 +593,7 @@ def validate_reasoning_stage_output(
     frozen_evidence_closure: list[dict[str, object]],
     frozen_research_context: dict[str, object],
     expected_completion_milestone_basis_refs: tuple[str, ...] | None = None,
+    historical_resolver: HistoricalEvidenceResolver | None = None,
 ) -> tuple[str, str, str]:
     """Validate the one closed execution document emitted by Reasoning.
 
@@ -552,6 +627,7 @@ def validate_reasoning_stage_output(
         scientific_outcome,
         frozen_evidence_closure=frozen_evidence_closure,
         frozen_research_context=frozen_research_context,
+        historical_resolver=historical_resolver,
     )
     transition_hash = validate_reasoning_transition(
         scientific_outcome,
@@ -569,6 +645,7 @@ def validate_reasoning_autonomous_checkpoint(
     *,
     frozen_evidence_closure: list[dict[str, object]],
     frozen_research_context: dict[str, object],
+    historical_resolver: HistoricalEvidenceResolver | None = None,
 ) -> tuple[str, str, str]:
     """Validate the non-terminal Reasoning checkpoint used by create_question.
 
@@ -597,6 +674,7 @@ def validate_reasoning_autonomous_checkpoint(
         outcome,
         frozen_evidence_closure=frozen_evidence_closure,
         frozen_research_context=frozen_research_context,
+        historical_resolver=historical_resolver,
     )
     scope_hash = validate_autonomous_question_scope(
         scope,
@@ -614,7 +692,9 @@ def validate_autonomous_question_scope(
 
     ``question_blueprint`` is reviewed inside the current Reasoning Run, but it
     is not yet a QuestionProposal.  The creation lifecycle forms that proposal
-    only after mandatory DeepFetch has an accepted snapshot.
+    only after mandatory DeepFetch has an accepted snapshot.  Its entry/skip
+    fields are provisional research hints, not a committed successor choice;
+    the final NextCycleProposal is independently validated after creation.
     """
 
     _exact_keys(
@@ -828,15 +908,117 @@ def _validate_formal_question(question: dict[str, object]) -> None:
         )
 
 
+def _validated_closure_leaf(value: dict[str, object]) -> str:
+    """Validate one closure leaf shape and return its citation ref."""
+
+    kind = value.get("kind")
+    if kind == "LiteratureRecord":
+        _exact_keys(
+            value,
+            {"kind", "ref", "evidence_basis", "evidence_basis_ref"},
+            "reasoning_evidence_closure_invalid",
+        )
+        if value.get("evidence_basis") not in _LITERATURE_EVIDENCE_BASES:
+            raise ReasoningContractError("reasoning_evidence_closure_invalid")
+        _require_text(
+            value.get("evidence_basis_ref"),
+            "reasoning_evidence_closure_invalid",
+        )
+    elif kind == "MetricResult":
+        _exact_keys(
+            value,
+            {
+                "kind",
+                "ref",
+                "source_evaluation_attempt_ref",
+                "research_graph_acceptance_receipt_ref",
+                "formal_measurement_acceptance_receipt_ref",
+            },
+            "reasoning_evidence_closure_invalid",
+        )
+        for field in (
+            "source_evaluation_attempt_ref",
+            "research_graph_acceptance_receipt_ref",
+            "formal_measurement_acceptance_receipt_ref",
+        ):
+            _require_text(
+                value.get(field), "reasoning_evidence_closure_invalid"
+            )
+    elif kind == "HumanInput" and "input_ref" in value:
+        _exact_keys(value,{"kind","ref","input_ref","content_hash","owner_acceptance_receipt_ref"},"reasoning_evidence_closure_invalid")
+        for field in ("ref","input_ref","content_hash","owner_acceptance_receipt_ref"):
+            _require_text(value.get(field),"reasoning_evidence_closure_invalid")
+    elif kind == "HumanInput":
+        # An answered HumanRequest response is adoptable professional
+        # opinion: the citation identity is the response itself, bound to
+        # its verified content hash; no attempt or measurement fields apply.
+        _exact_keys(
+            value,
+            {
+                "kind",
+                "ref",
+                "response_ref",
+                "request_ref",
+                "content_hash",
+                "owner_acceptance_receipt_ref",
+            },
+            "reasoning_evidence_closure_invalid",
+        )
+        for field in (
+            "response_ref",
+            "request_ref",
+            "content_hash",
+            "owner_acceptance_receipt_ref",
+        ):
+            _require_text(
+                value.get(field), "reasoning_evidence_closure_invalid"
+            )
+        if value.get("ref") != value.get("response_ref"):
+            raise ReasoningContractError("reasoning_evidence_closure_invalid")
+    elif isinstance(kind, str) and kind:
+        _exact_keys(
+            value,
+            {
+                "kind",
+                "ref",
+                "source_subject_ref",
+                "owner_acceptance_receipt_ref",
+            },
+            "reasoning_evidence_closure_invalid",
+        )
+        _require_text(
+            value.get("source_subject_ref"),
+            "reasoning_evidence_closure_invalid",
+        )
+        _require_text(
+            value.get("owner_acceptance_receipt_ref"),
+            "reasoning_evidence_closure_invalid",
+        )
+    else:
+        raise ReasoningContractError("reasoning_evidence_closure_invalid")
+    return _require_text(
+        value.get("ref"), "reasoning_evidence_closure_invalid"
+    )
+
+
 def validate_scientific_outcome(
     outcome: dict[str, object],
     *,
     frozen_evidence_closure: list[dict[str, object]],
     frozen_research_context: dict[str, object],
+    historical_resolver: HistoricalEvidenceResolver | None = None,
 ) -> str:
-    """Validate an evidence-bounded scientific outcome candidate."""
+    """Validate an evidence-bounded scientific outcome candidate.
 
-    _exact_keys(outcome, _OUTCOME_FIELDS, "scientific_outcome_invalid")
+    ``historical_resolver`` verifies one cited ref at a time against facts of
+    earlier cycles of this Quest.  It stays per-citation: history is never
+    bulk-injected into the frozen closure, and an unresolved citation still
+    fails with ``scientific_outcome_evidence_invalid``.
+    """
+
+    _exact_keys(outcome, _OUTCOME_FIELDS | ({"notes"} if "notes" in outcome else set()), "scientific_outcome_invalid")
+    if "notes" in outcome and not isinstance(outcome["notes"], str):
+        raise ReasoningContractError("scientific_outcome_notes_invalid")
     if (
         outcome.get("schema_ref") != SCIENTIFIC_OUTCOME_SCHEMA_REF
         or outcome.get("kind") != "ScientificOutcomeCandidate"
@@ -871,63 +1053,7 @@ def validate_scientific_outcome(
     for value in frozen_evidence_closure:
         if not isinstance(value, dict):
             raise ReasoningContractError("reasoning_evidence_closure_invalid")
-        kind = value.get("kind")
-        if kind == "LiteratureRecord":
-            _exact_keys(
-                value,
-                {"kind", "ref", "evidence_basis", "evidence_basis_ref"},
-                "reasoning_evidence_closure_invalid",
-            )
-            if value.get("evidence_basis") not in _LITERATURE_EVIDENCE_BASES:
-                raise ReasoningContractError("reasoning_evidence_closure_invalid")
-            _require_text(
-                value.get("evidence_basis_ref"),
-                "reasoning_evidence_closure_invalid",
-            )
-        elif kind == "MetricResult":
-            _exact_keys(
-                value,
-                {
-                    "kind",
-                    "ref",
-                    "source_evaluation_attempt_ref",
-                    "research_graph_acceptance_receipt_ref",
-                    "formal_measurement_acceptance_receipt_ref",
-                },
-                "reasoning_evidence_closure_invalid",
-            )
-            for field in (
-                "source_evaluation_attempt_ref",
-                "research_graph_acceptance_receipt_ref",
-                "formal_measurement_acceptance_receipt_ref",
-            ):
-                _require_text(
-                    value.get(field), "reasoning_evidence_closure_invalid"
-                )
-        elif kind in _DIAGNOSTIC_EVIDENCE_KINDS:
-            _exact_keys(
-                value,
-                {
-                    "kind",
-                    "ref",
-                    "source_subject_ref",
-                    "owner_acceptance_receipt_ref",
-                },
-                "reasoning_evidence_closure_invalid",
-            )
-            _require_text(
-                value.get("source_subject_ref"),
-                "reasoning_evidence_closure_invalid",
-            )
-            _require_text(
-                value.get("owner_acceptance_receipt_ref"),
-                "reasoning_evidence_closure_invalid",
-            )
-        else:
-            raise ReasoningContractError("reasoning_evidence_closure_invalid")
-        evidence_ref = _require_text(
-            value.get("ref"), "reasoning_evidence_closure_invalid"
-        )
+        evidence_ref = _validated_closure_leaf(value)
         if evidence_ref in closure_by_ref:
             raise ReasoningContractError("reasoning_evidence_closure_invalid")
         closure_by_ref[evidence_ref] = value
@@ -936,7 +1062,6 @@ def validate_scientific_outcome(
     if not isinstance(evidence, list):
         raise ReasoningContractError("scientific_outcome_evidence_invalid")
     cited_refs: set[str] = set()
-    has_substantive_evidence = False
     for value in evidence:
         if not isinstance(value, dict):
             raise ReasoningContractError("scientific_outcome_evidence_invalid")
@@ -949,22 +1074,26 @@ def validate_scientific_outcome(
             value.get("ref"), "scientific_outcome_evidence_invalid"
         )
         frozen = closure_by_ref.get(evidence_ref)
+        if frozen is None and historical_resolver is not None:
+            resolved = historical_resolver(evidence_ref)
+            if isinstance(resolved, dict):
+                # A resolver leaf must carry the same issuer-closed shape and
+                # the exact cited ref as a frozen closure leaf.
+                if _validated_closure_leaf(resolved) != evidence_ref:
+                    raise ReasoningContractError(
+                        "scientific_outcome_evidence_invalid"
+                    )
+                frozen = resolved
         frozen_kind = None if frozen is None else frozen.get("kind")
         finding = value.get("finding")
         if (
             frozen is None
             or value.get("kind") != frozen_kind
             or finding not in _SCIENTIFIC_FINDINGS
-            or (
-                frozen_kind in _DIAGNOSTIC_EVIDENCE_KINDS
-                and finding != "context"
-            )
             or evidence_ref in cited_refs
         ):
             raise ReasoningContractError("scientific_outcome_evidence_invalid")
         cited_refs.add(evidence_ref)
-        if frozen_kind in _SUBSTANTIVE_EVIDENCE_KINDS:
-            has_substantive_evidence = True
 
     missing_evidence = _require_text_list(
         outcome.get("missing_evidence"), "scientific_outcome_missing_evidence_invalid"
@@ -972,8 +1101,6 @@ def validate_scientific_outcome(
     uncertainty_basis = _require_text_list(
         outcome.get("uncertainty_basis"), "scientific_outcome_uncertainty_invalid"
     )
-    if disposition != "insufficient_evidence" and not has_substantive_evidence:
-        raise ReasoningContractError("scientific_outcome_substantive_evidence_missing")
     _validate_outcome_scope_and_synthesis(
         outcome,
         cited_refs=cited_refs,
@@ -983,7 +1110,6 @@ def validate_scientific_outcome(
         if (
             outcome.get("claim") is not None
             or not missing_evidence
-            or uncertainty_basis
         ):
             raise ReasoningContractError(
                 "scientific_outcome_insufficient_evidence_invalid"
@@ -991,13 +1117,9 @@ def validate_scientific_outcome(
         return canonical_hash(outcome)
 
     _require_text(outcome.get("claim"), "scientific_outcome_claim_invalid")
-    if missing_evidence:
-        raise ReasoningContractError("scientific_outcome_disposition_boundary_invalid")
     if disposition == "uncertain":
         if not uncertainty_basis:
             raise ReasoningContractError("scientific_outcome_uncertainty_invalid")
-    elif uncertainty_basis:
-        raise ReasoningContractError("scientific_outcome_disposition_boundary_invalid")
     return canonical_hash(outcome)
 
 
@@ -1055,11 +1177,11 @@ def _validate_frozen_research_context(
             "prior_current_question_outcomes",
             "binding_ref",
             "binding_hash",
-        },
+        } | ({"history_page"} if graph.get("schema_ref") == "meta-research/reasoning-graph-context/v2" else set()),
         "reasoning_research_context_invalid",
     )
     if (
-        graph.get("schema_ref") != "meta-research/reasoning-graph-context/v1"
+        graph.get("schema_ref") not in {"meta-research/reasoning-graph-context/v1", "meta-research/reasoning-graph-context/v2"}
         or graph.get("issuer") != "research_graph"
         or graph.get("quest_ref") != quest_ref
         or graph.get("question_ref") != question_ref
@@ -1076,6 +1198,11 @@ def _validate_frozen_research_context(
     prior = graph.get("prior_current_question_outcomes")
     if not isinstance(parents, list) or not isinstance(prior, list):
         raise ReasoningContractError("reasoning_research_context_invalid")
+    if graph.get("schema_ref") == "meta-research/reasoning-graph-context/v2":
+        try:
+            validate_history_page(graph)
+        except (OwnerConflict, KeyError, TypeError) as error:
+            raise ReasoningContractError("reasoning_research_context_invalid") from error
     causal = context.get("causal_context")
     if not isinstance(causal, dict):
         raise ReasoningContractError("reasoning_research_context_invalid")
@@ -1109,7 +1236,7 @@ def _validate_frozen_research_context(
             parent.get("question_receipt_ref"),
             "reasoning_research_context_invalid",
         )
-        if parent_ref in parent_refs or parent_ref not in active:
+        if parent_ref in parent_refs or (graph.get("schema_ref") == "meta-research/reasoning-graph-context/v1" and parent_ref not in active):
             raise ReasoningContractError("reasoning_research_context_invalid")
         parent_refs.append(parent_ref)
     prior_refs: list[str] = []

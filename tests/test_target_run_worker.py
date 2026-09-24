@@ -21,9 +21,6 @@ from meta_research.bundle_protocol import (
     ProtocolAggregationProof,
     ProtocolPart,
     ReceiptProof,
-    ReuseSourceProof,
-    ReuseTierDecision,
-    ReuseTrace,
     RevisionEvidenceProof,
     ResultReviewRecord,
     RouteDisposition,
@@ -75,22 +72,6 @@ def _handle(suffix: str, *, target_run: str = "target-run-1") -> TargetWorkHandl
 
 
 def _candidate() -> TargetCandidate:
-    implementation_hash = hashlib.sha256(b"implementation-1").hexdigest()
-    source = ReuseSourceProof(
-        source_ref="self-source-1",
-        exact_version_ref="self-version-1",
-        implementation_revision_ref="implementation-1",
-        eligible_tier="self-implementation",
-        verification_receipt=_receipt("self-version-1", "source-verification"),
-        implementation_binding=ContentBindingProof(
-            subject_ref="implementation-1",
-            content_hash_ref=implementation_hash,
-        ),
-        implementation_acceptance_receipt=_receipt(
-            implementation_hash,
-            "source-implementation",
-        ),
-    )
     return TargetCandidate(
         local_label="candidate-1",
         experiment_keys=("experiment-key-1",),
@@ -98,17 +79,6 @@ def _candidate() -> TargetCandidate:
         held_fixed_bindings=(),
         implementation_revision_ref="implementation-1",
         code_changed=True,
-        reuse_trace=ReuseTrace(
-            tier_decisions=(
-                ReuseTierDecision(
-                    tier="self-implementation",
-                    disposition="selected",
-                    reason_ref="reuse-reason-1",
-                    source_proofs=(source,),
-                ),
-            ),
-            greenfield_exception="simple-implementation",
-        ),
         routes=(RouteSpec(route_ref="route-1"),),
         direct_accepted_input_asset_refs=("asset-1",),
     )
@@ -158,20 +128,6 @@ def _scope(
             }
         )
     ).hexdigest()
-    source = candidate.reuse_trace.tier_decisions[0].source_proofs[0]
-    reuse_audit_refs = tuple(
-        sorted(
-            {
-                candidate.reuse_trace.tier_decisions[0].reason_ref,
-                source.source_ref,
-                source.exact_version_ref,
-                source.verification_receipt.receipt_ref,
-                source.implementation_revision_ref,
-                source.implementation_binding.content_hash_ref,
-                source.implementation_acceptance_receipt.receipt_ref,
-            }
-        )
-    )
     return CodeReviewScope(
         candidate_revision_binding=ContentBindingProof(
             subject_ref=revision,
@@ -188,7 +144,7 @@ def _scope(
         semantic_deltas=("semantic-delta-1",),
         held_fixed_bindings=(),
         accepted_input_refs=("asset-1", "target-commit-upstream"),
-        reuse_provenance_refs=reuse_audit_refs,
+        reuse_provenance_refs=(),
         repository_standards_refs=("repository-standard-1",),
     )
 
@@ -392,16 +348,7 @@ def _closure(
     ).hexdigest()
     variant_binding_ref = "variant-input-binding-1"
     evaluation_binding_ref = "evaluation-input-binding-1"
-    source = candidate.reuse_trace.tier_decisions[0].source_proofs[0]
-    provenance = tuple(
-        dict.fromkeys(
-            (
-                source.source_ref,
-                source.exact_version_ref,
-                source.verification_receipt.receipt_ref,
-                source.implementation_revision_ref,
-                source.implementation_binding.content_hash_ref,
-                source.implementation_acceptance_receipt.receipt_ref,
+    provenance = tuple(dict.fromkeys((
                 preflight.implementation_revision_ref,
                 preflight.review_scope.candidate_revision_binding.content_hash_ref,
                 preflight.implementation_acceptance_receipt.receipt_ref,

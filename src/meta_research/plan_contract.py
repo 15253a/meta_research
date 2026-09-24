@@ -15,9 +15,12 @@ PLAN_CONTEXT_PACK_SCHEMA_REF = "meta-research/plan-context-pack/v1"
 PLAN_DOCUMENT_SCHEMA_REF = "meta-research/plan-document/v1"
 PLAN_REVIEW_SCHEMA_REF = "meta-research/plan-advisory-review/v1"
 EVIDENCE_REF_SCHEMA_REF = "meta-research/evidence-ref/v1"
+EVIDENCE_SOURCE_REF_SCHEMA = "meta-research/evidence-source-ref/v1"
+GENERIC_EVIDENCE_KINDS = frozenset({"HumanInput", "ScientificOutcome", "AssetVersion", "LiteratureSnapshot"})
 MAX_PLAN_OBLIGATIONS = 64
 MAX_PLAN_EVIDENCE_REFS = 256
 MAX_PLAN_EXPERIMENT_BRIEFS = 64
+MAX_SELECTED_PLAN_EVIDENCE_REFS = 32
 
 _QUESTION_TRACE_FIELDS = {
     "unknown_statement",
@@ -131,12 +134,65 @@ def validate_plan_context_pack(
                     or projection.get("content_hash") != evidence["content_hash"]
                     or not _text(projection.get("question_ref"))
                     or not _text(projection.get("cycle_ref"))
-                    or not isinstance(projection.get("target_spec"), dict)
-                    or canonical_hash(projection["target_spec"]) != projection.get("target_spec_hash")
-                    or not isinstance(projection.get("metric_result"), dict)
+                    or not _valid_evidence_discovery_projection(projection)
                     or projection.get("exact_content_reader") != "research_memory.plan_evidence.read"):
                 raise PlanContractError("plan_evidence_page_invalid")
     return evidence_by_ref
+
+
+
+def _valid_evidence_discovery_projection(projection: dict[str, object]) -> bool:
+    # Legacy complete projections retain their exact content check. New discovery
+    # summaries are explicitly partial and never establish evidence authority.
+    if "target_spec" in projection:
+        return (isinstance(projection.get("target_spec"), dict)
+                and canonical_hash(projection["target_spec"]) == projection.get("target_spec_hash")
+                and isinstance(projection.get("metric_result"), dict))
+    summary = projection.get("research_summary")
+    digest = projection.get("target_spec_hash")
+    return (isinstance(digest, str) and len(digest) == 64
+            and all(c in "0123456789abcdef" for c in digest)
+            and isinstance(summary, dict)
+            and summary.get("schema_ref") == "meta-research/evidence-discovery-summary/v1"
+            and summary.get("summary_only") is True)
+
+
+def selected_plan_evidence_catalog(
+    document: dict[str, object], frozen_catalog: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Join a discovery page with only explicitly selected exact later bindings.
+
+    This validates structure, not authority. RG validates every selected receipt,
+    source, exact content and Quest eligibility before accepting the FormalPlan.
+    Keeping these selected bindings in the Plan preserves historical readback
+    without expanding or mutating the original Stage request.
+    """
+    bindings = document.get("source_bindings")
+    additions = bindings.get("selected_evidence_catalog", []) if isinstance(bindings, dict) else []
+    if not isinstance(additions, list) or len(additions) > MAX_SELECTED_PLAN_EVIDENCE_REFS:
+        raise PlanContractError("plan_selected_evidence_invalid")
+    uses = document.get("evidence_reuse_set", [])
+    if not isinstance(uses, list):
+        raise PlanContractError("plan_evidence_reuse_set_invalid")
+    used = {item.get("evidence_ref") for item in uses if isinstance(item, dict) and isinstance(item.get("evidence_ref"), str)}
+    result = {str(item["evidence_ref"]): item for item in frozen_catalog}
+    seen: set[str] = set()
+    versions = {str(item.get("asset_version_ref", item.get("source_ref"))): str(item["evidence_ref"]) for item in frozen_catalog}
+    for raw in additions:
+        entry = _object(raw, "plan_selected_evidence_invalid")
+        _validate_evidence_ref(entry)
+        ref = cast(str, entry["evidence_ref"])
+        version = cast(str, entry.get("asset_version_ref", entry.get("source_ref")))
+        if ref not in used or ref in seen or (ref in result and result[ref] != entry):
+            raise PlanContractError("plan_selected_evidence_invalid")
+        if version in versions and versions[version] != ref:
+            raise PlanContractError("plan_selected_evidence_invalid")
+        seen.add(ref)
+        versions[version] = ref
+        result[ref] = entry
+    if len(result) > MAX_PLAN_EVIDENCE_REFS:
+        raise PlanContractError("plan_selected_evidence_invalid")
+    return list(result.values())
 
 
 def validate_plan_document(
@@ -168,9 +224,11 @@ def validate_plan_document(
             "idea_trace",
             "bundle_disposition",
             "source_bindings",
-        },
+        } | ({"notes"} if "notes" in document else set()),
         "plan_document_invalid",
     )
+    if "notes" in document and not isinstance(document["notes"], str):
+        raise PlanContractError("plan_notes_invalid")
     if (
         document.get("schema_ref") != PLAN_DOCUMENT_SCHEMA_REF
         or document.get("kind") != "PlanDocument"
@@ -184,6 +242,8 @@ def validate_plan_document(
         evidence_reference_revision, bool
     ):
         raise PlanContractError("plan_document_source_invalid")
+
+    evidence_by_ref = {str(item["evidence_ref"]): item for item in selected_plan_evidence_catalog(document, list(evidence_by_ref.values()))}
 
     candidate_refs = _accepted_candidate_refs(
         accepted_idea_set,
@@ -307,10 +367,10 @@ def validate_plan_document(
             "context_pack_ref",
             "context_pack_hash",
             "evidence_reference_revision",
-        },
+        } | ({"selected_evidence_catalog"} if "selected_evidence_catalog" in source_bindings else set()),
         "plan_document_source_invalid",
     )
-    if source_bindings != {
+    if {key: value for key, value in source_bindings.items() if key != "selected_evidence_catalog"} != {
         "question_ref": question_ref,
         "idea_set_ref": idea_set_ref,
         "context_pack_ref": context_pack_ref,
@@ -321,96 +381,15 @@ def validate_plan_document(
     return canonical_hash(document)
 
 
-def validate_plan_review(
-    review: dict[str, object],
-    *,
-    reviewed_draft_hash: str,
-    final_plan_hash: str,
-) -> str:
-    _exact_keys(
-        review,
-        {
-            "schema_ref",
-            "review_mode",
-            "reviewer_agent_ref",
-            "reviewed_draft_hash",
-            "findings",
-            "dispositions",
-            "final_plan_hash",
-            "independent",
-            "advisory_only",
-        },
-        "plan_review_invalid",
-    )
-    if (
-        review.get("schema_ref") != PLAN_REVIEW_SCHEMA_REF
-        or review.get("reviewed_draft_hash") != reviewed_draft_hash
+def validate_plan_review(review: dict[str, object], *, final_plan_hash: str, reviewed_draft_hash: str) -> str:
+    """Bind draft and final bytes; review feedback is part of native execution."""
+    if (not isinstance(review, dict) or set(review) != {"schema_ref", "reviewed_draft_hash", "final_plan_hash"}
+        or review.get("schema_ref") != PLAN_REVIEW_SCHEMA_REF
         or review.get("final_plan_hash") != final_plan_hash
-        or review.get("advisory_only") is not True
-    ):
-        raise PlanContractError("plan_review_invalid")
-    review_mode = review.get("review_mode")
-    reviewer_agent_ref = review.get("reviewer_agent_ref")
-    if review_mode == "advisory_unobserved":
-        if reviewer_agent_ref is not None or review.get("independent") is not False:
-            raise PlanContractError("plan_review_invalid")
-    elif review_mode == "harness_child_agent":
-        # Immutable pre-ADR-0003 content remains readable. Current Skill and
-        # Agent Runtime write gates reject this historical provenance shape.
-        if not _text(reviewer_agent_ref) or review.get("independent") is not True:
-            raise PlanContractError("plan_review_invalid")
-    else:
-        raise PlanContractError("plan_review_invalid")
-    _sha256(reviewed_draft_hash, "plan_review_invalid")
-    _sha256(final_plan_hash, "plan_review_invalid")
-    findings = review.get("findings")
-    dispositions = review.get("dispositions")
-    if not isinstance(findings, list) or not isinstance(dispositions, list):
-        raise PlanContractError("plan_review_invalid")
-    finding_ids: set[str] = set()
-    for value in findings:
-        finding = _object(value, "plan_review_invalid")
-        _exact_keys(
-            finding,
-            {"finding_id", "category", "message"},
-            "plan_review_invalid",
-        )
-        if (
-            not _text(finding.get("finding_id"))
-            or finding["finding_id"] in finding_ids
-            or finding.get("category") not in REVIEW_CATEGORIES
-        ):
-            raise PlanContractError("plan_review_invalid")
-        _require_text(finding.get("message"), "plan_review_invalid")
-        finding_ids.add(cast(str, finding["finding_id"]))
-    disposition_ids: set[str] = set()
-    revised = False
-    for value in dispositions:
-        disposition = _object(value, "plan_review_invalid")
-        _exact_keys(
-            disposition,
-            {"finding_id", "action", "rationale"},
-            "plan_review_invalid",
-        )
-        finding_id = disposition.get("finding_id")
-        if (
-            finding_id not in finding_ids
-            or finding_id in disposition_ids
-            or disposition.get("action") not in DISPOSITION_ACTIONS
-        ):
-            raise PlanContractError("plan_review_invalid")
-        _require_text(disposition.get("rationale"), "plan_review_invalid")
-        disposition_ids.add(cast(str, finding_id))
-        revised = revised or disposition.get("action") == "revised"
-    if disposition_ids != finding_ids:
-        raise PlanContractError("plan_review_invalid")
-    changed = reviewed_draft_hash != final_plan_hash
-    if changed != revised:
-        raise PlanContractError(
-            "plan_review_revision_not_material"
-            if revised
-            else "plan_changed_without_review_revision"
-        )
+        or not isinstance(review.get("reviewed_draft_hash"), str)
+        or len(review["reviewed_draft_hash"]) != 64
+        or (reviewed_draft_hash is not None and review["reviewed_draft_hash"] != reviewed_draft_hash)):
+        raise PlanContractError("plan_review_binding_invalid")
     return canonical_hash(review)
 
 
@@ -494,6 +473,14 @@ def _validate_idea_set_binding(
 
 
 def _validate_evidence_ref(evidence: dict[str, object]) -> None:
+    if evidence.get("schema_ref") == EVIDENCE_SOURCE_REF_SCHEMA:
+        _exact_keys(evidence, {"schema_ref", "evidence_ref", "source_kind", "source_ref"},
+                    "plan_evidence_ref_invalid")
+        if (evidence.get("source_kind") not in GENERIC_EVIDENCE_KINDS
+                or not _text(evidence.get("source_ref"))
+                or evidence.get("evidence_ref") != evidence.get("source_ref")):
+            raise PlanContractError("plan_evidence_ref_invalid")
+        return
     _exact_keys(
         evidence,
         {
@@ -640,12 +627,11 @@ def _validate_answer_contract(
             not isinstance(trace, list)
             or len(trace) != len(set(cast(list[str], trace)))
             or not set(cast(list[str], trace)) <= _QUESTION_TRACE_FIELDS
-            or "answer_shape" not in trace
-            or len(trace) < 2
+            or not trace
         ):
             raise PlanContractError("answer_contract_trace_invalid")
         relevance = obligation.get("idea_relevance")
-        if not isinstance(relevance, list) or len(relevance) != len(candidate_refs):
+        if not isinstance(relevance, list) or len(relevance) > len(candidate_refs):
             raise PlanContractError("plan_idea_matrix_incomplete")
         roles: dict[str, str] = {}
         for item_value in relevance:
@@ -661,8 +647,6 @@ def _validate_answer_contract(
                 raise PlanContractError("plan_idea_matrix_invalid")
             _require_text(item.get("rationale"), "plan_idea_matrix_invalid")
             roles[cast(str, idea_ref)] = cast(str, role)
-        if set(roles) != set(candidate_refs):
-            raise PlanContractError("plan_idea_matrix_incomplete")
         result[cast(str, key)] = roles
     return result
 
@@ -747,7 +731,8 @@ def _validate_idea_trace(
     candidate_refs: tuple[str, ...],
     obligation_roles: dict[str, dict[str, str]],
 ) -> None:
-    if not isinstance(value, list) or len(value) != len(candidate_refs):
+    expected_refs = {ref for roles in obligation_roles.values() for ref in roles}
+    if not isinstance(value, list) or len(value) != len(expected_refs):
         raise PlanContractError("plan_idea_trace_invalid")
     seen: set[str] = set()
     for item_value in value:
@@ -762,7 +747,7 @@ def _validate_idea_trace(
         if idea_ref not in candidate_refs or idea_ref in seen or not isinstance(roles, list):
             raise PlanContractError("plan_idea_trace_invalid")
         expected = {
-            key: by_idea[cast(str, idea_ref)] for key, by_idea in obligation_roles.items()
+            key: by_idea[cast(str, idea_ref)] for key, by_idea in obligation_roles.items() if idea_ref in by_idea
         }
         actual: dict[str, str] = {}
         for role_value in roles:
@@ -780,7 +765,7 @@ def _validate_idea_trace(
         if actual != expected:
             raise PlanContractError("plan_idea_trace_invalid")
         seen.add(cast(str, idea_ref))
-    if seen != set(candidate_refs):
+    if seen != expected_refs:
         raise PlanContractError("plan_idea_trace_invalid")
 
 

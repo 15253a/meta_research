@@ -15,6 +15,7 @@ def test_waiting_reason_follows_current_attempt_and_not_a_newer_historical_reque
             'ar_target_root_lifecycles':'lifecycle_ref,target_ref,target_run_ref,status,updated_at,cancel_reason,launch_ref,root_session_ref,created_at',
             'ar_target_launches':'launch_ref,target_ref,target_run_ref,root_session_ref,graph_ref,stage_request_ref,quest_ref',
             'rg_targets':'target_ref,graph_ref,target_key',
+            'ar_bundle_dispatch_decisions':'run_ref,attempt_ref,fence_ref,generation INTEGER,action,rationale',
             'owner_human_requests':'request_ref,obligation,kind,quest_ref,is_current INTEGER,status,updated_at REAL',
             'owner_human_request_waiters':'request_ref,target_assertion_json,status',
         }
@@ -39,5 +40,10 @@ def test_waiting_reason_follows_current_attempt_and_not_a_newer_historical_reque
             c.exec_driver_sql("UPDATE ar_stage_runs SET current_attempt_ref='attempt-successor'")
         status=reader.query()
         assert status['waiting_reason']=='当前阶段输出已生成，等待系统接纳'
+        with db.write() as c:
+            c.exec_driver_sql("INSERT INTO ar_bundle_dispatch_decisions VALUES ('run','attempt-old','fence-old',99,'wait','Historical research wait')")
+            c.exec_driver_sql("INSERT INTO ar_bundle_dispatch_decisions VALUES ('run','attempt-successor','fence-current',2,'wait','Reassess the conflicting evidence')")
+        assert reader.query()['waiting_reason']=='Reassess the conflicting evidence'
+
     finally:
         db.close()

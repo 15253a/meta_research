@@ -1,0 +1,32 @@
+{
+  "conformance_ref": "operation_binding_1f5974d335ab5e33bed12a712fbb211aed2628556a60ac60",
+  "contract_hash": "1f5974d335ab5e33bed12a712fbb211aed2628556a60ac6072e6af23e940016c",
+  "contract_ref": "meta-research/harness-operation-binding/v1",
+  "profile_receipts": [],
+  "required_capabilities": [
+    "shell",
+    "file_access",
+    "stream",
+    "native_session"
+  ],
+  "required_families": [
+    "codex"
+  ],
+  "required_operation_ids": [
+    "agent_runtime.target_run.observe",
+    "research_graph.datasets.page",
+    "research_graph.datasets.read",
+    "research_graph.datasets.register",
+    "research_graph.datasets.register.reconcile",
+    "research_graph.datasets.register_version",
+    "research_graph.datasets.register_version.reconcile",
+    "research_graph.datasets.reference",
+    "research_graph.datasets.reference.reconcile",
+    "agent_runtime.acquisition.request",
+    "agent_runtime.acquisition.request.reconcile",
+    "human_request.open",
+    "human_request.open.reconcile"
+  ],
+  "semantic_mcp_catalog_hash": "134985f047df035059df68e03b8b698c716dfc0b003c12e060b2936895d6ad92",
+  "semantic_mcp_operation_bindings_hash": "73bd418a6b07ad728d8590a9335c887b89cebaefd799405ec853650d19854626"
+}

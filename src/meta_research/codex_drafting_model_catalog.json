@@ -1,8 +1,8 @@
 {
   "models": [
     {
-      "slug": "gpt-5.6-sol",
-      "display_name": "GPT-5.6 Sol Proposal Drafter",
+      "slug": "gpt-6-sol",
+      "display_name": "GPT-6 Sol Proposal Drafter",
       "description": "Schema-only pre-confirmation drafting model metadata.",
       "default_reasoning_level": "max",
       "supported_reasoning_levels": [
@@ -38,8 +38,8 @@
       },
       "supports_parallel_tool_calls": false,
       "supports_image_detail_original": false,
-      "context_window": 272000,
-      "max_context_window": 272000,
+      "context_window": 1050000,
+      "max_context_window": 1050000,
       "auto_compact_token_limit": null,
       "effective_context_window_percent": 95,
       "experimental_supported_tools": [],

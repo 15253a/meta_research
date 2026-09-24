@@ -14,9 +14,11 @@ export type ExperimentLogsProps = {
   minimized: boolean;
   onMinimize: () => void;
   onClose: () => void;
+  onShowExecution: () => void;
 };
 
 const POLL_MILLISECONDS = 2000;
+const REQUEST_TIMEOUT_MILLISECONDS = 8000;
 const fileSize = (bytes: number) => bytes < 1024 ? `${bytes} B`
   : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KiB`
     : bytes < 1024 * 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
@@ -24,6 +26,7 @@ const fileSize = (bytes: number) => bytes < 1024 ? `${bytes} B`
 const timeLabel = (seconds: number) => new Date(seconds * 1000).toLocaleString();
 function errorCode(error: unknown) { return error instanceof Error ? error.message : "experiment_log_unavailable"; }
 function friendlyError(code: string) {
+  if (code === "experiment_log_timeout") return "读取日志超时，正在自动重试。";
   if (code === "experiment_log_identity_invalid") return "日志所属任务已变化，正在等待当前任务信息。";
   if (code === "experiment_log_not_found") return "这个日志文件暂时不可读，正在重新查找。";
   return "暂时无法读取日志，保留最后一次读取的内容，稍后自动重试。";
@@ -36,19 +39,46 @@ function targetStatus(target: BundleTargetProjection) {
 }
 
 async function readJson<T>(url: string, signal: AbortSignal): Promise<T> {
-  const response = await fetch(url, { credentials: "same-origin", headers: { Accept: "application/json" }, signal });
-  if (!response.ok) {
-    let code = `request_failed:${response.status}`;
-    try {
-      const body = await response.json() as { detail?: { code?: string }; error?: { code?: string } };
-      code = body.detail?.code ?? body.error?.code ?? code;
-    } catch { /* Preserve the HTTP status when there is no structured error. */ }
-    throw new Error(code);
+  const request = new AbortController();
+  const cancel = () => request.abort(signal.reason);
+  let timedOut = false;
+  signal.addEventListener("abort", cancel, { once: true });
+  if (signal.aborted) cancel();
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    request.abort();
+  }, REQUEST_TIMEOUT_MILLISECONDS);
+  try {
+    const response = await fetch(url, { credentials: "same-origin", headers: { Accept: "application/json" }, signal: request.signal });
+    if (!response.ok) {
+      let code = `request_failed:${response.status}`;
+      try {
+        const body = await response.json() as { detail?: { code?: string }; error?: { code?: string } };
+        code = body.detail?.code ?? body.error?.code ?? code;
+      } catch { /* Preserve the HTTP status when there is no structured error. */ }
+      throw new Error(code);
+    }
+    return await response.json() as T;
+  } catch (error) {
+    if (timedOut && !signal.aborted) throw new Error("experiment_log_timeout");
+    throw error;
+  } finally {
+    clearTimeout(deadline);
+    signal.removeEventListener("abort", cancel);
   }
-  return await response.json() as T;
 }
 
-export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, minimized, onMinimize, onClose }: ExperimentLogsProps) {
+export function ExperimentOutputViews({ view, onChange }: {
+  view: "records" | "files";
+  onChange: (view: "records" | "files") => void;
+}) {
+  return <nav className="experiment-output-views" aria-label="实验输出视图">
+    <button type="button" aria-pressed={view === "records"} onClick={() => onChange("records")}>任务执行记录</button>
+    <button type="button" aria-pressed={view === "files"} onClick={() => onChange("files")}>日志文件</button>
+  </nav>;
+}
+
+export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, minimized, onMinimize, onClose, onShowExecution }: ExperimentLogsProps) {
   const scope = `${target.target_ref}:${target.target_run_ref ?? ""}`;
   const [catalog, setCatalog] = useState<ExperimentLogList | null>(null);
   const [selectedRef, setSelectedRef] = useState<string | null>(null);
@@ -249,7 +279,7 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
   const sourceBytes = file?.source_bytes ?? current?.sourceBytes ?? 0;
   const unreadBytes = current ? Math.max(0, sourceBytes - current.nextOffset - current.pendingUtf8Bytes) : 0;
   const taskLabel = targetStatus(target);
-  const connectionLabel = paused ? "已暂停读取" : connection === "connected" ? "日志读取正常"
+  const connectionLabel = paused ? "已暂停读取" : connection === "connected" ? currentCatalog?.status === "empty" ? "正在等待匹配的日志文件" : "日志读取正常"
     : connection === "error" ? "正在重连" : "正在连接日志";
 
   const resume = () => {
@@ -268,7 +298,7 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
 
   return createPortal(<section id="experiment-log-dialog" ref={windowRef}
     className="experiment-log-window" role="dialog" aria-modal="false"
-    aria-label={`${target.target_key} 训练与评估日志`} aria-hidden={blockedByHumanRequest ? true : undefined}
+    aria-label={`${target.target_key} 日志文件`} aria-hidden={blockedByHumanRequest ? true : undefined}
     inert={blockedByHumanRequest} data-hc-background data-hc-inert-owner="experiment-log"
     data-minimized={minimized ? "true" : "false"}
     onKeyDown={event => {
@@ -277,16 +307,18 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
       }
     }}>
     <header className="experiment-log-header">
-      <div><small>训练与评估 · 文件实时输出</small><b>{target.target_key}</b></div>
+      <div><small>日志文件 · 原始写入</small><b>{target.target_key}</b></div>
       <div className="experiment-log-window-actions">
         <button type="button" onClick={onMinimize} aria-label={minimized ? "展开实验日志" : "最小化实验日志"}>{minimized ? "展开" : "最小化"}</button>
         <button ref={closeRef} type="button" onClick={onClose} aria-label="关闭实验日志">×</button>
       </div>
     </header>
+    <p className="experiment-log-source-note">当前按 train/eval 文件名查找。文件名不代表训练或模型评估已经运行。此处展示文件的原始写入。</p>
     {minimized ? <p className="experiment-log-minimized">{file?.name ?? "等待日志文件"} · 已暂停读取</p> : <div className="experiment-log-body">
+      <ExperimentOutputViews view="files" onChange={view => { if (view === "records") onShowExecution(); }} />
       <div className="experiment-log-toolbar">
         <label className="experiment-log-select">日志文件
-          <select aria-label="选择训练或评估日志文件" value={selectedRef ?? ""} disabled={!currentCatalog?.logs.length}
+          <select aria-label="选择日志文件" value={selectedRef ?? ""} disabled={!currentCatalog?.logs.length}
             onChange={event => {
               selected.current = event.currentTarget.value;
               setSelectedRef(selected.current);
@@ -301,9 +333,9 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
               setError(null);
               setRefresh(value => value + 1);
             }}>
-            {!currentCatalog?.logs.length ? <option value="">尚未发现日志文件</option> : null}
+            {!currentCatalog?.logs.length ? <option value="">尚未发现 train/eval 命名的日志文件</option> : null}
             {currentCatalog?.logs.map(log => <option key={log.log_ref} value={log.log_ref}>
-              {log.kind === "train" ? "训练" : "评估"} · {log.relative_path}
+              {log.relative_path}
             </option>)}
           </select>
         </label>
@@ -311,7 +343,7 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
         <label className="experiment-log-wrap"><input type="checkbox" checked={rawCharacters} onChange={event => setRawCharacters(event.currentTarget.checked)} />控制字符原样</label>
       </div>
       <div className="experiment-log-states"><span data-connection={paused ? "paused" : connection}><i aria-hidden="true" />{connectionLabel}</span>
-        <span>任务：{taskLabel}</span>
+        <span>Target 状态：{taskLabel}</span>
       </div>
       {file ? <div className="experiment-log-file-facts"><code title={file.relative_path}>{file.relative_path}</code>
         <span>{fileSize(sourceBytes)} · 最近写入 {timeLabel(file.modified_at)}</span></div> : null}
@@ -330,11 +362,12 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
           }
         }}>{displayText}</pre> : <div className="experiment-log-empty" role="status">
         <span aria-hidden="true">⌘</span>
-        <b>{connection === "connecting" ? "正在查找训练与评估日志…"
-          : currentCatalog?.status === "unavailable" ? "当前实验的日志文件暂不可读"
-            : file ? "正在读取文件末尾…" : "尚未生成 train.log / eval.log"}</b>
+        <b>{connection === "connecting" ? "正在查找日志文件…"
+          : currentCatalog?.status === "unavailable" ? "当前 Target 的日志文件暂不可读"
+            : file ? "正在读取文件末尾…" : "尚未发现 train/eval 命名的日志文件"}</b>
         <p>{file ? "首次只读取末尾一段，后续增量刷新。"
-          : "实际训练或评估开始并写入日志后，这里会自动更新。"}</p>
+          : "文件页每 2 秒自动查找，发现文件后增量刷新。任务准备、资料核查和命令输出可在“任务执行记录”中实时查看。"}</p>
+        {!file ? <button type="button" className="experiment-log-execution-link" onClick={onShowExecution}>查看任务执行记录</button> : null}
       </div>}
       {current && !current.text ? <p className="experiment-log-empty-file">文件已创建，暂时没有完整可读取的内容。</p> : null}
       <footer className="experiment-log-footer">
@@ -351,7 +384,7 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
           <small>{rawCharacters ? "控制字符按读取文本显示" : "终端显示 · 安全呈现 ANSI / 回车进度"}</small>
         </div>
         <div className="experiment-log-follow-state">{following
-          ? <span>{paused ? "恢复窗口后继续读取" : file ? "跟随文件最新写入" : "等待日志文件生成"}</span>
+          ? <span>{paused ? "恢复窗口后继续读取" : file ? "跟随文件最新写入" : "每 2 秒自动查找日志文件"}</span>
           : <><span>正在阅读已加载内容{unreadBytes ? ` · 新增 ${fileSize(unreadBytes)}` : ""}</span>
             <button type="button" onClick={resume}>{unreadBytes ? "有新日志 · 继续跟随 ↓" : "继续跟随 ↓"}</button></>}
         </div>

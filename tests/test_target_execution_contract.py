@@ -107,14 +107,33 @@ def test_protocol_projection_uses_canonical_candidate_label() -> None:
     assert intent.title == "formal-protocol-target"
 
 
-def test_protocol_target_rejects_untyped_or_inconsistent_provider_inputs() -> None:
+@pytest.mark.parametrize("policy", ["required", "optional", "forbidden"])
+def test_remeasurement_keeps_checkpoint_retention_as_an_agent_preference(policy) -> None:
     execution = _execution()
     execution["request"]["variant_source"] = {
         "kind": "existing",
         "source_variant_run_ref": "variant-run-one",
         "selected_checkpoint_role_refs": [],
     }
-    execution["request"]["checkpoint_policy"] = "optional"
+    execution["request"]["checkpoint_policy"] = policy
+
+    assert validate_target_execution(execution) == PROTOCOL_EVALUATION_ADAPTER
+    intent = target_experiment_intent(
+        quest_ref="quest-protocol", target_ref="target-protocol",
+        target_spec={"title": "Reassess an exact Run", "execution": execution},
+    )
+    assert intent.checkpoint_policy == policy
+    assert intent.source_variant_run_ref == "variant-run-one"
+    assert intent.selected_checkpoint_role_refs == ()
+
+
+def test_protocol_target_rejects_untyped_or_inconsistent_provider_inputs() -> None:
+    execution = _execution()
+    execution["request"]["variant_source"] = {
+        "kind": "existing",
+        "source_variant_run_ref": "variant-run-one",
+        "selected_checkpoint_role_refs": ["checkpoint-one", "checkpoint-one"],
+    }
 
     with pytest.raises(
         TargetExecutionContractError, match="target_execution_request_invalid"

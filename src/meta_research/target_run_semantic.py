@@ -27,6 +27,7 @@ _REF_MAX_BYTES = 512
 
 TARGET_RUN_SEMANTIC_OPERATION_IDS = (
     "agent_runtime.target_run.observe",
+    "agent_runtime.target_run.progress",
 )
 
 
@@ -47,12 +48,44 @@ def target_run_semantic_operations(
 ) -> tuple[SemanticOperation, ...]:
     """Build the exact, observation-only Target root catalog."""
 
-    operations = (_observe_operation(agent_runtime, target_agent),)
+    operations = (_observe_operation(agent_runtime, target_agent), _progress_operation(target_agent))
     if tuple(item.semantic_operation_id for item in operations) != (
         TARGET_RUN_SEMANTIC_OPERATION_IDS
     ):
         raise RuntimeError("TargetRun Semantic catalog drift")
     return operations
+
+
+def _progress_operation(target_agent) -> SemanticOperation:
+    def read(context, arguments):
+        from meta_research.experiment_logs import ExperimentLogError
+        target_ref = _ref(arguments['target_ref'], 96)
+        _verify_target_context(target_agent, context, target_ref)
+        raw = arguments.get('mode', 'progress') == 'raw'
+        if raw:
+            if 'cursor' in arguments or not all(key in arguments for key in ('log_ref', 'stream_ref', 'before')):
+                raise SemanticMcpError('experiment_log_cursor_invalid')
+        elif any(key in arguments for key in ('log_ref', 'stream_ref', 'before')):
+            raise SemanticMcpError('experiment_log_cursor_invalid')
+        try:
+            result = target_agent.query_target_progress(target_ref, target_run_ref=context.run_ref,
+                **{key: arguments[key] for key in ('cursor', 'log_ref', 'stream_ref', 'before') if key in arguments})
+        except ExperimentLogError as error:
+            raise SemanticMcpError(error.code) from error
+        _verify_target_context(target_agent, context, target_ref)
+        return result
+
+    return SemanticOperation(
+        semantic_operation_id='agent_runtime.target_run.progress', owning_module='agent_runtime',
+        description='Read new training/evaluation log fragments and observed Target status with a cursor. '
+                    'Reuse the returned cursor and choose the next observation time for the experiment; '
+                    'the suggested interval is optional. Unchanged polls return no old text. '
+                    'Initial read gives bounded tails. For earlier raw bytes use mode=raw with exact log_ref, '
+                    'stream_ref and before=the prior offset. File names and log text are observations, not evaluation acceptance.',
+        input_schema=_closed({'target_ref': _string(96), 'cursor': _string(32768),
+            'mode': _string(enum=('progress', 'raw')), 'log_ref': _string(128), 'stream_ref': _string(128),
+            'before': {'type': 'integer', 'minimum': 0}}, required=('target_ref',)),
+        output_schema={'type': 'object'}, handler=read)
 
 
 def _observe_operation(

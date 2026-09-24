@@ -197,26 +197,14 @@ def _review(
 ) -> dict[str, object]:
     return {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "review_mode": "advisory_unobserved",
-        "reviewer_agent_ref": None,
+
+
         "reviewed_draft_hash": canonical_hash(primary_draft),
-        "findings": [
-            {
-                "finding_id": "finding:question-title",
-                "category": "owner_boundary",
-                "message": "Make the proposed Question title explicitly bounded.",
-            }
-        ],
-        "dispositions": [
-            {
-                "finding_id": "finding:question-title",
-                "action": "revised",
-                "rationale": "The reviewed checkpoint now carries the bounded title.",
-            }
-        ],
+
+
         "final_output_hash": canonical_hash(checkpoint),
-        "independent": False,
-        "advisory_only": True,
+
+
     }
 
 

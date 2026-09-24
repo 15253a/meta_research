@@ -5,7 +5,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from meta_research.codex_runtime import (
+    CODEX_MODEL_REF, CODEX_REASONING_EFFORT, CODEX_ROOT_REASONING_PRESET,
+    CODEX_COLLABORATION_MODE,
+)
 from meta_research.owners.common import canonical_hash
+from meta_research.system_prompt import RESEARCH_SYSTEM_PROMPT, research_system_prompt
 
 
 RootAgentKind = Literal[
@@ -96,9 +101,11 @@ ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
     "deepfetch": (),
     "acquisition": (),
     "companion": (),
-    "idea": (),
-    "plan": ("research_graph.plan_evidence.page", "research_memory.plan_evidence.read"),
+    "idea": ("research_memory.research_notes.read", "research_memory.stage_context.read"),
+    "plan": ("research_memory.research_notes.read", "research_memory.stage_context.read", "research_graph.plan_evidence.page", "research_memory.plan_evidence.read"),
     "bundle": (
+        "research_memory.research_notes.read",
+        "research_memory.stage_context.read",
         "advancement_engine.bundle_stage_run.observe",
         "advancement_engine.bundle_exhaustion.submit",
         "advancement_engine.bundle_exhaustion.reconcile",
@@ -106,16 +113,19 @@ ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
         "research_memory.implementation_content.accept",
         "research_memory.implementation_content.accept.reconcile",
         "research_memory.implementation_content.read",
-        "research_graph.reuse_eligibility.read",
-        "research_graph.reuse_inputs.verify",
         "research_graph.target_launch_request.read",
         "agent_runtime.target_work.request",
         "agent_runtime.target_work.request.reconcile",
         "agent_runtime.target_frontier.read",
         "agent_runtime.bundle_inbox.read",
     ),
-    "target": ("agent_runtime.target_run.observe",),
+    "target": ("research_memory.research_notes.read", "agent_runtime.target_run.observe",
+               "agent_runtime.target_run.progress"),
     "reasoning": (
+        "research_graph.question_relations.record",
+        "research_graph.question_relations.record.reconcile",
+        "research_memory.research_notes.read",
+        "research_memory.stage_context.read",
         "advancement_engine.reasoning_stage_run.observe",
         "research_memory.reasoning_evidence.read",
         "research_graph.reasoning_context.read",
@@ -138,6 +148,11 @@ class RootCapabilityProfile:
             "enabled_codex_features": list(_CODEX_ROOT_FEATURES),
             "multi_agent_enabled": self.multi_agent_enabled,
             "web_search_mode": self.web_search_mode,
+            "research_system_prompt_hash": canonical_hash(RESEARCH_SYSTEM_PROMPT),
+            "model_ref": CODEX_MODEL_REF,
+            "cli_reasoning_preset": CODEX_ROOT_REASONING_PRESET,
+            "effective_reasoning_effort": CODEX_REASONING_EFFORT,
+            "collaboration_mode": CODEX_COLLABORATION_MODE,
         }
 
     @property
@@ -148,6 +163,7 @@ class RootCapabilityProfile:
         self,
         *,
         entry_path: RootCapabilityEntryPath = "initial",
+        output_language: str = "zh",
     ) -> tuple[str, ...]:
         """Return the common real CLI switches owned by this profile.
 
@@ -165,11 +181,16 @@ class RootCapabilityProfile:
         ) + (
             "--config",
             'web_search="live"',
+            "--config",
+            "developer_instructions=" + json.dumps(research_system_prompt(output_language), ensure_ascii=False),
         )
 
     def runtime_bindings(self) -> tuple[str, ...]:
         return (
             "root-capability-floor:v3",
+            f"codex-config:model_reasoning_effort={CODEX_ROOT_REASONING_PRESET}",
+            f"codex-effective:reasoning.effort={CODEX_REASONING_EFFORT}",
+            f"codex-collaboration-mode:{CODEX_COLLABORATION_MODE}",
             "root-capability-profile:sha256:" + self.digest,
             "codex-config:features.hooks=true",
             "codex-config:features.multi_agent=true",

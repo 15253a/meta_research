@@ -10,6 +10,7 @@ from typing import Protocol
 
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
 from meta_research.root_capabilities import root_capability_profile
+from meta_research.codex_runtime import CODEX_REASONING_EFFORT_BINDING
 
 
 WRITING_REPORT_INTENT_SCHEMA = "meta-research/writing-report-intent/v1"
@@ -305,7 +306,8 @@ class WritingRuntimeBinding:
                 for value in self.capability_bindings
             )
             or any(
-                not value.startswith(_WRITING_SAFE_RESOURCE_PREFIXES)
+                (not value.startswith(_WRITING_SAFE_RESOURCE_PREFIXES)
+                 and value != CODEX_REASONING_EFFORT_BINDING)
                 or "\n" in value
                 or "\r" in value
                 or "../" in value

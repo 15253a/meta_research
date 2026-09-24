@@ -1,69 +1,43 @@
-# Discovery radar
+# 文献发现入口
 
-Use two complementary discovery channels:
-
-- OpenAlex is the structured radar for reproducible metadata search, exact identity resolution, and citation neighborhoods.
-- Web Search is the recall radar for vocabulary discovery, recent or weakly indexed work, reviews, benchmarks, named methods, and gaps visible only after inspecting the current ledger.
-
-Neither channel is a quality verdict. The main agent owns every query, anchor, direction, depth, relevance, and stopping decision.
+OpenAlex 提供可复核的元数据查询、精确身份解析和引文邻域；Web Search 补充术语、近期或弱索引工作、综述、基准、命名方法及台账中显现的缺口。两者都不直接判定质量。主智能体负责查询、锚点、方向、深度、相关性与停止判断。
 
 ## OpenAlex
 
-`scripts/openalex.py` is state-free. It returns normalized metadata and explicit citation directions.
-
-Search with multiple formulations:
+`scripts/openalex.py` 不保存运行状态，返回规范元数据和明确引文方向。按研究语言和领域选择实际查询；例：
 
 ```bash
 python3 "$DEEPFETCH_ROOT/scripts/openalex.py" search \
   --query "unsupervised domain adaptation EEG emotion recognition" \
   --query "cross-subject EEG affective computing transfer" \
   --limit 25 --output "$OUTPUT_DIR/.deepfetch/openalex-search.json"
-```
 
-Resolve one or more DOI or OpenAlex IDs:
-
-```bash
 python3 "$DEEPFETCH_ROOT/scripts/openalex.py" get \
   "doi:10.xxxx/example" "W1234567890" \
   --output "$OUTPUT_DIR/.deepfetch/openalex-works.json"
-```
 
-Inspect either or both citation directions around one or more seeds:
-
-```bash
 python3 "$DEEPFETCH_ROOT/scripts/openalex.py" citations \
   --seed "W1234567890" --seed "doi:10.xxxx/example" \
   --direction both --limit 50 \
   --output "$OUTPUT_DIR/.deepfetch/openalex-citations.json"
 ```
 
-Use `--from-year`, `--to-year`, repeated `--work-type`, or `--sort FIELD:asc|desc` when they clarify a search dimension. Run a subcommand with `--help` for its exact flags.
+明确维度需要时使用 `--from-year`、`--to-year`、重复 `--work-type` 或 `--sort FIELD:asc|desc`，精确参数查 `--help`。search／get 信封为 `deepfetch.openalex.v4`；向 `papers.py upsert` 传精确 get 或筛选后保留的 works，不把整页噪声直接登记。最终交接前补足有限预理解，引文邻域仍是供选择的线索。
 
-Search/get envelopes use `deepfetch.openalex.v4`. Pass an exact `get` envelope or only the individually retained works from a search to `papers.py upsert`; do not register a whole noisy search page merely because its format is accepted. Enrich retained records with bounded pre-understanding before finalization. Citation-neighborhood output remains radar evidence from which the main agent selects records.
+已有 `OPENALEX_API_KEY` 时由运行环境提供，客户端在输出和错误中隐去；不要把密钥写进研究材料。
 
-Set `OPENALEX_API_KEY` when available. The client redacts it from output and runtime errors.
+## Web 覆盖检查
 
-## Web coverage audit
+发现陌生术语或稀疏结果时用 Web Search 补查。冻结精读集合前，对当前台账和已见候选做一次有界检查：先重新考虑相关但未登记的候选，再查询重要缺口，避免重复宽查询。维度可包括任务设置、方法族、同义术语、综述／分类／教程／基准／数据集、参考文献中的经典方法、精确方法名、近期预印本和反证或比较研究。
 
-Use Web Search during discovery whenever OpenAlex results expose unfamiliar terminology or appear sparse. Before freezing the full-text subset, always make one bounded audit of the current ledger and the candidates already seen. First reconsider high-relevance candidates that were found but not registered; then search the most consequential missing axes rather than repeating the same broad query. Useful axes include:
+关键缺口已有代表性占位，且新增表达主要返回重复或无关内容时可停止；候选数量本身不证明覆盖。主动检索预算约束工作，不另设查询次数门槛。
 
-- task settings and major method families;
-- task and method synonyms;
-- review, survey, taxonomy, tutorial, benchmark, or dataset language;
-- classic or highly cited named methods found in references;
-- exact method names and authors found in promising papers;
-- recent years, early-access articles, preprints, and negative, contrary, or comparative evidence.
+## 接纳一条 Web 线索
 
-Stop the audit when the important gaps have representative placeholders and additional formulations mostly return duplicates or out-of-scope work. Candidate count alone is not a stopping reason. Let the selected intensity budget bound this work; do not impose a fixed query count.
+1. 核实精确学术标题及至少一项身份来源，例如 DOI、arXiv、OpenAlex、PubMed、会议录、仓储或出版商论文页。
+2. 可行时用 OpenAlex 规范元数据；没有记录仍可保留已核实 DOI、arXiv 或标题身份的论文。
+3. 优先按 DOI，再按 arXiv、OpenAlex 或明确的标题／作者证据去重。
+4. 仅填写标题、摘要、引文上下文或元数据实际支持的预理解。
+5. 入选正文交给 Acquisition 和 Reader，不在主上下文展开全文科学阅读。
 
-## Admit a Web lead
-
-A result page or snippet is discovery evidence, not paper evidence. Before adding a Web lead to the ledger:
-
-1. verify an exact scholarly title and at least one identity-bearing source such as a DOI, arXiv record, OpenAlex work, PubMed record, proceedings page, repository record, or publisher article page;
-2. resolve through OpenAlex when possible to normalize metadata, but retain a verified DOI-, arXiv-, or title-keyed paper when OpenAlex has no record;
-3. merge by DOI first, then arXiv, OpenAlex ID, or explicit title-and-author identity evidence;
-4. write only bounded title-, abstract-, citation-context-, or metadata-supported pre-understanding;
-5. send any selected article body to Acquisition and a Reader instead of reading it in the main context.
-
-Blogs, news pages, lab publication lists, and search snippets may point to a paper but cannot replace its scholarly record. Do not add them as papers or copy a snippet into `metadata.abstract`. Keep useful identity-bearing URLs in `metadata.source_urls`.
+博客、新闻、实验室列表和搜索片段可指向论文，不能代替学术记录；不作为论文登记，也不把片段伪装成 `metadata.abstract`。有身份价值的 URL 放入 `metadata.source_urls`。

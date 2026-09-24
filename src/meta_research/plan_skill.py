@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.context_presentation import stage_context_view
+
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
@@ -23,6 +25,7 @@ from meta_research.idea_skill import (
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.research_guidance import shared_research_guidance
 from meta_research.plan_contract import (
     MAX_PLAN_EXPERIMENT_BRIEFS,
     MAX_PLAN_OBLIGATIONS,
@@ -86,8 +89,6 @@ class PlanSkillDraft:
 class PlanSkillResult:
     reviewed_draft: dict[str, object]
     final_plan: dict[str, object]
-    findings: tuple[dict[str, str], ...]
-    dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
     reviewer_agent_ref: str | None
@@ -212,14 +213,8 @@ def review_record(
 ) -> dict[str, object]:
     return {
         "schema_ref": PLAN_REVIEW_SCHEMA_REF,
-        "review_mode": result.review_mode,
-        "reviewer_agent_ref": result.reviewer_agent_ref,
         "reviewed_draft_hash": draft_hash,
-        "findings": list(result.findings),
-        "dispositions": list(result.dispositions),
         "final_plan_hash": final_plan_hash,
-        "independent": False,
-        "advisory_only": True,
     }
 
 
@@ -468,13 +463,25 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "Evidence catalog page metadata reports candidate totals, filtering, and next_offset. "
             "Use research_graph.plan_evidence.page to browse further candidates and "
             "research_memory.plan_evidence.read with the exact commit/version/hash/role to read content. "
-            "Additional pages are discovery context; only this ContextPack's frozen evidence_catalog "
-            "may support evidence_reuse_set. Undisplayed candidates are not evidence of absence. "
+            "The initial evidence page is a bounded discovery index, not an exhaustive history. "
+            "Read exact sources before citing them. Additional accepted evidence may be selected "
+            "using its exact Owner catalog binding; the Owner revalidates selected evidence. "
+            "Use research_graph.questions.page, research_graph.question_history.read, human_request.read, "
+            "and research_memory.content.read to discover and read "
+            "same-Quest human input, earlier ScientificOutcome, or accepted AssetVersion relevant to this Plan. "
+            "For each actually adopted source, put a compact binding in additional_evidence_bindings: "
+            "{schema_ref: meta-research/evidence-source-ref/v1, evidence_ref: the exact source ref, "
+            "source_kind: HumanInput|ScientificOutcome|AssetVersion|LiteratureSnapshot, source_ref: the same exact ref}. "
+            "Use its evidence_ref in coverage.evidence_uses with the supported claim and support boundary. "
+            "Preserve human input scope and distinguish reported opinion from observation or assessment. "
+            "Copy only actually reused later-page EvidenceRef objects verbatim into additional_evidence_bindings "
+            "(maximum 32; [] if none). The adapter stores these in source_bindings.selected_evidence_catalog. "
+            "Never invent receipt/hash fields or copy a discovery summary as an EvidenceRef. "
             "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
             "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
             "你是 Plan 主 Agent。只返回 {\"plan\": ...}，其中 plan 是完整、"
             "自洽且可由 Owner 验证的 PlanDocument 候选。必须从 accepted Question "
-            "推导 AnswerContract，逐 obligation 交代完整 IdeaSet，只引用 ContextPack "
+            "选择本 Cycle 承担的 AnswerContract obligations，逐已选 obligation 交代实际相关的 Idea 候选，只引用经过 Owner 核验的精确 EvidenceRef；按需读取 ContextPack "
             "中的精确 EvidenceRef，并且只为 gap 形成 ExperimentBrief。不得创建 "
             "FormalPlan identity、Owner receipt、StageCommit、Bundle Run、Target、DAG、"
             "Worker 或 Provider。\n"
@@ -493,7 +500,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"{canonical_json(request.context_pack['accepted_question_binding'])}\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"完整 IdeaSet={canonical_json(request.accepted_idea_set)}\n"
-            f"context_pack={canonical_json(request.context_pack)}"
+            f"provider_context_view={canonical_json(stage_context_view('plan', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}"
         )
         primary_output, primary_session, _primary_stdout = (
             self._invoke_root_operation(
@@ -525,7 +532,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             )
         return PlanSkillDraft(
             draft=_with_derived_answer_contract_hash(
-                cast(dict[str, object], plan_value)
+                cast(dict[str, object], plan_value), request
             ),
             primary_session_ref=primary_session,
             adapter_kind="codex_cli",
@@ -541,16 +548,10 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         lineage = _plan_owner_rejection_prompt(request)
         reviewer_prompt = (
             f"{_plan_skill_instructions()}\n\n"
-            "本回合是同一个根 Plan Agent 的 Review phase。针对下方 exact frozen "
-            "Question/IdeaSet/Evidence 闭包与完整 reviewed_draft，重新检查 Question "
-            "对齐、每个 obligation × IdeaCandidate 是否完整、EvidenceRef "
-            "support boundary、coverage、gap 到 ExperimentBrief 闭合和 Owner 权限边界；"
-            "这次 advisory finalization 不批准 Plan，也不调用 Owner 写入。必须在同一个 "
-            "resumed turn 形成 bounded findings，并对每条 finding 给出 "
-            "revised | not_adopted disposition，并返回最终完整 PlanDocument。revised "
-            "必须实际改变 Plan；没有 finding 时 findings/dispositions 都为空。只返回 "
-            "findings、final_plan、dispositions。final_plan 中的 "
-            "answer_contract_hash 由适配器计算，不要返回该字段。"
+            "本回合在原根 Session 中完成独立审查后的修订。使用原生子智能体审查完整草稿和必要原文，"
+            "让它独立核查来源、推理、研究边界及后继选择。根据反馈和你的判断修订；没有发现问题也可改稿。"
+            "根负责最终研究判断和交接，子智能体使用已授予的工具与当前 fence。"
+            "审查反馈保留在原生执行记录中。只返回final_plan 的完整内容。"
             f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"question_ref={request.question_ref}\n"
@@ -558,7 +559,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"context_pack_ref={request.context_pack_ref}\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"完整 IdeaSet={canonical_json(request.accepted_idea_set)}\n"
-            f"context_pack={canonical_json(request.context_pack)}\n"
+            f"provider_context_view={canonical_json(stage_context_view('plan', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}\n"
             f"reviewed_draft={canonical_json(draft.draft)}"
         )
         reviewed, resumed_session, _review_stdout = self._invoke_root_operation(
@@ -575,13 +576,9 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         )
         if resumed_session != draft.primary_session_ref:
             raise PlanSkillUnavailable("codex_primary_session_changed")
-        findings_value = reviewed.get("findings")
         final_value = reviewed.get("final_plan")
-        dispositions_value = reviewed.get("dispositions")
         if (
-            not isinstance(findings_value, list)
-            or not isinstance(final_value, dict)
-            or not isinstance(dispositions_value, list)
+            not isinstance(final_value, dict)
         ):
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
@@ -596,11 +593,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         return PlanSkillResult(
             reviewed_draft=draft.draft,
             final_plan=_with_derived_answer_contract_hash(
-                cast(dict[str, object], final_value)
-            ),
-            findings=tuple(cast(dict[str, str], item) for item in findings_value),
-            dispositions=tuple(
-                cast(dict[str, str], item) for item in dispositions_value
+                cast(dict[str, object], final_value), request
             ),
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
@@ -661,8 +654,11 @@ def _plan_skill_resources() -> dict[str, str]:
     )
     try:
         return {
-            name: resource.read_text(encoding="utf-8")
-            for name, resource in resources
+            "research-guidance.md": shared_research_guidance(),
+            **{
+                name: resource.read_text(encoding="utf-8")
+                for name, resource in resources
+            },
         }
     except (FileNotFoundError, ModuleNotFoundError) as error:
         raise PlanSkillUnavailable("plan_skill_resource_unavailable") from error
@@ -716,50 +712,7 @@ def _plan_envelope_schema(request: PlanSkillRequest) -> dict[str, object]:
 
 
 def _review_finalization_schema(request: PlanSkillRequest) -> dict[str, object]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "findings": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "finding_id": {"type": "string", "minLength": 1},
-                        "category": {
-                            "type": "string",
-                            "enum": sorted(REVIEW_CATEGORIES),
-                        },
-                        "message": {"type": "string", "minLength": 1},
-                    },
-                    "required": ["finding_id", "category", "message"],
-                },
-            },
-            "final_plan": _plan_document_schema(request),
-            "dispositions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "finding_id": {"type": "string", "minLength": 1},
-                        "action": {
-                            "type": "string",
-                            "enum": sorted(DISPOSITION_ACTIONS),
-                        },
-                        "rationale": {"type": "string", "minLength": 1},
-                    },
-                    "required": ["finding_id", "action", "rationale"],
-                },
-            },
-        },
-        "required": [
-            "findings",
-            "final_plan",
-            "dispositions",
-        ],
-    }
+    return {"type": "object", "additionalProperties": False, "properties": {"final_plan": _plan_document_schema(request)}, "required": ["final_plan"]}
 
 
 def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
@@ -815,7 +768,7 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
             "minimum_support": text,
             "question_trace": {
                 "type": "array",
-                "minItems": 2,
+                "minItems": 1,
                 "uniqueItems": True,
                 "items": {
                     "type": "string",
@@ -828,7 +781,7 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
             },
             "idea_relevance": {
                 "type": "array",
-                "minItems": len(candidate_refs),
+                "minItems": 0,
                 "maxItems": len(candidate_refs),
                 "items": relevance,
             },
@@ -841,7 +794,7 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
             "idea_relevance",
         ],
     }
-    return {
+    schema = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
@@ -944,7 +897,7 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
             },
             "idea_trace": {
                 "type": "array",
-                "minItems": len(candidate_refs),
+                "minItems": 0,
                 "maxItems": len(candidate_refs),
                 "items": {
                     "type": "object",
@@ -1022,10 +975,74 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
         ],
     }
 
+    # These views repeat information already fixed by the request and decisions.
+    for field in ("evidence_reuse_set", "gap_set", "idea_trace", "bundle_disposition", "source_bindings"):
+        schema["properties"].pop(field)
+        schema["required"].remove(field)
+    schema["properties"]["notes"] = {"type": "string"}
+    schema["required"].append("notes")
+    receipt={"type":"object","additionalProperties":False,
+        "properties":{key:{"type":"string","minLength":1} for key in
+            ("status","issuer","kind","receipt_ref","subject_ref","payload_hash")},
+        "required":["status","issuer","kind","receipt_ref","subject_ref","payload_hash"]}
+    fields=("schema_ref","evidence_ref","asset_version_ref","asset_ref","content_hash",
+        "manifest_hash","target_commit_root_ref","eligibility_token_ref","integrity_receipt_ref",
+        "availability_receipt_ref","currentness_receipt_ref","role_ref")
+    props={key:{"type":"string","minLength":1} for key in fields}
+    props.update(provenance_closure_refs={"type":"array","items":{"type":"string"}},
+        capabilities={"type":"array","items":{"type":"string"}},asset_receipt=receipt,role_receipt=receipt)
+    schema["properties"]["additional_evidence_bindings"]={"type":"array","maxItems":32,
+        "items":{"anyOf":[
+            {"type":"object","additionalProperties":False,"properties":props,"required":list(props)},
+            {"type":"object","additionalProperties":False,
+             "properties":{"schema_ref":{"type":"string","enum":["meta-research/evidence-source-ref/v1"]},
+                "evidence_ref":{"type":"string","minLength":1},
+                "source_kind":{"type":"string","enum":["HumanInput","ScientificOutcome","AssetVersion","LiteratureSnapshot"]},
+                "source_ref":{"type":"string","minLength":1}},
+             "required":["schema_ref","evidence_ref","source_kind","source_ref"]}]}}
+    # Optional scientifically; an empty array is the strict transport spelling.
+    schema["required"].append("additional_evidence_bindings")
+    return schema
+
 
 def _with_derived_answer_contract_hash(
-    plan: dict[str, object],
+    plan: dict[str, object], request: PlanSkillRequest | None = None,
 ) -> dict[str, object]:
+    if request is not None:
+        plan = dict(plan)
+        coverage = plan.get("coverage")
+        contract = plan.get("answer_contract")
+        obligations = contract.get("obligations") if isinstance(contract, dict) else None
+        if isinstance(coverage, list) and all(isinstance(item, dict) for item in coverage):
+            uses = [use for item in coverage for use in item.get("evidence_uses", [])] if all(isinstance(item.get("evidence_uses"), list) for item in coverage) else None
+            if uses is not None:
+                plan.setdefault("evidence_reuse_set", uses)
+            gaps = [item.get("obligation_key") for item in coverage if item.get("disposition") == "gap"]
+            plan.setdefault("gap_set", gaps)
+            plan.setdefault("bundle_disposition", "experiments_required" if gaps else "no_new_experiment_required")
+        if isinstance(obligations, list) and all(isinstance(item, dict) and isinstance(item.get("idea_relevance"), list) for item in obligations):
+            plan.setdefault("idea_trace", [
+                {"idea_ref": ref, "obligation_roles": [
+                    {"obligation_key": item.get("obligation_key"), "role": relevance.get("role")}
+                    for item in obligations for relevance in item["idea_relevance"]
+                    if isinstance(relevance, dict) and relevance.get("idea_ref") == ref
+                ]} for ref in _candidate_refs(request.accepted_idea_set)
+                if any(isinstance(relevance,dict) and relevance.get("idea_ref")==ref
+                    for item in obligations for relevance in item["idea_relevance"])
+            ])
+        additional = plan.pop("additional_evidence_bindings", [])
+        plan.setdefault("source_bindings", {
+            "question_ref": request.question_ref, "idea_set_ref": request.idea_set_ref,
+            "context_pack_ref": request.context_pack_ref, "context_pack_hash": request.context_pack_hash,
+            "evidence_reference_revision": request.context_pack.get("evidence_reference_revision", 0),
+        })
+        if additional:
+            source=dict(plan["source_bindings"])
+            existing=source.get("selected_evidence_catalog")
+            if existing is not None and existing!=additional:
+                raise PlanSkillContractError("plan_selected_evidence_catalog_conflict")
+            source["selected_evidence_catalog"]=additional
+            plan["source_bindings"]=source
     answer_contract = plan.get("answer_contract")
     if not isinstance(answer_contract, dict):
         return plan

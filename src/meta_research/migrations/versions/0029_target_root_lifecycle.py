@@ -331,9 +331,9 @@ def upgrade() -> None:
         sa.Column("authority_hash", sa.String(64), nullable=False),
         sa.Column("variant_run_ref", sa.String(96), nullable=False, unique=True),
         sa.Column(
-            "evaluation_attempt_ref", sa.String(96), nullable=False, unique=True
+            "evaluation_attempt_ref", sa.String(96), nullable=True, unique=True
         ),
-        sa.Column("metric_result_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("metric_result_ref", sa.String(96), nullable=True, unique=True),
         sa.Column("metrics_json", sa.Text(), nullable=False),
         sa.Column("metrics_hash", sa.String(64), nullable=False),
         sa.Column("checkpoint_refs_json", sa.Text(), nullable=False),

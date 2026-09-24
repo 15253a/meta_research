@@ -91,6 +91,17 @@ _DECISION_STATUSES = frozenset(
 )
 
 
+def _waiter_asserts_run(assertion: object, run_ref: str) -> bool:
+    """Match the two public target_assertion shapes that carry a run_ref."""
+
+    if not isinstance(assertion, dict):
+        return False
+    root = assertion.get("root")
+    if isinstance(root, dict):
+        return root.get("run_ref") == run_ref
+    return assertion.get("run_ref") == run_ref
+
+
 def _text(value: object, code: str, *, maximum: int = 4096) -> str:
     if type(value) is not str or not value.strip() or len(value) > maximum:
         raise OwnerConflict(code)
@@ -1719,11 +1730,15 @@ class BundleExhaustionOwnerProofVerifier:
                 # Writing, or sibling Target request must not make the Bundle
                 # root look globally blocked. Target-local waits are evaluated
                 # by the target inventory below; only this exact root wait is a
-                # direct exhaustion blocker here.
+                # direct exhaustion blocker here. Public waiters carry the
+                # asserted run inside target_assertion (top-level run_ref or
+                # root.run_ref) and block while status == "blocked".
                 if any(
                     isinstance(waiter, dict)
-                    and waiter.get("run_ref") == proposal.run_ref
-                    and waiter.get("status") == "waiting"
+                    and waiter.get("status") == "blocked"
+                    and _waiter_asserts_run(
+                        waiter.get("target_assertion"), proposal.run_ref
+                    )
                     for waiter in direct_waiters
                 ):
                     open_requests.append(request_ref)

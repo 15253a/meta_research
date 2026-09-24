@@ -142,8 +142,8 @@ class _NoViableIdeaSkill:
         return IdeaSkillResult(
             reviewed_draft=draft.draft,
             final_outcome=draft.draft,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
             review_mode="harness_child_agent",
             reviewer_agent_ref="completion-idea-reviewer",
@@ -283,8 +283,8 @@ class _CandidateCompletionReasoningSkill:
             scientific_outcome=outcome,
             next_cycle_proposal=None,
             candidate_completion=completion,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
             review_mode="harness_child_agent",
             reviewer_agent_ref="completion-reasoning-reviewer",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from itertools import chain
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -46,7 +47,7 @@ from test_idea_stage_recovery import (
     _runtime,
 )
 from test_idea_skill_contract import (
-    _SequenceRunner,
+    _SequenceRunner as _IdeaSequenceRunner,
     _idea_set,
     _review_turn_output,
 )
@@ -79,6 +80,38 @@ from test_public_reasoning_stage import (
     _confirm_deepfetch_quest,
     _reasoning_runtime,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_codex_executable(tmp_path, monkeypatch):
+    # These adapters use injected process runners; discovery still needs a real
+    # current CLI identity and must never accidentally launch the host CLI.
+    executable_dir = tmp_path / "fake-cli"
+    executable_dir.mkdir()
+    executable = executable_dir / "codex"
+    executable.write_text("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.156.1\\n'; else exit 97; fi\n")
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(executable_dir) + os.pathsep + os.environ["PATH"])
+
+
+def _with_resident_endpoint(factory):
+    def configured(*args, **kwargs):
+        runtime = factory(*args, **kwargs)
+        runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
+        return runtime
+    return configured
+
+
+_runtime = _with_resident_endpoint(_runtime)
+_plan_runtime = _with_resident_endpoint(_plan_runtime)
+_bundle_runtime = _with_resident_endpoint(_bundle_runtime)
+_reasoning_runtime = _with_resident_endpoint(_reasoning_runtime)
+
+
+class _SequenceRunner(_IdeaSequenceRunner):
+    def run_job(self, job_ref, argv, prompt, timeout, environment=None):
+        del job_ref
+        return self(argv, prompt, timeout, environment)
 
 
 def _signed_ceiling_evidence(reason: str) -> dict[str, object]:
@@ -218,7 +251,7 @@ def _transport_contract_codex(
         "import sys\n"
         "from pathlib import Path\n"
         "if '--version' in sys.argv:\n"
-        "    print('codex-plan-transport-contract-test 1')\n"
+        "    print('codex-cli 0.156.1')\n"
         "    raise SystemExit(0)\n"
         "sys.stdin.buffer.read()\n"
         f"counter = Path({str(call_counter)!r})\n"
@@ -241,6 +274,9 @@ def _current_plan_skill_request(runtime, cycle_ref: str):
     assert run is not None
     return request, run, PlanSkillRequest(
         stage_request_ref=request.request_ref,
+        run_ref=run.run_ref,
+        attempt_ref=run.attempt_ref,
+        fence_ref=run.fence_ref,
         cycle_ref=request.cycle_ref,
         question_ref=request.accepted_question.question_ref,
         idea_set_ref=request.accepted_idea_set.outcome_ref,
@@ -435,25 +471,7 @@ class _SealedMaterialContractFailureIdeaProvider(_IdeaProvider):
     def review_draft(self, request, draft):
         self.review_calls += 1
         result = super().review_draft(request, draft)
-        return replace(
-            result,
-            review_mode="advisory_unobserved",
-            reviewer_agent_ref=None,
-            findings=(
-                {
-                    "finding_id": "finding-material",
-                    "category": "falsifiability",
-                    "message": "必须形成实质修订。",
-                },
-            ),
-            dispositions=(
-                {
-                    "finding_id": "finding-material",
-                    "action": "revised",
-                    "rationale": "声称已修订，但 Outcome 未改变。",
-                },
-            ),
-        )
+        return replace(result, final_outcome={})
 
     def terminal_contract_failure_checkpoint(
         self,
@@ -468,7 +486,7 @@ class _SealedMaterialContractFailureIdeaProvider(_IdeaProvider):
         assert operation_name == "review"
         assert native_session_ref
         assert failure_code == "idea_review_result_contract_invalid"
-        assert detail_code == "review_revision_not_material"
+        assert detail_code == "idea_outcome_question_mismatch"
         self.checkpoint_calls += 1
         return _signed_contract_failure_evidence(failure_code, detail_code)
 
@@ -481,28 +499,12 @@ class _SealedMaterialContractFailurePlanProvider(_DeterministicPlanSkill):
     def review_draft(self, request, draft):
         self.review_calls += 1
         result = super().review_draft(request, draft)
-        return replace(
-            result,
-            findings=(
-                {
-                    "finding_id": "plan-material",
-                    "category": "evidence_boundary",
-                    "message": "必须形成实质修订。",
-                },
-            ),
-            dispositions=(
-                {
-                    "finding_id": "plan-material",
-                    "action": "revised",
-                    "rationale": "声称修订但 Plan 未改变。",
-                },
-            ),
-        )
+        return replace(result, final_plan={})
 
     def terminal_contract_failure_checkpoint(self, **values):
         assert values["operation_name"] == "review"
         assert values["failure_code"] == "plan_review_result_contract_invalid"
-        assert values["detail_code"] == "plan_review_revision_not_material"
+        assert values["detail_code"] == "plan_document_invalid"
         return _signed_contract_failure_evidence(
             values["failure_code"], values["detail_code"]
         )
@@ -585,30 +587,14 @@ class _SealedMaterialContractFailureReasoningProvider(
     def review_draft(self, request, draft):
         self.review_calls += 1
         result = super().review_draft(request, draft)
-        return replace(
-            result,
-            findings=(
-                {
-                    "finding_id": "reasoning-material",
-                    "category": "owner_boundary",
-                    "message": "必须形成实质修订。",
-                },
-            ),
-            dispositions=(
-                {
-                    "finding_id": "reasoning-material",
-                    "action": "revised",
-                    "rationale": "声称修订但 Reasoning output 未改变。",
-                },
-            ),
-        )
+        return replace(result, scientific_outcome={})
 
     def terminal_contract_failure_checkpoint(self, **values):
         assert values["operation_name"] == "review"
         assert values["failure_code"] == (
             "reasoning_review_result_contract_invalid"
         )
-        assert values["detail_code"] == "reasoning_review_revision_invalid"
+        assert values["detail_code"] == "reasoning_skill_output_binding_mismatch"
         return _signed_contract_failure_evidence(
             values["failure_code"], values["detail_code"]
         )
@@ -814,7 +800,7 @@ def test_idea_sealed_review_trace_failure_stays_local_to_the_attempt(
         runtime.close()
 
 
-def test_idea_material_contract_failure_creates_same_session_successor(
+def test_idea_invalid_final_content_creates_same_session_successor(
     tmp_path: Path,
 ) -> None:
     provider = _SealedMaterialContractFailureIdeaProvider()
@@ -837,7 +823,7 @@ def test_idea_material_contract_failure_creates_same_session_successor(
         assert run["blocker"] is None
         assert run["completion_rejection"]["reason"] == {
             "code": "idea_review_result_contract_invalid",
-            "detail": "review_revision_not_material",
+            "detail": "idea_outcome_question_mismatch",
         }
         assert run["completion_rejection"]["attempt_ref"] == original[
             "attempt_ref"
@@ -875,7 +861,7 @@ def test_plan_post_result_contract_failure_creates_successor(
         assert successor["blocker"] is None
         assert successor["completion_rejection"]["reason"] == {
             "code": "plan_review_result_contract_invalid",
-            "detail": "plan_review_revision_not_material",
+            "detail": "plan_document_invalid",
         }
         assert provider.review_calls == 1
     finally:
@@ -1120,7 +1106,7 @@ def test_reasoning_post_result_contract_failure_creates_successor(
         assert successor["blocker"] is None
         assert successor["completion_rejection"]["reason"] == {
             "code": "reasoning_review_result_contract_invalid",
-            "detail": "reasoning_review_revision_invalid",
+            "detail": "reasoning_skill_output_binding_mismatch",
         }
         assert provider.review_calls == 1
     finally:
@@ -1261,7 +1247,7 @@ def test_production_adapter_invalid_shape_creates_same_session_successor(
         runtime.close()
 
 
-def test_production_adapter_sealed_review_trace_failure_never_replays(
+def test_production_adapter_missing_review_trace_accepts_hash_bound_result(
     tmp_path: Path,
 ) -> None:
     data_root = prepare_data_root(tmp_path / "production-review-trace-failure")
@@ -1290,50 +1276,20 @@ def test_production_adapter_sealed_review_trace_failure_never_replays(
         )
 
         assert runtime.idea_stage.process_once()
-        assert not runtime.idea_stage.process_once()
-        blocked = runtime.idea_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"] == {
-            "status": "durable",
-            "reason": {"code": "codex_child_review_spawn_invalid"},
-        }
-        run = runtime.owners.agent_runtime.query_idea_stage_run(
-            request.request_ref
-        )
-        assert run is not None
-        operation_ref = run.review_invocation.operation_ref
-        terminal_rows = _provider_terminal_rows(runtime, operation_ref)
-        assert len(terminal_rows["units"]) == 1
-        assert terminal_rows["units"][0][1] == "revoked"
-        assert terminal_rows["units"][0][3] is not None
-        assert len(terminal_rows["responsibilities"]) == 1
-        assert terminal_rows["responsibilities"][0][1:3] == (
-            "finished",
-            "permanent_fence",
-        )
+        assert runtime.idea_stage.process_once(), runtime.idea_stage.transient_error
+        accepted = runtime.idea_stage.query_current()["run"]
+        assert accepted["status"] == "awaiting_acceptance"
+        assert accepted["fence_status"] == "submitted"
+        assert accepted["blocker"] is None
         assert len(runner.calls) == 2
-
-        assert not runtime.idea_stage.process_once()
-        assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
-        assert len(runner.calls) == 2
+        # Native stdout remains diagnostic; currentness and acceptance still
+        # come from the Owner-bound run, output hash, and current fence.
+        assert accepted["native_session_ref"]
     finally:
         runtime.close()
 
-    no_replay = _SequenceRunner([])
-    restarted_adapter = CodexIdeaSkillAdapter(
-        workspace,
-        process_runner=no_replay,
-    )
-    restarted = _runtime(data_root, restarted_adapter)  # type: ignore[arg-type]
-    try:
-        assert not restarted.idea_stage.process_once()
-        assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert no_replay.calls == []
-    finally:
-        restarted.close()
 
-
-def test_production_adapter_primary_phase_violation_is_owner_terminal(
+def test_production_adapter_primary_review_diagnostics_do_not_fence(
     tmp_path: Path,
 ) -> None:
     data_root = prepare_data_root(tmp_path / "production-primary-phase-failure")
@@ -1353,15 +1309,15 @@ def test_production_adapter_primary_phase_violation_is_owner_terminal(
         assert request is not None
         outputs.append({"outcome": _runtime_idea_outcome(request)})
 
-        assert not runtime.idea_stage.process_once()
-        blocked = runtime.idea_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"] == {
-            "status": "durable",
-            "reason": {"code": "codex_primary_review_phase_invalid"},
-        }
-        assert not runtime.idea_stage.process_once()
+        assert runtime.idea_stage.process_once(), runtime.idea_stage.transient_error
+        accepted = runtime.idea_stage.query_current()["run"]
+        assert accepted["status"] == "admitted"
+        assert accepted["fence_status"] == "current"
+        assert accepted["blocker"] is None
         assert len(runner.calls) == 1
+        # Native stdout remains diagnostic; currentness and acceptance still
+        # come from the Owner-bound run, output hash, and current fence.
+        assert accepted["native_session_ref"]
     finally:
         runtime.close()
 
@@ -1582,7 +1538,7 @@ def test_plan_raw_transport_proof_rejects_missing_or_changed_artifact(
     assert rejected.value.recovery_checkpoint is None
 
 
-def test_plan_production_adapter_missing_review_trace_never_replays(
+def test_plan_production_adapter_missing_review_trace_accepts_result(
     tmp_path: Path,
 ) -> None:
     data_path = tmp_path / "plan-production-review-trace"
@@ -1637,80 +1593,28 @@ def test_plan_production_adapter_missing_review_trace_never_replays(
             [
                 {"plan": document},
                 {
-                    "reviewer_agent_ref": "plan-reviewer:missing-trace",
-                    "findings": [],
+
                     "final_plan": document,
-                    "dispositions": [],
+
                 },
             ]
         )
 
         assert runtime.plan_stage.process_once()
-        assert not runtime.plan_stage.process_once()
-        blocked_view = runtime.plan_stage.query_current()
-        blocked = blocked_view["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["fence_status"] == "revoked"
-        assert blocked["blocker"] == {
-            "status": "durable",
-            "reason": {"code": "codex_child_review_spawn_invalid"},
-        }
-        checkpoint = blocked["recovery_checkpoint"]
-        provider_exit = checkpoint["checkpoint"]["provider_exit"]
-        assert provider_exit["schema_ref"] == (
-            "meta-research/provider-terminal-contract-failure/v1"
-        )
-        assert provider_exit["contract_failure_code"] == (
-            "codex_child_review_spawn_invalid"
-        )
-        assert provider_exit["contract_failure_detail_code"] == (
-            "codex_child_review_spawn_invalid"
-        )
-        assert checkpoint["checkpoint"]["attempt_ref"] == blocked["attempt_ref"]
-        assert checkpoint["checkpoint"]["fence_ref"] == blocked["fence_ref"]
-        assert blocked_view["stage_commit"] is None
-        operation_ref = run.review_invocation.operation_ref
-        terminal_rows = _provider_terminal_rows(runtime, operation_ref)
-        assert len(terminal_rows["units"]) == 1
-        assert terminal_rows["units"][0][1] == "revoked"
-        assert terminal_rows["units"][0][3] is not None
-        assert len(terminal_rows["responsibilities"]) == 1
-        assert terminal_rows["responsibilities"][0][1:3] == (
-            "finished",
-            "permanent_fence",
-        )
+        assert runtime.plan_stage.process_once(), runtime.plan_stage.transient_error
+        accepted = runtime.plan_stage.query_current()["run"]
+        assert accepted["status"] == "awaiting_acceptance"
+        assert accepted["fence_status"] == "submitted"
+        assert accepted["blocker"] is None
         assert len(runner.calls) == 2
-
-        assert not runtime.plan_stage.process_once()
-        assert runtime.plan_stage.query_current()["stage_commit"] is None
-        assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
-        assert len(runner.calls) == 2
+        # Native stdout remains diagnostic; currentness and acceptance still
+        # come from the Owner-bound run, output hash, and current fence.
+        assert accepted["native_session_ref"]
     finally:
         runtime.close()
 
-    no_replay = _SequenceRunner([])
-    restarted_adapter = CodexPlanSkillAdapter(
-        workspace,
-        process_runner=no_replay,
-    )
-    restarted = _plan_runtime(
-        data_path,
-        idea_skill=_DeterministicIdeaSkill(),
-        plan_skill=restarted_adapter,  # type: ignore[arg-type]
-    )
-    try:
-        assert not restarted.plan_stage.process_once()
-        restarted_view = restarted.plan_stage.query_current()
-        assert restarted_view["run"]["status"] == "suspended_fenced"
-        assert restarted_view["run"]["fence_status"] == "revoked"
-        assert restarted_view["stage_commit"] is None
-        assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert no_replay.calls == []
-    finally:
-        restarted.close()
 
-
-def test_bundle_production_adapter_missing_review_trace_never_replays(
+def test_bundle_production_adapter_persists_primary_without_second_review_turn(
     tmp_path: Path,
 ) -> None:
     data_path = tmp_path / "bundle-production-review-trace"
@@ -1774,52 +1678,29 @@ def test_bundle_production_adapter_missing_review_trace_never_replays(
         )
 
         assert runtime.bundle_stage.process_once()
-        assert not runtime.bundle_stage.process_once()
-        blocked = runtime.bundle_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"]["reason"] == {
-            "code": "codex_child_review_spawn_invalid"
-        }
-        operation_ref = run.review_invocation.operation_ref
-        terminal_rows = _provider_terminal_rows(runtime, operation_ref)
-        assert len(runner.calls) == 2
-
-        assert not runtime.bundle_stage.process_once()
-        assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
-        assert len(runner.calls) == 2
+        assert runtime.bundle_stage.process_once(), runtime.bundle_stage.transient_error
+        accepted = runtime.bundle_stage.query_current()["run"]
+        assert accepted["status"] == "awaiting_acceptance"
+        assert accepted["fence_status"] == "submitted"
+        assert accepted["blocker"] is None
+        assert len(runner.calls) == 1
+        # Native stdout remains diagnostic; currentness and acceptance still
+        # come from the Owner-bound run, output hash, and current fence.
+        assert accepted["native_session_ref"]
     finally:
         runtime.close()
-
-    no_replay = _ResidentSequenceRunner([])
-    restarted_adapter = CodexBundleSkillAdapter(
-        workspace,
-        process_runner=no_replay,
-    )
-    restarted = _bundle_runtime(
-        data_path,
-        bundle_skill_provider=restarted_adapter,
-    )
-    restarted.bundle_stage.configure_resident_mcp_endpoint(
-        "http://127.0.0.1:8765"
-    )
-    try:
-        assert not restarted.bundle_stage.process_once()
-        assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert no_replay.calls == []
-    finally:
-        restarted.close()
 
 
 @pytest.mark.parametrize(
     ("rolling_operation", "detail_code", "expected_calls"),
     [
-        ("dispatch", "codex_bundle_dispatch_invalid", 3),
+        ("dispatch", "codex_bundle_dispatch_invalid", 2),
         (
             "dispatch-contract",
             "bundle_dispatch_requires_authoritative_blocker",
-            3,
+            2,
         ),
-        ("target-batch", "codex_bundle_target_batch_invalid", 4),
+        ("target-batch", "codex_bundle_target_batch_invalid", 3),
     ],
 )
 def test_bundle_rolling_invalid_result_is_terminal_without_replay(
@@ -1862,12 +1743,6 @@ def test_bundle_rolling_invalid_result_is_terminal_without_replay(
         )
         target_plan = _DeterministicBundleSkill()._target_plan(skill_request)
         yield {"target_plan": target_plan}
-        yield {
-            "reviewer_agent_ref": "bundle-reviewer:rolling-shape",
-            "findings": [],
-            "final_target_plan": target_plan,
-            "dispositions": [],
-        }
         if rolling_operation.startswith("dispatch"):
             if rolling_operation == "dispatch-contract":
                 yield {
@@ -1964,7 +1839,7 @@ def test_bundle_rolling_invalid_result_is_terminal_without_replay(
         restarted.close()
 
 
-def test_bundle_exhaustion_non_independent_review_is_terminal_without_replay(
+def test_bundle_exhaustion_primary_assessment_reaches_owner_acceptance(
     tmp_path: Path,
 ) -> None:
     data_path = tmp_path / "bundle-exhaustion-review-contract"
@@ -2015,63 +1890,20 @@ def test_bundle_exhaustion_non_independent_review_is_terminal_without_replay(
         _confirm_direct_quest(runtime)
         _finish_idea_stage(runtime)
         _finish_plan_stage(runtime)
-        for _step in range(10):
-            changed = runtime.bundle_stage.process_once()
+        for _step in range(12):
             current = runtime.bundle_stage.query_current()
-            if (
-                current["run"] is not None
-                and current["run"]["status"] == "suspended_fenced"
-            ):
-                assert not changed
+            if current["stage_commit"] is not None:
                 break
-        else:
-            raise AssertionError("Bundle exhaustion review did not terminalize")
-
-        assert current["run"]["blocker"]["reason"] == {
-            "code": "bundle_review_result_contract_invalid"
-        }
-        provider_exit = current["run"]["recovery_checkpoint"]["checkpoint"][
-            "provider_exit"
-        ]
-        assert provider_exit["contract_failure_code"] == (
-            "bundle_review_result_contract_invalid"
-        )
-        assert provider_exit["contract_failure_detail_code"] == (
-            "bundle_exhaustion_review_not_independent"
-        )
-        request_ref = current["stage_run_request"]["request_ref"]
-        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
-        assert run is not None
-        operation_ref = run.review_invocation.operation_ref
-        terminal_rows = _provider_terminal_rows(runtime, operation_ref)
-        assert len(runner.calls) == 2
-
-        assert not runtime.bundle_stage.process_once()
-        assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
-        assert len(runner.calls) == 2
+            assert runtime.bundle_stage.process_once(), runtime.bundle_stage.transient_error
+        assert current["stage_commit"]["disposition"] == "exhausted"
+        assert current["run"]["status"] == "completed"
+        assert current["run"]["blocker"] is None
+        assert len(runner.calls) == 1
     finally:
         runtime.close()
 
-    no_replay = _BundleSequenceRunner([])
-    restarted = _bundle_runtime(
-        data_path,
-        bundle_skill_provider=CodexBundleSkillAdapter(
-            workspace,
-            process_runner=no_replay,
-        ),
-    )
-    restarted.bundle_stage.configure_resident_mcp_endpoint(
-        "http://127.0.0.1:8765"
-    )
-    try:
-        assert not restarted.bundle_stage.process_once()
-        assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert no_replay.calls == []
-    finally:
-        restarted.close()
 
-
-def test_reasoning_production_adapter_missing_review_trace_never_replays(
+def test_reasoning_production_adapter_missing_review_trace_accepts_result(
     tmp_path: Path,
 ) -> None:
     data_path = tmp_path / "reasoning-production-review-trace"
@@ -2117,49 +1949,25 @@ def test_reasoning_production_adapter_missing_review_trace_never_replays(
                 draft,
                 {
                     "schema_ref": "meta-research/reasoning-review/v1",
-                    "reviewer_agent_ref": "reasoning-reviewer:missing-trace",
-                    "findings": [],
+
                     "final_output": draft,
-                    "dispositions": [],
+
                 },
             ]
         )
 
         assert runtime.reasoning_stage.process_once()
-        assert not runtime.reasoning_stage.process_once()
-        blocked = runtime.reasoning_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"]["reason"] == {
-            "code": "codex_child_review_spawn_invalid"
-        }
-        operation_ref = run.review_invocation.operation_ref
-        terminal_rows = _provider_terminal_rows(runtime, operation_ref)
+        assert runtime.reasoning_stage.process_once(), runtime.reasoning_stage.transient_error
+        accepted = runtime.reasoning_stage.query_current()["run"]
+        assert accepted["status"] == "awaiting_acceptance"
+        assert accepted["fence_status"] == "submitted"
+        assert accepted["blocker"] is None
         assert len(runner.calls) == 2
-
-        assert not runtime.reasoning_stage.process_once()
-        assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
-        assert len(runner.calls) == 2
+        # Native stdout remains diagnostic; currentness and acceptance still
+        # come from the Owner-bound run, output hash, and current fence.
+        assert accepted["native_session_ref"]
     finally:
         runtime.close()
-
-    no_replay = _ResidentSequenceRunner([])
-    restarted_adapter = CodexReasoningSkillAdapter(
-        workspace,
-        process_runner=no_replay,
-    )
-    restarted = _reasoning_runtime(
-        data_path,
-        reasoning_skill=restarted_adapter,  # type: ignore[arg-type]
-    )
-    restarted.reasoning_stage.configure_resident_mcp_endpoint(
-        "http://127.0.0.1:8765"
-    )
-    try:
-        assert not restarted.reasoning_stage.process_once()
-        assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert no_replay.calls == []
-    finally:
-        restarted.close()
 
 
 @pytest.mark.parametrize(
@@ -2169,7 +1977,7 @@ def test_reasoning_production_adapter_missing_review_trace_never_replays(
         ("review", "reasoning_review_result_contract_invalid", 1, 2),
     ],
 )
-def test_reasoning_missing_semantic_trace_is_terminal_without_replay(
+def test_reasoning_missing_semantic_trace_is_diagnostic(
     tmp_path: Path,
     phase: str,
     failure_code: str,
@@ -2218,56 +2026,24 @@ def test_reasoning_missing_semantic_trace_is_terminal_without_replay(
             outputs.append(
                 {
                     "schema_ref": "meta-research/reasoning-review/v1",
-                    "reviewer_agent_ref": "reasoning-reviewer:semantic-trace",
-                    "findings": [],
+
                     "final_output": draft,
-                    "dispositions": [],
+
                 }
             )
             assert runtime.reasoning_stage.process_once()
 
-        assert not runtime.reasoning_stage.process_once()
-        blocked = runtime.reasoning_stage.query_current()["run"]
-        assert blocked["status"] == "suspended_fenced"
-        assert blocked["blocker"]["reason"] == {"code": failure_code}
-        provider_exit = blocked["recovery_checkpoint"]["checkpoint"][
-            "provider_exit"
-        ]
-        assert provider_exit["contract_failure_code"] == failure_code
-        assert provider_exit["contract_failure_detail_code"] == (
-            "reasoning_semantic_mcp_currentness_unobserved"
-        )
-        operation_ref = (
-            run.primary_invocation.operation_ref
-            if phase == "primary"
-            else run.review_invocation.operation_ref
-        )
-        terminal_rows = _provider_terminal_rows(runtime, operation_ref)
+        assert runtime.reasoning_stage.process_once(), runtime.reasoning_stage.transient_error
+        accepted = runtime.reasoning_stage.query_current()["run"]
+        assert accepted["status"] == ("admitted" if phase == "primary" else "awaiting_acceptance")
+        assert accepted["fence_status"] == ("current" if phase == "primary" else "submitted")
+        assert accepted["blocker"] is None
         assert len(runner.calls) == expected_calls
-
-        assert not runtime.reasoning_stage.process_once()
-        assert _provider_terminal_rows(runtime, operation_ref) == terminal_rows
-        assert len(runner.calls) == expected_calls
+        # Native stdout remains diagnostic; currentness and acceptance still
+        # come from the Owner-bound run, output hash, and current fence.
+        assert accepted["native_session_ref"]
     finally:
         runtime.close()
-
-    no_replay = _ResidentSequenceRunner([])
-    restarted = _reasoning_runtime(
-        data_path,
-        reasoning_skill=CodexReasoningSkillAdapter(
-            workspace,
-            process_runner=no_replay,
-        ),  # type: ignore[arg-type]
-    )
-    restarted.reasoning_stage.configure_resident_mcp_endpoint(
-        "http://127.0.0.1:8765"
-    )
-    try:
-        assert not restarted.reasoning_stage.process_once()
-        assert _provider_terminal_rows(restarted, operation_ref) == terminal_rows
-        assert no_replay.calls == []
-    finally:
-        restarted.close()
 
 
 @pytest.mark.parametrize(
@@ -2386,7 +2162,10 @@ def test_resume_after_production_ceiling_uses_a_new_physical_operation(
         "import sys\n"
         "import time\n"
         "if '--version' in sys.argv:\n"
-        "    print('codex-stage-ceiling-test 1')\n"
+        "    print('codex-cli 0.156.1')\n"
+        "    raise SystemExit(0)\n"
+        "if 'features' in sys.argv and 'list' in sys.argv:\n"
+        "    print('multi_agent stable true')\n"
         "    raise SystemExit(0)\n"
         "prompt = sys.stdin.buffer.read().decode('utf-8')\n"
         f"counter = Path({str(invocation_count)!r})\n"
@@ -2449,6 +2228,7 @@ def test_resume_after_production_ceiling_uses_a_new_physical_operation(
         idea_skill_provider=adapter,
     )
     try:
+        runtime.configure_resident_mcp_endpoint("http://127.0.0.1:8999")
         completed = _confirm_question(runtime)
         runtime.idea_stage.start("production-ceiling-start")
         assert not runtime.idea_stage.process_once()

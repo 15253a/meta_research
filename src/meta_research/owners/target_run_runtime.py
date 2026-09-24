@@ -14,10 +14,13 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import time
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from functools import lru_cache
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import UnionType
 from typing import (
     Any,
@@ -32,6 +35,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from meta_research.bundle_protocol import (
+    decode_target_metric_values,
+    AcceptedMeasurementClosure,
     AcceptedInputAssetProof,
     CodeReviewRecord,
     CodeReviewScope,
@@ -72,6 +77,8 @@ from meta_research.owners.common import (
     AcceptanceReceipt,
     AcceptedTargetCommitTransition,
     AcceptedAssetBinding,
+    AcceptedFormalPlanBinding,
+    acceptance_receipt_from_public,
     OwnerConflict,
     canonical_hash,
     canonical_json,
@@ -82,11 +89,13 @@ from meta_research.owners.research_graph import (
     AcceptedFormalPlanContent,
     AcceptedAssetRole,
     AcceptedTargetGraph,
+    EvidenceReuseLeaf,
 )
 from meta_research.owners.research_memory import (
     IMPLEMENTATION_CONTENT_RECEIPT_KIND,
     REUSE_SOURCE_VERSION_RECEIPT_KIND,
     AcceptedImplementationRevisionContent,
+    AssetExportDescription,
     AssetIntakeRequest,
 )
 from meta_research.target_run_contract import (
@@ -239,6 +248,13 @@ TARGET_ROOT_WORKSPACE_CONTINUITY_MANIFEST_SCHEMA_REF = (
 
 
 @dataclass(frozen=True, slots=True)
+class _SelectedTargetInput:
+    asset: AcceptedAssetBinding
+    quest_ref: str
+    role: AcceptedAssetRole | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FrozenTargetCommitInputArtifact:
     """One exact RM-owned upstream artifact delivered to a Target root."""
 
@@ -250,7 +266,8 @@ class FrozenTargetCommitInputArtifact:
     version_ref: str
     content_hash: str
     tree_hash: str
-    content: bytes
+    content: bytes | None = None
+    export_description: AssetExportDescription | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +282,20 @@ class FrozenTargetCommitInput:
     manifest_receipt_ref: str
     manifest_content: bytes
     artifacts: tuple[FrozenTargetCommitInputArtifact, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenInputFile:
+    """Expected bytes of a file delivered directly from RM custody."""
+
+    content_hash: str
+    byte_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenInputExport:
+    relative_path: str
+    description: AssetExportDescription
 
 
 def canonical_target_scope_binding(
@@ -316,11 +347,26 @@ def canonical_target_candidate_projection_digest(
 
 
 class ResearchMemoryTargetVerifier(Protocol):
+    def read_question_content(self, content_ref: str, expected_hash: str) -> dict[str, object]: ...
+
+    def query_research_notes_for_target(self, target_ref: str) -> list[dict[str, object]]: ...
+
     def verify_implementation_content(self, **values: object) -> None: ...
 
     def verify_asset_binding(self, **values: object) -> None: ...
 
+    def verify_asset_projection_binding(self, **values: object) -> None: ...
+
     def materialize_asset(self, memory_ref: str) -> object: ...
+
+    def describe_asset_export(self, memory_ref: str) -> AssetExportDescription: ...
+
+    def export_asset(self, memory_ref: str, destination: Path) -> object: ...
+
+    def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str: ...
+
+    def export_asset_entry(self, memory_ref: str, destination: Path,
+                           *, entry_path: str | None = None) -> object: ...
 
     def submit_asset_intake(
         self, request: AssetIntakeRequest, *, idempotency_key: str
@@ -365,6 +411,31 @@ class ResearchGraphTargetVerifier(Protocol):
 
 
 class ResearchGraphTargetReader(Protocol):
+    def query_target_dependency_asset_bindings(
+        self, target_ref: str
+    ) -> tuple[str, tuple[AcceptedAssetBinding, ...]]: ...
+
+    def query_target_commit_input_asset_bindings(
+        self, *, quest_ref: str, target_commit_refs: tuple[str, ...]
+    ) -> dict[str, tuple[AcceptedAssetBinding, ...]]: ...
+
+    def accept_asset_role(
+        self, *, binding: AcceptedAssetBinding, role: str, quest_ref: str,
+        idempotency_key: str, verify_content: bool = True,
+    ) -> AcceptedAssetRole: ...
+
+    def resolve_plan_evidence_reuse_leaves(
+        self, *, quest_ref: str, accepted_formal_plan: AcceptedFormalPlanBinding
+    ) -> tuple[EvidenceReuseLeaf, ...]: ...
+
+    def query_asset_roles(
+        self, *, quest_ref: str, version_refs: tuple[str, ...]
+    ) -> tuple[AcceptedAssetRole, ...]: ...
+
+    def verify_asset_quest_scope(
+        self, version_ref: str, *, quest_ref: str
+    ) -> AcceptedAssetBinding: ...
+
     def query_target_graph(self, request_ref: str) -> object | None: ...
 
     def query_formal_plan_content_acceptance(
@@ -527,6 +598,11 @@ def _proof(receipt: AcceptanceReceipt) -> ReceiptProof:
     return receipt_proof(receipt, subject_ref=receipt.subject_ref)
 
 
+@lru_cache(maxsize=None)
+def _record_type_hints(annotation: type) -> dict[str, object]:
+    return get_type_hints(annotation)
+
+
 def _decode_bundle_value(value: object, annotation: object) -> object:
     origin = get_origin(annotation)
     if origin in {Union, UnionType}:
@@ -563,10 +639,12 @@ def _decode_bundle_value(value: object, annotation: object) -> object:
         record_fields = fields(annotation)
         if set(value) != {item.name for item in record_fields}:
             raise TypeError("record fields changed")
-        hints = get_type_hints(annotation)
+        hints = _record_type_hints(annotation)
         return annotation(
             **{
-                item.name: _decode_bundle_value(value[item.name], hints[item.name])
+                item.name: (decode_target_metric_values(value[item.name])
+                            if annotation in {AcceptedMeasurementClosure, AcceptedTargetGenericMeasurement} and item.name == "metric_values"
+                            else _decode_bundle_value(value[item.name], hints[item.name]))
                 for item in record_fields
             }
         )
@@ -605,6 +683,45 @@ class SQLiteTargetRunMemoryAuthority:
             TargetImplementationBundleRevisionVerifier | None
         ) = None
         self._generic_result_verifier: TargetGenericResultVerifier | None = None
+
+    def query_research_notes_for_target(self, target_ref: str) -> list[dict[str, object]]:
+        """The graph caller has already selected the exact relevant Target scope."""
+        return self._verifier.query_research_notes_for_target(target_ref)
+
+    def materialize_asset(self, memory_ref: str) -> object:
+        """Read the immutable RM version behind a selected note reference."""
+        return self._verifier.materialize_asset(memory_ref)
+
+    def export_asset(self, memory_ref: str, destination: Path) -> object:
+        """Deliver a previously selected exact version without loading its bytes."""
+        return self._verifier.export_asset(memory_ref, destination)
+
+    def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
+        return self._verifier.describe_asset_export(memory_ref)
+
+    def read_asset_entry_text(self, memory_ref: str, *, entry_path: str | None = None) -> str:
+        return self._verifier.read_asset_entry_text(memory_ref, entry_path=entry_path)
+
+    def export_asset_entry(self, memory_ref: str, destination: Path,
+                           *, entry_path: str | None = None) -> object:
+        return self._verifier.export_asset_entry(memory_ref, destination, entry_path=entry_path)
+
+    def describe_input_asset(
+        self, *, target_ref: str, asset_ref: str
+    ) -> tuple[AcceptedAssetBinding, AcceptanceReceipt, AssetExportDescription]:
+        accepted = self.query_input_asset(target_ref=target_ref, asset_ref=asset_ref)
+        if accepted is None:
+            raise OwnerConflict("target_input_asset_proof_missing")
+        asset, receipt = accepted
+        try:
+            description = self._verifier.describe_asset_export(asset.version_ref)
+        except Exception as error:
+            raise OwnerConflict("target_input_asset_unavailable") from error
+        if (description.memory_ref != asset.version_ref
+                or description.content_hash != asset.content_hash
+                or description.manifest_hash != asset.manifest_hash):
+            raise OwnerConflict("target_input_asset_integrity_invalid")
+        return asset, receipt, description
 
     def bind_implementation_bundle_revision_verifier(
         self,
@@ -861,7 +978,7 @@ class SQLiteTargetRunMemoryAuthority:
             target_ref=target_ref,
             implementation_revision_ref=implementation_revision_ref,
         )
-        if origin_kind not in {"reused", "greenfield", "recovery"}:
+        if origin_kind not in {"reused", "recovery"}:
             raise OwnerConflict("target_implementation_bundle_revision_invalid")
         payload = {
             "target_ref": target_ref,
@@ -1275,6 +1392,10 @@ class SQLiteTargetRunMemoryAuthority:
             raise OwnerConflict("target_implementation_artifact_integrity_invalid")
         return accepted, content
 
+    def read_question_content(self, content_ref: str, expected_hash: str) -> dict[str, object]:
+        """Use RM's existing exact content reader without creating new storage."""
+        return self._verifier.read_question_content(content_ref, expected_hash)
+
     def accept_input_asset(
         self,
         *,
@@ -1282,7 +1403,7 @@ class SQLiteTargetRunMemoryAuthority:
         asset: AcceptedAssetBinding,
         idempotency_key: str,
     ) -> AcceptanceReceipt:
-        self._verify_asset(asset)
+        self._verify_input_asset_binding(asset)
         bindings = {"target_ref": target_ref, "asset": asset.as_dict()}
         request_hash = canonical_hash(bindings)
         now = time.time()
@@ -1737,7 +1858,7 @@ class SQLiteTargetRunMemoryAuthority:
                 payload_hash=row.source_receipt_hash,
             ),
         )
-        self._verify_asset(asset)
+        self._verify_input_asset_binding(asset)
         return asset, self._rm_asset_proof_receipt(row, asset)
 
     def materialize_input_asset(
@@ -1808,6 +1929,17 @@ class SQLiteTargetRunMemoryAuthority:
             receipt_subject_ref=(
                 implementation.content_acceptance_receipt.subject_ref
             ),
+        )
+
+    def _verify_input_asset_binding(self, asset: AcceptedAssetBinding) -> None:
+        # Target input proofs bind already accepted exact versions. Both first
+        # binding and later reads use metadata; export checks bytes as it copies.
+        self._verifier.verify_asset_projection_binding(
+            asset_ref=asset.asset_ref,
+            version_ref=asset.version_ref,
+            content_hash=asset.content_hash,
+            manifest_hash=asset.manifest_hash,
+            receipt=asset.receipt,
         )
 
     def _verify_asset(self, asset: AcceptedAssetBinding) -> None:
@@ -1901,12 +2033,9 @@ class SQLiteTargetRunGraphAuthority:
             existing = connection.execute(
                 text(
                     "SELECT * FROM rg_target_formal_plan_projections WHERE "
-                    "graph_ref = :graph_ref OR formal_plan_ref = :formal_plan_ref"
+                    "graph_ref = :graph_ref"
                 ),
-                {
-                    "graph_ref": graph_ref,
-                    "formal_plan_ref": graph.formal_plan_ref,
-                },
+                {"graph_ref": graph_ref},
             ).first()
         selected = replay or existing
         if selected is not None:
@@ -2380,11 +2509,12 @@ class SQLiteTargetRunGraphAuthority:
     ) -> tuple[str, AcceptanceReceipt]:
         """Resolve an initial revision to the exact canonical Candidate fact.
 
-        The Candidate projection has already reverified either the independent
-        reuse proof chain or the explicit greenfield exception.  This method
-        returns that receipt under its own subject; RM issues a second receipt
-        for the actual code bundle and never relabels the projection receipt.
-        Recovery replacements use a separate AR declaration path.
+        The Candidate projection has already bound the precise implementation
+        revision.  This method returns that receipt under its own subject; RM
+        issues a second receipt for the actual code bundle and never relabels
+        the projection receipt.  Recovery replacements use a separate AR
+        declaration path.  Self-implementation is normal research and no
+        longer a distinct origin kind.
         """
 
         projection = self.query_candidate_projection(target_ref=target_ref)
@@ -2396,12 +2526,7 @@ class SQLiteTargetRunGraphAuthority:
             != implementation_revision_ref
         ):
             raise OwnerConflict("target_implementation_bundle_revision_invalid")
-        origin_kind = (
-            "greenfield"
-            if candidate.reuse_trace.greenfield_exception is not None
-            else "reused"
-        )
-        return origin_kind, projection.receipt
+        return "reused", projection.receipt
 
     def _current_candidate_projection_facts(
         self, target_ref: str
@@ -2443,6 +2568,504 @@ class SQLiteTargetRunGraphAuthority:
         except (BundleTargetContractError, TypeError, ValueError) as error:
             raise OwnerConflict("target_candidate_projection_source_invalid") from error
         return source, formal.candidate
+
+    def _declared_input_asset_refs(self, target_ref: str) -> tuple[str, ...]:
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT spec_json, spec_hash FROM rg_targets WHERE target_ref = :target_ref"
+            ), {"target_ref": target_ref}).first()
+        try:
+            spec = json.loads(row.spec_json)
+            refs = spec["candidate"]["direct_accepted_input_asset_refs"]
+            if (canonical_json(spec) != row.spec_json
+                or canonical_hash(spec) != row.spec_hash
+                or not isinstance(refs, list)
+                or any(type(ref) is not str or not ref for ref in refs)
+                or len(refs) != len(set(refs))):
+                raise ValueError("Target input refs")
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise OwnerConflict("target_input_reference_scope_invalid") from error
+        return tuple(refs)
+
+    def _selected_input_assets(
+        self, target_ref: str, *, commit_sources: dict[str, list[str]] | None = None
+    ) -> tuple[tuple[str, ...], dict[str, _SelectedTargetInput]]:
+        """Resolve exact Plan selections and accepted dependency artifacts.
+
+        Catalog evidence identities remain distinct from RM asset identities.
+        The existing RG leaf resolver authenticates the Plan selection, source
+        TargetCommit and bytes; the catalog-entry hash fixes the wrapper asset
+        even when a legacy leaf cites a more specific experimental role.
+        """
+        refs = self._declared_input_asset_refs(target_ref)
+        _quest_ref, dependency_assets = self._dependency_input_assets(target_ref, refs)
+        resolved: dict[str, _SelectedTargetInput] = {}
+        for ref, asset in dependency_assets.items():
+            projection = self.query_input_asset_projection(target_ref=target_ref, asset_ref=asset.asset_ref)
+            if projection is None:
+                continue
+            if projection.asset != asset:
+                raise OwnerConflict("target_input_evidence_version_conflict")
+            roles = self._domain_reader.query_asset_roles(quest_ref=_quest_ref, version_refs=(asset.version_ref,))
+            matching = [role for role in roles if role.role_ref == projection.source_role_ref
+                        and role.asset_binding() == asset and role.receipt == projection.source_role_receipt]
+            if len(matching) != 1:
+                raise OwnerConflict("target_input_evidence_role_invalid")
+            resolved[ref] = _SelectedTargetInput(asset, _quest_ref, matching[0])
+        # Retain provenance after preparation, without retroactively expanding
+        # old direct-input workspaces whose proofs predate companion selection.
+        with self._database.read() as connection:
+            companion_assets = set(connection.execute(text(
+                "SELECT asset_ref FROM rg_target_input_asset_role_proofs WHERE "
+                "target_ref = :target_ref AND idempotency_key LIKE "
+                "'target-plan-companion-input-rg:%'"
+            ), {"target_ref": target_ref}).scalars())
+        unresolved = tuple(ref for ref in refs if ref not in resolved and (ref.startswith("evidence_")
+            or ref in companion_assets
+            or self.query_input_asset_projection(target_ref=target_ref, asset_ref=ref) is None))
+        # Existing ordinary asset proofs already fix their exact version.  Empty
+        # inputs and that established path need no new Plan/catalog authority.
+        if not unresolved:
+            return refs, resolved
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT t.spec_json, t.spec_hash, g.graph_ref, g.quest_ref, "
+                "g.formal_plan_ref, g.plan_content_ref, g.plan_document_hash, "
+                "g.context_pack_ref, g.context_pack_hash, r.context_pack_json, "
+                "r.context_pack_hash AS request_context_hash, "
+                "r.context_pack_ref AS request_context_ref FROM rg_targets t "
+                "JOIN rg_target_graphs g ON g.graph_ref = t.graph_ref JOIN "
+                "ae_stage_run_requests r ON r.request_ref = g.request_ref "
+                "WHERE t.target_ref = :target_ref"
+            ), {"target_ref": target_ref}).first()
+        if row is None:
+            raise OwnerConflict("target_input_reference_scope_invalid")
+        try:
+            context = json.loads(row.context_pack_json)
+            if (canonical_json(context) != row.context_pack_json
+                or canonical_hash(context) != row.context_pack_hash
+                or row.context_pack_hash != row.request_context_hash
+                or row.context_pack_ref != row.request_context_ref):
+                raise ValueError("Bundle context")
+            raw = context["accepted_formal_plan_binding"]
+            binding = AcceptedFormalPlanBinding(
+                formal_plan_ref=raw["formal_plan_ref"], content_ref=raw["content_ref"],
+                plan_document_hash=raw["plan_document_hash"],
+                answer_contract_hash=raw["answer_contract_hash"],
+                content_receipt=acceptance_receipt_from_public(raw["content_receipt"]),
+                formal_plan_receipt=acceptance_receipt_from_public(raw["formal_plan_receipt"]),
+                stage_commit_ref=raw["stage_commit_ref"],
+                stage_commit_receipt=acceptance_receipt_from_public(raw["stage_commit_receipt"]),
+                plan_document=raw["plan_document"],
+            )
+            if (binding.as_dict() != raw
+                or binding.formal_plan_ref != row.formal_plan_ref
+                or binding.content_ref != row.plan_content_ref
+                or binding.plan_document_hash != row.plan_document_hash):
+                raise ValueError("Plan binding")
+        except (KeyError, TypeError, ValueError) as error:
+            raise OwnerConflict("target_input_reference_scope_invalid") from error
+        authority = self._domain_reader.query_target_measurement_domain_authority(target_ref)
+        if (authority is None or authority.graph_ref != row.graph_ref
+            or authority.target_spec_hash != row.spec_hash
+            or authority.accepted_formal_plan_binding_hash != canonical_hash(binding.as_dict())):
+            raise OwnerConflict("target_input_reference_scope_invalid")
+        leaves = self._domain_reader.resolve_plan_evidence_reuse_leaves(
+            quest_ref=row.quest_ref, accepted_formal_plan=binding
+        )
+        commit_leaves = [leaf for leaf in leaves if leaf.role in {"MetricResult", "WorkProduct"}]
+        asset_leaves = [leaf for leaf in leaves if leaf.role == "AssetVersion"]
+        if not commit_leaves and not asset_leaves:
+            return tuple(refs), resolved
+        with self._database.read() as connection:
+            plan = connection.execute(text(
+                "SELECT r.context_pack_json, r.context_pack_hash FROM "
+                "rg_formal_plan_decisions d JOIN ae_stage_run_requests r ON "
+                "r.request_ref = d.request_ref AND r.context_pack_ref = d.context_pack_ref "
+                "WHERE d.formal_plan_ref = :formal_plan_ref AND d.decision = 'accepted'"
+            ), {"formal_plan_ref": binding.formal_plan_ref}).first()
+        try:
+            plan_context = json.loads(plan.context_pack_json)
+            from meta_research.plan_contract import selected_plan_evidence_catalog
+            catalog = selected_plan_evidence_catalog(binding.plan_document, plan_context["evidence_catalog"])
+            if (canonical_hash(plan_context) != plan.context_pack_hash
+                or canonical_json(plan_context) != plan.context_pack_json
+                or not isinstance(catalog, list)):
+                raise ValueError("Plan catalog")
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise OwnerConflict("target_input_evidence_catalog_invalid") from error
+        selected_assets = {item.asset.asset_ref: item.asset for item in resolved.values()}
+        selected_commits: set[str] = set()
+        for leaf in asset_leaves:
+            matches = [entry for entry in catalog if isinstance(entry, dict)
+                and entry.get("evidence_ref") == leaf.evidence_ref]
+            if len(matches) != 1:
+                raise OwnerConflict("target_input_evidence_catalog_invalid")
+            entry = matches[0]
+            if (canonical_hash(entry) != leaf.evidence_catalog_entry_hash
+                or entry.get("schema_ref") != "meta-research/evidence-source-ref/v1"
+                or entry.get("source_kind") != "AssetVersion"
+                or entry.get("source_ref") != leaf.asset_version_ref
+                or leaf.evidence_item_ref != leaf.asset_version_ref):
+                raise OwnerConflict("target_input_evidence_catalog_invalid")
+            # The accepted Plan fixes the version. Recheck its existing Quest
+            # origin before the normal Target input proof path writes any role.
+            asset = self._domain_reader.verify_asset_quest_scope(
+                leaf.asset_version_ref, quest_ref=row.quest_ref
+            )
+            source = leaf.source_binding
+            if (asset.version_ref != leaf.asset_version_ref
+                or asset.asset_ref != leaf.source_subject_ref
+                or not isinstance(source, dict)
+                or source.get("kind") != "AssetVersion"
+                or source.get("ref") != asset.version_ref
+                or source.get("source_subject_ref") != asset.asset_ref
+                or source.get("owner_acceptance_receipt_ref") != asset.receipt.receipt_ref):
+                raise OwnerConflict("target_input_evidence_catalog_invalid")
+            relevant_refs = tuple(ref for ref in (leaf.evidence_ref, asset.asset_ref, asset.version_ref)
+                if ref in unresolved)
+            if not relevant_refs:
+                continue
+            previous_asset = selected_assets.get(asset.asset_ref)
+            if previous_asset is not None and previous_asset != asset:
+                raise OwnerConflict("target_input_evidence_version_conflict")
+            selected_assets[asset.asset_ref] = asset
+            for ref in relevant_refs:
+                previous = resolved.get(ref)
+                if previous is not None and previous.asset != asset:
+                    raise OwnerConflict("target_input_evidence_version_conflict")
+                resolved[ref] = _SelectedTargetInput(asset, row.quest_ref)
+        for leaf in commit_leaves:
+            matches = [entry for entry in catalog if isinstance(entry, dict)
+                and entry.get("evidence_ref") == leaf.evidence_ref]
+            if len(matches) != 1:
+                raise OwnerConflict("target_input_evidence_catalog_invalid")
+            entry = matches[0]
+            if (canonical_hash(entry) != leaf.evidence_catalog_entry_hash
+                or entry.get("target_commit_root_ref") != leaf.target_commit_ref):
+                raise OwnerConflict("target_input_evidence_catalog_invalid")
+            selected_commits.add(leaf.target_commit_ref)
+            relevant_refs = tuple(ref for ref in (leaf.evidence_ref, entry.get("asset_ref"), entry.get("asset_version_ref"))
+                if ref in unresolved)
+            if not relevant_refs:
+                continue
+            roles = self._domain_reader.query_asset_roles(
+                quest_ref=row.quest_ref, version_refs=(entry["asset_version_ref"],)
+            )
+            matching_roles = [role for role in roles if role.role_ref == entry["role_ref"]]
+            if len(matching_roles) != 1:
+                raise OwnerConflict("target_input_evidence_role_invalid")
+            role = matching_roles[0]
+            asset = AcceptedAssetBinding(
+                asset_ref=entry["asset_ref"], version_ref=entry["asset_version_ref"],
+                content_hash=entry["content_hash"], manifest_hash=entry["manifest_hash"],
+                receipt=acceptance_receipt_from_public(entry["asset_receipt"]),
+            )
+            if (role.asset_binding() != asset or role.quest_ref != row.quest_ref
+                or role.receipt != acceptance_receipt_from_public(entry["role_receipt"])):
+                raise OwnerConflict("target_input_evidence_role_invalid")
+            previous_asset = selected_assets.get(asset.asset_ref)
+            if previous_asset is not None and previous_asset != asset:
+                raise OwnerConflict("target_input_evidence_version_conflict")
+            selected_assets[asset.asset_ref] = asset
+            if commit_sources is not None:
+                selected = commit_sources.setdefault(leaf.target_commit_ref, [])
+                selected.extend(ref for ref in relevant_refs if ref not in selected)
+            for ref in relevant_refs:
+                previous = resolved.get(ref)
+                if previous is not None and previous.asset != asset:
+                    raise OwnerConflict("target_input_evidence_version_conflict")
+                resolved[ref] = _SelectedTargetInput(asset, row.quest_ref, role)
+        companion_refs = {ref for ref in unresolved if ref.startswith("asset_") and ref not in resolved}
+        if companion_refs and selected_commits:
+            sources = self._domain_reader.query_target_commit_input_asset_bindings(
+                quest_ref=row.quest_ref, target_commit_refs=tuple(sorted(selected_commits)),
+            )
+            for commit_ref, assets in sources.items():
+                for asset in assets:
+                    relevant_refs = companion_refs.intersection((asset.asset_ref, asset.version_ref))
+                    if not relevant_refs:
+                        continue
+                    previous = selected_assets.get(asset.asset_ref)
+                    if previous is not None and previous != asset:
+                        raise OwnerConflict("target_input_evidence_version_conflict")
+                    selected_assets[asset.asset_ref] = asset
+                    for ref in relevant_refs:
+                        resolved[ref] = _SelectedTargetInput(asset, row.quest_ref)
+                    if commit_sources is not None:
+                        selected = commit_sources.setdefault(commit_ref, [])
+                        selected.extend(ref for ref in sorted(relevant_refs) if ref not in selected)
+        return tuple(refs), resolved
+
+    def _dependency_input_assets(
+        self, target_ref: str, refs: tuple[str, ...]
+    ) -> tuple[str | None, dict[str, AcceptedAssetBinding]]:
+        selected_refs = {ref for ref in refs if ref.startswith("asset_")}
+        if not selected_refs:
+            return None, {}
+        quest_ref, assets = self._domain_reader.query_target_dependency_asset_bindings(target_ref)
+        # Asset identities are resolved only inside accepted dependency manifests,
+        # which freeze their versions. Never consult the asset's latest version.
+        selected: dict[str, AcceptedAssetBinding] = {}
+        for asset in assets:
+            for ref in (asset.asset_ref, asset.version_ref):
+                if ref not in selected_refs:
+                    continue
+                previous = selected.get(ref)
+                if previous is not None and previous != asset:
+                    raise OwnerConflict("target_input_evidence_version_conflict")
+                selected[ref] = asset
+        by_asset: dict[str, AcceptedAssetBinding] = {}
+        for asset in selected.values():
+            previous = by_asset.get(asset.asset_ref)
+            if previous is not None and previous != asset:
+                raise OwnerConflict("target_input_evidence_version_conflict")
+            by_asset[asset.asset_ref] = asset
+        return quest_ref, selected
+
+    def selected_evidence_target_commits(self, target_ref: str) -> dict[str, tuple[str, ...]]:
+        """Resolve companion artifacts only for evidence selected by this Target.
+
+        The verified Plan leaf and catalog entry bind the source TargetCommit;
+        no result document path or free-text reference is an input authority.
+        """
+        selected: dict[str, list[str]] = {}
+        refs, inputs = self._selected_input_assets(target_ref, commit_sources=selected)
+        for ref in refs:
+            if ref.startswith("evidence_") and ref not in inputs:
+                raise OwnerConflict("target_input_evidence_not_selected")
+        for selected_input in inputs.values():
+            self._verify_input_asset_version(target_ref=target_ref, selected=selected_input)
+        return {ref: tuple(sorted(values)) for ref, values in sorted(selected.items())}
+
+    def query_target_reading_context(self, *, target_ref: str,
+                                    research_note_directory: Path | None = None):
+        return self.query_target_research_context(target_ref=target_ref,
+            research_note_directory=research_note_directory)
+
+    def query_target_research_context(self, *, target_ref: str,
+                                     research_note_directory: Path | None = None) -> dict[str, object]:
+        """Read the exact research purpose attached to this accepted Target.
+
+        Keep currentness/proof reconstruction in Owners. Return only its selected
+        obligations and Briefs, plus immutable Question and handoff source refs.
+        """
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT t.graph_ref, t.spec_json, t.spec_hash, t.append_ref, t.dependency_refs_json, "
+                "r.context_pack_json, r.context_pack_hash FROM rg_targets t "
+                "JOIN rg_target_graphs g ON g.graph_ref = t.graph_ref "
+                "JOIN ae_stage_run_requests r ON r.request_ref = g.request_ref "
+                "WHERE t.target_ref = :target_ref"
+            ), {"target_ref": target_ref}).first()
+        if row is None:
+            raise OwnerConflict("target_research_context_unavailable")
+        graph, source, _completion, _briefs = self._current_formal_plan_facts(row.graph_ref)
+        try:
+            context = json.loads(row.context_pack_json)
+            spec = json.loads(row.spec_json)
+            binding = context["accepted_formal_plan_binding"]
+            plan = binding["plan_document"]
+            question_binding = context["accepted_question_binding"]
+            selected_keys = spec["candidate"]["experiment_keys"]
+            if (canonical_hash(context) != row.context_pack_hash
+                or canonical_json(context) != row.context_pack_json
+                or canonical_hash(spec) != row.spec_hash
+                or canonical_json(spec) != row.spec_json
+                or canonical_hash(plan) != source.plan_document_hash
+                or binding["formal_plan_ref"] != source.formal_plan_ref
+                or plan["question_ref"] != question_binding["question_ref"]
+                or question_binding["quest_ref"] != graph.quest_ref):
+                raise ValueError("frozen research binding")
+            selected_briefs = [item for item in plan["experiment_briefs"]
+                if item["experiment_key"] in selected_keys]
+            if {item["experiment_key"] for item in selected_briefs} != set(selected_keys):
+                raise ValueError("selected Briefs")
+            obligation_keys = {key for item in selected_briefs for key in item["gap_obligation_keys"]}
+            obligations = [item for item in plan["answer_contract"]["obligations"]
+                if item["obligation_key"] in obligation_keys]
+            if {item["obligation_key"] for item in obligations} != obligation_keys:
+                raise ValueError("selected obligations")
+            question = self._memory.read_question_content(
+                question_binding["content_ref"], question_binding["content_hash"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise OwnerConflict("target_research_context_invalid") from error
+        # query_target_graph above verifies the accepted append lineage. Freeze
+        # the notes that existed when this candidate was admitted, not later notes.
+        notes = graph.target_plan.get("notes", "")
+        update = graph.target_plan.get("initial_strategy_update", {})
+        if isinstance(update, dict) and isinstance(update.get("notes"), str) and update["notes"].strip():
+            notes = update["notes"]
+        notes_ref, notes_hash = graph.submission_ref, graph.target_plan_hash
+        if row.append_ref is not None:
+            with self._database.read() as connection:
+                appended = connection.execute(text(
+                    "SELECT p.proposal_json, a.proposal_ref FROM rg_target_graph_appends a "
+                    "JOIN ar_bundle_target_proposals p ON p.proposal_ref = a.proposal_ref "
+                    "WHERE a.append_ref = :append_ref AND a.graph_ref = :graph_ref"
+                ), {"append_ref": row.append_ref, "graph_ref": row.graph_ref}).first()
+            if appended is None:
+                raise OwnerConflict("target_research_context_invalid")
+            proposal = json.loads(appended.proposal_json)
+            update = proposal.get("strategy_update", {})
+            if isinstance(update, dict) and isinstance(update.get("notes"), str) and update["notes"].strip():
+                notes, notes_ref, notes_hash = update["notes"], appended.proposal_ref, canonical_hash(proposal)
+        result = {
+            "schema_ref": "meta-research/target-research-context/v1",
+            "target_ref": target_ref, "question_ref": question_binding["question_ref"],
+            "question_content_ref": question_binding["content_ref"],
+            "question_content_hash": question_binding["content_hash"],
+            "question": question, "formal_plan_ref": source.formal_plan_ref,
+            "plan_document_hash": source.plan_document_hash,
+            "obligations": obligations, "experiment_briefs": selected_briefs,
+            "plan_notes": plan.get("notes", ""), "bundle_notes": notes,
+            "bundle_notes_source_ref": notes_ref, "bundle_notes_source_hash": notes_hash,
+            "selection_boundary": "Only the listed obligations and Briefs belong to this Target; the wider Question and Quest remain research context.",
+        }
+        from meta_research.human_research_context import human_research_reader
+        result["human_guidance_reader"] = human_research_reader()
+        if research_note_directory is not None:
+            from meta_research.research_notes import materialize_note_body
+            upstream_refs = [target_ref, *json.loads(row.dependency_refs_json)]
+            selected_commits = self.selected_evidence_target_commits(target_ref)
+            if selected_commits:
+                with self._database.read() as connection:
+                    for commit_ref in selected_commits:
+                        upstream = connection.execute(text("SELECT target_ref FROM rg_target_commits "
+                            "WHERE commit_ref=:ref"), {"ref": commit_ref}).scalar_one()
+                        upstream_refs.append(upstream)
+            notes = []
+            for upstream_ref in list(dict.fromkeys(upstream_refs))[:12]:
+                for note in self._memory.query_research_notes_for_target(upstream_ref)[:2]:
+                    notes.append({**note, "body_path": materialize_note_body(
+                        self._memory, note, research_note_directory)})
+            if notes:
+                result["research_notes"] = notes
+            result["research_notes_reader"] = {
+                "operation": "research_memory.research_notes.read", "source": "research_notes",
+                "path": [], "offset": 0, "limit": 8192, "index_offset": 0,
+                "summary_only": True,
+            }
+        return result
+
+    def resolve_input_asset_ref(self, *, target_ref: str, input_ref: str) -> str:
+        """Translate a selected frozen evidence ref without creating proofs."""
+        return self.resolve_input_asset_refs(
+            target_ref=target_ref, input_refs=(input_ref,),
+        )[0]
+
+    def resolve_input_asset_refs(
+        self, *, target_ref: str, input_refs: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """Resolve one input set with a single read of its dependency bindings."""
+        refs, inputs = self._selected_input_assets(target_ref)
+        declared = set(refs)
+        resolved = []
+        for input_ref in input_refs:
+            if input_ref not in declared:
+                raise OwnerConflict("target_input_reference_not_declared")
+            selected = inputs.get(input_ref)
+            if selected is not None:
+                self._verify_input_asset_version(target_ref=target_ref, selected=selected)
+                resolved.append(selected.asset.asset_ref)
+            elif input_ref.startswith("evidence_"):
+                raise OwnerConflict("target_input_evidence_not_selected")
+            elif input_ref.startswith("asset_version_"):
+                raise OwnerConflict("target_input_asset_version_not_selected")
+            else:
+                resolved.append(input_ref)
+        return tuple(resolved)
+
+    def _verify_input_asset_version(
+        self, *, target_ref: str, selected: _SelectedTargetInput
+    ) -> AcceptedTargetInputAssetProjection | None:
+        asset, role = selected.asset, selected.role
+        current = self.query_input_asset_projection(target_ref=target_ref, asset_ref=asset.asset_ref)
+        if current is not None:
+            if (current.asset != asset or role is not None and (
+                current.source_role_ref != role.role_ref
+                or current.source_role_receipt != role.receipt)):
+                raise OwnerConflict("target_input_evidence_version_conflict")
+        else:
+            rm_current = self._memory.query_input_asset(target_ref=target_ref, asset_ref=asset.asset_ref)
+            if rm_current is not None and rm_current[0] != asset:
+                raise OwnerConflict("target_input_evidence_version_conflict")
+        return current
+
+    def prepare_input_assets(self, target_ref: str) -> bool:
+        """Issue exact Target proofs from Plan selections or accepted dependencies."""
+        refs = self._declared_input_asset_refs(target_ref)
+        quest_ref, dependency_assets = self._dependency_input_assets(target_ref, refs)
+        dependency_progress = False
+        for asset in dependency_assets.values():
+            existing = self.query_input_asset_projection(target_ref=target_ref, asset_ref=asset.asset_ref)
+            if existing is not None:
+                if existing.asset != asset:
+                    raise OwnerConflict("target_input_evidence_version_conflict")
+                continue
+            identity = canonical_hash({"target_ref": target_ref, "asset": asset.as_dict()})
+            role = self._domain_reader.accept_asset_role(binding=asset, role="evidence", quest_ref=quest_ref,
+                idempotency_key="target-dependency-input-role:" + identity, verify_content=False)
+            receipt = self._memory.accept_input_asset(target_ref=target_ref, asset=asset,
+                idempotency_key="target-dependency-input-rm:" + identity)
+            self.accept_input_asset_role(target_ref=target_ref, role=role, rm_proof_receipt=receipt,
+                idempotency_key="target-dependency-input-rg:" + identity)
+            dependency_progress = True
+        refs, inputs = self._selected_input_assets(target_ref)
+        pending: dict[str, _SelectedTargetInput] = {}
+        for ref in refs:
+            selected = inputs.get(ref)
+            if selected is None:
+                if ref.startswith("evidence_"):
+                    raise OwnerConflict("target_input_evidence_not_selected")
+                if ref.startswith("asset_version_"):
+                    raise OwnerConflict("target_input_asset_version_not_selected")
+                if self.query_input_asset_projection(target_ref=target_ref, asset_ref=ref) is None:
+                    raise OwnerConflict("target_input_asset_not_selected")
+                continue
+            if self._verify_input_asset_version(target_ref=target_ref, selected=selected) is not None:
+                continue
+            pending[selected.asset.asset_ref] = selected
+        for asset_ref, selected in sorted(pending.items()):
+            role = selected.role
+            companion = role is None
+            if companion:
+                identity = canonical_hash({"target_ref": target_ref, "asset": selected.asset.as_dict()})
+                role = self._domain_reader.accept_asset_role(
+                    binding=selected.asset, role="evidence", quest_ref=selected.quest_ref,
+                    idempotency_key="target-plan-companion-input-role:" + identity, verify_content=False,
+                )
+            identity = canonical_hash({"target_ref": target_ref,
+                "asset": role.asset_binding().as_dict(), "role_ref": role.role_ref})
+            receipt = self._memory.accept_input_asset(target_ref=target_ref,
+                asset=role.asset_binding(), idempotency_key="target-plan-input-rm:" + identity)
+            self.accept_input_asset_role(target_ref=target_ref, role=role,
+                rm_proof_receipt=receipt, idempotency_key=(
+                    "target-plan-companion-input-rg:" if companion else "target-plan-input-rg:"
+                ) + identity)
+        return bool(pending) or dependency_progress
+
+    def input_asset_source_refs(self, target_ref: str) -> dict[str, tuple[str, ...]]:
+        """Retain original evidence names beside actual materialized assets."""
+        # Legacy direct-asset materialization has no evidence aliases to expose.
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT spec_json FROM rg_targets WHERE target_ref = :target_ref"
+            ), {"target_ref": target_ref}).first()
+        if row is not None:
+            spec = json.loads(row.spec_json)
+            candidate = spec.get("candidate", {})
+            direct_refs = candidate.get("direct_accepted_input_asset_refs", ())
+            if not any(isinstance(ref, str) and ref.startswith(("evidence_", "asset_version_")) for ref in direct_refs):
+                return {}
+        refs, inputs = self._selected_input_assets(target_ref)
+        grouped: dict[str, list[str]] = {}
+        for ref in refs:
+            selected = inputs.get(ref)
+            asset_ref = ref if selected is None else selected.asset.asset_ref
+            grouped.setdefault(asset_ref, []).append(ref)
+        return {asset_ref: tuple(sorted(values)) for asset_ref, values in grouped.items()
+            if any(value != asset_ref for value in values)}
 
     def accept_input_asset_role(
         self,
@@ -3759,6 +4382,23 @@ class SQLiteTargetRunAgentAuthority:
         self._workspace_root = (
             None if workspace_root is None else workspace_root.resolve()
         )
+        from meta_research.experiment_logs import TargetExperimentLogs
+        self._progress_logs = (None if self._workspace_root is None else
+                               TargetExperimentLogs(self, self._workspace_root))
+
+    def query_target_progress(self, target_ref: str, *, target_run_ref: str,
+                              cursor: str | None = None, log_ref: str | None = None,
+                              stream_ref: str | None = None, before: int | None = None) -> dict:
+        """Observe incremental training/evaluation output or one exact raw page."""
+        from meta_research.experiment_logs import ExperimentLogError
+        from meta_research.target_progress import read_target_progress
+        if self._progress_logs is None:
+            raise ExperimentLogError('experiment_log_workspace_unavailable', 503)
+        if log_ref is not None:
+            return self._progress_logs.read(target_ref, log_ref, target_run_ref=target_run_ref,
+                                             stream_ref=stream_ref, before=before, limit=16384)
+        return read_target_progress(self._progress_logs, target_ref,
+                                    target_run_ref=target_run_ref, cursor=cursor)
 
     def reserve_target_workspace(
         self,
@@ -5443,6 +6083,14 @@ class SQLiteTargetRunAgentAuthority:
         path = self._ensure_target_workspace_layout(workspace)
         return workspace.workspace_ref, path
 
+    def target_input_commit_sources(self, handle: TargetWorkHandle) -> dict[str, tuple[str, ...]]:
+        """Supplement direct dependencies with exact selected Evidence sources."""
+        self.verify_current_target_run_handle(handle)
+        sources = {ref: () for ref in handle.accepted_input_target_commit_refs}
+        if handle.accepted_input_asset_proofs:
+            sources.update(self._graph.selected_evidence_target_commits(handle.target_ref))
+        return dict(sorted(sources.items()))
+
     def materialize_target_workspace_inputs(
         self,
         *,
@@ -5451,9 +6099,9 @@ class SQLiteTargetRunAgentAuthority:
     ) -> tuple[str, ...]:
         """Populate the root's read-only input directory from accepted RM bytes.
 
-        This is delivery of already accepted context, not acceptance of a
-        Target output.  It runs before the root Session starts and is exact
-        replay: a pre-existing path must contain the same bytes.
+        RM verifies bytes during the atomic export. Resume reuses delivered
+        inputs; formal completion verifies the frozen tree before accepting
+        the Target output.
         """
 
         self.verify_current_target_run_handle(handle)
@@ -5467,7 +6115,7 @@ class SQLiteTargetRunAgentAuthority:
         root = self._ensure_target_workspace_layout(workspace)
         inputs = root / workspace.inputs_relative_path
         frozen_inputs = self._ensure_frozen_input_root(workspace)
-        expected, entries = self._target_workspace_input_projection(
+        expected, entries, exports, _directories = self._target_workspace_input_projection(
             handle=handle,
             accepted_target_commit_inputs=accepted_target_commit_inputs,
         )
@@ -5483,10 +6131,7 @@ class SQLiteTargetRunAgentAuthority:
                 root=frozen_inputs,
                 expected=expected,
             )
-            self._verify_target_workspace_input_tree(
-                inputs=frozen_inputs,
-                expected=expected,
-            )
+            self._export_target_inputs(root=frozen_inputs, exports=exports, expected=expected)
         finally:
             self._lock_input_directories(frozen_inputs)
         pointer = canonical_json(
@@ -5501,10 +6146,6 @@ class SQLiteTargetRunAgentAuthority:
         try:
             self._write_target_input_tree(
                 root=inputs,
-                expected={"manifest.json": pointer},
-            )
-            self._verify_target_workspace_input_tree(
-                inputs=inputs,
                 expected={"manifest.json": pointer},
             )
         finally:
@@ -5533,7 +6174,7 @@ class SQLiteTargetRunAgentAuthority:
         root = self._ensure_target_workspace_layout(workspace)
         inputs = root / workspace.inputs_relative_path
         frozen_inputs = self._ensure_frozen_input_root(workspace)
-        expected, entries = self._target_workspace_input_projection(
+        expected, entries, _exports, directories = self._target_workspace_input_projection(
             handle=handle,
             accepted_target_commit_inputs=accepted_target_commit_inputs,
         )
@@ -5548,6 +6189,7 @@ class SQLiteTargetRunAgentAuthority:
         self._verify_target_workspace_input_tree(
             inputs=frozen_inputs,
             expected=expected,
+            directories=directories,
         )
         pointer = canonical_json(
             {
@@ -5558,10 +6200,15 @@ class SQLiteTargetRunAgentAuthority:
                 ).hexdigest(),
             }
         ).encode("utf-8")
-        self._verify_target_workspace_input_tree(
-            inputs=inputs,
-            expected={"manifest.json": pointer},
-        )
+        # Only the pointer belongs to the system in this working directory.
+        # The Agent may keep analysis copies/caches alongside it; accepted
+        # custody remains the exact frozen tree checked above.
+        if (
+            inputs.is_symlink()
+            or not inputs.is_dir()
+            or not self._input_file_matches(inputs / "manifest.json", pointer)
+        ):
+            raise OwnerConflict("target_run_workspace_input_integrity_invalid")
 
     def query_target_workspace_quest_ref(self, handle: TargetWorkHandle) -> str:
         """Return the AR-admitted Quest identity for issuer-scoped RG reads."""
@@ -5637,34 +6284,68 @@ class SQLiteTargetRunAgentAuthority:
         *,
         handle: TargetWorkHandle,
         accepted_target_commit_inputs: tuple[FrozenTargetCommitInput, ...],
-    ) -> tuple[dict[str, bytes], list[dict[str, object]]]:
-        expected: dict[str, bytes] = {}
+    ) -> tuple[dict[str, bytes | _FrozenInputFile], list[dict[str, object]],
+               list[_FrozenInputExport], set[str]]:
+        expected: dict[str, bytes | _FrozenInputFile] = {}
         entries: list[dict[str, object]] = []
+        exports: list[_FrozenInputExport] = []
+        directories: set[str] = set()
+        context_reader = getattr(getattr(self, "_graph", None), "query_target_research_context", None)
+        if callable(context_reader):
+            context = context_reader(target_ref=handle.target_ref)
+            content = canonical_json(context).encode("utf-8")
+            expected["research-context.json"] = content
+            entries.append({"kind": "research_context", "relative_path": "research-context.json",
+                "content_sha256": hashlib.sha256(content).hexdigest(), "byte_count": len(content)})
+        sources = (
+            self._graph.input_asset_source_refs(handle.target_ref)
+            if handle.accepted_input_asset_proofs else {}
+        )
         for ordinal, proof in enumerate(handle.accepted_input_asset_proofs, start=1):
-            asset, _proof_receipt, file_name, content = (
-                self._memory.materialize_input_asset(
+            descriptor = getattr(self._memory, "describe_input_asset", None)
+            if callable(descriptor):
+                asset, _proof_receipt, description = descriptor(
                     target_ref=handle.target_ref,
                     asset_ref=proof.asset_ref,
                 )
-            )
-            suffix = _safe_input_suffix(file_name)
+                file_name = description.file_name
+                content = None
+            else:
+                # Historical in-memory adapters retain their existing seam.
+                asset, _proof_receipt, file_name, content = self._memory.materialize_input_asset(
+                    target_ref=handle.target_ref, asset_ref=proof.asset_ref,
+                )
+                description = None
+            suffix = ("" if description is not None and description.kind == "directory"
+                      else _safe_input_suffix(file_name))
             relative_path = (
                 "direct/"
                 f"{ordinal:04d}-"
                 f"{hashlib.sha256(asset.asset_ref.encode('utf-8')).hexdigest()[:16]}"
                 f"{suffix}"
             )
-            expected[relative_path] = content
+            if description is None:
+                expected[relative_path] = content
+                content_hash, byte_count = hashlib.sha256(content).hexdigest(), len(content)
+            else:
+                self._project_input_export(relative_path, description, expected, exports, directories)
+                content_hash, byte_count = description.content_hash, description.byte_count
             entries.append(
                 {
                     "kind": "direct_asset",
+                    **({"source_refs": list(sources[asset.asset_ref])}
+                       if asset.asset_ref in sources else {}),
                     "relative_path": relative_path,
                     "asset_ref": asset.asset_ref,
                     "version_ref": asset.version_ref,
-                    "content_sha256": hashlib.sha256(content).hexdigest(),
-                    "byte_count": len(content),
+                    "content_sha256": content_hash,
+                    "byte_count": byte_count,
+                    **({"artifact_kind": description.kind,
+                        "media_type": description.media_type}
+                       if description is not None else {}),
                 }
             )
+        commit_sources = self.target_input_commit_sources(handle)
         for commit_ordinal, accepted in enumerate(
             accepted_target_commit_inputs, start=1
         ):
@@ -5681,8 +6362,9 @@ class SQLiteTargetRunAgentAuthority:
             artifact_entries: list[dict[str, object]] = []
             for artifact in accepted.artifacts:
                 suffix = _safe_input_suffix(artifact.declared_relative_path)
+                description = artifact.export_description
                 if artifact.artifact_kind == "directory":
-                    suffix = ".zip"
+                    suffix = "" if description is not None and description.kind == "directory" else ".zip"
                 artifact_path = (
                     prefix
                     + "/artifacts/"
@@ -5693,7 +6375,12 @@ class SQLiteTargetRunAgentAuthority:
                     raise OwnerConflict(
                         "target_run_workspace_input_integrity_invalid"
                     )
-                expected[artifact_path] = artifact.content
+                if description is None:
+                    expected[artifact_path] = artifact.content
+                    byte_count = len(artifact.content)
+                else:
+                    self._project_input_export(artifact_path, description, expected, exports, directories)
+                    byte_count = description.byte_count
                 artifact_entries.append(
                     {
                         "relative_path": artifact_path,
@@ -5704,12 +6391,13 @@ class SQLiteTargetRunAgentAuthority:
                         "version_ref": artifact.version_ref,
                         "content_sha256": artifact.content_hash,
                         "tree_sha256": artifact.tree_hash,
-                        "byte_count": len(artifact.content),
+                        "byte_count": byte_count,
                     }
                 )
             entries.append(
                 {
                     "kind": "target_commit",
+                    "source_refs": list(commit_sources[accepted.target_commit_ref]),
                     "target_commit_ref": accepted.target_commit_ref,
                     "target_ref": accepted.target_ref,
                     "target_run_ref": accepted.target_run_ref,
@@ -5720,17 +6408,242 @@ class SQLiteTargetRunAgentAuthority:
                     "artifacts": artifact_entries,
                 }
             )
-        return expected, entries
+        return expected, entries, exports, directories
 
     @staticmethod
+    def _project_input_export(
+        relative_path: str, description: AssetExportDescription,
+        expected: dict[str, bytes | _FrozenInputFile],
+        exports: list[_FrozenInputExport], directories: set[str],
+    ) -> None:
+        """Project only exact file metadata; large contents remain in RM custody."""
+        def safe_path(value: str) -> None:
+            if (not value or value.startswith("/") or "\\" in value or ":" in value or "\x00" in value
+                    or any(part in {"", ".", ".."} for part in value.split("/"))):
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+
+        safe_path(relative_path)
+        if description.kind == "file":
+            files = [(relative_path, description.content_hash, description.byte_count)]
+        elif description.kind == "directory":
+            directories.add(relative_path)
+            for directory in description.directories:
+                safe_path(directory)
+                directories.add(relative_path + "/" + directory)
+            files = []
+            for entry in description.entries:
+                safe_path(entry.path)
+                files.append((relative_path + "/" + entry.path, entry.sha256, entry.size))
+        else:
+            raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+        for path, digest, byte_count in files:
+            if (path in expected or path in directories or type(byte_count) is not int
+                    or byte_count < 0 or type(digest) is not str or len(digest) != 64):
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+            expected[path] = _FrozenInputFile(digest, byte_count)
+        exports.append(_FrozenInputExport(relative_path, description))
+
+    def _export_target_inputs(
+        self, *, root: Path, exports: list[_FrozenInputExport],
+        expected: dict[str, bytes | _FrozenInputFile],
+    ) -> None:
+        for export in exports:
+            destination = root.joinpath(*export.relative_path.split("/"))
+            self._ensure_input_parent_directories(root, destination.parent)
+            if destination.is_symlink():
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+            if destination.exists():
+                # RM exports atomically. Resume reuses the published input;
+                # formal completion verifies the whole frozen tree.
+                continue
+            try:
+                self._materialize_shared_target_input(root=root, export=export)
+            except OwnerConflict as error:
+                if error.code == "asset_export_destination_unavailable":
+                    # A full or unwritable destination does not invalidate the
+                    # accepted research input. Keep the storage cause so the
+                    # worker can report the actionable failure and resume the
+                    # same immutable export after storage is available again.
+                    raise OwnerConflict(
+                        "target_run_workspace_input_storage_unavailable"
+                    ) from error
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid") from error
+            except OSError as error:
+                raise OwnerConflict(
+                    "target_run_workspace_input_storage_unavailable"
+                ) from error
+            except Exception as error:
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid") from error
+        for relative_path, item in expected.items():
+            if isinstance(item, _FrozenInputFile):
+                root.joinpath(*relative_path.split("/")).chmod(0o400)
+
+    @staticmethod
+    def _target_input_asset_identity(description: AssetExportDescription) -> dict[str, object]:
+        # A byte hash alone must never merge distinct accepted version identities.
+        return {"schema_ref": "meta-research/target-input-asset/v1",
+                "description": asdict(description)}
+
+    def _target_input_asset_cache_root(self) -> Path:
+        if self._workspace_root is None:
+            raise OwnerConflict("target_run_workspace_unavailable")
+        base = self._workspace_root.parent / "target-input-assets"
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if base.is_symlink() or base.resolve().parent != self._workspace_root.parent:
+            raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+        return base
+
+    @classmethod
+    def _check_shared_input_payload(
+        cls, path: Path, description: AssetExportDescription,
+    ) -> None:
+        """Check published structure, without rehashing accepted GB on startup."""
+        expected: dict[str, bytes | _FrozenInputFile] = {}
+        directories: set[str] = set()
+        cls._project_input_export("content", description, expected, [], directories)
+        if path.is_symlink() or not path.exists():
+            raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+        actual: set[str] = set()
+        actual_directories: set[str] = set()
+        paths = [path] + (list(path.rglob("*")) if description.kind == "directory" else [])
+        for item in paths:
+            relative = "content" + ("/" + item.relative_to(path).as_posix() if item != path else "")
+            info = item.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                if info.st_mode & 0o222:
+                    raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+                actual_directories.add(relative)
+                continue
+            bound = expected.get(relative)
+            if (not stat.S_ISREG(info.st_mode) or not isinstance(bound, _FrozenInputFile)
+                    or info.st_size != bound.byte_count or info.st_mode & 0o222):
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+            actual.add(relative)
+        for relative in expected:
+            parent = Path(relative).parent
+            while parent != Path("."):
+                directories.add(parent.as_posix())
+                parent = parent.parent
+        if actual != set(expected) or actual_directories != directories:
+            raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+
+    @staticmethod
+    def _discard_input_asset_staging(path: Path) -> None:
+        # Staging may contain hardlinks. Make only directories writable; changing
+        # a leaf's permissions would also change published read-only inputs.
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+        if path.exists():
+            path.chmod(0o700)
+            for child in path.rglob("*"):
+                if child.is_dir() and not child.is_symlink():
+                    child.chmod(0o700)
+            shutil.rmtree(path)
+
+    @classmethod
+    def _link_input_asset_payload(
+        cls, source: Path, destination: Path, description: AssetExportDescription,
+    ) -> None:
+        if description.kind == "file":
+            os.link(source, destination, follow_symlinks=False)
+            return
+        destination.mkdir(mode=0o700)
+        for directory in description.directories:
+            (destination / directory).mkdir(mode=0o700, parents=True, exist_ok=True)
+        for entry in description.entries:
+            target = destination / entry.path
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.link(source / entry.path, target, follow_symlinks=False)
+        cls._lock_input_directories(destination)
+
+    def _materialize_shared_target_input(self, *, root: Path, export: _FrozenInputExport) -> None:
+        """Export an exact version once, then link its separate handoff custody.
+
+        This cache never hardlinks RM objects or linked_local sources. Target
+        manifests, paths and receipt bindings remain independent and unchanged.
+        A kernel lock serializes first delivery across processes; it is released
+        on process death, allowing the next wake to discard incomplete staging.
+        """
+        base = self._target_input_asset_cache_root()
+        identity = self._target_input_asset_identity(export.description)
+        key = canonical_hash(identity)
+        metadata = canonical_json(identity).encode("utf-8")
+        cached = base / key
+        staging = base / (".staging-" + key)
+        destination = root.joinpath(*export.relative_path.split("/"))
+        descriptor = os.open(base / ("lock-" + key),
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if destination.is_symlink():
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+            if destination.exists():
+                return
+            self._discard_input_asset_staging(staging)
+            if cached.is_symlink() or (cached.exists() and not cached.is_dir()):
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+            if not cached.exists():
+                staging.mkdir(mode=0o700)
+                try:
+                    payload = staging / "content"
+                    delivered = self._memory.export_asset(export.description.memory_ref, payload)
+                    if delivered.description != export.description or delivered.path != payload:
+                        raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+                    if export.description.kind == "file":
+                        payload.chmod(0o400)
+                    else:
+                        for entry in export.description.entries:
+                            (payload / entry.path).chmod(0o400)
+                        self._lock_input_directories(payload)
+                    self._check_shared_input_payload(payload, export.description)
+                    with (staging / "description.json").open("wb") as output:
+                        output.write(metadata)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    (staging / "description.json").chmod(0o400)
+                    self._lock_input_directories(staging)
+                    os.rename(staging, cached)
+                    parent_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(parent_fd)
+                    finally:
+                        os.close(parent_fd)
+                finally:
+                    self._discard_input_asset_staging(staging)
+            if ({item.name for item in cached.iterdir()} != {"description.json", "content"}
+                    or not self._input_file_matches(cached / "description.json", metadata)):
+                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+            self._check_shared_input_payload(cached / "content", export.description)
+            # Directory links are assembled outside the frozen tree and published
+            # together, so crashes cannot leave a partial accepted projection.
+            with TemporaryDirectory(prefix=".input-projection-", dir=root.parent) as temporary:
+                projected = Path(temporary) / "content"
+                try:
+                    self._link_input_asset_payload(cached / "content", projected, export.description)
+                    os.rename(projected, destination)
+                finally:
+                    if projected.is_dir():
+                        self._discard_input_asset_staging(projected)
+            parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        finally:
+            os.close(descriptor)
+
     def _validate_target_commit_inputs(
+        self,
         *,
         handle: TargetWorkHandle,
         accepted: tuple[FrozenTargetCommitInput, ...],
     ) -> None:
         if type(accepted) is not tuple or tuple(
             item.target_commit_ref for item in accepted
-        ) != handle.accepted_input_target_commit_refs:
+        ) != tuple(self.target_input_commit_sources(handle)):
             raise OwnerConflict("target_root_upstream_input_invalid")
         for item in accepted:
             if type(item) is not FrozenTargetCommitInput:
@@ -5758,12 +6671,36 @@ class SQLiteTargetRunAgentAuthority:
                 != item.manifest_content
                 or any(
                     type(artifact) is not FrozenTargetCommitInputArtifact
-                    or hashlib.sha256(artifact.content).hexdigest()
-                    != artifact.content_hash
+                    or not self._valid_frozen_artifact(artifact)
                     for artifact in item.artifacts
                 )
             ):
                 raise OwnerConflict("target_root_upstream_input_invalid")
+            for artifact in item.artifacts:
+                description = artifact.export_description
+                if description is not None:
+                    try:
+                        actual = self._memory.describe_asset_export(artifact.version_ref)
+                    except Exception as error:
+                        raise OwnerConflict("target_root_upstream_input_invalid") from error
+                    if actual != description:
+                        raise OwnerConflict("target_root_upstream_input_invalid")
+
+    @staticmethod
+    def _valid_frozen_artifact(artifact: FrozenTargetCommitInputArtifact) -> bool:
+        description = artifact.export_description
+        if description is None:
+            return (type(artifact.content) is bytes
+                    and hashlib.sha256(artifact.content).hexdigest() == artifact.content_hash)
+        return (type(description) is AssetExportDescription and artifact.content is None
+                and description.memory_ref == artifact.version_ref
+                and description.content_hash == artifact.content_hash
+                and (description.kind == artifact.artifact_kind
+                     or (artifact.artifact_kind == "directory"
+                         and artifact.media_type == description.media_type == "application/zip"
+                         and description.kind == "file"))
+                and (description.kind != "directory"
+                     or artifact.tree_hash == description.content_hash))
 
     @staticmethod
     def _ensure_input_parent_directories(inputs: Path, parent: Path) -> None:
@@ -5799,24 +6736,54 @@ class SQLiteTargetRunAgentAuthority:
 
     @classmethod
     def _write_target_input_tree(
-        cls, *, root: Path, expected: dict[str, bytes]
+        cls, *, root: Path, expected: dict[str, bytes | _FrozenInputFile],
     ) -> None:
-        root.chmod(0o700)
-        for relative_path, content in sorted(expected.items()):
-            destination = root.joinpath(*relative_path.split("/"))
-            cls._ensure_input_parent_directories(root, destination.parent)
-            if destination.exists():
+        try:
+            root.chmod(0o700)
+            for relative_path, content in sorted(expected.items()):
+                if isinstance(content, _FrozenInputFile):
+                    # Export will atomically create the file or complete directory.
+                    continue
+                destination = root.joinpath(*relative_path.split("/"))
+                cls._ensure_input_parent_directories(root, destination.parent)
+                if not destination.exists():
+                    # Publish only a complete file. A failed write must leave
+                    # the final path absent so a later wake can retry normally.
+                    # Stage outside the frozen tree so a process interruption
+                    # cannot leave an unlisted file among accepted inputs.
+                    with TemporaryDirectory(
+                        prefix=".input-metadata-", dir=root.parent,
+                    ) as staging:
+                        staged = Path(staging) / "content"
+                        with staged.open("wb") as output:
+                            output.write(content)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        staged.chmod(0o400)
+                        try:
+                            os.link(staged, destination)
+                        except FileExistsError:
+                            # Another preparer may have published the same
+                            # immutable metadata. Verify it below; never replace.
+                            pass
+                        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(parent_fd)
+                        finally:
+                            os.close(parent_fd)
                 if (
                     destination.is_symlink()
                     or not destination.is_file()
-                    or destination.read_bytes() != content
+                    or not cls._input_file_matches(destination, content)
                 ):
                     raise OwnerConflict(
                         "target_run_workspace_input_integrity_invalid"
                     )
-            else:
-                destination.write_bytes(content)
-            destination.chmod(0o400)
+                destination.chmod(0o400)
+        except OSError as error:
+            raise OwnerConflict(
+                "target_run_workspace_input_storage_unavailable"
+            ) from error
 
     @staticmethod
     def _lock_input_directories(inputs: Path) -> None:
@@ -5829,13 +6796,14 @@ class SQLiteTargetRunAgentAuthority:
             directory.chmod(0o500)
         inputs.chmod(0o500)
 
-    @staticmethod
+    @classmethod
     def _verify_target_workspace_input_tree(
-        *, inputs: Path, expected: dict[str, bytes]
+        cls, *, inputs: Path, expected: dict[str, bytes | _FrozenInputFile],
+        directories: set[str] | None = None,
     ) -> None:
         if inputs.is_symlink() or not inputs.is_dir():
             raise OwnerConflict("target_run_workspace_input_integrity_invalid")
-        actual: dict[str, bytes] = {}
+        actual: set[str] = set()
         actual_directories: set[str] = set()
         for path in inputs.rglob("*"):
             if path.is_symlink():
@@ -5847,46 +6815,52 @@ class SQLiteTargetRunAgentAuthority:
             if not path.is_file():
                 raise OwnerConflict("target_run_workspace_input_integrity_invalid")
             expected_content = expected.get(relative_path)
-            try:
-                before = path.lstat()
-            except OSError as error:
-                raise OwnerConflict(
-                    "target_run_workspace_input_integrity_invalid"
-                ) from error
-            if expected_content is None or before.st_size != len(expected_content):
+            if expected_content is None or not cls._input_file_matches(path, expected_content):
                 raise OwnerConflict("target_run_workspace_input_integrity_invalid")
-            first = path.read_bytes()
-            second = path.read_bytes()
-            try:
-                after = path.lstat()
-            except OSError as error:
-                raise OwnerConflict(
-                    "target_run_workspace_input_integrity_invalid"
-                ) from error
-            stable_identity = (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            ) == (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
-            if not stable_identity or first != second:
-                raise OwnerConflict("target_run_workspace_input_integrity_invalid")
-            actual[relative_path] = first
-        expected_directories: set[str] = set()
+            actual.add(relative_path)
+        expected_directories: set[str] = set(directories or ())
         for relative_path in expected:
             parent = Path(relative_path).parent
             while parent != Path("."):
                 expected_directories.add(parent.as_posix())
                 parent = parent.parent
-        if actual != expected or actual_directories != expected_directories:
+        if actual != set(expected) or actual_directories != expected_directories:
             raise OwnerConflict("target_run_workspace_input_integrity_invalid")
+
+    @staticmethod
+    def _input_file_matches(path: Path, expected: bytes | _FrozenInputFile) -> bool:
+        """Hash a stable, non-link file with bounded memory regardless of size."""
+        size = len(expected) if isinstance(expected, bytes) else expected.byte_count
+        digest = (hashlib.sha256(expected).hexdigest() if isinstance(expected, bytes)
+                  else expected.content_hash)
+        try:
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_size != size:
+                return False
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                    return False
+                actual = hashlib.sha256()
+                remaining = size
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        return False
+                    actual.update(chunk)
+                    remaining -= len(chunk)
+                if stream.read(1):
+                    return False
+                after_open = os.fstat(stream.fileno())
+            after = path.lstat()
+        except OSError:
+            return False
+        def identity(value: os.stat_result) -> tuple[int, ...]:
+            return (value.st_dev, value.st_ino, value.st_size,
+                    value.st_mtime_ns, value.st_ctime_ns)
+        return (identity(before) == identity(opened) == identity(after_open) == identity(after)
+                and actual.hexdigest() == digest)
 
     def freeze_target_workspace_implementation(
         self,
@@ -7138,7 +8112,7 @@ class SQLiteTargetRunAgentAuthority:
         """
 
         run = self._harness.query_target_run_by_ref(run_ref)
-        projection = self._graph.query_candidate_projection(target_ref)
+        projection = self._graph.query_candidate_projection(target_ref=target_ref)
         if run is None or projection is None or (
             run.run_ref,
             run.attempt_ref,

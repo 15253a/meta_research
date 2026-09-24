@@ -7,6 +7,9 @@ from meta_research.target_run_runtime import TargetRunRuntime
 from test_target_run_owner import _records
 
 
+SOURCE_SPEC_HASH = "b" * 64
+
+
 def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
     candidate, formal_plan, handle, _preflight, request = _records()
     launch = SimpleNamespace(
@@ -33,15 +36,22 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
             return SimpleNamespace(terminal="issuer-derived")
 
     class ResearchGraph:
+        def query_target_measurement_domain_authority(self, target_ref):
+            return _measurement_authority(target_ref, launch)
+
         def query_target_candidate_projection(self, *, target_ref: str):
             assert target_ref == handle.target_ref
-            return SimpleNamespace(candidate=candidate)
+            return SimpleNamespace(candidate=candidate, source_spec_hash=SOURCE_SPEC_HASH)
 
         def query_target_formal_plan_projection(self, *, graph_ref: str):
             assert graph_ref == launch.graph_ref
             return SimpleNamespace(formal_plan=formal_plan)
 
     class TargetGraph:
+        def query_target_reading_context(self, *, target_ref, research_note_directory):
+            assert target_ref == handle.target_ref
+            return {"question": {"question_ref": "question-1"}}
+
         binding: object | None = None
 
         def query_execution_input_binding_for_attempt(self, **_values):
@@ -179,11 +189,11 @@ def test_light_driver_resumes_one_root_until_one_final_publication() -> None:
 
     assert len(harnesses.root_calls) == 2
     assert all(
-        "own the entire loop" in values["prompt"]
-        and "repeat as many times" in values["prompt"]
-        and "native multi-agent collaboration" in values["prompt"]
-        and "delegation is optional" in values["prompt"]
-        and "You remain responsible" in values["prompt"]
+        "进行研究、检查与局部修订" in values["prompt"]
+        and "最终交接前完成独立子智能体审阅" in values["prompt"]
+        and "普通检索、实施和整理按需要委派" in values["prompt"]
+        and "子智能体使用当前任务授予的工具与权限" in values["prompt"]
+        and "根负责整体判断" in values["prompt"]
         and "/var/lib/meta-research/target-frozen-inputs/manifest.json"
         in values["prompt"]
         for _request_ref, values in harnesses.root_calls
@@ -233,13 +243,20 @@ def test_recoverable_owner_rejection_resumes_same_root_with_exact_feedback() -> 
             lifecycle.record = SimpleNamespace(status="completed")
 
     class ResearchGraph:
+        def query_target_measurement_domain_authority(self, target_ref):
+            return _measurement_authority(target_ref, launch)
+
         def query_target_candidate_projection(self, **_values):
-            return SimpleNamespace(candidate=candidate)
+            return SimpleNamespace(candidate=candidate, source_spec_hash=SOURCE_SPEC_HASH)
 
         def query_target_formal_plan_projection(self, **_values):
             return SimpleNamespace(formal_plan=formal_plan)
 
     class TargetGraph:
+        def query_target_reading_context(self, *, target_ref, research_note_directory):
+            assert target_ref == handle.target_ref
+            return {"question": {"question_ref": "question-1"}}
+
         def query_execution_input_binding_for_attempt(self, **_values):
             return SimpleNamespace(binding_ref="target-input-revision")
 
@@ -377,13 +394,20 @@ def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() ->
             lifecycle.record = SimpleNamespace(status="completed")
 
     class ResearchGraph:
+        def query_target_measurement_domain_authority(self, target_ref):
+            return _measurement_authority(target_ref, launch)
+
         def query_target_candidate_projection(self, **_values):
-            return SimpleNamespace(candidate=candidate)
+            return SimpleNamespace(candidate=candidate, source_spec_hash=SOURCE_SPEC_HASH)
 
         def query_target_formal_plan_projection(self, **_values):
             return SimpleNamespace(formal_plan=formal_plan)
 
     class TargetGraph:
+        def query_target_reading_context(self, *, target_ref, research_note_directory):
+            assert target_ref == handle.target_ref
+            return {"question": {"question_ref": "question-1"}}
+
         query_calls = 0
 
         def query_execution_input_binding_for_attempt(self, **_values):
@@ -528,3 +552,36 @@ def test_failed_harness_tick_only_recovers_then_next_ticks_finish_same_root() ->
             "target_commit_ref": "target-root-commit-after-recovery",
         }
     ]
+
+
+def _measurement_authority(target_ref, launch):
+    from meta_research.bundle_target_contract import (
+        FrozenJsonObject, FrozenMetricDefinition, FrozenProtocolVersionCandidate,
+        TargetMeasurementContractCandidate,
+    )
+    # The accepted source spec and the execution candidate projection are
+    # different documents in production; their hashes must not be conflated.
+    assert SOURCE_SPEC_HASH != launch.request.target_spec_binding.content_hash_ref
+    contract = TargetMeasurementContractCandidate(
+        experiment_keys=("experiment-a",), measurement_unit_key="unit-a",
+        baseline_forward_contract=FrozenJsonObject('{"baseline":"frozen"}'),
+        variant_recipe=FrozenJsonObject('{"variant":"frozen"}'),
+        evaluation_protocol_lineage=FrozenJsonObject('{"protocol":"frozen"}'),
+        protocol_version=FrozenProtocolVersionCandidate(
+            evaluation_data=FrozenJsonObject('{"data":"frozen"}'),
+            split=FrozenJsonObject('{"split":"heldout"}'),
+            preprocessing=FrozenJsonObject('{"normalization":"train_only"}'),
+            required_metrics=(FrozenMetricDefinition("effect", FrozenJsonObject(
+                '{"meaning":"measured effect or null if unmeasured"}')),),
+            optional_metrics=(), internal_part_keys=(), aggregation=None,
+            preregistered_stop_rules=(),
+        ),
+        checkpoint_policy="optional", result_schema_ref="test/result/v1",
+        result_schema=FrozenJsonObject('{"type":"object"}'),
+    )
+    return SimpleNamespace(
+        target_ref=target_ref, graph_ref=launch.graph_ref,
+        target_spec_hash=SOURCE_SPEC_HASH,
+        authority_ref="authority-a", authority_hash="a" * 64,
+        measurement_contract=contract,
+    )

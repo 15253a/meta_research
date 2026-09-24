@@ -1,7 +1,5 @@
-# Intentionally empty.
-#
-# nature-downloader is distributed as an institution-neutral skill. Users must
-# configure their own library/resource URL at runtime with:
+# 初始学校清单为空。
+# nature-downloader 不预设机构，用户在运行时配置自己的图书馆／资源入口：
 #   python3 scripts/configure_school.py url "https://library.example.edu/resources"
 version: 1
 schools: []

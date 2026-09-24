@@ -15,7 +15,7 @@ import math
 from dataclasses import dataclass, fields, is_dataclass
 from functools import lru_cache
 from types import UnionType
-from typing import Any, Optional, Tuple, Union, get_args, get_origin, get_type_hints
+from typing import Any, Optional, Tuple, TypeAlias, Union, get_args, get_origin, get_type_hints
 
 
 ALLOWED_STOP_BASES = frozenset(
@@ -23,17 +23,6 @@ ALLOWED_STOP_BASES = frozenset(
 )
 ALLOWED_BUNDLE_ESCALATION_SCOPES = frozenset(
     {"cross_target", "shared_resource", "authority", "human_input", "strategy"}
-)
-REUSE_TIER_ORDER = (
-    "accepted-local",
-    "related-history",
-    "global-baseline-pool",
-    "mature-external",
-    "self-implementation",
-)
-REUSE_TIERS = frozenset(REUSE_TIER_ORDER)
-GREENFIELD_EXCEPTIONS = frozenset(
-    {"simple-implementation", "implementation-is-semantic-delta"}
 )
 FROZEN_SEMANTIC_FIELDS = frozenset(
     {
@@ -61,6 +50,57 @@ BUNDLE_ROOT_MAX_NODES = 65_536
 BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES = 4096
 BUNDLE_PROJECTION_MAX_TUPLE_ITEMS = 1024
 BUNDLE_CANONICAL_INTEGER_MAX_ABS = (1 << 63) - 1
+
+
+TARGET_METRIC_MAX_DEPTH = 64
+TargetMetricValue: TypeAlias = (
+    int | float | str | bool | None
+    | list["TargetMetricValue"] | dict[str, "TargetMetricValue"]
+)
+
+
+def valid_target_metric_value(value: object) -> bool:
+    """Admit JSON research values while retaining the established scalar bounds."""
+    nodes = 0
+    def valid(item: object, depth: int) -> bool:
+        nonlocal nodes
+        nodes += 1
+        # Reuse the final Bundle projection budget before traversing an expanded tree.
+        if nodes > BUNDLE_ROOT_MAX_NODES or depth > TARGET_METRIC_MAX_DEPTH:
+            return False
+        if item is None or type(item) is bool:
+            return True
+        if type(item) is int:
+            return abs(item) <= BUNDLE_CANONICAL_INTEGER_MAX_ABS
+        if type(item) is float:
+            return math.isfinite(item)
+        if type(item) is str:
+            try:
+                return len(item.encode("utf-8")) <= BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES
+            except UnicodeError:
+                return False
+        if type(item) is list:
+            return all(valid(child, depth + 1) for child in item)
+        if type(item) is dict:
+            return all(type(key) is str and valid(key, depth + 1)
+                       and valid(child, depth + 1) for key, child in item.items())
+        return False
+    return valid(value, 0)
+
+
+def _copy_target_metric_value(value: TargetMetricValue) -> TargetMetricValue:
+    if type(value) is list:
+        return [_copy_target_metric_value(item) for item in value]
+    if type(value) is dict:
+        return {key: _copy_target_metric_value(item) for key, item in value.items()}
+    return value
+
+
+def decode_target_metric_values(value: object) -> tuple[TargetMetricValue, ...]:
+    """Decode only the metric-values field, without opening other Bundle fields."""
+    if type(value) is not list or not all(valid_target_metric_value(item) for item in value):
+        raise TypeError("non-canonical Target metric values")
+    return tuple(_copy_target_metric_value(item) for item in value)
 
 
 class BundleProtocolError(ValueError):
@@ -182,37 +222,6 @@ class TargetExecutionPreflight:
 
 
 @dataclass(frozen=True, slots=True)
-class ReuseSourceProof:
-    source_ref: str
-    exact_version_ref: str
-    implementation_revision_ref: str
-    eligible_tier: str
-    verification_receipt: ReceiptProof
-    implementation_binding: ContentBindingProof
-    implementation_acceptance_receipt: ReceiptProof
-    eligibility_anchor_ref: Optional[str] = None
-    eligibility_binding: Optional[ContentBindingProof] = None
-    eligibility_receipt: Optional[ReceiptProof] = None
-    license_ref: Optional[str] = None
-    content_hash_ref: Optional[str] = None
-    patch_ref: Optional[str] = None
-
-
-@dataclass(frozen=True, slots=True)
-class ReuseTierDecision:
-    tier: str
-    disposition: str
-    reason_ref: str
-    source_proofs: Tuple[ReuseSourceProof, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ReuseTrace:
-    tier_decisions: Tuple[ReuseTierDecision, ...]
-    greenfield_exception: Optional[str] = None
-
-
-@dataclass(frozen=True, slots=True)
 class ProtocolAggregationProof:
     protocol_version_ref: str
     part_keys: Tuple[str, ...]
@@ -243,7 +252,6 @@ class TargetCandidate:
     held_fixed_bindings: Tuple[HeldFixedBinding, ...]
     implementation_revision_ref: str
     code_changed: bool
-    reuse_trace: ReuseTrace
     routes: Tuple[RouteSpec, ...]
     depends_on_labels: Tuple[str, ...] = ()
     direct_accepted_input_asset_refs: Tuple[str, ...] = ()
@@ -395,9 +403,9 @@ class AcceptedMeasurementClosure:
     variant_run_ref: str
     evaluation_ref: str
     protocol_version_ref: str
-    evaluation_attempt_ref: str
-    metric_result_ref: str
-    metric_values: Tuple[Union[int, float], ...]
+    evaluation_attempt_ref: Optional[str]
+    metric_result_ref: Optional[str]
+    metric_values: Tuple[TargetMetricValue, ...]
     asset_manifest_ref: str
     execution_attempt_ref: str
     execution_fence_ref: str
@@ -406,10 +414,10 @@ class AcceptedMeasurementClosure:
     held_fixed_bindings: Tuple[HeldFixedBinding, ...]
     implementation_provenance_refs: Tuple[str, ...]
     variant_run_input_binding: ExecutionInputBindingProof
-    evaluation_attempt_input_binding: ExecutionInputBindingProof
+    evaluation_attempt_input_binding: Optional[ExecutionInputBindingProof]
     rm_asset_receipt: ReceiptProof
     ar_execution_receipt: ReceiptProof
-    rg_formal_measurement_receipt: ReceiptProof
+    rg_formal_measurement_receipt: Optional[ReceiptProof]
     rg_target_commit_receipt: ReceiptProof
     code_review: Optional[CodeReviewRecord]
     result_review: Optional[ResultReviewRecord]
@@ -542,9 +550,6 @@ _CANONICAL_TYPES = frozenset(
         ResultReviewRecord,
         CodeReviewScope,
         TargetExecutionPreflight,
-        ReuseSourceProof,
-        ReuseTierDecision,
-        ReuseTrace,
         ProtocolAggregationProof,
         ProtocolPart,
         RouteSpec,
@@ -581,7 +586,6 @@ _DUPLICATE_SENSITIVE_TYPES = frozenset(
         ExecutionInputBindingProof,
         ProtocolAggregationProof,
         ReceiptProof,
-        ReuseSourceProof,
         RevisionEvidenceProof,
         StopDecisionProof,
         TargetExecutionPreflight,
@@ -625,7 +629,9 @@ def projection_plain_value(value: object) -> object:
 
     if is_dataclass(value):
         projected = {
-            item.name: projection_plain_value(getattr(value, item.name))
+            item.name: ([_copy_target_metric_value(metric) for metric in value.metric_values]
+                        if type(value) is AcceptedMeasurementClosure and item.name == "metric_values"
+                        else projection_plain_value(getattr(value, item.name)))
             for item in fields(value)
         }
         # ``root_completion_receipt`` is an additive wire discriminator.  Its
@@ -677,7 +683,7 @@ def validate_closed_bundle_projection(
         if state["scalar_bytes"] > max_serialized_bytes:
             raise BundleProtocolError(name + " exceeds the root projection byte budget")
 
-    def visit(item_value: object) -> None:
+    def visit(item_value: object, *, metric: bool = False) -> None:
         state["nodes"] += 1
         if state["nodes"] > BUNDLE_ROOT_MAX_NODES:
             raise BundleProtocolError(name + " exceeds the root projection node budget")
@@ -687,6 +693,11 @@ def validate_closed_bundle_projection(
             hints = _type_hints(type(item_value))
             for item in fields(item_value):
                 field_value = getattr(item_value, item.name)
+                if type(item_value) is AcceptedMeasurementClosure and item.name == "metric_values":
+                    if type(field_value) is not tuple or not all(valid_target_metric_value(value) for value in field_value):
+                        raise BundleProtocolError(name + " field metric_values has a non-canonical schema type")
+                    visit(field_value, metric=True)
+                    continue
                 if not _matches_annotation(field_value, hints.get(item.name)):
                     raise BundleProtocolError(
                         f"{name} field {item.name} has a non-canonical schema type"
@@ -698,11 +709,20 @@ def validate_closed_bundle_projection(
                 raise BundleProtocolError(name + " contains an oversized tuple")
             seen: set[object] = set()
             for nested in item_value:
-                visit(nested)
+                visit(nested, metric=metric)
                 if type(nested) in _DUPLICATE_SENSITIVE_TYPES:
                     if nested in seen:
                         raise BundleProtocolError(name + " contains an exact duplicate proof")
                     seen.add(nested)
+            return
+        if metric and type(item_value) in {list, dict}:
+            if type(item_value) is dict:
+                for key, nested in item_value.items():
+                    visit(key, metric=True)
+                    visit(nested, metric=True)
+            else:
+                for nested in item_value:
+                    visit(nested, metric=True)
             return
         if type(item_value) is str:
             try:

@@ -152,8 +152,8 @@ def _result(
     return IdeaSkillResult(
         reviewed_draft=draft,
         final_outcome=final or draft,
-        findings=findings,
-        dispositions=dispositions,
+
+
         primary_session_ref="codex-primary:1",
         review_mode=review_mode,
         reviewer_agent_ref=reviewer_agent_ref,
@@ -170,9 +170,9 @@ def _review_turn_output(
 ) -> dict[str, object]:
     del reviewer_agent_ref
     return {
-        "findings": findings or [],
+
         "final_outcome": final_outcome or _idea_set(),
-        "dispositions": dispositions or [],
+
     }
 
 
@@ -182,9 +182,9 @@ def test_canonical_skill_is_an_installed_runtime_resource() -> None:
     skill = (package / "SKILL.md").read_text(encoding="utf-8")
     contract = (package / "references" / "contract.md").read_text(encoding="utf-8")
 
-    assert "execution completed != content accepted != domain accepted" in skill
+    assert "StageCommit" in skill and "Owner" in skill
     assert "NoViableCandidate" in contract
-    assert "canonical selected Idea" in skill
+    assert "selected Idea" in skill
 
 
 def test_runtime_binding_fixes_harness_artifact_and_output_contract(
@@ -313,61 +313,28 @@ def test_validator_accepts_a_material_revision_with_a_revised_disposition() -> N
     assert draft_hash != outcome_hash
 
 
-def test_validator_rejects_revised_disposition_without_a_material_revision() -> None:
-    finding = {
-        "finding_id": "finding-1",
-        "category": "falsifiability",
-        "message": "增加可推翻条件。",
-    }
+def test_validator_accepts_unchanged_outcome_without_a_review_form() -> None:
+    draft_hash, outcome_hash, review_hash = validate_idea_skill_result(_request(), _result())
+    assert draft_hash == outcome_hash and review_hash
 
-    with pytest.raises(IdeaSkillContractError, match="review_revision_not_material"):
-        validate_idea_skill_result(
-            _request(),
-            _result(
-                findings=(finding,),
-                dispositions=(
-                    {
-                        "finding_id": "finding-1",
-                        "action": "revised",
-                        "rationale": "声称已修订。",
-                    },
-                ),
-            ),
+
+def test_validator_accepts_changed_outcome_without_a_disposition_form() -> None:
+    revised = _idea_set("A revised comparison with a preregistered falsification threshold")
+    draft_hash, outcome_hash, review_hash = validate_idea_skill_result(
+        _request(), _result(final=revised)
+    )
+    assert draft_hash != outcome_hash and review_hash
+
+
+def test_validator_rejects_historical_v1_review_payloads() -> None:
+    draft_hash = canonical_hash(_idea_set())
+    outcome_hash = canonical_hash(_idea_set("Revised research output"))
+    with pytest.raises(IdeaSkillContractError, match="idea_review_binding_invalid"):
+        validate_advisory_review(
+            {"schema_ref": "meta-research/idea-advisory-review/v1",
+             "reviewed_draft_hash": draft_hash, "final_outcome_hash": outcome_hash},
+            outcome_hash=outcome_hash, reviewed_draft_hash=draft_hash,
         )
-
-
-def test_validator_rejects_changed_outcome_without_a_revised_disposition() -> None:
-    revised = _idea_set("比较带预注册推翻阈值的结构一致性与像素重建")
-
-    with pytest.raises(
-        IdeaSkillContractError,
-        match="review_outcome_changed_without_revision",
-    ):
-        validate_idea_skill_result(_request(), _result(final=revised))
-
-
-def test_validator_keeps_historical_v1_review_payloads_readable() -> None:
-    reviewed_draft_hash = canonical_hash(_idea_set())
-    outcome_hash = canonical_hash(
-        _idea_set("历史 v1 曾允许 reviewer 后的 Outcome 与草稿不同")
-    )
-
-    review_hash = validate_advisory_review(
-        {
-            "schema_ref": "meta-research/idea-advisory-review/v1",
-            "reviewer_session_ref": "historical-reviewer-session:1",
-            "reviewed_draft_hash": reviewed_draft_hash,
-            "findings": [],
-            "dispositions": [],
-            "final_outcome_hash": outcome_hash,
-            "independent": True,
-            "advisory_only": True,
-        },
-        outcome_hash=outcome_hash,
-        reviewed_draft_hash=reviewed_draft_hash,
-    )
-
-    assert review_hash
 
 
 def test_validator_accepts_no_viable_candidate_as_a_real_outcome() -> None:
@@ -1453,7 +1420,9 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     assert "shell_tool" not in disabled
     assert "skill_search" not in disabled
     assert "view_image" not in disabled
-    assert "execution completed != content accepted" in primary_prompt
+    from meta_research.research_guidance import shared_research_guidance
+    assert shared_research_guidance() in primary_prompt
+    assert shared_research_guidance() in review_prompt
     assert "## IdeaStageInvocation" in primary_prompt
     assert "## Accepted handoff" in primary_prompt
     assert "一个 submission identity" in primary_prompt

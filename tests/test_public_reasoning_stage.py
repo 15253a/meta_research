@@ -44,6 +44,7 @@ from test_public_plan_stage import (
     _runtime,
 )
 from test_public_manual_question_lifecycle import (
+    DeterministicAcquisitionProvider,
     QUESTION,
     _confirm_waived_manual_question,
     _open_and_confirm_seed,
@@ -255,11 +256,11 @@ class _DeterministicReasoningSkill:
             scientific_outcome=scientific_outcome,
             next_cycle_proposal=next_cycle,
             candidate_completion=None,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="reasoning-child-reviewer-1",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
         assert result.outcome_document() == draft.draft
@@ -420,7 +421,7 @@ def _reasoning_runtime(
         plan_skill_provider=(plan_skill or _DeterministicPlanSkill(no_gap=False)),
         bundle_skill_provider=bundle_skill,
         reasoning_skill_provider=reasoning_skill,
-        acquisition_provider=acquisition_provider,
+        acquisition_provider=(acquisition_provider or DeterministicAcquisitionProvider()),
         harness_adapters=(
             _FullConformanceAdapter("codex"),
             _FullConformanceAdapter("claude"),
@@ -429,6 +430,8 @@ def _reasoning_runtime(
     if runtime.harnesses.query_status()["status"] != "ready":
         runtime.harnesses.start_full_conformance(_full_request())
         for _turn in range(4):
+            if runtime.harnesses.query_status()["status"] == "ready":
+                break
             assert runtime.harnesses.advance_full_conformance(
                 mcp_base_url="http://127.0.0.1:8765"
             )
@@ -725,7 +728,7 @@ def test_reasoning_affirmed_next_cycle_keeps_owner_acceptance_layers_distinct(
         literature = request.context_pack["question_literature_input"]
         assert literature["kind"] == "revision"
         revision = literature["binding"]
-        assert revision["kind"] == "QuestionLiteratureRevision"
+        assert revision["kind"] == "QuestionLiteratureReference"
         assert revision["revision_ref"] == literature["revision_ref"]
         assert revision["question_ref"] == quest["question_ref"]
         snapshot_ref = quest["proposal"]["literature_snapshot_ref"]
@@ -733,9 +736,14 @@ def test_reasoning_affirmed_next_cycle_keeps_owner_acceptance_layers_distinct(
         assert revision["revision_ref"] != snapshot_ref
         assert revision["rm_acceptance_receipt_ref"]
         assert revision["rg_question_association_receipt_ref"]
+        assert "records" not in revision
+        accepted_revision = runtime.owners.research_memory.query_question_literature_revision_ref(
+            question_ref=str(revision["question_ref"]),
+            revision_ref=str(revision["revision_ref"]),
+        )
         assert any(
             record["evidence_basis"] == "verified_fulltext"
-            for record in revision["records"]
+            for record in accepted_revision["records"]
         )
 
         admitted = _tick_reasoning(runtime)
@@ -854,7 +862,7 @@ def test_reasoning_affirmed_next_cycle_keeps_owner_acceptance_layers_distinct(
         )
         assert successor_context is not None
         assert successor_context["idea_context_pack"]["schema_ref"] == (
-            "meta-research/idea-context-pack/v3"
+            "meta-research/idea-context-pack/v4"
         )
         stable_selection_counts = {
             key: runtime.owners.research_graph.query_snapshot().facts[key]
@@ -1050,9 +1058,15 @@ def test_source_current_direct_plan_reuses_exact_accepted_idea_set(
         runtime.close()
 
 
-def test_source_current_direct_bundle_reuses_exact_accepted_formal_plan(
+def test_historical_direct_bundle_keeps_exact_accepted_formal_plan_readable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Construct accepted history under the previous policy, then restore the
+    # current policy before restarting and verifying the old receipts/context.
+    from meta_research import reasoning_contract
+    monkeypatch.setattr(reasoning_contract, "REASONING_SUCCESSOR_ENTRY_STAGES",
+                        ("idea", "plan", "bundle", "reasoning"))
     data_path = tmp_path / "reasoning-source-current-bundle"
     source_bundle_skill = _MultiRunExhaustionBundleSkill()
     reasoning_skill = _AcceptedAssetRouteReasoningSkill(entry_stage="bundle")
@@ -1103,6 +1117,8 @@ def test_source_current_direct_bundle_reuses_exact_accepted_formal_plan(
             accepted_formal_plan.as_dict()
         )
 
+        monkeypatch.setattr(reasoning_contract, "REASONING_SUCCESSOR_ENTRY_STAGES",
+                            ("idea", "plan", "reasoning"))
         runtime.close()
         replay_bundle_skill = _MultiRunExhaustionBundleSkill()
         runtime = _reasoning_runtime(
@@ -1416,7 +1432,6 @@ def test_reasoning_rejects_pruned_target_before_domain_acceptance(
     ("entry_stage", "expected_error"),
     (
         ("plan", "reasoning_next_cycle_plan_basis_unavailable"),
-        ("bundle", "reasoning_next_cycle_bundle_basis_unavailable"),
     ),
 )
 def test_source_current_later_stage_route_is_rejected_atomically_by_rg(

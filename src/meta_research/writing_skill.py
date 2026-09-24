@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-import builtins
 from dataclasses import dataclass, replace
 import hashlib
 from importlib.resources import files
 import json
-import math
 import os
 from pathlib import Path
 import stat
-import sys
-import threading
-from types import ModuleType
 from typing import Protocol, cast
 
 from meta_research.codex_runtime import CODEX_REASONING_EFFORT_BINDING
@@ -46,33 +41,6 @@ WRITING_MARKDOWN_MAX_LENGTH = 2 * 1024 * 1024
 WRITING_MAX_CITATIONS = 512
 WRITING_MAX_REVIEW_FINDINGS = 128
 WRITING_MAX_SOURCE_BYTES = 512 * 1024 * 1024
-# 0030 changed this module's source hash when paper and presentation became
-# first-class document types. Runs admitted by the immediately preceding 0029
-# runtime keep this exact report-only executable and Skill bundle instead of
-# having their persisted binding rewritten during upgrade. Provenance:
-# c8322e93d02e18d3c8c2cd8ccd35c2705a46deb9.
-_LEGACY_REPORT_BUNDLE = "legacy-report-c8322e93"
-_LEGACY_REPORT_MODULE_NAME = (
-    "meta_research._legacy_writing_report_c8322e93"
-)
-_LEGACY_REPORT_SUPERVISOR_MODULE_NAME = (
-    "meta_research._legacy_provider_supervisor_c8322e93"
-)
-_LEGACY_REPORT_HASHES = {
-    "writing_skill.py": (
-        "a6ef050f866709ac6620d982caaf8f5e0d7bf21e548490968c9fa550b21bd453"
-    ),
-    "provider_supervisor.py": (
-        "623fa83da2893790aaee02351865db1d2a1c9cc90987e11795ef34c3a24b7ab1"
-    ),
-    "SKILL.md": (
-        "1a5a101300c8b86eabd74940fedc81afd1e40578436506589677439c222e9701"
-    ),
-    "agents/openai.yaml": (
-        "5f344c6c9036d5f146efc38249c2b5166001673c3da8cd81428b15e82f576376"
-    ),
-}
-_LEGACY_REPORT_LOAD_LOCK = threading.Lock()
 
 
 class WritingSkillUnavailable(RuntimeError):
@@ -378,24 +346,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         )
 
     def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
-        legacy = self._legacy_report_adapter_for(request)
-        if legacy is not None:
-            module, adapter = legacy
-            try:
-                result = adapter.generate_draft(request)
-            except Exception as error:
-                legacy_unavailable = getattr(
-                    module, "WritingSkillUnavailable"
-                )
-                if isinstance(error, legacy_unavailable):
-                    raise WritingSkillUnavailable(str(error.code)) from error
-                raise
-            return WritingSkillDraft(
-                markdown=result.markdown,
-                citations=result.citations,
-                primary_session_ref=result.primary_session_ref,
-                adapter_kind=result.adapter_kind,
-            )
+        self._require_runtime_binding(request)
         source_manifest = self._stage_source_materials(request)
         source_root = Path(cast(str, source_manifest["manifest_path"])).parent
         lineage = (
@@ -475,73 +426,14 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             ) from error
         return draft
 
-    def _legacy_report_adapter_for(
-        self, request: WritingSkillRequest
-    ) -> tuple[ModuleType, CodexWritingSkillAdapter] | None:
-        if request.runtime_binding == self.runtime_binding(
-            request.document_type
-        ):
-            return None
-        if request.document_type != "report":
+    def _require_runtime_binding(self, request: WritingSkillRequest) -> None:
+        if request.runtime_binding != self.runtime_binding(request.document_type):
             raise WritingSkillUnavailable("writing_runtime_binding_drift")
-        if request.profile_ref != "report-v1":
-            raise OwnerConflict("writing_document_profile_invalid")
-        module = _load_legacy_report_module()
-        adapter_type = getattr(module, "CodexWritingSkillAdapter")
-        adapter = cast(
-            CodexWritingSkillAdapter,
-            adapter_type.__new__(adapter_type),
-        )
-        adapter.__dict__.update(self.__dict__)
-        timeout_bindings = tuple(
-            item
-            for item in request.runtime_binding.resource_bindings
-            if item.startswith("provider-timeout-seconds:")
-        )
-        if len(timeout_bindings) != 1:
-            raise WritingSkillUnavailable("writing_runtime_binding_drift")
-        try:
-            legacy_timeout = float(timeout_bindings[0].rsplit(":", 1)[1])
-        except ValueError as error:
-            raise WritingSkillUnavailable(
-                "writing_runtime_binding_drift"
-            ) from error
-        if not math.isfinite(legacy_timeout) or legacy_timeout <= 0:
-            raise WritingSkillUnavailable("writing_runtime_binding_drift")
-        # The hash-pinned adapter predates unbounded production execution and
-        # formats its original numeric ceiling into the historical binding.
-        adapter._timeout_seconds = legacy_timeout
-        if request.runtime_binding != adapter.runtime_binding():
-            raise WritingSkillUnavailable("writing_runtime_binding_drift")
-        return module, adapter
 
     def review_draft(
         self, request: WritingSkillRequest, draft: WritingSkillDraft
     ) -> WritingSkillResult:
-        legacy = self._legacy_report_adapter_for(request)
-        if legacy is not None:
-            module, adapter = legacy
-            try:
-                result = adapter.review_draft(request, draft)
-            except Exception as error:
-                legacy_unavailable = getattr(
-                    module, "WritingSkillUnavailable"
-                )
-                if isinstance(error, legacy_unavailable):
-                    raise WritingSkillUnavailable(str(error.code)) from error
-                raise
-            return WritingSkillResult(
-                reviewed_markdown=result.reviewed_markdown,
-                final_markdown=result.final_markdown,
-                citations=result.citations,
-                findings=result.findings,
-                dispositions=result.dispositions,
-                primary_session_ref=result.primary_session_ref,
-                review_mode=result.review_mode,
-                reviewer_agent_ref=result.reviewer_agent_ref,
-                review_task_hash=result.review_task_hash,
-                adapter_kind=result.adapter_kind,
-            )
+        self._require_runtime_binding(request)
         if request.native_session_ref != draft.primary_session_ref:
             raise WritingSkillUnavailable("writing_native_session_changed")
         source_manifest = self._stage_source_materials(request)
@@ -561,9 +453,9 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             "给出 revised | not_adopted disposition，并在当前 resumed Session 返回最终 "
             "Markdown 与 citations。revised 必须实际改变稿件或 citations。不要返回或"
             "声称 reviewer identity。Owner effect 只通过当前 operation 已授权的 resident "
-            "MCP；不得伪造 Owner 写入或 receipt。可按需使用无 Owner authority 的 "
-            "advisory child，但验收不依赖 child 数量、拓扑、"
-            "顺序或 reviewer identity。\n"
+            "MCP；不得伪造 Owner 写入或 receipt。委派原生独立子智能体只读审阅"
+            "冻结稿件与必要来源，根 Session 根据反馈和自身判断修订并最终交接。"
+            "Owner 验收不要求 child 数量、拓扑、顺序或 reviewer identity 证明。\n"
             f"{advisory_prompt}"
         )
         try:
@@ -936,115 +828,6 @@ def _require_safe_staging_directory(path: Path) -> None:
         ) from error
     if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
         raise WritingSkillUnavailable("writing_source_staging_unsafe")
-
-
-def _load_legacy_report_module() -> ModuleType:
-    root = (
-        Path(__file__).resolve().parent
-        / "skills"
-        / "writing-report"
-        / "references"
-        / _LEGACY_REPORT_BUNDLE
-    )
-    with _LEGACY_REPORT_LOAD_LOCK:
-        try:
-            bundle = {
-                name: (root / name).resolve().read_bytes()
-                for name in _LEGACY_REPORT_HASHES
-            }
-            for name, expected_hash in _LEGACY_REPORT_HASHES.items():
-                if hashlib.sha256(bundle[name]).hexdigest() != expected_hash:
-                    raise WritingSkillUnavailable(
-                        "writing_legacy_runtime_invalid"
-                    )
-            skill_resources = {
-                "SKILL.md": bundle["SKILL.md"].decode("utf-8"),
-                "agents/openai.yaml": bundle["agents/openai.yaml"].decode(
-                    "utf-8"
-                ),
-            }
-            supervisor_path = root / "provider_supervisor.py"
-            supervisor = ModuleType(
-                _LEGACY_REPORT_SUPERVISOR_MODULE_NAME
-            )
-            supervisor.__file__ = str(supervisor_path)
-            supervisor.__package__ = "meta_research"
-            prior_supervisor = sys.modules.get(
-                _LEGACY_REPORT_SUPERVISOR_MODULE_NAME
-            )
-            sys.modules[_LEGACY_REPORT_SUPERVISOR_MODULE_NAME] = supervisor
-            try:
-                supervisor_code = compile(
-                    bundle["provider_supervisor.py"],
-                    str(supervisor_path),
-                    "exec",
-                )
-                exec(supervisor_code, supervisor.__dict__)
-            finally:
-                if prior_supervisor is None:
-                    sys.modules.pop(
-                        _LEGACY_REPORT_SUPERVISOR_MODULE_NAME, None
-                    )
-                else:
-                    sys.modules[
-                        _LEGACY_REPORT_SUPERVISOR_MODULE_NAME
-                    ] = prior_supervisor
-
-            original_import = builtins.__import__
-
-            def legacy_import(
-                name: str,
-                globals: dict[str, object] | None = None,
-                locals: dict[str, object] | None = None,
-                fromlist: tuple[str, ...] = (),
-                level: int = 0,
-            ) -> object:
-                if (
-                    level == 0
-                    and name == "meta_research.provider_supervisor"
-                    and fromlist
-                ):
-                    return supervisor
-                return original_import(name, globals, locals, fromlist, level)
-
-            source_path = root / "writing_skill.py"
-            module = ModuleType(_LEGACY_REPORT_MODULE_NAME)
-            module.__file__ = str(source_path)
-            module.__package__ = "meta_research"
-            module_builtins = dict(vars(builtins))
-            module_builtins["__import__"] = legacy_import
-            module.__dict__["__builtins__"] = module_builtins
-            prior_module = sys.modules.get(_LEGACY_REPORT_MODULE_NAME)
-            sys.modules[_LEGACY_REPORT_MODULE_NAME] = module
-            try:
-                code = compile(
-                    bundle["writing_skill.py"], str(source_path), "exec"
-                )
-                exec(code, module.__dict__)
-                if (
-                    getattr(module, "transport_key_hash", None)
-                    is not getattr(supervisor, "transport_key_hash", None)
-                ):
-                    raise WritingSkillUnavailable(
-                        "writing_legacy_runtime_invalid"
-                    )
-            finally:
-                if prior_module is None:
-                    sys.modules.pop(_LEGACY_REPORT_MODULE_NAME, None)
-                else:
-                    sys.modules[_LEGACY_REPORT_MODULE_NAME] = prior_module
-        except WritingSkillUnavailable:
-            raise
-        except Exception as error:
-            raise WritingSkillUnavailable(
-                "writing_legacy_runtime_unavailable"
-            ) from error
-
-    def resources() -> dict[str, str]:
-        return dict(skill_resources)
-
-    setattr(module, "_writing_skill_resources", resources)
-    return module
 
 
 def _writing_skill_resources(document_type: str = "report") -> dict[str, str]:

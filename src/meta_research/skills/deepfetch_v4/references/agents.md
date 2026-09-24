@@ -1,20 +1,14 @@
-# Agent contracts
+# DeepFetch 角色契约
 
-DeepFetch uses one main agent, the Quest-scoped Acquisition Root, and independent Readers. Keep each role inside its boundary.
+## 主智能体
 
-## Main agent
+负责解释任务、选择查询和引文方向、维护元数据与候选、选择全文、协调任务及撰写 `summary.md`。台账广度由相关性和主动检索时钟约束；精读总上限见主 Skill。按组合后的新增证据价值排序，获取顺序和访问方便程度不决定入选。书目、摘要和 Web 页面用于发现与核实，全文科学阅读交给 Reader；汇合后从台账读取全部 Reader 结果。
 
-Own topic interpretation, multidimensional discovery, OpenAlex and Web Search calls, paper selection, placeholders, the full-text subset, orchestration, and `summary.md`. Search and ledger breadth have no paper-count cap beyond relevance and the active-search clock. Maintain a ranked reserve and choose no more than 10 distinct papers whose combined marginal evidence value is highest for the task; acquisition order and access ease never determine admission. Re-rank before consuming the final Reader slots. Use Web Search results and bibliographic or abstract pages only to discover and verify papers; do not expand an article body into the main context. Hand selected bodies to Acquisition and Readers. Read all Reader results from the ledger after fan-in. Do not perform full-text scientific reading in the main context.
+## 预检与 Acquisition
 
-## Preflight and Acquisition
+Quest 级 Acquisition Root 负责当前访问模式、合法路线、浏览器状态和私有存储。沿当前配置预检：`oa_only` 无需机构浏览器，`provided_only` 仅核实已提供材料，`oa_then_institution` 核实所需机构路线。每次请求使用当前明确模式，不继承上回合的临时判断。
 
-The Quest-scoped Acquisition Root owns provider selection, access mode, lawful routing, browser
-state and private storage. DeepFetch submits one bounded batch of 1 to 10 targets through the common
-`agent_runtime.acquisition.request` effect. The host reconciles the same `effect_id` before any
-request replay. A Reader may receive only the same `paper_id` returned as `obtained` with a verified
-path and content proof.
-
-Return this `action=acquire` envelope for one bounded batch:
+通过共用 `agent_runtime.acquisition.request` effect 提交 1–10 个目标的有界批次；请求结果不明时以同一 `effect_id` 对账，再判断是否重试。当前适配器的 `action=acquire` 请求体形状为：
 
 ```json
 {
@@ -22,51 +16,33 @@ Return this `action=acquire` envelope for one bounded batch:
   "targets": [
     {
       "paper_id": "openalex:W123",
-      "title": "Exact title",
+      "title": "已核实的精确论文标题",
       "source_urls": []
     }
   ]
 }
 ```
 
-Include DOI, arXiv ID and source URLs when Radar already has them. Acquisition treats them as hints,
-applies the Quest's accepted access configuration, and returns one typed result per target. `obtained` includes
-the verified path, format and content proof. `waiting_user` or `missing` includes only status and
-failure. When a real human obligation blocks the current task, use the common HumanRequest effect
-explicitly; a provider wait is only an Acquisition result.
+已知 DOI、arXiv ID 或 URL 时一并传入。获取服务逐目标返回 typed 结果：`obtained` 带已核实路径、格式与内容证明；`waiting_user`／`missing` 说明状态和原因。Reader 只能接收同一 `paper_id` 的核实正文。provider 等待只是获取结果，具体人类义务需显式提出 HumanRequest。
 
-Acquisition works from the main agent's ranked reserve queue. Never keep more unresolved
-acquisition items than the unfilled read-target capacity. Before the active-search deadline,
-`missing` or explicit abandonment before a first Reader assignment releases its reservation and
-may be replaced; after the deadline, do not promote a reserve candidate. `waiting_user` retains its
-reservation until resolved or abandoned. Only an obtained, identity-verified body proceeds to
-Reader admission.
+未决获取项不超过当前精读目标的空余容量。截止前、首次 Reader 分配前的 `missing` 或明确放弃可释放预留并替补；截止后不晋升候补。`waiting_user` 保留预留直至解决或放弃。登录过期时及时返回受影响论文，同时推进独立的 OpenAlex、OA 与阅读；给出重新登录后重试、用户提供正文或放弃该文的选项。没有其他检索活动的纯等待不计时。
 
-If login expires during a run, return the affected paper immediately. Continue independent OpenAlex, OA acquisition, and Reader work. Offer re-login and retry, user-supplied full text, or abandonment of that paper. User wait does not consume active-search time when no other search work is running.
+## Reader
 
-## Readers
+每个逻辑 Reader 只读一篇已分配全文。首次分配占用该论文运行级名额，重试仍是同一名额。立即填充实际可用容量：
 
-Create one logical Reader per admitted full text. Across the run, no more than the main agent's read target, and never more than 10 distinct `paper_id`s, may receive a Reader assignment. The first assignment consumes that paper's slot permanently for the run; retries use the same slot. For admitted work, start:
+```text
+readers_to_start = min(queued jobs, max(0, 10 - active Readers), runtime slots currently free for Readers)
+```
 
-`readers_to_start = min(queued jobs, max(0, 10 - active Readers), runtime slots currently free for Readers)`
+10 是上限，不是必须达到的峰值；空闲 Acquisition Root 不预留 Reader 槽位。宿主容量不足时按波次处理已接纳论文或其重试，不新增第 11 篇。
 
-Fill available capacity immediately. Ten is a ceiling, not a required peak. Never assign multiple papers to one Reader. Use successive waves only for already admitted papers when host capacity is lower than the admitted job count, or for retries of those papers; no later wave may admit an eleventh paper. An idle Acquisition Root does not reserve an execution slot. A lower observed peak caused by host capacity is a runtime limitation, not a reason to serialize otherwise independent Reader jobs.
+Reader 输入必须包括研究任务、论文记录、单篇全文绝对路径与 SHA-256、`papers-json.md` 的绝对路径、单次 assignment ID 和 patch 模板。先打开任务，完整读取 `reading_contract_path` 的阅读部分，再读取指定正文。依据全文填写理解、方法、实验设置、主张、材料、局限和可信度；不另行检索、下载、读其他论文、修元数据或写总报告。
 
-A Reader receives:
+通过 `scripts/papers.py apply-reader` 提交自身 patch，仅向主智能体返回 `paper_id`、assignment ID、终态和简短错误。正文未读到的内容保持未知。
 
-- the research task;
-- its assigned paper record;
-- one absolute full-text path and SHA-256;
-- one absolute path to the `papers-json.md` reading contract;
-- one single-use assignment ID and patch template.
+失败处理：
 
-It opens its job, reads the Reading section at `reading_contract_path` completely, and opens its assigned full text. It does not search, download, inspect other papers, repair metadata, or write the overall report. It reads enough of the whole paper to fill the complete `reading` object, including claims, experimental setup, reported artifacts, limitations, and credibility.
-
-The Reader applies its patch through `scripts/papers.py apply-reader` and returns only `paper_id`, assignment ID, terminal status, and a concise error to the main agent.
-
-Failure types:
-
-- `reader_failed`, `timeout`, or `invalid_output`: retain the valid full text and publish an empty `failed` reading. Retry the same paper when worthwhile; otherwise that slot ends without a replacement paper.
-- `file_invalid` or `paper_mismatch`: let the merge tool quarantine the file, clear the public path, and restore `not_read`. The admitted paper keeps its slot; correct and retry that paper when worthwhile, but do not replace it with an eleventh paper.
-
-If a Reader disappears, the main agent may submit a `timeout` failure patch using that job's assignment data. This closes the job without inventing a reading.
+- `reader_failed`、`timeout`、`invalid_output`：保留有效全文，发布空的 `failed` 阅读；值得重试时重试同文，否则该名额以失败结束。
+- `file_invalid`、`paper_mismatch`：由合并工具隔离文件、清空公开路径并恢复 `not_read`；可修正并重试同文，名额仍已占用。
+- Reader 确实失联且达到运行时超时条件时，主智能体可用原 assignment 数据提交 `timeout` 失败 patch；尚在运行或等待时继续观察，不用主观等待时长伪造超时或阅读结论。

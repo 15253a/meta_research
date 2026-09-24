@@ -59,3 +59,12 @@
   .experiment-log-text { font-size: 11px; }
   .experiment-log-window[data-minimized="true"] { width: calc(100vw - 16px); }
 }
+
+.experiment-output-views { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 6px; }
+.experiment-output-views button { border: 1px solid #48516d; border-radius: 6px; padding: 5px 11px; min-height: 32px; background: #252c3e; color: #b6c1d8; font-size: 12px; cursor: pointer; }
+.experiment-output-views button[aria-pressed="true"] { border-color: #9990d3; color: #eeeaff; background: #35304f; }
+.experiment-output-views button:focus-visible { outline: 2px solid #aaa3ef; outline-offset: 2px; }
+.experiment-log-empty .experiment-log-execution-link { margin-top: 14px; border-color: #9990d3; color: #eeeaff; }
+
+.experiment-log-source-note { flex:0 0 auto; margin:10px 16px 0; color:#a5b1c8; font-size:11px; line-height:1.6; }
+@media (max-width:600px) { .experiment-log-source-note { margin-inline:12px; } }

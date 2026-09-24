@@ -1,7 +1,7 @@
 interface:
-  display_name: "Bundle Stage"
-  short_description: "按完整 Bundle 合同滚动执行并收口 Target 工作"
+  display_name: "研究实施组织"
+  short_description: "按当前正式计划滚动安排并收口 Target 工作"
   brand_color: "#596B5A"
-  default_prompt: "使用 $bundle-stage 时，先完整读取 Bundle 合同和 Owner 操作，再按固定原型的八步滚动执行并收口 Target 工作。"
+  default_prompt: "使用 $bundle-stage 围绕本轮承诺组织研究，按实际依赖启用 Target，并依据真实接纳结果收口。"
 policy:
   allow_implicit_invocation: false

@@ -261,8 +261,8 @@ def _result(
     return PlanSkillResult(
         reviewed_draft=draft,
         final_plan=final or draft,
-        findings=findings,
-        dispositions=dispositions,
+
+
         primary_session_ref="codex-plan-primary:1",
         review_mode="advisory_unobserved",
         reviewer_agent_ref=None,
@@ -280,12 +280,12 @@ def test_packaged_plan_skill_is_the_runtime_authority() -> None:
         encoding="utf-8"
     )
 
-    assert "execution completed != content accepted != domain accepted" in skill
+    assert "StageCommit" in skill and "Owner" in skill
     assert "AnswerContract" in contract
-    assert "每个 obligation" in contract
-    assert "ExperimentBrief" in contract
+    assert "每项义务恰出现一次" in contract
+    assert "experiment_key" in contract and "Brief" in contract
     assert "TODO-IMPL" not in operations
-    assert "Research Memory" in operations
+    assert "RM 管内容保管" in operations
 
 
 def test_validator_accepts_exact_plan_and_owner_feedback_requires_material_change() -> None:
@@ -449,9 +449,9 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
             {"plan": draft},
             {
                 "reviewer_agent_ref": "codex-plan-reviewer:1",
-                "findings": [],
+
                 "final_plan": draft,
-                "dispositions": [],
+
             },
         ]
     )
@@ -469,10 +469,11 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     assert result.primary_session_ref == "codex-plan-primary:1"
     assert result.review_mode == "advisory_unobserved"
     assert result.reviewer_agent_ref is None
-    assert binding.model_ref == "gpt-5.6-sol"
+    assert binding.model_ref == "gpt-6-sol"
+    assert "codex-effective:reasoning.effort=max" in binding.resource_bindings
     assert (
-        "codex-config:model_reasoning_effort=max"
-        in binding.resource_bindings
+        "codex-config:model_reasoning_effort=ultra"
+        in binding.capability_bindings
     )
     assert any(
         item.startswith(
@@ -485,7 +486,10 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     review_argv, review_prompt, review_schema = runner.calls[1]
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert "--json" in primary_argv
-    assert 'model_reasoning_effort="max"' in primary_argv
+    assert 'model_reasoning_effort="ultra"' in primary_argv
+    from meta_research.research_guidance import shared_research_guidance
+    assert shared_research_guidance() in primary_prompt
+    assert shared_research_guidance() in review_prompt
     assert "AcceptedQuestionBinding" in primary_prompt
     assert "完整 IdeaSet" in primary_prompt
     assert "EvidenceRef" in primary_prompt
@@ -577,9 +581,9 @@ def test_production_adapter_derives_answer_contract_hash_after_each_turn(
             {"plan": primary},
             {
                 "reviewer_agent_ref": "codex-plan-reviewer:derived-hash",
-                "findings": [],
+
                 "final_plan": final,
-                "dispositions": [],
+
             },
         ]
     )
@@ -623,9 +627,9 @@ def test_production_adapter_does_not_require_child_trace(
             {"plan": plan},
             {
                 "reviewer_agent_ref": "plan-root-review:1",
-                "findings": [],
+
                 "final_plan": plan,
-                "dispositions": [],
+
             },
         ],
         emit_review_trace=False,
@@ -657,9 +661,9 @@ def test_durable_plan_review_shape_failure_is_terminal_and_not_replayed(
             {"plan": draft},
             {
                 "reviewer_agent_ref": "codex-plan-reviewer:shape",
-                "findings": "invalid",
-                "final_plan": draft,
-                "dispositions": [],
+
+                "final_plan": None,
+
             },
         ]
     )
@@ -745,9 +749,9 @@ def test_owner_feedback_is_present_in_both_successor_prompts(tmp_path: Path) -> 
         [
             {"plan": successor},
             {
-                "findings": [],
+
                 "final_plan": successor,
-                "dispositions": [],
+
             },
         ]
     )

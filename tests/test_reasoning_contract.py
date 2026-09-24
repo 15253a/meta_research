@@ -438,7 +438,7 @@ def test_conclusive_or_uncertain_outcome_accepts_a_formal_metric_result(
 
 @pytest.mark.parametrize("kind", ["LogAsset", "AnalysisAsset", "CheckpointArtifact"])
 @pytest.mark.parametrize("finding", ["supporting", "negative", "partial"])
-def test_diagnostic_assets_cannot_masquerade_as_substantive_evidence(
+def test_material_category_does_not_restrict_scientific_finding(
     kind: str,
     finding: str,
 ) -> None:
@@ -447,15 +447,12 @@ def test_diagnostic_assets_cannot_masquerade_as_substantive_evidence(
         {"kind": kind, "ref": "diagnostic:1", "finding": finding}
     ]
 
-    with pytest.raises(
-        ReasoningContractError,
-        match="scientific_outcome_evidence_invalid",
-    ):
-        validate_scientific_outcome(
-            outcome,
-            frozen_evidence_closure=_diagnostic_closure(kind),
-            frozen_research_context=_research_context(),
-        )
+    outcome["causal_interpretation"]["attribution_basis_refs"] = ["diagnostic:1"]
+    assert len(validate_scientific_outcome(
+        outcome,
+        frozen_evidence_closure=_diagnostic_closure(kind),
+        frozen_research_context=_research_context(),
+    )) == 64
 
 
 @pytest.mark.parametrize("kind", ["LogAsset", "AnalysisAsset", "CheckpointArtifact"])
@@ -483,7 +480,7 @@ def test_scientific_outcome_accepts_contextual_diagnostic_with_substantive_evide
 
 @pytest.mark.parametrize("disposition", ["affirmed", "denied", "uncertain"])
 @pytest.mark.parametrize("kind", ["LogAsset", "AnalysisAsset", "CheckpointArtifact"])
-def test_diagnostic_context_alone_never_satisfies_substantive_gate(
+def test_verified_material_can_support_each_scientific_disposition(
     disposition: str,
     kind: str,
 ) -> None:
@@ -492,15 +489,12 @@ def test_diagnostic_context_alone_never_satisfies_substantive_gate(
         {"kind": kind, "ref": "diagnostic:1", "finding": "context"}
     ]
 
-    with pytest.raises(
-        ReasoningContractError,
-        match="scientific_outcome_substantive_evidence_missing",
-    ):
-        validate_scientific_outcome(
-            outcome,
-            frozen_evidence_closure=_diagnostic_closure(kind),
-            frozen_research_context=_research_context(),
-        )
+    outcome["causal_interpretation"]["attribution_basis_refs"] = ["diagnostic:1"]
+    assert len(validate_scientific_outcome(
+        outcome,
+        frozen_evidence_closure=_diagnostic_closure(kind),
+        frozen_research_context=_research_context(),
+    )) == 64
 
 
 @pytest.mark.parametrize("kind", ["LogAsset", "AnalysisAsset", "CheckpointArtifact"])
@@ -660,18 +654,15 @@ def test_unknown_scientific_outcome_fails_closed() -> None:
         )
 
 
-def test_uncertain_requires_present_but_nonconvergent_evidence() -> None:
+def test_theory_can_have_zero_citations_but_uncertain_requires_explanation() -> None:
     outcome = _scientific_outcome("uncertain")
     outcome["evidence"] = []
-    with pytest.raises(
-        ReasoningContractError,
-        match="scientific_outcome_substantive_evidence_missing",
-    ):
-        validate_scientific_outcome(
-            outcome,
-            frozen_evidence_closure=_literature_closure(),
-            frozen_research_context=_research_context(),
-        )
+    outcome["causal_interpretation"]["attribution_basis_refs"] = []
+    assert len(validate_scientific_outcome(
+        outcome,
+        frozen_evidence_closure=[],
+        frozen_research_context=_research_context(),
+    )) == 64
 
     outcome = _scientific_outcome("uncertain")
     outcome["uncertainty_basis"] = []
@@ -691,10 +682,9 @@ def test_uncertain_requires_present_but_nonconvergent_evidence() -> None:
     [
         ("claim", "This must not be a scientific claim."),
         ("missing_evidence", []),
-        ("uncertainty_basis", ["Accepted evidence conflicts."]),
     ],
 )
-def test_insufficient_evidence_names_missing_evidence_only(
+def test_insufficient_evidence_requires_missing_evidence_and_no_claim(
     field: str,
     invalid_value: object,
 ) -> None:

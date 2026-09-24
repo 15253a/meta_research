@@ -1,20 +1,22 @@
-# Ledger tools
+# 台账工具
 
-In examples, `DEEPFETCH_ROOT` is the absolute `deepfetch-v4/` directory and `OUTPUT_DIR` is the absolute run directory.
+示例中 `DEEPFETCH_ROOT` 为 `deepfetch-v4/` 的绝对目录，`OUTPUT_DIR` 为本次运行的绝对目录。具体参数以各子命令 `--help` 为准。
 
-Initialize from arbitrary input:
+## 初始化与发现登记
 
 ```bash
 python3 "$DEEPFETCH_ROOT/scripts/papers.py" init \
   --out-dir "$OUTPUT_DIR" --topic-file "/absolute/prompt.txt" \
-  --interpretation "Concise interpretation" \
-  --concept "concept one" --concept "concept two" \
+  --interpretation "当前任务的简洁检索解释" \
+  --concept "检索概念一" --concept "检索概念二" \
   --intensity medium
 ```
 
-`upsert` accepts one discovery-owned paper object, an array, `{ "papers": [...], "limitations": [...] }`, or a complete `deepfetch.openalex.v4` search/get envelope. OpenAlex-only radar fields are discarded and metadata flows directly into the ledger. Enrich every retained record with `summary`, `evidence_level`, `basis`, `why_included`, and `uncertainty` under [the ledger contract](papers-json.md). `update-run` records monotonic active-search seconds, actual dimensions, and the stopping reason.
+`upsert` 接受一项发现记录、数组、`{"papers": [...], "limitations": [...]}` 或完整 `deepfetch.openalex.v4` search／get 信封。工具移除雷达专属字段并写入元数据；主智能体仍须筛选实际保留条目，按[台账契约](papers-json.md)填写 `summary`、`evidence_level`、`basis`、`why_included`、`uncertainty`。`update-run` 保存单调递增的主动检索秒数、实际维度和停止理由。
 
-Register one verified Acquisition result:
+## 全文与 Reader
+
+对已核实的 Acquisition 结果登记正文：
 
 ```bash
 python3 "$DEEPFETCH_ROOT/scripts/papers.py" register-fulltext \
@@ -22,27 +24,24 @@ python3 "$DEEPFETCH_ROOT/scripts/papers.py" register-fulltext \
   --file "/absolute/provider/result.pdf"
 ```
 
-`register-fulltext` accepts at most 10 distinct paper records in one run. Keep additional search
-results as metadata placeholders. Replacing the file for an already registered or Reader-admitted
-paper does not consume another slot; after 10 distinct papers have received Reader assignments, a
-different paper cannot replace one of them.
-
-Create Reader jobs and merge their deterministic patches:
+单次运行最多登记 10 篇不同论文的全文；额外发现仍可作为元数据占位。替换同篇已登记／分配论文的文件不另占名额，首次 Reader 分配后的名额规则见[角色契约](agents.md)。
 
 ```bash
 python3 "$DEEPFETCH_ROOT/scripts/papers.py" prepare-readers \
-  --out-dir "$OUTPUT_DIR" --task "Current research question"
+  --out-dir "$OUTPUT_DIR" --task "当前研究问题"
 
 python3 "$DEEPFETCH_ROOT/scripts/papers.py" apply-reader \
   --out-dir "$OUTPUT_DIR" --result "/absolute/reader-patch.json"
 ```
 
-Each generated job carries the exact `patch_template` and an absolute `reading_contract_path`. Reader agents edit only their own patch and apply it through the merge command.
+任务带精确 `patch_template` 和绝对 `reading_contract_path`。各 Reader 只修改自身 patch，由合并命令负责并发写入。
 
-After the main agent writes `summary.md`, finalize:
+## 完成验证
+
+主智能体写完 `summary.md` 后运行：
 
 ```bash
 python3 "$DEEPFETCH_ROOT/scripts/papers.py" finalize --out-dir "$OUTPUT_DIR"
 ```
 
-Use `validate` for sparse work in progress and `validate --final` to inspect the final gate without cleanup. Add `--keep-debug-state` to `finalize` only for debugging or resume. Subcommand `--help` defines exact CLI flags.
+`validate` 检查进行中的稀疏台账；`validate --final` 只检查最终门槛，不清理。仅调试或需恢复时给 `finalize` 添加 `--keep-debug-state`。完成条件是公开文件与阅读状态一致、引用可解析，工具校验通过；命令成功不替代综述内容核查。

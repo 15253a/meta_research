@@ -22,6 +22,7 @@ from meta_research.chat_progress import (
 )
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
+    CODEX_LOCKED_VERSION,
     CODEX_REASONING_EFFORT_CONFIG,
 )
 from meta_research.provider_supervisor import (
@@ -49,7 +50,7 @@ INTENT_MESSAGE_MAX_LENGTH = 12000
 INTENT_REPLY_MAX_LENGTH = CHAT_REPLY_MAX_LENGTH
 PROVIDER_RESULT_MAX_BYTES = 16 * 1024 * 1024
 PROVIDER_STREAM_MAX_BYTES = 64 * 1024 * 1024
-CODEX_DRAFTING_LOCKED_VERSION = "0.153.2"
+CODEX_DRAFTING_LOCKED_VERSION = CODEX_LOCKED_VERSION
 DRAFTING_JOB_SCHEMA_V1 = "meta-research/codex-drafting-job/v1"
 DRAFTING_JOB_SCHEMA_V2 = "meta-research/codex-drafting-job/v2"
 DRAFTING_EXECUTION_CONTRACT_SCHEMA = (
@@ -60,7 +61,7 @@ _DRAFTING_MODEL_CATALOG_PATH = Path(__file__).with_name(
     "codex_drafting_model_catalog.json"
 )
 _DRAFTING_MODEL_CATALOG_SHA256 = (
-    "f340eee121d525ab9e05782ca2eb5e7648a7db2694b2473e473da529ef2eba9b"
+    "a3fc197550401b1577c73a23553f2630d7095b2c151381a4baaaa4c2305ddae8"
 )
 _DRAFTING_MODEL_CATALOG_MAX_BYTES = 64 * 1024
 _DISABLED_DRAFTING_CODEX_FEATURES = (
@@ -1876,6 +1877,19 @@ def _read_sealed_drafting_result(
 
 
 def _remove_durable_job(directory: Path) -> None:
+    observation = directory / "call-observation.json"
+    if observation.is_file():
+        # Keep the signed call record after the completed drafting spool retires.
+        archive = (directory.parent.parent.parent / "provider-observations" /
+                   directory.parent.name / (directory.name + "-call-observation.json"))
+        archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        content = observation.read_bytes()
+        if archive.exists():
+            if archive.read_bytes() != content:
+                raise DraftingUnavailable("codex_observation_archive_conflict")
+        else:
+            with archive.open("xb") as stream:
+                stream.write(content)
     for name in (
         "result.json",
         "invocation.json",
@@ -1888,6 +1902,7 @@ def _remove_durable_job(directory: Path) -> None:
         "supervisor-ready.json",
         "provider-started.json",
         "supervisor-exit.json",
+        "call-observation.json",
         "supervisor-stop.json",
         "supervisor.lock",
         "pid.json",

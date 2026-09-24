@@ -1,4 +1,4 @@
 interface:
-  display_name: "Writing Report"
-  short_description: "Draft and revise evidence-grounded reports"
-  default_prompt: "Use $writing-report to draft and self-review a report from the frozen Quest snapshot."
+  display_name: "研究文档写作"
+  short_description: "根据冻结来源起草、独立审阅并修订研究文档"
+  default_prompt: "使用 $writing-report 根据冻结 Quest Snapshot 起草研究文档，组织独立审阅并在原根会话定稿。"

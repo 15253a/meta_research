@@ -1,17 +1,6 @@
-"""Public TDD contract for Reasoning-internal AutonomousCreation.
-
-There is exactly one outward Reasoning transition.  A preliminary scientific
-candidate plus an internal ``create_question`` checkpoint stays in the current
-AR Run and is not a Reasoning Stage output.  RM first stages that autonomous
-scope and RG independently accepts its preliminary scientific source; neither
-fact is the later closed-output/transition acceptance.  AutonomousCreation
-then resolves the checkpoint through AE-issued mandatory DeepFetch, RM Question
-content, RG Question facts, and only then a real QuestionLiteratureRevision.
-The same Reasoning Run can finally resume and form its one closed
-output/NextCycleProposal for RM/RG/AR/AE.
-
-Tests use public Runtime/Owner/Service queries and deterministic external
-providers only.  They never read an Owner table or fabricate an Owner receipt.
+"""Current autonomous flow: draft checkpoint, mandatory DeepFetch, same-Session
+decision, scientific acceptance, Question creation, and one final transition.
+All Owner facts are real; external providers are deterministic fixtures.
 """
 
 from __future__ import annotations
@@ -311,24 +300,29 @@ class _AutonomousReasoningSkill:
                 scientific_outcome=scientific_outcome,
                 next_cycle_proposal=None,
                 candidate_completion=completion,
-                findings=(),
-                dispositions=(),
+
+
                 primary_session_ref=draft.primary_session_ref,
-                review_mode="harness_child_agent",
-                reviewer_agent_ref="reasoning-successor-reviewer-1",
+                review_mode="advisory_unobserved",
+                reviewer_agent_ref=None,
                 adapter_kind=draft.adapter_kind,
             )
         assert draft.draft == self.checkpoints[-1]
         return ReasoningAutonomousCheckpointResult(
             primary_draft=draft.draft,
             reviewed_checkpoint=draft.draft,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="reasoning-autonomous-scope-reviewer-1",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
+
+    def decide_after_deepfetch(self, request, checkpoint, facts, summary):
+        assert request.native_session_ref and summary is not None
+        assert facts["status"] == "succeeded" and summary["summary"]
+        return {"action": "create", "final_output": checkpoint}
 
     def resume_after_autonomous_creation(
         self,
@@ -385,24 +379,12 @@ class _AutonomousReasoningSkill:
             scientific_outcome=outcome,
             next_cycle_proposal=transition,
             candidate_completion=None,
-            findings=(
-                {
-                    "finding_id": "autonomous-target-owner-facts",
-                    "category": "transition_boundary",
-                    "message": "Bind the final transition to the accepted target.",
-                },
-            ),
-            dispositions=(
-                {
-                    "finding_id": "autonomous-target-owner-facts",
-                    "action": "revised",
-                    "rationale": "The accepted Anchor and facts are now available.",
-                },
-            ),
+
+
             primary_session_ref=request.native_session_ref
             or "reasoning-autonomous-primary-1",
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="reasoning-autonomous-reviewer-1",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind="test_deterministic",
         )
         self.creation_results.append(creation_result)
@@ -481,40 +463,20 @@ def _reach_autonomous_checkpoint(runtime, *, direct_quest: bool = False):
     idea = _finish_idea_stage(runtime)
     assert idea["stage_commit"]["outcome_kind"] == "NoViableCandidate"
 
-    checkpoint_history: list[dict[str, object]] = []
     for _step in range(9):
         view = runtime.reasoning_stage.query_current()
         checkpoint = view.get("autonomous_creation_checkpoint")
         if checkpoint is not None:
-            checkpoint_history.append(checkpoint)
-        if checkpoint is not None and checkpoint["status"] == "source_accepted":
             break
         view = _tick_reasoning(runtime)
     else:
         raise AssertionError("Reasoning did not record its autonomous checkpoint")
 
-    assert checkpoint["status"] == "source_accepted"
+    assert checkpoint["status"] == "awaiting_content"
     assert checkpoint["schema_ref"] == _CHECKPOINT_SCHEMA_REF
-    assert checkpoint["scope_acceptance"]["status"] == "accepted"
-    assert checkpoint["scope_acceptance"]["content"]["status"] == "accepted"
-    assert checkpoint["scope_acceptance"]["content"]["receipt"]["issuer"] == (
-        "research_memory"
-    )
-    assert checkpoint["scope_acceptance"]["domain"]["status"] == "accepted"
-    assert checkpoint["scope_acceptance"]["domain"]["receipt"]["issuer"] == (
-        "research_graph"
-    )
-    assert checkpoint["scope_acceptance"]["domain"]["outcome_ref"] == (
-        checkpoint["scientific_outcome"]["outcome_ref"]
-    )
-    assert any(
-        item["scope_acceptance"]["status"] == "awaiting_content"
-        for item in checkpoint_history
-    )
-    assert any(
-        item["scope_acceptance"]["status"] == "awaiting_domain"
-        for item in checkpoint_history
-    )
+    assert checkpoint["scope_acceptance"]["content"]["status"] == "not_attempted"
+    assert checkpoint["scope_acceptance"]["domain"]["status"] == "not_attempted"
+    assert runtime.owners.research_memory.query_reasoning_scientific_candidate_by_checkpoint_ref(checkpoint["checkpoint_ref"]) is None
     assert view["run"]["attempt_execution_receipt"] is None
     assert view["run"]["completion_receipt"] is None
     assert view["reasoning_acceptance"] == {
@@ -577,7 +539,7 @@ def _tick_autonomous(
     return view
 
 
-def _drive_until(runtime, predicate, *, limit: int = 24):
+def _drive_until(runtime, predicate, *, limit: int = 40):
     history: list[dict[str, object]] = []
     for _step in range(limit):
         view = runtime.autonomous_creation.query_current()
@@ -596,7 +558,10 @@ def _drive_until(runtime, predicate, *, limit: int = 24):
             if predicate(after_deepfetch):
                 return after_deepfetch, history
 
-        advanced = _tick_autonomous(runtime)
+        if not runtime.autonomous_creation.process_once():
+            assert runtime.reasoning_stage.process_once(), runtime.reasoning_stage.transient_error
+        advanced = runtime.autonomous_creation.query_current()
+        _assert_autonomous_mode(advanced)
         history.append(advanced)
         if predicate(advanced):
             return advanced, history
@@ -1114,9 +1079,8 @@ def test_autonomous_creation_resumes_one_reasoning_run_before_final_acceptance(
             "foreground_cycle_count"
         ]
 
-        # The caller names the AR checkpoint and its separately RG-accepted
-        # preliminary science.  It cannot inject/replace either payload or
-        # author an outward transition.
+        # The caller names the immutable AR draft; science is accepted only
+        # after the same Session receives the forthcoming DeepFetch summary.
         started = runtime.autonomous_creation.start(
             reasoning_checkpoint_ref=checkpoint_ref,
             source_scientific_outcome_ref=str(preliminary["outcome_ref"]),
@@ -1141,12 +1105,7 @@ def test_autonomous_creation_resumes_one_reasoning_run_before_final_acceptance(
             "foreground_epoch": preliminary["foreground_epoch"],
             "reasoning_checkpoint_ref": checkpoint_ref,
             "reasoning_checkpoint_hash": checkpoint_hash,
-            "autonomous_scope_content_acceptance_receipt_ref": scope_acceptance[
-                "content"
-            ]["receipt"]["receipt_ref"],
-            "preliminary_scientific_acceptance_receipt_ref": scope_acceptance[
-                "domain"
-            ]["receipt"]["receipt_ref"],
+            "execution_checkpoint_receipt_ref": checkpoint["receipt"]["receipt_ref"],
         }
         assert started["deepfetch"] == {
             "required": True,
@@ -1157,6 +1116,7 @@ def test_autonomous_creation_resumes_one_reasoning_run_before_final_acceptance(
             "request_ref": None,
             "run_ref": None,
             "literature_snapshot_ref": None,
+            "attempt_ref": None, "attempt_generation": None, "failure_code": None,
         }
         assert started["content_acceptance"] == {"status": "not_attempted"}
         assert started["question_anchor"] is None
@@ -1186,6 +1146,8 @@ def test_autonomous_creation_resumes_one_reasoning_run_before_final_acceptance(
             lambda value: value["content_acceptance"]["status"] == "accepted"
             and value["question_anchor"] is None,
         )
+        scope_acceptance = runtime.reasoning_stage.query_current()["autonomous_creation_checkpoint"]["scope_acceptance"]
+        assert scope_acceptance["status"] == "accepted"
         # There is no accepted Question identity yet, so RM must not bind a
         # QuestionLiteratureRevision to a future/local QuestionRef.
         assert content_only["literature_revision"] is None
@@ -1350,15 +1312,25 @@ def test_autonomous_creation_resumes_one_reasoning_run_before_final_acceptance(
         assert successor_request is not None
         successor_pack = successor_request.context_pack
         assert successor_pack["schema_ref"] == (
-            "meta-research/idea-context-pack/v3"
+            "meta-research/idea-context-pack/v4"
         )
-        assert successor_pack["literature_binding"] == literature
-        restarted.owners.research_memory.verify_question_literature_revision(
-            successor_pack["literature_binding"]
-        )
+        frozen_literature = successor_pack["literature_binding"]
+        assert frozen_literature["kind"] == "QuestionLiteratureReference"
+        assert "records" not in frozen_literature
+        assert frozen_literature["revision_ref"] == literature["revision_ref"]
+        assert restarted.owners.research_memory.query_question_literature_revision_ref(
+            question_ref=frozen_literature["question_ref"],
+            revision_ref=frozen_literature["revision_ref"],
+        ) == literature
         prior_bindings = successor_pack["prior_accepted_bindings"]
         assert len(prior_bindings) == 1
-        prior = prior_bindings[0]
+        prior_ref = prior_bindings[0]
+        assert prior_ref["kind"] == "ReasoningHandoffReference"
+        assert "closure" not in prior_ref
+        exact_successor = restarted.owners.advancement_engine.query_reasoning_successor_context(str(successor["cycle_ref"]))
+        prior = exact_successor["prior_accepted_bindings"][0]
+        assert prior_ref["closure_hash"] == canonical_hash(prior["closure"])
+        assert prior_ref["outcome_ref"] == prior["outcome_ref"]
         assert prior["stage"] == "reasoning"
         assert prior["cycle_ref"] == preliminary["cycle_ref"]
         assert prior["request_ref"] == preliminary["stage_run_request_ref"]
@@ -1481,8 +1453,10 @@ def test_new_question_direct_reasoning_runs_the_successor_to_stage_commit(
             for item in successor["skipped_stage_commits"]
         )
         pack = successor["idea_context_pack"]
-        assert pack["schema_ref"] == "meta-research/idea-context-pack/v3"
-        assert pack["literature_binding"] == ready["literature_revision"]
+        assert pack["schema_ref"] == "meta-research/idea-context-pack/v4"
+        assert pack["literature_binding"]["kind"] == "QuestionLiteratureReference"
+        assert pack["literature_binding"]["revision_ref"] == ready["literature_revision"]["revision_ref"]
+        assert "records" not in pack["literature_binding"]
         assert pack["prior_accepted_bindings"][0]["outcome_ref"] == (
             source_outcome["outcome_ref"]
         )
@@ -1625,166 +1599,8 @@ def test_provided_human_response_does_not_resume_autonomous_creation(
         runtime.close()
 
 
-@pytest.mark.parametrize(
-    ("entry_stage", "expected_error"),
-    (
-        ("plan", "reasoning_next_cycle_plan_basis_unavailable"),
-        ("bundle", "reasoning_next_cycle_bundle_basis_unavailable"),
-    ),
-)
-def test_new_question_later_stage_route_fails_before_creation_side_effects(
-    tmp_path: Path,
-    entry_stage: str,
-    expected_error: str,
-) -> None:
-    data_path = tmp_path / f"autonomous-{entry_stage}-entry-rejected"
-    runtime = _reasoning_runtime(
-        data_path,
-        reasoning_skill=_AutonomousReasoningSkill(entry_stage=entry_stage),
-    )
-    try:
-        _quest, _reasoning, checkpoint = _reach_autonomous_checkpoint(runtime)
-        preliminary = checkpoint["scientific_outcome"]
-        context = runtime.autonomous_creation.start(
-            reasoning_checkpoint_ref=str(checkpoint["checkpoint_ref"]),
-            source_scientific_outcome_ref=str(preliminary["outcome_ref"]),
-            idempotency_key=f"autonomous-{entry_stage}-start",
-        )
-        assert context["scope"]["mode"] == "new"
-        assert context["scope"]["entry_stage"] == entry_stage
-        assert context["deepfetch"]["status"] == "not_started"
-
-        foreground_before = (
-            runtime.owners.advancement_engine.query_foreground(
-                str(preliminary["quest_ref"])
-            )
-        )
-        ae_before = runtime.owners.advancement_engine.query_snapshot().facts
-        questions_before = runtime.owners.research_graph.query_question_tree(
-            str(preliminary["quest_ref"])
-        )
-
-        with pytest.raises(OwnerConflict, match=expected_error):
-            runtime.autonomous_creation.process_once()
-
-        rejected = runtime.autonomous_creation.query(
-            str(checkpoint["checkpoint_ref"])
-        )
-        assert rejected is not None
-        assert rejected["deepfetch"]["status"] == "not_started"
-        assert rejected["deepfetch"]["request_ref"] is None
-        assert rejected["deepfetch"]["literature_snapshot_ref"] is None
-        assert rejected["content_acceptance"] == {"status": "not_attempted"}
-        assert rejected["question_anchor"] is None
-        assert rejected["graph_presence_fact"] is None
-        assert rejected["question_research_state_fact"] is None
-        assert rejected["literature_revision"] is None
-        assert (
-            runtime.owners.advancement_engine.query_autonomous_deepfetch_request(
-                str(context["context_ref"])
-            )
-            is None
-        )
-        assert (
-            runtime.owners.research_memory
-            .query_autonomous_question_content_by_checkpoint_ref(
-                str(checkpoint["checkpoint_ref"])
-            )
-            is None
-        )
-        assert (
-            runtime.owners.research_graph
-            .query_autonomous_question_by_checkpoint_ref(
-                str(checkpoint["checkpoint_ref"])
-            )
-            is None
-        )
-        assert runtime.owners.research_graph.query_question_tree(
-            str(preliminary["quest_ref"])
-        ) == questions_before
-        assert (
-            runtime.owners.advancement_engine.query_foreground(
-                str(preliminary["quest_ref"])
-            )
-            == foreground_before
-        )
-        assert (
-            runtime.owners.advancement_engine.query_snapshot().facts[
-                "foreground_cycle_count"
-            ]
-            == ae_before["foreground_cycle_count"]
-        )
-    finally:
-        runtime.close()
-
-    restarted = _reasoning_runtime(
-        data_path,
-        reasoning_skill=_AutonomousReasoningSkill(entry_stage=entry_stage),
-    )
-    try:
-        with pytest.raises(OwnerConflict, match=expected_error):
-            restarted.autonomous_creation.process_once()
-        replayed = restarted.autonomous_creation.query(
-            str(checkpoint["checkpoint_ref"])
-        )
-        assert replayed is not None
-        assert replayed["deepfetch"]["status"] == "not_started"
-        assert replayed["question_anchor"] is None
-        assert replayed["literature_revision"] is None
-        assert (
-            restarted.owners.advancement_engine.query_foreground(
-                str(preliminary["quest_ref"])
-            )
-            == foreground_before
-        )
-        assert restarted.owners.research_graph.query_question_tree(
-            str(preliminary["quest_ref"])
-        ) == questions_before
-    finally:
-        restarted.close()
 
 
-def test_autonomous_plan_entry_rejects_unbound_skip_basis_before_deepfetch(
-    tmp_path: Path,
-) -> None:
-    runtime = _reasoning_runtime(
-        tmp_path / "autonomous-plan-forged-skip",
-        reasoning_skill=_AutonomousReasoningSkill(
-            entry_stage="plan",
-            skip_basis_ref="forged-unaccepted-skip-basis",
-        ),
-    )
-    try:
-        _quest, _reasoning, checkpoint = _reach_autonomous_checkpoint(runtime)
-        preliminary = checkpoint["scientific_outcome"]
-        started = runtime.autonomous_creation.start(
-            reasoning_checkpoint_ref=str(checkpoint["checkpoint_ref"]),
-            source_scientific_outcome_ref=str(preliminary["outcome_ref"]),
-            idempotency_key="autonomous-plan-forged-start",
-        )
-        assert started["scope"]["typed_skip_basis_refs_by_stage"] == {
-            "idea": ["forged-unaccepted-skip-basis"]
-        }
-
-        with pytest.raises(
-            OwnerConflict, match="autonomous_successor_skip_basis_invalid"
-        ):
-            runtime.autonomous_creation.process_once()
-
-        assert (
-            runtime.owners.advancement_engine.query_autonomous_deepfetch_request(
-                str(started["context_ref"])
-            )
-            is None
-        )
-        rejected = runtime.autonomous_creation.query_current()
-        assert rejected is not None
-        assert rejected["deepfetch"]["status"] == "not_started"
-        assert rejected["content_acceptance"] == {"status": "not_attempted"}
-        assert rejected["question_anchor"] is None
-        assert rejected["literature_revision"] is None
-    finally:
-        runtime.close()
 
 
 def test_failed_deepfetch_command_is_queryable_after_restart_but_not_reexecuted(

@@ -34,6 +34,7 @@ class RuntimeStatusReader:
                 root = None
                 waiting = None
                 pending_requests = 0
+                dispatch_wait = None
                 if foreground is not None:
                     scope = dict(foreground)
                     run = c.execute(text('''
@@ -46,6 +47,13 @@ class RuntimeStatusReader:
                         ORDER BY r.created_at DESC, r.run_ref DESC LIMIT 1
                     '''), scope).mappings().first()
                     if run is not None:
+                        if foreground['stage'] == 'bundle':
+                            dispatch_wait = c.execute(text('''
+                                SELECT action, rationale FROM ar_bundle_dispatch_decisions
+                                WHERE run_ref=:run_ref AND attempt_ref=:current_attempt_ref
+                                  AND fence_ref=:current_fence_ref
+                                ORDER BY generation DESC LIMIT 1
+                            '''), dict(run)).mappings().first()
                         with query_section('current_target'):
                             root = c.execute(text('''
                                 SELECT r.target_ref, r.target_run_ref AS run_ref, r.status,
@@ -105,6 +113,8 @@ class RuntimeStatusReader:
                     reason = '等待当前研究控制操作完成'
                 elif state == 'pending':
                     reason = '等待工作器接续当前阶段'
+                elif dispatch_wait is not None and dispatch_wait['action'] == 'wait' and root is None:
+                    state, reason = 'waiting', dispatch_wait['rationale']
                 elif raw == 'awaiting_acceptance':
                     reason = '当前阶段输出已生成，等待系统接纳'
                 elif state == 'waiting':
@@ -121,3 +131,23 @@ class RuntimeStatusReader:
             }
             result['query_diagnostics'] = timing.public()
             return result
+
+
+def project_worker_health(status: dict, health: dict) -> None:
+    """Make the current worker's failure visible without altering research state."""
+    status['health'] = health
+    foreground = status.get('foreground')
+    task = status.get('current_task')
+    if (not foreground or not task or status.get('state') in {'paused', 'idle'}
+            or foreground.get('status') in {'completed', 'closed'}):
+        return
+    stage_worker = str(foreground.get('stage')) + '_stage_worker'
+    current_workers = {stage_worker}
+    if task.get('kind') == 'target':
+        current_workers.update({'target_run_worker', 'target_root_lifecycle'})
+    failure = next((check for check in health.get('checks', [])
+                    if check.get('name') in current_workers and check.get('status') == 'unavailable'), None)
+    if failure:
+        code = (failure.get('reason') or {}).get('code', 'worker_unavailable')
+        status['state'] = 'failed'
+        status['waiting_reason'] = '研究推进暂时受阻：' + code

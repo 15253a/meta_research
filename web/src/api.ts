@@ -2555,9 +2555,12 @@ export async function fetchSnapshot(
   const abort = () => controller.abort();
   if (signal?.aborted) controller.abort();
   signal?.addEventListener("abort", abort, { once: true });
-  const timer = window.setTimeout(abort, 22_000);
+  let timer: number | undefined;
   try {
     for (;;) {
+      // Bound each request; explicit server retry responses may need more than
+      // one request window before the shared read is ready for delivery.
+      timer = window.setTimeout(abort, 22_000);
       const response = await fetch("/api/v1/snapshot", {
         credentials: "same-origin",
         headers: {
@@ -2569,9 +2572,11 @@ export async function fetchSnapshot(
       });
       if (response.status === 503) {
         const failure = await response.json().catch(() => null);
-        if (failure?.detail?.code === "snapshot_query_in_progress") {
-          // Another page is using the shared query slot. Keep loading and retry
-          // within the original deadline instead of reporting the service offline.
+        if (failure?.detail?.code === "snapshot_query_in_progress" ||
+            failure?.detail?.code === "snapshot_query_timeout") {
+          // The shared read is still running. Honor its retry delay while keeping
+          // navigation cancellation active, without an offline/error interlude.
+          window.clearTimeout(timer);
           const seconds = Number(response.headers.get("Retry-After") ?? "2");
           const delay = Number.isFinite(seconds) ? Math.min(5_000, Math.max(250, seconds * 1_000)) : 2_000;
           await new Promise<void>((resolve, reject) => {
@@ -6308,3 +6313,51 @@ export function followProjection(
     stream?.close();
   };
 }
+
+
+export type OutputLanguage = "zh" | "en";
+export type ResearchLibraryEntry = "questions" | "baselines" | "datasets" | "literature" | "human";
+export type ResearchContentReader = { source_ref: string; version_ref?: string | null; entry_path?: string; ref?: string; operation?: string };
+export type ResearchLibraryItem = Record<string, unknown> & {
+  ref?: string; title?: string; name?: string; summary?: string; status?: string;
+  reader?: ResearchContentReader | null;
+};
+export type ResearchLibraryPage = { items: ResearchLibraryItem[]; next_offset: number | null; total_count?: number; request_next_cursor?: string | null };
+export type ResearchContentPage = {
+  text?: string; content?: unknown; next_offset: number | null; status?: string;
+  [key: string]: unknown;
+};
+async function readResearchJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  const timer = window.setTimeout(abort, 15_000);
+  try {
+    const response = await fetch(path, { credentials: "same-origin", headers: { Accept: "application/json" }, signal: controller.signal });
+    if (!response.ok) throw new ProductError((await response.json().catch(() => null))?.detail?.code ?? `request_failed:${response.status}`);
+    return await response.json() as T;
+  } finally {
+    window.clearTimeout(timer); signal?.removeEventListener("abort", abort);
+  }
+}
+export const fetchOutputLanguage = (signal?: AbortSignal) =>
+  readResearchJson<{ output_language: OutputLanguage }>("/api/v1/preferences", signal);
+export const saveOutputLanguage = (output_language: OutputLanguage) =>
+  writeJson<{ output_language: OutputLanguage }>("/api/v1/preferences", "PUT", { output_language });
+export function fetchResearchLibrary(entry: ResearchLibraryEntry, questRef: string, query: string, offset: number, signal?: AbortSignal, scope: Record<string, string> = {}) {
+  if (scope.formal_ref) {
+    const parameters = new URLSearchParams({ quest_ref: questRef, ref: scope.formal_ref });
+    return readResearchJson<ResearchLibraryPage>(`/api/v1/research-formal?${parameters}`, signal);
+  }
+  const parameters = new URLSearchParams({ quest_ref: questRef, query, offset: String(offset), limit: "12", ...scope });
+  return readResearchJson<ResearchLibraryPage>(`/api/v1/research-library/${entry}?${parameters}`, signal);
+}
+export function fetchResearchContent(questRef: string, reader: ResearchContentReader, offset: number, signal?: AbortSignal) {
+  const parameters = new URLSearchParams({ quest_ref: questRef, source_ref: reader.source_ref, offset: String(offset), limit: "16384" });
+  if (reader.version_ref) parameters.set("version_ref", reader.version_ref);
+  if (reader.entry_path) parameters.set("entry_path", reader.entry_path);
+  return readResearchJson<ResearchContentPage>(`/api/v1/research-content?${parameters}`, signal);
+}
+export const submitResearchInput = (quest_ref: string, question_ref: string | null, text: string) =>
+  writeJson<Record<string, unknown>>("/api/v1/research-inputs", "POST", { quest_ref, question_ref, text, asset_bindings: [] });

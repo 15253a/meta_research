@@ -13,16 +13,17 @@ import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlsplit
 
 from meta_research.acquisition import DEEPFETCH_PROTOTYPE_COMMIT
+from meta_research.system_prompt import read_output_language
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
-    CODEX_REASONING_EFFORT_CONFIG,
+    CODEX_ROOT_REASONING_PRESET_CONFIG,
 )
 from meta_research.codex_ledger import (
     CodexHomeLedgerReader,
@@ -797,7 +798,7 @@ class CodexDeepFetchAdapter:
         if callable(run_command):
             argv = [
                 self._executable,
-                *profile.codex_arguments(entry_path=entry_path),
+                *profile.codex_arguments(entry_path=entry_path, output_language=read_output_language(self._workspace)),
                 "features",
                 "list",
             ]
@@ -1667,7 +1668,7 @@ class CodexDeepFetchAdapter:
         previous_native_session_ref: str | None = None
         enforce_previous_native = False
         for turn_number in range(checkpoint.next_turn_number):
-            raw, native_session_ref, evidence = self._read_existing_turn(
+            raw, native_session_ref, evidence, native_effects = self._read_existing_turn(
                 request,
                 public_root=public_root,
                 provider_job_ref=f"{request.job_ref}:v4-turn:{turn_number}",
@@ -1681,6 +1682,10 @@ class CodexDeepFetchAdapter:
                 ),
             )
             observed_evidence.append(evidence)
+            acquisition_effects.extend(
+                (_resident_mcp_phase(request, f"turn-{turn_number}"), effect)
+                for effect in native_effects
+            )
             previous_native_session_ref = native_session_ref
             enforce_previous_native = True
             if raw.get("status") == "web_evidence_ready":
@@ -1704,6 +1709,15 @@ class CodexDeepFetchAdapter:
 
         if tuple(observed_evidence) != checkpoint.evidence_parts:
             raise ValueError("deepfetch reconciliation evidence mismatch")
+        unique_effects: dict[tuple[str, str], dict[str, object]] = {}
+        for phase, effect in acquisition_effects:
+            key = (phase, cast(str, effect["effect_id"]))
+            if key in unique_effects and unique_effects[key] != effect:
+                raise ValueError("deepfetch reconciliation acquisition conflict")
+            unique_effects[key] = effect
+        acquisition_effects = [
+            (phase, effect) for (phase, _effect_id), effect in unique_effects.items()
+        ]
         observed_effects = tuple(
             {
                 "effect_id": effect["effect_id"],
@@ -1736,7 +1750,7 @@ class CodexDeepFetchAdapter:
                 or checkpoint.next_turn_number < 1
             ):
                 raise ValueError("deepfetch reconciliation checkpoint mismatch")
-            final_raw, final_native, _final_evidence = self._read_existing_turn(
+            final_raw, final_native, _final_evidence, _native_effects = self._read_existing_turn(
                 request,
                 public_root=public_root,
                 provider_job_ref=(
@@ -1753,13 +1767,16 @@ class CodexDeepFetchAdapter:
                 ),
             )
             if (
-                final_raw != checkpoint.final_envelope
+                final_raw != _with_host_finalized_at(
+                    checkpoint.final_envelope,
+                    cast(str, cast(dict[str, object], final_raw["workflow"])["finalized_at"]),
+                )
                 or final_native != checkpoint.native_session_ref
                 or request.native_session_ref is not None
                 and final_native != request.native_session_ref
             ):
                 raise ValueError("deepfetch reconciliation final mismatch")
-            return checkpoint
+            return replace(checkpoint, final_envelope=final_raw)
 
         if checkpoint.phase == "pending_acquisition":
             assert checkpoint.pending_acquisition is not None
@@ -1769,11 +1786,20 @@ class CodexDeepFetchAdapter:
                     checkpoint.pending_acquisition["targets"],
                 )
             )
+            pending_already_recorded = any(
+                proof["phase"] == f"turn-{checkpoint.next_turn_number - 1}"
+                and proof["effect_id"] == checkpoint.pending_acquisition["effect_id"]
+                for proof in checkpoint.acquisition_item_proofs
+            )
+            prior_effects = (
+                observed_effects if pending_already_recorded
+                else observed_effects[:-pending_target_count]
+            )
             if (
                 not acquisition_effects
                 or checkpoint.pending_acquisition
                 != acquisition_effects[-1][1]
-                or observed_effects[:-pending_target_count] != recorded_effects
+                or prior_effects != recorded_effects
                 or recorded_request_ids != checkpoint.acquisition_request_ids
             ):
                 raise ValueError("deepfetch reconciliation acquisition mismatch")
@@ -1789,7 +1815,7 @@ class CodexDeepFetchAdapter:
             or recorded_request_ids != checkpoint.acquisition_request_ids
         ):
             raise ValueError("deepfetch reconciliation acquisition mismatch")
-        raw, native_session_ref, evidence = self._read_existing_turn(
+        raw, native_session_ref, evidence, native_effects = self._read_existing_turn(
             request,
             public_root=public_root,
             provider_job_ref=(
@@ -1828,6 +1854,11 @@ class CodexDeepFetchAdapter:
             native_session_ref != request.native_session_ref
         ):
             raise ValueError("deepfetch reconciliation native session mismatch")
+        checkpoint = self._collect_native_acquisition_proofs(
+            request, checkpoint, native_effects,
+            phase=f"turn-{checkpoint.next_turn_number}",
+            native_session_ref=native_session_ref,
+        )
         return replace(
             checkpoint,
             phase="finalized",
@@ -1849,7 +1880,7 @@ class CodexDeepFetchAdapter:
         enforce_native_session_ref: bool,
         expected_web_gate: bool,
         allow_missing_operation: bool = False,
-    ) -> tuple[dict[str, object], str, dict[str, object]]:
+    ) -> tuple[dict[str, object], str, dict[str, object], tuple[dict[str, object], ...]]:
         """Verify one old durable turn without publishing any new files."""
 
         operation_root = self._select_reconciliation_root(
@@ -1948,6 +1979,11 @@ class CodexDeepFetchAdapter:
                     "root_capability_profile",
                     "root_capability_profile_hash",
                 }
+                if "mcp_url" in invocation or "mcp_scope_binding_hash" in invocation:
+                    expected_invocation_keys |= {"mcp_url", "mcp_scope_binding_hash"}
+                    self._verify_existing_mcp_invocation(
+                        request, invocation, provider_job_ref=provider_job_ref,
+                    )
                 capability_profile = root_capability_profile("deepfetch")
                 if enforce_native and invocation_native != native_session_ref:
                     raise ValueError("deepfetch reconciliation session mismatch")
@@ -2052,7 +2088,10 @@ class CodexDeepFetchAdapter:
                         raise error.as_verified_terminal(
                             observed_native
                         ) from error
-                    return outcome[1], observed_native, evidence
+                    return (
+                        outcome[1], observed_native, evidence,
+                        _native_acquisition_effects("\n".join(traces)),
+                    )
                 if not isinstance(observed_native, str) or not observed_native:
                     raise DeepFetchUnavailable(
                         "deepfetch_provider_stopped_before_session",
@@ -2195,6 +2234,35 @@ class CodexDeepFetchAdapter:
         ):
             raise ValueError("deepfetch reconciliation argv identity invalid")
 
+    def _verify_existing_mcp_invocation(
+        self,
+        request: DeepFetchProviderRequest,
+        invocation: dict[str, object],
+        *,
+        provider_job_ref: str,
+    ) -> None:
+        """Bind signed historical MCP metadata to this run's resident catalog."""
+        phase = _resident_mcp_phase(
+            request, "turn-" + provider_job_ref.rsplit(":v4-turn:", 1)[-1]
+        )
+        try:
+            channel_key, access = self._root_resident_mcp.acquire(
+                run_ref=request.run_ref, attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
+                capability_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
+                phase=phase, job_ref=provider_job_ref,
+            )
+            try:
+                if (
+                    invocation.get("mcp_url") != access.url
+                    or invocation.get("mcp_scope_binding_hash") != access.scope_binding_hash
+                ):
+                    raise ValueError("deepfetch reconciliation MCP scope mismatch")
+            finally:
+                self._root_resident_mcp.release(channel_key)
+        except RootResidentMcpError as error:
+            raise DeepFetchUnavailable(error.code) from error
+
     def _execute_protocol(
         self,
         request: DeepFetchProviderRequest,
@@ -2254,18 +2322,10 @@ class CodexDeepFetchAdapter:
                         durable_outcome="pending",
                         native_session_ref=checkpoint.native_session_ref,
                     ) from error
-                acquisition_ids = (
-                    *checkpoint.acquisition_request_ids,
-                    cast(str, item_proofs[0]["request_id"]),
-                )
+                checkpoint = _append_acquisition_proofs(checkpoint, item_proofs)
                 checkpoint = replace(
                     checkpoint,
                     phase="ready_for_turn",
-                    acquisition_request_ids=acquisition_ids,
-                    acquisition_item_proofs=(
-                        *checkpoint.acquisition_item_proofs,
-                        *item_proofs,
-                    ),
                     pending_acquisition=None,
                     next_prompt=self._acquisition_result_prompt(
                         public_root,
@@ -2300,7 +2360,7 @@ class CodexDeepFetchAdapter:
             web_gate = checkpoint.next_prompt.startswith(
                 "web_evidence_gate=v1\n"
             )
-            raw, native_session_ref, turn_evidence = self._invoke(
+            raw, native_session_ref, turn_evidence, native_effects = self._invoke(
                 turn_request,
                 checkpoint.next_prompt,
                 phase=f"turn-{turn_number}",
@@ -2323,6 +2383,11 @@ class CodexDeepFetchAdapter:
             elif checkpoint.native_session_ref != native_session_ref:
                 raise DeepFetchUnavailable("deepfetch_native_session_changed")
             evidence_parts = (*checkpoint.evidence_parts, turn_evidence)
+            checkpoint = self._collect_native_acquisition_proofs(
+                request, checkpoint, native_effects,
+                phase=f"turn-{turn_number}",
+                native_session_ref=native_session_ref,
+            )
             if web_gate:
                 _validate_web_evidence_gate_result(raw)
                 _merge_web_evidence([turn_evidence])
@@ -2355,14 +2420,6 @@ class CodexDeepFetchAdapter:
             if raw.get("action") != "acquire":
                 raise DeepFetchUnavailable("codex_deepfetch_output_invalid")
             effect = _validated_v4_acquisition_effect(raw)
-            if any(
-                proof["effect_id"] == effect["effect_id"]
-                and proof["phase"] == f"turn-{turn_number}"
-                for proof in checkpoint.acquisition_item_proofs
-            ):
-                raise DeepFetchUnavailable(
-                    "deepfetch_acquisition_identity_duplicate"
-                )
             checkpoint = replace(
                 checkpoint,
                 phase="pending_acquisition",
@@ -2421,6 +2478,45 @@ class CodexDeepFetchAdapter:
         # provenance, and public-result validation all pass.
         _write_protocol_checkpoint(checkpoint_path, checkpoint)
         return result
+
+    def _collect_native_acquisition_proofs(
+        self,
+        request: DeepFetchProviderRequest,
+        checkpoint: _DeepFetchProtocolCheckpoint,
+        effects: tuple[dict[str, object], ...],
+        *,
+        phase: str,
+        native_session_ref: str,
+    ) -> _DeepFetchProtocolCheckpoint:
+        """Reattest observed native tool calls through the bound Owner, never dispatch."""
+        phase = _resident_mcp_phase(request, phase)
+        try:
+            for effect in effects:
+                effect_id = cast(str, effect["effect_id"])
+                execution = self._call_acquisition_operation(
+                    request,
+                    operation_id=ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
+                    phase=phase,
+                    arguments={"effect_id": effect_id},
+                )
+                if execution.get("status") == "unknown_outcome":
+                    raise DeepFetchUnavailable("deepfetch_acquisition_reattestation_required")
+                item_proofs = _semantic_acquisition_item_proofs(
+                    execution,
+                    effect_id=effect_id,
+                    phase=phase,
+                    target_hashes={
+                        cast(str, target["paper_id"]): canonical_hash(target)
+                        for target in cast(list[dict[str, object]], effect["targets"])
+                    },
+                )
+                checkpoint = _append_acquisition_proofs(checkpoint, item_proofs)
+        except DeepFetchUnavailable as error:
+            raise DeepFetchUnavailable(
+                error.code, durable_outcome="pending",
+                native_session_ref=native_session_ref,
+            ) from error
+        return checkpoint
 
     def _query_authoritative_acquisition_proofs(
         self,
@@ -2588,6 +2684,10 @@ class CodexDeepFetchAdapter:
             "根据 scope 做至少一次真实 Web Search，并立即 Open/Fetch 至少一个检索结果。"
             "Codex 默认工具能力保持可用，但本 Gate 只验收上述 Search 与 Open/Fetch；"
             "通过前不要展开 Acquisition、Reader 或正式成果生成。"
+            "当前完成条件要求真实 Search 与 Open/Fetch 成功；Web 不可用时保留真实阻塞，"
+            "如实说明具体故障，按已有 HumanRequest 与恢复机制处理，需要人工帮助时"
+            "使用 system_operation_help。缺少成功证据时不得返回 web_evidence_ready，"
+            "也不能以记录 Web 不可用代替通过 Gate。"
             "完成 Search 与 Open/Fetch 后，只返回 schema 要求的 web_evidence_ready。\n"
             f"request_ref={request.request_ref}\n"
             f"draft_revision={request.draft_revision}\n"
@@ -2628,7 +2728,7 @@ class CodexDeepFetchAdapter:
         phase: str,
         output_schema: dict[str, object] | None = None,
         timeout_seconds: float | None = None,
-    ) -> tuple[dict[str, object], str, dict[str, object]]:
+    ) -> tuple[dict[str, object], str, dict[str, object], tuple[dict[str, object], ...]]:
         if not self._root_resident_mcp.enabled:
             return self._invoke_with_access(
                 request,
@@ -2638,11 +2738,7 @@ class CodexDeepFetchAdapter:
                 access=None,
             )
         try:
-            channel_phase = (
-                request.human_request_resume["phase"]
-                if request.human_request_resume is not None
-                else phase
-            )
+            channel_phase = _resident_mcp_phase(request, phase)
             channel_key, access = self._root_resident_mcp.acquire(
                 run_ref=request.run_ref,
                 attempt_ref=request.attempt_ref,
@@ -2691,7 +2787,7 @@ class CodexDeepFetchAdapter:
         output_schema: dict[str, object] | None,
         timeout_seconds: float | None,
         access: RootResidentMcpAccess | None,
-    ) -> tuple[dict[str, object], str, dict[str, object]]:
+    ) -> tuple[dict[str, object], str, dict[str, object], tuple[dict[str, object], ...]]:
         schema = output_schema or _deepfetch_output_schema()
         if request.job_ref is not None and callable(
             getattr(self._runner, "run_durable_job", None)
@@ -2752,7 +2848,7 @@ class CodexDeepFetchAdapter:
                 "--config",
                 'approval_policy="never"',
                 "--config",
-                CODEX_REASONING_EFFORT_CONFIG,
+                CODEX_ROOT_REASONING_PRESET_CONFIG,
                 *(
                     (
                         "--config",
@@ -2761,7 +2857,7 @@ class CodexDeepFetchAdapter:
                     if access is not None
                     else ()
                 ),
-                *capability_profile.codex_arguments(),
+                *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
                 "--sandbox",
                 self._sandbox_mode,
                 "--model",
@@ -2858,9 +2954,10 @@ class CodexDeepFetchAdapter:
             )
             web_evidence = _verified_turn_evidence(completed.stdout)
             return (
-                cast(dict[str, object], decoded),
+                _with_host_finalized_at(decoded, datetime.now(timezone.utc).isoformat()),
                 observed_native_session_ref,
                 web_evidence,
+                _native_acquisition_effects(completed.stdout),
             )
 
     def _invoke_durable(
@@ -2871,7 +2968,7 @@ class CodexDeepFetchAdapter:
         output_schema: dict[str, object],
         timeout_seconds: float | None,
         access: RootResidentMcpAccess | None = None,
-    ) -> tuple[dict[str, object], str, dict[str, object]]:
+    ) -> tuple[dict[str, object], str, dict[str, object], tuple[dict[str, object], ...]]:
         """Reconcile one logical provider operation across daemon Attempts."""
 
         assert request.job_ref is not None
@@ -2913,7 +3010,10 @@ class CodexDeepFetchAdapter:
                     evidence = _verified_turn_evidence("\n".join(trace_parts))
                 except DeepFetchUnavailable as error:
                     raise error.as_verified_terminal(completed_session) from error
-                return decoded, completed_session, evidence
+                return (
+                    decoded, completed_session, evidence,
+                    _native_acquisition_effects("\n".join(trace_parts)),
+                )
             recovered_session = outcome[3]
             if not isinstance(recovered_session, str) or not recovered_session:
                 if outcome[0] == "stopped":
@@ -3155,7 +3255,7 @@ class CodexDeepFetchAdapter:
             "--config",
             'approval_policy="never"',
             "--config",
-            CODEX_REASONING_EFFORT_CONFIG,
+            CODEX_ROOT_REASONING_PRESET_CONFIG,
             *(
                 (
                     "--config",
@@ -3164,7 +3264,7 @@ class CodexDeepFetchAdapter:
                 if mcp_url is not None
                 else ()
             ),
-            *capability_profile.codex_arguments(),
+            *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
             "--sandbox",
             self._sandbox_mode,
             "--model",
@@ -3211,6 +3311,12 @@ class CodexDeepFetchAdapter:
                 stdout_path=stdout_path,
                 result_path=result_path,
             )
+            # The host publishes this receipt after observing provider exit.
+            # Its file timestamp stays stable when the sealed output is replayed;
+            # it is observation metadata, not a model-supplied evidence claim.
+            finalized_at = datetime.fromtimestamp(
+                receipt_path.stat().st_mtime, timezone.utc
+            ).isoformat()
             if stdout_path.stat().st_size > DEEPFETCH_PROVIDER_STREAM_MAX_BYTES:
                 raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
             stdout = stdout_path.read_text(encoding="utf-8")
@@ -3268,10 +3374,23 @@ class CodexDeepFetchAdapter:
             )
         return (
             "completed",
-            cast(dict[str, object], decoded),
+            _with_host_finalized_at(decoded, finalized_at),
             stdout,
             observed_session_ref,
         )
+
+
+def _with_host_finalized_at(
+    envelope: dict[str, object], finalized_at: str
+) -> dict[str, object]:
+    """Keep provider output intact while assigning host-owned completion metadata."""
+    workflow = envelope.get("workflow")
+    if envelope.get("action") != "finalize" or not isinstance(workflow, dict):
+        return envelope
+    return {
+        **envelope,
+        "workflow": {**workflow, "finalized_at": finalized_at},
+    }
 
 
 def _deepfetch_skill_root() -> Path:
@@ -3564,6 +3683,35 @@ def _acquisition_effect_from_checkpoint(
         raise DeepFetchUnavailable(
             "deepfetch_protocol_checkpoint_invalid"
         ) from error
+
+
+def _resident_mcp_phase(request: DeepFetchProviderRequest, phase: str) -> str:
+    return (
+        request.human_request_resume["phase"]
+        if request.human_request_resume is not None else phase
+    )
+
+
+def _append_acquisition_proofs(
+    checkpoint: _DeepFetchProtocolCheckpoint,
+    item_proofs: tuple[dict[str, object], ...],
+) -> _DeepFetchProtocolCheckpoint:
+    first = item_proofs[0]
+    existing = tuple(
+        proof for proof in checkpoint.acquisition_item_proofs
+        if (proof["phase"], proof["effect_id"]) == (first["phase"], first["effect_id"])
+    )
+    if existing:
+        if existing != item_proofs:
+            raise DeepFetchUnavailable("deepfetch_hosted_acquisition_proof_mismatch")
+        return checkpoint
+    return replace(
+        checkpoint,
+        acquisition_request_ids=tuple(dict.fromkeys((
+            *checkpoint.acquisition_request_ids, cast(str, first["request_id"]),
+        ))),
+        acquisition_item_proofs=(*checkpoint.acquisition_item_proofs, *item_proofs),
+    )
 
 
 def _semantic_acquisition_item_proofs(
@@ -4766,6 +4914,37 @@ def _validated_prototype_evidence(value: object) -> dict[str, object]:
         ):
             raise DeepFetchUnavailable("deepfetch_prototype_evidence_invalid")
     return cast(dict[str, object], value)
+
+
+def _native_acquisition_effects(stdout: str) -> tuple[dict[str, object], ...]:
+    """Read native calls from the verified provider stream, not model prose/results."""
+    effects: dict[str, dict[str, object]] = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "mcp_tool_call"
+            or item.get("server") != "meta_research"
+            or item.get("tool") != ROOT_AGENT_ACQUISITION_OPERATION_IDS[0]
+            or item.get("status") != "completed"
+            or item.get("error") is not None
+        ):
+            continue
+        arguments = item.get("arguments")
+        if not isinstance(arguments, dict):
+            raise DeepFetchUnavailable("deepfetch_acquisition_request_invalid")
+        effect = _acquisition_effect_from_checkpoint(arguments)
+        effect_id = cast(str, effect["effect_id"])
+        if effect_id in effects and effects[effect_id] != effect:
+            raise DeepFetchUnavailable("deepfetch_acquisition_identity_duplicate")
+        effects[effect_id] = effect
+    return tuple(effects.values())
 
 
 def _verified_turn_evidence(stdout: str) -> dict[str, object]:

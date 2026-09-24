@@ -1,86 +1,50 @@
 ---
 name: deepfetch-v4
-description: Build a full-text-grounded scholarly evidence map only when a prompt explicitly requests DeepFetch, systematic multi-paper literature mapping, or literature-search-based novelty analysis. Use Nature Downloader for acquisition of an already-known paper and ordinary document analysis for one supplied paper.
+description: 当任务明确调用 DeepFetch、系统性多论文文献梳理或基于检索的新颖性分析时，形成有全文依据的学术证据图景。单篇已知论文的获取使用 Nature Downloader，单篇已提供文档使用普通阅读流程。
 ---
 
-# DeepFetch v4
+# DeepFetch v4：文献证据梳理
 
-Search wide. Let evidence earn certainty.
+主智能体负责发现、取舍和综合，获取服务负责合法取得全文，独立 Reader 负责全文科学阅读。按当前根 Session 的 `zh`／`en` 偏好直接撰写用户可见内容并传递给子智能体；未提供偏好时采用输入语言。原文、标识和引用保持原貌。
 
-## Deliver
+交付 `papers.json`、`summary.md` 和 `fulltext/`。检索强度仅决定主动检索时钟：`low` 8 分钟、`medium` 13 分钟、`high` 20 分钟，默认 `medium`。预检完成后计时；纯等待用户登录或上传不计入。到时停止新发现和候补晋升，冻结正在获取、已取得待分配 Reader 及已获 Reader 分配的当前目标；仅排空这些工作，排空时间在主动检索时钟之外。
 
-Publish exactly:
+发现、台账、获取和阅读可重叠推进，下面的步骤界定职责与完成条件，不要求逐批串行。台账可包含任意有价值的已核实论文；一次运行最多给 10 个不同 `paper_id` 分配全文 Reader。检索广度与精读深度分别记录，按预期新增证据价值选择，宁缺毋滥。
 
-- `papers.json`
-- `summary.md`
-- `fulltext/`
+## 1. 预检
 
-Use low, medium, or high intensity only as an active-search clock:
+读取[角色契约](references/agents.md)的预检与获取部分。当前已选 `oa_only` 或 `provided_only` 时，沿其明确授权路线继续，不探测机构登录；前者是本次主路线，后者仅使用用户提供材料。其他模式通过 Acquisition 确认已配置的机构路线；无法使用时保留具体人类待办，明确选择 OA 路线后才继续。用户取消则结束。
 
-| Intensity | Budget |
-|---|---:|
-| low | 8 minutes |
-| medium | 13 minutes |
-| high | 20 minutes |
+完成条件：当前访问模式明确，所需路线可用或等待条件可解释。
 
-Default to medium. Start the clock after Preflight. Exclude time spent waiting for user login or
-uploads. At the deadline, stop discovery and reserve promotion. Freeze currently in-flight
-target candidates, including acquisitions in flight and verified bodies awaiting Reader assignment,
-plus Reader-admitted papers. Drain only that frozen work; do not promote a reserve candidate after
-the deadline. Queue drain is outside the active-search clock.
+## 2. 发现
 
-Search breadth, ledger size, and reading depth are independent. Register as many verified,
-relevant papers as useful within the search clock, but admit at most 10 distinct `paper_id`s to
-full-text Readers across the entire run, not per batch. Treat those slots as a scarce evidence
-budget: when at least 10 worthwhile candidates exist, choose the 10-paper set with the highest
-expected marginal value for the task, never the first or easiest 10. Choose fewer rather than pad
-the set with weak papers.
+首轮查询前完整读取[发现入口](references/openalex.md)与[台账契约](references/papers-json.md)，初始化台账。把任意研究输入转成检索概念，从文本查询、文献角色与引文结构三个维度发现。OpenAlex 是结构化主入口；Web Search 用于术语、综述、基准、命名方法、近期工作和索引缺口。查询、锚点、方向、深度与停止由主智能体判断。
 
-Run Radar, Ledger, and Fan-out as an overlapping pipeline. The numbered sections define ownership and completion gates, not a serial wait between discovery, acquisition, and reading.
+每批宽检索先筛选、核实身份并登记重要条目，再扩展下一批。标题级占位也可以保留相关已核实论文；合并明确重复、移除无关线索。访问容易、引用量、机构或期刊名不直接证明研究价值。
 
-## 1. Preflight
+冻结精读集合前，对现有台账和已见候选做一次有界覆盖检查：重要任务设置、方法族、经典到近期脉络、综述或基准，以及反证和边界是否有代表性条目；重看相关却尚未登记的候选，针对关键缺口使用 Web Search。Web 结果先核实学术身份；摘要片段不是全文证据，OpenAlex 无记录也不是丢弃理由。
 
-Read the Preflight section of [references/agents.md](references/agents.md). Treat an injected
-`oa_only` session as the user's already explicit primary route: its preflight is satisfied without
-probing institutional/browser access. Otherwise verify the configured institutional route through
-the Acquisition session before starting the clock. Start only after access works or the user
-explicitly selects open-access-only continuation. Never describe an already selected `oa_only`
-route as forced, as a downgrade, or as a fallback caused by unavailable institutional access.
+完成条件：三个发现维度均有实际工作，使用 OpenAlex 和 Web 完成覆盖检查，并已有真实 Web Search 与 Open/Fetch 成功证据；预算耗尽或已有可辩护的提前停止理由。Web 不可用时保留真实阻塞，如实说明具体故障，按已有 HumanRequest 与恢复机制处理，需要人工帮助时使用 `system_operation_help`；不能仅记录 Web 不可用便宣称完成，也不能伪造 Gate 的 ready 状态。
 
-If the user cancels, end without starting a run.
+## 3. 维护台账并选择全文
 
-Completion criterion: the institutional route is usable or the run is explicitly OA-only.
+依[台账工具](references/ledger-tools.md)登记稳定身份、元数据、受来源限制的预理解和纳入理由。精读选择权衡直接相关性、方法／数据／基准覆盖、经典与前沿、反证、关键不确定性及可用质量信息，降低重复材料的优先级。随候选池更新候补次序，在覆盖检查前保留 Reader 容量。
 
-## 2. Radar
+完成条件：所有保留条目有唯一稳定记录、有限预理解和明确纳入理由；最多 10 篇精读候选的选择有依据。
 
-Read [references/openalex.md](references/openalex.md) and [references/papers-json.md](references/papers-json.md) completely, then initialize the ledger before issuing the first query. Interpret arbitrary input into search concepts, then conduct multidimensional discovery across text queries, literature roles, and citation structure. Use OpenAlex as the structured primary radar, not as the corpus boundary. Use Web Search as a second discovery channel for terminology, reviews, benchmarks, named methods, recent work, and other coverage gaps. Choose every query, anchor, direction, depth, and stopping judgment yourself.
+## 4. 并行获取和阅读
 
-Before freezing the full-text subset, run one bounded coverage audit against both the current ledger and the candidates already seen. Check whether the task settings, major method families, classic-to-recent development, reviews or benchmarks, and contrary or boundary evidence have representative placeholders. Reconsider high-relevance candidates that were discovered but never registered, then use Web Search on the consequential gaps. Candidate volume is not coverage. Treat every Web result as a lead: verify that it is a scholarly work and resolve its exact identity before registration. OpenAlex absence is not a reason to discard a verified paper. Search snippets and non-paper pages never count as full-text evidence.
+读取[角色契约](references/agents.md)的获取与 Reader 部分，按研究需要设置 0–10 篇内部精读目标。仅把当前选中目标交给 Acquisition；核实全文身份后登记，每篇交给一个 Reader。并行度受实际 Reader 可用槽位限制。
 
-Triage each broad result batch before accumulating another one. Register every important work whose scholarly identity is verified, even if only a title-level placeholder can be filled; merge duplicates and drop clearly irrelevant leads. Do not carry an unreviewed candidate dump into synthesis. Access convenience is not a relevance signal. A citation count, venue, author, institution, publisher, or publication date is context rather than proof.
+首次 Reader 分配永久占用该论文本运行的一个名额；同文重试复用该名额，失败或错文不允许补入第 11 篇。截止前、首次分配前获取失败的目标可由候补替换；截止后只排空冻结目标。确定性台账工具负责并发合并。
 
-Completion criterion: the three discovery dimensions have been touched; OpenAlex and the Web coverage audit have both been used, or Web Search unavailability is recorded as a limitation; and either the active-search budget expires or a defensible early stopping reason is recorded.
+完成条件：每个选中目标的获取已有终态或明确放弃，每个已登记全文的阅读为完成或失败，没有待处理的已分配工作；等待用户的条目保持等待事实，不冒充完成。
 
-## 3. Ledger
+## 5. 综合并验证
 
-Use the loaded ledger contract and [references/ledger-tools.md](references/ledger-tools.md). Create a placeholder whenever an important paper's exact title is known. Preserve the distinction between metadata-level pre-understanding and full-text reading. Rank the candidate set by expected marginal evidence value: direct task relevance; non-redundant coverage of methods, datasets, benchmarks, classic anchors, frontier work, and contrary or boundary evidence; ability to resolve consequential uncertainty; and available quality signals. Penalize redundancy. Treat venue, citations, and age as secondary context, and never treat access convenience as value. Re-rank unassigned candidates as discovery changes the pool, and do not consume all Reader slots before the bounded coverage audit. Select the highest-value set of at most 10; the ledger may be much larger.
+Reader 汇合后重载 `papers.json`，按[综述契约](references/summary.md)形成文献图景、边界和建议。主智能体不替 Reader 直接完成全文科学阅读；需补读时明确委派原文任务并核对其结果。建议不替代 Reasoning 的正式科学判断或创建问题决定。
 
-Completion criterion: every paper retained for synthesis has one stable record, a bounded pre-understanding, and an explicit inclusion reason.
+用 `scripts/papers.py finalize` 校验并清理；仅调试或需恢复时保留私有状态。完成条件：适用报告部分齐全，论文主张／跨论文综合／暂定推断区分清楚，引用 ID 均在同一台账，缺失证据明示，公开产物通过校验且没有过期全文。
 
-## 4. Fan-out
-
-Read the Acquisition and Reader sections of [references/agents.md](references/agents.md). Choose an internal full-text read target of 0--10 papers and keep a ranked reserve queue. Early in Radar, admit only clearly high-value anchors and preserve capacity for candidates revealed by broader discovery. Before the active-search deadline, a candidate that fails before its first Reader assignment may be replaced by the highest-value remaining candidate while target capacity remains. Give only currently selected target candidates to Acquisition, register only identity-verified bodies, and create one Reader job per obtained full text. Run admitted jobs concurrently up to 10 Readers, bounded by the runtime's Reader-capable slots. The first Reader assignment permanently consumes that paper's run-level slot; retries of the same paper do not consume another slot, while a failure or mismatch does not authorize an eleventh paper. After the deadline, drain only the frozen target candidates and Reader-admitted work.
-
-Readers own full-text understanding. The main agent owns discovery, selection, metadata, and synthesis. Let deterministic tools own concurrent writes.
-
-Completion criterion: every selected full-text item has a terminal acquisition or explicit
-abandonment; every registered full text has a complete or failed reading; no admitted job remains
-pending.
-
-## 5. Synthesis
-
-Read [references/summary.md](references/summary.md). Reload `papers.json` after Reader fan-in, then write the report in the input language under that contract.
-
-Run final validation and cleanup through `scripts/papers.py finalize`. Keep private state only when debugging or when the run must resume.
-
-Completion criterion: all applicable report sections and all three evidence identities have been checked; public artifacts validate; every cited `paper_id` exists; consequential missing evidence is reported; and the output root contains no stale public full text.
+最终交接如实填写完成状态、Reader 分配和限制；`workflow.finalized_at` 留为 `null`，由宿主根据 Provider 完成记录填入时间。

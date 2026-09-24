@@ -29,6 +29,8 @@ import {
   type ResearchAssetsView,
 } from "./api";
 import "./research-assets.css";
+import { ResearchLibrary } from "./ResearchLibrary";
+import { OutputLanguageControl, useOutputLanguage } from "./OutputLanguage";
 
 type IntakeKind = AssetIntakeRequest["source_kind"];
 type CommandReceipt = {
@@ -59,17 +61,23 @@ const sourceLabels: Record<IntakeKind, string> = {
 
 export function ResearchAssetsWorkbench({
   initial,
+  currentQuestRef = null,
+  currentQuestionRef = null,
   intakeWorkerReady,
   verificationWorkerReady,
   onClose,
   onChanged,
 }: {
   initial: ResearchAssetsView;
+  currentQuestRef?: string | null;
+  currentQuestionRef?: string | null;
   intakeWorkerReady: boolean;
   verificationWorkerReady: boolean;
   onClose: () => void;
   onChanged: () => void;
 }) {
+  const { language } = useOutputLanguage();
+  const t = (zh: string, en: string) => language === "zh" ? zh : en;
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const intakeControllerRef = useRef<AbortController | null>(null);
@@ -807,24 +815,28 @@ export function ResearchAssetsWorkbench({
         <header className="asset-header">
           <span className="asset-symbol" aria-hidden="true">RA</span>
           <div className="asset-title">
-            <small>RESEARCH MEMORY · PUBLIC INTERFACE</small>
-            <h2 id="asset-workbench-title">Research Asset 工作台</h2>
-            <p>Intake → immutable AssetVersion → custody / semantic role / release receipt</p>
+            <small>{t("研究项目资料", "PROJECT RESEARCH LIBRARY")}</small>
+            <h2 id="asset-workbench-title">{t("研究资料", "Research library")}</h2>
+            <p>{t("找到、阅读并保存可供后续研究使用的材料", "Find, read, and preserve material for future research")}</p>
           </div>
+          <OutputLanguageControl />
           <span className="asset-header-chip">
-            {view.items.length} / {view.total_count} versions
+            {view.items.length} / {view.total_count} {t("个版本", "versions")}
           </span>
           <button
             ref={closeRef}
             type="button"
             className="asset-close"
-            aria-label="关闭 Research Asset 工作台"
+            aria-label={t("关闭研究资料", "Close research library")}
             onClick={close}
           >
             ×
           </button>
         </header>
 
+        <ResearchLibrary questRef={currentQuestRef} questionRef={currentQuestionRef} />
+        <details className="asset-storage-details">
+          <summary>{t("保存文件与保管设置", "Save files and manage storage")}</summary>
         <div className="asset-body">
           <aside className="asset-intake" aria-labelledby="asset-intake-title">
             <div className="asset-section-heading">
@@ -1224,12 +1236,13 @@ export function ResearchAssetsWorkbench({
           </aside>
         </div>
 
+        </details>
         <footer className="asset-footer">
           <div aria-live="polite">
-            <b>{error ? "操作未完成" : "公开 Interface"}</b>
-            <small className={error ? "error" : ""}>{error ?? notice}</small>
+            <b>{error ? t("操作未完成", "Action incomplete") : t("文件保管状态", "File storage status")}</b>
+            <small className={error ? "error" : ""}>{error ?? (notice === "盘点来自 Research Memory 公开 Query；浏览不会写 Owner。" ? t("原件按精确版本保留，浏览不会改变已保存内容。", "Originals are preserved by exact version. Browsing does not change saved content.") : notice)}</small>
           </div>
-          <button type="button" onClick={close}>完成</button>
+          <button type="button" onClick={close}>{t("完成", "Done")}</button>
         </footer>
       </div>
     </dialog>

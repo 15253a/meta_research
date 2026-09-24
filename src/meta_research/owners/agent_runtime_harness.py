@@ -22,6 +22,7 @@ from meta_research.runtime_protection import (
     RuntimeEffectIdentity,
     record_runtime_boundary,
 )
+from meta_research.target_raw_output import TargetRawOutputUnavailable
 from meta_research.target_run_runtime_contract import (
     TARGET_COMPLETION_BINDING_SCHEMA,
     TargetCompletionHandoff,
@@ -437,6 +438,8 @@ class AgentRuntimeHarnessInterface(Protocol):
         *,
         durable_outcome: Literal["terminal", "unknown"] | None = None,
         transport_receipt: dict[str, object] | None = None,
+        native_session_ref: str | None = None,
+        expected_running_run_ref: str | None = None,
         runtime_effect: RuntimeEffectIdentity | None = None,
         predecessor_effects: tuple[RuntimeEffectIdentity, ...] = (),
     ) -> AgentRuntimeHarnessRetry | None: ...
@@ -2651,6 +2654,80 @@ class SQLiteAgentRuntimeHarness:
             )
         return reconciliation_generation
 
+    def _verify_stopped_target_native_receipt(
+        self, operation_ref: str, native_session_ref: str, receipt: object,
+    ) -> None:
+        """Check the signed stopped stream through its existing exact operation binding."""
+        verifier = self._target_provider_ceiling_receipt_verifier
+        query = getattr(verifier, "query", None)
+        if (verifier is None or not callable(query) or not isinstance(native_session_ref, str)
+            or not native_session_ref or len(native_session_ref) > 160):
+            raise AgentRuntimeHarnessError("target_stopped_session_unverified")
+        try:
+            verified = verifier.verify_signed_transport_receipt(operation_ref, receipt)
+            if verified.get("termination_reason") != "stopped":
+                raise AgentRuntimeHarnessError("target_stopped_session_unverified")
+            after = 0
+            while True:
+                page = query(operation_ref, after=after, limit=256 * 1024,
+                             expected_native_session_ref=native_session_ref, terminal=True)
+                if (page.operation_ref != operation_ref or not page.exact
+                    or page.transport_invocation_hash != verified["transport_invocation_hash"]
+                    or page.root_native_session_ref != native_session_ref):
+                    raise AgentRuntimeHarnessError("target_stopped_session_unverified")
+                if page.source_caught_up:
+                    break
+                after = page.next_offset
+            # Recheck the seal after reading: changed stdout cannot become a checkpoint.
+            if verifier.verify_signed_transport_receipt(operation_ref, receipt) != verified:
+                raise AgentRuntimeHarnessError("target_stopped_session_unverified")
+        except (TargetRawOutputUnavailable, OSError) as error:
+            raise AgentRuntimeHarnessError("target_stopped_session_unverified") from error
+
+    def _validate_stopped_target_native_scope(self, connection, operation_ref: str, run_ref: str, native_session_ref: str) -> None:
+        row = connection.execute(text(
+            "SELECT runs.*, bindings.target_ref AS bound_target_ref, launches.launch_ref AS bound_launch_ref, "
+            "launches.target_run_ref AS launch_target_run_ref, launches.status AS launch_status "
+            "FROM ar_harness_runs AS runs JOIN ar_target_harness_admissions AS bindings ON bindings.target_run_ref=runs.run_ref "
+            "JOIN ar_target_launches AS launches ON launches.target_ref=bindings.target_ref WHERE runs.run_ref=:run_ref"
+        ), {"run_ref": run_ref}).first()
+        latest = connection.execute(text(
+            "SELECT * FROM ar_harness_provider_operations WHERE run_ref=:run_ref ORDER BY generation DESC LIMIT 1"
+        ), {"run_ref": run_ref}).first()
+        if row is None or latest is None:
+            raise AgentRuntimeHarnessError("target_stopped_session_scope_invalid")
+        run = _run_from_row(row)
+        if (run.harness_family != "codex" or run.status != "running" or latest.status != "running"
+            or latest.operation_ref != operation_ref or operation_ref != provider_operation_ref(run_ref, "harness_turn", int(latest.generation))
+            or run.native_session_ref not in {None, native_session_ref}
+            or row.launch_target_run_ref != run_ref or row.launch_status not in {"admitted", "active"}):
+            raise AgentRuntimeHarnessError("target_stopped_session_scope_invalid")
+        frontier = connection.execute(text("SELECT * FROM ar_target_frontier_entries WHERE target_ref=:ref"),
+                                      {"ref": row.bound_target_ref}).first()
+        lifecycle = connection.execute(text("SELECT * FROM ar_target_root_lifecycles WHERE target_ref=:ref"),
+                                       {"ref": row.bound_target_ref}).first()
+        _validate_target_root_recovery_scope(row, run, operation_count=int(latest.generation), latest_operation=latest,
+                                            frontier=frontier, lifecycle=lifecycle)
+        observations = connection.execute(text(
+            "SELECT * FROM ar_harness_evidence_events WHERE operation_ref=:ref ORDER BY sequence"
+        ), {"ref": operation_ref}).all()
+        count = 0
+        for observed in observations:
+            try:
+                event = json.loads(observed.summary_json)
+            except (TypeError, ValueError) as error:
+                raise AgentRuntimeHarnessError("target_stopped_session_scope_invalid") from error
+            if not isinstance(event, dict) or "target_root_observation" not in event:
+                continue
+            event_ref, sequence, payload, digest, _raw_sequence = _validated_target_root_event(
+                event, expected_scope=_target_root_scope_from_row(row), expected_native_session_ref=native_session_ref)
+            if (event_ref != observed.event_ref or sequence != observed.sequence
+                or payload != observed.summary_json or digest != observed.summary_hash):
+                raise AgentRuntimeHarnessError("target_stopped_session_scope_invalid")
+            count += 1
+        if count == 0:
+            raise AgentRuntimeHarnessError("target_stopped_session_scope_invalid")
+
     def record_operation_failure(
         self,
         operation_ref: str,
@@ -2658,6 +2735,8 @@ class SQLiteAgentRuntimeHarness:
         *,
         durable_outcome: Literal["terminal", "unknown"] | None = None,
         transport_receipt: dict[str, object] | None = None,
+        native_session_ref: str | None = None,
+        expected_running_run_ref: str | None = None,
         runtime_effect: RuntimeEffectIdentity | None = None,
         predecessor_effects: tuple[RuntimeEffectIdentity, ...] = (),
     ) -> AgentRuntimeHarnessRetry | None:
@@ -2684,8 +2763,28 @@ class SQLiteAgentRuntimeHarness:
         )
         operation_status = "unknown_outcome" if unknown else "failed"
         run_status = "running" if unknown or terminal_ceiling else "failed"
+        stopped_native = native_session_ref if code == "provider_stopped" and not unknown else None
+        if expected_running_run_ref is not None and durable_outcome != "unknown":
+            raise AgentRuntimeHarnessError("harness_operation_guard_invalid")
+        if stopped_native is not None:
+            self._verify_stopped_target_native_receipt(operation_ref, stopped_native, transport_receipt)
         retry: AgentRuntimeHarnessRetry | None = None
         with self._database.fenced_write() as connection:
+            if expected_running_run_ref is not None:
+                guarded = connection.execute(
+                    text(
+                        "SELECT 1 FROM ar_harness_provider_operations AS operations "
+                        "JOIN ar_harness_runs AS runs ON runs.run_ref=operations.run_ref "
+                        "WHERE operations.operation_ref=:operation_ref AND "
+                        "runs.run_ref=:run_ref AND runs.status='running' AND "
+                        "operations.status='running' AND operations.generation="
+                        "(SELECT MAX(generation) FROM ar_harness_provider_operations "
+                        "WHERE run_ref=:run_ref)"
+                    ),
+                    {"operation_ref": operation_ref, "run_ref": expected_running_run_ref},
+                ).first()
+                if guarded is None:
+                    return None
             row = connection.execute(
                 text(
                     "SELECT operations.run_ref, operations.generation, "
@@ -2703,6 +2802,8 @@ class SQLiteAgentRuntimeHarness:
                 ),
                 {"operation_ref": operation_ref},
             ).one()
+            if stopped_native is not None:
+                self._validate_stopped_target_native_scope(connection, operation_ref, str(row.run_ref), stopped_native)
             if terminal_ceiling:
                 assert runtime_effect is not None
                 _validate_provider_ceiling_effect(
@@ -2739,7 +2840,7 @@ class SQLiteAgentRuntimeHarness:
                 )
             failure_profile_json: str | None = None
             failure_profile_hash: str | None = None
-            if terminal_ceiling:
+            if terminal_ceiling or stopped_native is not None:
                 assert transport_receipt is not None
                 prior_profile = _profile_from_row(row)
                 failure_profile = (
@@ -2789,7 +2890,7 @@ class SQLiteAgentRuntimeHarness:
                     "= :code, profile_json = CASE WHEN :profile_json IS NULL "
                     "THEN profile_json ELSE :profile_json END, profile_hash = "
                     "CASE WHEN :profile_hash IS NULL THEN profile_hash ELSE "
-                    ":profile_hash END, updated_at = :now, completed_at = "
+                    ":profile_hash END, native_session_ref = COALESCE(:native_session_ref, native_session_ref), updated_at = :now, completed_at = "
                     ":completed_at "
                     "WHERE run_ref = :run_ref"
                 ),
@@ -2801,6 +2902,7 @@ class SQLiteAgentRuntimeHarness:
                     "run_ref": str(row.run_ref),
                     "profile_json": failure_profile_json,
                     "profile_hash": failure_profile_hash,
+                    "native_session_ref": stopped_native,
                 },
             )
             self._record_owner_change(
@@ -2811,6 +2913,7 @@ class SQLiteAgentRuntimeHarness:
                     "operation_ref": operation_ref,
                     "status": operation_status,
                     "failure_code": code,
+                    "native_session_ref": stopped_native,
                 },
             )
             if terminal_ceiling:
@@ -3251,7 +3354,9 @@ class SQLiteAgentRuntimeHarness:
                 text(
                     "SELECT runs.run_ref, runs.attempt_ref, "
                     "runs.attempt_generation, runs.root_session_ref, "
-                    "runs.native_session_ref, runs.fence_ref, runs.status "
+                    "runs.native_session_ref, runs.fence_ref, runs.status, "
+                    "(SELECT MAX(generation) FROM ar_harness_provider_operations "
+                    "WHERE run_ref = runs.run_ref) AS latest_generation "
                     "FROM ar_target_harness_admissions AS admissions JOIN "
                     "ar_harness_runs AS runs ON runs.run_ref = "
                     "admissions.target_run_ref WHERE admissions.target_ref = "
@@ -3343,6 +3448,30 @@ class SQLiteAgentRuntimeHarness:
                     "scan_limit": min(limit + 1, 257),
                 },
             ).all()
+            # Native provider sessions belong to an operation. A failed fresh
+            # turn can be followed by a different native session on the same
+            # logical root; the current run head must not rewrite its history.
+            # Read the whole operation's accepted observation identity so a
+            # conflicting native outside this page is still rejected.
+            operation_natives = connection.execute(
+                text(
+                    "SELECT operations.operation_ref, operations.generation, "
+                    "COUNT(*) AS observation_count, "
+                    "COUNT(json_extract(events.summary_json, "
+                    "'$.target_root_observation.root_native_session_ref')) "
+                    "AS native_value_count, "
+                    "COUNT(DISTINCT json_extract(events.summary_json, "
+                    "'$.target_root_observation.root_native_session_ref')) "
+                    "AS native_count, MIN(json_extract(events.summary_json, "
+                    "'$.target_root_observation.root_native_session_ref')) "
+                    "AS native_session_ref FROM ar_harness_evidence_events "
+                    "AS events JOIN ar_harness_provider_operations AS operations "
+                    "ON operations.operation_ref = events.operation_ref WHERE "
+                    + scope_predicate
+                    + " GROUP BY operations.operation_ref, operations.generation"
+                ),
+                scope_parameters,
+            ).all()
 
         expected_scope = {
             "schema_ref": "meta-research/target-root-observation-scope/v1",
@@ -3355,6 +3484,24 @@ class SQLiteAgentRuntimeHarness:
         native_session_ref = (
             None if run.native_session_ref is None else str(run.native_session_ref)
         )
+        native_by_operation: dict[str, str] = {}
+        for operation in operation_natives:
+            operation_native = operation.native_session_ref
+            if (
+                int(operation.native_count) != 1
+                or operation.native_value_count != operation.observation_count
+                or not isinstance(operation_native, str)
+                or not operation_native
+                or (
+                    operation.generation == run.latest_generation
+                    and native_session_ref is not None
+                    and operation_native != native_session_ref
+                )
+            ):
+                raise AgentRuntimeHarnessError(
+                    "target_root_observation_integrity_invalid"
+                )
+            native_by_operation[str(operation.operation_ref)] = operation_native
         items: list[TargetRootObservation] = []
         page_bytes = 0
         has_more = False
@@ -3362,7 +3509,9 @@ class SQLiteAgentRuntimeHarness:
             item = _target_root_observation_from_row(
                 row,
                 expected_scope=expected_scope,
-                expected_native_session_ref=native_session_ref,
+                expected_native_session_ref=native_by_operation[
+                    str(row.operation_ref)
+                ],
                 stream_ref=stream_ref,
             )
             encoded_bytes = len(item.text.encode("utf-8"))

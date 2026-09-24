@@ -1,7 +1,7 @@
 """Light driver for one root-owned Target lifecycle.
 
-One native Target root Session owns implementation, training, evaluation, and
-result-driven code changes.  The daemon does not model those activities as
+One native Target root Session owns method implementation, evidence collection,
+evaluation, and result-driven revision.  The daemon does not model those activities as
 phases and does not launch a second execution service.  It only prepares the
 root scope, resumes or reconciles one Harness turn, and hands one final closed
 envelope to the finalizer.
@@ -9,16 +9,23 @@ envelope to the finalizer.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
+from meta_research.database import Database
 from meta_research.bundle_protocol import (
     FormalPlan,
     TargetCandidate,
     TargetWorkHandle,
     projection_plain_value,
 )
+from meta_research.target_execution_contract import (
+    target_execution_context, target_execution_skill_text,
+)
 from meta_research.harness import HarnessAdmissionError, HarnessRuntime
+from meta_research.context_presentation import bounded_text
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.agent_runtime_harness import (
     TARGET_ROOT_RECOVERY_PENDING_CODE,
@@ -81,8 +88,10 @@ class TargetRunRuntime:
         harnesses: HarnessRuntime,
         finalizer: TargetRunFinalizerInterface,
         harness_family: str = "codex",
+        database: Database | None = None,
     ) -> None:
         self._agent_runtime = agent_runtime
+        self._database = database
         self._research_graph = research_graph
         self._target_graph = target_graph
         self._target_agent = target_agent
@@ -101,6 +110,11 @@ class TargetRunRuntime:
     def query_status(self, target_ref: str) -> TargetRunRuntimeStatus | None:
         return self._status_by_target.get(target_ref)
 
+    def cleanup_completed_workspaces(self, *, dry_run=True, now=None, limit=10, retention_seconds=None):
+        from meta_research.target_workspace_cleanup import cleanup_completed_workspaces
+        return cleanup_completed_workspaces(self, dry_run=dry_run, now=now,
+            limit=limit, retention_seconds=retention_seconds)
+
     def has_pending_cancel(self, target_ref: str) -> bool:
         """Expose only the mechanical wake bit, never the operator's reason."""
 
@@ -118,14 +132,24 @@ class TargetRunRuntime:
         if launch is None:
             self._set_status(target_ref, "launch_pending")
             return False
-        candidate_projection = self._research_graph.query_target_candidate_projection(
-            target_ref=target_ref
+        # One immutable read cut lets the projection-level snapshot
+        # caches deduplicate the shared verification subtrees inside
+        # this pass instead of re-proving them per query.
+        read_cut = (
+            self._database.read_snapshot()
+            if self._database is not None else nullcontext()
         )
-        formal_plan_projection = (
-            self._research_graph.query_target_formal_plan_projection(
-                graph_ref=launch.graph_ref
+        with read_cut:
+            candidate_projection = (
+                self._research_graph.query_target_candidate_projection(
+                    target_ref=target_ref
+                )
             )
-        )
+            formal_plan_projection = (
+                self._research_graph.query_target_formal_plan_projection(
+                    graph_ref=launch.graph_ref
+                )
+            )
         if candidate_projection is None or formal_plan_projection is None:
             raise OwnerConflict("target_run_projection_required")
         candidate = candidate_projection.candidate
@@ -203,6 +227,16 @@ class TargetRunRuntime:
                 raise OwnerConflict("target_root_cancel_integrity_invalid")
             self._set_status(target_ref, "cancelled")
             return True
+
+        if getattr(harness, "status", None) == "suspended":
+            # The issuing Owner parks a root while its HumanRequest is open.
+            # Wait before asking for execution authority or touching inputs or
+            # results; only the Owner's consumed disposition may resume it.
+            # Cancellation above remains available while the root is parked.
+            self._set_status(
+                target_ref, "harness_suspended", "runtime_run_suspended"
+            )
+            return False
 
         if (
             getattr(harness, "status", None) == "running"
@@ -433,6 +467,7 @@ class TargetRunRuntime:
                         frozen_input_paths[0] if frozen_input_paths else None
                     ),
                     revision=revision,
+                    source_spec_hash=candidate_projection.source_spec_hash,
                 )
             return True
 
@@ -443,7 +478,17 @@ class TargetRunRuntime:
                 "target_run_mcp_endpoint_unavailable",
             )
             return False
+        # The authority binds the accepted source spec. The launch binding
+        # identifies its execution projection and therefore has a different hash.
         prompt = self._root_prompt(
+            research_context=self._reading_research_context(handle.target_ref,
+                frozen_input_paths[0] if frozen_input_paths else None),
+            execution_contract=target_execution_context(
+                authority=self._research_graph.query_target_measurement_domain_authority(handle.target_ref),
+                target_ref=handle.target_ref,
+                graph_ref=launch.graph_ref,
+                target_spec_hash=candidate_projection.source_spec_hash,
+            ),
             handle=handle,
             candidate=candidate,
             formal_plan=formal_plan,
@@ -481,6 +526,7 @@ class TargetRunRuntime:
                         frozen_input_paths[0] if frozen_input_paths else None
                     ),
                     revision=revision,
+                    source_spec_hash=candidate_projection.source_spec_hash,
                 )
             return True
         self._set_status(target_ref, "root_turn_completed")
@@ -560,6 +606,7 @@ class TargetRunRuntime:
         launch: object,
         frozen_input_manifest_path: str | None,
         revision: object,
+        source_spec_hash: str,
     ) -> bool:
         """Wake the same native root Session with one issuer-owned rejection."""
 
@@ -580,6 +627,13 @@ class TargetRunRuntime:
             "feedback": getattr(revision, "rejection_feedback"),
         }
         prompt = self._root_prompt(
+            research_context=self._reading_research_context(handle.target_ref, frozen_input_manifest_path),
+            execution_contract=target_execution_context(
+                authority=self._research_graph.query_target_measurement_domain_authority(handle.target_ref),
+                target_ref=handle.target_ref,
+                graph_ref=launch.graph_ref,
+                target_spec_hash=source_spec_hash,
+            ),
             handle=handle,
             candidate=candidate,
             formal_plan=formal_plan,
@@ -604,20 +658,50 @@ class TargetRunRuntime:
         self._set_status(handle.target_ref, "root_revision_turn_completed")
         return True
 
+    def _reading_research_context(self, target_ref, frozen_input_manifest_path):
+        # Research explanations can acquire later immutable versions. Keep
+        # these optional reading files beside, never inside, the exact input
+        # manifest whose bytes an already-running Target must retain.
+        directory = (Path(frozen_input_manifest_path).parent.parent /
+                     "research-note-context" / target_ref
+                     if frozen_input_manifest_path else None)
+        reader = getattr(self._target_graph, "query_target_reading_context", None)
+        if callable(reader):
+            return reader(target_ref=target_ref, research_note_directory=directory)
+        return self._target_graph.query_target_research_context(target_ref=target_ref)
+
     @staticmethod
     def _root_prompt(
         *,
+        execution_contract: dict[str, object],
         handle: TargetWorkHandle,
         candidate: TargetCandidate,
         formal_plan: FormalPlan,
         launch: object,
         frozen_input_manifest_path: str | None,
         revision_request: dict[str, object] | None = None,
+        research_context: dict[str, object] | None = None,
     ) -> str:
+        research = dict(research_context or {})
+        question = research.get("question")
+        if isinstance(question, dict):
+            research["question"] = {name: bounded_text(value, max_bytes=2048)
+                for name, value in question.items()}
+        research["exact_context_path"] = (str(Path(frozen_input_manifest_path).with_name("research-context.json"))
+            if frozen_input_manifest_path and research_context else None)
+        for name in ("plan_notes", "bundle_notes"):
+            if name in research:
+                research[name] = bounded_text(research[name], max_bytes=4096)
         material = {
-            "handle": projection_plain_value(handle),
+            "research_context": research,
+            "execution_contract": execution_contract,
+            "handle": {name: getattr(handle, name) for name in (
+                "target_ref", "target_run_ref", "root_session_ref", "execution_attempt_ref",
+                "execution_fence_ref", "execution_input_binding_ref", "recoverable")},
             "candidate": projection_plain_value(candidate),
-            "formal_plan": projection_plain_value(formal_plan),
+            "formal_plan": {"formal_plan_ref": formal_plan.formal_plan_ref,
+                "briefs": [projection_plain_value(brief) for brief in formal_plan.briefs
+                    if brief.experiment_key in candidate.experiment_keys]},
             "target_spec_binding": projection_plain_value(
                 getattr(launch, "request").target_spec_binding
             ),
@@ -636,6 +720,7 @@ class TargetRunRuntime:
                     "result": "outputs/result.json",
                 },
                 "optional_workspace_paths": {
+                    "data": "outputs/data",
                     "checkpoint": "outputs/checkpoints",
                     "analysis": "outputs/analysis",
                     "log": "logs",
@@ -649,70 +734,31 @@ class TargetRunRuntime:
             },
         }
         return (
-            "You are the sole root agent for this Target lifecycle. Work directly "
-            "inside the assigned workspace and own the entire loop: implement or "
-            "reuse code, run real training/evaluation commands in your terminal, "
-            "inspect results, change code or configuration, and repeat as many times "
-            "as the evidence requires. You may use native multi-agent collaboration "
-            "when it helps, but delegation is optional and never an acceptance gate. "
-            "This authenticated Target Root operation owns every formal HumanRequest; "
-            "children do not gain a separate public requester identity. A provider, "
-            "validator, daemon, or other system condition must never synthesize or "
-            "impersonate a HumanRequest; report the condition so this root can "
-            "decide whether one of the four formal request kinds is warranted. "
-            "You remain responsible "
-            "for every code change, stop decision, checkpoint choice, and final "
-            "result. Do not use or invent an external TargetExecutionPort, a "
-            "daemon-owned Supervisor, execution Attempt, monitor phase, RM receipt, "
-            "RG receipt, MetricResult, or TargetCommit. The light daemon continues "
-            "this logical root lifecycle and forwards activity to the Web UI; only "
-            "the Owner may rotate physical runtime identity after a signed provider "
-            "ceiling.\n\n"
-            "Put code under implementation/. Keep the canonical Target result at "
-            "outputs/result.json with exactly schema_ref, metrics, and "
-            "result_disposition. Do not create or retain that result file until its "
-            "content represents the genuinely finished current implementation and "
-            "evaluation. Optional checkpoints belong under outputs/checkpoints, "
-            "optional analysis under outputs/analysis, and logs under logs/. "
-            "\n\nFor an actual training or evaluation process required by this "
-            "accepted Target, capture that process's stdout and stderr verbatim "
-            "and continuously into logs/train.log or logs/eval.log respectively, "
-            "relative to the assigned workspace. Begin capturing when the process "
-            "starts; do not wait for command completion. Use the real program's "
-            "supported unbuffered or line-buffered mode where available, for "
-            "example Python -u or PYTHONUNBUFFERED=1. If mirroring output with tee, "
-            "combine stdout and stderr with 2>&1, enable pipefail, preserve the "
-            "training/evaluation process's original exit code, and surface any "
-            "log-writer failure as well. Never hide failures or replace output "
-            "with progress invented by an agent. Preserve earlier invocations in "
-            "separate train-*.log or eval-*.log files instead of overwriting their "
-            "logs, and never truncate a log while its process is running. Keep "
-            "output from separate setup commands, environment checks, or data "
-            "audits out of these training/evaluation logs; do not create such a "
-            "log when no corresponding process has started. These are observation "
-            "logs, not result artifacts or evidence of successful completion: "
-            "the outputs/result.json and Owner verification requirements remain "
-            "unchanged. This convention does not authorize additional experiments, "
-            "wider permissions, or changes to scientific parameters.\n\nEnd "
-            "each provider turn with normal concise root text; do not emit a JSON "
-            "handoff or repeat Target, TargetRun, Attempt, Fence, operation, or "
-            "workspace identity. After a clean terminal turn, the Harness binds the "
-            "exact final root text and UTF-8 hash to the terminal operation and "
-            "Owner workspace. The Owner then scans only the fixed paths above and "
-            "constructs the internal completion handoff. Missing or invalid required "
-            "paths produce issuer feedback and another recoverable root revision; "
-            "they are not a request for an envelope. RM and RG receive nothing from "
-            "this Target until the binding, current workspace, and physical artifact "
-            "bytes have been issuer-verified. Accepted upstream "
-            "TargetCommit outputs and direct assets are available through the exact "
-            "read-only manifest at frozen_input_manifest_path. It is outside your "
-            "workspace-write root; read it by that absolute path and treat it as "
-            "immutable. inputs/manifest.json is only a convenience pointer. "
-            "When owner_revision_request is present, leave the Owner's rejected "
-            "binding immutable, address its exact issuer feedback, and finish a "
-            "materially changed successor root turn. Do not attempt to rotate the "
-            "TargetRun, Attempt, Fence, root Session, or native Session yourself.\n\nExact Owner "
-            "context:\n" + canonical_json(material)
+            target_execution_skill_text() + "\n\n"
+            "本回合在下列 Owner 冻结范围内实施或恢复 Target。按上述 Skill 读取实际合同和所需参考，"
+            "进行研究、检查与局部修订，并在最终交接前完成独立子智能体审阅。普通检索、实施和整理"
+            "按需要委派，子智能体使用当前任务授予的工具与权限，按对象划分写入；根负责整体判断、"
+            "停止决定、保存取舍与最终交接。正式 HumanRequest 归属于当前已认证根操作，"
+            "执行身份的恢复或轮换由 Owner 根据真实执行事实处理。\n\n"
+            "完成文件按 completion_binding 的固定路径交接。implementation/ 保存可核查的方法材料；"
+            "当前工作与证据检查形成可交接结论后，再写 outputs/result.json 作为完成候选；"
+            "在途观察写分析或日志，失败、阻塞和未评价保持真实状态，不把在途工作当已完成。"
+            "result_schema 是初始表达指导；Protocol 指标集合、身份、来源与数值安全仍按实际合同核验。"
+            "多个 Run、分离评价或待评价工作读取 Skill 的正式工作交接参考，使用 formal_runs 表达。\n\n"
+            "实际训练或评价开始时连续保留完整 stdout 与 stderr，分别写入 logs/train.log 或 logs/eval.log；"
+            "使用程序支持的无缓冲或行缓冲模式，如 Python -u 或 PYTHONUNBUFFERED=1。用 tee 镜像时，"
+            "以 2>&1 合并输出并启用 pipefail，保留原进程退出码，同时报告日志写入失败。"
+            "每次实施保留独立 train-*.log 或 eval-*.log，在途日志持续追加；准备检查按实际用途另行命名。"
+            "没有相应进程时，相应日志保持不存在。日志用于观察，实际结果仍由 Owner 核验。\n\n"
+            "frozen_input_manifest_path 是工作区之外的只读原件，以其绝对路径读取；inputs/manifest.json "
+            "只是便捷指针。采用历史材料前读取所选 TargetCommit 的精确 manifest 及其中所需实现、"
+            "数据和分析；上游正文提到的路径不等于已交付资产。必要输入缺失时记录精确来源与缺口，"
+            "经当前 Owner 反馈或具体 HumanRequest 处理，继续可独立完成的已授权工作。\n\n"
+            "owner_revision_request 存在时，按精确 issuer 反馈修订后继内容，保留被拒版本的绑定，"
+            "仅重做变更失效的工作。最终用简洁正文交代结果、局限和未完成事项；Harness 绑定该回合的"
+            "精确最终文本及 UTF-8 hash，Owner 从固定路径核实原件并构造内部 completion handoff。"
+            "缺失或无效的必要产物沿真实反馈恢复修订；根不自行构造 Owner receipt 或执行身份。\n\n"
+            "Exact Owner context:\n" + canonical_json(material)
         )
 
     def _set_status(

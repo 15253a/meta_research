@@ -25,6 +25,7 @@ from meta_research.bundle_protocol import (
     TargetCandidate,
     TargetExecutionPreflight,
     TargetWorkHandle,
+    TargetMetricValue,
 )
 from meta_research.bundle_target_contract import NormalizedCompletionContract
 from meta_research.owners.common import AcceptanceReceipt, AcceptedAssetBinding
@@ -33,9 +34,8 @@ from meta_research.owners.common import AcceptanceReceipt, AcceptedAssetBinding
 TARGET_COMPLETION_HANDOFF_SCHEMA = "meta-research/target-completion-handoff/v1"
 TARGET_COMPLETION_BINDING_SCHEMA = "meta-research/target-completion-binding/v1"
 TARGET_COMPLETION_ARTIFACT_ROLES = frozenset(
-    {"implementation", "checkpoint", "result", "log", "analysis"}
+    {"implementation", "checkpoint", "result", "log", "analysis", "data"}
 )
-_TARGET_COMPLETION_MAX_ARTIFACTS = 64
 _TARGET_COMPLETION_MAX_REF_BYTES = 512
 _TARGET_COMPLETION_MAX_SUMMARY_BYTES = 16_384
 
@@ -163,7 +163,6 @@ def validate_target_completion_handoff(
     if (
         type(handoff.artifacts) is not tuple
         or not handoff.artifacts
-        or len(handoff.artifacts) > _TARGET_COMPLETION_MAX_ARTIFACTS
     ):
         raise TargetCompletionHandoffError()
     artifact_paths: set[str] = set()
@@ -523,7 +522,7 @@ class AcceptedTargetGenericMeasurement:
     protocol_version_ref: str
     evaluation_attempt_ref: str
     metric_result_ref: str
-    metric_values: tuple[int | float, ...]
+    metric_values: tuple[TargetMetricValue, ...]
     result_disposition: str
     checkpoint_artifact_refs: tuple[str, ...]
     variant_run_input_binding: ExecutionInputBindingProof

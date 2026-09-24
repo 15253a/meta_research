@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { ResearchIcon, SpectrumStages, spectrumStage } from "./Spectrum";
+import { fetchRootSessions, type RootSessions } from "./rootSessionsApi";
+import { canObserveActiveTarget, observedActiveTarget, TARGET_OBSERVATION_INTERVAL_MS } from "./activeTargetStatus";
 import "./status-home.css";
 
 type Health = { status: string; checks: { name: string; status: string; reason?: { code: string } }[] };
-type RuntimeStatus = {
+export type RuntimeStatus = {
   schema_ref: "meta-research/runtime-status/v1";
   revision: number;
   observed_at: string;
@@ -12,13 +14,13 @@ type RuntimeStatus = {
   current_task: { kind: string; title: string; run_ref: string | null; target_ref: string | null; status: string } | null;
   waiting_reason: string | null;
   pending_requests: number;
-  foreground: { stage: string; question_ref: string; cycle_ref: string } | null;
+  foreground: { quest_ref: string; stage: string; question_ref: string; cycle_ref: string; status?: string } | null;
   health: Health;
 };
 
 // Shared across StrictMode remounts. A discarded view does not start a duplicate GET.
 let pendingStatus: Promise<RuntimeStatus> | null = null;
-function readStatus(): Promise<RuntimeStatus> {
+export function readStatus(): Promise<RuntimeStatus> {
   if (pendingStatus) return pendingStatus;
   const controller = new AbortController();
   const deadline = window.setTimeout(() => controller.abort(), 4_000);
@@ -44,16 +46,38 @@ const states: Record<string, string> = {
   completed: "已完成", pending: "等待接续", idle: "尚未开始", failed: "执行异常",
 };
 const stages: Record<string, string> = { idea: "研究思路", plan: "验证计划", bundle: "实验与证据", reasoning: "研究判断" };
+
+// Keep one bounded index request across StrictMode remounts and manual refreshes.
+let pendingRoots: { questRef: string; promise: Promise<RootSessions> } | null = null;
+let rootsStartedAt = -Infinity;
+let lastRoots: RootSessions | null = null;
+async function readHomeRoots(questRef: string): Promise<RootSessions | null> {
+  if (pendingRoots) return pendingRoots.questRef === questRef ? pendingRoots.promise : null;
+  if (Date.now() - rootsStartedAt < TARGET_OBSERVATION_INTERVAL_MS) return lastRoots?.quest_ref === questRef ? lastRoots : null;
+  rootsStartedAt = Date.now();
+  const promise = fetchRootSessions(questRef, new AbortController().signal).then(data => {
+    lastRoots = data;
+    return data;
+  }).catch(error => {
+    lastRoots = null;
+    throw error;
+  }).finally(() => { pendingRoots = null; });
+  pendingRoots = { questRef, promise };
+  return promise;
+}
+
 function timeLabel(value: string): string {
   const time = new Date(value);
   return Number.isNaN(time.getTime()) ? value : time.toLocaleString("zh-CN", { hour12: false });
 }
 
 export function StatusHome() {
-  const [status, setStatus] = useState<RuntimeStatus | null>(null);
+  const [rawStatus, setStatus] = useState<RuntimeStatus | null>(null);
+  const [rootObservation, setRootObservation] = useState<{ scope: string; data: RootSessions } | null>(null);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(true);
   const refresh = useRef<() => void>(() => undefined);
+  const refreshRoots = useRef<() => void>(() => undefined);
   useEffect(() => {
     let stopped = false;
     let running = false;
@@ -85,6 +109,40 @@ export function StatusHome() {
     void reload();
     return () => { stopped = true; window.clearTimeout(timer); };
   }, []);
+  const rootScope = !error && canObserveActiveTarget(rawStatus) ? JSON.stringify([
+    rawStatus!.foreground!.quest_ref, rawStatus!.foreground!.cycle_ref, rawStatus!.foreground!.question_ref,
+  ]) : "";
+  useEffect(() => {
+    setRootObservation(null);
+    if (!rootScope) { refreshRoots.current = () => undefined; return; }
+    const [questRef] = JSON.parse(rootScope) as string[];
+    let stopped = false;
+    let reading = false;
+    let timer: number | undefined;
+    const load = async () => {
+      clearTimeout(timer);
+      if (stopped || reading || document.visibilityState === "hidden") return;
+      reading = true;
+      try {
+        const data = await readHomeRoots(questRef);
+        if (!stopped && data) setRootObservation({ scope: rootScope, data });
+      } catch {
+        if (!stopped) setRootObservation(null);
+      } finally {
+        reading = false;
+        if (!stopped && !document.hidden) {
+          timer = window.setTimeout(load, Math.max(1_000, TARGET_OBSERVATION_INTERVAL_MS - (Date.now() - rootsStartedAt)));
+        }
+      }
+    };
+    refreshRoots.current = () => void load();
+    const onVisible = () => { if (document.visibilityState !== "hidden") void load(); else clearTimeout(timer); };
+    document.addEventListener("visibilitychange", onVisible);
+    void load();
+    return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [rootScope]);
+  const targetObservation = observedActiveTarget(rawStatus, rootObservation?.scope === rootScope ? rootObservation.data : null);
+  const status = targetObservation?.status ?? rawStatus;
   const unhealthy = status?.health.checks.filter(check => check.status !== "ready") ?? [];
   return <div className="status-home">
     <header className="status-home-header">
@@ -111,10 +169,11 @@ export function StatusHome() {
         </div>
         </div>
         <div className="home-task-details">
-        <div className="home-detail-title"><span>运行摘要{status?.foreground ? ` / ${stages[status.foreground.stage] ?? status.foreground.stage}` : ""}</span><button type="button" disabled={loading} onClick={() => refresh.current()}>{loading ? "刷新中…" : "刷新状态"}</button></div>
+        <div className="home-detail-title"><span>运行摘要{status?.foreground ? ` / ${stages[status.foreground.stage] ?? status.foreground.stage}` : ""}</span><button type="button" disabled={loading} onClick={() => { refresh.current(); refreshRoots.current(); }}>{loading ? "刷新中…" : "刷新状态"}</button></div>
         <dl className="status-home-facts">
           <div><dt>任务状态{error && status ? " · 上次记录" : ""}</dt><dd>{status ? states[status.state] ?? status.state : "待确认"}</dd></div>
           <div><dt>等待原因</dt><dd>{status ? status.waiting_reason ?? "未记录等待原因" : "待确认"}</dd></div>
+          {targetObservation ? <div><dt>执行观测时间</dt><dd><time dateTime={targetObservation.observedAt}>{timeLabel(targetObservation.observedAt)}</time></dd></div> : null}
           <div><dt>数据更新时间</dt><dd><time dateTime={status?.updated_at}>{status ? timeLabel(status.updated_at) : "—"}</time></dd></div>
         </dl>
         </div>

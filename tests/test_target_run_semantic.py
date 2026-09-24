@@ -81,6 +81,10 @@ class _TargetAgent:
             raise OwnerConflict("target_run_harness_identity_invalid")
         return handle
 
+    def query_target_progress(self, target_ref, *, target_run_ref, **arguments):
+        return {'target_ref': target_ref, 'target_run_ref': target_run_ref,
+                'cursor': arguments.get('cursor', 'first'), 'fragments': []}
+
 
 def _gateway():
     handle = _handle()
@@ -153,9 +157,27 @@ def test_catalog_is_exact_observation_only_and_has_no_execution_port() -> None:
         and ".submit" not in operation_id
         for operation_id in gateway.operation_ids
     )
-    (binding,) = gateway.required_bindings(TARGET_RUN_SEMANTIC_OPERATION_IDS)
-    assert binding["access_mode"] == "read"
-    assert binding["reconciliation_operation_id"] is None
+    for binding in gateway.required_bindings(TARGET_RUN_SEMANTIC_OPERATION_IDS):
+        assert binding["access_mode"] == "read"
+        assert binding["reconciliation_operation_id"] is None
+
+
+def test_progress_tool_derives_run_and_verifies_scope_before_and_after_read():
+    gateway, _runtime, agent, _entry = _gateway()
+    connection = _issue(gateway)
+    status, response = gateway.dispatch(connection.token, {
+        'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+            'name': 'agent_runtime.target_run.progress',
+            'arguments': {'target_ref': 'target:1', 'cursor': 'next'}}})
+    assert status == 200
+    assert response['result']['isError'] is False
+    assert response['result']['structuredContent'] == {
+        'target_ref': 'target:1', 'target_run_ref': 'target-run:1', 'cursor': 'next', 'fragments': []}
+    assert agent.context_checks == 2
+    _, wrong = gateway.dispatch(connection.token, {
+        'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {
+            'name': 'agent_runtime.target_run.progress', 'arguments': {'target_ref': 'target:other'}}})
+    assert wrong['result']['isError'] is True
 
 
 def test_observe_returns_exact_current_root_context() -> None:

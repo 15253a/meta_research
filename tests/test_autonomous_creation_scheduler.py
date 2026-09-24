@@ -138,6 +138,9 @@ class _AgentRuntime:
         self.reasoning_runs: dict[str, dict[str, object]] = {}
         self.checkpoints: dict[str, dict[str, object]] = {}
 
+    def query_reasoning_autonomous_decision(self, checkpoint_ref: str):
+        return None
+
     def query_acquisition_session(self, **values: object) -> dict[str, object]:
         return {
             "status": "ready",
@@ -433,6 +436,12 @@ def test_daemon_discovers_each_active_checkpoint_without_global_latest() -> None
             "foreground_epoch": 7,
         }
         scope = {"name": name}
+        agent.checkpoints[checkpoint_ref] = {
+            "checkpoint_ref": checkpoint_ref,
+            "checkpoint_hash": canonical_hash({"checkpoint": checkpoint_ref}),
+            "checkpoint": {"scientific_outcome": outcome, "autonomous_scope": scope},
+            "receipt": _receipt("agent_runtime", "reasoning_autonomous_checkpoint", checkpoint_ref),
+        }
         memory.candidates[checkpoint_ref] = {
             "scientific_outcome": outcome,
             "autonomous_scope": scope,
@@ -452,8 +461,8 @@ def test_daemon_discovers_each_active_checkpoint_without_global_latest() -> None
             }
 
     assert service.process_once()
-    assert writes == ["human_collaboration.prepare:accepted"]
-    assert human.query_autonomous_creation(
-        "reasoning-checkpoint:not-yet-accepted"
-    ) is None
+    assert writes == ["human_collaboration.prepare:not-yet-accepted"]
+    assert human.query_autonomous_creation("reasoning-checkpoint:not-yet-accepted") is not None
+    assert service.process_once()
+    assert writes[-1] == "human_collaboration.prepare:accepted"
     assert human.query_autonomous_creation("reasoning-checkpoint:accepted") is not None

@@ -1,0 +1,452 @@
+[
+  {
+    "semantic_operation_id": "advancement_engine.bundle_exhaustion.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "advancement_engine",
+    "access_mode": "reconcile",
+    "input_schema_hash": "a1976510e78dad677cb92aec7cd9af5f1814a4f438e467de31d3a0eb4cae4ab6",
+    "output_schema_hash": "43ca9543fab009ef28d42825bd52f2ea40d57eb2d0f336fc92a07186654712be",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "advancement_engine.bundle_exhaustion.reconcile"
+  },
+  {
+    "semantic_operation_id": "advancement_engine.bundle_exhaustion.submit",
+    "operation_contract_version": "v1",
+    "owning_module": "advancement_engine",
+    "access_mode": "effect",
+    "input_schema_hash": "a1976510e78dad677cb92aec7cd9af5f1814a4f438e467de31d3a0eb4cae4ab6",
+    "output_schema_hash": "43ca9543fab009ef28d42825bd52f2ea40d57eb2d0f336fc92a07186654712be",
+    "reconciliation_operation_id": "advancement_engine.bundle_exhaustion.reconcile",
+    "discovered_tool_name": "advancement_engine.bundle_exhaustion.submit"
+  },
+  {
+    "semantic_operation_id": "advancement_engine.bundle_stage_run.observe",
+    "operation_contract_version": "v1",
+    "owning_module": "advancement_engine",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "33bcf18cfec27ee886934ee199a656e6086d9ba42f3cd7720c0b8d63015f5d9f",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "advancement_engine.bundle_stage_run.observe"
+  },
+  {
+    "semantic_operation_id": "advancement_engine.reasoning_stage_run.observe",
+    "operation_contract_version": "v1",
+    "owning_module": "advancement_engine",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "22f734dec11c704046616a44b67590ffd3cc3e3b40811adafca130afd8f0a6a1",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "advancement_engine.reasoning_stage_run.observe"
+  },
+  {
+    "semantic_operation_id": "advancement_engine.snapshot.read",
+    "operation_contract_version": "v1",
+    "owning_module": "advancement_engine",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "44f691d8d7f63c6c1ccc02018caf7a335c3a3c90e83b025f5b653f3028bd95a6",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "advancement_engine.snapshot.read"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.acquisition.request",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "effect",
+    "input_schema_hash": "301ea3901b8d124340b6da7db3f58a69ab56796caf6594b2c67ba4c8eceeca4e",
+    "output_schema_hash": "cf46987cd588554b85aa856ba936999b30cb6bae996a6128fd77faa3f581fb93",
+    "reconciliation_operation_id": "agent_runtime.acquisition.request.reconcile",
+    "discovered_tool_name": "agent_runtime.acquisition.request"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.acquisition.request.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "reconcile",
+    "input_schema_hash": "b2c5c28ec2be0c570ce387befd59351ed856ee02afdfe09ed27967d1032c9604",
+    "output_schema_hash": "cf46987cd588554b85aa856ba936999b30cb6bae996a6128fd77faa3f581fb93",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "agent_runtime.acquisition.request.reconcile"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.bundle_inbox.read",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "read",
+    "input_schema_hash": "f01512b19380b6dd132e5a5d5394f6009594f2d29e368046d20803848991b9c9",
+    "output_schema_hash": "4aef210a108ec2d90201565be719cdb0e6517b910453c292549673aabf944b10",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "agent_runtime.bundle_inbox.read"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.bundle_run_binding.observe",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "eeb2b99f624bc91490f6a49f6c6533cfc8bfd15fcd74ccd454122a6735b9f51e",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "agent_runtime.bundle_run_binding.observe"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.host_compute.observe",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "effect",
+    "input_schema_hash": "b2c5c28ec2be0c570ce387befd59351ed856ee02afdfe09ed27967d1032c9604",
+    "output_schema_hash": "4b7e905d33bf0cde644e487d1ab0401826c6ce681547fae64ebb8e2aa09515fc",
+    "reconciliation_operation_id": "agent_runtime.host_compute.reconcile",
+    "discovered_tool_name": "agent_runtime.host_compute.observe"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.host_compute.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "reconcile",
+    "input_schema_hash": "b2c5c28ec2be0c570ce387befd59351ed856ee02afdfe09ed27967d1032c9604",
+    "output_schema_hash": "4b7e905d33bf0cde644e487d1ab0401826c6ce681547fae64ebb8e2aa09515fc",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "agent_runtime.host_compute.reconcile"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.snapshot.read",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "44f691d8d7f63c6c1ccc02018caf7a335c3a3c90e83b025f5b653f3028bd95a6",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "agent_runtime.snapshot.read"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.target_frontier.read",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "read",
+    "input_schema_hash": "51a27b86c466462bcb62778882d40c20034c64a6b66d70fd7d6a4afd3cb47194",
+    "output_schema_hash": "832f0644aac2b76455b62166a26b44cd0d37fb35c549d8db642b12dbad4cc380",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "agent_runtime.target_frontier.read"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.target_run.observe",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "read",
+    "input_schema_hash": "5910772b17e6570749242cb447812596ccf961613c48be373383074dccb3b70c",
+    "output_schema_hash": "8239cd2f34354d7c6a765dee8baa12db465679b2fcd38fae5df72c0f3152f9d7",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "agent_runtime.target_run.observe"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.target_work.request",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "effect",
+    "input_schema_hash": "0e46a673b16eaa3a0f0beaa9d8a210ed316bc117abee866058d3bd1385192468",
+    "output_schema_hash": "88dc240cb1e4c6a776ec75fe259b64b28d613ba9254a08c371a531063f814477",
+    "reconciliation_operation_id": "agent_runtime.target_work.request.reconcile",
+    "discovered_tool_name": "agent_runtime.target_work.request"
+  },
+  {
+    "semantic_operation_id": "agent_runtime.target_work.request.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "reconcile",
+    "input_schema_hash": "0e46a673b16eaa3a0f0beaa9d8a210ed316bc117abee866058d3bd1385192468",
+    "output_schema_hash": "88dc240cb1e4c6a776ec75fe259b64b28d613ba9254a08c371a531063f814477",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "agent_runtime.target_work.request.reconcile"
+  },
+  {
+    "semantic_operation_id": "human_collaboration.snapshot.read",
+    "operation_contract_version": "v1",
+    "owning_module": "human_collaboration",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "44f691d8d7f63c6c1ccc02018caf7a335c3a3c90e83b025f5b653f3028bd95a6",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "human_collaboration.snapshot.read"
+  },
+  {
+    "semantic_operation_id": "human_request.open",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "effect",
+    "input_schema_hash": "19469b48bcf2005e9007ce157f74d0e5be0ab1edcff065dc342287a73fbb2579",
+    "output_schema_hash": "e8d552ce51459b29891f9ca27c0d3ed2b14e7b80e5bc7f58fb701cf42b9cad87",
+    "reconciliation_operation_id": "human_request.open.reconcile",
+    "discovered_tool_name": "human_request.open"
+  },
+  {
+    "semantic_operation_id": "human_request.open.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "agent_runtime",
+    "access_mode": "reconcile",
+    "input_schema_hash": "b2c5c28ec2be0c570ce387befd59351ed856ee02afdfe09ed27967d1032c9604",
+    "output_schema_hash": "e8d552ce51459b29891f9ca27c0d3ed2b14e7b80e5bc7f58fb701cf42b9cad87",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "human_request.open.reconcile"
+  },
+  {
+    "semantic_operation_id": "research_graph.baselines.page",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "7564b691ffb8a27c1eda642a30a47ec5f40723c2644679da8c9c7dfa484ad957",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.baselines.page"
+  },
+  {
+    "semantic_operation_id": "research_graph.baselines.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "2c3d280034280b1813319cd348e16245045f43448cb4960ae4fbcac46a67aad7",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.baselines.read"
+  },
+  {
+    "semantic_operation_id": "research_graph.datasets.page",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "d2de4bac910f0dfdd6c773d4bb32bb7c532b76899fb36388faa3719a92d62542",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.datasets.page"
+  },
+  {
+    "semantic_operation_id": "research_graph.datasets.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "ad887e3c41a9d66c201a9ed1cf3353013bf89810d479399476fc3bfa6385f43e",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.datasets.read"
+  },
+  {
+    "semantic_operation_id": "research_graph.datasets.reference",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "effect",
+    "input_schema_hash": "d3967be54361aa3d040d33de08edcd449c0eeb32886eab217f631dad29ad9396",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": "research_graph.datasets.reference.reconcile",
+    "discovered_tool_name": "research_graph.datasets.reference"
+  },
+  {
+    "semantic_operation_id": "research_graph.datasets.reference.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "reconcile",
+    "input_schema_hash": "b2c5c28ec2be0c570ce387befd59351ed856ee02afdfe09ed27967d1032c9604",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.datasets.reference.reconcile"
+  },
+  {
+    "semantic_operation_id": "research_graph.datasets.register",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "effect",
+    "input_schema_hash": "003ce1ec6988f6235969a3ae818603e7f97ab834c000f1f840d9d83cfdfbdd41",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": "research_graph.datasets.register.reconcile",
+    "discovered_tool_name": "research_graph.datasets.register"
+  },
+  {
+    "semantic_operation_id": "research_graph.datasets.register.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "reconcile",
+    "input_schema_hash": "b2c5c28ec2be0c570ce387befd59351ed856ee02afdfe09ed27967d1032c9604",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.datasets.register.reconcile"
+  },
+  {
+    "semantic_operation_id": "research_graph.datasets.register_version",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "effect",
+    "input_schema_hash": "fbb81b4b6a6e464305eb59035b735293596b2b86e8db2233b5835ceba03b1ee9",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": "research_graph.datasets.register_version.reconcile",
+    "discovered_tool_name": "research_graph.datasets.register_version"
+  },
+  {
+    "semantic_operation_id": "research_graph.datasets.register_version.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "reconcile",
+    "input_schema_hash": "b2c5c28ec2be0c570ce387befd59351ed856ee02afdfe09ed27967d1032c9604",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.datasets.register_version.reconcile"
+  },
+  {
+    "semantic_operation_id": "research_graph.plan_evidence.page",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "69a53a811e7744458aad4cdc36a656f610e7e8100038b70c26edafd4ff8ad76c",
+    "output_schema_hash": "6c0f4e1221da637e656c3e7093864f66df590a34e4e1d4179fba0cbca2ec6be0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.plan_evidence.page"
+  },
+  {
+    "semantic_operation_id": "research_graph.quest_receipt.verify",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "verify",
+    "input_schema_hash": "6a81d47da990cb7cd2bc780bb336a18887b6519b0949fd62de3852f977ec59fa",
+    "output_schema_hash": "5a6df6257a9259fc5fd9cbbd61a6b1b4f654c10c27b0cd777d8c9b571793e51f",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.quest_receipt.verify"
+  },
+  {
+    "semantic_operation_id": "research_graph.reasoning_context.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "2713237710c9e5e29ab8f0f2f20c2672301354376a680d95584bb4e43f383a24",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.reasoning_context.read"
+  },
+  {
+    "semantic_operation_id": "research_graph.reuse_eligibility.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "18ce20e79c816b93a632e6f86104ea72f9a768617dd8b91735a9dfdc4079d93d",
+    "output_schema_hash": "531c8a28059ce94bd2f601ec6248a06d338735982168a165981b0dd65d5c2fee",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.reuse_eligibility.read"
+  },
+  {
+    "semantic_operation_id": "research_graph.reuse_inputs.verify",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "verify",
+    "input_schema_hash": "0dbffc72fe597b5fc1ead6c97421b6add67b31698e76f39cf3684919bfba6df5",
+    "output_schema_hash": "cf7fd27f847cd46e82f3723b16ee916c28517bf063d56436f1da406c78a37305",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.reuse_inputs.verify"
+  },
+  {
+    "semantic_operation_id": "research_graph.snapshot.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "44f691d8d7f63c6c1ccc02018caf7a335c3a3c90e83b025f5b653f3028bd95a6",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.snapshot.read"
+  },
+  {
+    "semantic_operation_id": "research_graph.target_formal_results.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "641c5683fffd53219b8547efda048b21f31f8cfc665a21118fcdb98f1c220fcf",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.target_formal_results.read"
+  },
+  {
+    "semantic_operation_id": "research_graph.target_launch_request.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_graph",
+    "access_mode": "read",
+    "input_schema_hash": "51a27b86c466462bcb62778882d40c20034c64a6b66d70fd7d6a4afd3cb47194",
+    "output_schema_hash": "240c35409778e6d562f31a324653b2bb099dd81f280d9fc89c55445cc49c0b6d",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_graph.target_launch_request.read"
+  },
+  {
+    "semantic_operation_id": "research_memory.implementation_content.accept",
+    "operation_contract_version": "v1",
+    "owning_module": "research_memory",
+    "access_mode": "effect",
+    "input_schema_hash": "ee54ebacfa816cb8909a4782b8fbbfbf50e25235510382802b7a85559c135458",
+    "output_schema_hash": "873ee77500bdd76da05607b4555ff57b52fe2855ab4234111dae92a24a76c88a",
+    "reconciliation_operation_id": "research_memory.implementation_content.accept.reconcile",
+    "discovered_tool_name": "research_memory.implementation_content.accept"
+  },
+  {
+    "semantic_operation_id": "research_memory.implementation_content.accept.reconcile",
+    "operation_contract_version": "v1",
+    "owning_module": "research_memory",
+    "access_mode": "reconcile",
+    "input_schema_hash": "ee54ebacfa816cb8909a4782b8fbbfbf50e25235510382802b7a85559c135458",
+    "output_schema_hash": "873ee77500bdd76da05607b4555ff57b52fe2855ab4234111dae92a24a76c88a",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_memory.implementation_content.accept.reconcile"
+  },
+  {
+    "semantic_operation_id": "research_memory.implementation_content.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_memory",
+    "access_mode": "read",
+    "input_schema_hash": "17f03ba9d4111d2d0a99222aec9f8fdec82dcf0b280222881bbf95f58aec53c3",
+    "output_schema_hash": "1b1db8d54abcc140c1393b976d6188070dfcd5f24f834c68e13846b0385c6aca",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_memory.implementation_content.read"
+  },
+  {
+    "semantic_operation_id": "research_memory.plan_evidence.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_memory",
+    "access_mode": "read",
+    "input_schema_hash": "cdcc79e1dfd233a179a167f331707ab243f000971bc48c84d735931b09d464cf",
+    "output_schema_hash": "61c3aed0cf66d0725735a7a48dd1bb636376a0f787d8b0b92e22e8bd53b1bd0a",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_memory.plan_evidence.read"
+  },
+  {
+    "semantic_operation_id": "research_memory.reasoning_evidence.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_memory",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "8d753ce4363805476064335924c6893a70e2ce4b57a697a79ea7ce5f37585efe",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_memory.reasoning_evidence.read"
+  },
+  {
+    "semantic_operation_id": "research_memory.research_notes.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_memory",
+    "access_mode": "read",
+    "input_schema_hash": "ef4bc7cd5310bd56440daa120c8f6fa5e16ce78d63988554ce251072a12ed81b",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_memory.research_notes.read"
+  },
+  {
+    "semantic_operation_id": "research_memory.snapshot.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_memory",
+    "access_mode": "read",
+    "input_schema_hash": "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    "output_schema_hash": "44f691d8d7f63c6c1ccc02018caf7a335c3a3c90e83b025f5b653f3028bd95a6",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_memory.snapshot.read"
+  },
+  {
+    "semantic_operation_id": "research_memory.stage_context.read",
+    "operation_contract_version": "v1",
+    "owning_module": "research_memory",
+    "access_mode": "read",
+    "input_schema_hash": "b01612643036783bf7e1b2198ee89409a03f65bae8a5306abd30839c6f3cbc44",
+    "output_schema_hash": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+    "reconciliation_operation_id": null,
+    "discovered_tool_name": "research_memory.stage_context.read"
+  }
+]

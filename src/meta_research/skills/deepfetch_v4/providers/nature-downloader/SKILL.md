@@ -1,114 +1,67 @@
 ---
 name: nature-downloader
-description: Acquire a finite DeepFetch-selected list of academic full texts through lawful open-access, publisher-API, CNKI, or authenticated institutional-browser routes. This bound provider downloads and validates files; it does not discover, rank, read, or synthesize literature.
+description: 按 DeepFetch 已选定的有限论文清单，经合法开放获取、出版商 API、CNKI 或已认证机构浏览器取得并验证全文；不负责发现、排序、科学阅读或综合。
 ---
 
-# Nature Downloader — DeepFetch bound provider
+# Nature Downloader：DeepFetch 全文获取服务
 
-Acquire exactly the papers requested. Return compact evidence of delivery.
+只获取本次明确请求的论文，返回简洁交付证据。DeepFetch 提供精确标题、标识、URL 线索与绝对私有获取目录；选题、科学阅读及公开产物由 DeepFetch 负责。用户可见说明遵循当前根 Session 的语言偏好，原文和协议值保持原貌。
 
-## Contract
+## 当前请求与路线
 
-DeepFetch supplies a finite list of exact titles, identifiers, source-URL hints, and one absolute
-private acquisition directory. Keep selection, scientific reading, and public artifacts with the
-DeepFetch main agent.
+每个 `request_id` 是独立路由事务，即使 Acquisition Session 在整个 Quest 中持续存在。按当前请求明确的 `session_mode` 执行，不沿用上一回合的临时模式：`oa_then_institution` 先 OA 再已授权机构路线，`oa_only` 只做 OA，`provided_only` 只验证用户已提供的正文。`route_policy=oa_first_then_institution` 是协议中的路线次序，不能覆盖 `session_mode` 的权限限制。
 
-Treat every `request_id` as a fresh routing transaction, even when the Acquisition session stays
-alive for an entire Quest. Require `route_policy=oa_first_then_institution`; never inherit an
-institutional or OA-only mode from the previous turn.
+获取服务负责合法路由、传输、内容验证、hash、typed 失败和私有 manifest，只写调用方指定目录。已选正文获取始终传 `--no-si` 和 `--cnki-format pdf`，无需再次确认补充材料；DeepFetch 接受核实的 PDF、HTML、XML 正文，CAJ 不适用。
 
-The bundled downloader owns lawful routing, transfer, validation, hashes, typed failures, and
-private manifests. Write only beneath the supplied acquisition directory.
+## 1. 预检
 
-Every bound request has already selected正文 only. Pass `--no-si` without asking again. Also pass `--cnki-format pdf`; DeepFetch accepts verified PDF, HTML, or XML article bodies, not CAJ.
-
-Completion criterion: every requested item is `obtained`, paused for a specific user handoff, or
-route-exhausted with every applicable attempt preserved in its private manifest.
-
-## Preflight
-
-Run configuration and reachability checks before DeepFetch starts its active-search clock:
+`oa_only` 跳过全部机构／浏览器预检，并传 `--no-institutional-access`；这是已选主路线，不描述为被迫降级。`provided_only` 仅核实已提供文件，不发起网络下载。需要机构路线时，在 DeepFetch 开始主动检索计时前检查配置、连接和真实权限：
 
 ```bash
 python3 scripts/configure_school.py show
 python3 scripts/configure_school.py health --force
-```
-
-These checks do not prove entitlement. Inspect existing controlled-browser targets before opening
-the library portal. A publisher/article target that visibly identifies the institution, or a
-verified paywalled article-body response, proves the route; one newly opened login tab does not
-invalidate another authorized target. Run the functional probe; `/targets` reachability alone is
-insufficient:
-
-```bash
 node scripts/functional_cdp_probe.mjs --proxy http://127.0.0.1:3456
 ```
 
-If the probe fails at `new` or `eval` while native Chrome CDP remains reachable, start the bundled
-bridge once on an unused loopback port, probe that port, and pass its URL as `--proxy` to every
-institutional attempt. Classify login state only after the functional probe passes. A library home
-page alone does not prove entitlement.
+先检查已有受控浏览器页面。显示机构身份的出版商正文页，或核实的付费正文响应才能证明访问权限；图书馆首页和 `/targets` 可达只证明连接。新开登录页不推翻其他已授权页面。
 
-When native Chrome CDP is already available at loopback port 9222 and the expected proxy is absent, reuse that browser through the bundled bridge:
+代理 `new`／`eval` 失败而原生 Chrome CDP 可用时，在未占用回环端口启动随包桥接并重新功能探测，所有机构请求传同一 `--proxy`。原生 CDP 已在 9222、预期代理缺失时可复用：
 
 ```bash
 node scripts/direct_cdp_proxy.mjs --chrome http://127.0.0.1:9222 --port 3456
 curl --noproxy '*' --max-time 10 http://127.0.0.1:3456/targets
 ```
 
-The bridge attaches to the running browser and exposes only page-control operations. Keep credentials, cookies, local storage, and browser-profile files outside agent context.
+桥接复用现有浏览器，仅暴露页面操作。凭据、cookie、local storage 和用户配置文件留在受控环境，不进入 Agent 上下文。机构路线仍不可用时给出具体登录待办、OA-only 继续或取消选项；纯用户等待不计主动检索时间。完成条件：当前模式已明确，所需访问已核实或有明确等待原因。
 
-If the session is already OA-only, treat it as the user's selected primary route, skip every
-institutional/browser preflight, and pass `--no-institutional-access`; never describe this as forced,
-as a downgrade, or as a fallback. Otherwise, if the authenticated route fails, ask the user to
-re-login in that browser, continue OA-only, or cancel. Waiting for user login or upload is outside
-the DeepFetch active-search clock. Cancellation ends the provider and its parent run immediately.
+## 2. 获取
 
-Completion criterion: authenticated entitlement is visibly verified or OA-only continuation is explicit.
-
-## Acquire
-
-Run two explicit passes for every English batch.
-
-Run every remote download through the proxy-aware launcher. It enables the configured HTTP(S)
-proxy while bypassing loopback browser control:
+远程下载统一经代理感知启动器，启用已配 HTTP(S) 代理并绕过回环浏览器控制：
 
 ```bash
 python3 scripts/run_batch_download.py <batch_download arguments>
 ```
 
-Give every item and route attempt a unique attempt directory beneath `target_dir`; preserve each
-manifest until the request is terminal. Never reuse one `--out` directory across title attempts.
+每个论文和路线尝试使用 `target_dir` 下唯一目录并保留 manifest，不跨标题复用 `--out`。`provided_only` 直接进入验证；其他模式先做 OA。
 
-### OA pass
+### OA 轮次
 
-Attempt lawful open access for every requested paper before opening an institutional route. Use
-the exact title as well as the DOI: DOI-only resolution can miss arXiv and publisher-hosted OA.
-Start with the supplied `arxiv_id` and public-looking `source_urls` such as arXiv, PMC, repository,
-or explicit PDF URLs. Treat them as untrusted hints and validate the returned work. Then submit the
-exact title and DOI resolvers. A failed candidate or transport does not end the pass; continue until
-one body validates or all lawful candidates are exhausted.
+对每篇请求先尝试合法 OA。标题和 DOI 均用于查找；优先检查已有 arXiv ID、PMC、仓储或显式 PDF 等 `source_urls`，将线索视为未核实输入并验证所得论文。候选或传输失败不结束整个 OA 轮次，直到得到核实正文或适用候选耗尽。
 
-Submit each direct candidate first with `--pdf-url "<url>" --title "<exact title>"
---no-institutional-access --no-si` and its own attempt directory.
-The downloader resolves moved DSpace repository records by exact title before treating a landing
-page as exhausted.
-
-Submit exact titles individually while keeping the finite queue in the Acquisition session:
+直接候选用 `--pdf-url "<url>" --title "<exact title>" --no-institutional-access --no-si`，每次独立目录；精确标题示例：
 
 ```bash
 python3 scripts/run_batch_download.py \
-  --title "Exact article title" --open-access --no-institutional-access \
+  --title "精确论文标题" --open-access --no-institutional-access \
   --no-si --cnki-format pdf \
   --out "/absolute/private/acquisition-dir/attempts/<paper-id>/title-oa-1"
 ```
 
-Validate every obtained body and remove its paper from the unresolved queue.
+工具会按精确标题解析迁移的 DSpace 条目。每个获得正文都先验证，再从未决清单移除。`oa_only` 到此为止，不进入机构路线。
 
-### Institutional pass
+### 机构轮次
 
-Send only papers still unresolved after the OA pass to publisher-API and authorized institutional
-fallback. Batch DOI-bearing unresolved papers together:
+仅 `oa_then_institution` 中 OA 仍未解决的论文可进入出版商 API 和已授权机构路线。带 DOI 的未决项可有界批量处理：
 
 ```bash
 python3 scripts/run_batch_download.py \
@@ -117,30 +70,13 @@ python3 scripts/run_batch_download.py \
   --out "/absolute/private/acquisition-dir/attempts/institution-batch-1"
 ```
 
-For an unresolved DOI-less title, submit that exact title alone through the authorized route. If
-Preflight selected OA-only continuation, stop after the OA pass and return typed missing results.
-Never send an OA success to the institutional pass, and never combine `--api-fallback-web` with
-`--no-institutional-access`.
+无 DOI 的精确标题单独提交。OA 成功项不再获取，`--api-fallback-web` 不与 `--no-institutional-access` 并用。中文论文走可授权 CNKI 并要求 PDF；英文合法 OA 可含出版商 OA、PMC、Unpaywall 所列合法副本、arXiv 与仓储，剩余项再按当前授权用出版商凭据和机构浏览器。
 
-Routing remains mechanical:
+仅在所有适用路线均有终态时返回 `missing`。OA-only 耗尽为 `oa_not_found` 或宿主 `acquisition_route_exhausted`，不是机构授权失败；已确认正文位置但字节传输超时为 `transfer_failed`。不得把等待用户当作路线耗尽。
 
-- Chinese literature uses CNKI with PDF required.
-- Lawful OA sources include publisher OA, PMC, Unpaywall-listed copies, arXiv, and legitimate repositories.
-- Supported publisher credentials may serve an unresolved English paper after the OA pass.
-- Institutional Web Access is the final authorized route for the remaining unresolved papers.
+## 3. 核实并返回
 
-Return `missing` only when the item is route-exhausted: every supplied hint and applicable OA
-resolver is terminal, and, when institutional fallback is enabled, the unresolved item has also
-reached a typed terminal institutional outcome. Under a user-selected OA-only session, exhausted
-items return `oa_not_found` (or the host-level `acquisition_route_exhausted`), never an
-institutional-authorization failure. A confirmed OA location whose bytes timed out is
-`transfer_failed`, not `oa_fulltext_not_found`.
-
-## Verify and return
-
-Trust a file only after the downloader manifest and content checks agree. PDF must contain a real PDF response; HTML/XML must contain the article body rather than a landing, login, denial, or challenge page. CAJ-only delivery is `missing` for DeepFetch.
-
-Return exactly one compact item per requested paper:
+manifest 与实际内容需一致：PDF 是有效正文，HTML／XML 含文章主体而非登录、拒绝、落地或验证页，身份与所请求论文匹配。CAJ-only 不算 DeepFetch 正文。每篇返回一项：
 
 ```json
 {
@@ -152,16 +88,8 @@ Return exactly one compact item per requested paper:
 }
 ```
 
-`status` is `obtained`, `waiting_user`, or `missing`; `format` is `pdf`, `html`, `xml`,
-or `null`. Keep an affected tab open for `waiting_user` and retain its retry reference privately.
-A verified authenticated article page whose automatic PDF transfer fails is `waiting_user`: offer
-the preserved tab for manual download or accept a user-supplied full text.
-A missing item sets path and format to `null` and returns `{ "code": "...", "detail": "..." }`
-without credentials or session material. DeepFetch registers obtained files through its
-deterministic ledger tool.
+`status` 为 `obtained | waiting_user | missing`；`format` 为 `pdf | html | xml | null`。`waiting_user` 保留相关页面和私有重试引用；已认证正文页自动下载失败时，可请用户在该页手动下载或提供正文。`missing` 的路径和格式为 `null`，失败对象为 `{"code":"...","detail":"..."}`，不含凭据和会话材料。DeepFetch 通过确定性台账工具登记成功文件。
 
-## Escalate only the affected item
+完成条件：每个请求都有核实交付、具体人类待办或保留全部适用尝试的路线耗尽终态。受影响论文及时返回，其他 OA、检索和 Reader 工作继续。
 
-If login expires during acquisition, return that paper promptly while unrelated OA, OpenAlex, and Reader work continues. Offer re-login and retry, user-supplied PDF/HTML/XML, or abandonment. Pause on CAPTCHA, QR login, SMS/OTP, security warnings, publisher bot challenges, or unclear consent.
-
-Read [institutional browser workflow](references/institutional-browser-workflow.md) only when a legitimate OA/API route is exhausted and browser fallback or login handoff is needed. Read [delivery verification and failures](references/delivery-verification-and-failures.md) only when a transfer needs diagnosis, validation, quarantine, or a typed terminal status.
+需要机构浏览器或登录交接时读取[机构浏览器流程](references/institutional-browser-workflow.md)；需要验证、诊断、隔离、重试或具体失败码时读取[交付验证与失败](references/delivery-verification-and-failures.md)。遇 CAPTCHA、QR、OTP、安全或机器人验证时暂停受影响路线，由用户处理。

@@ -67,7 +67,7 @@ class _RecordedRunner:
         assert timeout is None or timeout > 0
         self.calls.append((list(argv), prompt, dict(environment)))
         if "--version" in argv:
-            version = "codex-cli 0.153.2\n" if self.family == "codex" else "2.1.220\n"
+            version = f"codex-cli {CODEX_LOCKED_VERSION}\n" if self.family == "codex" else "2.1.220\n"
             return subprocess.CompletedProcess(argv, 0, version, "")
         if argv[-2:] == ["features", "list"]:
             stdout = "\n".join(
@@ -255,7 +255,7 @@ def _child_ledger(
         "parent_thread_id": root_ref,
         "cwd": cwd,
         "originator": "codex_exec",
-        "cli_version": "0.153.2",
+        "cli_version": CODEX_LOCKED_VERSION,
         "thread_source": "subagent",
         "source": {"subagent": {"thread_spawn": {"parent_thread_id": root_ref}}},
     }
@@ -365,7 +365,7 @@ def _result_child_ledger(
         "parent_thread_id": root_ref,
         "cwd": cwd,
         "originator": "codex_exec",
-        "cli_version": "0.153.2",
+        "cli_version": CODEX_LOCKED_VERSION,
         "thread_source": "subagent",
         "source": {"subagent": {"thread_spawn": {"parent_thread_id": root_ref}}},
     }
@@ -771,7 +771,7 @@ def test_codex_adapter_derives_native_identity_and_capabilities_from_jsonl(
     )
 
     assert result.native_session_ref == "codex-thread-1"
-    assert result.profile["provider_version"] == "0.153.2"
+    assert result.profile["provider_version"] == CODEX_LOCKED_VERSION
     _assert_profile_is_event_derived(
         result.profile,
         expected_available={
@@ -792,7 +792,7 @@ def test_codex_adapter_derives_native_identity_and_capabilities_from_jsonl(
         for index, value in enumerate(argv)
         if value == "--config"
     ]
-    assert 'model_reasoning_effort="max"' in config_values
+    assert 'model_reasoning_effort="ultra"' in config_values
     assert "mcp_servers.meta_research.required=true" in config_values
     assert (
         'mcp_servers.meta_research.default_tools_approval_mode="approve"'
@@ -819,7 +819,7 @@ def test_installation_profile_is_a_pure_read_of_durable_provider_capability(
 
     assert adapter.installation_profile() == {
         "harness_family": "codex",
-        "locked_version": "0.153.2",
+        "locked_version": CODEX_LOCKED_VERSION,
         "status": "capability_unavailable",
         "reason": {"code": "provider_capability_unverified"},
     }
@@ -833,8 +833,8 @@ def test_installation_profile_is_a_pure_read_of_durable_provider_capability(
     restarted = CodexHarnessAdapter(workspace, runner=runner)
     assert restarted.installation_profile() == {
         "harness_family": "codex",
-        "locked_version": "0.153.2",
-        "provider_version": "0.153.2",
+        "locked_version": CODEX_LOCKED_VERSION,
+        "provider_version": CODEX_LOCKED_VERSION,
         "status": "ready",
     }
     assert len(runner.calls) == calls_after_protected_probe
@@ -1300,7 +1300,7 @@ def test_codex_subagent_evidence_records_exact_code_review_skill_invocation(
         "thread_source": "subagent",
         "cwd": str(tmp_path.resolve()),
         "originator": "codex_exec",
-        "cli_version": "0.153.2",
+        "cli_version": CODEX_LOCKED_VERSION,
         "sandbox_mode": "workspace-write",
     }
     assert ledger.reads == [child_ref]
@@ -1493,7 +1493,7 @@ def test_codex_result_review_uses_native_child_ledger_evidence(
         "thread_source": "subagent",
         "cwd": str(tmp_path.resolve()),
         "originator": "codex_exec",
-        "cli_version": "0.153.2",
+        "cli_version": CODEX_LOCKED_VERSION,
         "sandbox_mode": sandbox_mode,
     }
     assert evidence[0]["spawn_prompt_hash"] == hashlib.sha256(
@@ -2875,7 +2875,7 @@ def test_doctor_does_not_reuse_a_ready_profile_after_resume_auth_revocation(
         def __call__(self, argv, prompt, timeout, environment):
             if "--version" in argv:
                 return subprocess.CompletedProcess(
-                    argv, 0, "codex-cli 0.153.2\n", ""
+                    argv, 0, f"codex-cli {CODEX_LOCKED_VERSION}\n", ""
                 )
             self.turns += 1
             if self.turns == 1:
@@ -4633,7 +4633,7 @@ def test_codex_and_claude_complete_short_runs_through_one_typed_admission(
         assert [
             item["locked_version"]
             for item in snapshot["harnesses"]["adapters"]
-        ] == ["0.153.2", "2.1.220"]
+        ] == [CODEX_LOCKED_VERSION, "2.1.220"]
         assert snapshot["harnesses"]["status"] == "capability_unavailable"
         assert all(
             item["capability_profile"] is None

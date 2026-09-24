@@ -1,43 +1,45 @@
-# Plan Stage Owner 操作
+# Plan 的 Owner 操作
 
-这些是语义边界；运行时只调用安装产品公开的 Owner Interface，不读取 SQLite、spool、seal key 或控制文件来代替验证。
+以当前公开工具目录和 schema 为调用依据；本文件解释语义，不替系统生成身份、receipt 或控制事实。仅经公开接口核实，不读取 SQLite、spool、seal key 或控制文件绕过验证。
 
-## Prototype binding
+## 发现、读取和精确引用
 
-- 行为基线固定为 `f2d3f3f0d77a6f50ab535d50d6d404a525c09757` 下的 `meta-research/vnext/skills/plan-stage/`；实现前已完整读取其中的 `SKILL.md`、`references/contract.md`、`references/owner-operations.md`、`agents/openai.yaml` 和确定性参考脚本。
-- 生产 Adapter 以 AE 签发的 ContextPack 冻结创建时完整、稳定的 Plan Evidence catalog，而不把原型的 `explore(open | follow | refresh)` 暴露为第二个产品状态面。后续新增且未被本 Plan 选择的 evidence 不改写旧 snapshot；正式写边界只实时重验 PlanDocument 实际选择的叶子，引用叶子 stale／unavailable／receipt mismatch 时 fail closed，绝不静默替换。
-- 普通 RG `role=evidence` 与 RM provenance metadata 不能证明成功 TargetCommit。后继 TargetCommit/Baseline Pool authority 接入前，生产 Plan catalog 因而诚实地冻结为空；非空目录 fail closed。当前票验证 empty catalog → gap 的真实闭环及 no-gap 的条件性机械合同，不伪造 TargetCommit、EvidenceRef 或 Owner receipt；TargetCommit-backed 正向复用与显式 refresh 由该唯一 authority seam 接入。
-- 原型的 `reviewer_session_ref` 在当前生产写入中收敛为同一 managed root/native Session 的第二个 advisory finalization turn；记录 `advisory_unobserved`、null reviewer 与 `independent=false`，不制造或声称第二个 Agent Runtime Session。历史 reviewer provenance 只读兼容。
-- `no_new_experiment_required` 由正式 Plan 内容机械派生并作为后续 Bundle skip basis 投影；Plan 不提前创建或伪造 Bundle Run。
+ContextPack 提供创建时 evidence_catalog 及版本。`research_graph.plan_evidence.page` 通过 total、filter、next_offset 发现同 Quest 其他证据；`research_memory.plan_evidence.read` 读取精确 commit／version／hash／role 对应正文。已接纳后续条目可选用，Owner 在提交时重验引用与来源；后续发现不改写原 ContextPack。
 
-## 权限
+TargetCommit 来源经现有验证接缝核查，包括有指标测量和无测量的观察、分析、负结果。科学含义由 Plan 说明，capability 与 provenance 如实记录，不能为可引用而补造测量。空目录不推导全库无证据，索引摘要不替代实际采用正文。
 
-- Advancement Engine 拥有 Plan StageRunRequest、foreground epoch、StageCommit 与 Bundle skip 验证。
-- Agent Runtime 拥有 Run admission、Attempt、根 Session、Execution Fence、runtime binding、执行恢复与 execution receipt。
-- Research Memory 拥有不可变 PlanDocument 内容、AssetVersion custody、完整性、可用性与内容 receipt。
-- Research Graph 拥有 accepted Question/Idea/FormalPlan 身份、Evidence eligibility/currentness、ExperimentKey 关系与 domain receipt。
-- Plan 主 Agent 拥有候选 AnswerContract、相关性与充分性判断、coverage/gap、ExperimentBrief、review disposition 和修订；它不是 State Owner。
+HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 先从当前 Quest 的 Question 历史、文献、数据集或人类输入入口发现，再沿返回 reader 读精确正文。额外来源采用：
 
-## 调用顺序
+```json
+{
+  "schema_ref": "meta-research/evidence-source-ref/v1",
+  "evidence_ref": "精确来源ref",
+  "source_kind": "HumanInput|ScientificOutcome|AssetVersion|LiteratureSnapshot",
+  "source_ref": "同一精确来源ref"
+}
+```
 
-1. 由 AE 验证当前 Plan request/epoch 和精确 accepted Question/IdeaSet handoff。
-2. 由 AR 验证 runtime binding、ContextPack、根 Session 与 Fence，并记录每个 Attempt 的 durable provider operation。
-3. 由 RM 和 RG 验证每个入选 EvidenceRef 的不可变内容、可用性、eligibility 与 currentness。
-4. 由 RM 以 operation identity 接受 PlanDocument 内容，保存 content ref、payload hash 与 receipt checkpoint。
-5. 由 RG 以新的 submission identity 接受或拒绝精确 PlanDocument binding，保存 FormalPlan ref 或 structured feedback receipt。
-6. RG accepted 后由 AR 形成 execution-completed receipt；最后由 AE 验证 current request/epoch 与全部 receipts 并形成 Plan StageCommit。
+`source_kind` 选实际单一类别，不写四类拼接值；coverage 的 evidence use 使用同一 ref。Target 证据使用工具返回的完整 EvidenceRef。`additional_evidence_bindings` 只提交本轮读过并实际采用的条目，最多 32 项；adapter 写入 `source_bindings.selected_evidence_catalog`，RG 重验真实接纳事实、同 Quest 范围和内容，并供后续读回。
 
-## 原生结果
+Dataset 的登记与用途关系帮助发现；实际实施仍需 Bundle 绑定所需 AssetVersion。人类意见可供判断，不能替代执行授权或 HumanRequest 已满足事实。
 
-| Result | 处理 |
+## 职责与顺序
+
+AE 管 request、epoch、StageCommit 和 skip；AR 管 Run、Attempt、根 Session、Fence、运行绑定、恢复和执行 receipt；RM 管内容保管、完整性、可用性和内容 receipt；RG 管 Question／Idea／FormalPlan、证据资格和领域 receipt。Plan Agent 负责义务、相关性、充分性、Brief 与修订，不是 State Owner。
+
+系统依次验证精确输入及 current scope，核验已选来源，以独立操作身份保存 RM 内容、提交 RG 决策，接纳后形成 AR 执行完成事实，最后由 AE 提交 StageCommit。Agent 交付科学内容，不手工重建这些 receipts。
+
+## 反馈与恢复
+
+| 结果 | 处理 |
 | --- | --- |
-| `accepted` | 保存精确 ref 与 receipt，再进入下一个获授权 Owner。 |
-| `rejected` | 保存 feedback 与 receipt，在同一根 Session 实质修订并使用新的 payload/submission identity。 |
-| `stale` | 重新验证冻结闭包和入选 EvidenceRef；仅新增未选 evidence 不改写既有冻结 snapshot。 |
-| `needs_input` | 等待精确 HumanRequest 获 Owner satisfied disposition 后恢复。 |
-| `outcome_unknown` | 协调原 operation identity；确认结果前不重放。 |
-| `technical_blocker` | 保留已证明范围，修复后从首个缺失 receipt 恢复。 |
-| `idempotency_conflict` | 停止写入并报告同一 key 的 payload 冲突。 |
-| `already_sealed` | 返回既有 immutable accepted state。 |
+| `accepted` | 保存精确 ref／receipt，沿下一获授权步骤继续。 |
+| `rejected` | 保存反馈及来源，在同一根 Session 实质修订后形成新提交。 |
+| `stale` | 重验精确闭包及入选证据；不换成 latest。 |
+| `needs_input` | 等待精确 HumanRequest 获 Owner satisfied 结果后继续。 |
+| `outcome_unknown` | 对账原 operation，结果明确前不重放。 |
+| `technical_blocker` | 说明真实范围，修复后从首个缺失步骤继续。 |
+| `idempotency_conflict` | 保留同 key 的 payload 冲突并停止该写入。 |
+| `already_sealed` | 消费原不可变接纳事实。 |
 
-同一 operation/submission identity 只绑定一个 payload 与 invocation closure。重启、丢 ACK 或局部成功时，查询 Owner 事实并从第一个缺失 checkpoint 继续；已存在的 RM/RG/AR/AE receipt 不重复创建。
+同一 operation／submission identity 只对应同一 payload 与调用闭包。重启或丢响应时按 Owner 已有事实续接，不重复创建已存在接纳记录。

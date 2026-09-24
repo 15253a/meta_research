@@ -193,7 +193,7 @@ def test_research_graph_accepts_and_replays_one_issuer_verified_root_commit(
                 if item["commit_ref"] == accepted.target_commit_ref
             )
             assert public_commit["closure"]["schema_ref"] == (
-                "meta-research/target-root-commit-closure/v1"
+                "meta-research/target-root-commit-closure/v2"
             )
             accepted_measurement = public_commit["closure"][
                 "accepted_measurement"

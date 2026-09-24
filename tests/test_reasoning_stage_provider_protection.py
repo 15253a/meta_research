@@ -20,7 +20,7 @@ from test_public_reasoning_stage import (
 )
 from test_public_autonomous_creation import (
     _AutonomousReasoningSkill,
-    _reach_autonomous_checkpoint,
+    _reach_autonomous_checkpoint, _drive_autonomous_creation_ready,
 )
 
 
@@ -106,7 +106,8 @@ class _AutonomousCeilingReasoningSkill(_CountingAutonomousReasoningSkill):
         checkpoint: dict[str, object],
         creation_result: dict[str, object],
     ):
-        del request, checkpoint, creation_result
+        del checkpoint, creation_result
+        self.resume_job_ref = request.job_ref
         self.resume_calls += 1
         raise ReasoningSkillUnavailable(
             "codex_operation_timeout",
@@ -203,14 +204,7 @@ def test_reasoning_autonomous_resume_waits_on_typed_protection_before_call(
         _quest, _view, checkpoint = _reach_autonomous_checkpoint(runtime)
         checkpoint_ref = str(checkpoint["checkpoint_ref"])
 
-        def ready_creation(queried_ref: str):
-            assert queried_ref == checkpoint_ref
-            return {
-                "status": "ready_for_reasoning_resume",
-                "checkpoint": {"ref": checkpoint_ref},
-            }
-
-        monkeypatch.setattr(runtime.autonomous_creation, "query", ready_creation)
+        _drive_autonomous_creation_ready(runtime, checkpoint, key="protection-ready")
 
         def blocked_provider_unit(**_values) -> None:
             raise OwnerConflict("power_inhibitor_acquisition_failed")
@@ -341,14 +335,7 @@ def test_reasoning_autonomous_resume_records_hard_ceiling_without_safe_ack(
         assert run is not None
         checkpoint_ref = str(checkpoint["checkpoint_ref"])
 
-        def ready_creation(queried_ref: str):
-            assert queried_ref == checkpoint_ref
-            return {
-                "status": "ready_for_reasoning_resume",
-                "checkpoint": {"ref": checkpoint_ref},
-            }
-
-        monkeypatch.setattr(runtime.autonomous_creation, "query", ready_creation)
+        _drive_autonomous_creation_ready(runtime, checkpoint, key="protection-ready")
         recorded: list[dict[str, object]] = []
         safe_acks: list[dict[str, object]] = []
         monkeypatch.setattr(
@@ -368,7 +355,7 @@ def test_reasoning_autonomous_resume_records_hard_ceiling_without_safe_ack(
         assert safe_acks == []
         assert recorded == [
             {
-                "unit_ref": run.review_invocation.invocation_ref,
+                "unit_ref": "provider_unit_" + canonical_hash({"run_ref": run.run_ref, "job_ref": provider.resume_job_ref})[:64],
                 "run_ref": run.run_ref,
                 "attempt_ref": run.attempt_ref,
                 "fence_ref": run.fence_ref,

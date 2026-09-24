@@ -1,4 +1,4 @@
 interface:
-  display_name: "Reasoning Stage"
-  short_description: "综合冻结证据并提出唯一下一周期或完成候选"
-  default_prompt: "使用 $reasoning-stage 从 current Reasoning 闭包形成诚实 ScientificOutcomeCandidate。"
+  display_name: "研究综合"
+  short_description: "综合真实来源、沉积可复用数据并判断下一步"
+  default_prompt: "使用 $reasoning-stage 综合当前研究，读回需保留的数据积累，形成诚实科学结果与唯一后继候选。"

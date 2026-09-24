@@ -47,8 +47,11 @@ class CodexCompanionAdapter(
 
     Companion turns resume the same native Root Session.  A Proposal generation
     is not another narrow provider: the Companion must spawn exactly one fresh
-    child, wait for it, and return its schema-constrained draft.  The child ref
-    is returned only as terminal provenance and is never used for resume.
+    child with inherited context, wait for it, and return its schema-constrained
+    draft.  A short child message points to the exact current materials already
+    inherited.  The child identifier returned by spawn is terminal provenance
+    only; a provider's canonical task path is retained when that is the exposed
+    identifier, and is never used for resume.
     """
 
     _root_agent_kind = "companion"
@@ -156,7 +159,12 @@ class CodexCompanionAdapter(
         child_prompt = (
             "你是这一次 Proposal 窗口的短命 Proposal Drafter。只根据随附的精确"
             "研究上下文形成六字段 Proposal；不得写 Owner、确认 Proposal、创建 Quest "
-            "或把自己变成长期 Session。完成后把结果返回给父 Companion。\n\n"
+            "或把自己变成长期 Session。完成后在最终输出中仅返回六字段 JSON 给父"
+            " Companion；它就是父结果中的 content。子标识由父根据 spawn 返回值"
+            "记录，子任务只负责内容，无需查询或返回任何 Session ID。过程进展使用"
+            " commentary。以下是本次子任务的完整输出 schema：\n"
+            + _canonical_json(_proposal_schema())
+            + "\n\n"
             + _proposal_prompt(request)
         )
         schema = {
@@ -174,10 +182,21 @@ class CodexCompanionAdapter(
         prompt = (
             "你是长期存在的全局 Companion 根智能体。为当前 Proposal 窗口调用"
             " spawn_agent 恰好一次，并使用 fork_turns=all 创建一个新的短命"
-            " Proposal Drafter；把下面的 child message 原样交给它，等待它完成。"
-            "不得 resume 或复用任何旧 Proposal Drafter。把本次 child 的原生"
-            " Session ref 与它形成的六字段内容返回指定 schema。父 Companion 保持"
-            "当前 Session，child 在本窗口工作结束后不再可寻址。\n\n"
+            " Proposal Drafter。完整任务和精确材料已在本次消息中，子任务会继承；"
+            "spawn 的 message 只发送短指令：读取继承上下文中本次父消息的"
+            " BEGIN_PROPOSAL_DRAFTER_MESSAGE 与 END_PROPOSAL_DRAFTER_MESSAGE "
+            "之间的完整任务及材料，完成后在最终输出中仅返回六字段 JSON。无需"
+            "在 spawn message 中复制材料或重写摘要。\n\n"
+            "保存 spawn 返回的真实子标识，等待该子任务完成。收到结果后校验"
+            "六字段满足给定 schema；格式问题在本次子任务中修正，合格后立即将"
+            "六字段放入 content，并将保存的子标识放入"
+            " proposal_fork_native_session_ref，按指定 schema 返回。若 spawn "
+            "只返回 canonical task path，就如实使用该路径；该字段只记录本次"
+            "交接来源，无需额外查询隐藏会话文件或另找原生 Session ID。"
+            "草案合格即完成本次交接，无需追加研究。过程进展使用 commentary，"
+            "最终输出仅包含指定 schema 的完整结果。\n\n"
+            "父 Companion 保持当前 Session。不得 resume 或复用旧 Proposal "
+            "Drafter；本次 child 在窗口结束后不再用于后续工作。\n\n"
             "BEGIN_PROPOSAL_DRAFTER_MESSAGE\n"
             + child_prompt
             + "\nEND_PROPOSAL_DRAFTER_MESSAGE"

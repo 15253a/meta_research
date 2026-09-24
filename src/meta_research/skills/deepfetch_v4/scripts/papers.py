@@ -950,9 +950,10 @@ def build_reader_job(assignment: Dict[str, Any], out_dir: Path) -> Dict[str, Any
         },
         "reading_contract_path": str(reading_contract),
         "instructions": (
-            "Read the Reading section at reading_contract_path, then read only this paper's "
-            "assigned full text. Fill every full-text-dependent field "
-            "you can support, preserve null/[] for unknowns, and submit exactly one patch."
+            "先完整读取 reading_contract_path 的阅读部分，再只读本任务分配的论文全文。"
+            "填写全文实际支持的各字段，未知保留 null/[]，仅提交一份 patch。"
+            "说明按任务指定的 zh/en 偏好直接撰写；未指定时使用任务输入语言。"
+            "原文、引用与协议标识保持原貌。"
         ),
         "patch_template": reader_patch_template(
             assignment["assignment_id"], assignment["paper_id"], assignment["fulltext_sha256"],

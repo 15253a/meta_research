@@ -256,7 +256,8 @@ def upgrade() -> None:
         sa.CheckConstraint("ordinal >= 0"),
         sa.CheckConstraint(
             "(role = 'checkpoint_artifact' AND subject_kind = 'variant_run') OR "
-            "(role != 'checkpoint_artifact' AND subject_kind = 'evaluation_attempt')"
+            "(role IN ('log_asset', 'analysis_asset') AND subject_kind IN ('variant_run', 'evaluation_attempt')) OR "
+            "(role = 'result_content' AND subject_kind = 'evaluation_attempt')"
         ),
         sa.CheckConstraint(
             "role IN ('checkpoint_artifact', 'log_asset', 'analysis_asset', "

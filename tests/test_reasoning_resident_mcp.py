@@ -100,7 +100,7 @@ class _MalformedChannelAuthority(_FullConformanceAuthority):
         channel = super().issue_resident_mcp_channel(**kwargs)  # type: ignore[arg-type]
         bindings = list(channel.binding.operation_bindings)
         if self._mutation == "missing_currentness":
-            bindings = bindings[1:]
+            bindings = [b for b in bindings if b["semantic_operation_id"] != "advancement_engine.reasoning_stage_run.observe"]
         elif self._mutation == "effect_without_reconcile":
             bindings[1] = {
                 **bindings[1],
@@ -218,6 +218,8 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
     try:
         runtime.harnesses.start_full_conformance(_full_request())
         for _turn in range(4):
+            if runtime.harnesses.query_status()["status"] == "ready":
+                break
             assert runtime.harnesses.advance_full_conformance(
                 mcp_base_url="http://127.0.0.1:8765"
             )
@@ -311,7 +313,7 @@ def test_real_harness_authority_issues_only_current_reasoning_operations(
 
         with pytest.raises(
             HarnessAdmissionError,
-            match="attempt_fence_invalid|reasoning_runtime_scope_invalid",
+            match="attempt_fence_invalid|reasoning_runtime_scope_invalid|root_agent_human_request_scope_stale",
         ):
             runtime.harnesses.issue_resident_mcp_channel(
                 run_ref=run.run_ref,

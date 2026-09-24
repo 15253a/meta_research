@@ -11,6 +11,11 @@ def snapshot_cached(query):
         if cache is None:
             return query(owner, *args, **kwargs)
         key = (owner, query, args, tuple(sorted(kwargs.items())))
+        try:
+            hash(key)
+        except TypeError:
+            # Preserve the original query behavior for unhashable inputs.
+            return query(owner, *args, **kwargs)
         if key not in cache:
             # Never retain failures or let callers mutate the cached proof.
             cache[key] = deepcopy(query(owner, *args, **kwargs))

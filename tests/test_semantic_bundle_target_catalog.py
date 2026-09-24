@@ -369,6 +369,10 @@ def _gateway():
         research_memory=memory,
         agent_runtime=runtime,
         human_collaboration_snapshot=lambda: _snapshot("human_collaboration"),
+        human_collaboration=SimpleNamespace(
+            query_research_help_page=lambda **values: {"items": [], "next_cursor": None},
+            query_human_request=lambda request_ref: None,
+        ),
         target_run_agent=target_agent,
     )
     return gateway, graph, memory, runtime
@@ -422,7 +426,7 @@ def test_bundle_and_target_catalogs_contain_only_registered_reconciled_operation
             assert by_id[reconcile_id]["access_mode"] == "reconcile"
 
 
-def test_formal_catalog_schemas_are_closed_at_every_declared_object_boundary():
+def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content():
     gateway, _graph, _memory, _runtime = _gateway()
     operation_ids = (
         *BUNDLE_ROOT_SEMANTIC_OPERATION_IDS,
@@ -445,8 +449,28 @@ def test_formal_catalog_schemas_are_closed_at_every_declared_object_boundary():
             assert_closed(schema["items"])
 
     for tool in response["result"]["tools"]:
-        assert_closed(tool["inputSchema"])
-        assert_closed(tool["outputSchema"])
+        assert tool["inputSchema"].get("additionalProperties") is False
+        try:
+            # Dataset registration accepts the researcher's content definition.
+            if tool["name"] not in {
+                "research_graph.datasets.register",
+                "research_graph.datasets.register_version",
+            }:
+                assert_closed(tool["inputSchema"])
+            if not (tool["name"].startswith(("research_graph.baselines.", "research_graph.datasets."))
+                    or tool["name"] in {
+                        "research_graph.target_formal_results.read",
+                        "research_memory.research_notes.read",
+                        "research_memory.stage_context.read",
+                        "human_request.open",
+                        "human_request.open.reconcile",
+                        "agent_runtime.target_run.progress",
+                    }):
+                # Bounded content readers and human requests preserve their
+                # selected research content without a second fixed schema.
+                assert_closed(tool["outputSchema"])
+        except AssertionError as error:
+            raise AssertionError(tool["name"]) from error
 
 
 def test_bundle_inbox_read_uses_owner_cursor_and_exact_call_scope():

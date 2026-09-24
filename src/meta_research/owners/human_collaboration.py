@@ -230,6 +230,10 @@ class HumanCollaborationInterface(Protocol):
 
     def query_human_request(self, request_ref: str) -> dict[str, object] | None: ...
 
+    def query_research_help_page(
+        self, *, quest_ref: str, cursor: str | None = None, limit: int = 12
+    ) -> dict[str, object]: ...
+
     def respond_to_human_request(
         self,
         request_ref: str,
@@ -412,6 +416,7 @@ class HumanCollaborationInterface(Protocol):
         context_ref: str,
         *,
         literature_snapshot_ref: str,
+        candidate: object,
         idempotency_key: str,
     ) -> dict[str, object]: ...
 
@@ -1707,7 +1712,10 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         return authorization
 
 
-class SQLiteHumanCollaboration:
+from meta_research.human_research_input import HumanResearchInputMixin
+
+
+class SQLiteHumanCollaboration(HumanResearchInputMixin):
     def __init__(
         self,
         database: Database,
@@ -1969,6 +1977,47 @@ class SQLiteHumanCollaboration:
             if error.code == "human_request_not_found":
                 return None
             raise
+
+    def query_research_help_page(
+        self, *, quest_ref: str, cursor: str | None = None, limit: int = 12
+    ) -> dict[str, object]:
+        """Read a bounded cross-issuer page, including answered prior requests.
+
+        Keyset pagination keeps older pages stable when a new request arrives.
+        Each selected record is still verified by its original issuing Owner.
+        """
+        if not isinstance(quest_ref, str) or not quest_ref or len(quest_ref) > 256:
+            raise OwnerConflict("human_request_quest_ref_invalid")
+        if type(limit) is not int or not 1 <= limit <= 12:
+            raise OwnerConflict("research_help_page_invalid")
+        parameters = {"quest_ref": quest_ref, "limit": limit + 1}
+        clause = ""
+        if cursor is not None:
+            try:
+                before = json.loads(cursor)
+                if (not isinstance(before, list) or len(before) != 2
+                    or type(before[0]) not in {float, int} or not math.isfinite(before[0])
+                    or not isinstance(before[1], str) or not before[1]
+                    or len(before[1]) > 96):
+                    raise ValueError("cursor")
+                parameters.update(before_time=before[0], before_ref=before[1])
+            except (TypeError, ValueError) as error:
+                raise OwnerConflict("research_help_cursor_invalid") from error
+            clause = " AND (created_at < :before_time OR (created_at = :before_time AND request_ref < :before_ref))"
+        with self._database.read_snapshot() as connection:
+            rows = connection.execute(text(
+                "SELECT request_ref, created_at FROM owner_human_requests WHERE quest_ref = :quest_ref"
+                + clause + " ORDER BY created_at DESC, request_ref DESC LIMIT :limit"
+            ), parameters).all()
+            items = []
+            for row in rows[:limit]:
+                request = self.query_human_request(row.request_ref)
+                if request is None or request.get("quest_ref") != quest_ref:
+                    raise OwnerConflict("human_request_integrity_invalid")
+                items.append(request)
+        tail = rows[limit - 1] if len(rows) > limit else None
+        return {"items": items, "limit": limit,
+                "next_cursor": None if tail is None else canonical_json([float(tail.created_at), tail.request_ref])}
 
     def send_companion_message(
         self,
@@ -3250,6 +3299,7 @@ class SQLiteHumanCollaboration:
         context_ref: str,
         *,
         literature_snapshot_ref: str,
+        candidate: object,
         idempotency_key: str,
     ) -> dict[str, object]:
         _require_nonempty_ref(context_ref, "autonomous_context_ref")
@@ -3275,12 +3325,11 @@ class SQLiteHumanCollaboration:
             if row is None:
                 raise OwnerConflict("autonomous_creation_context_unavailable")
             source = _decoded_mapping(row.source_json, "autonomous_creation_source")
-            source_outcome = _decoded_mapping(
-                row.scientific_outcome_json, "autonomous_scientific_outcome"
-            )
-            scope = _decoded_mapping(
-                row.autonomous_scope_json, "autonomous_creation_scope"
-            )
+            if (candidate.checkpoint_ref != row.reasoning_checkpoint_ref or candidate.scientific_outcome_ref != source["scientific_outcome_ref"]):
+                raise OwnerConflict("autonomous_creation_source_invalid")
+            self._research_memory.verify_reasoning_scientific_candidate_receipt(request_ref=candidate.request_ref, submission_ref=candidate.submission_ref, content_ref=candidate.content_ref, checkpoint_ref=candidate.checkpoint_ref, checkpoint_hash=candidate.checkpoint_hash, outcome_hash=candidate.outcome_hash, autonomous_scope_hash=candidate.autonomous_scope_hash, review_hash=candidate.review_hash, receipt=candidate.receipt)
+            source_outcome = candidate.scientific_outcome
+            scope = candidate.autonomous_scope
             proposal = autonomous_question_proposal_from_scope(
                 scope,
                 source_outcome=source_outcome,

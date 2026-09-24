@@ -146,8 +146,8 @@ class _IdeaProvider:
         return IdeaSkillResult(
             reviewed_draft=draft.draft,
             final_outcome=draft.draft,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,

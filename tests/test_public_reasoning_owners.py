@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import meta_research.owners.research_graph as research_graph_module
 from meta_research.database import Database
 from meta_research.deepfetch import DeepFetchRunRequest, DeepFetchRuntimeBinding
 from meta_research.feed import DurableFeed
@@ -323,6 +324,7 @@ def _accepted_snapshot(memory: SQLiteResearchMemory):
         attempt_generation=1,
         provider_operation_ref="deepfetch-operation:reasoning",
         provider_operation_generation=1,
+        provider_operation_retry_permitted=False,
         root_session_ref="deepfetch-root:reasoning",
         native_session_ref="deepfetch-native:reasoning",
         fence_ref="deepfetch-fence:reasoning",
@@ -543,14 +545,14 @@ def _review(
     )
     return {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "review_mode": "harness_child_agent",
-        "reviewer_agent_ref": "reasoning-child:1",
+
+
         "reviewed_draft_hash": canonical_hash(output),
-        "findings": findings,
-        "dispositions": dispositions,
+
+
         "final_output_hash": canonical_hash(output),
-        "independent": True,
-        "advisory_only": True,
+
+
     }
 
 
@@ -559,26 +561,14 @@ def _revised_review(
 ) -> dict[str, object]:
     return {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "review_mode": "harness_child_agent",
-        "reviewer_agent_ref": "reasoning-child:resume",
+
+
         "reviewed_draft_hash": canonical_hash(reviewed_draft),
-        "findings": [
-            {
-                "finding_id": "finding:resume-transition",
-                "category": "owner_boundary",
-                "message": "Close the staged science with one outward transition.",
-            }
-        ],
-        "dispositions": [
-            {
-                "finding_id": "finding:resume-transition",
-                "action": "revised",
-                "rationale": "The final output adds the unique accepted transition.",
-            }
-        ],
+
+
         "final_output_hash": canonical_hash(final_output),
-        "independent": True,
-        "advisory_only": True,
+
+
     }
 
 
@@ -1015,6 +1005,7 @@ def _accepted_autonomous_snapshot(
         attempt_generation=1,
         provider_operation_ref="deepfetch-operation:autonomous",
         provider_operation_generation=1,
+        provider_operation_retry_permitted=False,
         root_session_ref="deepfetch-root:autonomous",
         native_session_ref="deepfetch-native:autonomous",
         fence_ref="deepfetch-fence:autonomous",
@@ -1302,8 +1293,13 @@ def test_rm_refuses_a_literature_snapshot_disguised_as_a_revision(
         database.close()
 
 
+def _domain_reasoning_decision(review):
+    """Exercise persisted domain rejection independently of advisory review."""
+    return "rejected", "scientific_domain_conflict", ("The accepted source binding conflicts with the proposed interpretation.",)
+
+
 def test_rg_persists_accepted_and_rejected_reasoning_decisions(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
     database, memory, _receipts, graph, graph_receipts = _owners(tmp_path)
     try:
@@ -1315,7 +1311,12 @@ def test_rg_persists_accepted_and_rejected_reasoning_decisions(
             outcome_ref="scientific-outcome:rejected",
             unresolved=True,
         )
-        rejected = graph.decide_reasoning_outcome(content=rejected_content)
+        with monkeypatch.context() as domain:
+            domain.setattr(
+                research_graph_module, "_evaluate_reasoning_outcome",
+                _domain_reasoning_decision,
+            )
+            rejected = graph.decide_reasoning_outcome(content=rejected_content)
         assert rejected.decision == "rejected"
         assert rejected.outcome_ref is None
         assert rejected.receipt.kind == REASONING_REJECTED_RECEIPT_KIND
@@ -1349,7 +1350,7 @@ def test_rg_persists_accepted_and_rejected_reasoning_decisions(
             accepted.outcome_ref,
             accepted.receipt,
         )
-        assert transition == {
+        assert {key: value for key, value in transition.items() if key != "scientific_summary"} == {
             "scientific_disposition": (
                 accepted_content.scientific_outcome["disposition"]
             ),
@@ -1501,105 +1502,12 @@ def test_rg_candidate_completion_rejects_goal_outside_frozen_reasoning_lineage(
         database.close()
 
 
-def test_autonomous_science_is_accepted_before_the_unique_final_transition(
-    tmp_path: Path,
-) -> None:
+def test_initial_execution_checkpoint_cannot_accept_science_before_summary(tmp_path: Path) -> None:
     database, memory, receipts, graph, graph_receipts = _owners(tmp_path)
     try:
-        revision = _revision(memory)
-        rejected_content = _accept_scientific_candidate(
-            memory,
-            revision,
-            submission_ref="reasoning-science:rejected",
-            outcome_ref="scientific-outcome:staged-rejected",
-            unresolved=True,
-        )
-        assert rejected_content.receipt.kind == (
-            REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND
-        )
-        rejected = graph.decide_reasoning_scientific_candidate(
-            content=rejected_content
-        )
-        assert rejected.decision == "rejected"
-        assert rejected.outcome_ref is None
-        assert rejected.receipt.kind == REASONING_SCIENTIFIC_REJECTED_RECEIPT_KIND
-
-        candidate = _accept_scientific_candidate(
-            memory,
-            revision,
-            submission_ref="reasoning-science:accepted",
-            outcome_ref="scientific-outcome:staged-accepted",
-        )
-        assert memory.query_reasoning_scientific_candidate_by_outcome_ref(
-            candidate.scientific_outcome_ref
-        ) == candidate
-        receipts.verify_reasoning_scientific_candidate_receipt(
-            request_ref=candidate.request_ref,
-            submission_ref=candidate.submission_ref,
-            content_ref=candidate.content_ref,
-            checkpoint_ref=candidate.checkpoint_ref,
-            checkpoint_hash=candidate.checkpoint_hash,
-            outcome_hash=candidate.outcome_hash,
-            autonomous_scope_hash=candidate.autonomous_scope_hash,
-            review_hash=candidate.review_hash,
-            receipt=candidate.receipt,
-        )
-        scientific = graph.decide_reasoning_scientific_candidate(
-            content=candidate
-        )
-        assert scientific.decision == "accepted"
-        assert scientific.outcome_ref == candidate.scientific_outcome_ref
-        assert scientific.receipt.kind == REASONING_SCIENTIFIC_ACCEPTED_RECEIPT_KIND
-        assert graph.query_reasoning_scientific_decision_by_outcome_ref(
-            candidate.scientific_outcome_ref
-        ) == scientific
-        graph_receipts.verify_reasoning_scientific_decision(
-            request_ref=candidate.request_ref,
-            submission_ref=candidate.submission_ref,
-            decision="accepted",
-            outcome_ref=candidate.scientific_outcome_ref,
-            receipt=scientific.receipt,
-        )
-
-        records = revision["records"]
-        assert isinstance(records, list) and records
-        final_output = _stage_output(
-            str(records[0]["ref"]),
-            outcome_ref=candidate.scientific_outcome_ref,
-            completion=True,
-        )
-        final_output["scientific_outcome"] = candidate.scientific_outcome
-        context_pack = _context_pack(revision)
-        final_review = _revised_review(candidate.checkpoint, final_output)
-        final = memory.accept_reasoning_content(
-            request_ref=candidate.request_ref,
-            cycle_ref=candidate.cycle_ref,
-            foreground_epoch=candidate.foreground_epoch,
-            context_pack_ref=candidate.context_pack_ref,
-            context_pack_hash=candidate.context_pack_hash,
-            context_pack=context_pack,
-            stage_request_receipt=candidate.stage_request_receipt,
-            run_ref=candidate.run_ref,
-            attempt_ref=candidate.attempt_ref,
-            fence_ref=candidate.fence_ref,
-            submission_ref="reasoning-submission:staged-final",
-            outcome=final_output,
-            reviewed_draft=candidate.checkpoint,
-            review=final_review,
-            execution_receipt=_receipt(
-                "agent_runtime",
-                REASONING_ATTEMPT_EXECUTION_RECEIPT_KIND,
-                "reasoning-submission:staged-final",
-                "staged-final",
-            ),
-            scientific_candidate_content_receipt=candidate.receipt,
-            scientific_candidate_domain_receipt=scientific.receipt,
-        )
-        assert final.scientific_candidate_content_receipt == candidate.receipt
-        assert final.scientific_candidate_domain_receipt == scientific.receipt
-        accepted = graph.decide_reasoning_outcome(content=final)
-        assert accepted.decision == "accepted"
-        assert accepted.outcome_ref == candidate.scientific_outcome_ref
-        assert accepted.feedback == ()
+        with pytest.raises(OwnerConflict, match="reasoning_scientific_candidate_lineage_invalid"):
+            _accept_scientific_candidate(memory, _revision(memory),
+                submission_ref="reasoning-science:premature", outcome_ref="scientific-outcome:premature")
+        assert memory.query_reasoning_scientific_candidate_by_outcome_ref("scientific-outcome:premature") is None
     finally:
         database.close()

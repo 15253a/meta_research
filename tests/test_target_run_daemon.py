@@ -420,6 +420,8 @@ def test_public_snapshot_projects_only_target_run_worker_health(
         prepare_data_root(tmp_path / "target-run-health")
     )
 
+    original_inventory = runtime.owners.agent_runtime.list_target_root_work_refs
+
     def fail_closed_inventory():
         raise OwnerConflict("target_run_frontier_integrity_invalid")
 
@@ -478,6 +480,25 @@ def test_public_snapshot_projects_only_target_run_worker_health(
                 "status": "unavailable",
                 "last_error": "target_run_frontier_integrity_invalid",
             }
+            # Recovery changes only worker health; the cache must observe it
+            # even when no research Owner has emitted a durable event.
+            revision = runtime.feed.query_readiness().current_revision
+            monkeypatch.setattr(
+                runtime.owners.agent_runtime,
+                "list_target_root_work_refs",
+                original_inventory,
+            )
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                snapshot = client.get("/api/v1/snapshot").json()
+                checks = {item["name"]: item for item in snapshot["readiness"]["checks"]}
+                if checks["target_run_worker"]["status"] == "ready":
+                    break
+                time.sleep(0.01)
+            assert checks["target_run_worker"] == {
+                "name": "target_run_worker", "status": "ready"
+            }
+            assert runtime.feed.query_readiness().current_revision == revision
     finally:
         client.close()
         runtime.close()

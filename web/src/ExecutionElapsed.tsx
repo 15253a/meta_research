@@ -7,9 +7,13 @@ export type ExecutionClockSample = {
 };
 
 /** Server timestamps establish the age; the local monotonic clock only ticks it. */
-export function ExecutionElapsed({ sample }: { sample: ExecutionClockSample | null }) {
+export function ExecutionElapsed({ sample, ended = false }: {
+  sample: ExecutionClockSample | null;
+  ended?: boolean;
+}) {
   const [now, setNow] = useState(() => performance.now());
   useEffect(() => {
+    if (ended) return;
     const tick = () => setNow(performance.now());
     const timer = window.setInterval(tick, 1_000);
     document.addEventListener("visibilitychange", tick);
@@ -17,7 +21,12 @@ export function ExecutionElapsed({ sample }: { sample: ExecutionClockSample | nu
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", tick);
     };
-  }, []);
+  }, [ended]);
+  if (ended) return <span className="research-execution-clock" aria-live="off">
+    <span aria-hidden="true">◷</span> 输出已结束 · {sample
+      ? <>最后记录于 <time dateTime={new Date(sample.sourceUpdatedAt * 1_000).toISOString()}>{new Date(sample.sourceUpdatedAt * 1_000).toLocaleString()}</time></>
+      : "最后记录时间不可用"}
+  </span>;
   const seconds = sample ? Math.floor(Math.max(0,
     sample.observedAt - sample.sourceUpdatedAt + Math.max(0, now - sample.receivedAt) / 1_000,
   )) : null;

@@ -4,6 +4,7 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -361,8 +362,8 @@ def test_public_result_seam_does_not_claim_internal_reviewer_identity() -> None:
         scientific_outcome=output["scientific_outcome"],  # type: ignore[arg-type]
         next_cycle_proposal=output["next_cycle_proposal"],  # type: ignore[arg-type]
         candidate_completion=None,
-        findings=(),
-        dispositions=(),
+
+
         primary_session_ref="provider-session:1",
         review_mode="advisory_unobserved",
         reviewer_agent_ref=None,
@@ -374,14 +375,14 @@ def test_public_result_seam_does_not_claim_internal_reviewer_identity() -> None:
     assert final_output == output
     assert review == {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "review_mode": "advisory_unobserved",
-        "reviewer_agent_ref": None,
+
+
         "reviewed_draft_hash": canonical_hash(output),
-        "findings": [],
-        "dispositions": [],
+
+
         "final_output_hash": canonical_hash(output),
-        "independent": False,
-        "advisory_only": True,
+
+
     }
     assert validate_reasoning_skill_result(request, result) == (
         canonical_hash(output),
@@ -734,9 +735,9 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     primary = _stage_output()
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "findings": [],
+
         "final_output": primary,
-        "dispositions": [],
+
     }
     runner = _SequenceRunner([primary, review])
     authority = _FullConformanceAuthority()
@@ -759,9 +760,9 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     assert result.outcome_document() == primary
     assert result.primary_session_ref == "provider-session:1"
     assert result.reviewer_agent_ref is None
-    assert binding.model_ref == "gpt-5.6-sol"
+    assert binding.model_ref == "gpt-6-sol"
     assert (
-        "codex-config:model_reasoning_effort=max"
+        "codex-effective:reasoning.effort=max"
         in binding.resource_bindings
     )
     assert any(
@@ -771,7 +772,7 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
         for item in binding.resource_bindings
     )
     assert len(runner.calls) == 2
-    assert 'model_reasoning_effort="max"' in runner.calls[0][0]
+    assert 'model_reasoning_effort="ultra"' in runner.calls[0][0]
     assert runner.calls[1][0][-3:] == ["resume", "provider-session:1", "-"]
     assert len(authority.issued) == 2
     assert len(authority.revoked) == 2
@@ -834,16 +835,7 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     assert isinstance(evidence_item, dict)
     evidence_properties = evidence_item["properties"]
     assert isinstance(evidence_properties, dict)
-    assert evidence_properties["kind"] == {
-        "type": "string",
-        "enum": [
-            "AnalysisAsset",
-            "CheckpointArtifact",
-            "LiteratureRecord",
-            "LogAsset",
-            "MetricResult",
-        ],
-    }
+    assert evidence_properties["kind"] == {"type": "string", "minLength": 1}
     assert evidence_properties["ref"] == {"type": "string", "minLength": 1}
     assert evidence_properties["finding"]["enum"] == [
         "supporting",
@@ -872,9 +864,9 @@ def test_completion_rejection_feedback_reaches_reasoning_primary_and_review(
             primary,
             {
                 "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-                "findings": [],
+
                 "final_output": primary,
-                "dispositions": [],
+
             },
         ]
     )
@@ -913,16 +905,14 @@ def test_reasoning_result_does_not_require_internal_review_trace(
 ) -> None:
     base_request = _request()
     if autonomous:
-        from test_public_autonomous_creation import _AutonomousReasoningSkill
-
-        primary = _AutonomousReasoningSkill().generate_draft(base_request).draft
+        primary = _autonomous_checkpoint_fixture(base_request)
     else:
         primary = _stage_output()
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "findings": [],
+
         "final_output": primary,
-        "dispositions": [],
+
     }
     workspace = tmp_path / f"reasoning-terminal-{autonomous}"
     executable = _fake_codex(tmp_path / f"codex-terminal-{autonomous}")
@@ -958,13 +948,15 @@ def test_reasoning_result_does_not_require_internal_review_trace(
     assert len(runner.calls) == 2
 
 
+def _autonomous_checkpoint_fixture(request):
+    from test_public_reasoning_autonomous_checkpoint import _checkpoint
+    return _checkpoint(SimpleNamespace(request_ref=request.stage_request_ref, context_pack=request.context_pack, cycle_ref=request.cycle_ref, epoch=request.foreground_epoch, accepted_question=SimpleNamespace(question_ref=request.question_ref, quest_ref=request.quest_ref)), question_title="A literature-informed follow-up")
+
+
 def _autonomous_resume_fixture(
     request: ReasoningSkillRequest,
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
-    from test_public_autonomous_creation import _AutonomousReasoningSkill
-
-    deterministic = _AutonomousReasoningSkill()
-    checkpoint = deterministic.generate_draft(request).draft
+    checkpoint = _autonomous_checkpoint_fixture(request)
     assert (
         checkpoint["schema_ref"]
         == REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF
@@ -987,16 +979,14 @@ def _autonomous_resume_fixture(
             "graph_revision_ref": "graph-revision:autonomous:1",
         },
     }
-    expected = deterministic.resume_after_autonomous_creation(
-        replace(request, native_session_ref="provider-session:1"),
-        checkpoint,
-        creation_result,
-    )
+    from test_reasoning_summary_decision_flow import final_output
+    creation_result["scientific_outcome"] = checkpoint["scientific_outcome"]
+    output = final_output(checkpoint, creation_result["question_anchor"])
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "findings": list(expected.findings),
-        "final_output": expected.outcome_document(),
-        "dispositions": list(expected.dispositions),
+
+        "final_output": output,
+
     }
     return checkpoint, creation_result, review
 
@@ -1047,9 +1037,9 @@ def test_reasoning_result_does_not_require_semantic_call_trace(
     primary = _stage_output()
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-        "findings": [],
+
         "final_output": primary,
-        "dispositions": [],
+
     }
     checkpoint: dict[str, object] | None = None
     creation_result: dict[str, object] | None = None

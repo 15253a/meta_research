@@ -19,6 +19,7 @@ import json
 import math
 from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Mapping, cast
 
 from meta_research.bundle_protocol import (
@@ -27,23 +28,14 @@ from meta_research.bundle_protocol import (
     BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES,
     BUNDLE_ROOT_MAX_NODES,
     BUNDLE_ROOT_MAX_SERIALIZED_BYTES,
-    GREENFIELD_EXCEPTIONS,
-    REUSE_TIER_ORDER,
-    REUSE_TIERS,
     BundleProtocolError,
-    ContentBindingProof,
     ExperimentBrief,
     HeldFixedBinding,
-    ReceiptProof,
-    ReuseSourceProof,
-    ReuseTierDecision,
-    ReuseTrace,
     RouteSpec,
     StrategyUpdate,
     TargetCandidate,
     projection_plain_value,
     validate_closed_bundle_projection,
-    validate_receipt_proof,
 )
 from meta_research.plan_contract import PLAN_DOCUMENT_SCHEMA_REF
 
@@ -87,12 +79,6 @@ _DOMAIN_ROUTING_FIELDS = frozenset(
     }
 )
 
-_OWNER_ELIGIBLE_REUSE_TIERS = frozenset(
-    {"accepted-local", "related-history", "global-baseline-pool"}
-)
-_REUSE_DISPOSITIONS = frozenset(
-    {"selected", "rejected", "not_found", "not_applicable"}
-)
 _PLAN_BRIEF_FIELDS = frozenset(
     {
         "experiment_key",
@@ -112,7 +98,6 @@ _TARGET_CANDIDATE_FIELDS = frozenset(
         "held_fixed_bindings",
         "implementation_revision_ref",
         "code_changed",
-        "reuse_trace",
         "routes",
         "depends_on_labels",
         "direct_accepted_input_asset_refs",
@@ -244,6 +229,7 @@ class FormalStrategyUpdate:
     update: StrategyUpdate
     candidates: tuple[FormalTargetCandidate, ...]
     schema_ref: str = FORMAL_STRATEGY_UPDATE_SCHEMA_REF
+    notes: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -697,17 +683,12 @@ def strategy_update_from_dict(
     *,
     completion_contract: NormalizedCompletionContract,
 ) -> FormalStrategyUpdate:
-    document = _exact_dict(
-        value,
-        {
-            "schema_ref",
-            "revision",
-            "candidates",
-            "requires_accepted_labels",
-            "strategy_complete",
-        },
-        "formal_strategy_update_invalid",
-    )
+    document = _exact_object(value, "formal_strategy_update_invalid")
+    required = {"schema_ref", "revision", "candidates", "requires_accepted_labels", "strategy_complete"}
+    if set(document) not in (required, required | {"notes"}):
+        raise BundleTargetContractError("formal_strategy_update_invalid")
+    if "notes" in document and type(document["notes"]) is not str:
+        raise BundleTargetContractError("formal_strategy_update_notes_invalid")
     if document["schema_ref"] != FORMAL_STRATEGY_UPDATE_SCHEMA_REF:
         raise BundleTargetContractError("formal_strategy_update_schema_invalid")
     revision = _positive_int(document["revision"], "strategy revision")
@@ -733,7 +714,7 @@ def strategy_update_from_dict(
         strategy_complete=complete,
     )
     validate_closed_bundle_projection(update, "StrategyUpdate")
-    result = FormalStrategyUpdate(update=update, candidates=candidates)
+    result = FormalStrategyUpdate(update=update, candidates=candidates, notes=document.get("notes"))
     _validate_json_root(value, "FormalStrategyUpdate")
     return result
 
@@ -756,6 +737,8 @@ def strategy_update_to_dict(
         "requires_accepted_labels": list(update.update.requires_accepted_labels),
         "strategy_complete": update.update.strategy_complete,
     }
+    if update.notes is not None:
+        value["notes"] = update.notes
     _validate_json_root(value, "FormalStrategyUpdate")
     return value
 
@@ -1085,7 +1068,7 @@ def _validate_protocol_version(
     required = _validate_metric_definitions(
         protocol.required_metrics,
         "required_metrics",
-        allow_empty=False,
+        allow_empty=True,
     )
     optional = _validate_metric_definitions(
         protocol.optional_metrics,
@@ -1156,6 +1139,8 @@ def _validate_update_pair(
 ) -> None:
     if update.schema_ref != FORMAL_STRATEGY_UPDATE_SCHEMA_REF:
         raise BundleTargetContractError("formal_strategy_update_schema_invalid")
+    if update.notes is not None and type(update.notes) is not str:
+        raise BundleTargetContractError("formal_strategy_update_notes_invalid")
     _positive_int(update.update.revision, "strategy revision")
     _exact_bool(update.update.strategy_complete, "strategy complete")
     if update.update.candidates != tuple(item.candidate for item in update.candidates):
@@ -1224,10 +1209,9 @@ def _verify_candidate(
     bindings = _binding_map(candidate.held_fixed_bindings)
     if set(bindings) != expected_slots:
         raise BundleTargetContractError("candidate_held_fixed_binding_incomplete")
-    implementation = _ref(
+    _ref(
         candidate.implementation_revision_ref, "ImplementationRevisionRef"
     )
-    _verify_reuse_trace(candidate.reuse_trace, implementation)
     route_refs = tuple(route.route_ref for route in candidate.routes)
     if not route_refs or len(route_refs) != len(set(route_refs)):
         raise BundleTargetContractError("candidate_routes_incomplete")
@@ -1312,131 +1296,6 @@ def _verify_acyclic(candidates: Mapping[str, TargetCandidate]) -> None:
         raise BundleTargetContractError("strategy_dependency_cycle")
 
 
-def _verify_reuse_trace(trace: ReuseTrace, implementation_ref: str) -> None:
-    validate_closed_bundle_projection(trace, "ReuseTrace")
-    if not trace.tier_decisions:
-        raise BundleTargetContractError("reuse_trace_missing")
-    tiers = tuple(item.tier for item in trace.tier_decisions)
-    if not set(tiers) <= REUSE_TIERS or len(tiers) != len(set(tiers)):
-        raise BundleTargetContractError("reuse_tier_set_invalid")
-    receipt_subjects: dict[str, str] = {}
-    content_by_subject: dict[str, str] = {}
-    for decision in trace.tier_decisions:
-        if decision.disposition not in _REUSE_DISPOSITIONS:
-            raise BundleTargetContractError("reuse_disposition_invalid")
-        _ref(decision.reason_ref, "reuse reason")
-        if decision.disposition in {"not_found", "not_applicable"} and (
-            decision.source_proofs
-        ):
-            raise BundleTargetContractError("reuse_absence_has_source")
-        if len(decision.source_proofs) != len(set(decision.source_proofs)):
-            raise BundleTargetContractError("reuse_source_proof_duplicate")
-        for source in decision.source_proofs:
-            _verify_reuse_source(
-                source,
-                decision=decision,
-                implementation_ref=implementation_ref,
-                receipt_subjects=receipt_subjects,
-                content_by_subject=content_by_subject,
-            )
-    selected = tuple(
-        item for item in trace.tier_decisions if item.disposition == "selected"
-    )
-    if len(selected) != 1 or not selected[0].source_proofs:
-        raise BundleTargetContractError("reuse_selected_source_missing")
-    selected_tier = selected[0].tier
-    if trace.greenfield_exception is not None:
-        if (
-            selected_tier != "self-implementation"
-            or trace.greenfield_exception not in GREENFIELD_EXCEPTIONS
-        ):
-            raise BundleTargetContractError("reuse_greenfield_exception_invalid")
-    else:
-        prior = set(REUSE_TIER_ORDER[: REUSE_TIER_ORDER.index(selected_tier)])
-        if not prior <= set(tiers):
-            raise BundleTargetContractError("reuse_nearer_tier_skipped")
-
-
-def _verify_reuse_source(
-    source: ReuseSourceProof,
-    *,
-    decision: ReuseTierDecision,
-    implementation_ref: str,
-    receipt_subjects: dict[str, str],
-    content_by_subject: dict[str, str],
-) -> None:
-    _ref(source.source_ref, "reuse source")
-    _ref(source.exact_version_ref, "reuse exact version")
-    _ref(source.implementation_revision_ref, "reuse implementation revision")
-    if source.eligible_tier != decision.tier:
-        raise BundleTargetContractError("reuse_source_tier_drift")
-    if source.implementation_binding.subject_ref != source.implementation_revision_ref:
-        raise BundleTargetContractError("reuse_implementation_binding_drift")
-    _sha256(
-        source.implementation_binding.content_hash_ref,
-        "reuse implementation content hash",
-    )
-    _receipt(
-        source.verification_receipt,
-        source.exact_version_ref,
-        receipt_subjects,
-    )
-    _receipt(
-        source.implementation_acceptance_receipt,
-        source.implementation_binding.content_hash_ref,
-        receipt_subjects,
-    )
-    previous_hash = content_by_subject.setdefault(
-        source.implementation_binding.subject_ref,
-        source.implementation_binding.content_hash_ref,
-    )
-    if previous_hash != source.implementation_binding.content_hash_ref:
-        raise BundleTargetContractError("reuse_content_binding_changed")
-    eligibility = (
-        source.eligibility_anchor_ref,
-        source.eligibility_binding,
-        source.eligibility_receipt,
-    )
-    if source.eligible_tier in _OWNER_ELIGIBLE_REUSE_TIERS:
-        if any(value is None for value in eligibility):
-            raise BundleTargetContractError("reuse_owner_eligibility_missing")
-        assert source.eligibility_anchor_ref is not None
-        assert source.eligibility_binding is not None
-        assert source.eligibility_receipt is not None
-        _ref(source.eligibility_anchor_ref, "eligible TargetCommit")
-        _ref(source.eligibility_binding.subject_ref, "eligibility subject")
-        _sha256(
-            source.eligibility_binding.content_hash_ref,
-            "eligibility content hash",
-        )
-        _receipt(
-            source.eligibility_receipt,
-            source.eligibility_binding.content_hash_ref,
-            receipt_subjects,
-        )
-        previous_eligibility = content_by_subject.setdefault(
-            source.eligibility_binding.subject_ref,
-            source.eligibility_binding.content_hash_ref,
-        )
-        if previous_eligibility != source.eligibility_binding.content_hash_ref:
-            raise BundleTargetContractError("reuse_eligibility_binding_changed")
-    elif any(value is not None for value in eligibility):
-        raise BundleTargetContractError("reuse_false_owner_eligibility")
-    if source.eligible_tier == "mature-external":
-        for name, value in (
-            ("license", source.license_ref),
-            ("source content hash", source.content_hash_ref),
-            ("patch", source.patch_ref),
-        ):
-            _ref(value, f"mature external {name}")
-        assert source.content_hash_ref is not None
-        _sha256(source.content_hash_ref, "mature external source content hash")
-    if decision.disposition == "selected" and (
-        source.implementation_revision_ref != implementation_ref
-    ):
-        raise BundleTargetContractError("reuse_selected_revision_not_executed")
-
-
 # ---------------------------------------------------------------------------
 # Canonical parsers
 
@@ -1461,7 +1320,6 @@ def _candidate_from_dict(value: object) -> TargetCandidate:
             document["implementation_revision_ref"], "ImplementationRevisionRef"
         ),
         code_changed=_exact_bool(document["code_changed"], "code_changed"),
-        reuse_trace=_reuse_trace_from_dict(document["reuse_trace"]),
         routes=tuple(
             _route_from_dict(item)
             for item in _object_list(document["routes"], "routes")
@@ -1504,116 +1362,6 @@ def _route_from_dict(value: object) -> RouteSpec:
             "external operation refs",
             allow_empty=True,
         ),
-    )
-
-
-def _reuse_trace_from_dict(value: object) -> ReuseTrace:
-    document = _exact_dict(
-        value, {"tier_decisions", "greenfield_exception"}, "reuse_trace_invalid"
-    )
-    exception = document["greenfield_exception"]
-    if exception is not None:
-        exception = _ref(exception, "greenfield exception")
-    return ReuseTrace(
-        tier_decisions=tuple(
-            _reuse_decision_from_dict(item)
-            for item in _object_list(document["tier_decisions"], "tier_decisions")
-        ),
-        greenfield_exception=cast(str | None, exception),
-    )
-
-
-def _reuse_decision_from_dict(value: object) -> ReuseTierDecision:
-    document = _exact_dict(
-        value,
-        {"tier", "disposition", "reason_ref", "source_proofs"},
-        "reuse_tier_decision_invalid",
-    )
-    return ReuseTierDecision(
-        tier=_ref(document["tier"], "reuse tier"),
-        disposition=_ref(document["disposition"], "reuse disposition"),
-        reason_ref=_ref(document["reason_ref"], "reuse reason"),
-        source_proofs=tuple(
-            _reuse_source_from_dict(item)
-            for item in _object_list(document["source_proofs"], "source_proofs")
-        ),
-    )
-
-
-def _reuse_source_from_dict(value: object) -> ReuseSourceProof:
-    fields = {
-        "source_ref",
-        "exact_version_ref",
-        "implementation_revision_ref",
-        "eligible_tier",
-        "verification_receipt",
-        "implementation_binding",
-        "implementation_acceptance_receipt",
-        "eligibility_anchor_ref",
-        "eligibility_binding",
-        "eligibility_receipt",
-        "license_ref",
-        "content_hash_ref",
-        "patch_ref",
-    }
-    document = _exact_dict(value, fields, "reuse_source_proof_invalid")
-    return ReuseSourceProof(
-        source_ref=_ref(document["source_ref"], "reuse source"),
-        exact_version_ref=_ref(document["exact_version_ref"], "reuse version"),
-        implementation_revision_ref=_ref(
-            document["implementation_revision_ref"], "reuse implementation"
-        ),
-        eligible_tier=_ref(document["eligible_tier"], "eligible tier"),
-        verification_receipt=_receipt_from_dict(document["verification_receipt"]),
-        implementation_binding=_binding_from_dict(document["implementation_binding"]),
-        implementation_acceptance_receipt=_receipt_from_dict(
-            document["implementation_acceptance_receipt"]
-        ),
-        eligibility_anchor_ref=_optional_ref(
-            document["eligibility_anchor_ref"], "eligibility anchor"
-        ),
-        eligibility_binding=(
-            None
-            if document["eligibility_binding"] is None
-            else _binding_from_dict(document["eligibility_binding"])
-        ),
-        eligibility_receipt=(
-            None
-            if document["eligibility_receipt"] is None
-            else _receipt_from_dict(document["eligibility_receipt"])
-        ),
-        license_ref=_optional_ref(document["license_ref"], "license ref"),
-        content_hash_ref=_optional_ref(
-            document["content_hash_ref"], "source content hash"
-        ),
-        patch_ref=_optional_ref(document["patch_ref"], "patch ref"),
-    )
-
-
-def _binding_from_dict(value: object) -> ContentBindingProof:
-    document = _exact_dict(
-        value, {"subject_ref", "content_hash_ref"}, "content_binding_invalid"
-    )
-    return ContentBindingProof(
-        subject_ref=_ref(document["subject_ref"], "content subject"),
-        content_hash_ref=_sha256(document["content_hash_ref"], "content hash"),
-    )
-
-
-def _receipt_from_dict(value: object) -> ReceiptProof:
-    document = _exact_dict(
-        value,
-        {"receipt_ref", "subject_ref", "verified", "currentness_known", "current"},
-        "receipt_proof_invalid",
-    )
-    return ReceiptProof(
-        receipt_ref=_ref(document["receipt_ref"], "receipt ref"),
-        subject_ref=_ref(document["subject_ref"], "receipt subject"),
-        verified=_exact_bool(document["verified"], "receipt verified"),
-        currentness_known=_exact_bool(
-            document["currentness_known"], "receipt currentness known"
-        ),
-        current=_exact_bool(document["current"], "receipt current"),
     )
 
 
@@ -1736,20 +1484,6 @@ def _binding_map(bindings: tuple[HeldFixedBinding, ...]) -> dict[str, str]:
     return result
 
 
-def _receipt(
-    receipt: ReceiptProof,
-    subject: str,
-    observed: dict[str, str],
-) -> None:
-    try:
-        validate_receipt_proof(receipt, subject_ref=subject)
-    except BundleProtocolError as error:
-        raise BundleTargetContractError("reuse_receipt_invalid") from error
-    previous = observed.setdefault(receipt.receipt_ref, subject)
-    if previous != subject:
-        raise BundleTargetContractError("reuse_receipt_identity_rebound")
-
-
 def _freeze_object(value: dict[str, object], name: str) -> FrozenJsonObject:
     return FrozenJsonObject(_canonical_json(value, name))
 
@@ -1762,6 +1496,30 @@ def _domain_document(value: object, name: str) -> FrozenJsonObject:
 
 
 def _validate_frozen_domain_document(
+    value: FrozenJsonObject,
+    name: str,
+) -> None:
+    # Memoize only successful pure validation of bounded, exact string values.
+    # Full content and name keys revalidate even a forcibly mutated frozen object;
+    # unusual types and larger values retain the original validation/error path.
+    if (
+        type(value) is FrozenJsonObject
+        and type(value.canonical_json) is str
+        and type(name) is str
+        and len(value.canonical_json) <= 16_384
+        and len(name) <= 128
+    ):
+        return _validate_small_frozen_domain_document(value.canonical_json, name)
+    return _validate_frozen_domain_document_uncached(value, name)
+
+
+@lru_cache(maxsize=256)
+def _validate_small_frozen_domain_document(canonical: str, name: str) -> None:
+    # Store only the successful None result, never a mutable parsed dictionary.
+    _validate_frozen_domain_document_uncached(FrozenJsonObject(canonical), name)
+
+
+def _validate_frozen_domain_document_uncached(
     value: FrozenJsonObject,
     name: str,
 ) -> None:
@@ -1784,6 +1542,11 @@ def _validate_domain_document_root(
 ) -> None:
     if not document:
         raise BundleTargetContractError(f"{name}_invalid")
+    # JSON Schema property names and annotations describe domain content. A
+    # result field named image, command, or provider is not execution routing.
+    # Retain the root envelope guard and all recursive guards for other domain
+    # documents; result-schema validation still checks its supported syntax.
+    schema_document = name == "measurement result schema"
     pending: list[object] = [document]
     while pending:
         value = pending.pop()
@@ -1796,7 +1559,8 @@ def _validate_domain_document_root(
                 raise BundleTargetContractError(
                     f"{name}_contains_runtime_routing"
                 )
-            pending.extend(nested.values())
+            if not schema_document:
+                pending.extend(nested.values())
         elif type(value) is list:
             pending.extend(cast(list[object], value))
 
@@ -1865,8 +1629,7 @@ def _canonical_json(value: object, name: str) -> str:
 
 
 def _canonical_hash(value: object, name: str) -> str:
-    _validate_json_root(value, name)
-    return hashlib.sha256(_canonical_json(value, name).encode("utf-8")).hexdigest()
+    return _validate_json_root(value, name)
 
 
 def _exact_dict(value: object, fields: set[str], code: str) -> dict[str, object]:
@@ -1926,10 +1689,6 @@ def _ref(value: object, name: str) -> str:
     if result != result.strip() or any(char in result for char in ("\x00", "\r", "\n")):
         raise BundleTargetContractError(f"{name}_invalid")
     return result
-
-
-def _optional_ref(value: object, name: str) -> str | None:
-    return None if value is None else _ref(value, name)
 
 
 def _metric_key(value: object) -> str:

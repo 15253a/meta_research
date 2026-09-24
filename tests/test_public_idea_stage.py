@@ -124,8 +124,8 @@ class _DeterministicIdeaSkill:
         return IdeaSkillResult(
             reviewed_draft=draft.draft,
             final_outcome=draft.draft,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
@@ -367,8 +367,6 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
         assert committed["run"]["review"] == {
             "status": "completed",
             "review_mode": "advisory_unobserved",
-            "finding_count": 0,
-            "disposition_count": 0,
         }
         persisted_run = runtime.owners.agent_runtime.query_idea_stage_run(
             committed["stage_run_request"]["request_ref"]
@@ -393,28 +391,8 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
             persisted_run.execution.outcome
         )
 
-        # The v2 field is additive. Already-issued v1 payloads keep their
-        # original public reviewer_session_ref instead of losing audit data.
-        legacy_review = dict(persisted_run.execution.review)
-        legacy_review["schema_ref"] = "meta-research/idea-advisory-review/v1"
-        legacy_review["reviewer_session_ref"] = "legacy-reviewer-session-1"
-        legacy_review.pop("review_mode")
-        legacy_review.pop("reviewer_agent_ref")
-        legacy_projection = _public_run(
-            replace(
-                persisted_run,
-                execution=replace(
-                    persisted_run.execution,
-                    review=legacy_review,
-                ),
-            )
-        )
-        assert legacy_projection["review"] == {
-            "status": "completed",
-            "review_mode": "legacy_external_session",
-            "reviewer_session_ref": "legacy-reviewer-session-1",
-            "finding_count": 0,
-            "disposition_count": 0,
+        assert set(persisted_run.execution.review) == {
+            "schema_ref", "reviewed_draft_hash", "final_outcome_hash"
         }
     finally:
         runtime.close()
@@ -431,9 +409,9 @@ class _CorrectedIdeaSkill(_DeterministicIdeaSkill):
             raise IdeaSkillUnavailable(
                 "idea_review_result_contract_invalid",
                 rejected_candidate={
-                    "findings": [],
+
                     "final_outcome": result.final_outcome,
-                    "dispositions": [],
+
                 },
                 rejected_native_session_ref=result.primary_session_ref,
                 rejected_detail_code="codex_output_invalid",
@@ -471,7 +449,8 @@ def test_idea_completion_rejection_keeps_history_and_resumes_same_session(
         )
         assert rejection["reason"]["detail"] == "codex_output_invalid"
         assert rejection["candidate"]["phase"] == "review"
-        assert rejection["candidate"]["result"]["findings"] == []
+        assert set(rejection["candidate"]["result"]) == {"final_outcome"}
+        assert rejection["candidate"]["result"]["final_outcome"]["kind"] == "IdeaSet"
         assert rejection["feedback"]
         assert rejection["provider_completion"]["status"] == "completed"
         assert rejection["receipt"]["kind"] == "root_completion_rejected"

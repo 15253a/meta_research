@@ -202,11 +202,10 @@ evidence. Do not start a replacement Session and do not self-report capability.
 """
 _TARGET_ROOT_HUMAN_REQUEST_CONTINUATION = """\
 
-An exact HumanRequest waiter for this Target root has been released. Continue
-in this same native Session. First call human_request.open.reconcile for the
-existing effect and read its persisted resolution; then decide whether that
-response is sufficient for the blocked work. Do not replace the Session or
-open a successor request unless the persisted resolution is insufficient.
+本 Target 根的精确 HumanRequest waiter 已解除。沿同一 native Session 继续，
+先用原 effect 调用 human_request.open.reconcile，读取已持久化的实际 resolution，
+再判断信息是否足够恢复受阻工作。仅当已核实答复仍不足时，提出缺少的具体后续请求；
+执行身份与 Session 的恢复沿 Owner 当前事实处理。
 """
 
 
@@ -2154,8 +2153,33 @@ class HarnessRuntime:
                 workspace_ref=workspace_ref,
             )
         )
+        terminal_replay_only = False
         if invocation_hash != operation.invocation_hash:
-            raise HarnessAdmissionError("harness_operation_conflict")
+            recover = getattr(
+                self._adapters[request.harness_family], "recover_terminal_prompt", None
+            )
+            frozen_prompt = None
+            if isinstance(request, TargetHarnessRequest) and callable(recover):
+                try:
+                    frozen_prompt = recover(self._provider_invocation(
+                        admission, request, prompt=prompt,
+                        mcp_base_url=mcp_base_url, operation_ref=operation_ref,
+                        workspace_ref=workspace_ref, working_directory=working_directory,
+                        entry_path="recovery",
+                    ))
+                except HarnessAdapterUnavailable as error:
+                    raise HarnessAdmissionError(error.code) from error
+            if not isinstance(frozen_prompt, str) or not frozen_prompt:
+                raise HarnessAdmissionError("harness_operation_conflict")
+            frozen_hash = canonical_hash(_turn_invocation_material(
+                admission, request, prompt=frozen_prompt, mcp_base_url=mcp_base_url,
+                operation_ref=operation_ref, generation=generation, resume=resume,
+                workspace_ref=workspace_ref,
+            ))
+            if frozen_hash != operation.invocation_hash:
+                raise HarnessAdmissionError("harness_operation_conflict")
+            prompt = frozen_prompt
+            terminal_replay_only = True
         reconciliation_generation = self._begin_operation_reconciliation(
             operation_ref
         )
@@ -2172,6 +2196,44 @@ class HarnessRuntime:
             workspace_ref=workspace_ref,
             working_directory=working_directory,
             human_request_continuation=human_request_continuation,
+            terminal_replay_only=terminal_replay_only,
+        )
+
+    @staticmethod
+    def _provider_invocation(
+        admission: HarnessAdmission,
+        request: HarnessProbeRequest,
+        *,
+        prompt: str,
+        mcp_base_url: str,
+        operation_ref: str,
+        workspace_ref: str | None,
+        working_directory: Path | None,
+        entry_path: Literal["initial", "resume", "recovery"],
+    ) -> HarnessInvocation:
+        return HarnessInvocation(
+            harness_family=request.harness_family,
+            provider_operation_ref=operation_ref,
+            run_ref=admission.run.run_ref,
+            attempt_ref=admission.run.attempt_ref,
+            attempt_generation=admission.run.attempt_generation,
+            root_session_ref=admission.run.root_session_ref,
+            fence_ref=admission.run.fence_ref,
+            model_ref=request.model_ref,
+            prompt=prompt,
+            mcp_url=mcp_base_url.rstrip("/") + admission.run.mcp_binding.endpoint_ref,
+            mcp_token=admission.connection.token,
+            native_session_ref=admission.run.native_session_ref,
+            target_workspace_ref=workspace_ref,
+            working_directory=None if working_directory is None else str(working_directory),
+            provider_operation_timeout_seconds=(
+                request.provider_operation_timeout_seconds
+                if isinstance(request, (ConformanceHarnessRequest, TargetHarnessRequest))
+                else None
+            ),
+            root_kind="target" if isinstance(request, TargetHarnessRequest) else None,
+            entry_path=entry_path,
+            authorized_operation_ids=request.required_operation_ids,
         )
 
     def _invoke_provider_turn(
@@ -2189,6 +2251,7 @@ class HarnessRuntime:
         workspace_ref: str | None = None,
         working_directory: Path | None = None,
         human_request_continuation: bool = False,
+        terminal_replay_only: bool = False,
     ) -> HarnessProbeRun:
         adapter = self._adapters[request.harness_family]
         entry_path = (
@@ -2242,46 +2305,14 @@ class HarnessRuntime:
                     next_retry_at=(None if retry is None else retry.next_retry_at),
                 ) from error
         try:
-            result = adapter.invoke(
-                HarnessInvocation(
-                    harness_family=request.harness_family,
-                    provider_operation_ref=operation_ref,
-                    run_ref=admission.run.run_ref,
-                    attempt_ref=admission.run.attempt_ref,
-                    attempt_generation=admission.run.attempt_generation,
-                    root_session_ref=admission.run.root_session_ref,
-                    fence_ref=admission.run.fence_ref,
-                    model_ref=request.model_ref,
-                    prompt=prompt,
-                    mcp_url=(
-                        mcp_base_url.rstrip("/")
-                        + admission.run.mcp_binding.endpoint_ref
-                    ),
-                    mcp_token=admission.connection.token,
-                    native_session_ref=admission.run.native_session_ref,
-                    target_workspace_ref=workspace_ref,
-                    working_directory=(
-                        None
-                        if working_directory is None
-                        else str(working_directory)
-                    ),
-                    provider_operation_timeout_seconds=(
-                        request.provider_operation_timeout_seconds
-                        if isinstance(
-                            request,
-                            (ConformanceHarnessRequest, TargetHarnessRequest),
-                        )
-                        else None
-                    ),
-                    root_kind=(
-                        "target"
-                        if isinstance(request, TargetHarnessRequest)
-                        else None
-                    ),
-                    entry_path=entry_path,
-                    authorized_operation_ids=request.required_operation_ids,
-                )
-            )
+            invoke = getattr(adapter, "invoke_terminal", None) if terminal_replay_only else adapter.invoke
+            if not callable(invoke):
+                raise HarnessAdapterUnavailable("provider_io_unavailable", durable_outcome="unknown")
+            result = invoke(self._provider_invocation(
+                admission, request, prompt=prompt, mcp_base_url=mcp_base_url,
+                operation_ref=operation_ref, workspace_ref=workspace_ref,
+                working_directory=working_directory, entry_path=entry_path,
+            ))
         except HarnessAdapterUnavailable as error:
             parked = (
                 self._checkpoint_target_root_human_request_session(
@@ -2323,6 +2354,14 @@ class HarnessRuntime:
                 and code in _PROVIDER_CEILING_CODES
                 and error.transport_receipt is not None
             )
+            stopped_session = (
+                isinstance(request, TargetHarnessRequest)
+                and admission.run.native_session_ref is None
+                and error.code == "provider_stopped"
+                and error.durable_outcome == "terminal"
+                and error.transport_receipt is not None
+                and error.native_session_ref is not None
+            )
             if not terminal_ceiling and reconciling and code in {
                 "provider_unavailable",
                 "provider_version_unavailable",
@@ -2332,8 +2371,8 @@ class HarnessRuntime:
                 "provider_outcome_unknown",
             }:
                 code = "provider_outcome_unknown"
-            retry = (
-                self._record_operation_failure(
+            if terminal_ceiling:
+                retry = self._record_operation_failure(
                     operation_ref,
                     code,
                     durable_outcome="terminal",
@@ -2341,9 +2380,28 @@ class HarnessRuntime:
                     runtime_effect=protection_effect,
                     predecessor_effects=predecessor_effects,
                 )
-                if terminal_ceiling
-                else self._record_operation_failure(operation_ref, code)
-            )
+            elif stopped_session:
+                try:
+                    retry = self._record_operation_failure(
+                        operation_ref, code,
+                        transport_receipt=error.transport_receipt,
+                        native_session_ref=error.native_session_ref,
+                    )
+                except HarnessAdmissionError:
+                    # A rejected native checkpoint cannot authorize a fresh
+                    # turn. Retain this operation for later reconciliation;
+                    # the Owner guard preserves concurrent pause/cancel facts.
+                    try:
+                        self._owner.record_operation_failure(
+                            operation_ref, "provider_outcome_unknown",
+                            durable_outcome="unknown",
+                            expected_running_run_ref=admission.run.run_ref,
+                        )
+                    except AgentRuntimeHarnessError as deferred_error:
+                        raise HarnessAdmissionError(deferred_error.code) from deferred_error
+                    raise
+            else:
+                retry = self._record_operation_failure(operation_ref, code)
             if terminal_ceiling and self._runtime_protection is not None:
                 self._runtime_protection.finish(
                     protection_effect.responsibility_ref,
@@ -3172,6 +3230,8 @@ class HarnessRuntime:
         ):
             raise HarnessAdmissionError("harness_probe_request_invalid")
         if isinstance(request, TargetHarnessRequest):
+            from meta_research.runtime_binding_compatibility import target_request_catalog_compatible
+
             if (
                 not request.target_ref
                 or len(request.target_ref) > 96
@@ -3181,8 +3241,10 @@ class HarnessRuntime:
                 != request.full_conformance_binding_hash
                 or len(request.full_conformance_binding_hash) != 64
                 or len(request.target_scope_binding_hash) != 64
-                or request.required_operation_ids
-                != TARGET_ROOT_SEMANTIC_OPERATION_IDS
+                or not target_request_catalog_compatible(
+                    request.required_operation_ids, request.full_conformance_binding,
+                    TARGET_ROOT_SEMANTIC_OPERATION_IDS,
+                )
                 or request.required_capabilities
                 not in {
                     _target_root_lifecycle_capabilities(resume=False),
@@ -3301,6 +3363,7 @@ class HarnessRuntime:
         transport_receipt: dict[str, object] | None = None,
         runtime_effect: RuntimeEffectIdentity | None = None,
         predecessor_effects: tuple[RuntimeEffectIdentity, ...] = (),
+        native_session_ref: str | None = None,
     ) -> AgentRuntimeHarnessRetry | None:
         try:
             if (
@@ -3308,10 +3371,15 @@ class HarnessRuntime:
                 and transport_receipt is None
                 and runtime_effect is None
                 and not predecessor_effects
+                and native_session_ref is None
             ):
                 return self._owner.record_operation_failure(
                     operation_ref, code
                 )
+            native_binding = (
+                {} if native_session_ref is None
+                else {"native_session_ref": native_session_ref}
+            )
             return self._owner.record_operation_failure(
                 operation_ref,
                 code,
@@ -3319,6 +3387,7 @@ class HarnessRuntime:
                 transport_receipt=transport_receipt,
                 runtime_effect=runtime_effect,
                 predecessor_effects=predecessor_effects,
+                **native_binding,
             )
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error

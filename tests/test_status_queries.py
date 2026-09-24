@@ -70,7 +70,8 @@ def test_status_uses_exact_foreground_and_excludes_historical_stage_runs(tmp_pat
         assert payload['current_task']['kind'] == 'stage'
         assert payload['current_task']['title'] == '研究思路'
         assert payload['current_task']['run_ref'] is None
-        assert payload['state'] == 'pending'
+        assert payload['state'] == 'failed'  # current Idea worker has not started
+        assert '研究推进暂时受阻' in payload['waiting_reason']
     finally:
         client.close()
         runtime.close()

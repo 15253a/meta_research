@@ -332,14 +332,14 @@ def test_plan_domain_validator_rejects_duplicate_question_trace_after_decode() -
         )
 
 
-def test_plan_rejects_an_incomplete_obligation_by_idea_matrix() -> None:
+def test_plan_rejects_trace_roles_absent_from_the_selected_idea_relationships() -> None:
     document = _plan_document()
     document["answer_contract"]["obligations"][0]["idea_relevance"].pop()
     contract = document["answer_contract"]
     contract.pop("answer_contract_hash")
     contract["answer_contract_hash"] = canonical_hash(contract)
 
-    with pytest.raises(PlanContractError, match="plan_idea_matrix_incomplete"):
+    with pytest.raises(PlanContractError, match="plan_idea_trace_invalid"):
         validate_plan_document(
             document,
             question_ref="question_1",

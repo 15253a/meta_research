@@ -1,61 +1,44 @@
 ---
 name: plan-stage
-description: 从当前 accepted Question binding 与完整 accepted IdeaSet 形成并评审可审计 PlanDocument 候选。用于 Plan Stage 推导 AnswerContract、核对 EvidenceRef、判定 coverage/gap、仅为 gap 形成 ExperimentBrief，并把候选交给 RM/RG Owner 接纳。
+description: 根据当前研究重心、构想与历史证据选择本轮投入及复盘条件，形成可接纳 PlanDocument；用于 Plan 阶段草稿、独立审阅和按反馈修订。
 ---
 
-# Plan Stage
+# Plan：选择本轮工作
 
-把一个冻结的 Plan invocation closure 收口成 `PlanDocument` 候选。拥有 AnswerContract、证据充分性、gap、ExperimentBrief 与 advisory review disposition 的研究判断；把内容保管、FormalPlan 身份、Run 与 Stage 推进留给对应 State Owner。
+把已接纳 Question、IdeaSet 与已有研究转化为值得投入的工作和重新判断的检查点。Question 可以跨多轮推进，本轮范围由当前研究需要决定。按根系统提示执行五入口、预算、人类输入和语言偏好；委派子智能体时传递范围与输出语言。
 
-开始前完整读取[语义合同](references/contract.md)和[Owner 操作](references/owner-operations.md)。
+字段语义见[Plan 契约](references/contract.md)；发现、精确引用与反馈处理见[Owner 操作](references/owner-operations.md)。
 
-## 1. 锁定闭包
+## 1. 读取当前认识
 
-1. 核对当前 `PlanStageRunRequest`、Execution Fence、runtime binding、ContextPack ref/hash、accepted Question binding/content 与 accepted IdeaSet binding/content。
-2. 只消费同一 Quest、Cycle、request 与 epoch 下的精确 ref、hash、schema 和 RM/RG/AE receipt；把缺失、漂移、不可用或未知结果返回为 typed blocker。
-3. 把 ContextPack 的 Evidence catalog 当成被冻结的可引用候选集合；搜索发现若没有当前 Owner 验证的精确 `EvidenceRef`，只作为研究观察。
+先读上轮综合、notes、已完成工作和相关证据。默认缺上轮摘要时，用 `research_memory.stage_context.read` 的 `source=question_history` 找已接纳结果，再用 `source=scientific_outcome`、`source_ref=outcome_ref` 读正文；缺摘要不代表没有历史。
 
-完成标准：Question、完整 IdeaSet 与 Evidence catalog 属于同一不可变调用闭包。
+明确本轮继续、复用及补充什么。复用 Idea 不继承旧 Plan 的 coverage、gap 或 Brief 状态；仍适用的工作保留精确来源，重做需说明新条件、疑点或预期增量。新 Cycle 或空 TargetGraph 本身不要求重跑。
 
-## 2. 冻结 AnswerContract
+完成条件：本轮投入依据与历史关系清楚，关键采用材料已读到精确原文。
 
-1. 从 Question 的 unknown、answer shape 与 applicability scope 推导非空 obligations。
-2. 让每个 obligation 追溯到 `answer_shape` 和至少一个其他 Question 字段。
-3. 对每个 `obligation × IdeaCandidate` 恰好记录一个 `query_lens | experiment_lens | not_relevant` 角色及理由。
-4. 在使用 EvidenceRef 前冻结 `answer_contract_hash`；语义变化产生新的合同闭包。
+## 2. 选择义务与检查点
 
-完成标准：每个 obligation 和每个 IdeaCandidate 都被完整交代，Question 语义没有扩张。
+选择非空 obligations：`statement` 表达本轮调查责任，`minimum_support` 和 notes 说明投入依据、拟取得观察与复盘条件。可调查广泛缺口或具体假设，履行意味着做过相关工作并如实报告，不能保证假设获支持或问题被解决。完整性只检查本轮承诺。
 
-## 3. 编译 PlanDocument
+每项义务通过 `question_trace` 指向实际相关 Question 字段；`idea_relevance` 仅记录真正影响义务的候选、角色和理由。读完整 IdeaSet 后取舍，无需逐项重复所有候选。
 
-1. 对每个 obligation 恰好形成 `covered | gap` 判定。
-2. 只用 ContextPack 中精确、不可变、当前可验证的 EvidenceRef；逐项记录 supported claim 与 support boundary。
-3. `covered` 至少有一个 evidence use 且没有 ExperimentBrief；`gap` 记录 insufficiency 并至少由一个 Brief 收口。
-4. 让 Brief 覆盖全部且只覆盖 gap。保存 goal、characteristics、boundary constraints、semantic delta 和 Idea provenance；把 Target、DAG、实现路线、Worker、Provider 与资源调度留给 Bundle。
-5. 机械派生 disposition：无 gap 且无 Brief 为 `no_new_experiment_required`；存在 gap 且全部由 Brief 收口为 `experiments_required`。
+局部工作条件与 Quest／Question 总体完成标准分开。已具备数据、方法和授权的局部工作可先取得限定证据；确需整体资格时在相关 Brief 说明。冻结核心科学语义后，由 Bundle／Target 自主判断实现、实际方法归属、补充核验与顺序；需要改变核心承诺时由 Reasoning 与后继 Cycle 承接。
 
-完成标准：AnswerContract、EvidenceReuseSet、coverage、GapSet、Brief 与 IdeaTrace 彼此闭合。
+## 3. 核实证据并形成 Brief
 
-## 4. 根会合质询
+先用相关历史或五入口索引发现，再按需分页和读取精确正文。首目录不限制候选全集，同 Quest 后续发现的已接纳来源可正式选用；未取得身份的新发现先作为研究观察。
 
-1. Owner 保存 primary draft checkpoint 后，在同一 managed native 根 Session 发起第二个 provider turn，只处理冻结闭包和完整草稿。
-2. 根 Agent 重新检查 Question 对齐、obligation/Idea 完整性、Evidence 支持边界、gap/Brief 闭合和 Owner 权限边界，形成 bounded findings；它不批准内容。
-3. 对每条 finding 给出唯一 `revised | not_adopted` disposition，并返回最终完整 PlanDocument。`revised` 必须产生实质变化。当前 record 固定为 `advisory_unobserved`、null reviewer、`independent=false`。
+逐 obligation 判断 `covered | gap`，写支持主张及边界。`covered` 至少有一个实际 evidence use；无测量观察、分析、负结果、人类输入等可按真实内容使用，来源类型不预设科学价值。`gap` 说明相对义务还缺什么，可有部分证据，但须由一个或多个 ExperimentBrief 覆盖。仍要消费的历史来源选入 evidence use，不能只在 notes 写“复用”。
 
-完成标准：真实第二个 provider turn 已完成并绑定 response hash，且每条 finding 均有处置。
+Brief 用 goal、characteristics、boundary constraints、semantic delta 和真实 Idea 来源说明目的、可接受观察与局部限制。Target、实现和依赖由 Bundle 决定。全部 covered 且无 Brief 时为 `no_new_experiment_required`；存在 gap 且均被 Brief 覆盖时为 `experiments_required`。
 
-## 5. 提交与恢复
+完成条件：每项义务有唯一覆盖判断，所有新工作对应真实缺口，复用来源与适用边界可核查。
 
-1. 正式写入前重验调用闭包与全部入选 EvidenceRef。
-2. 先让 Research Memory 接受不可变 PlanDocument 内容，再让 Research Graph 接受精确内容绑定及 FormalPlan 语义。
-3. 保留 RM checkpoint 与 RG decision 的独立 identity/receipt。`rejected` 在同一根 Session 中按正式 feedback 实质修订；未知结果只协调原 operation identity。
-4. RG accepted 后才允许 Agent Runtime 形成 execution-completed receipt；Advancement Engine 只在当前 request/epoch、AR receipt 与全部 Owner receipt 完整时形成 Plan StageCommit。
-5. `no_new_experiment_required` 只形成可验证的 Bundle skip basis；不伪造 Bundle Run。
+## 4. 独立审阅与提交
 
-完成标准：每个外部效果有类型化结果，恢复从第一个缺失的 durable receipt 继续且不重复副作用。
+委派原生独立子智能体审阅完整草稿和关键原文；根据自由格式反馈及自身判断修订并交接完整最终内容。同根自查不替代独立审阅，没有具体问题也可改稿。Owner 绑定草稿／最终 hash 并核验科研来源，不要求审查表单、审阅者身份证明或批准记录。
 
-## 收口检查
+输出 `answer_contract`、`coverage`、`experiment_briefs`、`notes` 等核心字段。首目录外实际读过并采用的来源放入最多 32 项 `additional_evidence_bindings`，精确格式见 Owner 操作。adapter 派生 `evidence_reuse_set`、`gap_set`、`idea_trace`、`bundle_disposition`、`source_bindings` 和合同 hash，不重复手填。拒绝时修订具体原因并保留来源；未知效果先对账原身份。
 
-- 永久保持 `execution completed != content accepted != domain accepted != Stage advanced`。
-- 只把 RG 接受且精确绑定 RM 内容的对象称为 FormalPlan。
-- Skill 不创建 Owner receipt、StageCommit、Bundle Run、Target、DAG、Worker 或 Provider 身份，也不接纳自己的候选。
+完成条件：真实 RM／RG 接纳及 AR／AE 交接可验证。Plan 不创建 receipt、StageCommit、Bundle Run 或 Target；无新实验只提供由 AE 核验的 skip 依据。

@@ -1058,6 +1058,7 @@ def write_exit_receipt(
     input_bytes: int,
     termination_reason: str = "completed",
     schema_ref: str = SUPERVISOR_EXIT_SCHEMA,
+    codex_home: Path | None = None,
 ) -> None:
     if schema_ref not in _SUPERVISOR_EXIT_SCHEMAS:
         raise ProviderSupervisorError("provider_supervisor_exit_invalid")
@@ -1078,6 +1079,20 @@ def write_exit_receipt(
         ),
     }
     _write_signed_envelope(path, payload, key)
+
+    # An observation cannot invalidate the signed execution receipt. Keep the
+    # additional report separately so historical receipt schemas stay exact.
+    try:
+        from meta_research.provider_call_observations import observe_provider_files
+        observation = observe_provider_files(prompt_path, stdout_path, codex_home=codex_home)
+        _write_signed_envelope(path.with_name("call-observation.json"), {
+            **observation, "invocation_hash": invocation_hash,
+            "output_schema_utf8_bytes": schema_path.stat().st_size,
+            "stdout_file_hash": payload["stdout_file_hash"],
+            "prompt_file_hash": payload["prompt_file_hash"],
+        }, key)
+    except (OSError, ValueError, UnicodeError, ProviderSupervisorError):
+        pass
 
 
 def read_verified_exit_receipt(
@@ -1660,6 +1675,7 @@ def _supervise_locked(
     ):
         raise ProviderSupervisorError("provider_supervisor_spool_invalid")
     selected_platform = process_platform.platform_name
+    invocation_codex_home: Path | None = None
     result_read_fd: int | None = None
     result_write_fd: int | None = None
     if selected_platform == "posix":
@@ -1704,6 +1720,8 @@ def _supervise_locked(
                     paths["ready_path"].parent / "supervisor-request.json"
                 ).resolve()
                 provider_environment = dict(os.environ)
+                if provider_environment.get("CODEX_HOME"):
+                    invocation_codex_home = Path(provider_environment["CODEX_HOME"])
                 provider_environment[PROVIDER_OPERATION_ENV] = str(operation_path)
                 spawn_options: dict[str, object] = {
                     "stdin": prompt_stream,
@@ -1884,6 +1902,7 @@ def _supervise_locked(
         input_bytes=input_bytes,
         termination_reason=termination_reason,
         schema_ref=exit_schema_ref,
+        codex_home=invocation_codex_home,
     )
 
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -16,6 +18,34 @@ DATA_ROOT_FORMAT = 1
 
 class DataRootError(RuntimeError):
     """The requested directory is not a compatible vNext data root."""
+
+
+def shared_provider_tools_root() -> Path | None:
+    """Deployment-level provider tool install shared by every data root.
+
+    Resolved from ``META_RESEARCH_PROVIDER_TOOLS`` when set, otherwise from a
+    ``provider-tools`` directory beside the running virtual environment (the
+    release layout: ``release/provider-tools`` next to ``release/.venv``).
+    The raw interpreter location is preferred over its resolved form because
+    managed venvs symlink their python to a base interpreter several
+    directories away.  Returns ``None`` when the location cannot be
+    determined.
+    """
+
+    override = os.environ.get("META_RESEARCH_PROVIDER_TOOLS", "")
+    if override:
+        return Path(override)
+    try:
+        executable = Path(sys.executable)
+        raw = executable.parent.parent.parent / "provider-tools"
+        resolved = executable.resolve().parent.parent.parent / "provider-tools"
+    except OSError:
+        return None
+    if (raw / "codex-cli").exists():
+        return raw
+    if (resolved / "codex-cli").exists():
+        return resolved
+    return raw
 
 
 @dataclass(frozen=True)
@@ -127,36 +157,98 @@ class DataRoot:
         executable = "codex.cmd" if os.name == "nt" else "codex"
         return self.codex_cli_install_root / "node_modules" / ".bin" / executable
 
-    def validated_codex_cli_executable(self) -> Path:
-        """Return the managed CLI path, rejecting an installed link that escapes it."""
+    def _codex_cli_install_candidates(
+        self, version: str | None = None
+    ) -> list[tuple[Path, Path]]:
+        """Managed installs to try, most specific first: (executable, install root).
 
-        executable = self.codex_cli_executable.absolute()
-        try:
-            executable.lstat()
-        except FileNotFoundError:
-            # Capability probing owns the normal "not installed" result.  The
-            # absolute managed path still prevents a fallback to global PATH.
+        The data-root install keeps precedence for roots that manage their own
+        CLI; the deployment-level shared install (versioned, then plain) is the
+        fallback so a fresh data root reuses the one CLI provisioned with the
+        release instead of needing its own copy.
+        """
+
+        executable = "codex.cmd" if os.name == "nt" else "codex"
+        relative = Path("node_modules") / ".bin" / executable
+        candidates: list[tuple[Path, Path]] = [
+            (self.codex_cli_install_root / relative, self.codex_cli_install_root)
+        ]
+        shared = shared_provider_tools_root()
+        if shared is not None:
+            shared_cli = shared / "codex-cli"
+            if version:
+                install_root = shared_cli / "installs" / version
+                candidates.append((install_root / relative, install_root))
+            candidates.append((shared_cli / relative, shared_cli))
+        return candidates
+
+    def validated_codex_cli_executable(self, version: str | None = None) -> Path:
+        """Return the managed CLI path, rejecting an installed link that escapes it.
+
+        A missing install returns the data-root default path unchanged:
+        capability probing owns the normal "not installed" result, and the
+        absolute managed path prevents a fallback to global PATH.
+        """
+
+        mismatched_installs = []
+        for candidate, install_root in self._codex_cli_install_candidates(version):
+            executable = candidate.absolute()
+            try:
+                executable.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise DataRootError(
+                    f"cannot inspect managed Codex executable: {executable}"
+                ) from error
+            try:
+                resolved_install_root = install_root.resolve(strict=True)
+                resolved = executable.resolve(strict=True)
+            except OSError as error:
+                raise DataRootError(
+                    f"cannot resolve managed Codex executable: {executable}"
+                ) from error
+            if not resolved.is_relative_to(resolved_install_root) or (
+                not resolved.is_file()
+            ):
+                raise DataRootError(
+                    f"managed Codex executable escapes its install root: {executable}"
+                )
+            if os.name == "posix" and not os.access(resolved, os.X_OK):
+                raise DataRootError(
+                    f"managed Codex executable is not executable: {executable}"
+                )
+            if version:
+                package = install_root / "node_modules/@openai/codex/package.json"
+                try:
+                    actual_version = json.loads(package.read_text())["version"]
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    raise DataRootError("managed Codex package metadata is invalid") from error
+                if actual_version != version:
+                    mismatched_installs.append(str(install_root))
+                    continue
+                manifest_path = install_root / "codex-install-manifest.json"
+                if manifest_path.exists():
+                    try:
+                        manifest = json.loads(manifest_path.read_text())
+                        if (manifest["schema"] != "meta-research/codex-cli-install/v1"
+                            or manifest["version"] != version
+                            or not manifest["files"]):
+                            raise ValueError("invalid manifest")
+                        for relative, expected_hash in manifest["files"].items():
+                            path = (install_root / relative).resolve(strict=True)
+                            if not path.is_relative_to(resolved_install_root):
+                                raise ValueError("manifest path escapes install")
+                            with path.open("rb") as stream:
+                                actual_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+                            if actual_hash != expected_hash:
+                                raise ValueError("manifest file hash mismatch")
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        raise DataRootError("managed Codex install manifest mismatch") from error
             return executable
-        except OSError as error:
-            raise DataRootError(
-                f"cannot inspect managed Codex executable: {executable}"
-            ) from error
-        try:
-            install_root = self.codex_cli_install_root.resolve(strict=True)
-            resolved = executable.resolve(strict=True)
-        except OSError as error:
-            raise DataRootError(
-                f"cannot resolve managed Codex executable: {executable}"
-            ) from error
-        if not resolved.is_relative_to(install_root) or not resolved.is_file():
-            raise DataRootError(
-                f"managed Codex executable escapes its install root: {executable}"
-            )
-        if os.name == "posix" and not os.access(resolved, os.X_OK):
-            raise DataRootError(
-                f"managed Codex executable is not executable: {executable}"
-            )
-        return executable
+        if mismatched_installs:
+            raise DataRootError(f"requested Codex version {version} is not installed")
+        return self.codex_cli_executable.absolute()
 
     @property
     def codex_environment(self) -> dict[str, str]:
@@ -286,6 +378,8 @@ def prepare_data_root(path: Path) -> DataRoot:
     ):
         _prepare_private_directory(directory)
 
+    _seed_codex_home_auth(root)
+
     if not root.object_store_marker.exists():
         _write_json_exclusive(
             root.object_store_marker,
@@ -300,6 +394,47 @@ def prepare_data_root(path: Path) -> DataRoot:
     if not root.control_key.exists():
         _write_exclusive(root.control_key, secrets.token_urlsafe(48), mode=0o600)
     return root
+
+
+def _seed_codex_home_auth(root: DataRoot) -> None:
+    """Seed a fresh CODEX_HOME with the deployment's Codex credentials.
+
+    Codex keeps its login inside ``CODEX_HOME/auth.json`` while sessions and
+    queues stay per research root, so a new root copies the deployment-level
+    credential template once and then owns its own state.  An existing auth
+    file is never overwritten; a missing or unreadable template is a silent
+    no-op (capability probing reports the unauthenticated provider).
+    """
+
+    auth = root.codex_home / "auth.json"
+    try:
+        if auth.exists():
+            return
+    except OSError:
+        return
+    template_override = os.environ.get("META_RESEARCH_CODEX_AUTH_TEMPLATE", "")
+    candidates: list[Path] = []
+    if template_override:
+        candidates.append(Path(template_override))
+    shared = shared_provider_tools_root()
+    if shared is not None:
+        candidates.append(shared / "codex-auth.json")
+    for candidate in candidates:
+        try:
+            payload = candidate.read_bytes()
+        except OSError:
+            continue
+        try:
+            json.loads(payload)
+        except ValueError:
+            continue
+        try:
+            root.codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            auth.write_bytes(payload)
+            os.chmod(auth, 0o600)
+        except OSError:
+            return
+        return
 
 
 def _prepare_private_directory(path: Path) -> None:

@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -3077,17 +3078,24 @@ function DeepFetchLiveEvents({
   events: DeepFetchActivityEvent[];
 }) {
   const logRef = useRef<HTMLDivElement>(null);
+  const pinnedRef = useRef(true);
   const lastSequence = events.at(-1)?.sequence ?? null;
 
-  useEffect(() => {
+  // The backend event window slides once it is full: every new event drops the
+  // oldest row while appending the newest. Animating a scroll-to-bottom on each
+  // sequence change made the log lurch every few seconds, so anchor instantly
+  // and only while the viewer is still pinned at the bottom.
+  const handleLogScroll = () => {
     const log = logRef.current;
-    if (!log || lastSequence === null) return;
-    log.scrollTo({
-      top: log.scrollHeight,
-      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
-        ? "auto"
-        : "smooth",
-    });
+    if (!log) return;
+    pinnedRef.current =
+      log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  };
+
+  useLayoutEffect(() => {
+    const log = logRef.current;
+    if (!log || lastSequence === null || !pinnedRef.current) return;
+    log.scrollTo({ top: log.scrollHeight });
   }, [attemptRef, lastSequence]);
 
   return (
@@ -3105,6 +3113,7 @@ function DeepFetchLiveEvents({
       </header>
       <div
         ref={logRef}
+        onScroll={handleLogScroll}
         className="quest-deepfetch-live-log"
         role="log"
         aria-live="polite"

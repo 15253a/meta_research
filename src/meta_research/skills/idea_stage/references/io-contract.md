@@ -1,19 +1,15 @@
-# Idea Stage 输入／输出契约
+# Idea 输入与交接
 
-## IdeaStageInvocation
+## 输入
 
-调用信封包含 exact `stage_request_ref`、validated runtime binding、ContextPack ref/hash、`AcceptedQuestionBinding` 与匹配的 content data，以及 Quest goal、文献、历史、Evidence 和 active guidance 的精确 binding。所有 ref/hash/schema/receipt 必须 immutable 且跨信封一致。
+`IdeaStageInvocation` 带精确 `stage_request_ref`、验证过的运行绑定、ContextPack ref／hash、`AcceptedQuestionBinding` 与匹配正文，以及 Quest 目标、文献、历史、证据和当前指导的绑定。默认正文给当前交接及相关索引；按需展开完整材料，索引不替代引用正文。身份、hash、schema 和 receipt 在信封中保持一致。
 
-`AcceptedQuestionBinding` 包含 Question/Quest/content ref、content hash/schema ref、RM content accepted receipt 与 RG Question accepted receipt。Question 内容作为另一个与 ref/hash 精确匹配的数据对象交付；Idea 只消费其语义，不拥有 Question schema 或生命周期。
+`AcceptedQuestionBinding` 含 Question／Quest／内容引用、内容 hash／schema、RM 内容 receipt 和 RG Question receipt；单独正文须与其精确匹配。Idea 消费科学含义，Question 的 schema 与生命周期由 Owner 管理。
 
-## IdeaSubmission
+当前 Evidence 首目录是发现页。需更多条目时用 `research_memory.stage_context.read` 的 `source=evidence_index` 分页，引用工具返回的精确资产版本。使用既有 `evidence_boundary.accepted_evidence_refs` 和 `NoViableCandidate.candidate_families_considered[].evidence_refs`，合计最多 100 个不同引用；按实际证据选择，不以数量作科研价值判断。RG 接纳及历史读回会核验同 Quest 角色、RM receipt 与精确内容。
 
-Submission 包含唯一 identity、Stage request、runtime binding、ContextPack、AcceptedQuestionBinding、实际 consumed/discovered inputs、`IdeaSet | NoViableCandidate`、Outcome hash、advisory review record 和 lineage。当前 review record 使用 `review_mode = advisory_unobserved`、`reviewer_agent_ref = null` 与 `independent = false`；真实的第二个根 provider turn 绑定 reviewed draft、bounded findings/dispositions 与 final Outcome，不声称未观测的 reviewer provenance。未被 Owner 接纳的新材料不能标记为 Evidence。
+## 输出与交接
 
-## Accepted handoff
+提交前按[主 Skill 的独立审阅与交接](../SKILL.md)执行。Plan 只消费完整已接纳交接：IdeaOutcome ref、RM 内容 ref／receipt、RG 领域 receipt、AR 执行完成 receipt 和 AE StageCommit ref。
 
-Plan 只接收完整 handoff：accepted IdeaOutcome ref、RM content ref/receipt、RG domain accepted receipt、AR run execution completed receipt 与 AE StageCommit ref。Draft、review finding、Session 状态、隐藏推理、rejection、unknown 或 ExhaustionProposal 都不是 accepted handoff。
-
-## 验收边界
-
-Submission、Owner accepted outcome 和 Stage handoff 是三个不同对象；RM/RG receipts 始终分开；StageCommit 只能作为外部 Owner 接纳结果进入 handoff。
+草稿、审阅反馈、Session 状态、拒绝、未知结果和 ExhaustionProposal 都不等于已接纳交接。Submission、Owner 接纳结果与阶段交接是不同对象；RM／RG receipts 分别核验，StageCommit 仅来自 AE。

@@ -12,7 +12,12 @@ import {
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { StatusHome } from "./StatusHome";
-import { ResearchIcon, spectrumStage } from "./Spectrum";
+import { OutputLanguageProvider, OutputLanguageControl } from "./OutputLanguage";
+import { observedActiveTarget } from "./activeTargetStatus";
+import { targetResearchFacts } from "./targetResearchFacts";
+import { BoundedDetails, PageWindow } from "./BoundedDetails";
+import { ResearchIcon, SpectrumStages, spectrumStage } from "./Spectrum";
+import { conversationContext, useWorkspaceStatus } from "./workspaceStatus";
 import {
   acknowledgeAssetIntake,
   adaptManualQuestionCreation,
@@ -79,10 +84,11 @@ import {
   TelemetryAuthorizationCard,
 } from "./HumanCollaboration";
 import "./shell.css";
-import { ResearchOverview, StageHistoryStrip, cycleOrdinalLabel, useResearchOverview } from "./ResearchOverview";
+import { ResearchOverview, ResearchTimeline, StageHistoryStrip, cycleOrdinalLabel, overviewQuestRef, useResearchOverview } from "./ResearchOverview";
 import { StageReadableOutput, TargetCommandOutput } from "./ReadableOutput";
-import { ExperimentLogs } from "./ExperimentLogs";
+import { ExperimentLogs, ExperimentOutputViews } from "./ExperimentLogs";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
+import { RootConversations, StageRootSessions, useRootConversations } from "./RootConversations";
 import "./research-interaction.css";
 import "./spectrum-workspace.css";
 
@@ -1371,6 +1377,7 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
       const sourceUpdatedAt = next.source_updated_at;
       if (typeof observedAt === "number" && Number.isFinite(observedAt) && observedAt > 0) {
         setExecutionClock(previous => {
+          if (current?.stream_ref !== next.stream_ref) previous = null;
           const source = typeof sourceUpdatedAt === "number" && Number.isFinite(sourceUpdatedAt) && sourceUpdatedAt > 0
             ? Math.max(sourceUpdatedAt, previous?.sourceUpdatedAt ?? 0) : previous?.sourceUpdatedAt;
           // A delayed poll must not rewind a clock already ticking for this record.
@@ -1410,6 +1417,7 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
     chunksRef.current = [];
     failuresRef.current = 0;
     setTerminal(null);
+    setExecutionClock(null);
     setChunks([]);
     setPreviousOutput(null);
     setFollowLive(true);
@@ -1479,7 +1487,7 @@ function StageRawOutputFeed({ item }: { item: ResearchActivityItem }) {
       <div className="research-output-context">
         <div className="research-output-meta">
           <span>{phaseLabel} · {error ? "读取中断 · 自动重试" : terminal?.status === "terminal" ? "本次输出结束" : terminal?.status === "replaced" ? "本次输出已替换" : loading && !terminal ? "正在读取" : "按实际记录更新"}</span>
-          <ExecutionElapsed sample={executionClock} />
+          <ExecutionElapsed sample={executionClock} ended={terminal?.status === "terminal" || terminal?.status === "replaced"} />
         </div>
         <details><summary>来源</summary><p>运行 {item.ref}</p><p>执行 {terminal?.operation_ref ?? "等待绑定"}</p><p>流 {terminal?.stream_ref ?? "等待记录"}</p></details>
       </div>
@@ -1611,17 +1619,27 @@ function ResearchTracePanel({snapshot, connected}: {
     .map(managedRunActivity).filter((item): item is ResearchActivityItem => item !== null)
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || a.ref.localeCompare(b.ref));
   const currentKind = stageManagedRunKinds[foreground?.stage.toLowerCase() as StagePosition];
+  const currentLabel = currentKind ? managedActivityKinds[currentKind].label : "当前阶段";
+  const currentWorkerFailure = foreground && snapshot.readiness.checks.find(check => (
+    check.name === `${foreground.stage.toLowerCase()}_stage_worker` && check.status === "unavailable"
+  ));
   const current = items.find(item => item.source === currentKind) ?? null;
   const selected = items.find(item => item.ref === selectedRef) ?? current;
   useEffect(() => setSelectedRef(null), [foreground?.cycle_ref, foreground?.stage]);
   return <section className="research-flow" id="research-activity" tabIndex={-1} aria-labelledby="research-trace-title">
     <header className="research-flow-heading">
       <h2 id="research-trace-title">研究过程</h2>
-    {items.length > 1 ? <label className="research-source-picker">查看记录 <select aria-label="研究记录来源" value={selected?.ref ?? ""} onChange={event => setSelectedRef(event.currentTarget.value)}>
+    {items.length > 1 || (!current && items.length > 0) ? <label className="research-source-picker">查看记录 <select aria-label="研究记录来源" value={selected?.ref ?? ""} onChange={event => setSelectedRef(event.currentTarget.value || null)}>
+      {!current ? <option value="">当前 · {currentLabel} · 尚未启动</option> : null}
       {items.map(item => <option key={item.ref} value={item.ref}>{item.ref === current?.ref ? "当前 · " : ""}{item.label} · {activityStatusCopy(item.status)}</option>)}
     </select>{selected?.ref !== current?.ref ? <button onClick={() => setSelectedRef(null)}>返回当前工作 ↗</button> : null}</label> : null}
       <span className="research-connection" data-connected={connected}><i />{connected ? "实时连接" : "连接中断 · 保留上次记录"}</span>
     </header>
+    {currentWorkerFailure ? <div className="lumen-idea-health-blocker" data-testid="research-current-worker-blocker" role="status">
+      <span aria-hidden="true">!</span>
+      <div><b>当前{currentLabel}暂时无法继续</b><small>当前阶段推进受阻；已完成的研究记录仍可查看。</small></div>
+      <code>{currentWorkerFailure.reason?.code ?? "worker_unavailable"}</code>
+    </div> : null}
     {selected ? <StageRawOutputFeed key={selected.ref} item={selected} /> : <p className="research-output-empty">本阶段还没有公开的主智能体记录。产生后会自动显示在这里。</p>}
   </section>;
 }
@@ -2790,25 +2808,33 @@ function validateTargetRawOutputPage(
   }
 }
 
+function TargetResearchFactsView({ facts, label }: { facts: ReturnType<typeof targetResearchFacts>; label: string }) {
+  return <>
+    <dl className="target-research-facts" aria-label={`${label} 研究状态`}>
+      {facts.facts.map(fact => <div key={fact.label}><dt>{fact.label}</dt><dd>{fact.text}</dd></div>)}
+    </dl>
+    {facts.readableAssets.length ? <nav className="target-research-asset-links" aria-label="精确资产读取入口"><PageWindow items={facts.readableAssets} size={3} label="产物引用分页" render={asset => <a key={asset.versionRef} href={`/api/v1/research-assets/${encodeURIComponent(asset.versionRef)}/content`} title={asset.versionRef}>{asset.label}</a>} /></nav> : null}
+    <BoundedDetails className="lumen-bundle-target-technical" summary="查看精确输入、产物与交接来源">{() => <>
+      <pre>{JSON.stringify({ ...facts.sources, research_notes: undefined }, null, 2)}</pre>
+      {facts.notes.length ? <PageWindow items={facts.notes} size={4} label="交接说明分页" render={(note, index) => <pre key={index}>{JSON.stringify(note, null, 2)}</pre>} /> : null}
+    </>}</BoundedDetails>
+  </>;
+}
+
 function BundleTargetCard({
   target,
   targetCommit,
+  humanRequests,
   terminalOpen,
   onOpenTerminal,
 }: {
   target: BundleTargetProjection;
   targetCommit: BundleTargetCommitProjection | undefined;
+  humanRequests: readonly HumanRequestItem[];
   terminalOpen: boolean;
   onOpenTerminal: () => void;
 }) {
-  const result = targetCommit?.result_disposition
-    ?? target.blocker?.code
-    ?? target.status;
-  const statusCopy = targetCommit
-    ? "实验结果已接纳"
-    : target.blocker
-      ? "等待处理"
-      : activityStatusCopy(target.status);
+  const facts = targetResearchFacts(target, targetCommit, humanRequests);
 
   return (
     <article
@@ -2822,7 +2848,7 @@ function BundleTargetCard({
         </span>
         <p>
           <b>{target.target_key}</b>
-          <small>{statusCopy}</small>
+          <small>{facts.summary}</small>
         </p>
         <div className="lumen-bundle-target-actions">
           {target.target_run_ref ? (
@@ -2837,14 +2863,7 @@ function BundleTargetCard({
           ) : null}
         </div>
       </div>
-      <details className="lumen-bundle-target-technical">
-        <summary>查看核验详情</summary>
-        <dl>
-          <div><dt>Target</dt><dd>{target.target_ref}</dd></div>
-          <div><dt>Target run</dt><dd>{target.target_run_ref ?? "not recorded"}</dd></div>
-          <div><dt>Result</dt><dd>{result}</dd></div>
-        </dl>
-      </details>
+      <TargetResearchFactsView facts={facts} label={target.target_key} />
     </article>
   );
 }
@@ -2857,6 +2876,7 @@ function TargetTerminalDialog({
   activityPaused,
   onMinimize,
   onClose,
+  onShowLogFiles,
 }: {
   target: BundleTargetProjection;
   observationPointer: TargetRootObservationPointer | null;
@@ -2865,6 +2885,7 @@ function TargetTerminalDialog({
   activityPaused: boolean;
   onMinimize: () => void;
   onClose: () => void;
+  onShowLogFiles?: () => void;
 }) {
   const [terminal, setTerminal] = useState<TargetRawTerminalState | null>(null);
   const [chunks, setChunks] = useState<OutputChunk[]>([]);
@@ -2894,8 +2915,14 @@ function TargetTerminalDialog({
     requestSequence.current = request;
     const controller = new AbortController();
     activeRequest.current = controller;
+    let timedOut = false;
+    const deadline = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 8000);
     const current = terminalRef.current;
-    setLoading(current === null || direction !== "refresh");
+    // Every read gets a loading transition so repeated identical errors still schedule another poll.
+    setLoading(true);
     try {
       let page: TargetRawOutputPage;
       try {
@@ -2948,13 +2975,13 @@ function TargetTerminalDialog({
       setTerminal(page);
       setTerminalError(null);
     } catch (caught) {
-      if ((caught as Error).name === "AbortError") return;
+      if (controller.signal.aborted && !timedOut) return;
       if (request !== requestSequence.current) return;
-      const code = caught instanceof ProductError
-        ? caught.code
-        : "target_raw_output_unavailable";
+      const code = timedOut ? "target_raw_output_timeout"
+        : caught instanceof ProductError ? caught.code : "target_raw_output_unavailable";
       setTerminalError(code);
     } finally {
+      window.clearTimeout(deadline);
       if (request === requestSequence.current) {
         activeRequest.current = null;
         setLoading(false);
@@ -3022,7 +3049,7 @@ function TargetTerminalDialog({
       paused
       || !followLive
       || loading
-      || !(terminal?.has_more || terminal?.status === "live" || (!terminal && targetMayStillProduceOutput))
+      || !(terminalError || terminal?.has_more || terminal?.status === "live" || (!terminal && targetMayStillProduceOutput))
     ) return;
     const timer = window.setTimeout(() => {
       const current = terminalRef.current;
@@ -3031,7 +3058,7 @@ function TargetTerminalDialog({
       } else {
         void loadRawOutput(current?.offset ?? 0, current ? "refresh" : "reset");
       }
-    }, terminal?.has_more ? 150 : targetRawOutputPollMilliseconds);
+    }, terminalError ? 2000 : terminal?.has_more ? 150 : targetRawOutputPollMilliseconds);
     return () => window.clearTimeout(timer);
   }, [
     loadRawOutput,
@@ -3063,7 +3090,7 @@ function TargetTerminalDialog({
       role="dialog"
       aria-modal="false"
       aria-hidden={blockedByHumanRequest ? true : undefined}
-      aria-label={`${target.target_key} 实验原始输出`}
+      aria-label={`${target.target_key} 任务执行记录`}
       inert={blockedByHumanRequest}
       data-hc-background
       data-hc-inert-owner="terminal"
@@ -3072,7 +3099,7 @@ function TargetTerminalDialog({
     >
       <header>
         <div>
-          <small>实验日志 · 原始命令输出</small>
+          <small>任务执行记录 · 命令与 Agent 输出</small>
           <b>{target.target_key}</b>
         </div>
         <div className="lumen-target-terminal-actions">
@@ -3080,19 +3107,20 @@ function TargetTerminalDialog({
             {loading && !terminal
               ? "读取中"
               : terminal?.status === "live"
-                ? "持续更新"
-                : terminal?.status === "complete" ? "本次执行结束" : "等待输出"}
+                ? "尚未收到结束记录"
+                : terminal?.status === "complete" ? "本次输出结束" : "等待读取记录"}
           </span>
           <button type="button" onClick={onMinimize}>
             {minimized ? "展开" : "最小化"}
           </button>
-          <button ref={closeRef} type="button" onClick={onClose} aria-label="关闭实验日志窗口">×</button>
+          <button ref={closeRef} type="button" onClick={onClose} aria-label="关闭任务执行记录">×</button>
         </div>
       </header>
       {!minimized ? (
         <div className="lumen-target-terminal-body">
+          {onShowLogFiles ? <ExperimentOutputViews view="records" onChange={view => { if (view === "files") onShowLogFiles(); }} /> : null}
           <p className="lumen-target-terminal-boundary">
-            训练与评估共用此窗口，按实际执行命令查看。关闭窗口后实验继续运行。
+            显示任务准备、命令与 Agent 的实际输出。{onShowLogFiles ? "训练与评估文件可在对应页签查看。" : ""}
           </p>
           {terminal ? (
             <details className="research-terminal-source"><summary>执行来源</summary><dl className="lumen-target-terminal-identity">
@@ -3103,7 +3131,7 @@ function TargetTerminalDialog({
           ) : null}
           {terminalError ? (
             <div className="lumen-target-terminal-error" role="alert">
-              <b>原始输出暂不可读</b>
+              <b>{terminalError === "target_raw_output_timeout" ? "任务记录读取超时，正在自动重试" : "原始输出暂不可读"}</b>
               <code>{terminalError}</code>
               <button
                 type="button"
@@ -3119,7 +3147,7 @@ function TargetTerminalDialog({
               </button>
             </div>
           ) : null}
-          {terminal && !terminalError ? (
+          {terminal ? (
             <div ref={terminalLogRef} className="research-terminal-scroll" onScroll={event => {
               const view = event.currentTarget;
               if (view.scrollHeight - view.scrollTop - view.clientHeight > 48) setFollowLive(false);
@@ -3132,8 +3160,8 @@ function TargetTerminalDialog({
           {terminal && terminal.text.length === 0 ? (
             <p className="lumen-target-terminal-empty">
               {terminal.status === "live"
-                ? "当前 Target 尚未产生 stdout，自动刷新中。"
-                : "当前 Target 输出已结束，没有可读取的 stdout。"}
+                ? "当前记录流暂时没有可读取输出，自动刷新中。"
+                : "本次记录流已结束，没有可读取输出。"}
             </p>
           ) : null}
           {terminal ? (
@@ -3175,6 +3203,7 @@ function TargetTerminalDialog({
 
 function BundleStageCard({
   bundleStage,
+  humanRequests,
   healthBlocker,
   observationPointers,
   humanRequestModalOpen,
@@ -3182,6 +3211,7 @@ function BundleStageCard({
   runtimeControl,
 }: {
   bundleStage: BundleStageProjection;
+  humanRequests: readonly HumanRequestItem[];
   healthBlocker: IdeaStageHealthBlocker | null;
   observationPointers: Record<string, TargetRootObservationPointer>;
   humanRequestModalOpen: boolean;
@@ -3229,9 +3259,10 @@ function BundleStageCard({
       )}
     >
       <header className="lumen-card-head">
-        <b id="bundle-stage-title">实验与训练</b>
-        <small>真实命令、真实输出、真实结果</small>
+        <b id="bundle-stage-title">研究实施与评价</b>
+        <small>执行、评价与接纳分别记录</small>
       </header>
+      <p className="target-research-guidance">负面结果、不确定或没有新认识都可以成为本轮记录。执行产物可先交接，评价可在后续继续。</p>
       {healthBlocker ? (
         <div
           className="lumen-idea-health-blocker"
@@ -3277,6 +3308,7 @@ function BundleStageCard({
                 key={target.target_ref}
                 target={target}
                 targetCommit={targetCommit}
+                humanRequests={humanRequests}
                 terminalOpen={target.target_ref === terminalTargetRef}
                 onOpenTerminal={() => {
                   setTerminalTargetRef(target.target_ref);
@@ -3944,8 +3976,9 @@ function ReasoningFollowupDock({
   );
 }
 
-function ExperimentLogLauncher({snapshot, blocked, paused}: {
+function ExperimentLogLauncher({snapshot, blocked, paused, observationPointers}: {
   snapshot: PublicSnapshot; blocked: boolean; paused: boolean;
+  observationPointers: Record<string, TargetRootObservationPointer>;
 }) {
   const foreground = snapshot.research_control.foreground;
   const bundle = allStageSurfaces(snapshot).find(surface => surface.kind === "Bundle");
@@ -3954,23 +3987,32 @@ function ExperimentLogLauncher({snapshot, blocked, paused}: {
   const [selected, setSelected] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [minimized, setMinimized] = useState(false);
+  const [view, setView] = useState<"records" | "files">("records");
   const opener = useRef<HTMLButtonElement>(null);
   const target = available.find(item => item.target_ref === selected) ?? available.find(item => item.status === "running") ?? available[0];
-  useEffect(() => {setOpen(false); setSelected(null);}, [foreground?.cycle_ref]);
+  useEffect(() => {setOpen(false); setSelected(null); setView("records");}, [foreground?.cycle_ref]);
   const close = () => {setOpen(false); opener.current?.focus();};
   return <div className="research-experiment-entry">
     <button ref={opener} type="button" className="research-log-button" aria-haspopup="dialog" disabled={!target}
-      onClick={() => {setOpen(true); setMinimized(false);}}>⌘ 实验日志 <span>↗</span></button>
+      onClick={() => {if (!open) setView("records"); setOpen(true); setMinimized(false);}}>⌘ 实验日志 <span>↗</span></button>
     {available.length > 1 ? <select aria-label="选择实验任务" value={target?.target_ref ?? ""} onChange={event => {setSelected(event.currentTarget.value); setMinimized(false);}}>
-      {available.map(item => <option key={item.target_ref} value={item.target_ref}>{item.target_key} · {activityStatusCopy(item.status)}</option>)}
-    </select> : <small>{target ? `${target.target_key} · ${activityStatusCopy(target.status)}` : targets.length ? "实验尚未开始执行" : "本轮尚无实验日志"}</small>}
-    {open && target ? <ExperimentLogs key={`${target.target_ref}:${target.target_run_ref}`} target={target}
-      minimized={minimized} blockedByHumanRequest={blocked} activityPaused={paused} onMinimize={() => setMinimized(value => !value)} onClose={close} /> : null}
+      {available.map(item => <option key={item.target_ref} value={item.target_ref}>{item.target_key}</option>)}
+    </select> : <small>{target ? target.target_key : targets.length ? "实验尚未开始执行" : "本轮尚无实验日志"}</small>}
+    {open && target ? view === "records" ? <TargetTerminalDialog key={`records:${target.target_ref}:${target.target_run_ref}`} target={target}
+      observationPointer={observationPointers[target.target_ref] ?? null}
+      minimized={minimized} blockedByHumanRequest={blocked} activityPaused={paused}
+      onMinimize={() => setMinimized(value => !value)} onClose={close}
+      onShowLogFiles={() => {setView("files"); setMinimized(false);}} />
+      : <ExperimentLogs key={`files:${target.target_ref}:${target.target_run_ref}`} target={target}
+        minimized={minimized} blockedByHumanRequest={blocked} activityPaused={paused}
+        onMinimize={() => setMinimized(value => !value)} onClose={close}
+        onShowExecution={() => {setView("records"); setMinimized(false);}} /> : null}
   </div>;
 }
 
 function WorkspaceMain({
   snapshot,
+  runtimeStatus,
   state,
   error,
   streamInterrupted,
@@ -3988,6 +4030,7 @@ function WorkspaceMain({
   onBrowseHumanRequests,
 }: {
   snapshot: PublicSnapshot | null;
+  runtimeStatus: ReturnType<typeof useWorkspaceStatus>;
   state: ShellState;
   error: string | null;
   streamInterrupted: boolean;
@@ -4005,10 +4048,26 @@ function WorkspaceMain({
   onBrowseHumanRequests: (requestRef?: string) => void;
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
+  const liveContext = conversationContext(snapshot, runtimeStatus.status, runtimeStatus.error);
+  const rootConversations = useRootConversations({ ...liveContext, questRef: overviewQuestRef(snapshot) }, !hidden);
+  // conversationContext may select a newer snapshot, including a pause or
+  // failure. Only supplement the exact status observation it selected.
+  const targetObservation = observedActiveTarget(!runtimeStatus.error
+    && liveContext.foreground === runtimeStatus.status?.foreground ? runtimeStatus.status : null,
+    !liveContext.stale && !rootConversations.error ? rootConversations.data : null);
+  const targetActivity = targetObservation ? <p role="status" data-testid="current-target-activity">
+    {targetObservation.target.title} · 执行中 · 观测于 <time dateTime={targetObservation.observedAt}>
+      {new Date(targetObservation.observedAt).toLocaleString("zh-CN", { hour12: false })}</time>
+  </p> : null;
   const [stageResultsRequested, setStageResultsRequested] = useState(() => Boolean(spectrumStage(new URLSearchParams(window.location.search).get("stage"))));
-  const overview = useResearchOverview(snapshot, !hidden && Boolean(snapshot?.research_control.foreground), historyOpen || stageResultsRequested);
+  const overview = useResearchOverview(snapshot, !hidden && Boolean(overviewQuestRef(snapshot)), historyOpen || stageResultsRequested);
   const unavailable = uniqueCapabilities(snapshot);
   const foreground = snapshot?.research_control.foreground;
+  const showingLiveOverview = !snapshot ? runtimeStatus.status !== null
+    : foreground?.quest_ref !== liveContext.foreground?.quest_ref
+    || foreground?.cycle_ref !== liveContext.foreground?.cycle_ref
+    || foreground?.question_ref !== liveContext.foreground?.question_ref
+    || foreground?.stage.toLowerCase() !== liveContext.foreground?.stage.toLowerCase();
   const currentQuestion = snapshot ? exactForegroundQuestion(snapshot) : null;
   const requests = snapshot ? currentOpenHumanRequests(snapshot) : [];
   const stageSurface = snapshot?.research_space.status === "active"
@@ -4023,6 +4082,10 @@ function WorkspaceMain({
   const bundleStage = stageSurface?.kind === "Bundle"
     ? stageSurface.projection
     : null;
+  const displayedTarget = bundleStage?.target_graph.targets.find(target => target.target_ref === rootConversations.selected?.target_ref)
+    ?? bundleStage?.target_graph.targets.find(target => target.status === "running") ?? bundleStage?.target_graph.targets.at(-1);
+  const displayedTargetFacts = displayedTarget ? targetResearchFacts(displayedTarget,
+    bundleStage?.target_commits.find(commit => commit.target_ref === displayedTarget.target_ref), snapshot?.human_collaboration?.human_requests.items ?? []) : null;
   const reasoningStage = stageSurface?.kind === "Reasoning"
     ? stageSurface.projection
     : null;
@@ -4047,7 +4110,7 @@ function WorkspaceMain({
       hidden={hidden}
       tabIndex={hidden ? -1 : 0}
       aria-labelledby="workspace-title"
-      aria-busy={state === "loading"}
+      aria-busy={state === "loading" && !liveContext.foreground}
     >
       {snapshot?.query_warnings?.length ? (
         <div className="lumen-reconnect-warning" role="status" data-testid="workspace-partial-warning">
@@ -4081,9 +4144,19 @@ function WorkspaceMain({
       >
         <span className="lumen-glow" aria-hidden="true" />
         <span className="lumen-comet" aria-hidden="true" />
-        {state === "loading" ? <LoadingHero /> : null}
-        {state === "first-error" ? <FirstErrorHero retry={retry} /> : null}
-        {snapshot && foreground ? <div className="research-current-heading" data-testid="current-cycle-overview" data-cycle-ref={foreground.cycle_ref} data-question-ref={foreground.question_ref}>
+        {state === "loading" && !showingLiveOverview ? <LoadingHero /> : null}
+        {state === "first-error" && !showingLiveOverview ? <FirstErrorHero retry={retry} /> : null}
+        {showingLiveOverview ? <div className="research-current-heading" data-testid="workspace-live-overview" data-cycle-ref={liveContext.foreground?.cycle_ref}>
+          <p className="lumen-eyebrow">当前研究现场</p>
+          <h1 id="workspace-title">{targetObservation?.status.current_task?.title ?? runtimeStatus.status?.current_task?.title ?? (liveContext.foreground ? "当前研究" : "当前没有运行中的阶段")}</h1>
+          {targetActivity}
+          <SpectrumStages compact current={rootConversations.currentStage} selected={rootConversations.selectedStage}
+            onSelect={stage => rootConversations.selectStage(stage)} stale={liveContext.stale}
+            stageContent={stage => <StageRootSessions model={rootConversations} stage={stage} />} />
+          <p role="status">{liveContext.stale ? "运行状态正在重新读取，以下保留上次记录。" : "当前运行状态已载入。"}
+            {error ? "详细成果读取失败，正在重试。" : "详细成果仍在加载，会自动补充。"}</p>
+        </div> : null}
+        {snapshot && foreground && !showingLiveOverview ? <div className="research-current-heading" data-testid="current-cycle-overview" data-cycle-ref={foreground.cycle_ref} data-question-ref={foreground.question_ref}>
           <div className="research-current-topline">
             <p className="lumen-eyebrow">当前研究问题</p>
             <div className="research-cycle-badge" aria-live="polite" data-cycle-ref={foreground.cycle_ref}>
@@ -4093,9 +4166,10 @@ function WorkspaceMain({
             </div>
           </div>
           <h1 id="workspace-title">{currentQuestion?.title ?? currentQuestion?.unknown_statement ?? "当前研究问题"}</h1>
-          <StageHistoryStrip snapshot={snapshot} overview={overview.data} error={overview.error} loading={overview.loading} onRetry={overview.retry} onRequestOverview={() => setStageResultsRequested(true)} />
+          {targetActivity}
+          <StageHistoryStrip snapshot={snapshot} overview={overview.data} error={overview.error} loading={overview.loading} onRetry={overview.retry} onRequestOverview={() => setStageResultsRequested(true)} rootConversations={rootConversations} />
           <button className="research-history-toggle" aria-expanded={historyOpen} onClick={() => setHistoryOpen(open => !open)}>{historyOpen ? "收起本轮记录与历史结果" : "查看本轮记录与历史结果"}<span aria-hidden="true">{historyOpen ? "−" : "+"}</span></button>
-        </div> : snapshot ? <SnapshotHero snapshot={snapshot} /> : null}
+        </div> : snapshot && !showingLiveOverview ? <SnapshotHero snapshot={snapshot} /> : null}
         {snapshot && !foreground && state !== "loading" && state !== "first-error" ? (
           <div className="lumen-workspace-actions" aria-label="研究快捷操作">
             {snapshot.research_space.status === "empty" ? (
@@ -4122,16 +4196,24 @@ function WorkspaceMain({
         ) : null}
       </section>
 
-      {snapshot && foreground ? <>
-        {historyOpen ? <ResearchOverview snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} onOpenWriting={onBrowseWriting} connected={connected} /> : null}
+      {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchTimeline snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} rootConversations={rootConversations} /> : null}
+      {snapshot && foreground && !showingLiveOverview ? <>
+        {historyOpen ? <>
+          <ResearchOverview snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} onOpenWriting={onBrowseWriting} connected={connected} />
+        </> : null}
         <div className="research-primary-actions">
-          <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} />
+          <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} observationPointers={targetRootObservationPointers} />
           <div><button onClick={onBrowseAssets}>研究资料 ↗</button><button onClick={onBrowseQuestions}>问题树 ↗</button></div>
         </div>
         {requests.length ? <button className="research-human-request" onClick={() => onBrowseHumanRequests(requests[0].request_ref)}><span><b>需要你回应 · {requests.length} 项</b><span>{requests[0].obligation}</span></span><b>查看并回应 ↗</b></button> : null}
+        {rootConversations.selectedStage === "bundle" && displayedTarget && displayedTargetFacts ? <section className="research-target-status" aria-label="当前研究工作状态">
+          <header><h2>{displayedTarget.target_key}</h2><p>{displayedTargetFacts.summary}</p></header>
+          <BoundedDetails key={displayedTarget.target_ref} className="research-target-details" summary="查看输入、产物与交接">{() => <TargetResearchFactsView facts={displayedTargetFacts} label={displayedTarget.target_key} />}</BoundedDetails>
+        </section> : null}
       </> : null}
-      {snapshot?.research_space.status === "active" && !hidden ? <ResearchTracePanel snapshot={snapshot} latestActivity={latestActivity} observedSince={observedSince} connected={connected} /> : null}
+      {(liveContext.foreground || rootConversations.selectedRef) && !hidden ? <RootConversations model={rootConversations} connected={connected} polling={Boolean(runtimeStatus.status && !runtimeStatus.error)} /> : null}
       <details className="research-existing-details"><summary>研究材料与阶段详情</summary>
+      {showingLiveOverview && snapshot ? <p role="status">以下保留上次读取的阶段详情；当前轮次的详细结果仍在加载。</p> : null}
       <div className="lumen-lower">
         {stageSurface && question ? (
           <CurrentQuestionCard stage={stageSurface.kind} question={question} />
@@ -4160,6 +4242,7 @@ function WorkspaceMain({
         ) : bundleStage ? (
           <BundleStageCard
             bundleStage={bundleStage}
+            humanRequests={snapshot?.human_collaboration?.human_requests.items ?? []}
             healthBlocker={bundleHealthBlocker}
             observationPointers={targetRootObservationPointers}
             humanRequestModalOpen={humanRequestModalOpen}
@@ -4353,6 +4436,14 @@ function DetailedApp() {
     }
   };
   const [snapshot, setSnapshot] = useState<PublicSnapshot | null>(null);
+  const runtimeStatus = useWorkspaceStatus(true);
+  const observedForeground = conversationContext(snapshot, runtimeStatus.status, runtimeStatus.error).foreground;
+  const snapshotForeground = snapshot?.research_control.foreground;
+  const detailsScopeChanged = Boolean(snapshot && (
+    snapshotForeground?.quest_ref !== observedForeground?.quest_ref
+    || snapshotForeground?.cycle_ref !== observedForeground?.cycle_ref
+    || snapshotForeground?.question_ref !== observedForeground?.question_ref
+    || snapshotForeground?.stage.toLowerCase() !== observedForeground?.stage.toLowerCase()));
   useEffect(() => {
     if (!showCompanion) return;
     window.scrollTo({ top: 0 });
@@ -4509,6 +4600,8 @@ function DetailedApp() {
     const request = (async () => {
       do {
         reloadQueued.current = false;
+        // A new read supersedes the previous failure while preserving cached data.
+        setError(null);
         try {
           const sections = snapshotSections.current;
           requestedSections.current = sections;
@@ -5203,8 +5296,8 @@ function DetailedApp() {
             <div><b>Meta Research</b><small>Lumen workspace</small></div>
           </a>
           <div className="lumen-quest-context">
-            <small>{snapshot?.research_space.status === "active" ? "当前研究" : "新的研究空间"}</small>
-            <b>{snapshot ? exactForegroundQuestion(snapshot)?.title ?? (snapshot.research_space.status === "active" ? "当前研究现场" : "等待第一个研究问题") : "正在读取研究空间"}</b>
+            <small>{detailsScopeChanged ? "研究详情更新中" : observedForeground || snapshot?.research_space.status === "active" ? "当前研究" : "新的研究空间"}</small>
+            <b>{detailsScopeChanged || !snapshot ? runtimeStatus.status?.current_task?.title ?? "正在读取研究空间" : exactForegroundQuestion(snapshot)?.title ?? (snapshot.research_space.status === "active" ? "当前研究现场" : "等待第一个研究问题")}</b>
           </div>
           <div className={`lumen-connection ${connected ? "connected" : ""}`} aria-live="polite">
             <i aria-hidden="true" />
@@ -5216,7 +5309,7 @@ function DetailedApp() {
           <ForegroundResearchControlShortcut
             control={snapshot?.research_control}
             commands={snapshot?.human_collaboration?.commands.items}
-            disabled={humanRequestSurfaceOpen}
+            disabled={humanRequestSurfaceOpen || detailsScopeChanged}
             onChanged={() => void reload()}
           />
         </header>
@@ -5248,6 +5341,7 @@ function DetailedApp() {
         />
         <WorkspaceMain
           snapshot={snapshot}
+          runtimeStatus={runtimeStatus}
           state={state}
           error={error}
           streamInterrupted={streamInterrupted}
@@ -5335,6 +5429,10 @@ function DetailedApp() {
       {assetsOpen && snapshot ? (
         <ResearchAssetsWorkbench
           initial={snapshot.research_assets}
+          currentQuestRef={snapshot.research_space.current_question?.quest_ref
+            ?? snapshot.question_tree.items[0]?.quest_ref
+            ?? snapshot.quest_creation.current?.quest_ref ?? null}
+          currentQuestionRef={snapshot.research_space.current_question?.question_ref ?? null}
           intakeWorkerReady={Boolean(intakeWorkerReady)}
           verificationWorkerReady={Boolean(verificationWorkerReady)}
           onClose={closeAssets}
@@ -5501,6 +5599,6 @@ function DetailedApp() {
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <OutputLanguageProvider><OutputLanguageControl floating /><App /></OutputLanguageProvider>
   </StrictMode>,
 );

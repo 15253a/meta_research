@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.context_presentation import literature_reference
+
 from dataclasses import asdict, dataclass
 from typing import cast
 
@@ -17,6 +19,7 @@ from meta_research.idea_skill import (
 )
 from meta_research.idea_contract import (
     IDEA_CONTEXT_PACK_SCHEMA_V3_REF,
+    IDEA_CONTEXT_PACK_SCHEMA_V4_REF,
     material_outcome_hash,
 )
 from meta_research.owners.advancement_engine import (
@@ -878,90 +881,27 @@ class IdeaStageWorker:
         return content
 
     def _context_pack(self, current: _CurrentCycle) -> dict[str, object]:
-        reference_query = getattr(
-            self._research_graph,
-            "query_evidence_reference_state",
-            self._research_graph.query_evidence_state,
-        )
-        evidence_revision, evidence_refs = reference_query(
-            current.question.quest_ref
-        )
-        quest = self._research_graph.query_quest(
-            current.question.initialization_id
-        )
-        if quest is None or quest.quest_ref != current.question.quest_ref:
-            raise OwnerConflict("idea_question_quest_binding_invalid")
-        successor_query = getattr(
-            self._advancement_engine,
-            "query_reasoning_successor_context",
-            None,
-        )
-        successor = (
-            successor_query(current.cycle_ref)
-            if callable(successor_query)
-            else None
-        )
-        if successor is None:
-            snapshot = self._research_memory.query_literature_snapshot_for_basis(
-                quest.initialization_id,
-                quest.draft_revision,
-                quest.draft_hash,
-            )
-            schema_ref = IDEA_CONTEXT_PACK_SCHEMA_REF
-            literature_value = (
-                None if snapshot is None else snapshot.as_context_binding()
-            )
-            prior_accepted_bindings: list[dict[str, object]] = []
-        else:
-            if (
-                successor.get("cycle_ref") != current.cycle_ref
-                or successor.get("target_question_ref")
-                != current.question.question_ref
-                or successor.get("entry_stage") != "idea"
-            ):
-                raise OwnerConflict("reasoning_successor_context_invalid")
-            frozen = successor.get("idea_context_pack")
-            if not isinstance(frozen, dict) or frozen.get("schema_ref") != (
-                IDEA_CONTEXT_PACK_SCHEMA_V3_REF
-            ):
-                raise OwnerConflict("reasoning_successor_context_invalid")
-            literature_value = frozen.get("literature_binding")
-            if not isinstance(literature_value, dict):
-                raise OwnerConflict("question_literature_revision_unavailable")
-            self._research_memory.verify_question_literature_revision(
-                literature_value
-            )
-            if frozen.get("prior_accepted_bindings") != successor.get(
-                "prior_accepted_bindings"
-            ):
+        successor_query=getattr(self._advancement_engine,"query_reasoning_successor_context",None)
+        successor=successor_query(current.cycle_ref) if callable(successor_query) else None
+        if successor is not None:
+            frozen=successor.get("idea_context_pack")
+            if successor.get("cycle_ref")!=current.cycle_ref or successor.get("target_question_ref")!=current.question.question_ref or successor.get("entry_stage")!="idea" or not isinstance(frozen,dict):
                 raise OwnerConflict("reasoning_successor_context_invalid")
             return dict(frozen)
-        guidance_bindings: list[dict[str, object]] = []
+        page,refs=self._research_graph.query_evidence_reference_page(current.question.quest_ref)
+        literature=self._research_memory.query_current_question_literature_revision(current.question.question_ref)
+        guidance=[]
         if self._human_collaboration is not None:
-            guidance_bindings = (
-                self._human_collaboration.query_active_guidance_bindings(
-                    f"quest:{quest.quest_ref}"
-                )
-            )
-            for binding in guidance_bindings:
+            guidance=self._human_collaboration.query_active_guidance_bindings(f"quest:{current.question.quest_ref}")
+            for binding in guidance:
                 self._human_collaboration.verify_guidance_binding(binding)
-            guidance_bindings.sort(
-                key=lambda item: (
-                    str(item["scope_ref"]),
-                    str(item["constraint_ref"]),
-                    int(cast(int, item["revision"])),
-                )
-            )
-        return {
-            "schema_ref": schema_ref,
-            "cycle_ref": current.cycle_ref,
-            "accepted_question_binding": current.question.as_binding().as_dict(),
-            "accepted_evidence_refs": list(evidence_refs),
-            "evidence_reference_revision": evidence_revision,
-            "literature_binding": literature_value,
-            "prior_accepted_bindings": prior_accepted_bindings,
-            "active_guidance_bindings": guidance_bindings,
-        }
+            guidance.sort(key=lambda item:(str(item["scope_ref"]),str(item["constraint_ref"]),int(item["revision"])))
+        return {"schema_ref":IDEA_CONTEXT_PACK_SCHEMA_V4_REF,"cycle_ref":current.cycle_ref,
+            "accepted_question_binding":current.question.as_binding().as_dict(),
+            "accepted_evidence_refs":list(refs),"evidence_reference_revision":page["total_count"],
+            "evidence_page":page,"literature_binding":literature_reference(literature),
+            "prior_accepted_bindings":[],"active_guidance_bindings":guidance}
+
 
     def _discover_current_cycle(self) -> _CurrentCycle | None:
         """Return the newest revalidated cycle for the public foreground view."""
@@ -1052,31 +992,9 @@ def _public_run(run: IdeaStageRun) -> dict[str, object]:
         fence_status = "submitted"
     review = None
     if execution is not None:
-        findings = execution.review.get("findings", [])
-        dispositions = execution.review.get("dispositions", [])
-        review_mode = execution.review.get("review_mode")
-        reviewer_agent_ref = execution.review.get("reviewer_agent_ref")
-        review = {
-            "status": "completed",
-            "review_mode": (
-                review_mode
-                if isinstance(review_mode, str)
-                else "legacy_external_session"
-            ),
-            "finding_count": len(findings) if isinstance(findings, list) else 0,
-            "disposition_count": (
-                len(dispositions) if isinstance(dispositions, list) else 0
-            ),
-        }
-        if isinstance(reviewer_agent_ref, str):
-            review["reviewer_agent_ref"] = reviewer_agent_ref
-        legacy_reviewer_session_ref = execution.review.get(
-            "reviewer_session_ref"
-        )
-        if isinstance(legacy_reviewer_session_ref, str):
-            # Preserve the v1 public field additively for already-issued
-            # immutable review payloads. New v2 reviews never write it.
-            review["reviewer_session_ref"] = legacy_reviewer_session_ref
+        # Current review envelopes bind draft/final bytes. They do not record
+        # child identity, findings or an approval form.
+        review = {"status": "completed", "review_mode": "advisory_unobserved"}
     return {
         "status": status,
         "run_ref": run.run_ref,

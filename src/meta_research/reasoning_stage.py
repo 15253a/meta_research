@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import cast
 
 from meta_research.feed import DurableFeed
+from meta_research.runtime_binding_compatibility import reasoning_bindings_compatible
 from meta_research.idea_stage import _public_run
 from meta_research.owners.advancement_engine import (
     AdvancementEngineInterface,
@@ -16,7 +17,7 @@ from meta_research.owners.agent_runtime import (
     ReasoningRuntimeBinding,
     ReasoningStageRun,
 )
-from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
 from meta_research.owners.research_graph import (
     AcceptedQuestion,
     ResearchGraphInterface,
@@ -40,6 +41,7 @@ from meta_research.reasoning_skill import (
     ReasoningSkillUnavailable,
     RecoverableReasoningSkillCandidateError,
     validate_reasoning_autonomous_checkpoint_result,
+    validate_reasoning_deepfetch_decision,
     validate_reasoning_autonomous_resume_result,
     validate_reasoning_skill_draft,
     validate_reasoning_skill_result,
@@ -197,16 +199,11 @@ class ReasoningStageWorker:
                 candidate, scientific_decision = self._accepted_checkpoint_facts(
                     run.autonomous_checkpoint.checkpoint_ref
                 )
-                if (
-                    candidate is None
-                    or scientific_decision is None
-                    or scientific_decision.decision != "accepted"
-                ):
-                    raise OwnerConflict(
-                        "reasoning_autonomous_source_acceptance_missing"
-                    )
-                scientific_candidate_content_receipt = candidate.receipt
-                scientific_candidate_domain_receipt = scientific_decision.receipt
+                if candidate is not None:
+                    if scientific_decision is None or scientific_decision.decision != "accepted":
+                        raise OwnerConflict("reasoning_autonomous_source_acceptance_missing")
+                    scientific_candidate_content_receipt = candidate.receipt
+                    scientific_candidate_domain_receipt = scientific_decision.receipt
             self._research_memory.accept_reasoning_content(
                 request_ref=request.request_ref,
                 cycle_ref=request.cycle_ref,
@@ -291,9 +288,28 @@ class ReasoningStageWorker:
         checkpoint = run.autonomous_checkpoint
         if checkpoint is None:
             raise OwnerConflict("reasoning_autonomous_checkpoint_missing")
-        candidate, decision = self._accepted_checkpoint_facts(
-            checkpoint.checkpoint_ref
-        )
+        current = None if self._autonomous_creation is None else self._autonomous_creation.query(checkpoint.checkpoint_ref)
+        continuation = self._agent_runtime.query_reasoning_autonomous_decision(checkpoint.checkpoint_ref)
+        if continuation is None or continuation["decision"]["action"] == "retry":
+            if current is None or current.get("status") != "awaiting_reasoning_decision":
+                return _CycleStep(False)
+            deepfetch = current["deepfetch"]
+            facts = {"request_ref": deepfetch["request_ref"], "run_ref": deepfetch["run_ref"], "attempt_ref": deepfetch.get("attempt_ref"), "attempt_generation": deepfetch.get("attempt_generation"), "status": deepfetch["status"], "snapshot_ref": deepfetch.get("literature_snapshot_ref"), "snapshot_hash": deepfetch.get("snapshot_hash"), "context_basis_hash": deepfetch.get("context_basis_hash"), "failure_code": deepfetch.get("failure_code")}
+            # A retry decision consumes this exact terminal attempt, even if
+            # scheduling changes its status before the next attempt starts.
+            if continuation is not None and continuation["facts"]["attempt_ref"] == facts["attempt_ref"]:
+                return _CycleStep(False)
+            prior = self._agent_runtime.query_reasoning_autonomous_decision(checkpoint.checkpoint_ref, fact_hash=canonical_hash(facts))
+            if prior is not None:
+                return _CycleStep(False)
+            return self._decide_after_deepfetch(request, run, facts)
+        if continuation["decision"]["action"] == "decline":
+            output = continuation["decision"]["final_output"]
+            review = {"schema_ref": "meta-research/reasoning-review/v1", "reviewed_draft_hash": checkpoint.checkpoint_hash, "final_output_hash": canonical_hash(output)}
+            self._agent_runtime.record_reasoning_attempt_execution(run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, submission_ref="reasoning_submission_" + canonical_hash(output)[:32], native_session_ref=run.native_session_ref, runtime_binding=run.runtime_binding, outcome=output, reviewed_draft=checkpoint.checkpoint, review=review, idempotency_key=_operation_key("reasoning-declined-creation", run.run_ref, checkpoint.checkpoint_ref))
+            return _CycleStep(True)
+        revised_checkpoint = continuation["decision"]["final_output"]
+        candidate, decision = self._accepted_checkpoint_facts(checkpoint.checkpoint_ref)
         if candidate is None:
             submission_ref = "reasoning_scientific_candidate_" + canonical_hash(
                 {
@@ -318,9 +334,9 @@ class ReasoningStageWorker:
                 fence_ref=run.fence_ref,
                 submission_ref=submission_ref,
                 checkpoint_ref=checkpoint.checkpoint_ref,
-                checkpoint=checkpoint.checkpoint,
-                review=checkpoint.review,
-                checkpoint_receipt=checkpoint.receipt,
+                checkpoint=revised_checkpoint,
+                review={"schema_ref": "meta-research/reasoning-review/v1", "reviewed_draft_hash": checkpoint.checkpoint_hash, "final_output_hash": canonical_hash(revised_checkpoint)},
+                checkpoint_receipt=AcceptanceReceipt(**{key: value for key, value in continuation["receipt"].items() if key != "status"}),
             )
             return _CycleStep(True)
         if decision is None:
@@ -329,12 +345,20 @@ class ReasoningStageWorker:
             )
             return _CycleStep(True)
         if decision.decision == "rejected":
-            self._transient_error = (
-                decision.reason_code
-                or "reasoning_scientific_candidate_requires_revision"
+            self._agent_runtime.continue_after_reasoning_checkpoint_rejection(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                decision_receipt=decision.receipt,
+                idempotency_key=_operation_key(
+                    "reasoning-checkpoint-revise",
+                    run.run_ref,
+                    run.attempt_ref,
+                    decision.receipt.receipt_ref,
+                ),
             )
-            return _CycleStep(False)
-        scientific_outcome = checkpoint.checkpoint.get("scientific_outcome")
+            return _CycleStep(True)
+        scientific_outcome = revised_checkpoint.get("scientific_outcome")
         if (
             decision.decision != "accepted"
             or not isinstance(scientific_outcome, dict)
@@ -348,8 +372,71 @@ class ReasoningStageWorker:
             request,
             run,
             checkpoint.checkpoint,
-            creation_result,
+            {**creation_result, "scientific_outcome": candidate.scientific_outcome},
         )
+
+    def _decide_after_deepfetch(self, request, run, facts):
+        checkpoint = run.autonomous_checkpoint
+        if not reasoning_bindings_compatible(self._provider.runtime_binding(), run.runtime_binding):
+            self._transient_error = "reasoning_runtime_binding_drift"
+            return _CycleStep(False, provider_boundary_attempted=True)
+        base_job_ref = "reasoning-deepfetch-decision_" + canonical_hash({"checkpoint": checkpoint.checkpoint_ref, "facts": facts})
+        skill_request = self._continuation_skill_request(request, run, phase="summary-decision", base_job_ref=base_job_ref)
+        job_ref = skill_request.job_ref
+        unit_ref = "provider_unit_" + canonical_hash({"run": run.run_ref, "job": job_ref})
+        self._agent_runtime.begin_provider_unit(unit_ref=unit_ref, operation_ref=job_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, unit_kind="reasoning_review")
+        safe = True
+        decision = None
+        try:
+            summary = None
+            if facts.get("snapshot_ref") is not None:
+                snapshot = self._research_memory.read_literature_snapshot(facts["snapshot_ref"])
+                if snapshot["snapshot_hash"] != facts["snapshot_hash"]:
+                    raise OwnerConflict("reasoning_summary_binding_invalid")
+                summary = {"kind": "LiteratureSnapshot", "source_ref": facts["snapshot_ref"], "version_ref": facts["snapshot_ref"], "summary_ref": snapshot["summary_ref"], "summary_hash": snapshot["summary_hash"], "summary": snapshot["summary"]}
+            decision = self._provider.decide_after_deepfetch(skill_request, checkpoint.checkpoint, facts, summary)
+            validate_reasoning_deepfetch_decision(skill_request, decision, facts)
+            if self._agent_runtime.park_root_provider_session_for_human_request(root_kind="reasoning", phase="autonomous-resume", run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=run.native_session_ref, runtime_binding_hash=run.runtime_binding_hash):
+                self._finish_provider_job(job_ref)
+                self._transient_error = None
+                return _CycleStep(True, provider_boundary_attempted=True)
+            self._agent_runtime.record_reasoning_autonomous_decision(run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=run.native_session_ref, checkpoint_ref=checkpoint.checkpoint_ref, facts=facts, decision=decision)
+            self._finish_provider_job(job_ref)
+            return _CycleStep(True, provider_boundary_attempted=True)
+        except ReasoningSkillUnavailable as error:
+            if self._agent_runtime.park_root_provider_session_for_human_request(root_kind="reasoning", phase="autonomous-resume", run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=error.native_session_ref or run.native_session_ref, runtime_binding_hash=run.runtime_binding_hash):
+                self._finish_provider_job(job_ref)
+                self._transient_error = None
+                return _CycleStep(True, provider_boundary_attempted=True)
+            if error.rejected_candidate is not None:
+                self._reject_completion_candidate(unit_ref=unit_ref, run=run, operation_name="autonomous-resume", native_session_ref=error.rejected_native_session_ref or run.native_session_ref, candidate=error.rejected_candidate, failure_code=error.code, detail_code=error.rejected_detail_code or error.code, continuation_phase="summary-decision")
+                safe = False
+                self._transient_error = error.code
+                return _CycleStep(True, provider_boundary_attempted=True)
+            if error.recovery_checkpoint is not None:
+                safe = False
+                self._agent_runtime.record_stage_provider_hard_ceiling(unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, failure_code=error.code, provider_exit=error.recovery_checkpoint)
+            if error.code == "codex_operation_reconciliation_pending":
+                safe = False
+            self._transient_error = error.code
+            return _CycleStep(False, provider_boundary_attempted=True)
+        except (ReasoningContractError, ReasoningSkillContractError) as error:
+            if decision is not None:
+                self._reject_completion_candidate(unit_ref=unit_ref, run=run, operation_name="autonomous-resume", native_session_ref=run.native_session_ref, candidate=decision, failure_code="reasoning_review_result_contract_invalid", detail_code=str(error), continuation_phase="summary-decision")
+                safe = False
+                self._transient_error = str(error)
+                return _CycleStep(True, provider_boundary_attempted=True)
+            self._transient_error = str(error)
+            return _CycleStep(False, provider_boundary_attempted=True)
+        finally:
+            if safe:
+                self._agent_runtime.acknowledge_provider_safe_point(unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref)
+
+    def _continuation_skill_request(self, request, run, *, phase: str, base_job_ref: str):
+        rejected = self._agent_runtime.query_reasoning_continuation_rejections(run.autonomous_checkpoint.checkpoint_ref, phase)
+        operation_ref = "reasoning-continuation_" + canonical_hash({"base_job_ref": base_job_ref, "phase": phase, "revision": len(rejected)})
+        job_ref = self._agent_runtime.root_provider_continuation_job_ref(root_kind="reasoning", phase="autonomous-resume", run_ref=run.run_ref, root_session_ref=run.root_session_ref, base_job_ref=operation_ref)
+        return replace(self._skill_request(request, run, job_ref=job_ref), continuation_feedback=tuple("The previous completion was rejected: " + item["detail_code"] + ". Correct the full output and resubmit in this same Session." for item in rejected))
 
     def _execute_attempt(
         self,
@@ -363,7 +450,7 @@ class ReasoningStageWorker:
         except ReasoningSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
-        if runtime_binding != run.runtime_binding:
+        if not reasoning_bindings_compatible(runtime_binding, run.runtime_binding):
             self._transient_error = "reasoning_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
 
@@ -774,9 +861,16 @@ class ReasoningStageWorker:
             context_pack_ref=request.context_pack_ref,
             context_pack_hash=request.context_pack_hash,
             context_pack=request.context_pack,
-            frozen_evidence_closure=_frozen_evidence_closure(request.context_pack),
+            frozen_evidence_closure=_frozen_evidence_closure(request.context_pack, revision_reader=self._research_memory.query_question_literature_revision_ref),
             root_session_ref=run.root_session_ref,
             runtime_binding=run.runtime_binding,
+            historical_evidence_resolver=(
+                lambda cited_ref, _quest_ref=request.accepted_question.quest_ref: (
+                    self._research_graph.resolve_reasoning_historical_evidence_leaf(
+                        quest_ref=_quest_ref, ref=cited_ref
+                    )
+                )
+            ),
             native_session_ref=run.native_session_ref,
             predecessor_candidate_ref=predecessor_candidate_ref,
             owner_rejection_receipt_ref=owner_rejection_receipt_ref,
@@ -793,9 +887,17 @@ class ReasoningStageWorker:
         predecessor = run.predecessor_execution
         rejection_receipt = run.rejection_receipt
         completion_rejection = run.completion_rejection
-        if (predecessor is None) != (rejection_receipt is None):
+        predecessor_checkpoint = run.predecessor_autonomous_checkpoint
+        checkpoint_rejection_receipt = run.checkpoint_rejection_receipt
+        if (predecessor is None) != (rejection_receipt is None) or (
+            (predecessor_checkpoint is None) != (checkpoint_rejection_receipt is None)
+        ):
             raise OwnerConflict("rejection_lineage_incomplete")
+        if predecessor is not None and predecessor_checkpoint is not None:
+            raise OwnerConflict("rejection_lineage_invalid")
         domain_feedback: tuple[str, ...] = ()
+        domain_candidate_ref: str | None = None
+        domain_receipt_ref: str | None = None
         if predecessor is not None and rejection_receipt is not None:
             decision = self._research_graph.query_reasoning_outcome_decision(
                 predecessor.submission_ref
@@ -813,6 +915,36 @@ class ReasoningStageWorker:
             ):
                 raise OwnerConflict("rejection_lineage_invalid")
             domain_feedback = decision.feedback
+            domain_candidate_ref = predecessor.submission_ref
+            domain_receipt_ref = rejection_receipt.receipt_ref
+
+        if predecessor_checkpoint is not None and checkpoint_rejection_receipt is not None:
+            candidate, decision = self._accepted_checkpoint_facts(
+                predecessor_checkpoint.checkpoint_ref
+            )
+            if (
+                candidate is None
+                or decision is None
+                or decision.decision != "rejected"
+                or decision.receipt != checkpoint_rejection_receipt
+                or decision.request_ref != request.request_ref
+                or decision.run_ref != run.run_ref
+                or decision.attempt_ref != predecessor_checkpoint.attempt_ref
+                or decision.fence_ref != predecessor_checkpoint.fence_ref
+                or decision.checkpoint_ref != predecessor_checkpoint.checkpoint_ref
+                or decision.submission_ref != candidate.submission_ref
+                or decision.content_ref != candidate.content_ref
+                or predecessor_checkpoint.request_ref != request.request_ref
+                or predecessor_checkpoint.run_ref != run.run_ref
+                or predecessor_checkpoint.native_session_ref != run.native_session_ref
+                or predecessor_checkpoint.runtime_binding != run.runtime_binding
+                or not decision.feedback
+                or run.native_session_ref is None
+            ):
+                raise OwnerConflict("rejection_lineage_invalid")
+            domain_feedback = decision.feedback
+            domain_candidate_ref = candidate.submission_ref
+            domain_receipt_ref = checkpoint_rejection_receipt.receipt_ref
 
         if completion_rejection is not None:
             if (
@@ -829,19 +961,19 @@ class ReasoningStageWorker:
                 != completion_rejection.attempt_ref
             ):
                 raise OwnerConflict("completion_rejection_lineage_invalid")
-        if predecessor is not None or completion_rejection is not None:
+        if domain_candidate_ref is not None or completion_rejection is not None:
             return (
                 (
                     completion_rejection.candidate_ref
                     if completion_rejection is not None
-                    else predecessor.submission_ref
+                    else domain_candidate_ref
                 ),
                 (
                     completion_rejection.receipt.receipt_ref
                     if completion_rejection is not None
-                    else rejection_receipt.receipt_ref
+                    else domain_receipt_ref
                 ),
-                "domain" if predecessor is not None else "completion",
+                "domain" if domain_candidate_ref is not None else "completion",
                 domain_feedback
                 + (
                     ()
@@ -871,27 +1003,14 @@ class ReasoningStageWorker:
         except ReasoningSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
-        if runtime_binding != run.runtime_binding:
+        if not reasoning_bindings_compatible(runtime_binding, run.runtime_binding):
             self._transient_error = "reasoning_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
         invocation = run.review_invocation
-        base_job_ref = invocation.operation_ref
-        job_ref = self._agent_runtime.root_provider_continuation_job_ref(
-            root_kind="reasoning",
-            phase="autonomous-resume",
-            run_ref=run.run_ref,
-            root_session_ref=run.root_session_ref,
-            base_job_ref=base_job_ref,
-        )
-        unit_ref = (
-            invocation.invocation_ref
-            if job_ref == base_job_ref
-            else "provider_unit_"
-            + canonical_hash(
-                {"invocation_ref": invocation.invocation_ref, "job_ref": job_ref}
-            )[:64]
-        )
-        skill_request = self._skill_request(request, run, job_ref=job_ref)
+        base_job_ref = invocation.operation_ref + ":creation-final"
+        skill_request = self._continuation_skill_request(request, run, phase="creation-final", base_job_ref=base_job_ref)
+        job_ref = skill_request.job_ref
+        unit_ref = "provider_unit_" + canonical_hash({"run_ref": run.run_ref, "job_ref": job_ref})[:64]
         try:
             self._agent_runtime.begin_provider_unit(
                 unit_ref=unit_ref,
@@ -954,6 +1073,7 @@ class ReasoningStageWorker:
                         unit_ref=unit_ref,
                         run=run,
                         operation_name="autonomous-resume",
+                        continuation_phase="creation-final",
                         native_session_ref=error.rejected_native_session_ref,
                         candidate=error.rejected_candidate,
                         failure_code=error.code,
@@ -997,6 +1117,7 @@ class ReasoningStageWorker:
                     unit_ref=unit_ref,
                     run=run,
                     operation_name="autonomous-resume",
+                    continuation_phase="creation-final",
                     native_session_ref=result.primary_session_ref,
                     candidate=asdict(result),
                     failure_code=failure_code,
@@ -1078,7 +1199,12 @@ class ReasoningStageWorker:
         candidate: dict[str, object],
         failure_code: str,
         detail_code: str,
+        continuation_phase: str | None = None,
     ) -> None:
+        if continuation_phase is not None:
+            job_ref = self._agent_runtime.record_reasoning_continuation_rejection(checkpoint_ref=run.autonomous_checkpoint.checkpoint_ref, phase=continuation_phase, unit_ref=unit_ref, run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, native_session_ref=native_session_ref, candidate=candidate, failure_code=failure_code, detail_code=detail_code)
+            self._finish_provider_job(job_ref)
+            return
         self._agent_runtime.reject_stage_completion_candidate(
             unit_ref=unit_ref,
             run_ref=run.run_ref,
@@ -1396,26 +1522,12 @@ def _is_current_reasoning_foreground(
 
 
 def _frozen_evidence_closure(
-    context_pack: dict[str, object],
+    context_pack: dict[str, object], *, revision_reader=None,
 ) -> tuple[dict[str, object], ...]:
-    values: list[dict[str, object]] = []
-    literature = context_pack.get("question_literature_input")
-    if isinstance(literature, dict) and literature.get("kind") == "revision":
-        binding = literature.get("binding")
-        records = binding.get("records") if isinstance(binding, dict) else None
-        if not isinstance(records, list):
-            raise OwnerConflict("reasoning_literature_binding_invalid")
-        for record in records:
-            if not isinstance(record, dict):
-                raise OwnerConflict("reasoning_literature_binding_invalid")
-            values.append(
-                {
-                    "kind": "LiteratureRecord",
-                    "ref": record.get("ref"),
-                    "evidence_basis": record.get("evidence_basis"),
-                    "evidence_basis_ref": record.get("evidence_basis_ref"),
-                }
-            )
+    from meta_research.reasoning_literature import reasoning_literature_leaves
+    # The complete four-field membership index is transient validation input;
+    # it is neither a Provider prompt nor a copy in the frozen ContextPack.
+    values = reasoning_literature_leaves(context_pack, revision_reader=revision_reader)
 
     try:
         values.extend(plan_evidence_reuse_leaves(context_pack))

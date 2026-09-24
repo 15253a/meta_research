@@ -296,11 +296,11 @@ class _MetricReuseReasoningSkill:
             scientific_outcome=outcome,
             next_cycle_proposal=None,
             candidate_completion=completion,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
-            review_mode="harness_child_agent",
-            reviewer_agent_ref="metric-reuse-reviewer",
+            review_mode="advisory_unobserved",
+            reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
 
@@ -328,9 +328,12 @@ def _runtime(path: Path, authority, provider):
     if runtime.harnesses.query_status()["status"] != "ready":
         runtime.harnesses.start_full_conformance(_full_request())
         for _turn in range(4):
+            if runtime.harnesses.query_status()["status"] == "ready":
+                break
             assert runtime.harnesses.advance_full_conformance(
                 mcp_base_url="http://127.0.0.1:8765"
             )
+        assert runtime.harnesses.query_status()["status"] == "ready"
     return runtime
 
 

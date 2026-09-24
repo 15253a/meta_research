@@ -191,32 +191,15 @@ class AutonomousCreationService:
             "source_scientific_outcome_ref_invalid",
         )
         _require_key(idempotency_key)
-        candidate = (
-            self._research_memory.query_reasoning_scientific_candidate_by_checkpoint_ref(
-                reasoning_checkpoint_ref
-            )
-        )
-        if candidate is None:
-            raise OwnerConflict("reasoning_autonomous_checkpoint_not_accepted")
-        outcome = _mapping_field(candidate, "scientific_outcome")
-        scope = _mapping_field(candidate, "autonomous_scope")
+        checkpoint = self._agent_runtime.query_reasoning_autonomous_checkpoint(reasoning_checkpoint_ref)
+        if checkpoint is None:
+            raise OwnerConflict("reasoning_autonomous_checkpoint_unavailable")
+        draft = _mapping_field(checkpoint, "checkpoint")
+        outcome = _mapping_field(draft, "scientific_outcome")
+        scope = _mapping_field(draft, "autonomous_scope")
         if outcome.get("outcome_ref") != source_scientific_outcome_ref:
             raise OwnerConflict("autonomous_creation_source_invalid")
-        decision = self._query_scientific_decision(source_scientific_outcome_ref)
-        if decision is None or _field(decision, "decision") != "accepted":
-            raise OwnerConflict("reasoning_scientific_candidate_not_accepted")
-        if _field(decision, "scientific_outcome_ref") not in {
-            None,
-            source_scientific_outcome_ref,
-        }:
-            raise OwnerConflict("autonomous_creation_source_invalid")
-
-        checkpoint_hash = _require_ref(
-            _field(candidate, "checkpoint_hash"),
-            "reasoning_checkpoint_hash_invalid",
-        )
-        candidate_receipt = _receipt(_field(candidate, "receipt"), "research_memory")
-        decision_receipt = _receipt(_field(decision, "receipt"), "research_graph")
+        checkpoint_hash = _require_ref(_field(checkpoint, "checkpoint_hash"), "reasoning_checkpoint_hash_invalid")
         source = {
             "quest_ref": outcome["quest_ref"],
             "cycle_ref": outcome["cycle_ref"],
@@ -226,12 +209,7 @@ class AutonomousCreationService:
             "foreground_epoch": outcome["foreground_epoch"],
             "reasoning_checkpoint_ref": reasoning_checkpoint_ref,
             "reasoning_checkpoint_hash": checkpoint_hash,
-            "autonomous_scope_content_acceptance_receipt_ref": (
-                candidate_receipt.receipt_ref
-            ),
-            "preliminary_scientific_acceptance_receipt_ref": (
-                decision_receipt.receipt_ref
-            ),
+            "execution_checkpoint_receipt_ref": _receipt(_field(checkpoint, "receipt"), "agent_runtime").receipt_ref,
         }
         existing = self._human_collaboration.query_autonomous_creation(
             reasoning_checkpoint_ref
@@ -263,7 +241,7 @@ class AutonomousCreationService:
             reasoning_checkpoint_hash=checkpoint_hash,
             autonomous_scope=scope,
             autonomous_scope_hash=_require_ref(
-                _field(candidate, "autonomous_scope_hash"),
+                canonical_hash(scope),
                 "autonomous_scope_hash_invalid",
             ),
             broad_authorization=authorization,
@@ -311,10 +289,15 @@ class AutonomousCreationService:
             "request_ref": _field(facts.request, "request_ref"),
             "run_ref": _field(facts.run, "run_ref"),
             "literature_snapshot_ref": _field(facts.snapshot, "snapshot_ref"),
+            "attempt_ref": _field(facts.run, "attempt_ref"),
+            "attempt_generation": _field(facts.run, "attempt_generation"),
+            "failure_code": _field(facts.run, "failure_code"),
         }
         if request_receipt is not None:
             deepfetch["request_receipt"] = request_receipt
         if facts.snapshot is not None:
+            deepfetch["snapshot_hash"] = _field(facts.snapshot, "snapshot_hash")
+            deepfetch["context_basis_hash"] = _field(facts.snapshot, "context_basis_hash")
             deepfetch["literature_snapshot_receipt"] = _receipt_public(
                 _field(facts.snapshot, "receipt")
             )
@@ -391,6 +374,15 @@ class AutonomousCreationService:
         if not self._source_is_current(facts.source):
             return False
 
+        continuation = self._agent_runtime.query_reasoning_autonomous_decision(facts.checkpoint_ref)
+        if continuation is not None and continuation["decision"]["action"] == "decline":
+            return False
+        if continuation is not None and continuation["decision"]["action"] == "retry":
+            decision_ref = continuation["receipt"]["receipt_ref"]
+            if self._agent_runtime.permit_reasoning_deepfetch_retry(facts.checkpoint_ref, decision_ref):
+                return True
+            if self._advancement_engine.retry_autonomous_deepfetch(context=facts.context, decision=continuation):
+                return True
         if facts.request is None:
             quest_ref = cast(str, facts.source["quest_ref"])
             session = self._agent_runtime.query_acquisition_session(
@@ -452,10 +444,17 @@ class AutonomousCreationService:
             return True
         if facts.snapshot is None:
             return False
+        candidate = self._research_memory.query_reasoning_scientific_candidate_by_checkpoint_ref(facts.checkpoint_ref)
+        if candidate is None:
+            return False
+        scientific_decision = self._query_scientific_decision(_field(candidate, "scientific_outcome_ref"))
+        if scientific_decision is None or _field(scientific_decision, "decision") != "accepted":
+            return False
         if facts.proposal is None:
             self._human_collaboration.form_autonomous_question_proposal(
                 cast(str, facts.context["context_ref"]),
                 literature_snapshot_ref=cast(str, _field(facts.snapshot, "snapshot_ref")),
+                candidate=candidate,
                 idempotency_key=_key(
                     "autonomous-proposal",
                     cast(str, facts.context["context_ref"]),
@@ -500,7 +499,7 @@ class AutonomousCreationService:
             return True
         if facts.dispatch is None:
             self._advancement_engine.authorize_autonomous_question_dispatch(
-                context=facts.context,
+                context={**facts.context, "checkpoint": {"ref": facts.checkpoint_ref, "hash": _field(candidate, "checkpoint_hash")}, "scope_hash": _field(candidate, "autonomous_scope_hash")},
                 content=facts.content,
                 idempotency_key=_key(
                     "autonomous-dispatch",
@@ -593,20 +592,8 @@ class AutonomousCreationService:
         )
         if checkpoint is None:
             return None
-        candidate = (
-            self._research_memory.query_reasoning_scientific_candidate_by_checkpoint_ref(
-                checkpoint_ref
-            )
-        )
-        if candidate is None:
-            return None
-        outcome = _mapping_field(candidate, "scientific_outcome")
-        outcome_ref = _require_ref(
-            outcome.get("outcome_ref"), "scientific_outcome_ref_invalid"
-        )
-        decision = self._query_scientific_decision(outcome_ref)
-        if decision is None or _field(decision, "decision") != "accepted":
-            return None
+        outcome = _mapping_field(_mapping_field(checkpoint, "checkpoint"), "scientific_outcome")
+        outcome_ref = _require_ref(outcome.get("outcome_ref"), "scientific_outcome_ref_invalid")
         return self.start(
             reasoning_checkpoint_ref=checkpoint_ref,
             source_scientific_outcome_ref=outcome_ref,
@@ -893,7 +880,9 @@ def _autonomous_status(facts: _AutonomousFacts) -> str:
     if facts.proposal is not None:
         return "proposal_formed"
     if facts.snapshot is not None:
-        return "literature_accepted"
+        return "awaiting_reasoning_decision"
+    if _deepfetch_status(facts.request, facts.run, facts.snapshot) in {"failed", "cancelled"}:
+        return "awaiting_reasoning_decision"
     if facts.request is not None:
         return "deepfetch_running"
     return "prepared"

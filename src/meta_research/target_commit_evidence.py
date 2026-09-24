@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from meta_research.context_presentation import CATALOG_LIMIT, CATALOG_MAX_BYTES, evidence_discovery_summary
+
 import json
 
 from typing import cast
 
+from meta_research.target_execution_contract import valid_target_metric_value
 from meta_research.experiment_contract import AcceptedExperimentAssetRole
 from meta_research.owners.common import (
     AcceptanceReceipt,
@@ -13,12 +16,13 @@ from meta_research.owners.common import (
 )
 from meta_research.owners.research_graph import (
     EvidenceReuseLeaf,
+    TARGET_COMMIT_RECEIPT_KIND,
     ResearchGraphInterface,
     TargetCommit,
     TargetCommitEvidenceAuthority,
 )
 from meta_research.owners.research_memory import ResearchMemoryInterface
-from meta_research.plan_contract import EVIDENCE_REF_SCHEMA_REF
+from meta_research.plan_contract import EVIDENCE_REF_SCHEMA_REF, EVIDENCE_SOURCE_REF_SCHEMA, GENERIC_EVIDENCE_KINDS
 
 
 TARGET_COMMIT_EVIDENCE_SCHEMA_REF = "meta-research/target-commit-evidence/v1"
@@ -35,11 +39,22 @@ TARGET_COMMIT_EVIDENCE_CAPABILITIES = (
 def target_commit_evidence_closure_refs(
     commit: TargetCommit,
 ) -> tuple[str, ...]:
-    return (
+    return tuple(ref for ref in (
         commit.target_ref,
         commit.target_run_ref,
         commit.evaluation_attempt_ref,
-    )
+    ) if ref is not None)
+
+
+def _has_measurement(commit: TargetCommit) -> bool:
+    terminal = commit.closure.get("accepted_measurement")
+    return not (isinstance(terminal, dict)
+                and terminal.get("formal_measurement_accepted") is False)
+
+
+def _evidence_capabilities(commit: TargetCommit) -> tuple[str, ...]:
+    return (TARGET_COMMIT_EVIDENCE_CAPABILITIES if _has_measurement(commit)
+            else ("experiment_result", "query_support"))
 
 
 def target_commit_evidence_provenance(
@@ -48,15 +63,17 @@ def target_commit_evidence_provenance(
     return {
         "target_commit_root_ref": commit.commit_ref,
         "provenance_closure_refs": list(target_commit_evidence_closure_refs(commit)),
-        "capabilities": list(TARGET_COMMIT_EVIDENCE_CAPABILITIES),
+        "capabilities": list(_evidence_capabilities(commit)),
         "target_commit_closure_hash": commit.closure_hash,
         "result_disposition": commit.result_disposition,
     }
 
 
-def target_commit_metric_result(commit: TargetCommit) -> dict[str, object]:
+def target_commit_metric_result(commit: TargetCommit) -> dict[str, object] | None:
     """Project the metric leaf from either accepted TargetCommit closure."""
 
+    if not _has_measurement(commit):
+        return None
     legacy = commit.closure.get("metric_result")
     if type(legacy) is dict:
         return cast(dict[str, object], legacy)
@@ -71,11 +88,10 @@ def target_commit_metric_result(commit: TargetCommit) -> dict[str, object]:
         type(metric_result_ref) is not str
         or not metric_result_ref
         or type(metrics) is not dict
-        or not metrics
         or any(
             type(key) is not str
             or not key
-            or type(value) not in {int, float}
+            or not valid_target_metric_value(value)
             for key, value in cast(dict[object, object], metrics).items()
         )
         or type(receipt) is not dict
@@ -106,9 +122,11 @@ def target_commit_evidence_document(
     }
 
 
-def _target_commit_metric_document(commit: TargetCommit) -> dict[str, object]:
+def _target_commit_metric_document(commit: TargetCommit) -> dict[str, object] | None:
     """Read the exact metric projection frozen by this TargetCommit version."""
 
+    if not _has_measurement(commit):
+        return None
     closure = commit.closure
     value = closure.get("metric_result")
     if isinstance(value, dict):
@@ -187,7 +205,7 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
 
     def query_plan_evidence_page(
         self, *, quest_ref: str, question_ref: str | None = None,
-        offset: int = 0, limit: int = 256,
+        offset: int = 0, limit: int = CATALOG_LIMIT,
     ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
         total, candidates = self._research_graph.query_target_commit_evidence_candidates(
             quest_ref=quest_ref, question_ref=question_ref, offset=offset, limit=limit
@@ -196,9 +214,29 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
         catalog = self._catalog_for_candidates(
             quest_ref=quest_ref, candidates=candidates, projections=projection_by_ref
         )
+        # Preserve the SQL cursor when the byte budget, rather than the row
+        # limit, ends this page. Never skip an unseen eligible candidate.
+        by_role = {str(item["role_ref"]): item for item in catalog}
+        selected = []
+        projections = []
+        scanned = 0
+        for candidate in candidates:
+            entry = by_role.get(str(candidate["role_ref"]))
+            if entry is not None:
+                projection = projection_by_ref[str(entry["evidence_ref"])]
+                proposed = {"evidence_catalog": selected + [entry],
+                            "projections": projections + [projection]}
+                if len(canonical_json(proposed).encode("utf-8")) > CATALOG_MAX_BYTES:
+                    if not selected:
+                        raise OwnerConflict("plan_evidence_catalog_entry_too_large")
+                    break
+                selected.append(entry)
+                projections.append(projection)
+            scanned += 1
+        catalog = tuple(sorted(selected, key=lambda item: str(item["evidence_ref"])))
         projections = [projection_by_ref[str(item["evidence_ref"])] for item in catalog]
         return evidence_catalog_page_metadata(
-            total=total, catalog=catalog, scanned=len(candidates), offset=offset,
+            total=total, catalog=catalog, scanned=scanned, offset=offset,
             limit=limit, question_ref=question_ref, projections=projections,
         ), catalog
 
@@ -257,6 +295,11 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
                 # Pool member.  It remains visible through the generic Asset
                 # projection, but cannot masquerade as TargetCommit evidence.
                 continue
+            # Work and its exact RM assets remain published and readable. The
+            # catalog admits every accepted TargetCommit: measured work carries
+            # its actual metrics, unmeasured work (observation, analysis,
+            # negative results) is adoptable as evidence with the Agent
+            # explaining basis, scope and uncertainty.
             expected_provenance = target_commit_evidence_provenance(commit)
             if any(
                 provenance.get(key) != value
@@ -293,7 +336,7 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
                 "provenance_closure_refs": list(
                     target_commit_evidence_closure_refs(commit)
                 ),
-                "capabilities": list(TARGET_COMMIT_EVIDENCE_CAPABILITIES),
+                "capabilities": list(_evidence_capabilities(commit)),
                 "eligibility_token_ref": role.receipt.receipt_ref,
                 "integrity_receipt_ref": asset.receipt.receipt_ref,
                 "availability_receipt_ref": asset.receipt.receipt_ref,
@@ -317,8 +360,10 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
                         "question_ref": source["question_ref"], "cycle_ref": source["cycle_ref"],
                         "target_commit_ref": commit.commit_ref,
                         "asset_version_ref": asset.version_ref, "content_hash": asset.content_hash,
-                        "target_spec": spec, "target_spec_hash": commit.target_spec_hash,
-                        "metric_result": _target_commit_metric_document(commit),
+                        "target_spec_hash": commit.target_spec_hash,
+                        "research_summary": evidence_discovery_summary(
+                            spec, _target_commit_metric_document(commit),
+                            commit.closure.get("result_content", {}), commit.result_disposition),
                         "result_disposition": commit.result_disposition,
                         "exact_content_reader": "research_memory.plan_evidence.read",
                     }
@@ -354,11 +399,15 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             raise OwnerConflict("plan_evidence_catalog_invalid")
         if len(evidence_catalog) != expected_reference_revision or len(evidence_catalog) > 256:
             raise OwnerConflict("plan_evidence_catalog_invalid")
-        root_refs = tuple(str(item.get("target_commit_root_ref", "")) for item in evidence_catalog)
-        current_catalog = self._catalog_for_refs(
+        generic = [item for item in evidence_catalog if item.get("schema_ref") == EVIDENCE_SOURCE_REF_SCHEMA]
+        target_entries = [item for item in evidence_catalog if item.get("schema_ref") != EVIDENCE_SOURCE_REF_SCHEMA]
+        for item in generic:
+            self._generic_plan_source(quest_ref, item)
+        root_refs = tuple(str(item.get("target_commit_root_ref", "")) for item in target_entries)
+        current_catalog = [*self._catalog_for_refs(
             quest_ref=quest_ref, target_commit_refs=root_refs, current_only=require_current,
-            role_refs=tuple(str(item.get("role_ref", "")) for item in evidence_catalog),
-        )
+            role_refs=tuple(str(item.get("role_ref", "")) for item in target_entries),
+        ), *generic]
         current_by_ref = {
             cast(str, item["evidence_ref"]): item for item in current_catalog
         }
@@ -382,6 +431,19 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             supplied_refs
         ):
             raise OwnerConflict("plan_evidence_catalog_invalid")
+
+    def _generic_plan_source(self, quest_ref, item):
+        if (set(item) != {'schema_ref','evidence_ref','source_kind','source_ref'}
+                or item.get('schema_ref') != EVIDENCE_SOURCE_REF_SCHEMA
+                or item.get('source_kind') not in GENERIC_EVIDENCE_KINDS
+                or not isinstance(item.get('source_ref'), str) or not item['source_ref']
+                or item.get('evidence_ref') != item['source_ref']):
+            raise OwnerConflict('plan_evidence_source_invalid')
+        source = self._research_graph.resolve_reasoning_historical_evidence_leaf(
+            quest_ref=quest_ref, ref=item['source_ref'])
+        if source is None or source.get('kind') != item['source_kind'] or source.get('ref') != item['source_ref']:
+            raise OwnerConflict('plan_evidence_source_invalid')
+        return source
 
     def resolve_plan_evidence_reuse_leaves(
         self,
@@ -425,7 +487,8 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             commit.commit_ref: commit
             for commit in self._research_graph.query_target_commits_for_quest(
                 quest_ref,
-                target_commit_refs=tuple(str(catalog_by_ref[ref]["target_commit_root_ref"]) for ref in selected_refs),
+                target_commit_refs=tuple(str(catalog_by_ref[ref]["target_commit_root_ref"]) for ref in selected_refs
+                                        if "target_commit_root_ref" in catalog_by_ref[ref]),
             )
         }
         leaves: list[EvidenceReuseLeaf] = []
@@ -433,6 +496,20 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             catalog_entry = catalog_by_ref.get(evidence_ref)
             if catalog_entry is None:
                 raise OwnerConflict("plan_evidence_reuse_closure_invalid")
+            if catalog_entry.get("schema_ref") == EVIDENCE_SOURCE_REF_SCHEMA:
+                source = self._generic_plan_source(quest_ref, catalog_entry)
+                leaves.append(EvidenceReuseLeaf(
+                    evidence_ref=evidence_ref, role=source['kind'], evidence_item_ref=source['ref'],
+                    source_role_ref=None, source_variant_run_ref=None, source_evaluation_attempt_ref=None,
+                    source_subject_kind=source['kind'],
+                    source_subject_ref=source.get('source_subject_ref', source['ref']),
+                    target_commit_ref=None, asset_version_ref=source['ref'] if source['kind']=='AssetVersion' else None,
+                    evidence_catalog_entry_hash=canonical_hash(catalog_entry),
+                    evidence_use_hashes=tuple(canonical_hash(use) for use in uses_by_ref[evidence_ref]),
+                    evidence_asset_receipt=None, evidence_role_receipt=None,
+                    formal_measurement_acceptance_receipt=None, target_commit_acceptance_receipt=None,
+                    source_binding=source))
+                continue
             target_commit_ref = catalog_entry.get("target_commit_root_ref")
             asset_version_ref = catalog_entry.get("asset_version_ref")
             if (
@@ -455,7 +532,7 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
             )
             if (
                 commit.receipt.issuer != "research_graph"
-                or commit.receipt.kind != "target_commit"
+                or commit.receipt.kind not in {TARGET_COMMIT_RECEIPT_KIND, "target_commit"}
                 or commit.receipt.subject_ref != commit.commit_ref
                 or catalog_asset_receipt.issuer != "research_memory"
                 or catalog_asset_receipt.subject_ref != asset_version_ref
@@ -527,7 +604,9 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
         for target_commit_ref in target_commit_refs:
             commit = commits.get(target_commit_ref)
             catalog_entry = catalog_by_commit.get(target_commit_ref)
-            if commit is None or catalog_entry is None:
+            if commit is None:
+                raise OwnerConflict("reasoning_target_evidence_closure_invalid")
+            if catalog_entry is None:
                 raise OwnerConflict("reasoning_target_evidence_closure_invalid")
             asset_receipt = _accepted_receipt(
                 catalog_entry.get("asset_receipt"),
@@ -586,6 +665,44 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
 
         error_code = "plan_evidence_reuse_closure_invalid"
         metric_document = _target_commit_metric_document(commit)
+        if metric_document is None:
+            # Unmeasured accepted work is adoptable as evidence: the citation
+            # identity is the TargetCommit itself, grounded on the exact RM
+            # evidence asset and the RG role/commit receipts.  No EvaluationAttempt
+            # or measurement receipt is manufactured.
+            variant_run_ref = None
+            formal = self._research_graph.query_target_formal_results(commit.target_ref)
+            for item in formal:
+                run = item.get("variant_run")
+                if isinstance(run, dict) and run.get("variant_run_ref"):
+                    variant_run_ref = cast(str, run["variant_run_ref"])
+                    break
+            if variant_run_ref is None:
+                raise OwnerConflict("target_formal_entity_missing")
+            return (
+                EvidenceReuseLeaf(
+                    evidence_ref=evidence_ref,
+                    role="WorkProduct",
+                    evidence_item_ref=commit.commit_ref,
+                    source_role_ref=cast(str, catalog_entry["role_ref"]),
+                    source_variant_run_ref=variant_run_ref,
+                    source_evaluation_attempt_ref=None,
+                    source_subject_kind="VariantRun",
+                    source_subject_ref=variant_run_ref,
+                    target_commit_ref=commit.commit_ref,
+                    asset_version_ref=cast(
+                        str, catalog_entry["asset_version_ref"]
+                    ),
+                    evidence_catalog_entry_hash=canonical_hash(catalog_entry),
+                    evidence_use_hashes=tuple(
+                        canonical_hash(use) for use in uses
+                    ),
+                    evidence_asset_receipt=catalog_asset_receipt,
+                    evidence_role_receipt=catalog_role_receipt,
+                    formal_measurement_acceptance_receipt=None,
+                    target_commit_acceptance_receipt=commit.receipt,
+                ),
+            )
         metric_result_ref = metric_document.get("metric_result_ref")
         if (
             not isinstance(metric_result_ref, str)

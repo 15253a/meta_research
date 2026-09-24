@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 from time import perf_counter
+from functools import wraps
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +43,17 @@ def measure_query(name):
     finally:
         _current.reset(token)
         LOGGER.info('public_query %s', json.dumps({'query': name, 'failed': failed, **timing.public()}))
+
+
+def measured_owner_operation(name):
+    """Measure an Owner boundary with the existing request-local SQL hooks."""
+    def decorate(function):
+        @wraps(function)
+        def measured(*args, **kwargs):
+            with measure_query(name):
+                return function(*args, **kwargs)
+        return measured
+    return decorate
 
 
 @contextmanager

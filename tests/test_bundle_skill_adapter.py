@@ -1085,7 +1085,7 @@ def test_production_adapter_freezes_skill_without_requiring_child_choreography(
     assert 'model_reasoning_effort="max"' in primary_argv
     assert f"inbox_checkpoint={serialized_checkpoint}" in primary_prompt
     assert "Agent Session 绝不是 Target 或 TargetRun" in primary_prompt
-    assert "本回合仅执行 Primary draft phase" in primary_prompt
+    assert "本回合形成可提交的 TargetPlan 或 exhaustion_assessment" in primary_prompt
     assert "TargetPlan 不选择 provider、adapter" in primary_prompt
     assert "installed_experiment_provider_catalog=" not in primary_prompt
     assert "Provider transport envelope" in primary_prompt

@@ -926,6 +926,7 @@ class PlanStageWorker:
         evidence_page, evidence_catalog = self._research_graph.query_plan_evidence_page(
             quest_ref=current.question.quest_ref,
             question_ref=current.question.question_ref,
+            limit=32,
         )
 
         return {

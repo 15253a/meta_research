@@ -24,6 +24,7 @@ export type ReadableOutputProps = {
   chunks?: readonly OutputChunk[];
   followLive?: boolean;
   onPauseFollow?: () => void;
+  publicOnly?: boolean;
 };
 
 function useParsedOutput(props: ReadableOutputProps): ParsedOutput {
@@ -215,7 +216,7 @@ export function StageReadableOutput(props: ReadableOutputProps & {
           ? "记录横跨分页；读取相邻页后会合并显示，原始片段已保留。"
           : "已读取的会话记录、其他来源和暂未识别的内容可在下方查看。"}</p>
       </div> : null}
-      <OtherRecords parsed={parsed} />
+      {!props.publicOnly && <OtherRecords parsed={parsed} />}
     </div>
   </section>;
 }
@@ -237,7 +238,7 @@ export function TargetCommandOutput(props: ReadableOutputProps & {
   useEffect(() => {
     if (props.followLive && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [props.followLive, selected?.id, selected?.output, logRef]);
-  return <section className="ro-target" aria-label="实验命令的真实输出">
+  return <section className="ro-target" aria-label="任务命令的真实输出">
     <div className="ro-target-toolbar">
       <label htmlFor={`${id}-command`}>执行命令</label>
       <select id={`${id}-command`} value={selected?.id ?? ""} disabled={!commands.length}
@@ -260,7 +261,7 @@ export function TargetCommandOutput(props: ReadableOutputProps & {
       <SourceSpans spans={selected.spans} label="查看所选命令的来源记录" />
     </> : <div className="ro-target-empty">
       <b>当前已读取记录中还没有命令输出</b>
-      <p>训练或评估命令产生输出后会显示在这里。也可以读取相邻页，查看已记录的其他命令。</p>
+      <p>命令产生输出后会显示在这里。也可以读取相邻页，查看已记录的其他命令。</p>
     </div>}
     {nonCommandSpans.length ? <SourceSpans spans={nonCommandSpans} label="查看智能体说明与工具原始记录" /> : null}
     <OtherRecords parsed={parsed} />

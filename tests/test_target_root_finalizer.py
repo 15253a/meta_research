@@ -45,10 +45,8 @@ import test_public_bundle_stage as bundle_fixtures
 from test_target_launch_admission import _ready_launch
 
 
-def _admit_independent_target_root(runtime):
-    graph, target, _bundle_run, dispatch, _source_launch_request = _ready_launch(
-        runtime
-    )
+def _admit_independent_target_root(runtime, *, ready=None):
+    graph, target, _bundle_run, dispatch, _source_launch_request = (ready if ready is not None else _ready_launch(runtime))
     runtime.owners.research_graph.accept_formal_plan_content(
         formal_plan_ref=graph.formal_plan_ref,
         idempotency_key="accept-target-root-plan-source",
@@ -196,10 +194,10 @@ class _EvidenceReader:
         )
 
 
-def _root_finalizer_fixture(tmp_path: Path):
-    runtime = _current_bundle_runtime(tmp_path / "target-root-finalizer")
+def _root_finalizer_fixture(tmp_path: Path, *, runtime=None, ready=None):
+    runtime = runtime or _current_bundle_runtime(tmp_path / "target-root-finalizer")
     target, candidate, formal_plan, _admission, handle = (
-        _admit_independent_target_root(runtime)
+        _admit_independent_target_root(runtime, ready=ready)
     )
     with runtime._database.read() as connection:
         launch_ref = connection.execute(
@@ -671,7 +669,7 @@ def test_invalid_result_candidate_is_rejected_before_rm_and_can_be_revised(
         assert rejected.rejection_issuer == "research_memory"
         assert rejected.pending_code == "target_root_result_document_invalid"
         assert rejected.rejection_feedback == (
-            "The declared result document is not valid canonical JSON for the "
+            "The declared result document is not valid unambiguous UTF-8 JSON for the "
             "Target result schema. Rewrite outputs/result.json and complete another "
             "root turn."
         )
@@ -1026,14 +1024,14 @@ def _oversize_declared_log(workspace: Path) -> None:
         ),
         (
             _oversize_declared_log,
-            "target_root_artifact_too_large",
+            None,
         ),
     ),
 )
-def test_missing_or_oversized_artifact_is_a_recoverable_rm_rejection(
+def test_missing_artifact_is_recoverable_but_large_artifact_is_accepted(
     tmp_path: Path,
     prepare_invalid_artifact,
-    expected_code: str,
+    expected_code: str | None,
 ) -> None:
     runtime, lifecycle, memory, _authority, handle, workspace, evidence = (
         _root_finalizer_fixture(tmp_path)
@@ -1048,6 +1046,11 @@ def test_missing_or_oversized_artifact_is_a_recoverable_rm_rejection(
     try:
         rejected = finalizer.finalize(handle=handle, evidence=evidence)
 
+        if expected_code is None:
+            assert rejected.status == "rm_accepted"
+            manifest = memory.query(rejected.manifest_ref)
+            assert any(entry.byte_count > MAX_ASSET_BYTES for entry in manifest.entries)
+            return
         assert rejected.status == "revision_required"
         assert rejected.manifest_ref is None
         assert rejected.pending_code == expected_code
@@ -1093,39 +1096,6 @@ def test_artifact_io_unavailability_remains_finalization_replay(
             finalizer.finalize(handle=handle, evidence=evidence)
         assert lifecycle.query_completion(handle.target_ref) is None
         assert lifecycle.query(handle.target_ref).status == "running"  # type: ignore[union-attr]
-    finally:
-        runtime.close()
-
-
-def test_aggregate_artifact_budget_is_a_recoverable_rm_rejection(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime, lifecycle, memory, _authority, handle, _workspace, evidence = (
-        _root_finalizer_fixture(tmp_path)
-    )
-    monkeypatch.setattr(
-        target_run_finalizer_module,
-        "TARGET_ROOT_MAX_ARTIFACT_SET_BYTES",
-        1,
-    )
-    finalizer = TargetRunFinalizer(
-        lifecycle=lifecycle,
-        memory=memory,
-        workspace_resolver=runtime.target_run_authorities.agent_runtime,
-        evidence_reader=_EvidenceReader(evidence),
-    )
-    try:
-        rejected = finalizer.finalize(handle=handle, evidence=evidence)
-
-        assert rejected.status == "revision_required"
-        assert rejected.manifest_ref is None
-        assert rejected.pending_code == "target_root_artifact_set_too_large"
-        assert rejected.rejection_issuer == "research_memory"
-        assert (
-            lifecycle.query(handle.target_ref).status == "running"  # type: ignore[union-attr]
-        )
-        assert memory.query_for_completion(rejected.completion_ref) is None
     finally:
         runtime.close()
 

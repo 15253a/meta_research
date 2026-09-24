@@ -20,6 +20,7 @@ IDEA_REVIEW_SCHEMA_REF = "meta-research/idea-advisory-review/v2"
 IDEA_CONTEXT_PACK_SCHEMA_REF = "meta-research/idea-context-pack/v1"
 IDEA_CONTEXT_PACK_SCHEMA_V2_REF = "meta-research/idea-context-pack/v2"
 IDEA_CONTEXT_PACK_SCHEMA_V3_REF = "meta-research/idea-context-pack/v3"
+IDEA_CONTEXT_PACK_SCHEMA_V4_REF = "meta-research/idea-context-pack/v4"
 MAX_IDEA_CONTEXT_EVIDENCE_REFS = 100
 MAX_IDEA_CONTEXT_GUIDANCE_BINDINGS = 100
 _IDEA_CONTEXT_PACK_V1_FIELDS = {
@@ -101,6 +102,31 @@ def validate_idea_content(
     return outcome_hash, review_hash
 
 
+def idea_used_evidence_refs(outcome: dict[str, object]) -> set[str]:
+    """Exact immutable asset-version identities actually cited by this outcome."""
+    refs: set[str] = set()
+    boundaries = ([candidate.get("evidence_boundary") for candidate in outcome.get("candidates", [])
+                   if isinstance(candidate, dict)] if outcome.get("kind") == "IdeaSet"
+                  else [outcome.get("evidence_boundary")])
+    collections = [item.get("accepted_evidence_refs", []) for item in boundaries if isinstance(item, dict)]
+    collections += [item.get("evidence_refs", []) for item in outcome.get("candidate_families_considered", []) if isinstance(item, dict)]
+    for values in collections:
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+            raise IdeaContractError("accepted_evidence_ref_unbound")
+        refs.update(values)
+    if len(refs) > MAX_IDEA_CONTEXT_EVIDENCE_REFS:
+        raise IdeaContractError("idea_selected_evidence_too_large")
+    return refs
+
+
+def idea_validation_evidence_refs(context_pack: dict[str, object]) -> set[str] | None:
+    # v4 freezes a discovery page, not the full eligible evidence universe.
+    # RG authenticates actual cited identities before domain acceptance.
+    if context_pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V4_REF:
+        return None
+    return accepted_evidence_refs(context_pack)
+
+
 def validate_idea_outcome(
     outcome: dict[str, object],
     *,
@@ -119,6 +145,8 @@ def validate_idea_outcome(
         raise IdeaContractError("idea_outcome_context_mismatch")
     _require_text(outcome.get("question_ref"), "question_ref")
     _require_text(outcome.get("context_pack_ref"), "context_pack_ref")
+    if "notes" in outcome and not isinstance(outcome["notes"], str):
+        raise IdeaContractError("idea_notes_invalid")
     kind = outcome.get("kind")
     if kind == "IdeaSet":
         _validate_idea_set(outcome, accepted_evidence_refs)
@@ -126,117 +154,19 @@ def validate_idea_outcome(
         _validate_no_viable(outcome, accepted_evidence_refs)
     else:
         raise IdeaContractError("idea_outcome_kind_invalid")
+    idea_used_evidence_refs(outcome)
     return _canonical_hash(outcome)
 
 
-def validate_advisory_review(
-    review: dict[str, object],
-    *,
-    outcome_hash: str,
-    reviewed_draft_hash: str | None = None,
-) -> str:
-    if not isinstance(review, dict):
-        raise IdeaContractError("idea_review_shape_invalid")
-    schema_ref = review.get("schema_ref")
-    common_fields = {
-        "schema_ref",
-        "reviewed_draft_hash",
-        "findings",
-        "dispositions",
-        "final_outcome_hash",
-        "independent",
-        "advisory_only",
-    }
-    if schema_ref == IDEA_REVIEW_SCHEMA_REF:
-        expected_fields = common_fields | {"review_mode", "reviewer_agent_ref"}
-    elif schema_ref == IDEA_REVIEW_SCHEMA_V1_REF:
-        expected_fields = common_fields | {"reviewer_session_ref"}
-    else:
-        raise IdeaContractError("idea_review_schema_invalid")
-    if set(review) != expected_fields:
-        raise IdeaContractError("idea_review_shape_invalid")
-    if schema_ref == IDEA_REVIEW_SCHEMA_REF:
-        review_mode = review["review_mode"]
-        reviewer_agent_ref = review["reviewer_agent_ref"]
-        if review_mode == "advisory_unobserved":
-            if reviewer_agent_ref is not None or review["independent"] is not False:
-                raise IdeaContractError("idea_review_authority_invalid")
-        elif review_mode == "harness_child_agent":
-            # Immutable executions written before ADR-0003 remain readable.
-            # Current Skill and Agent Runtime write gates reject this mode.
-            _require_text(reviewer_agent_ref, "reviewer_agent_ref")
-            if review["independent"] is not True:
-                raise IdeaContractError("idea_review_authority_invalid")
-        else:
-            raise IdeaContractError("idea_review_mode_invalid")
-    else:
-        _require_text(review["reviewer_session_ref"], "reviewer_session_ref")
-        if review["independent"] is not True:
-            raise IdeaContractError("idea_review_authority_invalid")
-    claimed_reviewed_draft_hash = review["reviewed_draft_hash"]
-    final_outcome_hash = review["final_outcome_hash"]
-    if (
-        not _is_hash(claimed_reviewed_draft_hash)
-        or final_outcome_hash != outcome_hash
-    ):
-        raise IdeaContractError("idea_review_outcome_hash_mismatch")
-    if (
-        reviewed_draft_hash is not None
-        and claimed_reviewed_draft_hash != reviewed_draft_hash
-    ):
-        raise IdeaContractError("idea_review_draft_hash_mismatch")
-    if review["advisory_only"] is not True:
-        raise IdeaContractError("idea_review_authority_invalid")
-
-    findings = review["findings"]
-    if not isinstance(findings, list):
-        raise IdeaContractError("review_finding_shape_invalid")
-    finding_ids: list[str] = []
-    for finding in findings:
-        if not isinstance(finding, dict) or set(finding) != {
-            "finding_id",
-            "category",
-            "message",
-        }:
-            raise IdeaContractError("review_finding_shape_invalid")
-        _require_text(finding["finding_id"], "finding_id")
-        _require_text(finding["message"], "finding_message")
-        if finding["category"] not in REVIEW_CATEGORIES:
-            raise IdeaContractError("review_category_invalid")
-        finding_ids.append(cast(str, finding["finding_id"]))
-    if len(finding_ids) != len(set(finding_ids)):
-        raise IdeaContractError("review_finding_duplicate")
-
-    dispositions = review["dispositions"]
-    if not isinstance(dispositions, list):
-        raise IdeaContractError("review_disposition_shape_invalid")
-    disposition_ids: list[str] = []
-    for disposition in dispositions:
-        if not isinstance(disposition, dict) or set(disposition) != {
-            "finding_id",
-            "action",
-            "rationale",
-        }:
-            raise IdeaContractError("review_disposition_shape_invalid")
-        _require_text(disposition["finding_id"], "disposition_finding_id")
-        _require_text(disposition["rationale"], "disposition_rationale")
-        if disposition["action"] not in DISPOSITION_ACTIONS:
-            raise IdeaContractError("review_disposition_action_invalid")
-        disposition_ids.append(cast(str, disposition["finding_id"]))
-    if len(disposition_ids) != len(set(disposition_ids)) or set(
-        disposition_ids
-    ) != set(finding_ids):
-        raise IdeaContractError("review_dispositions_incomplete")
-    has_revision = any(item["action"] == "revised" for item in dispositions)
-    outcome_changed = claimed_reviewed_draft_hash != outcome_hash
-    if has_revision and not outcome_changed:
-        raise IdeaContractError("review_revision_not_material")
-    if (
-        schema_ref == IDEA_REVIEW_SCHEMA_REF
-        and outcome_changed
-        and not has_revision
-    ):
-        raise IdeaContractError("review_outcome_changed_without_revision")
+def validate_advisory_review(review: dict[str, object], *, outcome_hash: str, reviewed_draft_hash: str | None = None) -> str:
+    """Bind draft and final bytes; review feedback is part of native execution."""
+    if (not isinstance(review, dict) or set(review) != {"schema_ref", "reviewed_draft_hash", "final_outcome_hash"}
+        or review.get("schema_ref") != IDEA_REVIEW_SCHEMA_REF
+        or review.get("final_outcome_hash") != outcome_hash
+        or not isinstance(review.get("reviewed_draft_hash"), str)
+        or len(review["reviewed_draft_hash"]) != 64
+        or (reviewed_draft_hash is not None and review["reviewed_draft_hash"] != reviewed_draft_hash)):
+        raise IdeaContractError("idea_review_binding_invalid")
     return _canonical_hash(review)
 
 
@@ -255,6 +185,9 @@ def validate_idea_context_pack(
     if not isinstance(context_pack, dict):
         raise IdeaContractError("idea_context_pack_invalid")
     schema_ref = context_pack.get("schema_ref")
+    if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V4_REF:
+        return _validate_context_pack_v4(context_pack, cycle_ref=cycle_ref,
+            accepted_question_binding=accepted_question_binding)
     expected_fields = (
         _IDEA_CONTEXT_PACK_V3_FIELDS
         if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V3_REF
@@ -376,6 +309,9 @@ def literature_binding(
     value = context_pack.get("literature_binding")
     if value is None:
         return None
+    if context_pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V4_REF:
+        _validate_literature_reference(value, context_pack["accepted_question_binding"].get("question_ref"))
+        return value
     if context_pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V3_REF:
         accepted = context_pack.get("accepted_question_binding")
         question_ref = (
@@ -592,6 +528,7 @@ def _material_value(value: object) -> object:
             key: _material_value(item)
             for key, item in value.items()
             if key not in _MATERIAL_IDENTITY_FIELDS
+            and not (key == "notes" and isinstance(item, str) and not item.strip())
         }
     if isinstance(value, list):
         # Outcome list order and duplicate copies are not research changes.
@@ -621,7 +558,7 @@ def _validate_idea_set(
         "context_pack_ref",
         "candidates",
         "recommendation",
-    }:
+    } | ({"notes"} if "notes" in outcome else set()):
         raise IdeaContractError("idea_set_shape_invalid")
     candidates = outcome["candidates"]
     if not isinstance(candidates, list) or not candidates:
@@ -629,40 +566,30 @@ def _validate_idea_set(
     keys: list[str] = []
     material_candidates: list[str] = []
     for candidate in candidates:
-        if not isinstance(candidate, dict) or set(candidate) != {
-            "candidate_key",
-            "direction",
-            "rationale",
-            "assumptions",
-            "risks",
-            "evidence_boundary",
-            "falsification_hint",
-            "material_difference",
-        }:
+        required = {"candidate_key", "direction", "rationale", "evidence_boundary"}
+        optional = {"assumptions", "risks", "falsification_hint", "material_difference", "notes"}
+        if (not isinstance(candidate, dict) or not required <= set(candidate)
+                or not set(candidate) <= required | optional):
             raise IdeaContractError("idea_candidate_shape_invalid")
+        if "notes" in candidate and not isinstance(candidate["notes"], str):
+            raise IdeaContractError("idea_notes_invalid")
         for field in ("candidate_key", "direction", "rationale"):
             _require_text(candidate[field], field)
         keys.append(cast(str, candidate["candidate_key"]))
-        _require_text_list(candidate["assumptions"], "candidate_assumptions")
-        _require_text_list(candidate["risks"], "candidate_risks")
+        for field in ("assumptions", "risks"):
+            if field in candidate:
+                _require_text_list(candidate[field], "candidate_" + field)
         _validate_evidence_boundary(candidate["evidence_boundary"], accepted_refs)
-        _validate_text_object(
-            candidate["falsification_hint"],
-            {"test", "would_refute"},
-            "falsification_hint",
-        )
-        _validate_text_object(
-            candidate["material_difference"],
-            {"from_history", "from_peers", "plan_commitment_change"},
-            "material_difference",
-        )
+        if "falsification_hint" in candidate:
+            _validate_text_object(candidate["falsification_hint"], {"test", "would_refute"}, "falsification_hint")
+        if "material_difference" in candidate:
+            _validate_text_object(candidate["material_difference"], {"from_history", "from_peers", "plan_commitment_change"}, "material_difference")
         material_candidate = dict(candidate)
         material_candidate.pop("candidate_key")
-        difference = dict(cast(dict[str, object], candidate["material_difference"]))
-        # A candidate cannot prove difference merely by changing its own
-        # advisory comparison-to-peers sentence.
-        difference.pop("from_peers")
-        material_candidate["material_difference"] = difference
+        if "material_difference" in candidate:
+            difference = dict(cast(dict[str, object], candidate["material_difference"]))
+            difference.pop("from_peers")
+            material_candidate["material_difference"] = difference
         material_candidates.append(
             _canonical_hash(_material_value(material_candidate))
         )
@@ -694,7 +621,7 @@ def _validate_no_viable(
         "evidence_boundary",
         "overturn_conditions",
         "why_plan_cannot_proceed",
-    }:
+    } | ({"notes"} if "notes" in outcome else set()):
         raise IdeaContractError("no_viable_shape_invalid")
     _require_text(outcome["exploration_scope"], "exploration_scope")
     _require_text(outcome["why_plan_cannot_proceed"], "why_plan_cannot_proceed")
@@ -780,3 +707,52 @@ def _canonical_json(value: object) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _validate_literature_reference(value, question_ref):
+    if value is None:
+        return
+    fields={"kind","revision_ref","question_ref","literature_snapshot_ref",
+        "rm_acceptance_receipt_ref","rg_question_association_receipt_ref","receipt",
+        "records_hash","record_count","records_preview"}
+    if not isinstance(value,dict) or set(value)!=fields or value["kind"]!="QuestionLiteratureReference" or type(value["record_count"])is not int or value["record_count"]<0 or not _is_hash(value["records_hash"]):
+        raise IdeaContractError("idea_context_pack_invalid")
+    # Pure receipt/identity shape check; Owner separately compares this reference
+    # to the exact accepted revision. The empty records here are never authority.
+    structural={k:v for k,v in value.items() if k not in {"records_hash","record_count","records_preview"}}
+    structural.update(kind="QuestionLiteratureRevision",records=[])
+    _validate_question_literature_revision_binding(structural,question_ref=question_ref)
+    page=value["records_preview"]
+    if not isinstance(page,dict) or type(page.get("items"))is not list or page.get("shown_count")!=len(page["items"]) or page.get("total_count")!=value["record_count"] or len(page["items"])>24 or page.get("truncated")!=(len(page["items"])<value["record_count"]):
+        raise IdeaContractError("idea_context_pack_invalid")
+
+
+def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
+    if set(pack)!=_IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page"}:
+        raise IdeaContractError("idea_context_pack_invalid")
+    legacy={k:v for k,v in pack.items() if k!="evidence_page"}
+    legacy.update(schema_ref=IDEA_CONTEXT_PACK_SCHEMA_V2_REF,literature_binding=None,prior_accepted_bindings=[])
+    refs=validate_idea_context_pack(legacy,cycle_ref=cycle_ref,accepted_question_binding=accepted_question_binding)
+    page=pack["evidence_page"]
+    if not isinstance(page,dict) or set(page)!={"schema_ref","total_count","shown_count","offset","limit","next_offset","selection","complete","references_hash"} or page["schema_ref"]!="meta-research/evidence-reference-page/v1" or type(page["total_count"])is not int or page["total_count"]<len(refs) or page["shown_count"]!=len(refs) or page["total_count"]!=pack["evidence_reference_revision"] or page["offset"]!=0 or page["limit"]!=32 or len(refs)>32 or page["references_hash"]!=_canonical_hash(sorted(refs)) or page["complete"]!=(len(refs)==page["total_count"]) or page["next_offset"]!=(len(refs) if len(refs)<page["total_count"] else None):
+        raise IdeaContractError("idea_context_pack_invalid")
+    _validate_literature_reference(pack["literature_binding"],accepted_question_binding.get("question_ref"))
+    prior=pack["prior_accepted_bindings"]
+    if not isinstance(prior,list) or len(prior)>1:
+        raise IdeaContractError("idea_context_pack_invalid")
+    for item in prior:
+        if not isinstance(item,dict) or set(item)-{"research_notes","handoff_notes"}!={"kind","cycle_ref","commit_ref","outcome_ref","closure_hash","receipt","outcome_receipt","scientific_summary","exact_reader"} or item["kind"]!="ReasoningHandoffReference" or not _is_hash(item["closure_hash"]) or item["exact_reader"]!="research_memory.stage_context.read":
+            raise IdeaContractError("idea_context_pack_invalid")
+        if "research_notes" in item and not isinstance(item["research_notes"], list):
+            raise IdeaContractError("idea_context_pack_invalid")
+        if "handoff_notes" in item:
+            note = item["handoff_notes"]
+            if (not isinstance(note, dict) or set(note) != {"text", "source_utf8_bytes", "truncated"}
+                or not isinstance(note["text"], str) or len(note["text"].encode()) > 2048
+                or type(note["source_utf8_bytes"]) is not int
+                or note["source_utf8_bytes"] < len(note["text"].encode())
+                or note["truncated"] != (note["source_utf8_bytes"] > len(note["text"].encode()))):
+                raise IdeaContractError("idea_context_pack_invalid")
+        _validate_public_receipt(item["receipt"],issuer="advancement_engine",subject_ref=item["commit_ref"])
+        _validate_public_receipt(item["outcome_receipt"],issuer="research_graph",subject_ref=item["outcome_ref"])
+    return refs

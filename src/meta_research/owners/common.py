@@ -713,6 +713,10 @@ class PlanContentReceiptVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> frozenset[str]: ...
 
+    def query_plan_selected_evidence_catalog(
+        self, *, submission_ref: str, content_ref: str, receipt: AcceptanceReceipt,
+    ) -> list[dict[str, object]]: ...
+
 
 class IdeaOutcomeDecisionVerifier(Protocol):
     def verify_accepted_idea_set_binding(
@@ -745,6 +749,17 @@ class FormalPlanDecisionVerifier(Protocol):
 
 class ReasoningOutcomeDecisionVerifier(Protocol):
     """RG decision seam consumed by AR for one Reasoning Attempt."""
+
+    def verify_reasoning_scientific_decision(
+        self,
+        request_ref: str,
+        submission_ref: str | None,
+        decision: str,
+        outcome_ref: str | None,
+        receipt: AcceptanceReceipt,
+        *,
+        checkpoint_ref: str | None = None,
+    ) -> None: ...
 
     def verify_reasoning_outcome_decision(
         self,

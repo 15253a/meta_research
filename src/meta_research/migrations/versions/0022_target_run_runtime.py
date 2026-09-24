@@ -72,7 +72,7 @@ def upgrade() -> None:
     op.create_table(
         "rg_target_formal_plan_projections",
         sa.Column("graph_ref", sa.String(96), primary_key=True),
-        sa.Column("formal_plan_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("formal_plan_ref", sa.String(96), nullable=False),
         sa.Column("plan_document_hash", sa.String(64), nullable=False),
         sa.Column("source_acceptance_receipt_ref", sa.String(96), nullable=False),
         sa.Column("source_acceptance_receipt_hash", sa.String(64), nullable=False),
@@ -80,7 +80,7 @@ def upgrade() -> None:
         sa.Column("completion_contract_hash", sa.String(64), nullable=False),
         sa.Column("briefs_json", sa.Text(), nullable=False),
         sa.Column("briefs_hash", sa.String(64), nullable=False),
-        sa.Column("content_hash", sa.String(64), nullable=False, unique=True),
+        sa.Column("content_hash", sa.String(64), nullable=False),
         sa.Column("idempotency_key", sa.String(128), nullable=False, unique=True),
         sa.Column("request_hash", sa.String(64), nullable=False),
         sa.Column("receipt_ref", sa.String(96), nullable=False, unique=True),

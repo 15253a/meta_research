@@ -109,7 +109,6 @@ class _ProtocolEvaluationAdapter:
                 or len(selected) > 32
                 or not all(_bounded_text(value, 96) for value in selected)
                 or len(selected) != len(set(selected))
-                or policy != "forbidden"
             ):
                 raise TargetExecutionContractError("target_execution_request_invalid")
             request_kind = "remeasure"
@@ -258,6 +257,7 @@ class _ProtocolEvaluationAdapter:
                 "checkpoint_policy": {
                     "type": "string",
                     "enum": ["forbidden", "optional", "required"],
+                    "description": "Existing retention preference; the Target Agent chooses which actual states to preserve based on research value, future reuse and storage cost.",
                 },
                 "provider": provider,
             },

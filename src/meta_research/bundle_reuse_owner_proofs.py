@@ -19,17 +19,15 @@ class ReuseContentOwner(Protocol):
     def verify_implementation_content(self, **values) -> None: ...
 
 
-class ReuseEligibilityOwner(Protocol):
-    def verify_reuse_eligibility(self, **values) -> None: ...
-
-
 class BundleTargetCandidateOwnerProofVerifier:
     """Verify every Target candidate proof against its actual issuing Owner."""
 
     def __init__(
         self,
         research_memory: ReuseContentOwner,
-        research_graph: ReuseEligibilityOwner,
+        # RG remains an accepted construction argument for the bound-owner
+        # composition seam; reuse content receipts are RM-issued facts.
+        research_graph: object,
     ) -> None:
         self._research_memory = research_memory
         self._research_graph = research_graph
@@ -37,7 +35,6 @@ class BundleTargetCandidateOwnerProofVerifier:
     def verify_reuse_source_receipt(
         self,
         *,
-        tier: str,
         source_ref: str,
         exact_version_ref: str,
         implementation_revision_ref: str,
@@ -52,7 +49,6 @@ class BundleTargetCandidateOwnerProofVerifier:
             code="reuse_source_version_receipt_invalid",
         )
         self._research_memory.verify_reuse_source_version(
-            tier=tier,
             source_ref=source_ref,
             exact_version_ref=exact_version_ref,
             implementation_revision_ref=implementation_revision_ref,
@@ -66,7 +62,6 @@ class BundleTargetCandidateOwnerProofVerifier:
     def verify_reuse_content_receipt(
         self,
         *,
-        tier: str,
         source_ref: str,
         exact_version_ref: str,
         implementation_revision_ref: str,
@@ -91,42 +86,6 @@ class BundleTargetCandidateOwnerProofVerifier:
             source_content_hash_ref=source_content_hash_ref,
             patch_ref=patch_ref,
             content_hash_ref=binding.content_hash_ref,
-            receipt_ref=receipt.receipt_ref,
-            receipt_subject_ref=receipt.subject_ref,
-        )
-
-    def verify_reuse_eligibility_receipt(
-        self,
-        *,
-        tier: str,
-        source_ref: str,
-        exact_version_ref: str,
-        implementation_revision_ref: str,
-        implementation_content_hash_ref: str,
-        eligibility_anchor_ref: str,
-        binding: ContentBindingProof,
-        receipt: ReceiptProof,
-    ) -> None:
-        if tier not in {
-            "accepted-local",
-            "related-history",
-            "global-baseline-pool",
-        }:
-            raise OwnerConflict("reuse_eligibility_tier_invalid")
-        _require_current_receipt(
-            receipt,
-            expected_subject_ref=binding.content_hash_ref,
-            code="reuse_eligibility_receipt_invalid",
-        )
-        self._research_graph.verify_reuse_eligibility(
-            tier=tier,
-            source_ref=source_ref,
-            exact_version_ref=exact_version_ref,
-            implementation_revision_ref=implementation_revision_ref,
-            implementation_content_hash_ref=implementation_content_hash_ref,
-            eligibility_anchor_ref=eligibility_anchor_ref,
-            eligibility_ref=binding.subject_ref,
-            eligibility_content_hash_ref=binding.content_hash_ref,
             receipt_ref=receipt.receipt_ref,
             receipt_subject_ref=receipt.subject_ref,
         )

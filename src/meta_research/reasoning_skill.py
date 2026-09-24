@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.context_presentation import stage_context_view
+
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
@@ -30,6 +32,7 @@ from meta_research.owners.agent_runtime import ReasoningRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
+from meta_research.runtime_binding_compatibility import reasoning_bindings_compatible
 from meta_research.root_capabilities import (
     ROOT_ROLE_OPERATION_DELTAS,
     merge_root_capability_bindings,
@@ -42,14 +45,17 @@ from meta_research.reasoning_contract import (
     REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF,
     REASONING_REVIEW_SCHEMA_REF,
     REASONING_STAGE_OUTPUT_SCHEMA_REF,
+    REASONING_SUCCESSOR_ENTRY_STAGES,
     SCIENTIFIC_OUTCOME_SCHEMA_REF,
     ReasoningContractError,
     completion_milestone_basis_refs,
     plan_evidence_reuse_leaves,
     validate_reasoning_autonomous_checkpoint,
+    validate_new_reasoning_successor_entry,
     validate_reasoning_stage_output,
     validate_scientific_outcome,
 )
+from .research_guidance import shared_research_guidance
 from meta_research.semantic_mcp import (
     ROOT_AGENT_COMMON_OPERATION_IDS,
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
@@ -91,7 +97,9 @@ REASONING_REVIEW_CATEGORIES = frozenset(
     }
 )
 REASONING_REVIEW_ACTIONS = frozenset({"revised", "not_adopted"})
-_SCIENTIFIC_EVIDENCE_KINDS = frozenset({"LiteratureRecord", "MetricResult"})
+_SCIENTIFIC_EVIDENCE_KINDS = frozenset(
+    {"LiteratureRecord", "MetricResult", "WorkProduct", "HumanInput"}
+)
 _DIAGNOSTIC_EVIDENCE_KINDS = frozenset(
     {"CheckpointArtifact", "LogAsset", "AnalysisAsset"}
 )
@@ -189,12 +197,14 @@ class ReasoningSkillRequest:
     frozen_evidence_closure: tuple[dict[str, object], ...]
     root_session_ref: str
     runtime_binding: ReasoningRuntimeBinding
+    historical_evidence_resolver: Callable[[str], dict[str, object] | None] | None = None
     native_session_ref: str | None = None
     predecessor_candidate_ref: str | None = None
     owner_rejection_receipt_ref: str | None = None
     owner_rejection_kind: str | None = None
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
+    continuation_feedback: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -210,8 +220,6 @@ class ReasoningSkillResult:
     scientific_outcome: dict[str, object]
     next_cycle_proposal: dict[str, object] | None
     candidate_completion: dict[str, object] | None
-    findings: tuple[dict[str, str], ...]
-    dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
     reviewer_agent_ref: str | None
@@ -232,14 +240,8 @@ class ReasoningSkillResult:
     def review_document(self) -> dict[str, object]:
         return {
             "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-            "review_mode": self.review_mode,
-            "reviewer_agent_ref": self.reviewer_agent_ref,
             "reviewed_draft_hash": canonical_hash(self.reviewed_draft),
-            "findings": list(self.findings),
-            "dispositions": list(self.dispositions),
             "final_output_hash": canonical_hash(self.outcome_document()),
-            "independent": False,
-            "advisory_only": True,
         }
 
 
@@ -249,8 +251,6 @@ class ReasoningAutonomousCheckpointResult:
 
     primary_draft: dict[str, object]
     reviewed_checkpoint: dict[str, object]
-    findings: tuple[dict[str, str], ...]
-    dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
     review_mode: str
     reviewer_agent_ref: str | None
@@ -259,14 +259,8 @@ class ReasoningAutonomousCheckpointResult:
     def review_document(self) -> dict[str, object]:
         return {
             "schema_ref": REASONING_REVIEW_SCHEMA_REF,
-            "review_mode": self.review_mode,
-            "reviewer_agent_ref": self.reviewer_agent_ref,
             "reviewed_draft_hash": canonical_hash(self.primary_draft),
-            "findings": list(self.findings),
-            "dispositions": list(self.dispositions),
             "final_output_hash": canonical_hash(self.reviewed_checkpoint),
-            "independent": False,
-            "advisory_only": True,
         }
 
 
@@ -280,6 +274,8 @@ class ReasoningSkillProvider(Protocol):
     def review_draft(
         self, request: ReasoningSkillRequest, draft: ReasoningSkillDraft
     ) -> ReasoningSkillResult | ReasoningAutonomousCheckpointResult: ...
+
+    def decide_after_deepfetch(self, request: ReasoningSkillRequest, checkpoint: dict[str, object], facts: dict[str, object], summary: object) -> dict[str, object]: ...
 
     def resume_after_autonomous_creation(
         self,
@@ -318,6 +314,7 @@ def validate_reasoning_skill_draft(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
+                historical_resolver=request.historical_evidence_resolver,
             )
         return validate_reasoning_stage_output(
             result.draft,
@@ -328,6 +325,7 @@ def validate_reasoning_skill_draft(
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, result.draft)
             ),
+            historical_resolver=request.historical_evidence_resolver,
         )
     except ReasoningSkillContractError as error:
         raise RecoverableReasoningSkillCandidateError(str(error)) from error
@@ -365,6 +363,7 @@ def validate_reasoning_autonomous_checkpoint_result(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
+                historical_resolver=request.historical_evidence_resolver,
             )
         )
         checkpoint_hash, outcome_hash, scope_hash = (
@@ -374,6 +373,7 @@ def validate_reasoning_autonomous_checkpoint_result(
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
+                historical_resolver=request.historical_evidence_resolver,
             )
         )
         review = result.review_document()
@@ -385,6 +385,25 @@ def validate_reasoning_autonomous_checkpoint_result(
     except ReasoningSkillContractError as error:
         raise RecoverableReasoningSkillCandidateError(str(error)) from error
     return checkpoint_hash, outcome_hash, scope_hash, canonical_hash(review)
+
+
+def validate_reasoning_deepfetch_decision(request: ReasoningSkillRequest, decision: dict[str, object], facts: dict[str, object]) -> None:
+    if not isinstance(decision, dict) or set(decision) != {"action", "final_output"}:
+        raise ReasoningContractError("reasoning_deepfetch_decision_invalid")
+    action, output = decision["action"], decision["final_output"]
+    if action == "retry":
+        if output is not None or facts.get("snapshot_ref") is not None or facts.get("status") not in {"failed", "cancelled"}:
+            raise ReasoningContractError("reasoning_deepfetch_retry_invalid")
+        return
+    if action not in {"create", "decline"} or not isinstance(output, dict):
+        raise ReasoningContractError("reasoning_deepfetch_decision_invalid")
+    _validate_output_bindings(request, output)
+    if action == "create":
+        if not facts.get("snapshot_ref"):
+            raise ReasoningContractError("reasoning_deepfetch_summary_required")
+        validate_reasoning_autonomous_checkpoint(output, frozen_evidence_closure=list(request.frozen_evidence_closure), frozen_research_context=request.context_pack["research_context"], historical_resolver=request.historical_evidence_resolver)
+    else:
+        validate_reasoning_stage_output(output, frozen_evidence_closure=list(request.frozen_evidence_closure), frozen_research_context=request.context_pack["research_context"], historical_resolver=request.historical_evidence_resolver, expected_completion_milestone_basis_refs=_completion_basis_for_output(request, output))
 
 
 def validate_reasoning_autonomous_resume_result(
@@ -417,6 +436,7 @@ def validate_reasoning_autonomous_resume_result(
             frozen_research_context=cast(
                 dict[str, object], request.context_pack["research_context"]
             ),
+            historical_resolver=request.historical_evidence_resolver,
         )
     )
     if result.reviewed_draft != checkpoint:
@@ -436,6 +456,7 @@ def validate_reasoning_autonomous_resume_result(
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, final_output)
             ),
+            historical_resolver=request.historical_evidence_resolver,
         )
         review = result.review_document()
         _validate_reasoning_review(
@@ -450,7 +471,6 @@ def validate_reasoning_autonomous_resume_result(
     anchor = creation_result.get("question_anchor")
     presence = creation_result.get("graph_presence_fact")
     research_state = creation_result.get("question_research_state_fact")
-    next_cycle = result.next_cycle_proposal
     if (
         not isinstance(anchor, dict)
         or not isinstance(presence, dict)
@@ -466,14 +486,12 @@ def validate_reasoning_autonomous_resume_result(
         != research_state.get("graph_revision_ref")
     ):
         raise ReasoningContractError("reasoning_autonomous_resume_lineage_invalid")
+    # Creation has an immutable checkpoint/source identity, but it does not
+    # commit the next research choice.  Validate the final output against the
+    # frozen evidence and source bindings above; RG authenticates whichever
+    # current/open Question and entry route the final proposal selects.
     if (
-        result.scientific_outcome != checkpoint_outcome
-        or not isinstance(next_cycle, dict)
-        or next_cycle.get("target_question_ref") != anchor.get("question_ref")
-        or next_cycle.get("target_question_anchor_ref") != anchor.get("ref")
-        or next_cycle.get("entry_stage") != checkpoint_scope.get("entry_stage")
-        or next_cycle.get("typed_skip_basis_refs_by_stage")
-        != checkpoint_scope.get("typed_skip_basis_refs_by_stage")
+        result.scientific_outcome != creation_result.get("scientific_outcome", checkpoint_outcome)
     ):
         raise RecoverableReasoningSkillCandidateError(
             "reasoning_autonomous_resume_lineage_invalid"
@@ -518,6 +536,7 @@ def validate_reasoning_skill_result(
                 expected_completion_milestone_basis_refs=(
                     _completion_basis_for_output(request, result.reviewed_draft)
                 ),
+                historical_resolver=request.historical_evidence_resolver,
             )
         )
         final_output = result.outcome_document()
@@ -531,6 +550,7 @@ def validate_reasoning_skill_result(
             expected_completion_milestone_basis_refs=(
                 _completion_basis_for_output(request, final_output)
             ),
+            historical_resolver=request.historical_evidence_resolver,
         )
         review = result.review_document()
         _validate_reasoning_review(
@@ -549,71 +569,16 @@ def validate_reasoning_skill_result(
     )
 
 
-def _validate_reasoning_review(
-    review: dict[str, object],
-    *,
-    reviewed_draft_hash: str,
-    final_output_hash: str,
-) -> None:
-    if set(review) != {
-        "schema_ref",
-        "review_mode",
-        "reviewer_agent_ref",
-        "reviewed_draft_hash",
-        "findings",
-        "dispositions",
-        "final_output_hash",
-        "independent",
-        "advisory_only",
-    } or (
-        review.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
-        or review.get("review_mode") != "advisory_unobserved"
-        or review.get("reviewer_agent_ref") is not None
-        or review.get("reviewed_draft_hash") != reviewed_draft_hash
+def _validate_reasoning_review(review: dict[str, object], *, final_output_hash: str, reviewed_draft_hash: str) -> str:
+    """Bind draft and final bytes; review feedback is part of native execution."""
+    if (not isinstance(review, dict) or set(review) != {"schema_ref", "reviewed_draft_hash", "final_output_hash"}
+        or review.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
         or review.get("final_output_hash") != final_output_hash
-        or review.get("independent") is not False
-        or review.get("advisory_only") is not True
-    ):
-        raise ReasoningContractError("reasoning_review_invalid")
-    findings = review.get("findings")
-    dispositions = review.get("dispositions")
-    if not isinstance(findings, list) or not isinstance(dispositions, list):
-        raise ReasoningContractError("reasoning_review_invalid")
-
-    finding_ids: list[str] = []
-    for finding in findings:
-        if (
-            not isinstance(finding, dict)
-            or set(finding) != {"finding_id", "category", "message"}
-            or not isinstance(finding.get("finding_id"), str)
-            or not finding["finding_id"]
-            or finding.get("category") not in REASONING_REVIEW_CATEGORIES
-            or not isinstance(finding.get("message"), str)
-            or not finding["message"]
-        ):
-            raise ReasoningContractError("reasoning_review_finding_invalid")
-        finding_ids.append(finding["finding_id"])
-    if len(finding_ids) != len(set(finding_ids)):
-        raise ReasoningContractError("reasoning_review_finding_invalid")
-
-    disposition_ids: list[str] = []
-    revised = False
-    for disposition in dispositions:
-        if (
-            not isinstance(disposition, dict)
-            or set(disposition) != {"finding_id", "action", "rationale"}
-            or not isinstance(disposition.get("finding_id"), str)
-            or disposition.get("action") not in REASONING_REVIEW_ACTIONS
-            or not isinstance(disposition.get("rationale"), str)
-            or not disposition["rationale"]
-        ):
-            raise ReasoningContractError("reasoning_review_disposition_invalid")
-        disposition_ids.append(disposition["finding_id"])
-        revised = revised or disposition["action"] == "revised"
-    if disposition_ids != finding_ids:
-        raise ReasoningContractError("reasoning_review_disposition_invalid")
-    if (reviewed_draft_hash != final_output_hash) != revised:
-        raise ReasoningContractError("reasoning_review_revision_invalid")
+        or not isinstance(review.get("reviewed_draft_hash"), str)
+        or len(review["reviewed_draft_hash"]) != 64
+        or (reviewed_draft_hash is not None and review["reviewed_draft_hash"] != reviewed_draft_hash)):
+        raise ReasoningContractError("reasoning_review_binding_invalid")
+    return canonical_hash(review)
 
 
 def _validate_request(request: ReasoningSkillRequest) -> None:
@@ -771,6 +736,7 @@ def _validate_output_bindings(
     request: ReasoningSkillRequest,
     output: dict[str, object],
 ) -> None:
+    validate_new_reasoning_successor_entry(output)
     outcome = output.get("scientific_outcome")
     if not isinstance(outcome, dict) or any(
         outcome.get(field) != expected
@@ -1192,7 +1158,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         self, request: ReasoningSkillRequest
     ) -> ReasoningSkillDraft:
         _validate_request(request)
-        if request.runtime_binding != self.runtime_binding():
+        if not reasoning_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise ReasoningSkillUnavailable("reasoning_runtime_binding_drift")
         lineage = _owner_rejection_prompt(request)
         human_resume = (
@@ -1223,12 +1189,13 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "一个 internal AutonomousQuestionScope；它只包含 reviewed question blueprint、"
             "mode、entry stage 与 typed skip basis，绝不能伪装成 outward transition。"
             "NextCycleProposal 必须闭合 entry_stage 与 exact typed skip basis；"
+            "下一 Cycle 只能进入 idea、plan 或 reasoning，不能直接进入 bundle。"
+            "继续实施前由 Plan 根据最新证据重新选择本轮工作；进入 plan 可复用已接纳 IdeaSet。"
             "source-current root/manual Question 的稳定 anchor ref 是其 question_ref，"
-            "但 present/open 仍由 RG 独立接纳。ScientificOutcome 不得冒充 IdeaSet 或 "
-            "FormalPlan skip basis。不得自称接纳内容、领域语义、创建 Question/Cycle、结束 "
-            "Quest 或形成 StageCommit。Log/Analysis/Checkpoint 只能以 finding=context "
-            "解释、限制、溯源或复现；affirmed/denied/uncertain 仍必须至少引用一项 "
-            "LiteratureRecord 或 MetricResult，诊断资产绝不能单独满足 substantive gate。"
+            "但 present/open 仍由 RG 独立接纳。进入 reasoning 时三个 skip basis 均为来源 "
+            "ScientificOutcome；进入 plan 的 IdeaSet basis 不得用 ScientificOutcome 冒充。"
+            "不得自称接纳内容、领域语义、创建 Question/Cycle、结束 "
+            "Quest 或形成 StageCommit。科研证据的判断与引用按上述 Skill 完成。"
             "Provider 是此 managed root Session 内的研究执行角色，不得创建第二个顶层 "
             "supervisor 或 Session。"
             f"{lineage}\n"
@@ -1243,9 +1210,12 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             f"foreground_epoch={request.foreground_epoch}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
-            f"context_pack={canonical_json(request.context_pack)}\n"
-            "frozen_evidence_closure="
-            f"{canonical_json(list(request.frozen_evidence_closure))}"
+            f"provider_context_view={canonical_json(stage_context_view('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}\n"
+            "Frozen evidence is available through the authenticated stage context reader; "
+            "the presentation is a preview, never a complete evidence authority. "
+            "The literature preview is not a citation limit: use source=literature_records "
+            "to page the exact frozen revision and cite any verified record in that revision; "
+            "the Owner checks actual cited record IDs, not preview membership."
         )
         output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
             request=request,
@@ -1272,7 +1242,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
     ) -> ReasoningSkillResult | ReasoningAutonomousCheckpointResult:
         _validate_request(request)
         if (
-            request.runtime_binding != self.runtime_binding()
+            not reasoning_bindings_compatible(request.runtime_binding, self.runtime_binding())
             or request.native_session_ref != draft.primary_session_ref
         ):
             raise ReasoningSkillUnavailable("reasoning_runtime_binding_drift")
@@ -1283,18 +1253,14 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         lineage = _owner_rejection_prompt(request)
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
-            "本回合是同一个 Reasoning 根 Agent 的 Review phase。先再次通过三项 resident "
-            "Semantic MCP 操作核对 current request/fence/epoch 与冻结 evidence/context，"
-            "再针对下方 exact frozen reviewed_draft 重新审查 source binding、"
-            "evidence role/disposition 边界、transition 或 internal autonomous scope 边界与 "
-            "Owner 权限。这次 advisory finalization 不批准结论，也不调用 Owner 写入。"
-            "形成 bounded findings，并对每条 finding 给出 revised | not_adopted；revised "
-            "必须实际改变 output。只返回 schema_ref、findings、final_output、"
-            "dispositions。"
+            "本回合在原根 Session 中完成独立审查后的修订。使用原生子智能体审查完整草稿和必要原文，"
+            "让它独立核查来源、推理、研究边界及后继选择。根据反馈和你的判断修订；没有发现问题也可改稿。"
+            "根负责最终研究判断和交接，子智能体使用已授予的工具与当前 fence。"
+            "审查反馈保留在原生执行记录中。只返回schema_ref 和 final_output 的完整内容。"
             f"{lineage}\n"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"context_pack_hash={request.context_pack_hash}\n"
-            f"frozen_evidence_closure={canonical_json(list(request.frozen_evidence_closure))}\n"
+            f"provider_context_view={canonical_json(stage_context_view('reasoning', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash))}\n"
             f"reviewed_draft={canonical_json(draft.draft)}"
         )
         reviewed, resumed_session, _stdout = self._invoke_with_resident_mcp(
@@ -1317,14 +1283,10 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             or set(reviewed)
             != {
                 "schema_ref",
-                "findings",
                 "final_output",
-                "dispositions",
             }
             or reviewed.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
-            or not isinstance(reviewed.get("findings"), list)
             or not isinstance(reviewed.get("final_output"), dict)
-            or not isinstance(reviewed.get("dispositions"), list)
         ):
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
@@ -1342,14 +1304,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             checkpoint_result = ReasoningAutonomousCheckpointResult(
                 primary_draft=draft.draft,
                 reviewed_checkpoint=final_output,
-                findings=tuple(
-                    cast(dict[str, str], item)
-                    for item in cast(list[object], reviewed["findings"])
-                ),
-                dispositions=tuple(
-                    cast(dict[str, str], item)
-                    for item in cast(list[object], reviewed["dispositions"])
-                ),
                 primary_session_ref=draft.primary_session_ref,
                 review_mode="advisory_unobserved",
                 reviewer_agent_ref=None,
@@ -1379,20 +1333,32 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             scientific_outcome=scientific_outcome,
             next_cycle_proposal=cast(dict[str, object] | None, next_cycle),
             candidate_completion=cast(dict[str, object] | None, completion),
-            findings=tuple(
-                cast(dict[str, str], item)
-                for item in cast(list[object], reviewed["findings"])
-            ),
-            dispositions=tuple(
-                cast(dict[str, str], item)
-                for item in cast(list[object], reviewed["dispositions"])
-            ),
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
             adapter_kind=draft.adapter_kind,
         )
         return result
+
+    def decide_after_deepfetch(self, request: ReasoningSkillRequest, checkpoint: dict[str, object], facts: dict[str, object], summary: object) -> dict[str, object]:
+        """Read the exact accepted summary in the original native Session."""
+        _validate_request(request)
+        if request.native_session_ref is None:
+            raise ReasoningSkillUnavailable("reasoning_native_session_missing")
+        final_schema = {"anyOf": [_reasoning_autonomous_checkpoint_schema(request), _reasoning_stage_output_schema(request), {"type": "null"}]}
+        schema = {"type": "object", "additionalProperties": False,
+            "properties": {"action": {"type": "string", "enum": ["create", "decline", "retry"]}, "final_output": final_schema},
+            "required": ["action", "final_output"]}
+        prompt = (_reasoning_skill_instructions() + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。依据新材料重新判断，可改变结论及拟题六字段。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
+            + "completion_feedback=" + canonical_json(list(request.continuation_feedback)) + "\ncheckpoint=" + canonical_json(checkpoint) + "\nfacts=" + canonical_json(facts) + "\nsummary=" + canonical_json(summary))
+        decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref)
+        if native_session != request.native_session_ref:
+            raise ReasoningSkillUnavailable("codex_primary_session_changed")
+        try:
+            validate_reasoning_deepfetch_decision(request, decision, facts)
+        except (ReasoningContractError, ReasoningSkillContractError) as error:
+            raise self._sealed_result_failure(job_ref=request.job_ref, operation_name="autonomous-resume", native_session_ref=request.native_session_ref, failure_code="reasoning_review_result_contract_invalid", detail_code=str(error), rejected_candidate=decision) from error
+        return decision
 
     def resume_after_autonomous_creation(
         self,
@@ -1403,7 +1369,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         """Resume the same native Session after create_question is selectable."""
 
         _validate_request(request)
-        if request.runtime_binding != self.runtime_binding():
+        if not reasoning_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise ReasoningSkillUnavailable("reasoning_runtime_binding_drift")
         try:
             validate_reasoning_autonomous_checkpoint(
@@ -1412,6 +1378,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 frozen_research_context=cast(
                     dict[str, object], request.context_pack["research_context"]
                 ),
+                historical_resolver=request.historical_evidence_resolver,
             )
         except ReasoningContractError as error:
             raise ReasoningSkillUnavailable(error.args[0]) from error
@@ -1421,17 +1388,16 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         prompt = (
             f"{_reasoning_skill_instructions()}\n\n"
             "本回合是同一 Reasoning root/native Session 的 autonomous finalization phase。"
-            "create_question 已通过五 Owner 公共 "
-            "seam 返回 RG accepted QuestionAnchor、同一 graph revision 的 present/open facts "
-            "以及真实 QuestionLiteratureRevision。先按既定顺序重查三项 resident Semantic "
-            "MCP currentness/evidence/context，再针对 exact checkpoint 与 creation result "
-            "重新审查 source/currentness binding、accepted Anchor/graph/literature binding 与"
-            "唯一 NextCycleProposal 边界，形成 bounded findings。ScientificOutcome "
-            "必须逐字节复用 checkpoint；"
-            "只形成一个指向 accepted Anchor 的 NextCycleProposal，不创建 Cycle、不形成 "
-            "StageCommit，也不调用 Owner 写入。reviewed_draft 必须视为 checkpoint；根 Agent"
-            "逐条给出 revised | not_adopted disposition。"
-            f"{lineage}\n"
+            "create_question 已返回 accepted QuestionAnchor、present/open facts 和真实 "
+            "QuestionLiteratureRevision。结合新信息检查当前选择事实及已有成果。创建新问题"
+            "与选择后继分别判断：下一 Cycle 可继续当前问题、其他已有问题或刚创建的问题，"
+            "并重新选择有依据的入口。checkpoint 中的入口只是创建前设想。"
+            "复用 creation_result 中摘要后已经接纳的 scientific_outcome，保留精确来源和证据。"
+            "新资料可改变尚未提交的后继选择；后续 Cycle 再将其纳入新的证据与综合。"
+            "形成一个 NextCycleProposal，或在已有完成依据充分时形成 CandidateCompletion。"
+            "reviewed_draft 使用 exact checkpoint；直接返回已有 final_output 结构，"
+            "由 Owner 接纳并创建后继 Cycle。"
+            f"{lineage}\ncompletion_feedback={canonical_json(list(request.continuation_feedback))}\n"
             f"checkpoint={canonical_json(checkpoint)}\n"
             f"creation_result={canonical_json(creation_result)}"
         )
@@ -1449,14 +1415,10 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             or set(reviewed)
             != {
                 "schema_ref",
-                "findings",
                 "final_output",
-                "dispositions",
             }
             or reviewed.get("schema_ref") != REASONING_REVIEW_SCHEMA_REF
-            or not isinstance(reviewed.get("findings"), list)
             or not isinstance(reviewed.get("final_output"), dict)
-            or not isinstance(reviewed.get("dispositions"), list)
         ):
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
@@ -1469,7 +1431,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         final_output = cast(dict[str, object], reviewed["final_output"])
         outcome = final_output.get("scientific_outcome")
         next_cycle = final_output.get("next_cycle_proposal")
-        if not isinstance(outcome, dict) or not isinstance(next_cycle, dict):
+        completion = final_output.get("candidate_completion")
+        if not isinstance(outcome, dict) or ((next_cycle is None) == (completion is None)):
             raise self._sealed_result_failure(
                 job_ref=request.job_ref,
                 operation_name="autonomous-resume",
@@ -1482,15 +1445,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             reviewed_draft=checkpoint,
             scientific_outcome=outcome,
             next_cycle_proposal=next_cycle,
-            candidate_completion=None,
-            findings=tuple(
-                cast(dict[str, str], item)
-                for item in cast(list[object], reviewed["findings"])
-            ),
-            dispositions=tuple(
-                cast(dict[str, str], item)
-                for item in cast(list[object], reviewed["dispositions"])
-            ),
+            candidate_completion=completion,
             primary_session_ref=request.native_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
@@ -1594,8 +1549,11 @@ def _reasoning_skill_resources() -> dict[str, str]:
     )
     try:
         return {
-            name: resource.read_text(encoding="utf-8")
-            for name, resource in resources
+            "research-guidance.md": shared_research_guidance(),
+            **{
+                name: resource.read_text(encoding="utf-8")
+                for name, resource in resources
+            },
         }
     except (FileNotFoundError, ModuleNotFoundError) as error:
         raise ReasoningSkillUnavailable(
@@ -1608,6 +1566,7 @@ def _reasoning_skill_instructions() -> str:
     return "\n\n".join(
         f"<!-- bundled resource: {name} -->\n{resources[name]}"
         for name in (
+            "research-guidance.md",
             "SKILL.md",
             "references/contract.md",
             "references/owner-operations.md",
@@ -1802,7 +1761,7 @@ def _reasoning_autonomous_checkpoint_schema(
                 "typed_skip_basis_refs_by_stage",
             ],
         }
-        for entry_stage in ("idea", "plan", "bundle", "reasoning")
+        for entry_stage in REASONING_SUCCESSOR_ENTRY_STAGES
     ]
     return {
         "type": "object",
@@ -1822,21 +1781,14 @@ def _scientific_outcome_schema(
     request: ReasoningSkillRequest,
 ) -> dict[str, object]:
     text = {"type": "string", "minLength": 1}
-    # Frozen-closure membership, kind/ref pairing, and the diagnostic-only
-    # ``context`` finding are all checked by ``validate_scientific_outcome``.
+    # Exact source identity and kind/ref pairing are Owner-verified.
     # Keep the provider projection fixed-size so a valid large closure cannot
     # overflow Structured Outputs' aggregate enum/property limits.
     citation = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "kind": {
-                "type": "string",
-                "enum": sorted(
-                    _SCIENTIFIC_EVIDENCE_KINDS
-                    | _DIAGNOSTIC_EVIDENCE_KINDS
-                ),
-            },
+            "kind": text,
             "ref": text,
             "finding": {
                 "type": "string",
@@ -1985,6 +1937,7 @@ def _scientific_outcome_schema(
                 "required": ["cycle", "current_question", "parent_questions", "quest"],
             },
             "is_authoritative": {"const": False},
+            "notes": {"type": "string"},
         },
         "required": [
             "schema_ref",
@@ -2006,6 +1959,7 @@ def _scientific_outcome_schema(
             "causal_interpretation",
             "research_synthesis",
             "is_authoritative",
+            "notes",
         ],
     }
 
@@ -2056,7 +2010,7 @@ def _next_cycle_proposal_schema(
                     "typed_skip_basis_refs_by_stage",
                 ],
             }
-            for entry_stage in ("idea", "plan", "bundle", "reasoning")
+            for entry_stage in REASONING_SUCCESSOR_ENTRY_STAGES
         ],
     }
 
@@ -2111,49 +2065,5 @@ def _candidate_completion_schema(
     }
 
 
-def _reasoning_review_response_schema(
-    request: ReasoningSkillRequest,
-    final_output_schema: dict[str, object],
-) -> dict[str, object]:
-    finding = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "finding_id": {"type": "string", "minLength": 1},
-            "category": {
-                "type": "string",
-                "enum": sorted(REASONING_REVIEW_CATEGORIES),
-            },
-            "message": {"type": "string", "minLength": 1},
-        },
-        "required": ["finding_id", "category", "message"],
-    }
-    disposition = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "finding_id": {"type": "string", "minLength": 1},
-            "action": {
-                "type": "string",
-                "enum": sorted(REASONING_REVIEW_ACTIONS),
-            },
-            "rationale": {"type": "string", "minLength": 1},
-        },
-        "required": ["finding_id", "action", "rationale"],
-    }
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "schema_ref": {"const": REASONING_REVIEW_SCHEMA_REF},
-            "findings": {"type": "array", "items": finding},
-            "final_output": final_output_schema,
-            "dispositions": {"type": "array", "items": disposition},
-        },
-        "required": [
-            "schema_ref",
-            "findings",
-            "final_output",
-            "dispositions",
-        ],
-    }
+def _reasoning_review_response_schema(request: ReasoningSkillRequest, final_output_schema: dict[str, object]) -> dict[str, object]:
+    return {"type": "object", "additionalProperties": False, "properties": {"schema_ref": {"const": REASONING_REVIEW_SCHEMA_REF}, "final_output": final_output_schema}, "required": ["schema_ref", "final_output"]}

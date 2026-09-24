@@ -17,9 +17,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from meta_research.codex_runtime import CODEX_REASONING_EFFORT_CONFIG
+from meta_research.system_prompt import read_output_language
+from meta_research.codex_runtime import CODEX_LOCKED_VERSION, CODEX_ROOT_REASONING_PRESET_CONFIG
 from meta_research.codex_ledger import CodexHomeLedgerReader
 from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.provider_call_observations import reported_usage, compaction_observation
 from meta_research.owners.secret_detection import contains_secret
 from meta_research.provider_supervisor import (
     PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS,
@@ -27,6 +29,7 @@ from meta_research.provider_supervisor import (
     SUPERVISOR_EXIT_SCHEMA_V2,
     SUPERVISOR_REQUEST_SCHEMA_V2,
     ensure_transport_key,
+    read_supervisor_request,
     read_verified_exit_receipt,
     write_supervisor_request,
 )
@@ -81,7 +84,6 @@ class CodexChildLedgerReader(Protocol):
 
         ...
 
-CODEX_LOCKED_VERSION = "0.153.2"
 CLAUDE_LOCKED_VERSION = "2.1.220"
 _MCP_TOKEN_ENV = "META_RESEARCH_MCP_TOKEN"
 _HARNESS_FAMILY_ENV = "META_RESEARCH_HARNESS_FAMILY"
@@ -332,6 +334,50 @@ class _NativeCliHarnessAdapter:
         )
 
     def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
+        return self._invoke(invocation, terminal_replay_only=False)
+
+    def invoke_terminal(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
+        """Consume a previously verified terminal operation without launching."""
+        return self._invoke(invocation, terminal_replay_only=True)
+
+    def recover_terminal_prompt(self, invocation: HarnessInvocation) -> str | None:
+        """Read the frozen prompt; Harness still verifies its Owner invocation hash."""
+        self._validate_invocation(invocation)
+        recover = getattr(self._runner, "recover_terminal_prompt", None)
+        if not callable(recover):
+            return None
+        try:
+            return recover(
+                self._argv(invocation),
+                invocation.provider_operation_timeout_seconds,
+                self._environment(invocation),
+            )
+        except OSError as error:
+            raise HarnessAdapterUnavailable(
+                "provider_io_unavailable", durable_outcome="unknown"
+            ) from error
+
+    def _environment(self, invocation: HarnessInvocation) -> dict[str, str]:
+        return {
+            _MCP_TOKEN_ENV: invocation.mcp_token,
+            _HARNESS_FAMILY_ENV: self.family,
+            _HARNESS_WORKSPACE_ENV: (
+                invocation.working_directory
+                if invocation.working_directory is not None
+                else str(self._workspace.resolve())
+            ),
+            _PROVIDER_OPERATION_ENV: invocation.provider_operation_ref,
+            _HARNESS_EVIDENCE_SCOPE_ENV: _harness_evidence_scope_ref(invocation),
+            _HARNESS_OBSERVATION_SCOPE_ENV: canonical_json(
+                _target_root_observation_scope(invocation)
+            ),
+            "NO_PROXY": _loopback_no_proxy(),
+            "no_proxy": _loopback_no_proxy(),
+        }
+
+    def _invoke(
+        self, invocation: HarnessInvocation, *, terminal_replay_only: bool
+    ) -> HarnessTurnEvidence:
         self._validate_invocation(invocation)
         provider_version = self._provider_version()
         self._record_provider_capability(provider_version)
@@ -343,22 +389,15 @@ class _NativeCliHarnessAdapter:
         evidence_scope_ref = _harness_evidence_scope_ref(invocation)
         observation_scope = _target_root_observation_scope(invocation)
         timeout_seconds = invocation.provider_operation_timeout_seconds
-        environment = {
-            _MCP_TOKEN_ENV: invocation.mcp_token,
-            _HARNESS_FAMILY_ENV: self.family,
-            _HARNESS_WORKSPACE_ENV: (
-                invocation.working_directory
-                if invocation.working_directory is not None
-                else str(self._workspace.resolve())
-            ),
-            _PROVIDER_OPERATION_ENV: invocation.provider_operation_ref,
-            _HARNESS_EVIDENCE_SCOPE_ENV: evidence_scope_ref,
-            _HARNESS_OBSERVATION_SCOPE_ENV: canonical_json(observation_scope),
-            "NO_PROXY": _loopback_no_proxy(),
-            "no_proxy": _loopback_no_proxy(),
-        }
+        environment = self._environment(invocation)
         try:
-            completed = self._runner(
+            runner = (
+                getattr(self._runner, "replay_terminal", None)
+                if terminal_replay_only else self._runner
+            )
+            if not callable(runner):
+                raise OSError("terminal provider replay unavailable")
+            completed = runner(
                 argv,
                 invocation.prompt,
                 timeout_seconds,
@@ -821,7 +860,7 @@ class _NativeCliHarnessAdapter:
         profile = root_capability_profile(invocation.root_kind)
         argv = [
             self.executable,
-            *profile.codex_arguments(entry_path=invocation.entry_path),
+            *profile.codex_arguments(entry_path=invocation.entry_path, output_language=read_output_language(self._workspace)),
             "features",
             "list",
         ]
@@ -956,7 +995,8 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             "--skip-git-repo-check",
             "--strict-config",
             *capability_profile.codex_arguments(
-                entry_path=invocation.entry_path
+                entry_path=invocation.entry_path,
+                output_language=read_output_language(self._workspace),
             ),
             "--json",
             "--model",
@@ -964,7 +1004,7 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             "--config",
             'approval_policy="never"',
             "--config",
-            CODEX_REASONING_EFFORT_CONFIG,
+            CODEX_ROOT_REASONING_PRESET_CONFIG,
             "--config",
             "mcp_servers={}",
             *target_environment_arguments,
@@ -1196,6 +1236,8 @@ class HarnessSupervisorTransport:
         prompt: str,
         timeout: float | None,
         environment: dict[str, str],
+        *,
+        _terminal_replay_only: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         if not prompt and (
             "--version" in argv or argv[-2:] == ["features", "list"]
@@ -1237,6 +1279,9 @@ class HarnessSupervisorTransport:
         result_path = directory / "last-message.json"
         provider_argv_path = directory / "provider-argv.json"
         request_path = directory / "supervisor-request.json"
+        receipt_path = directory / "supervisor-exit.json"
+        if _terminal_replay_only and not receipt_path.is_file():
+            raise OSError("terminal provider receipt unavailable")
         _ensure_private(prompt_path, prompt)
         _ensure_private(
             schema_path,
@@ -1248,45 +1293,19 @@ class HarnessSupervisorTransport:
             provider_argv_path,
             json.dumps(argv, ensure_ascii=False, separators=(",", ":")),
         )
-        bridge_argv = [
-            sys.executable,
-            "-m",
-            "meta_research.harness_cli_bridge",
-            "--family",
-            family,
-            "--provider-argv",
-            str(provider_argv_path),
-            "--output-schema",
-            str(schema_path),
-            "--output-last-message",
-            str(result_path),
-            "-",
-        ]
+        request = self._supervisor_request(directory, invocation_hash, family, timeout)
+        bridge_argv = cast(list[str], request["argv"])
+        terminal_replay = _terminal_replay_only or receipt_path.exists()
         try:
-            write_supervisor_request(
-                request_path,
-                {
-                    "schema_ref": SUPERVISOR_REQUEST_SCHEMA_V2,
-                    "invocation_hash": invocation_hash,
-                    "argv": bridge_argv,
-                    "timeout_seconds": timeout,
-                    "stream_max_bytes": _STREAM_LIMIT,
-                    "result_max_bytes": _RESULT_LIMIT,
-                    "prompt_path": str(prompt_path),
-                    "schema_path": str(schema_path),
-                    "stdout_path": str(stdout_path),
-                    "result_path": str(result_path),
-                    "lock_path": str(directory / "supervisor.lock"),
-                    "ready_path": str(directory / "supervisor-ready.json"),
-                    "started_path": str(directory / "provider-started.json"),
-                    "receipt_path": str(directory / "supervisor-exit.json"),
-                    "stop_path": str(directory / "supervisor-stop.json"),
-                },
-                self._transport_key,
-            )
+            if terminal_replay:
+                self._verify_terminal_request(request_path, request)
+                # Reading a sealed outcome never runs the bridge again. Its
+                # original interpreter may belong to the previous release env;
+                # retain that signed request and verify the exit receipt below.
+            else:
+                write_supervisor_request(request_path, request, self._transport_key)
         except ProviderSupervisorError as error:
             raise OSError("supervisor request unavailable") from error
-        receipt_path = directory / "supervisor-exit.json"
         tail = self._start_event_tail(
             stdout_path=stdout_path,
             family=family,
@@ -1294,7 +1313,7 @@ class HarnessSupervisorTransport:
             environment=environment,
         )
         try:
-            if not receipt_path.exists():
+            if not terminal_replay and not receipt_path.exists():
                 try:
                     self._process_runner.run_durable_job(
                         invocation_hash,
@@ -1333,7 +1352,20 @@ class HarnessSupervisorTransport:
                     result_path=result_path,
                     expected_schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
                 )
-                stdout = stdout_path.read_text(encoding="utf-8")
+                stdout_bytes = stdout_path.read_bytes()
+                try:
+                    stdout = stdout_bytes.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    if (
+                        receipt["termination_reason"] == "completed"
+                        or error.reason != "unexpected end of data"
+                        or error.end != len(stdout_bytes)
+                    ):
+                        raise
+                    # A signed interrupted process may leave only part of its
+                    # final UTF-8 scalar. Preserve the original sealed bytes;
+                    # only the parser view omits that incomplete final scalar.
+                    stdout = stdout_bytes[:error.start].decode("utf-8")
             except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
                 raise OSError("provider supervisor receipt invalid") from error
         finally:
@@ -1366,6 +1398,115 @@ class HarnessSupervisorTransport:
             "provider_returncode": int(receipt["returncode"]),
         }
         return completed
+
+    @staticmethod
+    def _supervisor_request(
+        directory: Path, invocation_hash: str, family: str, timeout: float | None
+    ) -> dict[str, object]:
+        return {
+            "schema_ref": SUPERVISOR_REQUEST_SCHEMA_V2,
+            "invocation_hash": invocation_hash,
+            "argv": [
+                sys.executable, "-m", "meta_research.harness_cli_bridge",
+                "--family", family,
+                "--provider-argv", str(directory / "provider-argv.json"),
+                "--output-schema", str(directory / "output-schema.json"),
+                "--output-last-message", str(directory / "last-message.json"), "-",
+            ],
+            "timeout_seconds": timeout,
+            "stream_max_bytes": _STREAM_LIMIT,
+            "result_max_bytes": _RESULT_LIMIT,
+            "prompt_path": str(directory / "prompt.txt"),
+            "schema_path": str(directory / "output-schema.json"),
+            "stdout_path": str(directory / "stdout.jsonl"),
+            "result_path": str(directory / "last-message.json"),
+            "lock_path": str(directory / "supervisor.lock"),
+            "ready_path": str(directory / "supervisor-ready.json"),
+            "started_path": str(directory / "provider-started.json"),
+            "receipt_path": str(directory / "supervisor-exit.json"),
+            "stop_path": str(directory / "supervisor-stop.json"),
+        }
+
+    def _verify_terminal_request(
+        self, request_path: Path, request: dict[str, object]
+    ) -> None:
+        persisted = read_supervisor_request(request_path, self._transport_key)
+        persisted_argv = persisted.get("argv")
+        if (
+            not isinstance(persisted_argv, list)
+            or not persisted_argv
+            or not isinstance(persisted_argv[0], str)
+            or not persisted_argv[0]
+            or persisted != {
+                **request,
+                "argv": [persisted_argv[0], *cast(list[str], request["argv"])[1:]],
+            }
+        ):
+            raise ProviderSupervisorError("provider_supervisor_spool_invalid")
+
+    def replay_terminal(
+        self, argv: list[str], prompt: str, timeout: float | None,
+        environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        return self(argv, prompt, timeout, environment, _terminal_replay_only=True)
+
+    def recover_terminal_prompt(
+        self, argv: list[str], timeout: float | None, environment: dict[str, str]
+    ) -> str | None:
+        family = environment.get(_HARNESS_FAMILY_ENV)
+        operation_ref = environment.get(_PROVIDER_OPERATION_ENV)
+        if family not in {"codex", "claude"} or not operation_ref or len(operation_ref) > 128:
+            raise OSError("provider operation identity unavailable")
+        matches: list[str] = []
+        operation_root = self._workspace / "provider-operations"
+        for receipt_path in operation_root.glob("*/*/supervisor-exit.json"):
+            directory = receipt_path.parent
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", directory.name) is None
+                or directory.parent.name != directory.name[:2]
+            ):
+                continue
+            prompt_path = directory / "prompt.txt"
+            try:
+                if prompt_path.stat().st_size > _STREAM_LIMIT:
+                    continue
+                prompt = prompt_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            try:
+                invocation_hash = canonical_hash({
+                    "schema_ref": "meta-research/harness-provider-operation/v1",
+                    "family": family,
+                    "provider_operation_ref": operation_ref,
+                    "argv": argv,
+                    "prompt_hash": canonical_hash(prompt),
+                    "timeout_seconds": timeout,
+                    "environment_names": sorted(environment),
+                })
+                if invocation_hash != directory.name:
+                    continue
+                self._verify_terminal_request(
+                    directory / "supervisor-request.json",
+                    self._supervisor_request(directory, invocation_hash, family, timeout),
+                )
+                if (directory / "provider-argv.json").read_text(encoding="utf-8") != json.dumps(
+                    argv, ensure_ascii=False, separators=(",", ":")
+                ):
+                    raise OSError("terminal provider argv invalid")
+                read_verified_exit_receipt(
+                    receipt_path, key=self._transport_key,
+                    invocation_hash=invocation_hash, prompt_path=prompt_path,
+                    schema_path=directory / "output-schema.json",
+                    stdout_path=directory / "stdout.jsonl",
+                    result_path=directory / "last-message.json",
+                    expected_schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+                )
+                matches.append(prompt)
+            except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
+                raise OSError("terminal provider input unavailable") from error
+        if len(matches) > 1:
+            raise OSError("terminal provider input ambiguous")
+        return matches[0] if matches else None
 
     def _start_event_tail(
         self,
@@ -2840,6 +2981,12 @@ def _summarize_codex_event(
     if event_type in lifecycle:
         capabilities.add(lifecycle[event_type])
     summary: dict[str, object] = {"kind": event_type}
+    usage = reported_usage(event)
+    if usage is not None:
+        summary["reported_token_usage"] = usage
+    compaction = compaction_observation(event)
+    if compaction is not None:
+        summary["context_compaction"] = compaction
     if inventory_names is not None:
         summary["inventory_kinds"] = list(dict.fromkeys(inventory_names))
     if isinstance(item_type, str):
@@ -2929,6 +3076,12 @@ def _summarize_claude_event(
     ):
         capabilities.add("hook")
     summary: dict[str, object] = {"kind": event_type}
+    usage = reported_usage(event)
+    if usage is not None:
+        summary["reported_token_usage"] = usage
+    compaction = compaction_observation(event)
+    if compaction is not None:
+        summary["context_compaction"] = compaction
     if isinstance(subtype, str):
         summary["subtype"] = subtype
     if inventory_names:

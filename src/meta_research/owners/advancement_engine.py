@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.context_presentation import literature_reference, reasoning_handoff_reference
+
 import json
 import time
 from dataclasses import dataclass
@@ -36,8 +38,10 @@ from meta_research.control_contract import (
 from meta_research.database import Database
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
+from meta_research.read_snapshot_cache import snapshot_cached
 from meta_research.idea_contract import (
     IDEA_CONTEXT_PACK_SCHEMA_V3_REF,
+    IDEA_CONTEXT_PACK_SCHEMA_V4_REF,
     IdeaContractError,
     evidence_reference_revision,
     literature_binding,
@@ -288,8 +292,10 @@ class BundleReplanActivation:
 
 def _bundle_stage_report_closure(
     accepted: VerifiedBundleReportReceipt,
+    *, notes: str | None = None,
 ) -> dict[str, object]:
     return {
+        **({"notes": notes} if notes is not None else {}),
         "schema_ref": "meta-research/bundle-stage-closure/v3",
         "formal_plan_ref": accepted.formal_plan_ref,
         "plan_document_hash": accepted.plan_document_hash,
@@ -812,24 +818,10 @@ class _SQLiteAutonomousAdvancementLifecycle:
         if verified_authorization != authorization:
             raise OwnerConflict("broad_research_authorization_invalid")
 
-        # This is the last Owner boundary before create_question can perform
-        # any acquisition, content, or graph side effect.  HC's immutable
-        # context receipt binds the coordinator-verified RM/RG checkpoint;
-        # validate that exact typed route before issuing a DeepFetch command.
-        outcome_ref = _required_mapping_ref(
-            scientific_outcome,
-            "outcome_ref",
-            "autonomous_creation_source_invalid",
-        )
-        entry_stage, _typed_skip = _validated_autonomous_successor_route(
-            scope,
-            outcome_ref=outcome_ref,
-            require_asset_bindings=False,
-        )
-        if entry_stage == PLAN_STAGE:
-            raise OwnerConflict("reasoning_next_cycle_plan_basis_unavailable")
-        if entry_stage == BUNDLE_STAGE:
-            raise OwnerConflict("reasoning_next_cycle_bundle_basis_unavailable")
+        # HC's immutable receipt binds the reviewed creation checkpoint.
+        # Creation does not select the next Cycle: its provisional route is
+        # shape-checked in that checkpoint, while RG/AE authenticate the final
+        # selection and any reused upstream assets after DeepFetch completes.
 
         session_ref = _required_object_ref(
             acquisition_session,
@@ -1421,6 +1413,25 @@ class _SQLiteAutonomousAdvancementLifecycle:
                 "advancement_engine.autonomous_deepfetch_failed",
                 {"request_ref": request_ref, "failure_code": failure_code},
             )
+
+    def retry_autonomous_deepfetch(self, *, context: dict, decision: dict) -> bool:
+        source = context["source"]
+        request = self._query_stage_request_by_ref(source["reasoning_stage_run_request_ref"])
+        self._assert_stage_request_current(request)
+        decision_ref = decision["receipt"]["receipt_ref"]
+        if decision["decision"]["action"] != "retry" or decision["checkpoint_ref"] != context["checkpoint"]["ref"]:
+            raise OwnerConflict("reasoning_retry_decision_invalid")
+        actual = self._runtime_control_verifier.query_reasoning_autonomous_decision(decision["checkpoint_ref"])
+        if actual != decision:
+            raise OwnerConflict("reasoning_retry_decision_invalid")
+        with self._database.write() as connection:
+            row = connection.execute(text("SELECT * FROM ae_autonomous_deepfetch_requests WHERE context_ref = :ref"), {"ref": context["context_ref"]}).one()
+            if row.retry_decision_ref == decision_ref:
+                return False
+            if row.request_ref != decision["facts"]["request_ref"] or row.status not in {"failed", "queued"}:
+                raise OwnerConflict("reasoning_retry_source_invalid")
+            connection.execute(text("UPDATE ae_autonomous_deepfetch_requests SET status = 'queued', run_ref = NULL, failure_code = NULL, retry_decision_ref = :decision, updated_at = :now WHERE request_ref = :ref"), {"decision": decision_ref, "now": time.time(), "ref": row.request_ref})
+        return True
 
     def authorize_autonomous_question_dispatch(
         self,
@@ -4028,11 +4039,15 @@ class SQLiteAdvancementEngine(
                         result_ref,
                     )
                 else:
-                    self._evidence_verifier.assert_evidence_state(
-                        quest_ref=accepted_question.quest_ref,
-                        version_refs=tuple(sorted(evidence_refs)),
-                        expected_reference_revision=reference_revision,
-                    )
+                    if context_pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V4_REF:
+                        self._evidence_verifier.verify_evidence_refs(quest_ref=accepted_question.quest_ref,
+                            version_refs=tuple(sorted(evidence_refs)))
+                    else:
+                        self._evidence_verifier.assert_evidence_state(
+                            quest_ref=accepted_question.quest_ref,
+                            version_refs=tuple(sorted(evidence_refs)),
+                            expected_reference_revision=reference_revision,
+                        )
                     guidance_bindings = context_pack.get("active_guidance_bindings")
                     if not isinstance(guidance_bindings, list):
                         raise OwnerConflict("idea_context_guidance_bindings_invalid")
@@ -4113,6 +4128,7 @@ class SQLiteAdvancementEngine(
                     result_ref = request_ref
         return self._query_stage_request_ref(result_ref)
 
+    @snapshot_cached
     def query_idea_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
         with self._database.read() as connection:
             head = connection.execute(
@@ -4384,6 +4400,7 @@ class SQLiteAdvancementEngine(
                     result_ref = request_ref
         return self._query_stage_request_ref(result_ref)
 
+    @snapshot_cached
     def query_plan_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
         with self._database.read() as connection:
             head = connection.execute(
@@ -4583,6 +4600,7 @@ class SQLiteAdvancementEngine(
                     result_ref = request_ref
         return self._query_stage_request_ref(result_ref)
 
+    @snapshot_cached
     def query_bundle_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
         with self._database.read() as connection:
             head = connection.execute(
@@ -4870,6 +4888,7 @@ class SQLiteAdvancementEngine(
             raise OwnerConflict("stage_command_result_missing")
         return self._query_stage_request_ref(result_ref)
 
+    @snapshot_cached
     def query_reasoning_stage_request(
         self, cycle_ref: str
     ) -> StageRunRequest | None:
@@ -5201,7 +5220,9 @@ class SQLiteAdvancementEngine(
     def _verify_reasoning_request_closure(
         self, requested: StageRunRequest
     ) -> None:
-        with self._database.read() as connection:
+        # Verify the frozen upstream route within one immutable read cut.
+        # Request creation and Run admission keep their separate write guards.
+        with self._database.read_snapshot() as connection:
             rows = connection.execute(
                 text(
                     "SELECT * FROM ae_stage_commits WHERE cycle_ref = :cycle_ref "
@@ -5230,12 +5251,14 @@ class SQLiteAdvancementEngine(
                     accepted_question=requested.accepted_question,
                 )
             )
+            verified_stage_commit_refs: set[str] = set()
             current_target_evidence_closure = (
                 self._resolve_reasoning_current_target_evidence(
                     connection,
                     cycle_ref=requested.cycle_ref,
                     epoch=requested.epoch,
                     quest_ref=requested.accepted_question.quest_ref,
+                    verified_stage_commit_refs=verified_stage_commit_refs,
                 )
             )
             rebuilt = _reasoning_context_pack_from_rows(
@@ -5246,6 +5269,7 @@ class SQLiteAdvancementEngine(
                 question_literature_revision=cast(
                     dict[str, object] | None, frozen_revision
                 ),
+                reference_literature=isinstance(frozen_revision, dict) and frozen_revision.get("kind") == "QuestionLiteratureReference",
                 quest_goal_revision=cast(
                     dict[str, object],
                     requested.context_pack["research_context"],
@@ -5262,41 +5286,46 @@ class SQLiteAdvancementEngine(
                     current_target_evidence_closure
                 ),
             )
-        if rebuilt != requested.context_pack:
-            raise OwnerConflict("reasoning_upstream_closure_stale")
-        for row in rows:
-            self._stage_commit_from_row(row)
+            if rebuilt != requested.context_pack:
+                raise OwnerConflict("reasoning_upstream_closure_stale")
+            for row in rows:
+                # The evidence resolver already authenticated this exact
+                # Bundle row in this read cut. Keep that proof local to this
+                # reconstruction; every later query authenticates again.
+                if row.commit_ref not in verified_stage_commit_refs:
+                    self._stage_commit_from_row(row)
 
-        if frozen_revision is not None:
-            if self._question_literature_revision_verifier is None:
-                raise OwnerConflict(
-                    "question_literature_revision_verifier_unavailable"
-                )
-            self._question_literature_revision_verifier.verify_question_literature_revision(
-                cast(dict[str, object], frozen_revision)
+            if frozen_revision is not None:
+                if self._question_literature_revision_verifier is None:
+                    raise OwnerConflict(
+                        "question_literature_revision_verifier_unavailable"
+                    )
+                from meta_research.reasoning_literature import frozen_reasoning_literature
+                frozen_reasoning_literature(requested.context_pack,
+                    revision_reader=self._question_literature_revision_verifier.query_question_literature_revision_ref,
+                    revision_verifier=self._question_literature_revision_verifier.verify_question_literature_revision)
+            research_context = requested.context_pack.get("research_context")
+            goal_revision = (
+                research_context.get("quest_goal_revision")
+                if isinstance(research_context, dict)
+                else None
             )
-        research_context = requested.context_pack.get("research_context")
-        goal_revision = (
-            research_context.get("quest_goal_revision")
-            if isinstance(research_context, dict)
-            else None
-        )
-        if (
-            not isinstance(goal_revision, dict)
-            or self._reasoning_outcome_verifier is None
-        ):
-            raise OwnerConflict("quest_goal_revision_verifier_unavailable")
-        self._reasoning_outcome_verifier.verify_quest_goal_revision(goal_revision)
-        graph_binding = (
-            research_context.get("graph_binding")
-            if isinstance(research_context, dict)
-            else None
-        )
-        if not isinstance(graph_binding, dict):
-            raise OwnerConflict("reasoning_research_context_invalid")
-        self._reasoning_outcome_verifier.verify_reasoning_research_context(
-            graph_binding
-        )
+            if (
+                not isinstance(goal_revision, dict)
+                or self._reasoning_outcome_verifier is None
+            ):
+                raise OwnerConflict("quest_goal_revision_verifier_unavailable")
+            self._reasoning_outcome_verifier.verify_quest_goal_revision(goal_revision)
+            graph_binding = (
+                research_context.get("graph_binding")
+                if isinstance(research_context, dict)
+                else None
+            )
+            if not isinstance(graph_binding, dict):
+                raise OwnerConflict("reasoning_research_context_invalid")
+            self._reasoning_outcome_verifier.verify_reasoning_research_context(
+                graph_binding
+            )
 
     def _resolve_reasoning_plan_evidence_reuse(
         self,
@@ -5306,24 +5335,30 @@ class SQLiteAdvancementEngine(
         epoch: int,
         accepted_question: AcceptedQuestionBinding,
     ) -> tuple[EvidenceReuseLeaf, ...]:
-        plan_row = connection.execute(
-            text(
-                "SELECT * FROM ae_stage_commits WHERE cycle_ref = :cycle_ref "
-                "AND stage = 'plan' AND epoch = :epoch"
-            ),
-            {"cycle_ref": cycle_ref, "epoch": epoch},
-        ).first()
-        if plan_row is None or plan_row.disposition != COMPLETED_DISPOSITION:
+        rows = _reasoning_route_rows_for_epoch(
+            connection, cycle_ref=cycle_ref, epoch=epoch
+        )
+        by_stage = {str(row.stage): row for row in rows}
+        if set(by_stage) != {IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE}:
+            raise OwnerConflict("reasoning_upstream_closure_incomplete")
+        _validate_reasoning_route_rows(by_stage)
+        if by_stage[PLAN_STAGE].disposition != COMPLETED_DISPOSITION:
             return ()
+        bundle = _stage_commit(by_stage[BUNDLE_STAGE])
         bundle_request = connection.execute(
             text(
                 "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
                 ":cycle_ref AND stage = 'bundle' AND epoch = :epoch"
             ),
-            {"cycle_ref": cycle_ref, "epoch": epoch},
+            {"cycle_ref": cycle_ref, "epoch": bundle.epoch},
         ).first()
         if bundle_request is None:
             raise OwnerConflict("reasoning_plan_evidence_binding_missing")
+        if (
+            bundle.request_ref is not None
+            and bundle_request.request_ref != bundle.request_ref
+        ):
+            raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
         bundle_context, bundle_question = _verify_stage_request_integrity(
             bundle_request
         )
@@ -5362,6 +5397,7 @@ class SQLiteAdvancementEngine(
         cycle_ref: str,
         epoch: int,
         quest_ref: str,
+        verified_stage_commit_refs: set[str] | None = None,
     ) -> tuple[EvidenceReuseLeaf, ...]:
         # Consume the same exact immutable route closure used to build the
         # ContextPack.  A restored foreground may intentionally reuse its one
@@ -5382,6 +5418,8 @@ class SQLiteAdvancementEngine(
         if bundle_row is None:
             raise OwnerConflict("reasoning_upstream_closure_incomplete")
         bundle = self._stage_commit_from_row(bundle_row)
+        if verified_stage_commit_refs is not None:
+            verified_stage_commit_refs.add(bundle.commit_ref)
         if bundle.disposition != COMPLETED_DISPOSITION:
             return ()
         closure = bundle.closure
@@ -5398,7 +5436,8 @@ class SQLiteAdvancementEngine(
             if isinstance(value, dict)
             and isinstance(value.get("target_commit_ref"), str)
         )
-        if len(target_commit_refs) != len(measurements):
+        if (len(target_commit_refs) != len(measurements)
+                or len(set(target_commit_refs)) != len(target_commit_refs)):
             raise OwnerConflict("reasoning_target_closure_invalid")
         if not target_commit_refs:
             return ()
@@ -5408,11 +5447,29 @@ class SQLiteAdvancementEngine(
             quest_ref=quest_ref,
             target_commit_refs=target_commit_refs,
         )
+        measured_target_refs = {
+            value["target_commit_ref"] for value in measurements
+            if value.get("formal_measurement_accepted") is not False
+        }
+        unmeasured_target_refs = {
+            value["target_commit_ref"] for value in measurements
+            if value.get("formal_measurement_accepted") is False
+        }
         if (
             not isinstance(leaves, tuple)
             or not all(type(leaf) is EvidenceReuseLeaf for leaf in leaves)
             or {leaf.target_commit_ref for leaf in leaves}
-            != set(target_commit_refs)
+            != measured_target_refs | unmeasured_target_refs
+            or any(
+                sum(leaf.target_commit_ref == target_commit_ref
+                    and leaf.role == "MetricResult" for leaf in leaves) != 1
+                for target_commit_ref in measured_target_refs
+            )
+            or any(
+                sum(leaf.target_commit_ref == target_commit_ref
+                    and leaf.role == "WorkProduct" for leaf in leaves) != 1
+                for target_commit_ref in unmeasured_target_refs
+            )
             or any(leaf.evidence_use_hashes for leaf in leaves)
         ):
             raise OwnerConflict("reasoning_target_evidence_closure_invalid")
@@ -5495,7 +5552,7 @@ class SQLiteAdvancementEngine(
             quest_ref=accepted_question.quest_ref,
             version_refs=tuple(sorted(evidence_refs)),
             expected_reference_revision=(
-                reference_revision if require_current else None
+                reference_revision if require_current and context_pack.get("schema_ref") != IDEA_CONTEXT_PACK_SCHEMA_V4_REF else None
             ),
         )
 
@@ -5511,6 +5568,15 @@ class SQLiteAdvancementEngine(
         except IdeaContractError as error:
             raise OwnerConflict(str(error)) from error
         if binding is None:
+            return
+        if context_pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V4_REF:
+            verifier=self._question_literature_revision_verifier
+            if verifier is None:
+                raise OwnerConflict("question_literature_revision_invalid")
+            exact=verifier.query_question_literature_revision_ref(question_ref=accepted_question.question_ref,
+                revision_ref=binding["revision_ref"])
+            if exact is None or literature_reference(exact)!=binding:
+                raise OwnerConflict("question_literature_revision_invalid")
             return
         if context_pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V3_REF:
             verifier = self._question_literature_revision_verifier
@@ -5554,6 +5620,11 @@ class SQLiteAdvancementEngine(
     ) -> None:
         successor = self.query_reasoning_successor_context(cycle_ref)
         schema_ref = context_pack.get("schema_ref")
+        if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V4_REF:
+            expected=[] if successor is None else [reasoning_handoff_reference(item) for item in successor.get("prior_accepted_bindings",[])]
+            if context_pack.get("prior_accepted_bindings")!=expected:
+                raise OwnerConflict("reasoning_successor_context_invalid")
+            return
         if successor is None:
             if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V3_REF:
                 raise OwnerConflict("reasoning_successor_context_invalid")
@@ -6388,7 +6459,7 @@ class SQLiteAdvancementEngine(
             outcome_ref=outcome_ref,
             receipt=outcome_receipt,
         )
-        if set(closure) != {
+        if set(closure) - {"notes", "scientific_summary"} != {
             "scientific_disposition",
             "scientific_outcome_hash",
             "transition_kind",
@@ -6401,6 +6472,8 @@ class SQLiteAdvancementEngine(
             "uncertain",
             "insufficient_evidence",
         }:
+            raise OwnerConflict("reasoning_transition_binding_invalid")
+        if "notes" in closure and not isinstance(closure["notes"], str):
             raise OwnerConflict("reasoning_transition_binding_invalid")
         closure_json = canonical_json(closure)
         closure_hash = canonical_hash(closure)
@@ -6625,77 +6698,91 @@ class SQLiteAdvancementEngine(
         bundle_report_ref: str,
         bundle_report_receipt: AcceptanceReceipt,
         expected_disposition: str | None = None,
+        closure_output: dict[str, object] | None = None,
     ) -> VerifiedBundleReportReceipt:
-        report_verifier = self._bundle_report_verifier
-        evidence_verifier = self._bundle_report_evidence_verifier
-        if report_verifier is None or evidence_verifier is None:
-            raise OwnerConflict("bundle_report_verifier_unavailable")
-        accepted = report_verifier.verify_bundle_report_receipt(
-            report_ref=bundle_report_ref,
-            receipt=bundle_report_receipt,
-            expected_disposition=expected_disposition,
-        )
-        formal_plan = request.accepted_formal_plan
-        if (
-            formal_plan is None
-            or accepted.request_ref != request.request_ref
-            or accepted.run_ref != run_ref
-            or accepted.report_ref != bundle_report_ref
-            or accepted.report.stage_request_ref != request.request_ref
-            or accepted.report.formal_plan_ref != formal_plan.formal_plan_ref
-            or accepted.formal_plan_ref != formal_plan.formal_plan_ref
-            or accepted.plan_document_hash != formal_plan.plan_document_hash
-            or accepted.formal_plan_projection_receipt.subject_ref
-            != accepted.formal_plan_projection_digest
-            or validate_bundle_report(accepted.report) != accepted.report_hash
-        ):
-            raise OwnerConflict("bundle_report_advancement_binding_invalid")
-        evidence_verifier.verify_formal_plan_content_acceptance(
-            formal_plan_ref=accepted.formal_plan_ref,
-            plan_document_hash=accepted.plan_document_hash,
-            receipt=accepted.formal_plan_content_receipt,
-        )
-        contract = evidence_verifier.query_bundle_report_contract(
-            request_ref=request.request_ref,
-            run_ref=run_ref,
-            graph_ref=accepted.target_graph_ref,
-            head_receipt=accepted.target_graph_receipt,
-            formal_plan_content_receipt=accepted.formal_plan_content_receipt,
-            formal_plan_projection_receipt=(
-                accepted.formal_plan_projection_receipt
-            ),
-        )
-        plan = contract.get("plan")
-        if (
-            type(plan) is not FormalPlan
-            or plan.formal_plan_ref != accepted.formal_plan_ref
-            or plan.content_binding.content_hash_ref
-            != accepted.formal_plan_projection_digest
-            or contract.get("plan_document_hash") != accepted.plan_document_hash
-            or contract.get("source_acceptance_receipt")
-            != accepted.formal_plan_content_receipt
-            or contract.get("completion_contract_hash")
-            != accepted.completion_contract_hash
-            or contract.get("briefs_hash") != accepted.formal_plan_briefs_hash
-            or contract.get("projection_digest")
-            != accepted.formal_plan_projection_digest
-            or contract.get("projection_receipt")
-            != accepted.formal_plan_projection_receipt
-            or contract.get("generation") != accepted.target_graph_generation
-            or contract.get("target_set_hash") != accepted.target_set_hash
-            or contract.get("coverage_hash") != accepted.coverage_hash
-            or contract.get("target_refs") != accepted.target_refs
-        ):
-            raise OwnerConflict("bundle_report_advancement_evidence_invalid")
-        resolved = evidence_verifier.verify_bundle_report_target_commits(
-            graph_ref=accepted.target_graph_ref,
-            closures=accepted.accepted_measurement_closures,
-            receipts=accepted.target_commit_receipts,
-            head_receipt=accepted.target_graph_receipt,
-        )
-        if resolved != accepted.target_commit_receipts:
-            raise OwnerConflict("bundle_report_advancement_evidence_invalid")
-        return accepted
+        # Keep AR and the additional advancement proofs in one read cut.
+        # Callers retain their final write guards after this helper returns.
+        with self._database.read_snapshot():
+            report_verifier = self._bundle_report_verifier
+            evidence_verifier = self._bundle_report_evidence_verifier
+            if report_verifier is None or evidence_verifier is None:
+                raise OwnerConflict("bundle_report_verifier_unavailable")
+            accepted = report_verifier.verify_bundle_report_receipt(
+                report_ref=bundle_report_ref,
+                receipt=bundle_report_receipt,
+                expected_disposition=expected_disposition,
+            )
+            formal_plan = request.accepted_formal_plan
+            if (
+                formal_plan is None
+                or accepted.request_ref != request.request_ref
+                or accepted.run_ref != run_ref
+                or accepted.report_ref != bundle_report_ref
+                or accepted.report.stage_request_ref != request.request_ref
+                or accepted.report.formal_plan_ref != formal_plan.formal_plan_ref
+                or accepted.formal_plan_ref != formal_plan.formal_plan_ref
+                or accepted.plan_document_hash != formal_plan.plan_document_hash
+                or accepted.formal_plan_projection_receipt.subject_ref
+                != accepted.formal_plan_projection_digest
+                or validate_bundle_report(accepted.report) != accepted.report_hash
+            ):
+                raise OwnerConflict("bundle_report_advancement_binding_invalid")
+            evidence_verifier.verify_formal_plan_content_acceptance(
+                formal_plan_ref=accepted.formal_plan_ref,
+                plan_document_hash=accepted.plan_document_hash,
+                receipt=accepted.formal_plan_content_receipt,
+            )
+            contract = evidence_verifier.query_bundle_report_contract(
+                request_ref=request.request_ref,
+                run_ref=run_ref,
+                graph_ref=accepted.target_graph_ref,
+                head_receipt=accepted.target_graph_receipt,
+                formal_plan_content_receipt=accepted.formal_plan_content_receipt,
+                formal_plan_projection_receipt=(
+                    accepted.formal_plan_projection_receipt
+                ),
+            )
+            plan = contract.get("plan")
+            if (
+                type(plan) is not FormalPlan
+                or plan.formal_plan_ref != accepted.formal_plan_ref
+                or plan.content_binding.content_hash_ref
+                != accepted.formal_plan_projection_digest
+                or contract.get("plan_document_hash") != accepted.plan_document_hash
+                or contract.get("source_acceptance_receipt")
+                != accepted.formal_plan_content_receipt
+                or contract.get("completion_contract_hash")
+                != accepted.completion_contract_hash
+                or contract.get("briefs_hash") != accepted.formal_plan_briefs_hash
+                or contract.get("projection_digest")
+                != accepted.formal_plan_projection_digest
+                or contract.get("projection_receipt")
+                != accepted.formal_plan_projection_receipt
+                or contract.get("generation") != accepted.target_graph_generation
+                or contract.get("target_set_hash") != accepted.target_set_hash
+                or contract.get("coverage_hash") != accepted.coverage_hash
+                or contract.get("target_refs") != accepted.target_refs
+            ):
+                raise OwnerConflict("bundle_report_advancement_evidence_invalid")
+            resolved = evidence_verifier.verify_bundle_report_target_commits(
+                graph_ref=accepted.target_graph_ref,
+                closures=accepted.accepted_measurement_closures,
+                receipts=accepted.target_commit_receipts,
+                head_receipt=accepted.target_graph_receipt,
+            )
+            if resolved != accepted.target_commit_receipts:
+                raise OwnerConflict("bundle_report_advancement_evidence_invalid")
+            if closure_output is not None:
+                notes = contract.get("notes")
+                if notes is not None and not isinstance(notes, str):
+                    raise OwnerConflict("bundle_stage_notes_invalid")
+                closure_output.update(_bundle_stage_report_closure(accepted, notes=notes))
+                if notes is not None:
+                    for key in ("notes_source_ref", "notes_source_hash"):
+                        if not isinstance(contract.get(key), str) or not contract[key]:
+                            raise OwnerConflict("bundle_stage_notes_invalid")
+                        closure_output[key] = contract[key]
+            return accepted
 
     def commit_bundle_stage(
         self,
@@ -6712,13 +6799,16 @@ class SQLiteAdvancementEngine(
             raise OwnerConflict("bundle_stage_request_invalid")
         if self._run_completion_verifier is None:
             raise OwnerConflict("bundle_stage_verifier_unavailable")
+        closure: dict[str, object] = {}
         accepted = self._verify_bundle_report_for_advancement(
             request=request,
             run_ref=run_ref,
             bundle_report_ref=bundle_report_ref,
             bundle_report_receipt=bundle_report_receipt,
-            expected_disposition="realized",
+            closure_output=closure,
         )
+        if accepted.report.disposition not in {"realized", "replan_required"}:
+            raise OwnerConflict("bundle_report_completion_disposition_invalid")
         self._run_completion_verifier.verify_run_completion_receipt(
             request_ref=request_ref,
             run_ref=run_ref,
@@ -6734,7 +6824,7 @@ class SQLiteAdvancementEngine(
             disposition=COMPLETED_DISPOSITION,
             run_completion_receipt=run_completion_receipt,
             outcome_receipt=bundle_report_receipt,
-            closure=_bundle_stage_report_closure(accepted),
+            closure=closure,
             idempotency_key=idempotency_key,
             command_kind="commit_bundle_stage",
         )
@@ -6758,7 +6848,7 @@ class SQLiteAdvancementEngine(
             bundle_report_ref=bundle_report_ref,
             bundle_report_receipt=bundle_report_receipt,
         )
-        if accepted.report.disposition not in {"blocked", "replan_required"}:
+        if accepted.report.disposition != "blocked":
             raise OwnerConflict("bundle_report_non_advancing_disposition_invalid")
         command_kind = "record_bundle_report_disposition"
         command_hash = canonical_hash(
@@ -6970,247 +7060,7 @@ class SQLiteAdvancementEngine(
         retirement_receipt: AcceptanceReceipt,
         idempotency_key: str,
     ) -> BundleReplanActivation:
-        _validate_idempotency_key(idempotency_key)
-        verifier = self._runtime_control_verifier
-        if verifier is None or not callable(
-            getattr(verifier, "verify_bundle_replan_run_retirement", None)
-        ):
-            raise OwnerConflict("bundle_replan_retirement_verifier_unavailable")
-        with self._database.read() as connection:
-            disposition_row = connection.execute(
-                text(
-                    "SELECT * FROM ae_bundle_report_dispositions WHERE "
-                    "disposition_ref = :disposition_ref"
-                ),
-                {"disposition_ref": disposition_ref},
-            ).first()
-        if disposition_row is None:
-            raise OwnerConflict("bundle_report_disposition_invalid")
-        disposition = self._bundle_report_disposition_from_row(disposition_row)
-        if (
-            disposition.disposition != "replan_required"
-            or disposition.status != "pending_run_retirement"
-        ):
-            raise OwnerConflict("bundle_replan_activation_invalid")
-        retirement = verifier.verify_bundle_replan_run_retirement(
-            retirement_ref=retirement_ref,
-            receipt=retirement_receipt,
-        )
-        if (
-            retirement.disposition_ref != disposition_ref
-            or retirement.request_ref != disposition.request_ref
-            or retirement.run_ref != disposition.run_ref
-            or retirement.report_ref != disposition.report_ref
-            or retirement.report_hash != disposition.report_hash
-            or retirement.receipt != retirement_receipt
-        ):
-            raise OwnerConflict("bundle_replan_retirement_invalid")
-        command_kind = "activate_bundle_replan"
-        command_hash = canonical_hash(
-            {
-                "command": command_kind,
-                "disposition_ref": disposition_ref,
-                "retirement_ref": retirement_ref,
-                "retirement_receipt": retirement_receipt.as_public_dict(),
-            }
-        )
-        replay_ref = _query_ae_command(
-            self._database, idempotency_key, command_kind, command_hash
-        )
-        if replay_ref is not None:
-            replay = self.query_bundle_replan_activation(disposition_ref)
-            if replay is None or replay.activation_ref != replay_ref:
-                raise OwnerConflict("stage_command_result_missing")
-            return replay
-        request = self._query_stage_request_by_ref(disposition.request_ref)
-        now = time.time()
-        with self._database.write() as connection:
-            replay_ref = _ae_command_replay(
-                connection, idempotency_key, command_kind, command_hash
-            )
-            existing = connection.execute(
-                text(
-                    "SELECT * FROM ae_bundle_replan_activations WHERE "
-                    "disposition_ref = :disposition_ref"
-                ),
-                {"disposition_ref": disposition_ref},
-            ).first()
-            if replay_ref is not None:
-                activation_ref = replay_ref
-            elif existing is not None:
-                if existing.request_hash != command_hash:
-                    raise OwnerConflict("bundle_replan_activation_conflict")
-                activation_ref = existing.activation_ref
-                _record_ae_command(
-                    connection,
-                    idempotency_key,
-                    command_kind,
-                    command_hash,
-                    activation_ref,
-                )
-            else:
-                self._assert_stage_head_current(
-                    connection,
-                    cycle_ref=request.cycle_ref,
-                    quest_ref=request.accepted_question.quest_ref,
-                    stage=BUNDLE_STAGE,
-                    epoch=request.epoch,
-                )
-                grant = connection.execute(
-                    text(
-                        "SELECT * FROM ae_foreground_grants WHERE quest_ref = "
-                        ":quest_ref AND cycle_ref = :cycle_ref AND epoch = "
-                        ":epoch AND status = 'active'"
-                    ),
-                    {
-                        "quest_ref": request.accepted_question.quest_ref,
-                        "cycle_ref": request.cycle_ref,
-                        "epoch": request.epoch,
-                    },
-                ).first()
-                if grant is None or grant.stage != BUNDLE_STAGE:
-                    raise OwnerConflict("bundle_replan_foreground_invalid")
-                activation_ref = new_ref("bundle_replan_activation")
-                next_epoch = request.epoch + 1
-                bindings = {
-                    "disposition_ref": disposition_ref,
-                    "retirement_ref": retirement_ref,
-                    "request_ref": request.request_ref,
-                    "cycle_ref": request.cycle_ref,
-                    "source_epoch": request.epoch,
-                    "next_epoch": next_epoch,
-                    "run_ref": disposition.run_ref,
-                    "report_ref": disposition.report_ref,
-                    "run_identity_hash": retirement.run_identity_hash,
-                    "retirement_receipt_ref": retirement_receipt.receipt_ref,
-                    "retirement_receipt_hash": retirement_receipt.payload_hash,
-                }
-                receipt_ref = new_ref("ae_bundle_replan_activation_receipt")
-                receipt_hash = _receipt_hash(
-                    BUNDLE_REPLAN_ACTIVATED_RECEIPT_KIND,
-                    activation_ref,
-                    bindings,
-                )
-                connection.execute(
-                    text(
-                        "INSERT INTO ae_bundle_replan_activations (activation_ref, "
-                        "disposition_ref, retirement_ref, request_ref, cycle_ref, "
-                        "source_epoch, next_epoch, run_ref, report_ref, "
-                        "run_identity_hash, retirement_receipt_ref, "
-                        "retirement_receipt_hash, idempotency_key, request_hash, "
-                        "receipt_ref, receipt_hash, activated_at) VALUES "
-                        "(:activation_ref, :disposition_ref, :retirement_ref, "
-                        ":request_ref, :cycle_ref, :source_epoch, :next_epoch, "
-                        ":run_ref, :report_ref, :run_identity_hash, "
-                        ":retirement_receipt_ref, :retirement_receipt_hash, "
-                        ":idempotency_key, :request_hash, :receipt_ref, "
-                        ":receipt_hash, :activated_at)"
-                    ),
-                    {
-                        **bindings,
-                        "activation_ref": activation_ref,
-                        "idempotency_key": idempotency_key,
-                        "request_hash": command_hash,
-                        "receipt_ref": receipt_ref,
-                        "receipt_hash": receipt_hash,
-                        "activated_at": now,
-                    },
-                )
-                revoked = connection.execute(
-                    text(
-                        "UPDATE ae_foreground_grants SET status = 'revoked', "
-                        "revoked_at = :now WHERE grant_ref = :grant_ref AND "
-                        "status = 'active'"
-                    ),
-                    {"now": now, "grant_ref": grant.grant_ref},
-                )
-                if revoked.rowcount != 1:
-                    raise OwnerConflict("bundle_replan_foreground_invalid")
-                connection.execute(
-                    text(
-                        "INSERT INTO ae_foreground_grants (grant_ref, quest_ref, "
-                        "cycle_ref, question_ref, stage, epoch, status, "
-                        "predecessor_grant_ref, safe_point_ref, granted_at, "
-                        "revoked_at) VALUES (:grant_ref, :quest_ref, :cycle_ref, "
-                        ":question_ref, :stage, :epoch, 'active', :predecessor, "
-                        "NULL, :now, NULL)"
-                    ),
-                    {
-                        "grant_ref": new_ref("foreground_grant"),
-                        "quest_ref": request.accepted_question.quest_ref,
-                        "cycle_ref": request.cycle_ref,
-                        "question_ref": request.accepted_question.question_ref,
-                        "stage": PLAN_STAGE,
-                        "epoch": next_epoch,
-                        "predecessor": grant.grant_ref,
-                        "now": now,
-                    },
-                )
-                advanced = connection.execute(
-                    text(
-                        "UPDATE ae_foreground_heads SET stage = :stage, epoch = "
-                        ":next_epoch, updated_at = :now WHERE quest_ref = "
-                        ":quest_ref AND cycle_ref = :cycle_ref AND stage = "
-                        ":source_stage AND epoch = :source_epoch AND status = "
-                        "'active' AND pending_operation_ref IS NULL"
-                    ),
-                    {
-                        "stage": PLAN_STAGE,
-                        "next_epoch": next_epoch,
-                        "now": now,
-                        "quest_ref": request.accepted_question.quest_ref,
-                        "cycle_ref": request.cycle_ref,
-                        "source_stage": BUNDLE_STAGE,
-                        "source_epoch": request.epoch,
-                    },
-                )
-                cycle = connection.execute(
-                    text(
-                        "UPDATE ae_cycles SET stage = :stage, suspension_reason = "
-                        "NULL, updated_at = :now WHERE cycle_ref = :cycle_ref AND "
-                        "stage = :source_stage AND status = 'ongoing'"
-                    ),
-                    {
-                        "stage": PLAN_STAGE,
-                        "now": now,
-                        "cycle_ref": request.cycle_ref,
-                        "source_stage": BUNDLE_STAGE,
-                    },
-                )
-                if advanced.rowcount != 1 or cycle.rowcount != 1:
-                    raise OwnerConflict("bundle_replan_foreground_invalid")
-                _record_ae_command(
-                    connection,
-                    idempotency_key,
-                    command_kind,
-                    command_hash,
-                    activation_ref,
-                )
-                connection.execute(
-                    text(
-                        "UPDATE advancement_engine_state SET revision = "
-                        "revision + 1, bundle_replan_activation_count = "
-                        "bundle_replan_activation_count + 1 WHERE singleton = "
-                        "'owner'"
-                    )
-                )
-                self._feed.record(
-                    connection,
-                    "advancement_engine.bundle_replan_activated",
-                    {
-                        "activation_ref": activation_ref,
-                        "disposition_ref": disposition_ref,
-                        "retirement_ref": retirement_ref,
-                        "cycle_ref": request.cycle_ref,
-                        "source_epoch": request.epoch,
-                        "next_epoch": next_epoch,
-                        "receipt_ref": receipt_ref,
-                    },
-                )
-        activated = self.query_bundle_replan_activation(disposition_ref)
-        if activated is None or activated.activation_ref != activation_ref:
-            raise OwnerConflict("bundle_replan_activation_missing_after_commit")
-        return activated
+        raise OwnerConflict("bundle_replan_requires_reasoning")
 
     def query_bundle_replan_activation(
         self, disposition_ref: str
@@ -8331,25 +8181,15 @@ class SQLiteAdvancementEngine(
         if evidence is None or literature is None or collaboration is None:
             raise OwnerConflict("reasoning_successor_context_verifier_unavailable")
 
-        evidence_revision, evidence_refs = (
-            evidence.query_evidence_reference_state(
-                accepted_question.quest_ref
-            )
-        )
-        evidence.verify_evidence_refs(
-            quest_ref=accepted_question.quest_ref,
-            version_refs=tuple(sorted(evidence_refs)),
-            expected_reference_revision=evidence_revision,
-            require_current=True,
-        )
+        evidence_page, evidence_refs = evidence.query_evidence_reference_page(accepted_question.quest_ref)
+        evidence_revision = evidence_page["total_count"]
         literature_revision = (
             literature.query_current_question_literature_revision(
                 accepted_question.question_ref
             )
         )
-        if literature_revision is None:
-            raise OwnerConflict("question_literature_revision_unavailable")
-        literature.verify_question_literature_revision(literature_revision)
+        if literature_revision is not None:
+            literature.verify_question_literature_revision(literature_revision)
 
         scope_ref = f"quest:{accepted_question.quest_ref}"
         guidance = collaboration.query_active_guidance_bindings(scope_ref)
@@ -8372,13 +8212,14 @@ class SQLiteAdvancementEngine(
             "cycle_ref": source_commit.cycle_ref,
         }
         context_pack: dict[str, object] = {
-            "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_V3_REF,
+            "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_V4_REF,
             "cycle_ref": cycle_ref,
             "accepted_question_binding": accepted_question.as_dict(),
             "accepted_evidence_refs": list(sorted(evidence_refs)),
             "evidence_reference_revision": evidence_revision,
-            "literature_binding": literature_revision,
-            "prior_accepted_bindings": [prior],
+            "evidence_page": evidence_page,
+            "literature_binding": literature_reference(literature_revision),
+            "prior_accepted_bindings": [reasoning_handoff_reference(prior)],
             "active_guidance_bindings": guidance,
         }
         try:
@@ -8921,14 +8762,17 @@ class SQLiteAdvancementEngine(
                     if committed.outcome_receipt is None:
                         raise OwnerConflict("bundle_stage_verifier_unavailable")
                     request = self._query_stage_request_by_ref(row.request_ref)
+                    expected_closure: dict[str, object] = {}
                     accepted = self._verify_bundle_report_for_advancement(
                         request=request,
                         run_ref=row.run_ref,
                         bundle_report_ref=row.outcome_ref,
                         bundle_report_receipt=committed.outcome_receipt,
-                        expected_disposition="realized",
+                        closure_output=expected_closure,
                     )
-                    if committed.closure != _bundle_stage_report_closure(accepted):
+                    if accepted.report.disposition not in {"realized", "replan_required"}:
+                        raise OwnerConflict("bundle_report_completion_disposition_invalid")
+                    if committed.closure != expected_closure:
                         raise OwnerConflict("bundle_stage_closure_invalid")
                 elif row.outcome_kind == TARGET_GRAPH_OUTCOME_KIND:
                     # Historical target-graph completions remain issuer-verified
@@ -9538,6 +9382,7 @@ class SQLiteAdvancementEngineReceiptVerifier:
             receipt=requested.receipt,
         )
 
+    @snapshot_cached
     def query_verified_plan_stage_request(
         self,
         *,
@@ -10349,6 +10194,25 @@ def _is_exact_derived_skip(
     )
 
 
+def _is_exact_reuse_skip(row, *, basis_kind: str) -> bool:
+    """Match an AE-authored prior-asset reuse skip for a successor Cycle.
+
+    _verify_reused_stage_asset_skip_basis re-authenticates the basis against
+    the frozen prior StageCommit whenever such a row is decoded.
+    """
+    return bool(
+        row.disposition == SKIPPED_DISPOSITION
+        and row.request_ref is None
+        and row.run_ref is None
+        and row.outcome_ref is None
+        and row.outcome_kind is None
+        and row.basis_kind == basis_kind
+        and row.basis_receipt_issuer == AE_OWNER
+        and row.basis_receipt_kind == STAGE_COMMIT_RECEIPT_KIND
+        and row.basis_receipt_subject_ref == row.basis_ref
+    )
+
+
 def _validate_reasoning_route_rows(by_stage: dict[str, object]) -> None:
     ordered = [by_stage[stage] for stage in (IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE)]
     if any(
@@ -10360,24 +10224,38 @@ def _validate_reasoning_route_rows(by_stage: dict[str, object]) -> None:
         raise OwnerConflict("reasoning_upstream_closure_invalid")
 
     if all(row.disposition == SKIPPED_DISPOSITION for row in ordered):
-        source_outcome_ref = ordered[0].basis_ref
-        source_receipt_ref = ordered[0].basis_receipt_ref
-        source_receipt_hash = ordered[0].basis_receipt_hash
-        if (
-            not isinstance(source_outcome_ref, str)
-            or not source_outcome_ref
-            or any(
-                row.basis_kind != AUTONOMOUS_REASONING_SKIP_BASIS_KIND
-                or row.basis_ref != source_outcome_ref
-                or row.basis_receipt_issuer != "research_graph"
-                or row.basis_receipt_kind != "reasoning_outcome_accepted"
-                or row.basis_receipt_subject_ref != source_outcome_ref
-                or row.basis_receipt_ref != source_receipt_ref
-                or row.basis_receipt_hash != source_receipt_hash
-                for row in ordered
+        # An entry=bundle successor reuses the prior accepted idea set and
+        # formal plan; skip_bundle_stage may then close Bundle itself when
+        # that plan carries no experiment gap. This exact closure shape must
+        # reach Reasoning like any other completed route.
+        successor_bundle_skip = (
+            _is_exact_reuse_skip(
+                ordered[0], basis_kind=PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND
             )
-        ):
-            raise OwnerConflict("reasoning_upstream_closure_invalid")
+            and _is_exact_reuse_skip(
+                ordered[1], basis_kind=PRIOR_ACCEPTED_FORMAL_PLAN_SKIP_BASIS_KIND
+            )
+            and ordered[2].outcome_kind == BUNDLE_SKIP_OUTCOME_KIND
+        )
+        if not successor_bundle_skip:
+            source_outcome_ref = ordered[0].basis_ref
+            source_receipt_ref = ordered[0].basis_receipt_ref
+            source_receipt_hash = ordered[0].basis_receipt_hash
+            if (
+                not isinstance(source_outcome_ref, str)
+                or not source_outcome_ref
+                or any(
+                    row.basis_kind != AUTONOMOUS_REASONING_SKIP_BASIS_KIND
+                    or row.basis_ref != source_outcome_ref
+                    or row.basis_receipt_issuer != "research_graph"
+                    or row.basis_receipt_kind != "reasoning_outcome_accepted"
+                    or row.basis_receipt_subject_ref != source_outcome_ref
+                    or row.basis_receipt_ref != source_receipt_ref
+                    or row.basis_receipt_hash != source_receipt_hash
+                    for row in ordered
+                )
+            ):
+                raise OwnerConflict("reasoning_upstream_closure_invalid")
         return
 
     exhausted = [row for row in ordered if row.disposition == EXHAUSTED_DISPOSITION]
@@ -10428,7 +10306,16 @@ def _validate_reasoning_route_rows(by_stage: dict[str, object]) -> None:
             raise OwnerConflict("reasoning_upstream_closure_invalid")
         return
 
-    if idea.disposition != COMPLETED_DISPOSITION or idea.outcome_kind != IDEA_SET_OUTCOME_KIND:
+    # A successor Cycle may reuse the prior accepted idea set: AE closes Idea
+    # with an engine-authored skip whose basis is re-authenticated by
+    # _verify_reused_stage_asset_skip_basis whenever the row is decoded.
+    idea_set_reuse = _is_exact_reuse_skip(
+        idea, basis_kind=PRIOR_ACCEPTED_IDEA_SET_SKIP_BASIS_KIND
+    )
+    if not idea_set_reuse and (
+        idea.disposition != COMPLETED_DISPOSITION
+        or idea.outcome_kind != IDEA_SET_OUTCOME_KIND
+    ):
         raise OwnerConflict("reasoning_upstream_closure_invalid")
     plan, bundle = ordered[1:]
     if plan.disposition not in {COMPLETED_DISPOSITION, SKIPPED_DISPOSITION}:
@@ -10480,6 +10367,7 @@ def _reasoning_context_pack_from_rows(
     epoch: int,
     accepted_question: AcceptedQuestionBinding,
     question_literature_revision: dict[str, object] | None = None,
+    reference_literature: bool = True,
     quest_goal_revision: dict[str, object] | None = None,
     reasoning_graph_context: dict[str, object] | None = None,
     evidence_reuse_closure: tuple[EvidenceReuseLeaf, ...] = (),
@@ -10506,7 +10394,7 @@ def _reasoning_context_pack_from_rows(
         else {
             "kind": "revision",
             "revision_ref": question_literature_revision.get("revision_ref"),
-            "binding": question_literature_revision,
+            "binding": literature_reference(question_literature_revision) if reference_literature else question_literature_revision,
         }
     )
     if (
@@ -10516,16 +10404,22 @@ def _reasoning_context_pack_from_rows(
         raise OwnerConflict("reasoning_literature_binding_invalid")
 
     plan = commits[1]
+    bundle = commits[2]
     if plan.disposition == COMPLETED_DISPOSITION:
         bundle_request = connection.execute(
             text(
                 "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = :cycle_ref "
                 "AND stage = 'bundle' AND epoch = :epoch"
             ),
-            {"cycle_ref": cycle_ref, "epoch": epoch},
+            {"cycle_ref": cycle_ref, "epoch": bundle.epoch},
         ).first()
         if bundle_request is None:
             raise OwnerConflict("reasoning_plan_evidence_binding_missing")
+        if (
+            bundle.request_ref is not None
+            and bundle_request.request_ref != bundle.request_ref
+        ):
+            raise OwnerConflict("reasoning_plan_evidence_binding_invalid")
         bundle_context, bundle_question = _verify_stage_request_integrity(
             bundle_request
         )
@@ -10567,7 +10461,6 @@ def _reasoning_context_pack_from_rows(
             "basis_stage_commit_refs": [commit.commit_ref for commit in commits],
         }
 
-    bundle = commits[2]
     accepted_target_commit_closures: list[object] = []
     if bundle.disposition == COMPLETED_DISPOSITION:
         if not isinstance(bundle.closure, dict):
@@ -10737,7 +10630,7 @@ def _validate_reasoning_context_pack(
     if literature.get("kind") == "revision":
         revision_binding = literature.get("binding")
         if not isinstance(revision_binding, dict) or (
-            revision_binding.get("kind") != "QuestionLiteratureRevision"
+            revision_binding.get("kind") not in {"QuestionLiteratureRevision", "QuestionLiteratureReference"}
             or revision_binding.get("revision_ref")
             != literature.get("revision_ref")
             or revision_binding.get("question_ref")
@@ -10746,7 +10639,14 @@ def _validate_reasoning_context_pack(
             or not isinstance(
                 revision_binding.get("literature_snapshot_ref"), str
             )
-            or not isinstance(revision_binding.get("records"), list)
+            or (revision_binding.get("kind") == "QuestionLiteratureRevision" and not isinstance(revision_binding.get("records"), list))
+            or (revision_binding.get("kind") == "QuestionLiteratureReference" and (
+                not isinstance(revision_binding.get("records_hash"), str)
+                or len(revision_binding["records_hash"]) != 64
+                or type(revision_binding.get("record_count")) is not int
+                or revision_binding["record_count"] < 0
+                or "records" in revision_binding
+                or not isinstance(revision_binding.get("records_preview"), dict)))
             or not isinstance(
                 revision_binding.get("rm_acceptance_receipt_ref"), str
             )
@@ -10829,7 +10729,7 @@ def _validate_reasoning_context_pack(
         or any(
             sum(
                 item.get("target_commit_ref") == target_ref
-                and item.get("role") == "MetricResult"
+                and item.get("role") in {"MetricResult", "WorkProduct"}
                 for item in target_evidence
             )
             != 1

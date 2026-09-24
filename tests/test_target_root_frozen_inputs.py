@@ -295,7 +295,9 @@ def test_tampered_frozen_input_blocks_all_completion_rm_and_rg_writes(
     ):
         finalizer.finalize(handle=handle, evidence=evidence)
 
-    assert lifecycle.query_completion_calls == 0
+    # Looking up an earlier accepted snapshot is read-only; no new completion
+    # or downstream Owner write may accept the changed first-generation input.
+    assert lifecycle.query_completion_calls == 1
     assert lifecycle.accept_completion_calls == 0
     assert memory.accept_calls == 0
     assert graph.accept_calls == 0

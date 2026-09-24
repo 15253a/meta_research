@@ -20,7 +20,32 @@ ROOT_AGENT_ACQUISITION_OPERATION_IDS = (
     "agent_runtime.acquisition.request",
     "agent_runtime.acquisition.request.reconcile",
 )
+ROOT_AGENT_DATASET_OPERATION_IDS = (
+    "research_graph.datasets.page",
+    "research_graph.datasets.read",
+    "research_graph.datasets.register",
+    "research_graph.datasets.register.reconcile",
+    "research_graph.datasets.register_version",
+    "research_graph.datasets.register_version.reconcile",
+    "research_graph.datasets.reference",
+    "research_graph.datasets.reference.reconcile",
+    "research_graph.datasets.derive",
+    "research_graph.datasets.derive.reconcile",
+)
 ROOT_AGENT_COMMON_OPERATION_IDS = (
+    "research_graph.questions.page",
+    "research_memory.literature.page",
+    "research_memory.content.read",
+    "human_request.read",
+    "research_graph.baselines.page",
+    "research_graph.baselines.read",
+    "research_graph.target_formal_results.read",
+    "research_graph.formal_results.read",
+    "research_graph.question_history.read",
+    "research_graph.question_relations.read",
+    "research_graph.artifact_roles.adjust",
+    "research_graph.artifact_roles.adjust.reconcile",
+    *ROOT_AGENT_DATASET_OPERATION_IDS,
     *ROOT_AGENT_ACQUISITION_OPERATION_IDS,
     *ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
 )
@@ -62,6 +87,22 @@ class SemanticCallContext:
                 "effect_id": effect_id,
             }
         )
+
+    def dataset_effect_key(self, effect_id: str) -> str:
+        """Keep a Dataset effect discoverable after a technical Root recovery."""
+        if not isinstance(effect_id, str) or not effect_id or len(effect_id) > 128:
+            raise SemanticMcpError("semantic_effect_id_invalid")
+        family = self.operation_id.removesuffix(".reconcile")
+        if family not in {
+            "research_graph.datasets.register", "research_graph.datasets.register_version",
+            "research_graph.datasets.reference", "research_graph.datasets.derive",
+        }:
+            raise SemanticMcpError("dataset_effect_operation_invalid")
+        return "mcp-effect:" + canonical_hash({
+            "run_ref": self.run_ref, "root_session_ref": self.root_session_ref,
+            "root_kind": self.root_kind, "phase": self.phase,
+            "operation_family": family, "effect_id": effect_id,
+        })
 
     def human_request_effect_key(self, effect_id: str) -> str:
         """Bind one HumanRequest effect to the logical task across recovery Attempts."""
@@ -339,8 +380,8 @@ class SemanticMcpGateway:
                         "version": __version__,
                     },
                     "instructions": (
-                        "Use only high-level semantic operations. Tool discovery does "
-                        "not grant authority, and tool results are not Owner acceptance."
+                        "通过本服务的高层语义操作读取或改变 Owner 权威状态；其他研究工作按当前授予的原生工具和阶段规则进行。"
+                        "以对应 Owner 验证的接纳事实与真实回执确认结果；工具可见或普通执行成功不扩大授权，也不替代领域接纳。"
                     ),
                 },
             }

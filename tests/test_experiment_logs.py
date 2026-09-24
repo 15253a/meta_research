@@ -253,6 +253,8 @@ def test_http_auth_and_cursor_errors_are_stable(tmp_path, monkeypatch):
     try:
         path = '/api/v1/bundle/targets/target-A/experiment-logs'
         assert client.get(path).status_code == 401
+        progress_path = '/api/v1/bundle/targets/target-A/progress'
+        assert client.get(progress_path, params={'target_run_ref': 'run-A'}).status_code == 401
         token = runtime.authentication.issue_bootstrap_token()
         assert client.post('/auth/bootstrap', headers={'Origin':'http://testserver'}, json={'token':token}).status_code == 200
         listed = client.get(path, params={'target_run_ref':'run-A'})
@@ -269,6 +271,13 @@ def test_http_auth_and_cursor_errors_are_stable(tmp_path, monkeypatch):
         conflict = client.get(path+'/'+ref, params={'after':0, 'before':1, 'stream_ref':tail['stream_ref']})
         assert conflict.status_code == 422
         assert client.get(path+'/unknown').status_code == 404
+        progress = client.get(progress_path, params={'target_run_ref': 'run-A'})
+        assert progress.status_code == 200
+        assert progress.json()['fragments'][0]['text'] == 'epoch 1\n'
+        unchanged = client.get(progress_path, params={'target_run_ref': 'run-A', 'cursor': progress.json()['cursor']})
+        assert unchanged.status_code == 200
+        assert unchanged.json()['fragments'] == []
+        assert client.get(progress_path, params={'target_run_ref': 'run-other'}).status_code == 409
     finally:
         client.close()
         runtime.close()

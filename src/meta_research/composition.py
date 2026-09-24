@@ -90,6 +90,7 @@ from meta_research.power_inhibitors import (
 )
 from meta_research.projection import PublicProjection
 from meta_research.quest_drafting import (
+    CODEX_DRAFTING_LOCKED_VERSION,
     HostComputeProbe,
     IntentDraftingProvider,
     NvidiaSmiProbe,
@@ -172,6 +173,11 @@ class _DeepFetchRequestVerifierRouter:
             "query_initialization_acquisition_binding",
         )
         return cast(dict[str, str] | None, query(request_ref))
+
+    def query_autonomous_deepfetch_request_by_ref(self, request_ref: str):
+        if self._advancement_engine is None:
+            raise RuntimeError("autonomous deepfetch verifier is not bound")
+        return self._advancement_engine.query_autonomous_deepfetch_request_by_ref(request_ref)
 
     def verify_deepfetch_run_request(self, **values: object) -> None:
         if values.get("creation_context_kind") == "autonomous_question_creation":
@@ -275,6 +281,7 @@ class ProductionRuntime:
     _provider_lifecycles: tuple[object, ...] = ()
     _resident_mcp_providers: tuple[object, ...] = ()
     _stop_requested: bool = False
+    timeline_summaries: object | None = None
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         for provider in self._resident_mcp_providers:
@@ -528,7 +535,9 @@ def build_production_runtime(
     startup_harness_diagnostics: bool = True,
     telemetry_exporter_factory: Callable[[str], TelemetryExporter] | None = None,
 ) -> ProductionRuntime:
-    codex_executable = str(data_root.validated_codex_cli_executable())
+    codex_executable = str(
+        data_root.validated_codex_cli_executable(CODEX_DRAFTING_LOCKED_VERSION)
+    )
     upgrade_database(data_root.database)
     database = Database(data_root.database)
     feed = DurableFeed(database)
@@ -756,6 +765,7 @@ def build_production_runtime(
         human_response_verifier=human_response_verifier,
         stage_request_verifier=stage_request_receipts,
     )
+    research_graph.bind_literature_source_reader(research_memory)
     target_run_memory = SQLiteTargetRunMemoryAuthority(
         database,
         feed,
@@ -865,6 +875,10 @@ def build_production_runtime(
         data_root.root,
         scope_lookup=owners.agent_runtime.query_stage_root_observation_scope,
     )
+    if isinstance(reasoning_skill_provider, CodexReasoningSkillAdapter):
+        agent_runtime.bind_operator_stop_reader(
+            StoppedStageProviderRecovery(stage_root_observations).read_for_operator_resume
+        )
     autonomous_creation = AutonomousCreationService(
         human_collaboration,
         advancement_engine,
@@ -907,6 +921,12 @@ def build_production_runtime(
         manifest_reader=target_root_memory,
     )
     owners.agent_runtime.bind_target_run_harness_verifier(target_run_agent)
+    # Cross-Owner report/completion reads use this separate receipt verifier.
+    # Bind the same Target authorities used by AR's own receipt reader.
+    attempt_receipts.bind_target_run_harness_verifier(target_run_agent)
+    attempt_receipts.bind_target_root_completion_authorities(
+        target_root_lifecycle, research_graph_receipts
+    )
     owners.research_graph.bind_target_execution_closure_verifier(
         target_run_agent
     )
@@ -921,6 +941,7 @@ def build_production_runtime(
         agent_runtime=owners.agent_runtime,
         acquisition_provider=acquisition_provider,
         human_collaboration_snapshot=owners.human_collaboration.query_snapshot,
+        human_collaboration=owners.human_collaboration,
         target_run_agent=target_run_agent,
     )
     harness_operation_canceller = None
@@ -1052,6 +1073,7 @@ def build_production_runtime(
         target_root_lifecycle=target_root_lifecycle,
         harnesses=harnesses,
         finalizer=target_run_finalizer,
+        database=database,
     )
     bundle_stage = BundleStageWorker(
         feed,
@@ -1151,4 +1173,8 @@ def build_production_runtime(
         _resident_mcp_providers=tuple(resident_mcp_providers),
     )
     runtime.reconcile_telemetry_authorization()
+    from meta_research.timeline_summaries import create_timeline_summary_service
+
+    runtime.timeline_summaries = create_timeline_summary_service(runtime, codex_executable)
+    runtime._provider_lifecycles += (runtime.timeline_summaries,)
     return runtime

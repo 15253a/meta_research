@@ -151,8 +151,8 @@ class _DeterministicIdeaSkill:
         return IdeaSkillResult(
             reviewed_draft=draft.draft,
             final_outcome=draft.draft,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
@@ -297,8 +297,8 @@ class _DeterministicPlanSkill:
         return PlanSkillResult(
             reviewed_draft=draft.draft,
             final_plan=draft.draft,
-            findings=(),
-            dispositions=(),
+
+
             primary_session_ref=draft.primary_session_ref,
             review_mode="advisory_unobserved",
             reviewer_agent_ref=None,
@@ -524,8 +524,6 @@ def test_plan_stage_keeps_five_fact_layers_with_a_real_gap(
         assert committed["run"]["review"] == {
             "status": "completed",
             "review_mode": "advisory_unobserved",
-            "finding_count": 0,
-            "disposition_count": 0,
         }
         assert {"awaiting_content", "awaiting_domain", "accepted"} <= set(
             observed_acceptance

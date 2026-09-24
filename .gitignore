@@ -6,3 +6,21 @@ __pycache__/
 *.py[cod]
 dist/
 build/
+
+# Runtime captures and local environments are not source.
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+.meta-research-acquisition/
+web/test-results/
+web/playwright-report/
+web/tests/snapshot-before.json
+web/tests/*-desktop.png
+web/tests/*-mobile.png
+web/prototypes/**/preview-*.png
+web/prototypes/**/*.log

@@ -1,134 +1,42 @@
 ---
 name: bundle-stage
-description: 从当前 BundleStageRunRequest 与已接受 FormalPlan 滚动规划并异步协调 Target。用于拆分或追加 Target、claim 或恢复 Target 根 Session、处理最终冻结交接、收口 TargetCommit，或提出 Bundle 级阻塞与语义重规划。
+description: 在已接纳 FormalPlan 内组织并启用 Target，滚动安排材料获取、整理、实验或其他研究，用真实接纳结果收口或说明语义修订理由。
 ---
 
-# Bundle Stage
+# Bundle：组织实际研究
 
-把 FormalPlan 的证据缺口变成可供 Reasoning 使用的正式测量闭包。Bundle
-主 Agent 掌握滚动策略、Target 分解和跨 Target 调度；每个 Target 的根 Agent
-Session 独占该 Target 的实现、训练、结果驱动修改和最终冻结交接。State Owner
-保留正式身份、内容、测量、接纳与 Stage 推进权。
+负责本轮工作范围、真实依赖与滚动安排；Target 根 Session 负责实施、检查、局部修订和结果交接。保持 Plan 承诺与 Idea 来源，在新结果出现时补充判断依据。按根系统提示执行五入口、预算、人类输入和语言偏好，子智能体继承范围及语言。
 
-执行前完整读取 [Bundle 合同](references/contract.md)。首次读取或写入 Owner
-状态、claim／wake／cancel Target、恢复 Session 或提交冻结交接前，完整读取
-[Owner 操作](references/owner-operations.md)。
+粒度、风险、正式工作与依赖查[Bundle 契约](references/contract.md)；调用与反馈查[Owner 操作](references/owner-operations.md)。Target 按运行时注入的 target-execution Skill、measurement_contract、result_schema 执行，Bundle 不重建另一套交接协议。
 
-## 1. 锁定 Bundle 调用闭包
+## 1. 读取与滚动安排
 
-1. 读取 current BundleStageRunRequest、根 Execution Fence、不可变 ContextPack，
-   以及 accepted FormalPlan 的 canonical content hash 和直接绑定该 hash 的 current
-   receipt。
-2. 完整读取 EvidenceReuseSet、GapSet 和所有 gap ExperimentBrief，核对
-   Quest／Cycle／Stage、输入 ref、内容 hash、receipt 与 currentness。
-3. 没有 gap ExperimentBrief 时不建立 Bundle Run；把精确 skip 依据交给
-   Advancement Engine。
+读取已接纳 FormalPlan、gap Brief、输入索引、权威 frontier 与反馈，选择值得现在投入的工作。局部策略可随结果调整尚未提交的候选和顺序，不要求起步列尽未来路线。研究观察可指导选择，正式 coverage 只用已接纳 TargetCommit。
 
-完成标准：所有输入来自同一不可变调用闭包；未接纳内容、本地草稿、漂移引用和
-不可验证 receipt 均未进入策略。
+仅 Bundle 经正式候选接纳与调度启用 Target；其他阶段、Target 和子智能体提供后续建议。Target 有独立可验目的、完成 cells、输入和实际依赖。获取、采集、清洗、整理可独立成 Target，也可与相关研究合并；粒度由研究需要、复用产物和真实依赖决定，湿实验、论证和辅助材料同样适用。
 
-## 2. 建立滚动策略
+cells 表达应实施及报告的责任，允许负结果、失败原因和未解决判断，范围只含相关 obligations 与 Briefs。只有消费上游新结果才建立依赖，共享已接纳输入可并行。复用按实际需要核对数据、划分、预测、实现和协议，精确绑定资产版本。
 
-1. 先形成足以启动首批工作的 Session-local 策略，再根据已经接受的
-   TargetCommit、最终交接 disposition、资源和 blocker 继续修订；不预先虚构完整
-   Target 图。
-2. 从每个 ExperimentBrief 的冻结 Goal、Characteristics、BoundaryConstraints、
-   SemanticDelta 与 required Metric 归一化 measurement completion cells。
-3. 提出最小、可独立收口的 Target 和真实输入依赖。只有下游消费上游新产生且已
-   接受的 TargetCommit／asset 时才建立依赖；共享同一已接受输入的工作可以并行。
-4. 优先搜索并比较可复用实现，保存 exact source/version/license/patch provenance
-   与采用或拒绝理由。探索子智能体只提供 candidate、finding 和 provenance。
-5. 按[风险分类与授权连续性](references/contract.md#风险分类与授权连续性)逐个判断
-   候选的实际动作、输入、输出位置与已授权资源范围，明确填写 `risk_class`。
+按实际动作及 Quest 授权填 `risk_class`；已授权获取、整理、实施、分析和大型保存自主进行，仅为具体外部权限、资源或人类动作提出 HumanRequest。体积或耗时本身不构成额外授权门槛。
 
-完成标准：首批 Target 有明确冻结语义、输入、完成 cell、复用路线、风险分类与依赖理由；
-未规划义务仍显式可见，Session-local 策略没有冒充 RG 的 Target identity、
-spec、dependency 或 frontier。
+## 2. 据结果调整
 
-## 3. Claim 独立 Target 根 Session
+首次 admission 仅处理未启动工作；已 claimed、running、recovering、finalizing 的工作沿既有 TargetRun 观察、wake 或 reconcile；已接纳 TargetCommit 用于收口。按证据、价值、资源与依赖选择 dispatch、wait 或 replan_required，说明理由。
 
-1. 通过 Owner seam 提交 Target candidate；Research Graph 接受正式 Target
-   identity／spec／dependency 后，重新读取 current frontier。
-2. 先区分未启动、既有 TargetRun 与已接纳完成的 Target。既有 TargetRun 的
-   claimed／running／recovering／finalizing 工作由 Owner 观察、wake 或 reconcile；
-   没有其他 ready 工作时返回 `wait`。已接纳 TargetCommit 直接计入 coverage。
-3. 只对尚无既有 TargetRun 的 ready Target 进入首次 admission，并请求 daemon claim。
-   请求冻结 TargetRef、current spec binding、accepted inputs、授权与所需 Harness
-   binding。只为这次新执行中尚未获授权的具体高风险动作申请 HumanRequest。
-4. daemon 只执行 claim、wake、per-Target single-flight、cancel、reconcile 和 event
-   forwarding。它为一个 Target 保持至多一个 current 根 Session，不参与实现、
-   训练、结果解释、候选选择或 Owner 接纳。
-5. Bundle 发起后继续其他工作、wait、暂停或重启均可；Target 根 Session 按 durable
-   identity 独立运行。Bundle Attempt／Fence 轮换后仍按原 TargetRun 对账；授权连续性
-   由 Owner 重验。若 admission frontier 与 running／completed 事实冲突，返回准确的
-   状态不一致说明，交给 Owner reconcile，再继续可运行的其他 Target。
+给 Target 留出方法复用／新建、实际归属（含跨 Baseline）、实现和补充检查空间。保持 FormalPlan 的 Goal、Characteristics、BoundaryConstraints、SemanticDelta、required Metric 和 held-fixed 条件；实质变化交给 Reasoning 与后继 Cycle，同一 Cycle 不回 Plan。
 
-完成标准：每个在途 Target 只有一个 current 根 Session；首次 admission、既有执行
-观察与已接纳结果收口各有明确去向，恢复不会重复请求同一执行的授权。
+## 3. 保存认识和可复用数据
 
-## 4. 在根 Session 内完成 Target 循环
+用已接纳工作的真实结果更新覆盖，既可有测量，也可为无评价工作。负、零、不显著、不确定和缺测保持各自含义；准备审计只支持准备事实，不代替承诺中的实质研究。
 
-1. 根 Session 在专属 Target workspace 中生成、修改或复用实现，并完成与当前
-   候选相称的自检。
-2. 根 Session 直接使用 Harness 已授权的原生工具启动训练或评估，读取真实结果，
-   决定下一轮修改，然后重复“实现 → 自检 → 训练／评估 → 结果驱动修改”。
-3. 中间代码、checkpoint、stdout／stderr、日志、分析、临时测量和未采用 Attempt
-   全部保持 Target-local。它们可以指导后续工程决策，但不会在循环中成为 RM／RG
-   接受事实。
-4. 根 Session 可以派探索、代码审阅或结果审阅子智能体；子智能体只返回
-   candidate／finding／provenance。根 Session 逐条处置 finding，并独占 workspace
-   修改、训练启动、checkpoint 选择和最终候选选择。
-   对长训练或长日志，根 Session 也可以派一个聚焦子智能体持续观察进程、tail 日志
-   并汇报进度；该子智能体不替根 Session 修改代码、停止训练或决定最终交接。
-5. 所有迭代保持 FormalPlan 冻结语义。确需改变 Goal、Characteristics、
-   BoundaryConstraints、SemanticDelta、required Metric 或 held-fixed 条件时，
-   形成类型化 Bundle 升级，不把变化伪装成局部修复。
+`TargetPlan.notes` 和 `StrategyUpdate.notes` 保存研究判断；系统把最后一条非空且已接纳策略备注及 proposal ref／hash 交给 Reasoning，空值保留前次。封口后未必还有写作回合，应及时写清认识、证据边界与未完成事项。
 
-单轮完成标准：一次真实训练／评估已有可追溯输入和输出，根 Session 已明确继续
-修改、保留候选或升级。局部循环完成标准：已选择 terminal candidate，所有在途
-进程与失联副作用均已 reconcile，且 workspace 不再发生会改变交接内容的写入。
+已接纳 Target 的 `research_notes` 保存当时说明和最终发言。先读摘要，必要时沿 `research_notes_reader`／`research_memory.research_notes.read` 分页；精确正文用 `source=research_note_body`、`source_ref=version_ref`。上一 Question 的入口使用 `predecessor_research_notes_readers`，正文保留对应 `predecessor_ref`。说明有助理解，不替代完整合同与冻结输入。
 
-## 5. 冻结最终交接
+Target 正式接纳后，读取 `dataset_candidates` 和 completion manifest，沿 `artifact_path` 找真实 RM binding。按独立复用价值选择，通过当前授予的 datasets.register／register_version／reference 登记并关联当前 Question；有真实派生关系时 derive。先发现或对账已有登记，复用身份和原件。可委派明确范围的整理，根独立查回精确版本、用途关系和正文。最后一个 Target 后 Bundle 若不再运行，由 Reasoning 在其综合交接前承接；暂存和未接纳产物留工作区。
 
-1. 只有代码实现和最后一次训练／评估都真正完成、在途进程已经对账后，根 Session
-   才返回一个闭合 `TargetCompletionHandoff`。它只声明 TargetRef、TargetRunRef、
-   `completed`、所选 artifact 的相对路径与 role、唯一 result document 路径和摘要。
-2. 根 Session 不创建 hash、receipt、VariantRun、EvaluationAttempt、MetricResult 或
-   TargetCommit，也不需要理解 Owner 的接纳流程。Owner 从 workspace 重新读取并计算
-   bytes、tree、size 与 manifest；不能信任 Agent 自报这些事实。
-3. daemon 只转发 handoff-ready 事件并重放 finalizer。lost ACK 或 restart 必须查询并
-   重用同一 Harness evidence，不能再次运行根循环或重新解释 stdout。
+## 4. 复核与收口
 
-完成标准：handoff 是一个小而闭合的路径选择；没有 active process、待定输出、可变
-路径或 live stdout 被当成交接事实。
+重大候选与终态交接按研究需要委派原生独立子智能体审阅，根核对完整结果及必要原文并自主修订；最终交接的独立审阅不能用同根自查替代，不要求固定反馈数量或审查表单。
 
-## 6. 在冻结后请求 Owner 接纳
-
-1. 只有 TargetCompletionHandoff 存在后，Research Memory 才接受其中明确选中的
-   implementation、checkpoint、result、log 与 analysis bytes。
-2. RM receipt 齐备后，Research Graph 才根据 accepted Target spec、FormalPlan、
-   冻结输入和 RM result document 派生并接受正式测量与 TargetCommit。根 Session
-   不提交这些正式身份；Agent Runtime 只证明 root evidence 与 lineage。
-3. stdout／stderr 与 Web event projection 不参与 Metric 计算或接纳。正式 Metric
-   只来自 handoff 选定的 result document 与已有冻结测量合同。
-4. Owner 拒绝不会改写原 handoff，也不能以 Web stdout 或本地文件绕过验证。
-
-完成标准：Target-local execution、completion handoff、RM asset acceptance、RG formal
-measurement、TargetCommit 与 StageCommit 是可分别查询的事实；没有任何生成内容
-在最终冻结交接前进入 RM／RG。
-
-## 7. 收口 Bundle
-
-1. 重读权威 frontier 和 Owner receipts，逐 ExperimentKey 收集 accepted
-   TargetCommit、remaining route、technical blocker 或 SemanticBarrier。
-2. 保留已接受负、零、不显著和不确定结果；它们是 realized 测量，由 Reasoning
-   解释。技术故障、pending、unknown outcome 或仍可执行路线保持在途。
-3. 所有 completion cells 都由 current accepted TargetCommit 覆盖时，形成 deeply
-   immutable BundleReport 候选；需要改变冻结语义时形成 replan_required 候选；
-   冻结合同内没有路线且所有副作用均已对账时才提出 ExhaustionProposal。
-4. 把候选交给获授权 Owner。只有 Advancement Engine 可以验证 current request、
-   BundleReport 与全部 receipts 并形成 StageCommit。
-
-完成标准：每个 gap、Target、Session、最终 handoff 和外部副作用都有明确去向；
-Bundle 没有把实时事件、workspace 状态、执行完成、资产接纳、测量接纳、
-TargetCommit 或 Stage 推进合并成一个事实。
+全部完成 cells 有 current accepted TargetCommit 覆盖时为 `realized`；需改变冻结语义时说明 `replan_required` 与剩余义务；真实阻塞、在途工作和未知效果保持实际状态。完成条件是本轮承诺已核对、结果与未决项已交接，Owner 接纳链可验证；执行结束、保存、TargetCommit 和科学结论分别成立。

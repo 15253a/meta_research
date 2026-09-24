@@ -272,14 +272,14 @@ def _presentation_output() -> dict[str, object]:
             "paper-v1",
             WRITING_PAPER_INTENT_SCHEMA,
             _paper_output,
-            "Paper profile",
+            "论文类型：`paper-v1`",
         ),
         (
             "presentation",
             "presentation-v1",
             WRITING_PRESENTATION_INTENT_SCHEMA,
             _presentation_output,
-            "Presentation profile",
+            "演示文稿类型：`presentation-v1`",
         ),
     ),
 )
@@ -403,16 +403,16 @@ def test_production_adapter_stages_exact_rm_sources_and_reuses_one_root_session(
 
     assert result.primary_session_ref == "codex-writing-primary:1"
     assert result.reviewer_agent_ref is None
-    assert request.runtime_binding.model_ref == "gpt-5.6-sol"
+    assert request.runtime_binding.model_ref == "gpt-6-sol"
     assert (
-        "codex-config:model_reasoning_effort=max"
+        "codex-effective:reasoning.effort=max"
         in request.runtime_binding.resource_bindings
     )
     assert len(runner.calls) == 2
     primary_argv, primary_prompt, _primary_schema = runner.calls[0]
     review_argv, review_prompt, _review_schema = runner.calls[1]
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
-    assert 'model_reasoning_effort="max"' in primary_argv
+    assert 'model_reasoning_effort="ultra"' in primary_argv
     assert review_argv[-3:] == ["resume", "codex-writing-primary:1", "-"]
     assert 'web_search="live"' in primary_argv
     assert 'web_search="live"' in review_argv
@@ -746,6 +746,7 @@ def test_writing_runtime_binding_seals_the_complete_provider_contract(
 
     binding = adapter.runtime_binding()
 
+    assert "codex-effective:reasoning.effort=max" in binding.resource_bindings
     binding.validate()
     assert "filesystem-read-root-confined" in binding.capability_bindings
     assert "environment-inheritance-none" in binding.capability_bindings
@@ -781,6 +782,9 @@ def test_writing_runtime_binding_seals_the_complete_provider_contract(
             + (binding.resource_bindings[0],),
         ),
         replace(binding, resource_bindings=("package:../escape",)),
+        *(replace(binding, resource_bindings=tuple(
+            f"codex-effective:reasoning.effort={wrong}" if value == "codex-effective:reasoning.effort=max" else value
+            for value in binding.resource_bindings)) for wrong in ("high", "ultra")),
     )
     for invalid in invalid_bindings:
         with pytest.raises(OwnerConflict, match="writing_runtime_binding"):

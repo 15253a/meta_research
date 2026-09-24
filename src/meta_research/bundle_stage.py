@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from meta_research.runtime_binding_compatibility import bundle_bindings_compatible
+from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
 
 import json
+import time
 from dataclasses import asdict, dataclass
 from typing import Callable, cast
 
@@ -200,6 +202,20 @@ class BundleStageWorker:
     def process_once(self) -> bool:
         """Advance at most one durable Bundle boundary."""
 
+        try:
+            return self._process_boundary_once()
+        except OwnerConflict as error:
+            if error.code not in {
+                "bundle_inbox_ack_stale", "bundle_inbox_checkpoint_stale",
+            }:
+                raise
+            # Another Owner advanced the inbox while this boundary was being
+            # assembled. Yield so the next pass reads a fresh run/checkpoint;
+            # this optimistic concurrency retry is not a worker health fault.
+            self._transient_error = None
+            return False
+
+    def _process_boundary_once(self) -> bool:
         if self._agent_runtime.reconcile_pending_provider_cleanup(
             self._provider,
             unit_kinds=("bundle_primary", "bundle_review"),
@@ -498,6 +514,9 @@ class BundleStageWorker:
                     ),
                     inbox_checkpoint=inbox_checkpoint.as_public_dict(),
                     job_ref=batch_operation_ref,
+                    provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
+                        run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+                    ),
                 )
                 if not self._runtime_binding_is_current(run):
                     return False
@@ -604,6 +623,12 @@ class BundleStageWorker:
                 if error.code == "completed_strategy_cell_coverage_invalid":
                     self._transient_error = "bundle_strategy_incomplete"
                     return False
+                if error.code in BASELINE_METHOD_REJECTION_FEEDBACK:
+                    return self._correct_target_batch_identity(
+                        run=run, unit_ref=batch_unit_ref, job_ref=batch_operation_ref,
+                        operation_name=f"target-batch-{graph.head_generation + 1}",
+                        native_session_ref=pending.native_session_ref, detail_code=error.code,
+                    )
                 raise
             self._transient_error = None
             return True
@@ -616,9 +641,9 @@ class BundleStageWorker:
             target
             for target in self._research_graph.query_target_frontier(graph.graph_ref)
             if target.target_ref not in committed_refs
-            and self._agent_runtime.query_admitted_target_launch(target.target_ref)
-            is None
             and self._agent_runtime.query_target_frontier_entry(target.target_ref)
+            is None
+            and self._agent_runtime.query_admitted_target_launch(target.target_ref)
             is None
         )
         authorizations: dict[str, _TargetAuthorization] = {}
@@ -683,7 +708,9 @@ class BundleStageWorker:
             request is None for request in human_requests.values()
         )
         same_input = latest is not None and (
-            latest.graph_ref == graph.graph_ref
+            latest.attempt_ref == run.attempt_ref
+            and latest.fence_ref == run.fence_ref
+            and latest.graph_ref == graph.graph_ref
             and latest.frontier == dispatch_frontier
             and latest.state == dispatch_state
             and self._operation_uses_inbox_checkpoint(
@@ -720,7 +747,10 @@ class BundleStageWorker:
         if (
             pending_dispatch is None
             and coordination_needed
-            and (not same_input or root_human_request_needed)
+            and (
+                not same_input or root_human_request_needed
+                or _research_wait_recheck_due(latest, dispatch_frontier)
+            )
         ):
             if run.native_session_ref is None:
                 raise OwnerConflict("bundle_native_session_missing")
@@ -738,6 +768,9 @@ class BundleStageWorker:
                 runtime_binding=cast(BundleRuntimeBinding, run.runtime_binding),
                 inbox_checkpoint=inbox_checkpoint.as_public_dict(),
                 job_ref=dispatch_operation_ref,
+                provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
+                    run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+                ),
             )
             if not self._runtime_binding_is_current(run):
                 return False
@@ -875,6 +908,12 @@ class BundleStageWorker:
                     )
                     self._transient_error = None
                     return True
+                if (
+                    target.spec["candidate"]["direct_accepted_input_asset_refs"]
+                    and self._research_graph.prepare_target_input_assets(target.target_ref)
+                ):
+                    self._transient_error = None
+                    return True
                 launch_request = self._research_graph.query_target_launch_request(
                     target.target_ref
                 )
@@ -957,6 +996,28 @@ class BundleStageWorker:
             return self._consume_bundle_report(request, run, accepted)
 
         disposition = self._bundle_report_disposition_hint(graph)
+        decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+        replan = decisions[-1] if decisions else None
+        if (replan is not None and replan.action == "replan_required"
+            and replan.attempt_ref == run.attempt_ref
+            and replan.fence_ref == run.fence_ref
+            and replan.graph_ref == graph.graph_ref):
+            # Stop expanding research while admitted work reaches its real
+            # terminal handoff.  Unlaunched Targets remain pending in the report.
+            for target in graph.targets:
+                frontier = self._agent_runtime.query_target_frontier_entry(target.target_ref)
+                if frontier is not None:
+                    if (frontier.state != "terminal"
+                        or frontier.currentness_known is not True
+                        or frontier.current is not True):
+                        self._transient_error = "bundle_replan_waiting_for_target_terminal"
+                        return False
+                    continue
+                if self._agent_runtime.query_target_launch_ack(target.target_ref) is not None:
+                    self._transient_error = "bundle_replan_waiting_for_target_terminal"
+                    return False
+            if disposition != "blocked":
+                disposition = "replan_required"
         if disposition is None:
             return None
         try:
@@ -1057,7 +1118,9 @@ class BundleStageWorker:
         """Mechanically map one accepted report to its next Owner boundary."""
 
         disposition = accepted.report.disposition
-        if disposition == "realized":
+        if disposition in {"realized", "replan_required"}:
+            # A semantic barrier closes this Bundle with its unmet frozen
+            # obligations intact.  Reasoning decides the successor Cycle.
             completion = run.completion
             if completion is None:
                 self._agent_runtime.complete_bundle_run(
@@ -1131,44 +1194,7 @@ class BundleStageWorker:
         if disposition == "blocked":
             self._transient_error = "bundle_report_blocked"
             return False
-        if disposition != "replan_required":
-            raise OwnerConflict("bundle_report_disposition_invalid")
-
-        retirement = self._agent_runtime.query_bundle_replan_run_retirement(
-            recorded.disposition_ref
-        )
-        if retirement is None:
-            self._agent_runtime.retire_bundle_run_for_replan(
-                disposition_ref=recorded.disposition_ref,
-                disposition_receipt=recorded.receipt,
-                idempotency_key=_operation_key(
-                    "bundle-replan-retire",
-                    run.run_ref,
-                    recorded.disposition_ref,
-                ),
-            )
-            self._transient_error = None
-            return True
-        activation = self._advancement_engine.query_bundle_replan_activation(
-            recorded.disposition_ref
-        )
-        if activation is None:
-            self._advancement_engine.activate_bundle_replan(
-                disposition_ref=recorded.disposition_ref,
-                retirement_ref=retirement.retirement_ref,
-                retirement_receipt=retirement.receipt,
-                idempotency_key=_operation_key(
-                    "bundle-replan-activate",
-                    request.request_ref,
-                    recorded.disposition_ref,
-                ),
-            )
-            self._finish_bundle_jobs(run)
-            self._transient_error = None
-            return True
-        self._finish_bundle_jobs(run)
-        self._transient_error = "bundle_replan_activated"
-        return False
+        raise OwnerConflict("bundle_report_disposition_invalid")
 
     def _advance_target_authorization(
         self,
@@ -1569,8 +1595,13 @@ class BundleStageWorker:
             notice = self._agent_runtime.query_target_work_notice(
                 target.target_ref
             )
-            launch = self._agent_runtime.query_admitted_target_launch(
-                target.target_ref
+            # Existing execution is already authenticated by its frontier.
+            # The independent Target may commit after the earlier commits read;
+            # rechecking first-launch eligibility here would reject that success.
+            launch = (
+                self._agent_runtime.query_admitted_target_launch(target.target_ref)
+                if frontier is None
+                else None
             )
             if notice is not None and notice.kind in {
                 "coordination_required",
@@ -1906,12 +1937,15 @@ class BundleStageWorker:
                 )
                 for target in graph.targets
             }
+            # A verified frontier already carries the displayed TargetRun identity.
+            # Only missing or failed frontier reads need the original launch fallback.
             launch_by_target = {
                 target.target_ref: self._agent_runtime.query_admitted_target_launch(
                     target.target_ref
                 )
                 for target in graph.targets
                 if target.target_ref not in commit_by_target
+                and frontier_by_target[target.target_ref] is None
             }
             target_rows: list[dict[str, object]] = []
             for target in graph.targets:
@@ -2008,12 +2042,16 @@ class BundleStageWorker:
                         "spec_hash": target.spec_hash,
                         "dependency_refs": list(target.dependency_refs),
                         "target_run_ref": (
-                            target_frontier.current_handle.target_run_ref
-                            if target_frontier is not None
+                            commit_by_target[target.target_ref].target_run_ref
+                            if target.target_ref in commit_by_target
                             else (
-                                None
-                                if target_launch is None
-                                else target_launch.target_run_ref
+                                target_frontier.current_handle.target_run_ref
+                                if target_frontier is not None
+                                else (
+                                    None
+                                    if target_launch is None
+                                    else target_launch.target_run_ref
+                                )
                             )
                         ),
                         "status": status,
@@ -2594,6 +2632,9 @@ class BundleStageWorker:
             owner_rejection_receipt_ref=owner_rejection_receipt_ref,
             owner_rejection_kind=owner_rejection_kind,
             owner_feedback=owner_feedback,
+            provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
+                run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+            ),
         )
         if run.primary_draft is None:
             try:
@@ -3036,6 +3077,33 @@ class BundleStageWorker:
             ),
         )
 
+    def _correct_target_batch_identity(
+        self, *, run, unit_ref, job_ref, operation_name, native_session_ref, detail_code,
+    ) -> bool:
+        """Reuse the retained rolling-output correction after exact RG rejection."""
+        self._agent_runtime.begin_provider_unit(
+            unit_ref=unit_ref, operation_ref=job_ref, run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, unit_kind="bundle_review",
+        )
+        corrected = False
+        try:
+            corrected = self._record_terminal_contract_failure(
+                unit_ref=unit_ref, run=run, job_ref=job_ref, operation_name=operation_name,
+                native_session_ref=native_session_ref,
+                failure_code="bundle_review_result_contract_invalid", detail_code=detail_code,
+            )
+            self._transient_error = None if corrected else detail_code
+            return corrected
+        except BundleSkillUnavailable as error:
+            self._transient_error = error.code
+            return False
+        finally:
+            if not corrected:
+                self._agent_runtime.acknowledge_provider_safe_point(
+                    unit_ref=unit_ref, run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
+                )
+
     def _record_terminal_contract_failure(
         self,
         *,
@@ -3438,15 +3506,23 @@ def _public_commit(commit: StageCommit) -> dict[str, object]:
         commit.closure is None and not is_bundle_exhaustion
     ):
         raise OwnerConflict("bundle_stage_commit_invalid")
-    target_commit_refs = (
-        [] if commit.closure is None else commit.closure.get("target_commit_refs")
-    )
+    if commit.outcome_kind == "bundle_report" and commit.closure is not None:
+        report = commit.closure.get("bundle_report")
+        if not isinstance(report, dict):
+            raise OwnerConflict("bundle_stage_commit_invalid")
+        target_commit_refs = report.get("accepted_target_commit_refs")
+    else:
+        target_commit_refs = (
+            [] if commit.closure is None else commit.closure.get("target_commit_refs")
+        )
     if not isinstance(target_commit_refs, list):
         raise OwnerConflict("bundle_stage_commit_invalid")
     if is_bundle_exhaustion:
         public_outcome_kind = "BundleExhaustion"
     elif commit.outcome_kind == "bundle_skip":
         public_outcome_kind = "BundleSkip"
+    elif commit.outcome_kind == "bundle_report":
+        public_outcome_kind = "BundleReport"
     else:
         public_outcome_kind = "TargetGraph"
     return {
@@ -3644,3 +3720,13 @@ def _accepted_formal_plan_binding_from_public(
     if binding.as_dict() != value:
         raise OwnerConflict("accepted_formal_plan_lineage_invalid")
     return binding
+
+
+def _research_wait_recheck_due(decision, frontier, *, now: float | None = None) -> bool:
+    """Revisit an autonomous deferral without spinning on unchanged evidence."""
+    return (
+        decision is not None
+        and decision.action == "wait"
+        and any(item.get("dispatch_allowed", True) is True for item in frontier)
+        and (time.time() if now is None else now) - decision.created_at >= 300
+    )

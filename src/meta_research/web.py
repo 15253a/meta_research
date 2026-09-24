@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -26,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sqlalchemy.exc import SQLAlchemyError
 
 from meta_research.auth import AuthSession
+from meta_research.asset_download import AssetDownloadResponse
 from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.composition import ProductionRuntime
 from meta_research.harness import (
@@ -55,6 +57,7 @@ from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticError,
 )
 from meta_research.stage_root_observations import StageRootObservationError
+from meta_research.root_session_observations import RootSessionObservations
 from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
 
 
@@ -155,7 +158,7 @@ class BootstrapExchange(BaseModel):
 class StartHarnessConformanceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    codex_model_ref: Literal["gpt-5.6-sol"] = CODEX_MODEL_REF
+    codex_model_ref: Literal["gpt-6-sol"] = CODEX_MODEL_REF
     codex_auth_profile_ref: str = Field(min_length=1, max_length=160)
     # Accepted only so an older diagnostic client does not fail at the HTTP
     # decoder boundary.  Production selection is Codex-only and ignores them.
@@ -712,6 +715,19 @@ class WritingDeliveryIntentRequest(BaseModel):
         return self
 
 
+class ResearchInputRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    quest_ref: str = Field(min_length=1,max_length=128)
+    question_ref: str | None = Field(default=None,min_length=1,max_length=128)
+    text: str = Field(min_length=1,max_length=65536)
+    asset_bindings: list[dict[str,object]] = Field(default_factory=list,max_length=256)
+
+
+class OutputLanguagePreference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    output_language: Literal["zh","en"]
+
+
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
@@ -736,6 +752,7 @@ def create_app(
     }
     worker_health = {name: ReconciliationHealth() for name in worker_operations}
     worker_tasks: dict[str, asyncio.Task[None]] = {}
+    recorder = getattr(runtime, 'timeline_summaries', None)
     worker_health_updates = WorkerHealthUpdates()
     asset_intake_slots = asyncio.Semaphore(MAX_CONCURRENT_ASSET_INTAKE_REQUESTS)
     asset_io_slots = asyncio.Semaphore(MAX_CONCURRENT_ASSET_IO_OPERATIONS)
@@ -751,6 +768,16 @@ def create_app(
             worker_tasks[name] = _start_background_worker(
                 lambda operation=operation, name=name: operation(
                     runtime, worker_health[name], worker_health_updates.publish
+                )
+            )
+        # Display notes are independently retried and never gate research health.
+        if recorder is not None:
+            worker_tasks['research_recorder'] = _start_background_worker(
+                lambda: _process_background_operation(
+                    recorder.process_once,
+                    health=ReconciliationHealth(), worker_label='research recorder',
+                    timeout_code='timeline_summary_timeout', timeout_seconds=None,
+                    on_health_change=None, idle_delay=5.0, active_delay=1.0,
                 )
             )
         try:
@@ -810,7 +837,13 @@ def create_app(
     status_reader = RuntimeStatusReader(runtime._database)
     latest_status_revision: int | None = None
     snapshot_queries = SnapshotQueryCoordinator(
-        lambda **options: public_snapshot(**options)
+        lambda **options: public_snapshot(**options),
+        # Worker failures/recovery do not necessarily record an Owner event.
+        # Their public readiness must invalidate a retained snapshot as well.
+        feed_revision=lambda: (
+            runtime.feed.query_readiness().current_revision,
+            worker_health_updates.revision,
+        ),
     )
 
     def worker_health_status() -> dict[str, object]:
@@ -2218,6 +2251,107 @@ def create_app(
             context_ref, _idempotency_key(request)
         )
 
+    @app.get("/api/v1/preferences")
+    def get_preferences() -> dict[str, object]:
+        from meta_research.system_prompt import read_output_language
+        return {"output_language":read_output_language(runtime.data_root.root)}
+
+    @app.put("/api/v1/preferences")
+    def set_preferences(preference: OutputLanguagePreference) -> dict[str, object]:
+        payload = preference.model_dump()
+        import os
+        import tempfile
+        if set(payload)!={"output_language"} or payload["output_language"] not in {"zh","en"}:
+            raise OwnerConflict("output_language_invalid")
+        path=runtime.data_root.root / "user-preferences.json"
+        fd,name=tempfile.mkstemp(prefix=".user-preferences-",dir=path.parent)
+        try:
+            with os.fdopen(fd,"w",encoding="utf-8") as f:
+                json.dump(payload,f);f.flush();os.fsync(f.fileno())
+            os.replace(name,path)
+        finally:
+            if os.path.exists(name):os.unlink(name)
+        return payload
+
+    @app.post("/api/v1/research-inputs",status_code=201)
+    def submit_research_input(request: Request, research_input: ResearchInputRequest) -> dict[str, object]:
+        payload = research_input.model_dump()
+        if set(payload)-{"quest_ref","question_ref","text","asset_bindings"}:
+            raise OwnerConflict("human_input_invalid")
+        return runtime.owners.human_collaboration.submit_research_input(
+            quest_ref=payload.get("quest_ref"),question_ref=payload.get("question_ref"),
+            text_content=payload.get("text"),asset_bindings=payload.get("asset_bindings",[]),
+            idempotency_key=_idempotency_key(request))
+
+    @app.get("/api/v1/research-formal")
+    def read_research_formal(quest_ref: str,ref: str) -> dict[str,object]:
+        graph=runtime.owners.research_graph
+        result=graph.query_formal_result_by_ref(ref,quest_ref=quest_ref)
+        if result is None:raise OwnerConflict("formal_result_quest_scope_invalid")
+        items=[]
+        for artifact in result.get("run_artifacts",[])+result.get("evaluation_artifacts",[]):
+            version=artifact.get("version_ref") or artifact.get("asset_version_ref")
+            if version:
+                items.append({"ref":artifact.get("role_ref"),"name":artifact.get("role","Research product"),
+                              "summary":artifact.get("declared_relative_path",artifact.get("relative_path","")),
+                              "reader":{"source_ref":version,"version_ref":version},"details":artifact})
+        return {"result":result,"items":items,"next_offset":None}
+
+    @app.get("/api/v1/research-content")
+    def read_research_content(quest_ref: str,source_ref: str,version_ref: str,
+            offset: int=Query(default=0,ge=0),limit: int=Query(default=8192,ge=1,le=65536),
+            entry_path: str|None=None) -> dict[str, object]:
+        from meta_research.research_content import read_content
+        return read_content(runtime.owners.research_graph,runtime.owners.research_memory,
+            quest_ref=quest_ref,source_ref=source_ref,version_ref=version_ref,offset=offset,limit=limit,
+            entry_path=entry_path,human_collaboration=runtime.owners.human_collaboration)
+
+    @app.get("/api/v1/research-library/{entry}")
+    def query_research_library(entry: str,quest_ref: str,query: str="",offset: int=Query(default=0,ge=0),
+            limit: int=Query(default=12,ge=1,le=100),dataset_ref: str|None=None,
+            baseline_ref: str|None=None,variant_ref: str|None=None,
+            request_cursor: str|None=Query(default=None,max_length=512)) -> dict[str,object]:
+        from meta_research.research_content import discover_questions,discover_literature
+        graph=runtime.owners.research_graph;memory=runtime.owners.research_memory
+        if graph.query_quest_by_ref(quest_ref) is None:raise OwnerConflict("research_library_quest_invalid")
+        args={"quest_ref":quest_ref,"query":query,"offset":offset,"limit":limit}
+        if entry=="questions":return discover_questions(graph,memory,**args)
+        if entry=="literature":return discover_literature(graph,memory,**args)
+        if entry=="baselines":
+            if baseline_ref:
+                result=graph.query_baseline(baseline_ref,quest_ref=quest_ref)
+                if result is None:return {"items":[],"next_offset":None}
+                return graph.query_baseline_variants(baseline_ref,variant_ref=variant_ref,quest_ref=quest_ref,offset=offset,limit=limit)
+            page=graph.query_baselines(**args)
+            page["items"]=[{**x,"name":x.get("method_key") or x["baseline_ref"],"ref":x["baseline_ref"]} for x in page["items"]]
+            return page
+        if entry=="datasets":
+            if dataset_ref:args={**args,"dataset_ref":dataset_ref,"query":""}
+            page=graph.query_datasets(**args)
+            for item in page["items"]:
+                item["summary"]=item.get("meaning","")
+                item["name"]=item.get("name",item.get("version_label",""))
+                item["ref"]=item.get("dataset_version_ref",item.get("dataset_ref"))
+                bindings=item.get("asset_bindings",[])
+                if bindings:
+                    item["reader"]={"source_ref":item["dataset_version_ref"],"version_ref":bindings[0]["version_ref"]}
+                    item["readers"]=[{"source_ref":item["dataset_version_ref"],"version_ref":b["version_ref"]} for b in bindings]
+            return page
+        if entry=="human":
+            hc=runtime.owners.human_collaboration
+            page=hc.query_research_inputs(**args) if request_cursor is None else {"items":[],"next_offset":None}
+            if offset==0 or request_cursor is not None:
+                requests=hc.query_research_help_page(quest_ref=quest_ref,cursor=request_cursor)
+                for request in requests["items"]:
+                    if query and query.casefold() not in str(request).casefold():continue
+                    for response in request.get("responses",[]):
+                        page["items"].append({"ref":response["response_ref"],"name":request.get("obligation","Human request"),
+                            "summary":response.get("note","")[:1200],"status":request["status"],
+                            "reader":{"source_ref":response["response_ref"],"version_ref":canonical_hash(response)}})
+                page["request_next_cursor"]=requests["next_cursor"]
+            return page
+        raise OwnerConflict("research_library_entry_invalid")
+
     @app.get("/api/v1/literature-snapshots/{snapshot_ref}")
     def query_literature_snapshot(snapshot_ref: str) -> dict[str, object]:
         return runtime.owners.research_memory.read_literature_snapshot(snapshot_ref)
@@ -2420,20 +2554,9 @@ def create_app(
 
     @app.get("/api/v1/research-assets/{memory_ref}/content")
     async def materialize_research_asset(memory_ref: str) -> Response:
-        materialized = await _await_bounded_asset_io(
-            lambda: runtime.owners.research_memory.materialize_asset(memory_ref),
-            slots=asset_io_slots,
-            timeout_code="asset_materialization_io_timeout",
-        )
-        return Response(
-            content=materialized.content,
-            media_type=materialized.media_type,
-            headers={
-                "Content-Disposition": (
-                    "attachment; filename*=UTF-8''"
-                    + quote(materialized.file_name, safe="")
-                )
-            },
+        return AssetDownloadResponse(
+            memory=runtime.owners.research_memory, memory_ref=memory_ref,
+            root=runtime.data_root.run / "asset-downloads", slots=asset_io_slots,
         )
 
     @app.post("/api/v1/research-assets/{memory_ref}/custody/managed")
@@ -2548,7 +2671,9 @@ def create_app(
         nonlocal latest_status_revision
         result = status_reader.query()
         latest_status_revision = result["revision"]
-        result["health"] = worker_health_status()
+        from .runtime_status import project_worker_health
+
+        project_worker_health(result, worker_health_status())
         return result
 
     @app.get("/api/v1/snapshot")
@@ -2585,6 +2710,17 @@ def create_app(
                 ),
                 detail={"code": error.code},
             ) from error
+
+    @app.get("/api/v1/quests/{quest_ref}/timeline-summaries")
+    def query_timeline_summaries(quest_ref: str) -> dict[str, object]:
+        if len(quest_ref) > 128 or runtime.owners.research_graph.query_quest_by_ref(quest_ref) is None:
+            raise HTTPException(status_code=404, detail={"code": "quest_not_found"})
+        if recorder is None:
+            raise HTTPException(status_code=503, detail={"code": "timeline_summary_unavailable"})
+        try:
+            return recorder.query(quest_ref)
+        except (OSError, sqlite3.Error) as error:
+            raise HTTPException(status_code=503, detail={"code": "timeline_summary_unavailable"}) from error
 
     @app.get("/api/v1/writing")
     def query_writing() -> dict[str, object]:
@@ -2867,6 +3003,53 @@ def create_app(
             raise OwnerConflict("quest_completion_context_unavailable")
         return refreshed
 
+    root_session_reader = None
+
+    def _root_session_reader():
+        nonlocal root_session_reader
+        if root_session_reader is None:
+            root_session_reader = RootSessionObservations(runtime)
+        return root_session_reader
+
+    def _root_session_http_error(error: ValueError) -> HTTPException:
+        code = str(error)
+        if not code.startswith("root_session_") or not code.replace("_", "").isalnum():
+            code = "root_session_observation_unavailable"
+        if code in {
+            "root_session_not_found",
+            "root_session_operation_not_found",
+            "root_session_quest_not_found",
+        }:
+            status_code = 404
+        elif "cursor" in code or code.endswith("_invalid"):
+            status_code = 409
+        else:
+            status_code = 503
+        return HTTPException(status_code=status_code, detail={"code": code})
+
+    @app.get("/api/v1/quests/{quest_ref}/root-sessions")
+    def query_root_sessions(quest_ref: str) -> dict[str, object]:
+        try:
+            return _root_session_reader().query(quest_ref)
+        except ValueError as error:
+            raise _root_session_http_error(error) from error
+
+    @app.get("/api/v1/quests/{quest_ref}/root-sessions/{session_ref}/output")
+    def query_root_session_output(
+        quest_ref: str,
+        session_ref: str,
+        operation_ref: str = Query(min_length=1, max_length=256),
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=64 * 1024, ge=4, le=256 * 1024),
+    ) -> dict[str, object]:
+        try:
+            return _root_session_reader().query_output(
+                quest_ref, session_ref, operation_ref=operation_ref,
+                after=after, limit=limit,
+            )
+        except ValueError as error:
+            raise _root_session_http_error(error) from error
+
     @app.get(
         "/api/v1/bundle/targets/{target_ref}/root-observations"
     )
@@ -2948,6 +3131,18 @@ def create_app(
         runtime.target_run_authorities.agent_runtime,
         runtime.data_root.run / "target-workspaces",
     )
+
+    @app.get("/api/v1/bundle/targets/{target_ref}/progress")
+    def query_target_progress(
+        target_ref: str,
+        target_run_ref: str = Query(min_length=1, max_length=128),
+        cursor: str | None = Query(default=None, max_length=32768),
+    ) -> dict[str, object]:
+        try:
+            return runtime.target_run_authorities.agent_runtime.query_target_progress(
+                target_ref, target_run_ref=target_run_ref, cursor=cursor)
+        except ExperimentLogError as error:
+            raise HTTPException(status_code=error.status, detail={"code": error.code}) from error
 
     @app.get("/api/v1/bundle/targets/{target_ref}/experiment-logs")
     def query_target_experiment_logs(
@@ -3424,8 +3619,25 @@ async def _verify_research_assets(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
+    last_cleanup = 0.0
+
+    def verify_and_reclaim() -> bool:
+        nonlocal last_cleanup
+        worked = runtime.owners.research_memory.verify_asset_inventory_once()
+        now = time.monotonic()
+        if now - last_cleanup >= 60:
+            last_cleanup = now
+            try:
+                report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, limit=10)
+                for item in report:
+                    if item.get("action") == "removed":
+                        LOGGER.info("Completed research workspace reclaimed: %s", item)
+            except (OSError, OwnerConflict, ValueError):
+                LOGGER.exception("Completed workspace cleanup deferred")
+        return worked
+
     await _process_background_operation(
-        runtime.owners.research_memory.verify_asset_inventory_once,
+        verify_and_reclaim,
         health=health,
         worker_label='research asset verification',
         timeout_code='asset_verification_io_timeout',
@@ -3700,6 +3912,8 @@ async def _process_target_runs(
 
     flights: dict[str, _TargetRunFlight] = {}
     cancel_flights: dict[str, _TargetRunFlight] = {}
+    operation_errors: dict[str, str] = {}
+    idle_sweeps = 0
 
     def set_health(status: Literal["ready", "unavailable"], code: str | None) -> None:
         changed = health.status != status or health.last_error != code
@@ -3726,6 +3940,12 @@ async def _process_target_runs(
             set_health("unavailable", error_code)
             await asyncio.sleep(min(2.0, 0.2 * (2 ** min(health.retry_count, 4))))
             continue
+
+        # An in-flight retry, or another Target's success, does not prove a
+        # failed boundary recovered. Retire its error only after that Target
+        # returns a valid result or leaves the authoritative work inventory.
+        for target_ref in operation_errors.keys() - set(target_refs):
+            del operation_errors[target_ref]
 
         discovery_error: str | None = None
         for target_ref in target_refs:
@@ -3792,7 +4012,6 @@ async def _process_target_runs(
             )
 
         advanced = False
-        operation_error: str | None = None
         for flight_map in (flights, cancel_flights):
             for target_ref, flight in tuple(flight_map.items()):
                 if (
@@ -3808,26 +4027,38 @@ async def _process_target_runs(
                             "TargetRun process_once returned a non-bool value"
                         )
                     advanced = advanced or result
+                    operation_errors.pop(target_ref, None)
                 except Exception as error:
                     if not isinstance(
                         error, (OSError, OwnerConflict, SQLAlchemyError)
                     ):
                         LOGGER.exception("TargetRun boundary failed unexpectedly")
-                    if operation_error is None:
-                        operation_error = (
-                            error.code
-                            if isinstance(error, OwnerConflict)
-                            else type(error).__name__
-                        )
+                    operation_errors[target_ref] = (
+                        error.code
+                        if isinstance(error, OwnerConflict)
+                        else type(error).__name__
+                    )
 
+        operation_error = next(iter(operation_errors.values()), None)
         if discovery_error is not None or operation_error is not None:
             set_health("unavailable", discovery_error or operation_error)
         else:
             set_health("ready", None)
 
-        await asyncio.sleep(
-            0 if advanced else (0.05 if flights or cancel_flights else 0.2)
-        )
+        if advanced:
+            idle_sweeps = 0
+            await asyncio.sleep(0)
+        elif flights or cancel_flights:
+            # A boundary is still executing; keep collecting promptly.
+            idle_sweeps = 0
+            await asyncio.sleep(0.05)
+        else:
+            # Every idle sweep re-runs each Target root's full read
+            # verification; polling that at the base rate pins a core
+            # without research progress. Back off while the inventory
+            # stays quiescent and snap back on the first advance.
+            idle_sweeps = min(idle_sweeps + 1, 7)
+            await asyncio.sleep(min(0.2 * (2 ** (idle_sweeps - 1)), 30.0))
 
 
 async def _process_bundle_stage(
@@ -3914,6 +4145,7 @@ async def _process_background_operation(
     Stage-specific waiting semantics stay with the caller.
     """
 
+    consecutive_idle_passes = 0
     while True:
         try:
             advanced = await _await_monitored_worker_call(
@@ -3942,7 +4174,18 @@ async def _process_background_operation(
             health.status = "ready"
             health.last_error = None
             health.retry_count = 0
-            delay = active_delay if advanced else idle_delay
+            if advanced:
+                consecutive_idle_passes = 0
+                delay = active_delay
+            else:
+                # An idle pass re-reads and re-verifies durable state;
+                # polling it at the base rate keeps the daemon pinned at
+                # full CPU with no research progress. Back off between
+                # idle passes and snap back the moment work appears.
+                consecutive_idle_passes = min(consecutive_idle_passes + 1, 6)
+                delay = min(
+                    idle_delay * (2 ** (consecutive_idle_passes - 1)), 30.0
+                )
         if changed and on_health_change is not None:
             on_health_change()
         await asyncio.sleep(delay)

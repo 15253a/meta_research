@@ -645,8 +645,8 @@ def test_running_checkpoint_and_frontier_inventory_rebuild_after_restart(
     assert initial.status_revision is None
     assert initial.checkpoint_revision == 1
     assert runtime.list_running_target_frontiers() == (frontier,)
-    assert target_authority.require_uncommitted_calls
-    assert all(target_authority.require_uncommitted_calls)
+    # Activation verifies upstream admission once; checkpoint reads reuse it.
+    assert target_authority.require_uncommitted_calls == [True]
     with database.write() as connection:
         assert (
             verify_current_target_run_frontier_in_transaction(connection, handle)
@@ -724,7 +724,7 @@ def test_running_frontier_accepts_only_exact_verified_post_commit_transition(
         checkpoint = runtime.query_target_run_checkpoint(handle.target_ref)
         assert checkpoint is not None
         assert checkpoint.frontier == frontier
-        assert target_authority.require_uncommitted_calls[-1] is False
+        assert target_authority.require_uncommitted_calls == [True]
 
         target_authority.transition = replace(
             target_authority.transition,

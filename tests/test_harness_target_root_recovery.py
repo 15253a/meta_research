@@ -20,6 +20,7 @@ from meta_research.harness import (
 )
 from meta_research.harness_adapters import (
     HARNESS_CAPABILITIES,
+    CODEX_LOCKED_VERSION,
     CodexHarnessAdapter,
 )
 from meta_research.migration import upgrade_database
@@ -80,7 +81,7 @@ class _TargetHumanRequestRunner:
         assert timeout is None or timeout > 0
         if "--version" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, "codex-cli 0.153.2\n", ""
+                argv, 0, f"codex-cli {CODEX_LOCKED_VERSION}\n", ""
             )
         if argv[-2:] == ["features", "list"]:
             return subprocess.CompletedProcess(

@@ -185,7 +185,7 @@ def test_materialization_reads_and_verifies_the_same_bounded_bytes(
         runtime.close()
 
 
-def test_legacy_oversized_asset_fails_before_any_corpus_io(
+def test_legacy_oversized_bytes_materialization_fails_before_corpus_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = build_production_runtime(
@@ -296,11 +296,6 @@ def test_legacy_oversized_asset_fails_before_any_corpus_io(
             OwnerConflict, match="asset_materialization_unsupported"
         ):
             research_memory.materialize_asset(version_ref)
-        with pytest.raises(OwnerConflict, match="asset_custody_unavailable"):
-            research_memory.handoff_asset_to_managed(
-                version_ref,
-                idempotency_key="legacy-oversized-handoff",
-            )
     finally:
         runtime.close()
 
@@ -531,7 +526,7 @@ def test_async_intake_queue_has_a_durable_admission_ceiling(
         runtime.close()
 
 
-def test_directory_ceiling_counts_nested_empty_directories(
+def test_managed_directory_preserves_nested_empty_directories_past_inline_ceiling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "nested-empty-directories"
@@ -551,9 +546,13 @@ def test_directory_ceiling_counts_nested_empty_directories(
             idempotency_key="directory-entry-ceiling",
         )
 
-        assert result.status == "failed"
-        assert result.failure_code == "asset_source_too_large"
-        assert runtime.owners.research_memory.query_asset_inventory() == ()
+        assert result.status == "accepted"
+        assert result.asset is not None
+        description = runtime.owners.research_memory.describe_asset_export(
+            result.asset.version_ref
+        )
+        assert description.directories == ("one", "one/two", "one/two/three")
+        assert description.entries == ()
     finally:
         runtime.close()
 
@@ -1109,13 +1108,13 @@ def test_concurrent_managed_repair_commands_join_one_durable_operation(
         source_check_count = 0
         original_matches = research_memory_module._linked_source_matches
 
-        def synchronized_matches(manifest, linked_source):
+        def synchronized_matches(manifest, linked_source, **options):
             nonlocal source_check_count
             with source_check_lock:
                 source_check_count += 1
                 first_source_check.set()
             release_source_check.wait(timeout=2.0)
-            matches = original_matches(manifest, linked_source)
+            matches = original_matches(manifest, linked_source, **options)
             return matches
 
         monkeypatch.setattr(
@@ -1197,15 +1196,15 @@ def test_interrupted_managed_repair_is_reconciled_after_losing_the_original_key(
     )
     object_path.write_bytes(b"corrupted before interrupted repair\n")
     revision_before_repair = runtime.owners.research_memory.query_snapshot().revision
-    original_replace = runtime.owners.research_memory._replace_asset_object
+    original_store = runtime.owners.research_memory._store_asset_file
 
-    def replace_then_interrupt(object_hash: str, content: bytes) -> str:
-        result = original_replace(object_hash, content)
+    def replace_then_interrupt(source: Path, size: int, expected_hash: str):
+        original_store(source, size, expected_hash)
         raise RuntimeError("crash after durable object replacement")
 
     monkeypatch.setattr(
         runtime.owners.research_memory,
-        "_replace_asset_object",
+        "_store_asset_file",
         replace_then_interrupt,
     )
     with pytest.raises(RuntimeError, match="crash after durable object replacement"):

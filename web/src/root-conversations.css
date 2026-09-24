@@ -1,0 +1,29 @@
+.root-return-current,.root-load-earlier,.root-session-warning button { border:0; background:none; color:#625fe7; font-size:11px; cursor:pointer; }
+.root-session-heading { display:flex; justify-content:space-between; gap:12px; padding:18px 21px 13px; border-bottom:1px solid #e4e7f1; }
+.root-session-heading b { font-size:15px; font-weight:550; overflow-wrap:anywhere; }
+.root-session-heading small { display:block; margin-top:7px; color:#858fa4; font-size:11px; }
+.root-session-heading > span { flex-shrink:0; font-size:11px; color:#8790a4; }
+.root-session-heading > span[data-executing=true] { color:#159987; }
+.root-session-context { display:flex; align-items:flex-start; gap:12px; padding:11px 21px; background:#f8f8fd; color:#858fa5; font-size:11px; }
+.root-session-context > details { margin-left:auto; flex-shrink:0; max-width:60%; }
+.root-session-context summary { cursor:pointer; }
+.root-session-context p { overflow-wrap:anywhere; }
+.root-session-scroll { overflow:auto; max-height:680px; min-height:240px; padding:8px 18px 18px; overflow-anchor:none; }
+.root-operation { min-width:0; }
+.root-operation-time { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:18px 0 8px; padding-top:14px; border-top:1px solid #e4e7f1; font-size:10px; color:#8b93a9; }
+.root-operation-time > span { color:#6c7294; }
+.root-operation .ro-stage-scroll { max-height:none; height:auto; min-height:0; overflow:visible; padding:5px 0; }
+.root-operation-clock { display:flex; gap:10px; flex-wrap:wrap; padding:7px 0; color:#8a94a9; font-size:10px; }
+.root-operation-clock .research-execution-clock { font-size:10px; }
+.root-session-warning { margin:10px 0; padding:10px 13px; border:1px solid #e1daf0; border-radius:10px; color:#837894; background:#faf8ff; font-size:11px; overflow-wrap:anywhere; }
+.root-output-pages,.root-output-truncated { font-size:10px; color:#8a94a9; margin:9px 0; }
+.root-output-pages summary { cursor:pointer; }
+.root-output-pages nav { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:8px; }
+.root-output-pages button { padding:5px 8px; background:#fafaff; color:#625fe7; border:1px solid #e2e2f0; border-radius:6px; cursor:pointer; }
+.root-output-pages button:disabled { opacity:.4; cursor:default; }
+@media(max-width:600px) { .root-session-heading { padding:15px; } .root-session-context { padding:10px 15px; } .root-session-scroll { padding:6px 12px 15px; max-height:65dvh; } }
+
+.root-pending-role { padding:22px; color:#7c859c; }
+.root-pending-role h3 { margin:0 0 13px; color:#625fe7; font-size:16px; font-weight:550; }
+.root-pending-role p { margin:0 0 10px; font-size:12px; line-height:1.7; }
+.root-pending-role small { font-size:11px; line-height:1.7; }

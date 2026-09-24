@@ -197,42 +197,36 @@ def _outcome() -> dict[str, object]:
 def _review(outcome_hash: str) -> dict[str, object]:
     return {
         "schema_ref": "meta-research/idea-advisory-review/v2",
-        "review_mode": "harness_child_agent",
-        "reviewer_agent_ref": "reviewer-agent-1",
+
+
         "reviewed_draft_hash": outcome_hash,
-        "findings": [],
-        "dispositions": [],
+
+
         "final_outcome_hash": outcome_hash,
-        "independent": True,
-        "advisory_only": True,
+
+
     }
 
 
 def _legacy_review(outcome_hash: str) -> dict[str, object]:
     return {
         "schema_ref": "meta-research/idea-advisory-review/v1",
-        "reviewer_session_ref": "legacy-reviewer-session",
+
         "reviewed_draft_hash": outcome_hash,
-        "findings": [],
-        "dispositions": [],
+
+
         "final_outcome_hash": outcome_hash,
-        "independent": True,
-        "advisory_only": True,
+
+
     }
 
 
-def test_legacy_review_payload_remains_readable_without_rewriting() -> None:
+def test_legacy_review_payload_is_rejected_without_rewriting() -> None:
     outcome = _outcome()
-    outcome_hash, review_hash = validate_idea_content(
-        outcome,
-        _legacy_review(canonical_hash(outcome)),
-        reviewed_draft=outcome,
-    )
-
-    assert outcome_hash == canonical_hash(outcome)
-    assert review_hash == canonical_hash(
-        _legacy_review(canonical_hash(outcome))
-    )
+    with pytest.raises(IdeaContractError, match="idea_review_binding_invalid"):
+        validate_idea_content(
+            outcome, _legacy_review(canonical_hash(outcome)), reviewed_draft=outcome
+        )
 
 
 def _record_direct_execution(runtime, **values):
@@ -536,7 +530,7 @@ def test_agent_runtime_requires_primary_checkpoint_before_execution(
         runtime.close()
 
 
-def test_agent_runtime_only_writes_child_agent_review_v2(tmp_path: Path) -> None:
+def test_agent_runtime_only_writes_current_hash_envelope(tmp_path: Path) -> None:
     runtime = _runtime(
         prepare_data_root(tmp_path / "execution-review-identity"),
         _IdeaProvider(),
@@ -553,7 +547,7 @@ def test_agent_runtime_only_writes_child_agent_review_v2(tmp_path: Path) -> None
         invalid_mode["review_mode"] = "external_session"
 
         with pytest.raises(
-            OwnerConflict, match="attempt_review_independence_invalid"
+            OwnerConflict, match="attempt_review_binding_invalid"
         ):
             _record_direct_execution(
                 runtime,
@@ -574,7 +568,7 @@ def test_agent_runtime_only_writes_child_agent_review_v2(tmp_path: Path) -> None
             "execution-review-native"
         )
         with pytest.raises(
-            OwnerConflict, match="attempt_review_independence_invalid"
+            OwnerConflict, match="attempt_review_binding_invalid"
         ):
             _record_direct_execution(
                 runtime,
@@ -591,7 +585,7 @@ def test_agent_runtime_only_writes_child_agent_review_v2(tmp_path: Path) -> None
             )
 
         with pytest.raises(
-            OwnerConflict, match="attempt_review_legacy_read_only"
+            OwnerConflict, match="attempt_review_binding_invalid"
         ):
             _record_direct_execution(
                 runtime,
@@ -638,28 +632,16 @@ def test_research_memory_recomputes_reviewed_draft_hash_at_acceptance_seam(
         )
         review = {
             "schema_ref": "meta-research/idea-advisory-review/v2",
-            "review_mode": "harness_child_agent",
-            "reviewer_agent_ref": "rm-independent-reviewer-agent",
+
+
             # This is the old exploit: a well-shaped but invented digest, with
             # no immutable reviewed bytes available to the accepting Owner.
             "reviewed_draft_hash": "f" * 64,
-            "findings": [
-                {
-                    "finding_id": "finding-1",
-                    "category": "falsifiability",
-                    "message": "需要更明确的反驳条件。",
-                }
-            ],
-            "dispositions": [
-                {
-                    "finding_id": "finding-1",
-                    "action": "revised",
-                    "rationale": "已改写干预方向。",
-                }
-            ],
+
+
             "final_outcome_hash": canonical_hash(outcome),
-            "independent": True,
-            "advisory_only": True,
+
+
         }
         execution = _record_direct_execution(
             runtime,
@@ -679,7 +661,7 @@ def test_research_memory_recomputes_reviewed_draft_hash_at_acceptance_seam(
 
         memory = runtime.owners.research_memory
         before = memory.query_snapshot()
-        with pytest.raises(OwnerConflict, match="idea_review_draft_hash_mismatch"):
+        with pytest.raises(OwnerConflict, match="idea_review_binding_invalid"):
             memory.accept_idea_outcome_content(
                 request_ref=request.request_ref,
                 run_ref=run.run_ref,
@@ -717,26 +699,14 @@ def test_reviewed_draft_hash_remains_verifiable_through_rm_and_rg(
         )
         review = {
             "schema_ref": "meta-research/idea-advisory-review/v2",
-            "review_mode": "harness_child_agent",
-            "reviewer_agent_ref": "reviewed-draft-chain-reviewer-agent",
+
+
             "reviewed_draft_hash": canonical_hash(reviewed_draft),
-            "findings": [
-                {
-                    "finding_id": "finding-1",
-                    "category": "falsifiability",
-                    "message": "原方向缺少明确干预轴。",
-                }
-            ],
-            "dispositions": [
-                {
-                    "finding_id": "finding-1",
-                    "action": "revised",
-                    "rationale": "最终版本已明确拓扑稳定性干预。",
-                }
-            ],
+
+
             "final_outcome_hash": canonical_hash(outcome),
-            "independent": True,
-            "advisory_only": True,
+
+
         }
         execution = _record_direct_execution(
             runtime,

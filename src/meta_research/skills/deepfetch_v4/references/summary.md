@@ -1,32 +1,26 @@
-# `summary.md`
+# `summary.md` 综述契约
 
-The main agent writes `summary.md` after Reader fan-in. Use the input language. Synthesize the map rather than serially restating every paper.
+Reader 汇合并重载台账后撰写。按当前语言偏好输出，未提供偏好时用输入语言。组织跨文献图景，不逐篇机械复述。
 
-## Order
+## 内容顺序
 
-1. scope;
-2. research landscape;
-3. technical development from classic work to the current frontier;
-4. evidence for candidate questions, only for novelty, idea, or question-generation tasks;
-5. conflicts, failures, boundaries, and gaps;
-6. missing full texts and uncertainty;
-7. coverage and stopping reason;
-8. research recommendations, or Question-generation recommendations when requested.
+1. 研究范围。
+2. 领域格局。
+3. 从经典到当前前沿的技术或思想发展。
+4. 候选问题的证据，仅在新颖性、构想或问题生成任务中使用。
+5. 冲突、失败、适用边界与缺口。
+6. 缺少的全文与不确定性。
+7. 覆盖范围及停止理由。
+8. 研究建议；任务要求时给出建题建议，实际是否建题由后续 Reasoning 决定。
 
-Include the candidate-question branch only when it is relevant.
+## 证据身份
 
-## Evidence identities
+用清楚标签或无歧义表述区分论文主张、跨论文综合和主智能体的暂定推断。重要文献主张附近标明同一 `papers.json` 中存在的 `paper_id`，如 `[doi:10.1000/example]` 或 `openalex:W123`；不要只在末尾堆一份脱离主张的 ID 清单。标题和纯运行说明无需人为添加引用。
 
-Keep three identities visible through concise labels or unambiguous prose:
+没有全文的论文可通过有边界的预理解进入图景，明确其依据是标题、摘要或引文上下文。实验细节、论文内部支持、材料报告和可信度只来自完成的 Reader；已获取未读、占位或失败阅读都不是全文证据。
 
-- **Paper claim**: what one paper reports.
-- **Cross-paper synthesis**: what comparison across papers supports.
-- **Tentative inference**: the main agent's interpretation or recommendation.
+## 完成核对
 
-Place valid `paper_id` values near material literature claims using `[paper_id]` or backticks, for example `[doi:10.1000/example]` or `openalex:W123`. Every ID written in the report must exist in the same `papers.json`. Do not replace local evidence binding with a detached list of IDs. Headings and pure run descriptions need no artificial citation.
+分别报告发现广度和精读深度：台账数量、获取终态、不同 Reader 入选篇数（最多 10）、完成阅读、失败和错文／隔离数。说明精读集合的选择价值及容量之外仍重要的证据。报告实际强度、维度、渠道、停止原因、全文缺失及限制，说明 Web 覆盖检查带来新论文还是主要重复，部分覆盖如实标明。
 
-A paper without full text may appear through its explicitly bounded pre-understanding. Phrase title-, abstract-, or citation-context evidence as such. Reserve experimental detail, internal claim support, artifact reporting, and credibility for completed Readers.
-
-## Completion
-
-Report discovery breadth and reading depth separately: ledger paper count, acquisition outcomes, distinct Reader-admitted papers (at most 10), completed readings, Reader failures, and mismatches or quarantines. Briefly explain why the selected full-text set had the highest expected marginal value for the task and identify consequential evidence left outside it by the cap. Report the search intensity, dimensions and discovery channels actually used, stopping reason, consequential missing full texts, and limitations. State whether the Web coverage audit added new papers or mostly duplicates, and state partial coverage plainly. Never describe a placeholder, an obtained-but-unread file, or a failed reading as full-text evidence. Put literature review before recommendations and keep code blocks out of the report body.
+文献综述在建议之前，正文不用代码块。完成条件：所有重要主张的来源与证据层级可核对，建议没有超出阅读范围，台账计数与终态一致。

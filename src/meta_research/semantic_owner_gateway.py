@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.stage_context_access import stage_context_operations
+
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import cast
@@ -23,8 +25,6 @@ from meta_research.bundle_exhaustion import (
 )
 from meta_research.bundle_protocol import (
     BundleProtocolError,
-    ContentBindingProof,
-    ReceiptProof,
     TargetFrontierEntry,
     TargetLaunchRequest,
     projection_plain_value,
@@ -32,9 +32,6 @@ from meta_research.bundle_protocol import (
     validate_closed_bundle_projection,
     validate_target_launch_ack,
     validate_target_launch_request,
-)
-from meta_research.bundle_reuse_owner_proofs import (
-    BundleTargetCandidateOwnerProofVerifier,
 )
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime import (
@@ -139,21 +136,6 @@ BUNDLE_TARGET_SEMANTIC_MISSING_MATRIX = (
         "the current RG receipt that directly binds that hash",
     ),
     MissingSemanticOwnerOperation(
-        "accept_reuse_eligibility",
-        "research_graph",
-        "reuse_eligibility_effect_reconciliation_unavailable",
-        "accept_reuse_eligibility stores the context-derived idempotency key, but "
-        "the public query seam requires the Owner-allocated eligibility_ref that is "
-        "unknown when the effect response is lost",
-    ),
-    MissingSemanticOwnerOperation(
-        "reconcile_reuse_eligibility",
-        "research_graph",
-        "reuse_eligibility_idempotency_query_unavailable",
-        "query the immutable eligibility by the original semantic effect key or "
-        "another caller-known identity",
-    ),
-    MissingSemanticOwnerOperation(
         "submit_implementation_roles",
         "research_graph",
         "implementation_role_acceptance_unavailable",
@@ -255,6 +237,7 @@ def create_semantic_owner_gateway(
     advancement_engine_snapshot: Callable[[], OwnerSnapshot] | None = None,
     research_memory_snapshot: Callable[[], OwnerSnapshot] | None = None,
     human_collaboration_snapshot: Callable[[], OwnerSnapshot],
+    human_collaboration=None,
     target_run_agent: SQLiteTargetRunAgentAuthority | None = None,
 ) -> SemanticMcpGateway:
     """Bind semantic operations to public Owner interfaces only.
@@ -323,6 +306,8 @@ def create_semantic_owner_gateway(
                 research_graph, context, arguments
             ),
         ),
+        *_dataset_operations(research_graph, agent_runtime),
+        *_baseline_operations(research_graph, agent_runtime),
         *_root_agent_human_request_operations(
             agent_runtime=agent_runtime,
             research_memory=research_memory,
@@ -332,6 +317,18 @@ def create_semantic_owner_gateway(
             acquisition_provider=acquisition_provider,
         ),
     ]
+    if human_collaboration is not None:
+        from meta_research.human_research_context import human_research_context_operation
+        operations.append(human_research_context_operation(
+            agent_runtime=agent_runtime, human_collaboration=human_collaboration))
+    from meta_research.question_relations import (
+        question_history_operations,
+        question_relation_operations,
+    )
+    operations.extend(question_relation_operations(
+        research_graph=research_graph, agent_runtime=agent_runtime))
+    operations.append(question_history_operations(
+        research_graph=research_graph, agent_runtime=agent_runtime))
     if advancement_engine is not None:
         if research_memory is None:
             raise ValueError("formal semantic catalog requires research memory")
@@ -343,6 +340,8 @@ def create_semantic_owner_gateway(
                     research_memory=research_memory,
                     agent_runtime=agent_runtime,
                 ),
+                *stage_context_operations(advancement_engine=advancement_engine,
+                    agent_runtime=agent_runtime,research_graph=research_graph,research_memory=research_memory),
                 *_plan_evidence_operations(
                     advancement_engine=advancement_engine, agent_runtime=agent_runtime,
                     research_graph=research_graph, research_memory=research_memory,
@@ -360,7 +359,277 @@ def create_semantic_owner_gateway(
                 target_agent=target_run_agent,
             )
         )
+    from meta_research.research_content import research_content_operations
+    operations.extend(research_content_operations(research_graph=research_graph,
+        research_memory=research_memory, agent_runtime=agent_runtime, human_collaboration=human_collaboration))
     return SemanticMcpGateway(tuple(operations))
+
+
+def _baseline_operations(research_graph, agent_runtime):
+    def read(context, arguments, *, page):
+        quest_ref = _dataset_scope(agent_runtime, context)["quest_ref"]
+        try:
+            if page:
+                return research_graph.query_baselines(**arguments, quest_ref=quest_ref)
+            result = research_graph.query_baseline(arguments["baseline_ref"], quest_ref=quest_ref)
+            if result is not None:
+                result["reusable_entities"] = research_graph.query_baseline_variants(**arguments, quest_ref=quest_ref)
+            return {"status": "not_found" if result is None else "accepted", "result": result}
+        except OwnerConflict as error:
+            raise SemanticMcpError(error.code) from error
+
+    return (
+        SemanticOperation(
+            semantic_operation_id="research_graph.baselines.page", owning_module="research_graph",
+            description="在当前 Quest 发现可复用的 Baseline 方法版本。文本或内容匹配只提供候选，由 Agent 明确选择；沿分页发现，再用选中的 baseline_ref 读取完整不可变方法合同。",
+            input_schema={"type": "object", "properties": {
+                "query": {"type": "string", "maxLength": 1024},
+                "method_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "offset": {"type": "integer", "minimum": 0}}, "additionalProperties": False},
+            output_schema={"type": "object"},
+            handler=lambda context, arguments: read(context, arguments, page=True)),
+        SemanticOperation(
+            semantic_operation_id="research_graph.baselines.read", owning_module="research_graph",
+            description="读取当前 Quest 内一个精确 Baseline 方法版本，并用 variant_ref、offset 和 limit 按需展开关联实体。Bundle 在初始 Target 候选的 measurement_contract.baseline_forward_contract 中声明复用；Target 在 formal_runs 的 baseline_forward_contract 中引用实际 Baseline，或用 variant_ref 复用精确 Variant，遵循正式工作交接契约。每次实际工作的数据和证据另行绑定。",
+            input_schema={"type": "object", "properties": {"baseline_ref": _string(max_length=1024),
+                "variant_ref": _string(max_length=1024),
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "offset": {"type": "integer", "minimum": 0}},
+                "required": ["baseline_ref"], "additionalProperties": False},
+            output_schema={"type": "object"},
+            handler=lambda context, arguments: read(context, arguments, page=False)),
+        SemanticOperation(
+            semantic_operation_id="research_graph.target_formal_results.read", owning_module="research_graph",
+            description="读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。包括已实施但尚未评价的 Run，评价或指标可为空。调试活动本身不构成正式结果；发现结果仍须经正式证据和执行输入绑定才能采用。",
+            input_schema={"type": "object", "properties": {"target_ref": _string(max_length=1024)},
+                "required": ["target_ref"], "additionalProperties": False},
+            output_schema={"type": "object"},
+            handler=lambda context, arguments: _formal_results_read(research_graph, agent_runtime, context, arguments)),
+        SemanticOperation(
+            semantic_operation_id="research_graph.artifact_roles.adjust", owning_module="research_graph",
+            description="Correct the current attribution of one retained research artifact: move its owning run or assessment with a short reason. The exact content version, receipts and historical references stay unchanged; no new run, attempt or approval flow is created.",
+            input_schema={"type": "object", "properties": {
+                "role_ref": _string(max_length=1024),
+                "to_subject_kind": {"type": "string", "enum": ["variant_run", "evaluation_attempt"]},
+                "to_subject_ref": _string(max_length=1024),
+                "reason": _string(max_length=4096),
+                "effect_id": _string(max_length=128)}, "required": ["role_ref", "to_subject_kind", "to_subject_ref", "reason", "effect_id"], "additionalProperties": False},
+            output_schema={"type": "object"},
+            access_mode="effect",
+            reconciliation_operation_id="research_graph.artifact_roles.adjust.reconcile",
+            handler=lambda context, arguments: _artifact_role_adjust(
+                research_graph, agent_runtime, context, arguments)),
+        SemanticOperation(
+            semantic_operation_id="research_graph.artifact_roles.adjust.reconcile", owning_module="research_graph",
+            description="Reconcile one artifact-role adjustment effect before considering replay.",
+            input_schema={"type": "object", "properties": {
+                "effect_id": _string(max_length=128)},
+                "required": ["effect_id"], "additionalProperties": False},
+            output_schema={"type": "object"},
+            access_mode="reconcile",
+            handler=lambda context, arguments: _artifact_role_adjust_reconcile(
+                research_graph, agent_runtime, context, arguments)),
+        SemanticOperation(
+            semantic_operation_id="research_graph.formal_results.read", owning_module="research_graph",
+            description="Read one exact formal result by its bare ref (variant_run_, evaluation_attempt_ or metric_result_ prefix, including target-root refs) with its verified lineage: a metric result resolves to its evaluation attempt and variant run, a variant run to its Target context. Uses the same receipt-verified reads as target_formal_results.read.",
+            input_schema={"type": "object", "properties": {"ref": _string(max_length=1024)},
+                "required": ["ref"], "additionalProperties": False},
+            output_schema={"type": "object"},
+            handler=lambda context, arguments: _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments)),
+    )
+
+
+def _artifact_role_adjust(research_graph, agent_runtime, context, arguments):
+    scope = _dataset_scope(agent_runtime, context)
+    quest_ref = scope.get("quest_ref") if isinstance(scope, dict) else None
+    if not isinstance(quest_ref, str) or not quest_ref:
+        raise SemanticMcpError("artifact_role_quest_scope_required")
+    effect_key = context.effect_key(arguments["effect_id"])
+    payload = {key: value for key, value in arguments.items() if key != "effect_id"}
+    def effect_scope():
+        _dataset_scope(agent_runtime, context)
+    try:
+        result = research_graph.adjust_experiment_artifact_role(
+            **payload, idempotency_key=effect_key, quest_ref=quest_ref,
+            effect_scope=effect_scope)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    return {"status": "accepted", "result": result}
+
+
+def _artifact_role_adjust_reconcile(research_graph, agent_runtime, context, arguments):
+    _dataset_scope(agent_runtime, context, reconcile=True)
+    effect_key = context.effect_key(arguments["effect_id"])
+    try:
+        result = research_graph.reconcile_artifact_role_adjustment(
+            idempotency_key=effect_key)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    return {"status": "not_found" if result is None else "accepted", "result": result}
+
+
+def _formal_results_read(research_graph, agent_runtime, context, arguments):
+    scope = _dataset_scope(agent_runtime, context)
+    from sqlalchemy import text
+    with research_graph._database.read_snapshot() as c:
+        row=c.execute(text("SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g ON g.graph_ref=t.graph_ref WHERE t.target_ref=:ref"),{"ref":arguments["target_ref"]}).first()
+        if row is None or row.quest_ref!=scope["quest_ref"]:raise SemanticMcpError("formal_result_quest_scope_invalid")
+    try:
+        return {
+            "items": list(research_graph.query_target_formal_results(arguments["target_ref"])),
+            "execution_registration": research_graph.query_target_execution_registration(arguments["target_ref"]),
+        }
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+
+
+def _formal_result_by_ref_read(research_graph, agent_runtime, context, arguments):
+    scope = _dataset_scope(agent_runtime, context)
+    quest_ref = scope.get("quest_ref") if isinstance(scope, dict) else None
+    if not isinstance(quest_ref, str) or not quest_ref:
+        raise SemanticMcpError("formal_result_quest_scope_required")
+    try:
+        result = research_graph.query_formal_result_by_ref(
+            arguments["ref"], quest_ref=quest_ref)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    return {"status": "not_found" if result is None else "accepted", "result": result}
+
+
+def _dataset_operations(research_graph, agent_runtime):
+    """Global discovery and scope-bound semantic effects; RM owns every byte."""
+    common = {"effect_id": _string(max_length=128), "notes": {"type": "string"}}
+    payloads = {
+        "register": ({"semantic_key": _string(max_length=1024), "name": _string(max_length=1024),
+                      "meaning": _string(max_length=65536), "metadata": {"type": "object"}},
+                     ["semantic_key", "name", "meaning"]),
+        "register_version": ({"dataset_ref": _string(max_length=1024), "version_label": _string(max_length=1024),
+                              "meaning": _string(max_length=65536),
+                              "asset_bindings": {"type": "array", "items": {"type": "object"}},
+                              "metadata": {"type": "object"}},
+                             ["dataset_ref", "version_label", "meaning", "asset_bindings"]),
+        "reference": ({"dataset_version_ref": _string(max_length=1024), "question_ref": _string(max_length=1024),
+                       "research_ref": _string(max_length=1024), "purpose": {"type": "string"}},
+                      ["dataset_version_ref", "question_ref"]),
+        "derive": ({"source_dataset_version_ref": _string(max_length=1024),
+                    "derived_dataset_version_ref": _string(max_length=1024),
+                    "question_ref": _string(max_length=1024), "research_ref": _string(max_length=1024),
+                    "processing": _string(max_length=65536)},
+                   ["source_dataset_version_ref", "derived_dataset_version_ref", "question_ref", "processing"]),
+    }
+    descriptions = {
+        "register": "登记可复用的 Dataset 语义身份；semantic_key 由系统统一识别，当前调用的发现与采用范围仍是本 Quest。先检索并复用已有 semantic_key；name、meaning、metadata 和 notes 描述研究含义，实际内容沿 RM 资产绑定保存。",
+        "register_version": "登记不可变 DatasetVersion，绑定当前 Quest 已正式接纳的精确 RM AssetVersion。asset_bindings 每项从原 binding 取 asset_ref、version_ref、content_hash、manifest_hash、receipt 五字段；receipt 保留 issuer、kind、receipt_ref、subject_ref、payload_hash，及原有 status=accepted。使用 1–256 个不重复的 version_ref。meaning 描述采集、解释和版本含义，材料可为数值、文本、观察或其他研究内容；随后用 datasets.reference 关联当前 Question。",
+        "reference": "记录本 Quest 的 Question 对精确 DatasetVersion 的使用；该版本的资产须在当前 Quest 的已接纳范围内，可复用身份本身不授予跨 Quest 访问或采用权限。可用 research_ref 关联当前 Quest 已有的 Baseline／Variant／VariantRun／Evaluation／EvaluationAttempt／Target／TargetCommit，以 purpose 和 notes 说明用途。关联表示研究关系，归属、生产、结果与执行授权各按对应 Owner 事实核验。",
+        "derive": "Record one exact source DatasetVersion -> retained derived DatasetVersion, for example collection -> cleaned, annotated, combined or split data. Both versions must already bind accepted RM assets; this copies no data. Use multiple edges for multiple sources. Describe processing and provenance under the current Quest's Question. Optional research_ref identifies existing related research, within the current Quest; it is not proof of production or independent verification. Choose useful lineage granularity yourself; registering every file, transient intermediate or processing step is not required. Self-links and provenance cycles are invalid.",
+    }
+    result = []
+    for action, (properties, required) in payloads.items():
+        operation_id = f"research_graph.datasets.{action}"
+        result.append(SemanticOperation(
+            semantic_operation_id=operation_id, owning_module="research_graph",
+            description=descriptions[action],
+            input_schema={"type": "object", "properties": {**common, **properties},
+                          "required": ["effect_id", *required], "additionalProperties": False},
+            output_schema={"type": "object"}, access_mode="effect",
+            reconciliation_operation_id=operation_id + ".reconcile",
+            handler=lambda context, arguments, action=action: _dataset_effect(
+                research_graph, agent_runtime, context, arguments, action, reconcile=False),
+        ))
+        result.append(SemanticOperation(
+            semantic_operation_id=operation_id + ".reconcile", owning_module="research_graph",
+            description="Read a Dataset effect receipt under the original effect identity after an interrupted or lost response.",
+            input_schema={"type": "object", "properties": {"effect_id": _string(max_length=128)},
+                          "required": ["effect_id"], "additionalProperties": False},
+            output_schema={"type": "object"}, access_mode="reconcile",
+            handler=lambda context, arguments, action=action: _dataset_effect(
+                research_graph, agent_runtime, context, arguments, action, reconcile=True),
+        ))
+    result.extend((
+        SemanticOperation(
+            semantic_operation_id="research_graph.datasets.page", owning_module="research_graph",
+            description="分页发现当前 Quest 使用的 Dataset。每次选择一种模式：query 搜索语义身份、dataset_ref 列精确版本、question_ref 列研究用途，或 dataset_version_ref 列派生关系；各模式分别调用。direction 仅用于派生模式：sources 查该版本的输入，derived 查下游数据，默认 both。保留 notes 和 metadata；发现记录仍须经正式证据和执行输入绑定才能采用。",
+            input_schema={"type": "object", "properties": {
+                "query": {"type": "string", "maxLength": 1024}, "dataset_ref": _string(max_length=1024),
+                "question_ref": _string(max_length=1024), "dataset_version_ref": _string(max_length=1024),
+                "direction": {"type": "string", "enum": ["sources", "derived", "both"]},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+                "additionalProperties": False}, output_schema={"type": "object"},
+            handler=lambda context, arguments: _dataset_read(research_graph, agent_runtime, context, arguments, page=True)),
+        SemanticOperation(
+            semantic_operation_id="research_graph.datasets.read", owning_module="research_graph",
+            description="Read one exact Dataset identity, DatasetVersion, usage reference or derivation edge, including meaning, notes, exact RM bindings or processing provenance. Supply exactly one of dataset_ref, dataset_version_ref, dataset_reference_ref and dataset_derivation_ref.",
+            input_schema={"type": "object", "properties": {
+                "dataset_ref": _string(max_length=1024), "dataset_version_ref": _string(max_length=1024),
+                "dataset_reference_ref": _string(max_length=1024), "dataset_derivation_ref": _string(max_length=1024)},
+                "additionalProperties": False}, output_schema={"type": "object"},
+            handler=lambda context, arguments: _dataset_read(research_graph, agent_runtime, context, arguments, page=False)),
+    ))
+    return tuple(result)
+
+
+def _dataset_scope(agent_runtime, context, *, reconcile=False):
+    if context.root_kind is None:
+        raise SemanticMcpError("dataset_root_scope_required")
+    verify = (agent_runtime.verify_root_agent_human_request_reconcile_scope if reconcile
+              else agent_runtime.verify_root_agent_runtime_scope)
+    try:
+        return verify(root_kind=context.root_kind, run_ref=context.run_ref, attempt_ref=context.attempt_ref,
+                      root_session_ref=context.root_session_ref, fence_ref=context.fence_ref,
+                      runtime_binding_hash=context.capability_binding_hash)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+
+
+def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *, reconcile):
+    effect_key = context.dataset_effect_key(arguments["effect_id"])
+    if reconcile:
+        _dataset_scope(agent_runtime, context, reconcile=True)
+        result = research_graph.reconcile_dataset_operation(operation=action, idempotency_key=effect_key)
+        return {"status": "not_found" if result is None else "accepted", "result": result}
+    payload = {key: value for key, value in arguments.items() if key != "effect_id"}
+    def effect_scope():
+        # RG calls this trusted closure inside its fenced writer transaction.
+        scope = _dataset_scope(agent_runtime, context)
+        if action == "register_version":
+            for binding in payload["asset_bindings"]:
+                research_graph.verify_asset_quest_scope(binding["version_ref"], quest_ref=scope["quest_ref"])
+        if action in {"reference", "derive"}:
+            question = research_graph.query_question_history_by_ref(payload["question_ref"])
+            if question is None or question.quest_ref != scope.get("quest_ref"):
+                raise SemanticMcpError("dataset_question_scope_invalid")
+            if payload.get("research_ref") is not None:
+                research_graph.verify_dataset_research_ref_scope(
+                    payload["research_ref"], quest_ref=scope["quest_ref"])
+            fields = ("dataset_version_ref",) if action == "reference" else ("source_dataset_version_ref", "derived_dataset_version_ref")
+            for field in fields:
+                research_graph.verify_dataset_version_quest_scope(payload[field], quest_ref=scope["quest_ref"])
+    handler = {"register": research_graph.register_dataset,
+               "register_version": research_graph.register_dataset_version,
+               "reference": research_graph.reference_dataset,
+               "derive": research_graph.derive_dataset}[action]
+    try:
+        result = handler(**payload, idempotency_key=effect_key, effect_scope=effect_scope)
+    except OwnerConflict as error:
+        raise SemanticMcpError(error.code) from error
+    return {"status": "accepted", "result": result}
+
+
+def _dataset_read(research_graph, agent_runtime, context, arguments, *, page):
+    quest_ref = _dataset_scope(agent_runtime, context)["quest_ref"]
+    if page:
+        return research_graph.query_datasets(**arguments, quest_ref=quest_ref)
+    if len(arguments) != 1:
+        raise SemanticMcpError("dataset_read_ref_invalid")
+    readers = {"dataset_ref": research_graph.query_dataset,
+               "dataset_version_ref": research_graph.query_dataset_version,
+               "dataset_reference_ref": research_graph.query_dataset_reference,
+               "dataset_derivation_ref": research_graph.query_dataset_derivation}
+    field, ref = next(iter(arguments.items()))
+    result = readers[field](ref, quest_ref=quest_ref)
+    return {"status": "not_found" if result is None else "accepted", "result": result}
 
 
 def _plan_evidence_operations(
@@ -372,7 +641,7 @@ def _plan_evidence_operations(
         SemanticOperation(
             semantic_operation_id="research_graph.plan_evidence.page",
             owning_module="research_graph",
-            description="Browse current Quest evidence candidates in bounded pages. Only the request's frozen EvidenceRefs may support this Plan; other pages are discovery context.",
+            description="Browse current Quest evidence candidates in bounded pages. An exact accepted candidate from any page may be selected; the Owner revalidates every actual selected evidence binding.",
             input_schema={"type": "object", "properties": {
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 256},
@@ -515,41 +784,6 @@ def _bundle_target_operations(
         ),
         *_bundle_exhaustion_operations(advancement_engine, agent_runtime),
         *_implementation_content_operations(research_memory, agent_runtime),
-        SemanticOperation(
-            semantic_operation_id="research_graph.reuse_eligibility.read",
-            owning_module="research_graph",
-            description=(
-                "Read one immutable RG reuse eligibility and revalidate its "
-                "accepted TargetCommit anchor."
-            ),
-            input_schema=_reuse_eligibility_read_input_schema(),
-            output_schema=_reuse_eligibility_read_output_schema(),
-            handler=lambda context, arguments: _read_reuse_eligibility(
-                research_graph, agent_runtime, context, arguments
-            ),
-        ),
-        SemanticOperation(
-            semantic_operation_id="research_graph.reuse_inputs.verify",
-            owning_module="research_graph",
-            description=(
-                "Verify exact RM source/content and RG eligibility receipts through "
-                "the production composite proof verifier."
-            ),
-            input_schema=_reuse_inputs_verification_schema(),
-            output_schema=_reuse_inputs_verification_output_schema(),
-            access_mode="verify",
-            handler=lambda context, arguments: _verify_reuse_inputs(
-                BundleTargetCandidateOwnerProofVerifier(
-                    research_memory,
-                    research_graph,
-                ),
-                research_memory,
-                research_graph,
-                agent_runtime,
-                context,
-                arguments,
-            ),
-        ),
         SemanticOperation(
             semantic_operation_id="research_graph.target_launch_request.read",
             owning_module="research_graph",
@@ -798,12 +1032,11 @@ def _root_agent_human_request_operations(
             semantic_operation_id=open_id,
             owning_module="agent_runtime",
             description=(
-                "Solve autonomously when the Agent or system can do so; open a "
-                "HumanRequest only for a genuine human obligation or action. Open "
-                "one blocking HumanRequest for this exact authenticated Root "
-                "operation, with the kind chosen explicitly by the Agent. The "
-                "server derives ownership and waiter identity; any participating "
-                "Agent Session holding the operation bearer may call it."
+                "自主完成 Agent 或系统可完成的工作；为确需人类判断、资源或行动的条件打开当前已认证根操作的 HumanRequest，"
+                "由 Agent 明确选择 request_kind，服务确定归属和 local waiter；持有该 operation bearer 的参与 Session 可调用。"
+                "通用请求中，capability_authorization 必须提供 required_authorization，其他分类省略该字段；"
+                "condition.guidance_asset_ref 仅用于 external_material_api_access 或 offline_action，引用已接纳资产版本。"
+                "acceptance_conditions 提供 1–32 条非空、去除首尾空格后互不重复的条件。"
             ),
             input_schema=_root_human_request_open_input_schema(),
             output_schema=_root_human_request_output_schema(),
@@ -2224,256 +2457,6 @@ def _implementation_content_public(accepted: object) -> dict[str, object]:
     return value
 
 
-def _read_reuse_eligibility(
-    research_graph: ResearchGraphInterface,
-    agent_runtime: AgentRuntimeInterface,
-    context: SemanticCallContext,
-    arguments: dict[str, object],
-) -> dict[str, object]:
-    _verify_bundle_scope(agent_runtime, context)
-    accepted = research_graph.query_reuse_eligibility(
-        str(arguments["eligibility_ref"])
-    )
-    if accepted is None:
-        return {"status": "absent"}
-    return {"status": "present", "accepted": _reuse_eligibility_public(accepted)}
-
-
-def _reuse_eligibility_public(accepted: object) -> dict[str, object]:
-    return {
-        "eligibility_ref": accepted.eligibility_ref,
-        "tier": accepted.tier,
-        "target_commit_ref": accepted.target_commit_ref,
-        "source_ref": accepted.source_ref,
-        "exact_version_ref": accepted.exact_version_ref,
-        "implementation_revision_ref": accepted.implementation_revision_ref,
-        "implementation_content_hash_ref": (
-            accepted.implementation_content_hash_ref
-        ),
-        "payload_json": canonical_json(accepted.payload),
-        "payload_hash": accepted.payload_hash,
-        "accepted_at": accepted.accepted_at,
-        "receipt": accepted.receipt.as_public_dict(),
-    }
-
-
-def _verify_reuse_inputs(
-    verifier: BundleTargetCandidateOwnerProofVerifier,
-    research_memory: ResearchMemoryInterface,
-    research_graph: ResearchGraphInterface,
-    agent_runtime: AgentRuntimeInterface,
-    context: SemanticCallContext,
-    arguments: dict[str, object],
-) -> dict[str, object]:
-    _verify_bundle_scope(agent_runtime, context)
-    values = arguments["proofs"]
-    if not isinstance(values, list) or not values or len(values) > 128:
-        raise SemanticMcpError("reuse_inputs_invalid")
-    identities: set[tuple[str, str, str]] = set()
-    verified: list[dict[str, object]] = []
-    try:
-        for value in values:
-            if not isinstance(value, dict):
-                raise SemanticMcpError("reuse_inputs_invalid")
-            identity = (
-                str(value["source_ref"]),
-                str(value["exact_version_ref"]),
-                str(value["implementation_revision_ref"]),
-            )
-            if identity in identities:
-                raise SemanticMcpError("reuse_inputs_invalid")
-            identities.add(identity)
-            verified.append(
-                _verify_one_reuse_input(
-                    verifier,
-                    research_memory,
-                    research_graph,
-                    value,
-                )
-            )
-    except OwnerConflict as error:
-        raise SemanticMcpError("reuse_inputs_verification_failed") from error
-    return {
-        "status": "verified",
-        "proof_count": len(verified),
-        "proofs": verified,
-    }
-
-
-def _verify_one_reuse_input(
-    verifier: BundleTargetCandidateOwnerProofVerifier,
-    research_memory: ResearchMemoryInterface,
-    research_graph: ResearchGraphInterface,
-    value: dict[str, object],
-) -> dict[str, object]:
-    tier = str(value["tier"])
-    source_ref = str(value["source_ref"])
-    exact_version_ref = str(value["exact_version_ref"])
-    implementation_revision_ref = str(value["implementation_revision_ref"])
-    license_ref = value.get("license_ref")
-    source_content_hash_ref = value.get("source_content_hash_ref")
-    patch_ref = value.get("patch_ref")
-    source_receipt = _receipt_proof_from_argument(value["verification_receipt"])
-    implementation_binding = _content_binding_from_argument(
-        value["implementation_binding"]
-    )
-    content_receipt = _receipt_proof_from_argument(
-        value["implementation_acceptance_receipt"]
-    )
-    verifier.verify_reuse_source_receipt(
-        tier=tier,
-        source_ref=source_ref,
-        exact_version_ref=exact_version_ref,
-        implementation_revision_ref=implementation_revision_ref,
-        license_ref=license_ref,
-        source_content_hash_ref=source_content_hash_ref,
-        patch_ref=patch_ref,
-        receipt=source_receipt,
-    )
-    verifier.verify_reuse_content_receipt(
-        tier=tier,
-        source_ref=source_ref,
-        exact_version_ref=exact_version_ref,
-        implementation_revision_ref=implementation_revision_ref,
-        license_ref=license_ref,
-        source_content_hash_ref=source_content_hash_ref,
-        patch_ref=patch_ref,
-        binding=implementation_binding,
-        receipt=content_receipt,
-    )
-    accepted_content = research_memory.query_implementation_content(
-        implementation_revision_ref
-    )
-    if accepted_content is None:
-        raise OwnerConflict("implementation_content_receipt_invalid")
-    _require_reuse_record_match(
-        accepted_content,
-        source_ref=source_ref,
-        exact_version_ref=exact_version_ref,
-        implementation_revision_ref=implementation_revision_ref,
-        license_ref=license_ref,
-        source_content_hash_ref=source_content_hash_ref,
-        patch_ref=patch_ref,
-        implementation_binding=implementation_binding,
-        source_receipt=source_receipt,
-        content_receipt=content_receipt,
-    )
-    eligibility_names = (
-        "eligibility_anchor_ref",
-        "eligibility_binding",
-        "eligibility_receipt",
-    )
-    eligibility_supplied = tuple(name in value for name in eligibility_names)
-    eligibility: dict[str, object] | None = None
-    if any(eligibility_supplied):
-        if not all(eligibility_supplied):
-            raise OwnerConflict("reuse_eligibility_receipt_invalid")
-        eligibility_binding = _content_binding_from_argument(
-            value["eligibility_binding"]
-        )
-        eligibility_receipt = _receipt_proof_from_argument(
-            value["eligibility_receipt"]
-        )
-        eligibility_anchor_ref = str(value["eligibility_anchor_ref"])
-        verifier.verify_reuse_eligibility_receipt(
-            tier=tier,
-            source_ref=source_ref,
-            exact_version_ref=exact_version_ref,
-            implementation_revision_ref=implementation_revision_ref,
-            implementation_content_hash_ref=implementation_binding.content_hash_ref,
-            eligibility_anchor_ref=eligibility_anchor_ref,
-            binding=eligibility_binding,
-            receipt=eligibility_receipt,
-        )
-        accepted_eligibility = research_graph.query_reuse_eligibility(
-            eligibility_binding.subject_ref
-        )
-        if accepted_eligibility is None or (
-            accepted_eligibility.target_commit_ref != eligibility_anchor_ref
-            or accepted_eligibility.payload_hash
-            != eligibility_binding.content_hash_ref
-            or accepted_eligibility.receipt.receipt_ref
-            != eligibility_receipt.receipt_ref
-            or accepted_eligibility.receipt.subject_ref
-            != eligibility_receipt.subject_ref
-        ):
-            raise OwnerConflict("reuse_eligibility_receipt_invalid")
-        eligibility = _reuse_eligibility_public(accepted_eligibility)
-    elif tier in {"accepted-local", "related-history", "global-baseline-pool"}:
-        raise OwnerConflict("reuse_eligibility_receipt_invalid")
-    result: dict[str, object] = {
-        "tier": tier,
-        "source_ref": source_ref,
-        "exact_version_ref": exact_version_ref,
-        "implementation_revision_ref": implementation_revision_ref,
-        "implementation_content_hash_ref": implementation_binding.content_hash_ref,
-        "source_verification_receipt": (
-            accepted_content.source_verification_receipt.as_public_dict()
-        ),
-        "content_acceptance_receipt": (
-            accepted_content.content_acceptance_receipt.as_public_dict()
-        ),
-    }
-    if eligibility is not None:
-        result["eligibility"] = eligibility
-    return result
-
-
-def _require_reuse_record_match(
-    accepted: object,
-    *,
-    source_ref: str,
-    exact_version_ref: str,
-    implementation_revision_ref: str,
-    license_ref: object,
-    source_content_hash_ref: object,
-    patch_ref: object,
-    implementation_binding: ContentBindingProof,
-    source_receipt: ReceiptProof,
-    content_receipt: ReceiptProof,
-) -> None:
-    if (
-        accepted.source_ref != source_ref
-        or accepted.exact_version_ref != exact_version_ref
-        or accepted.implementation_revision_ref != implementation_revision_ref
-        or accepted.license_ref != license_ref
-        or accepted.source_content_hash_ref != source_content_hash_ref
-        or accepted.patch_ref != patch_ref
-        or accepted.content_hash_ref != implementation_binding.content_hash_ref
-        or implementation_binding.subject_ref != implementation_revision_ref
-        or accepted.source_verification_receipt.receipt_ref
-        != source_receipt.receipt_ref
-        or accepted.source_verification_receipt.subject_ref
-        != source_receipt.subject_ref
-        or accepted.content_acceptance_receipt.receipt_ref
-        != content_receipt.receipt_ref
-        or accepted.content_acceptance_receipt.subject_ref
-        != content_receipt.subject_ref
-    ):
-        raise OwnerConflict("reuse_inputs_verification_failed")
-
-
-def _receipt_proof_from_argument(value: object) -> ReceiptProof:
-    if not isinstance(value, dict):
-        raise SemanticMcpError("reuse_inputs_invalid")
-    return ReceiptProof(
-        receipt_ref=str(value["receipt_ref"]),
-        subject_ref=str(value["subject_ref"]),
-        verified=value["verified"] is True,
-        currentness_known=value["currentness_known"] is True,
-        current=value["current"] is True,
-    )
-
-
-def _content_binding_from_argument(value: object) -> ContentBindingProof:
-    if not isinstance(value, dict):
-        raise SemanticMcpError("reuse_inputs_invalid")
-    return ContentBindingProof(
-        subject_ref=str(value["subject_ref"]),
-        content_hash_ref=str(value["content_hash_ref"]),
-    )
-
-
 def _read_target_launch_request(
     research_graph: ResearchGraphInterface,
     agent_runtime: AgentRuntimeInterface,
@@ -2797,8 +2780,9 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
                 "description": (
                     "Agent-selected kind: library_reconnect for library access; "
                     "external_material_api_access for internet, material, or API "
-                    "human work; offline_action only for research-related physical "
-                    "or offline work; capability_authorization for formal permission; "
+                    "human work; offline_action for human research judgment, "
+                    "expert advice, fieldwork or physical/offline action; "
+                    "capability_authorization for formal permission; "
                     "system_operation_help for a Meta Research runtime failure."
                 ),
             },
@@ -2808,7 +2792,10 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
             },
             "business_purpose": {
                 **_string(max_length=4000),
-                "description": "Raw Agent-written primary body.",
+                "description": (
+                    "Describe work attempted, observed results, the current uncertainty, "
+                    "the specific human judgment/resource/action needed, and its impact on next steps."
+                ),
             },
             "condition": _closed_object(
                 {
@@ -3189,146 +3176,6 @@ def _implementation_content_schema() -> dict[str, object]:
             "source_verification_receipt",
             "content_acceptance_receipt",
         ),
-    )
-
-
-def _reuse_eligibility_read_input_schema() -> dict[str, object]:
-    return _closed_object(
-        {"eligibility_ref": _string(max_length=256)},
-        required=("eligibility_ref",),
-    )
-
-
-def _reuse_eligibility_read_output_schema() -> dict[str, object]:
-    return _closed_object(
-        {
-            "status": _string(enum=("absent", "present")),
-            "accepted": _reuse_eligibility_schema(),
-        },
-        required=("status",),
-    )
-
-
-def _reuse_eligibility_schema() -> dict[str, object]:
-    return _closed_object(
-        {
-            "eligibility_ref": _string(max_length=256),
-            "tier": _eligibility_tier_schema(),
-            "target_commit_ref": _string(max_length=256),
-            "source_ref": _string(max_length=256),
-            "exact_version_ref": _string(max_length=256),
-            "implementation_revision_ref": _string(max_length=256),
-            "implementation_content_hash_ref": _hash_schema(),
-            "payload_json": _string(max_length=16_384),
-            "payload_hash": _hash_schema(),
-            "accepted_at": {"type": "number"},
-            "receipt": _receipt_schema(),
-        },
-        required=(
-            "eligibility_ref",
-            "tier",
-            "target_commit_ref",
-            "source_ref",
-            "exact_version_ref",
-            "implementation_revision_ref",
-            "implementation_content_hash_ref",
-            "payload_json",
-            "payload_hash",
-            "accepted_at",
-            "receipt",
-        ),
-    )
-
-
-def _reuse_inputs_verification_schema() -> dict[str, object]:
-    proof_properties = {
-        "tier": _reuse_tier_schema(),
-        "source_ref": _string(max_length=256),
-        "exact_version_ref": _string(max_length=256),
-        "implementation_revision_ref": _string(max_length=256),
-        "license_ref": _string(max_length=256),
-        "source_content_hash_ref": _hash_schema(),
-        "patch_ref": _string(max_length=256),
-        "verification_receipt": _receipt_proof_schema(),
-        "implementation_binding": _content_binding_schema(),
-        "implementation_acceptance_receipt": _receipt_proof_schema(),
-        "eligibility_anchor_ref": _string(max_length=256),
-        "eligibility_binding": _content_binding_schema(),
-        "eligibility_receipt": _receipt_proof_schema(),
-    }
-    return _closed_object(
-        {
-            "proofs": {
-                "type": "array",
-                "items": _closed_object(
-                    proof_properties,
-                    required=(
-                        "tier",
-                        "source_ref",
-                        "exact_version_ref",
-                        "implementation_revision_ref",
-                        "verification_receipt",
-                        "implementation_binding",
-                        "implementation_acceptance_receipt",
-                    ),
-                ),
-            }
-        },
-        required=("proofs",),
-    )
-
-
-def _reuse_inputs_verification_output_schema() -> dict[str, object]:
-    verified_proof = _closed_object(
-        {
-            "tier": _reuse_tier_schema(),
-            "source_ref": _string(max_length=256),
-            "exact_version_ref": _string(max_length=256),
-            "implementation_revision_ref": _string(max_length=256),
-            "implementation_content_hash_ref": _hash_schema(),
-            "source_verification_receipt": _receipt_schema(),
-            "content_acceptance_receipt": _receipt_schema(),
-            "eligibility": _reuse_eligibility_schema(),
-        },
-        required=(
-            "tier",
-            "source_ref",
-            "exact_version_ref",
-            "implementation_revision_ref",
-            "implementation_content_hash_ref",
-            "source_verification_receipt",
-            "content_acceptance_receipt",
-        ),
-    )
-    return _closed_object(
-        {
-            "status": _string(enum=("verified",)),
-            "proof_count": {"type": "integer"},
-            "proofs": {"type": "array", "items": verified_proof},
-        },
-        required=("status", "proof_count", "proofs"),
-    )
-
-
-def _reuse_tier_schema() -> dict[str, object]:
-    return _string(
-        enum=(
-            "accepted-local",
-            "related-history",
-            "global-baseline-pool",
-            "mature-external",
-            "self-implementation",
-        )
-    )
-
-
-def _eligibility_tier_schema() -> dict[str, object]:
-    return _string(
-        enum=(
-            "accepted-local",
-            "related-history",
-            "global-baseline-pool",
-        )
     )
 
 

@@ -181,6 +181,8 @@ def validate_target_plan(
         > MAX_BUNDLE_TARGET_PLAN_BYTES
     ):
         raise BundleContractError("target_plan_too_large")
+    if "notes" in target_plan and not isinstance(target_plan["notes"], str):
+        raise BundleContractError("target_plan_notes_invalid")
     _exact_keys(
         target_plan,
         {
@@ -191,7 +193,7 @@ def validate_target_plan(
             "completion_contract",
             "initial_strategy_update",
             "source_bindings",
-        },
+        } | ({"notes"} if "notes" in target_plan else set()),
         "target_plan_invalid",
     )
     if (
@@ -344,9 +346,11 @@ def validate_target_graph_append_proposal(
             "candidates",
             "requires_accepted_labels",
             "strategy_complete",
-        },
+        } | ({"notes"} if "notes" in update else set()),
         "target_graph_append_proposal_invalid",
     )
+    if "notes" in update and not isinstance(update["notes"], str):
+        raise BundleContractError("target_graph_append_proposal_invalid")
     revision = update.get("revision")
     candidates = update.get("candidates")
     required = update.get("requires_accepted_labels")
@@ -377,6 +381,8 @@ def material_target_plan_hash(target_plan: dict[str, object]) -> str:
     open-shaped documents rather than assigning them a formal outcome hash.
     """
 
+    if "notes" in target_plan and not isinstance(target_plan["notes"], str):
+        raise BundleContractError("target_plan_notes_invalid")
     _exact_keys(
         target_plan,
         {
@@ -387,7 +393,7 @@ def material_target_plan_hash(target_plan: dict[str, object]) -> str:
             "completion_contract",
             "initial_strategy_update",
             "source_bindings",
-        },
+        } | ({"notes"} if "notes" in target_plan else set()),
         "target_plan_invalid",
     )
     completion = target_plan.get("completion_contract")

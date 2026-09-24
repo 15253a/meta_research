@@ -1,0 +1,76 @@
+/* Bounded floating CLI viewer. Log growth only changes the inner scroll area. */
+.co-terminal-window {
+  position: fixed; z-index: 90; right: 28px; bottom: 26px;
+  width: 720px; height: 460px; max-width: calc(100vw - 40px); max-height: calc(100dvh - 80px);
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+  color: #d4dce8; background: #10141d; border: 1px solid #394251; border-radius: 14px;
+  box-shadow: 0 20px 68px #11182750; font-family: Aptos, Inter, "Microsoft YaHei", sans-serif;
+}
+.co-terminal-header {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 13px 16px; background: #191f2b; border-bottom: 1px solid #313a4b;
+}
+.co-terminal-header > div:first-child { min-width: 0; }
+.co-terminal-header strong { display: block; color: #f3f5fb; font-size: 13px; font-weight: 600; }
+.co-terminal-header strong span { margin-right: 7px; color: #9bb7ff; font-family: Consolas, monospace; }
+.co-terminal-header small { display: block; margin-top: 5px; color: #a3adc0; font-size: 11px; }
+.co-terminal-window-actions { display: flex; gap: 3px; }
+.co-terminal-window button, .co-terminal-min button { font: inherit; cursor: pointer; }
+.co-terminal-window-actions button {
+  width: 30px; height: 30px; border: 0; border-radius: 6px; background: transparent;
+  color: #c6d0e0; font-size: 21px; line-height: 1;
+}
+.co-terminal-window-actions button:hover { background: #303a4d; color: #fff; }
+.co-terminal-toolbar {
+  flex: 0 0 auto; display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 8px 16px; border-bottom: 1px solid #283143; color: #9ba8bd; font-size: 11px;
+}
+.co-terminal-modes { display: flex; gap: 5px; }
+.co-terminal-modes button, .co-terminal-footer button {
+  border: 1px solid transparent; border-radius: 5px; padding: 5px 8px;
+  background: transparent; color: #b0bdd2; font-size: 11px;
+}
+.co-terminal-modes button[aria-pressed="true"] { color: #f0f2ff; background: #333650; border-color: #525577; }
+.co-terminal-modes button:hover, .co-terminal-footer button:hover { background: #283144; color: #fff; }
+.co-terminal-output {
+  flex: 1 1 0; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain;
+  scrollbar-color: #526079 #151b26; scrollbar-width: thin; padding: 13px 16px; background: #10141d;
+}
+.co-terminal-output pre {
+  display: block; width: max-content; min-width: 100%; max-width: none; margin: 0; padding: 0;
+  border: 0; border-radius: 0; background: transparent; color: #c8d5c9;
+  font-family: "Cascadia Code", Consolas, "SFMono-Regular", monospace;
+  font-size: 11px; line-height: 1.8; white-space: pre; overflow: visible; tab-size: 2;
+}
+.co-terminal-output.is-wrapped pre { width: auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.co-terminal-footer {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 12px; color: #93a2b8; background: #191f2b; border-top: 1px solid #313a4b; font-size: 11px;
+}
+.co-terminal-footer > div { display: flex; align-items: center; gap: 3px; }
+.co-terminal-footer button[aria-pressed="true"] { color: #a2dccb; }
+.co-terminal-footer button:disabled { opacity: .4; cursor: default; }
+.co-terminal-window button:focus-visible, .co-terminal-min button:focus-visible, .co-terminal-output:focus-visible { outline: 2px solid #a8b9ff; outline-offset: -3px; }
+.co-terminal-min {
+  position: fixed; z-index: 90; right: 28px; bottom: 26px; max-width: calc(100vw - 32px);
+  display: flex; align-items: stretch; overflow: hidden; border: 1px solid #394251; border-radius: 11px;
+  background: #191f2b; box-shadow: 0 6px 28px #11182730;
+}
+.co-terminal-min button { border: 0; padding: 12px 14px; color: #e4eaf4; background: transparent; font-size: 12px; }
+.co-terminal-min button:first-child { text-align: left; }
+.co-terminal-min button:hover { background: #303a4d; }
+.co-terminal-min span { margin-right: 7px; font-family: Consolas, monospace; color: #9bb7ff; }
+.co-terminal-min small { display: block; color: #a3adc0; font-size: 10px; margin-top: 4px; }
+@media (max-width: 600px) {
+  .co-terminal-window { right: 12px; bottom: 12px; width: calc(100vw - 24px); height: 460px; max-width: none; max-height: calc(100dvh - 48px); }
+  .co-terminal-header { padding: 10px 12px; gap: 6px; }
+  .co-terminal-header strong { font-size: 12px; }
+  .co-terminal-header small { font-size: 10px; }
+  .co-terminal-toolbar { padding: 7px 10px; }
+  .co-terminal-output { padding: 10px 12px; }
+  .co-terminal-footer { flex-wrap: wrap; padding: 6px 9px; gap: 3px; }
+  .co-terminal-fixture { display: none; }
+  .co-terminal-footer > div { justify-content: space-between; width: 100%; }
+  .co-terminal-min { right: 12px; bottom: 12px; }
+}
+.co-target-min:has(~ .co-terminal-min){bottom:100px}

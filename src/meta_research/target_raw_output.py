@@ -48,6 +48,7 @@ class TargetRawOutputPage:
     root_native_session_ref: str | None
     exact: bool = True
     unredacted: bool = True
+    incomplete_tail_bytes: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -66,6 +67,7 @@ class TargetRawOutputPage:
             "root_native_session_ref": self.root_native_session_ref,
             "exact": self.exact,
             "unredacted": self.unredacted,
+            "incomplete_tail_bytes": self.incomplete_tail_bytes,
         }
 
 
@@ -77,13 +79,16 @@ class _MappingState:
     root_native_session_ref: str | None = None
     mapped: bytearray = field(default_factory=bytearray)
     failure_code: str | None = None
+    incomplete_tail_bytes: int = 0
 
 
 class TargetRawOutputStore:
     """Page the exact private Codex stdout JSONL on demand.
 
     The reader is observer-only. It validates the bound root stream, but does
-    not summarize or discard Provider events. It never edits the spool or an
+    not summarize or discard complete Provider events. A signed failed exit may
+    leave an incomplete final event, which is counted separately from exact text.
+    It never edits the spool or an
     Agent workspace, and any read failure is isolated from the Target Run. The
     bounded LRU avoids retaining every historical stream in memory.
     """
@@ -267,9 +272,20 @@ class TargetRawOutputStore:
                 )
             state = self._state(invocation_hash)
             source_path = self._source_path(invocation_hash)
+            if (
+                terminal
+                and state.failure_code == "target_raw_output_event_invalid"
+                and self._verified_failed_exit(source_path, invocation_hash)
+            ):
+                # Old readers consumed a terminal fragment before reporting an
+                # error. Rebuild from the signed source; never just clear a
+                # cached failure, since an interior event may be corrupt.
+                state = _MappingState()
+                self._states[invocation_hash] = state
             source_size = self._advance(
                 state,
                 source_path,
+                invocation_hash=invocation_hash,
                 expected_native_session_ref=expected_native_session_ref,
                 final=terminal,
             )
@@ -319,6 +335,7 @@ class TargetRawOutputStore:
                 has_more=has_more,
                 source_caught_up=source_caught_up,
                 root_native_session_ref=state.root_native_session_ref,
+                incomplete_tail_bytes=state.incomplete_tail_bytes,
             )
 
     def _state(self, invocation_hash: str) -> _MappingState:
@@ -348,6 +365,7 @@ class TargetRawOutputStore:
         state: _MappingState,
         source_path: Path,
         *,
+        invocation_hash: str,
         expected_native_session_ref: str | None,
         final: bool,
     ) -> int:
@@ -362,7 +380,11 @@ class TargetRawOutputStore:
         identity = (int(stat.st_dev), int(stat.st_ino))
         if state.source_identity is None:
             state.source_identity = identity
-        elif state.source_identity != identity or stat.st_size < state.source_offset:
+        elif (
+            state.source_identity != identity
+            or stat.st_size < state.source_offset
+            or (state.incomplete_tail_bytes and stat.st_size != state.source_offset)
+        ):
             state.failure_code = "target_raw_output_source_changed"
             return int(stat.st_size)
         remaining = min(
@@ -385,7 +407,6 @@ class TargetRawOutputStore:
         unterminated: bytes | None = None
         if final and state.source_offset >= int(stat.st_size) and state.source_buffer:
             unterminated = state.source_buffer
-            state.source_buffer = b""
         for line in lines:
             self._consume_line(
                 state,
@@ -396,13 +417,42 @@ class TargetRawOutputStore:
             if state.failure_code is not None:
                 break
         if unterminated is not None and state.failure_code is None:
-            self._consume_line(
-                state,
-                unterminated,
-                expected_native_session_ref=expected_native_session_ref,
-                terminated=False,
-            )
+            if (
+                state.root_native_session_ref is not None
+                and _incomplete_json_event(unterminated)
+                and self._verified_failed_exit(source_path, invocation_hash)
+            ):
+                state.incomplete_tail_bytes = len(unterminated)
+            else:
+                self._consume_line(
+                    state,
+                    unterminated,
+                    expected_native_session_ref=expected_native_session_ref,
+                    terminated=False,
+                )
+            # Keep the fragment available for retry if its exit seal has not
+            # appeared yet; verification above raises before this assignment.
+            state.source_buffer = b""
         return int(stat.st_size)
+
+    @staticmethod
+    def _verified_failed_exit(source_path: Path, invocation_hash: str) -> bool:
+        directory = source_path.parent
+        try:
+            _, key = read_transport_key_for_operation(directory)
+            receipt, _ = read_verified_exit_receipt(
+                directory / "supervisor-exit.json",
+                key=key,
+                invocation_hash=invocation_hash,
+                prompt_path=directory / "prompt.txt",
+                schema_path=directory / "output-schema.json",
+                stdout_path=source_path,
+                result_path=directory / "last-message.json",
+                expected_schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+            )
+        except (OSError, ProviderSupervisorError) as error:
+            raise TargetRawOutputUnavailable("target_raw_output_receipt_unavailable") from error
+        return receipt["returncode"] != 0
 
     @staticmethod
     def _consume_line(
@@ -442,6 +492,31 @@ class TargetRawOutputStore:
         state.mapped.extend(line)
         if terminated:
             state.mapped.extend(b"\n")
+
+
+def _incomplete_json_event(line: bytes) -> bool:
+    """Recognize an EOF fragment without accepting arbitrary corrupt JSON."""
+    try:
+        text = line.decode("utf-8")
+    except UnicodeDecodeError as error:
+        return (
+            error.reason == "unexpected end of data"
+            and error.end == len(line)
+            and _incomplete_json_event(line[:error.start])
+        )
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as error:
+        return (
+            error.pos >= len(text.rstrip())
+            or error.msg.startswith("Unterminated string")
+            or (
+                error.msg == "Expecting value"
+                and text[error.pos:].strip()
+                in {"t", "tr", "tru", "f", "fa", "fal", "fals", "n", "nu", "nul"}
+            )
+        )
+    return False
 
 
 __all__ = [

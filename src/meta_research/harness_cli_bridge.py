@@ -109,15 +109,17 @@ def _drain_bounded(stream, destination: bytearray) -> None:
 
 
 def _copy_redacted(stream, destination, redactions: tuple[bytes, ...]) -> None:
+    # BufferedReader.read waits for 64 KiB or EOF; read1 drains available bytes.
+    read_chunk = getattr(stream, "read1", stream.read)
     try:
         if not redactions:
-            while chunk := stream.read(64 * 1024):
+            while chunk := read_chunk(64 * 1024):
                 destination.write(chunk)
                 destination.flush()
             return
         pending = bytearray()
         maximum_length = max(len(value) for value in redactions)
-        while chunk := stream.read(64 * 1024):
+        while chunk := read_chunk(64 * 1024):
             pending.extend(chunk)
             while len(pending) >= maximum_length:
                 encoded = bytes(pending)
