@@ -1962,6 +1962,7 @@ class CodexDeepFetchAdapter:
                     invocation_path, transport_key
                 )
                 prompt = prompt_path.read_text(encoding="utf-8")
+                _conditions, original_prompt = split_runtime_prompt(prompt)
                 schema_text = schema_path.read_text(encoding="utf-8")
                 full_schema_text = canonical_json(_deepfetch_output_schema())
                 gate_schema_text = canonical_json(
@@ -2034,12 +2035,12 @@ class CodexDeepFetchAdapter:
                     or gate_turn != expected_web_gate
                     or (
                         gate_turn
-                        and not prompt.startswith("web_evidence_gate=v1\n")
+                        and not original_prompt.startswith("web_evidence_gate=v1\n")
                     )
                     or (
                         not gate_turn
                         and f"public_output_root={public_root}"
-                        not in prompt.splitlines()
+                        not in original_prompt.splitlines()
                     )
                 ):
                     raise ValueError("deepfetch reconciliation identity mismatch")
