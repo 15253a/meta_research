@@ -230,6 +230,12 @@ def bundle_bindings_compatible(left: "BundleRuntimeBinding", right: "BundleRunti
         return True
     if system_mcp_bindings_compatible(left, right):
         return True
+    # A later prose edit on the same executable needs no deployment bridge.
+    # Compare it before mapping one recognized endpoint to an older executable.
+    before = _same_execution_policy_value(left)
+    after = _same_execution_policy_value(right)
+    if before is not None and after is not None and before == after:
+        return True
     # Carry the existing Bundle prose contract across only this reviewed MCP
     # upgrade. The recognized endpoint maps back to its exact prior source and
     # instruction identities; every other field remains subject to comparison.
