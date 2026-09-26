@@ -731,7 +731,10 @@ def _durable_reasoning_codex(
 
 def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     tmp_path: Path,
+    scoped_system_mcp,
+    pre_system_mcp_binding,
 ) -> None:
+    registry, assert_loaded = scoped_system_mcp("reasoning")
     primary = _stage_output()
     review = {
         "schema_ref": REASONING_REVIEW_SCHEMA_REF,
@@ -745,11 +748,12 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
         tmp_path / "provider",
         executable=str(_fake_codex(tmp_path / "codex")),
         process_runner=runner,
+        system_mcp_registry=registry,
     )
     adapter.bind_full_conformance_authority(authority)
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
     binding = adapter.runtime_binding()
-    request = replace(_request(), runtime_binding=binding)
+    request = replace(_request(), runtime_binding=pre_system_mcp_binding(binding))
 
     draft = adapter.generate_draft(request)
     result = adapter.review_draft(
@@ -758,6 +762,8 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
     )
 
     assert result.outcome_document() == primary
+    for argv, *_ in runner.calls:
+        assert_loaded(argv)
     assert result.primary_session_ref == "provider-session:1"
     assert result.reviewer_agent_ref is None
     assert binding.model_ref == "gpt-6-sol"

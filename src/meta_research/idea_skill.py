@@ -26,6 +26,13 @@ from meta_research.codex_ledger import (
     CodexSessionLedgerReader,
 )
 from meta_research.system_prompt import read_output_language
+from meta_research.system_mcp_binding_compatibility import system_mcp_bindings_compatible
+from meta_research.system_mcp import (
+    SystemMcpError,
+    SystemMcpRegistry,
+    compile_snapshot,
+    validate_snapshot,
+)
 from meta_research.runtime_conditions import (
     compose_runtime_prompt, render_runtime_conditions, split_runtime_prompt,
 )
@@ -1007,6 +1014,7 @@ class CodexIdeaSkillAdapter:
         | None = None,
         codex_ledger_reader: CodexSessionLedgerReader | None = None,
         codex_home: Path | None = None,
+        system_mcp_registry: SystemMcpRegistry | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
@@ -1016,6 +1024,7 @@ class CodexIdeaSkillAdapter:
         self._model_ref = model_ref
         self._timeout_seconds = timeout_seconds
         self._runner = process_runner or _CancellableProcessRunner()
+        self._system_mcp_registry = system_mcp_registry
         self._codex_ledger_reader = codex_ledger_reader
         if self._codex_ledger_reader is None and codex_home is not None:
             self._codex_ledger_reader = CodexHomeLedgerReader(codex_home)
@@ -1033,6 +1042,14 @@ class CodexIdeaSkillAdapter:
             self._root_resident_mcp.bind_authority(authority)
         except RootResidentMcpError as error:
             raise IdeaSkillUnavailable(error.code) from error
+
+    def _new_system_mcp_snapshot(self) -> dict[str, object] | None:
+        if self._system_mcp_registry is None:
+            return None
+        try:
+            return self._system_mcp_registry.snapshot(self._root_agent_kind)
+        except SystemMcpError as error:
+            raise IdeaSkillUnavailable("system_mcp_configuration_unavailable") from error
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         try:
@@ -1252,6 +1269,9 @@ class CodexIdeaSkillAdapter:
                     "root_capability_profile",
                     "root_capability_profile_hash",
                 }
+                if "system_mcp_snapshot" in invocation:
+                    _operation_system_mcp_snapshot(invocation)
+                    expected_fields.add("system_mcp_snapshot")
                 if (
                     set(invocation) != expected_fields
                     or invocation.get("schema_ref")
@@ -1523,6 +1543,9 @@ class CodexIdeaSkillAdapter:
                 "root_capability_profile_hash",
                 *transport_limits.as_dict(),
             }
+            if "system_mcp_snapshot" in invocation:
+                _operation_system_mcp_snapshot(invocation)
+                expected_fields.add("system_mcp_snapshot")
             if (
                 set(invocation) != expected_fields
                 or invocation.get("schema_ref")
@@ -1643,7 +1666,7 @@ class CodexIdeaSkillAdapter:
         )
 
     def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
-        if request.runtime_binding != self.runtime_binding():
+        if not system_mcp_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
         skill = _idea_skill_instructions()
         lineage = _idea_owner_rejection_prompt(request)
@@ -1711,7 +1734,7 @@ class CodexIdeaSkillAdapter:
     def review_draft(
         self, request: IdeaSkillRequest, draft: IdeaSkillDraft
     ) -> IdeaSkillResult:
-        if request.runtime_binding != self.runtime_binding():
+        if not system_mcp_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise IdeaSkillUnavailable("idea_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:
             raise IdeaSkillUnavailable("codex_primary_session_changed")
@@ -2040,6 +2063,7 @@ class CodexIdeaSkillAdapter:
                     job_ref=None,
                     stdout_path=None,
                     invocation_hash=None,
+                    system_mcp_snapshot=self._new_system_mcp_snapshot(),
                     mcp_url=mcp_url,
                     mcp_token=mcp_token,
                     mcp_scope_binding_hash=mcp_scope_binding_hash,
@@ -2145,6 +2169,14 @@ class CodexIdeaSkillAdapter:
             **invocation_base,
             "transport_mode": current_transport_mode,
         }
+        # A pending operation owns its configuration, including the absence of
+        # this field in historical spools. Never consult mutable registration
+        # while recovering it, even if the registry is currently unavailable.
+        system_mcp_snapshot = (
+            None if invocation_path.exists() else self._new_system_mcp_snapshot()
+        )
+        if system_mcp_snapshot is not None:
+            invocation["system_mcp_snapshot"] = system_mcp_snapshot
         _key_path, transport_key = self._transport_key()
         invocation_json = _sealed_operation_invocation(invocation, transport_key)
         invocation_hash = canonical_hash(invocation)
@@ -2161,6 +2193,9 @@ class CodexIdeaSkillAdapter:
                 str, persisted_invocation["transport_mode"]
             )
             invocation = persisted_invocation
+            system_mcp_snapshot = _operation_system_mcp_snapshot(persisted_invocation)
+            if system_mcp_snapshot is not None and system_mcp_snapshot["root_kind"] != self._root_agent_kind:
+                raise IdeaSkillUnavailable("codex_operation_identity_conflict")
             transport_limits = _operation_transport_limits(
                 persisted_invocation
             )
@@ -2219,6 +2254,7 @@ class CodexIdeaSkillAdapter:
                 stdout_path=directory / "stdout.jsonl",
                 invocation_hash=invocation_hash,
                 mcp_url=mcp_url,
+                system_mcp_snapshot=system_mcp_snapshot,
                 mcp_token=mcp_token,
                 mcp_scope_binding_hash=mcp_scope_binding_hash,
                 semantic_mcp_protected_environment=(
@@ -2266,6 +2302,7 @@ class CodexIdeaSkillAdapter:
         mcp_scope_binding_hash: str | None = None,
         semantic_mcp_protected_environment: bool = False,
         sandbox_read_root: Path | None = None,
+        system_mcp_snapshot: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         mcp_values = (mcp_url, mcp_token, mcp_scope_binding_hash)
         if any(value is not None for value in mcp_values) and (
@@ -2293,6 +2330,14 @@ class CodexIdeaSkillAdapter:
         # tree. Root reconnects and native children share it, while shell
         # subprocesses do not inherit the bearer environment.
         capability_profile = root_capability_profile(self._root_agent_kind)
+        try:
+            system_mcp_argv, system_mcp_environment = (
+                compile_snapshot(system_mcp_snapshot)
+                if system_mcp_snapshot is not None
+                else ([], {})
+            )
+        except SystemMcpError as error:
+            raise IdeaSkillUnavailable("system_mcp_configuration_unavailable") from error
         argv = [
             self._executable,
             "exec",
@@ -2301,6 +2346,7 @@ class CodexIdeaSkillAdapter:
             "--strict-config",
             "--config",
             "mcp_servers={}",
+            *system_mcp_argv,
             *(
                 (
                     "--config",
@@ -2364,6 +2410,14 @@ class CodexIdeaSkillAdapter:
                 if semantic_mcp_enabled
                 else None
             )
+            if system_mcp_environment:
+                environment = {**system_mcp_environment, **(environment or {})}
+            if system_mcp_snapshot is not None and self._system_mcp_registry is not None:
+                self._system_mcp_registry.record_loading(
+                    system_mcp_snapshot,
+                    invocation_hash or canonical_hash({"prompt": prompt, "native_session_ref": native_session_ref}),
+                    native_session_ref=native_session_ref,
+                )
             if job_ref is None:
                 completed = (
                     self._runner(
@@ -2627,6 +2681,17 @@ def _validate_provider_inputs(
         raise IdeaSkillUnavailable("codex_output_schema_too_large")
 
 
+def _operation_system_mcp_snapshot(
+    invocation: dict[str, object],
+) -> dict[str, object] | None:
+    if "system_mcp_snapshot" not in invocation:
+        return None
+    try:
+        return validate_snapshot(invocation["system_mcp_snapshot"])
+    except SystemMcpError as error:
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+
+
 def _read_operation_invocation(
     path: Path,
     *,
@@ -2652,6 +2717,9 @@ def _read_operation_invocation(
     transport_mode = typed_invocation.get("transport_mode")
     _operation_transport_limits(typed_invocation)
     expected_keys = {*expected_base, "transport_mode"}
+    if "system_mcp_snapshot" in typed_invocation:
+        _operation_system_mcp_snapshot(typed_invocation)
+        expected_keys.add("system_mcp_snapshot")
     identity_fields = set(expected_base).difference(
         {
             "schema_ref",

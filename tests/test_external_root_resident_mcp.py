@@ -38,6 +38,7 @@ class _SequenceRunner:
         self._outputs = iter(outputs)
         self.environments: list[dict[str, str] | None] = []
         self.prompts: list[str] = []
+        self.argv: list[list[str]] = []
 
     def __call__(
         self,
@@ -49,6 +50,7 @@ class _SequenceRunner:
         del timeout
         self.environments.append(environment)
         self.prompts.append(prompt)
+        self.argv.append(argv)
         output_path = Path(argv[argv.index("--output-last-message") + 1])
         output_path.write_text(
             json.dumps(next(self._outputs), ensure_ascii=False),
@@ -282,13 +284,16 @@ def test_concurrent_exact_root_channel_is_issued_and_revoked_once() -> None:
 
 def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
     tmp_path: Path,
+    scoped_system_mcp,
 ) -> None:
+    registry, assert_loaded = scoped_system_mcp("acquisition")
     runner = _SequenceRunner([{"accepted": True, "human_request": None}])
     adapter = CodexAcquisitionRootAdapter(
         tmp_path / "acquisition",
         _WaitingAcquisitionDelegate(),  # type: ignore[arg-type]
         executable=str(_fake_codex(tmp_path / "acquisition-codex")),
         process_runner=runner,
+        system_mcp_registry=registry,
     )
     authority = _authority("acquisition", "acquisition-root-turn")
     adapter.bind_resident_mcp_authority(authority)
@@ -303,6 +308,7 @@ def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
     result = adapter.acquire(request)  # type: ignore[arg-type]
 
     assert result[0].status == "waiting_user"
+    assert_loaded(runner.argv[0])
     issued = authority.issue_resident_mcp_channel.call_args.kwargs
     assert issued["subject_policy"] == "operation_tree"
     assert issued["root_kind"] == "acquisition"
@@ -390,12 +396,15 @@ def test_quest_bound_companion_turn_uses_exact_resident_operation_tree(
 
 def test_pre_quest_companion_turn_remains_without_resident_channel(
     tmp_path: Path,
+    scoped_system_mcp,
 ) -> None:
+    registry, assert_loaded = scoped_system_mcp("companion")
     runner = _SequenceRunner([{"reply": "先澄清研究目标。"}])
     adapter = CodexCompanionAdapter(
         tmp_path / "pre-quest-companion",
         executable=str(_fake_codex(tmp_path / "pre-quest-companion-codex")),
         process_runner=runner,
+        system_mcp_registry=registry,
     )
     authority = _authority("companion", "companion-turn")
     adapter.bind_resident_mcp_authority(authority)
@@ -417,6 +426,7 @@ def test_pre_quest_companion_turn_remains_without_resident_channel(
 
     authority.issue_resident_mcp_channel.assert_not_called()
     assert runner.environments == [None]
+    assert_loaded(runner.argv[0])
 
 
 def test_production_acquisition_owner_injects_scope_into_actual_root_adapter(

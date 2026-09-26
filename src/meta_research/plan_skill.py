@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from meta_research.system_mcp import SystemMcpRegistry
+from meta_research.system_mcp_binding_compatibility import system_mcp_bindings_compatible
+
 from meta_research.context_presentation import stage_context_view
 
 from dataclasses import dataclass, replace
@@ -344,6 +347,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         | None = None,
         codex_ledger_reader: CodexSessionLedgerReader | None = None,
         codex_home: Path | None = None,
+        system_mcp_registry: SystemMcpRegistry | None = None,
     ) -> None:
         super().__init__(
             workspace,
@@ -353,6 +357,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             process_runner=process_runner,
             codex_ledger_reader=codex_ledger_reader,
             codex_home=codex_home,
+            system_mcp_registry=system_mcp_registry,
         )
 
     def runtime_binding(self) -> PlanRuntimeBinding:
@@ -447,7 +452,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         )
 
     def generate_draft(self, request: PlanSkillRequest) -> PlanSkillDraft:
-        if request.runtime_binding != self.runtime_binding():
+        if not system_mcp_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         lineage = _plan_owner_rejection_prompt(request)
         human_resume = (
@@ -541,7 +546,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
     def review_draft(
         self, request: PlanSkillRequest, draft: PlanSkillDraft
     ) -> PlanSkillResult:
-        if request.runtime_binding != self.runtime_binding():
+        if not system_mcp_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:
             raise PlanSkillUnavailable("codex_primary_session_changed")

@@ -1442,13 +1442,61 @@ def test_production_adapter_runs_packaged_skill_with_canonical_capabilities(
     _assert_codex_schema_types(review_schema)
 
 
-def test_idea_root_invocation_uses_and_revokes_its_operation_tree_channel(
+def test_system_mcp_changes_apply_to_review_and_continuation_in_same_native_session(
     tmp_path: Path,
 ) -> None:
+    from meta_research.system_mcp import SystemMcpRegistry
+
+    registry = SystemMcpRegistry(tmp_path / "system-mcp.json")
+    config = {
+        "server_id": "fixture", "display_name": "Fixture",
+        "transport": "stdio",
+        "connection": {"command": "fixture-one", "args": []},
+    }
+    registry.create(config, expected_revision=0)
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, _review_turn_output(), {"outcome": _idea_set()}]
+    )
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "provider", process_runner=runner, system_mcp_registry=registry,
+        executable=str(_fake_codex_executable(tmp_path / "codex", read_all_input=True)),
+    )
+    binding = adapter.runtime_binding()
+    request = _request(runtime_binding=binding)
+    draft = adapter.generate_draft(request)
+    registry.update("fixture", {**config, "connection": {"command": "fixture-two"}},
+                    expected_revision=1)
+    review = adapter.review_draft(
+        replace(request, native_session_ref=draft.primary_session_ref), draft
+    )
+    registry.delete("fixture", expected_revision=2)
+    continued = adapter.generate_draft(
+        replace(request, native_session_ref=draft.primary_session_ref)
+    )
+
+    assert 'mcp_servers.external_fixture.command="fixture-one"' in runner.calls[0][0]
+    assert 'mcp_servers.external_fixture.command="fixture-two"' in runner.calls[1][0]
+    assert not any("external_fixture" in arg for arg in runner.calls[2][0])
+    assert review.primary_session_ref == continued.primary_session_ref == draft.primary_session_ref
+    assert runner.calls[1][0][-3:] == runner.calls[2][0][-3:] == ["resume", "codex-primary:1", "-"]
+    assert adapter.runtime_binding() == binding
+    registry.path.write_text("not valid registry JSON", encoding="utf-8")
+    with pytest.raises(IdeaSkillUnavailable, match="system_mcp_configuration_unavailable"):
+        adapter.generate_draft(replace(request, native_session_ref=draft.primary_session_ref))
+    assert len(runner.calls) == 3
+
+
+def test_idea_root_invocation_uses_and_revokes_its_operation_tree_channel(
+    tmp_path: Path,
+    scoped_system_mcp,
+) -> None:
+    registry, assert_loaded = scoped_system_mcp("idea")
     runner = _SequenceRunner([{"outcome": _idea_set()}])
     authority = _IdeaResidentMcpAuthority()
     adapter = CodexIdeaSkillAdapter(
-        tmp_path / "idea-resident-mcp", process_runner=runner
+        tmp_path / "idea-resident-mcp", process_runner=runner,
+        system_mcp_registry=registry,
+        executable=str(_fake_codex_executable(tmp_path / "codex", read_all_input=True)),
     )
     adapter.bind_resident_mcp_authority(authority)
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
@@ -1486,6 +1534,7 @@ def test_idea_root_invocation_uses_and_revokes_its_operation_tree_channel(
         }
     ]
     argv = runner.calls[0][0]
+    assert_loaded(argv)
     assert 'mcp_servers.meta_research.url="http://127.0.0.1:8766/mcp"' in argv
     assert tuple(
         binding["semantic_operation_id"]
@@ -2540,6 +2589,62 @@ def test_durable_job_cancel_survives_daemon_runner_replacement(
         (operation / "supervisor-exit.json").read_text(encoding="utf-8")
     )
     assert receipt["payload"]["termination_reason"] == "stopped"
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_system_mcp_prelaunch_recovery_keeps_frozen_argv_and_legacy_hash(
+    tmp_path: Path, historical: bool,
+    pre_system_mcp_binding,
+) -> None:
+    from meta_research.system_mcp import SystemMcpRegistry
+
+    registry_path = tmp_path / "system-mcp.json"
+    registry = SystemMcpRegistry(registry_path)
+    registry.create({
+        "server_id": "fixture", "display_name": "Fixture", "transport": "stdio",
+        "connection": {"command": "original-fixture"},
+    }, expected_revision=0)
+    workspace = tmp_path / "provider"
+    executable = _fake_codex_executable(tmp_path / "codex", read_all_input=True)
+    first = CodexIdeaSkillAdapter(
+        workspace, executable=str(executable), process_runner=_PrelaunchLossRunner(),
+        system_mcp_registry=None if historical else registry,
+    )
+    binding = first.runtime_binding()
+    if historical:
+        binding = pre_system_mcp_binding(binding)
+        assert binding != first.runtime_binding()
+    request = _request(runtime_binding=binding, job_ref="mcp-recovery:1")
+    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_io_unavailable"):
+        first.generate_draft(request)
+    operation = next(workspace.glob("provider-operations/*/primary"))
+    invocation_before = (operation / "invocation.json").read_bytes()
+    supervisor_before = (operation / "supervisor-request.json").read_bytes()
+    assert (b"external_fixture" in supervisor_before) is not historical
+    assert (b"system_mcp_snapshot" in invocation_before) is not historical
+
+    registry.delete("fixture", expected_revision=1)
+    saved_registry = registry_path.read_bytes()
+    registry_path.write_text("corrupt registry while an operation is pending", encoding="utf-8")
+    recovered_adapter = CodexIdeaSkillAdapter(
+        workspace, executable=str(executable), system_mcp_registry=registry,
+    )
+    recovered = recovered_adapter.generate_draft(request)
+    assert recovered.primary_session_ref == "supervised-primary"
+    assert (operation / "invocation.json").read_bytes() == invocation_before
+    assert (operation / "supervisor-request.json").read_bytes() == supervisor_before
+    assert recovered_adapter.generate_draft(request) == recovered
+
+    registry_path.write_bytes(saved_registry)
+    next_request = replace(request, job_ref="mcp-recovery:2", native_session_ref=recovered.primary_session_ref)
+    continued = recovered_adapter.generate_draft(next_request)
+    assert continued.primary_session_ref == recovered.primary_session_ref
+    next_operation = next(path for path in workspace.glob("provider-operations/*/primary") if path != operation)
+    assert b"external_fixture" not in (next_operation / "supervisor-request.json").read_bytes()
+    with pytest.raises(IdeaSkillUnavailable, match="idea_runtime_binding_drift"):
+        recovered_adapter.generate_draft(replace(next_request, runtime_binding=replace(
+            binding, capability_bindings=("unexpected-capability",),
+        )))
 
 
 def test_durable_supervisor_recovers_a_prelaunch_daemon_loss(

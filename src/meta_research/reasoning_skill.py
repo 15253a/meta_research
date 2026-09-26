@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.system_mcp import SystemMcpRegistry
+
 from meta_research.context_presentation import stage_context_view
 
 from dataclasses import dataclass, replace
@@ -839,6 +841,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         | None = None,
         codex_ledger_reader: CodexSessionLedgerReader | None = None,
         codex_home: Path | None = None,
+        system_mcp_registry: SystemMcpRegistry | None = None,
     ) -> None:
         super().__init__(
             workspace,
@@ -848,6 +851,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             process_runner=process_runner,
             codex_ledger_reader=codex_ledger_reader,
             codex_home=codex_home,
+            system_mcp_registry=system_mcp_registry,
         )
         self._full_conformance_authority: (
             ReasoningFullConformanceAuthority | None

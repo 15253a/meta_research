@@ -442,7 +442,10 @@ def _fake_codex(path: Path) -> Path:
 
 def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     tmp_path: Path,
+    scoped_system_mcp,
+    pre_system_mcp_binding,
 ) -> None:
+    registry, assert_loaded = scoped_system_mcp("plan")
     draft = _plan()
     runner = _SequenceRunner(
         [
@@ -459,12 +462,15 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
         tmp_path / "provider",
         executable=str(_fake_codex(tmp_path / "codex")),
         process_runner=runner,
+        system_mcp_registry=registry,
     )
     binding = adapter.runtime_binding()
-    request = _request(runtime_binding=binding)
+    request = _request(runtime_binding=pre_system_mcp_binding(binding))
 
     result = adapter.execute(request)
     validate_plan_skill_result(request, result)
+    for argv, *_ in runner.calls:
+        assert_loaded(argv)
 
     assert result.primary_session_ref == "codex-plan-primary:1"
     assert result.review_mode == "advisory_unobserved"

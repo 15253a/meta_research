@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.system_mcp_binding_compatibility import system_mcp_bindings_compatible
+
 from dataclasses import dataclass, replace
 import hashlib
 from importlib.resources import files
@@ -427,7 +429,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
         return draft
 
     def _require_runtime_binding(self, request: WritingSkillRequest) -> None:
-        if request.runtime_binding != self.runtime_binding(request.document_type):
+        if not system_mcp_bindings_compatible(request.runtime_binding, self.runtime_binding(request.document_type)):
             raise WritingSkillUnavailable("writing_runtime_binding_drift")
 
     def review_draft(

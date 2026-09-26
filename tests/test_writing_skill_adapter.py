@@ -290,7 +290,10 @@ def test_type_specific_skill_resource_uses_the_same_resumable_session_seam(
     intent_schema_ref: str,
     draft_factory: Callable[[], dict[str, object]],
     profile_heading: str,
+    scoped_system_mcp,
+    pre_system_mcp_binding,
 ) -> None:
+    registry, assert_loaded = scoped_system_mcp("writing")
     draft = draft_factory()
     runner = _SequenceRunner(
         [
@@ -311,6 +314,7 @@ def test_type_specific_skill_resource_uses_the_same_resumable_session_seam(
         executable=str(_fake_codex(tmp_path / "codex")),
         model_ref="test-model",
         process_runner=runner,
+        system_mcp_registry=registry,
     )
     request = replace(
         _request(adapter),
@@ -323,12 +327,14 @@ def test_type_specific_skill_resource_uses_the_same_resumable_session_seam(
             "purpose": "communicate bounded evidence",
             "instructions": "",
         },
-        runtime_binding=adapter.runtime_binding(document_type),
+        runtime_binding=pre_system_mcp_binding(adapter.runtime_binding(document_type), document_type),
     )
 
     result = adapter.execute(request)
 
     assert result.primary_session_ref == "codex-writing-primary:1"
+    for argv, *_ in runner.calls:
+        assert_loaded(argv)
     assert runner.calls[1][0][-3:] == [
         "resume",
         "codex-writing-primary:1",

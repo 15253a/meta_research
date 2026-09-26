@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.system_mcp_binding_compatibility import system_mcp_bindings_compatible
+
 from meta_research.context_presentation import literature_reference
 
 from dataclasses import asdict, dataclass
@@ -459,7 +461,7 @@ class IdeaStageWorker:
         except IdeaSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
-        if runtime_binding != run.runtime_binding:
+        if not system_mcp_bindings_compatible(runtime_binding, run.runtime_binding):
             self._transient_error = "idea_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
         invocation = (

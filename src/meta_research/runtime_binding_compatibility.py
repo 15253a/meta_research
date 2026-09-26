@@ -6,6 +6,7 @@ policy prose resources. Models, capabilities, tools, executable artifacts and
 output schemas are still compared exactly.
 """
 from typing import TYPE_CHECKING
+from meta_research.system_mcp_binding_compatibility import system_mcp_bindings_compatible
 
 if TYPE_CHECKING:
     from meta_research.owners.agent_runtime import BundleRuntimeBinding, ReasoningRuntimeBinding
@@ -224,6 +225,8 @@ def bundle_bindings_compatible(left: "BundleRuntimeBinding", right: "BundleRunti
         return False
     if left == right:
         return True
+    if system_mcp_bindings_compatible(left, right):
+        return True
     before = _reviewed_conditions_execution_value(left)
     after = _reviewed_conditions_execution_value(right)
     if before is not None and after is not None and before == after:
@@ -292,6 +295,8 @@ def reasoning_bindings_compatible(
     if type(left) is not ReasoningRuntimeBinding or type(right) is not ReasoningRuntimeBinding:
         return False
     if left == right:
+        return True
+    if system_mcp_bindings_compatible(left, right):
         return True
     pair = frozenset((canonical_hash(left.as_dict()), canonical_hash(right.as_dict())))
     return len(pair) == 2 and pair in _REVIEWED_REASONING_BINDING_PAIRS

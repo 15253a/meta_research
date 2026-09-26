@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from meta_research.system_mcp import SystemMcpRegistry
+from meta_research.system_mcp_binding_compatibility import previous_system_mcp_binding
+
 import hashlib
 import subprocess
 from dataclasses import replace
@@ -56,6 +59,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         ]
         | None = None,
         codex_home: Path | None = None,
+        system_mcp_registry: SystemMcpRegistry | None = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
@@ -67,6 +71,7 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             timeout_seconds=timeout_seconds,
             process_runner=process_runner,
             codex_home=codex_home,
+            system_mcp_registry=system_mcp_registry,
         )
         _key_path, self._transport_key = ensure_transport_key(self._workspace)
 
@@ -100,6 +105,30 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         self, authority: RootResidentMcpAuthority
     ) -> None:
         self._root.bind_resident_mcp_authority(authority)
+
+    def runtime_binding_compatible(self, historical: AcquisitionRuntimeBinding) -> bool:
+        current = self.runtime_binding()
+        if historical == current:
+            return True
+        root = self._root.runtime_binding()
+        previous = previous_system_mcp_binding(root)
+        if previous is None:
+            return False
+        current_hash = canonical_hash(root.as_dict())
+        previous_hash = canonical_hash(previous.as_dict())
+        expected = replace(
+            current,
+            provider_version=current.provider_version.replace(
+                "+root-sha256:" + current_hash, "+root-sha256:" + previous_hash,
+            ),
+            capability_bindings=tuple(
+                "acquisition-codex-root-binding:sha256:" + previous_hash
+                if entry == "acquisition-codex-root-binding:sha256:" + current_hash
+                else entry
+                for entry in current.capability_bindings
+            ),
+        )
+        return historical == expected
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         self._root.configure_resident_mcp_endpoint(base_url)

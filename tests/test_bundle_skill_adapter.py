@@ -757,7 +757,10 @@ def _fake_codex(path: Path) -> Path:
 
 def test_completion_rejection_feedback_reaches_bundle_primary_prompt(
     tmp_path: Path,
+    scoped_system_mcp,
+    pre_system_mcp_binding,
 ) -> None:
+    registry, assert_loaded = scoped_system_mcp("bundle")
     plan = _plan_document()
     context = {
         "schema_ref": "meta-research/bundle-context-pack/v1",
@@ -778,6 +781,7 @@ def test_completion_rejection_feedback_reaches_bundle_primary_prompt(
         tmp_path / "bundle-successor-provider",
         executable=str(_fake_codex(tmp_path / "codex-successor")),
         process_runner=runner,
+        system_mcp_registry=registry,
     )
     adapter.bind_full_conformance_authority(_FullConformanceAuthority())
     adapter.configure_resident_mcp_endpoint("http://semantic-mcp.invalid")
@@ -794,7 +798,7 @@ def test_completion_rejection_feedback_reaches_bundle_primary_prompt(
         context_pack=context,
         plan_document=plan,
         root_session_ref="ar-session:bundle-1",
-        runtime_binding=adapter.runtime_binding(),
+        runtime_binding=pre_system_mcp_binding(adapter.runtime_binding()),
         inbox_checkpoint=_inbox_checkpoint(
             run_ref="bundle-run:1",
             attempt_ref="bundle-attempt:2",
@@ -810,6 +814,7 @@ def test_completion_rejection_feedback_reaches_bundle_primary_prompt(
     adapter.execute(request)
 
     assert len(runner.calls) == 1
+    assert_loaded(runner.calls[0][0])
     prompt = runner.calls[0][1]
     assert "owner_rejection_kind=completion" in prompt
     assert "bundle-candidate:rejected" in prompt

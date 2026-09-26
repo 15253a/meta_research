@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.system_mcp import SystemMcpRegistry
+
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -255,6 +257,7 @@ class _DeepFetchRequestAuthorityRouter:
 @dataclass
 class ProductionRuntime:
     data_root: DataRoot
+    system_mcp_registry: SystemMcpRegistry
     owners: OwnerInterfaces
     authentication: Authentication
     feed: DurableFeed
@@ -572,9 +575,11 @@ def build_production_runtime(
     codex_provider_runner = _CancellableProcessRunner(
         protected_environment=data_root.codex_environment
     )
+    system_mcp_registry = SystemMcpRegistry(data_root.root / "system-mcp.json")
     companion_adapter = (
         CodexCompanionAdapter(
             data_root.root / "companion-provider",
+            system_mcp_registry=system_mcp_registry,
             executable=codex_executable,
             process_runner=codex_provider_runner,
             codex_home=data_root.codex_home.absolute(),
@@ -589,18 +594,21 @@ def build_production_runtime(
     host_compute_probe = host_compute_probe or NvidiaSmiProbe()
     idea_skill_provider = idea_skill_provider or CodexIdeaSkillAdapter(
         data_root.root / "idea-skill-provider",
+        system_mcp_registry=system_mcp_registry,
         executable=codex_executable,
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
     )
     plan_skill_provider = plan_skill_provider or CodexPlanSkillAdapter(
         data_root.root / "plan-skill-provider",
+        system_mcp_registry=system_mcp_registry,
         executable=codex_executable,
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
     )
     bundle_skill_provider = bundle_skill_provider or CodexBundleSkillAdapter(
         data_root.root / "bundle-skill-provider",
+        system_mcp_registry=system_mcp_registry,
         executable=codex_executable,
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
@@ -609,6 +617,7 @@ def build_production_runtime(
         reasoning_skill_provider
         or CodexReasoningSkillAdapter(
             data_root.root / "reasoning-skill-provider",
+            system_mcp_registry=system_mcp_registry,
             executable=codex_executable,
             process_runner=codex_provider_runner,
             codex_home=data_root.codex_home.absolute(),
@@ -617,12 +626,14 @@ def build_production_runtime(
     acquisition_provider = acquisition_provider or CodexAcquisitionRootAdapter(
         data_root.root / "acquisition-root-provider",
         NatureDownloaderAdapter(),
+        system_mcp_registry=system_mcp_registry,
         executable=codex_executable,
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
     )
     writing_skill_provider = writing_skill_provider or CodexWritingSkillAdapter(
         data_root.root / "writing-skill-provider",
+        system_mcp_registry=system_mcp_registry,
         executable=codex_executable,
         process_runner=codex_provider_runner,
     )
@@ -687,6 +698,7 @@ def build_production_runtime(
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
+        system_mcp_registry=system_mcp_registry,
         executable=codex_executable,
         process_runner=codex_provider_runner,
         codex_home=data_root.codex_home.absolute(),
@@ -961,6 +973,7 @@ def build_production_runtime(
         harness_adapters = (
             CodexHarnessAdapter(
                 data_root.run / "harness",
+                system_mcp_registry=system_mcp_registry,
                 executable=codex_executable,
                 runner=codex_harness_transport,
                 codex_home=data_root.codex_home.absolute(),
@@ -1136,6 +1149,7 @@ def build_production_runtime(
             provider_lifecycles.append(provider)
     runtime = ProductionRuntime(
         data_root=data_root,
+        system_mcp_registry=system_mcp_registry,
         owners=owners,
         authentication=Authentication(database),
         feed=feed,

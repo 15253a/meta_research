@@ -15039,6 +15039,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             runtime_binding_hash = validate_acquisition_runtime_binding(runtime_binding)
         except AcquisitionUnavailable as error:
             raise OwnerConflict(error.code) from error
+        # The reviewed additive MCP transport upgrade may execute an existing
+        # Acquisition session without changing its admitted identity or grants.
+        compatible = getattr(provider, "runtime_binding_compatible", None)
+        if (
+            runtime_binding != session.runtime_binding
+            and callable(compatible)
+            and compatible(session.runtime_binding)
+        ):
+            runtime_binding = session.runtime_binding
+            runtime_binding_hash = session.runtime_binding_hash
         resume_binding: tuple[str, str, int] | None = None
         resume_target: dict[str, object] | None = None
         resume_route: dict[str, object] | None = None

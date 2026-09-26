@@ -271,7 +271,9 @@ def test_codex_adapter_generates_a_schema_checked_proposal_outside_domain_state(
 
 def test_companion_proposal_fork_returns_public_content_without_replacing_root_session(
     tmp_path: Path,
+    scoped_system_mcp,
 ) -> None:
+    registry, assert_loaded = scoped_system_mcp("companion")
     runner = RecordingRunner(
         {
             "proposal_fork_native_session_ref": "proposal-drafter-native-1",
@@ -282,6 +284,7 @@ def test_companion_proposal_fork_returns_public_content_without_replacing_root_s
     adapter = CodexCompanionAdapter(
         tmp_path / "companion",
         process_runner=runner,
+        system_mcp_registry=registry,
     )
 
     result = adapter.draft(
@@ -296,6 +299,7 @@ def test_companion_proposal_fork_returns_public_content_without_replacing_root_s
 
     assert result.content == QUESTION
     assert result.adapter_kind == "codex_companion_fork"
+    assert_loaded(runner.calls[0][0])
     assert result.companion_native_session_ref == "companion-native-1"
     assert result.proposal_fork_native_session_ref == "proposal-drafter-native-1"
 
@@ -2023,6 +2027,8 @@ def test_production_composition_installs_real_drafting_and_compute_adapters(
 ) -> None:
     runtime = build_production_runtime(prepare_data_root(tmp_path / "production-seams"))
     try:
+        assert runtime.system_mcp_registry.path == runtime.data_root.root / "system-mcp.json"
+        assert runtime.system_mcp_registry.read() == {"revision": 0, "servers": []}
         hc = runtime.owners.human_collaboration
         assert isinstance(hc._proposal_drafter, CodexCompanionAdapter)
         assert isinstance(hc._intent_drafting_provider, CodexCompanionAdapter)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.system_mcp import SystemMcpRegistry
+
 import json
 import subprocess
 from pathlib import Path
@@ -105,6 +107,7 @@ class CodexCompanionAdapter(
         ]
         | None = None,
         codex_home: Path | None = None,
+        system_mcp_registry: SystemMcpRegistry | None = None,
     ) -> None:
         super().__init__(
             workspace,
@@ -113,6 +116,7 @@ class CodexCompanionAdapter(
             timeout_seconds=timeout_seconds,
             process_runner=process_runner,
             codex_home=codex_home,
+            system_mcp_registry=system_mcp_registry,
         )
 
     def capability_profile(self) -> RootCapabilityProfile:
