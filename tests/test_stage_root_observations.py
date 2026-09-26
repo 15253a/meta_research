@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from meta_research.database import Database
 from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.provider_supervisor import (
@@ -17,6 +18,7 @@ from meta_research.stage_root_observations import (
     StageRootObservationError,
     StageRootObservationReader,
 )
+from meta_research.system_mcp import SystemMcpRegistry
 from meta_research.web import create_app
 from test_idea_stage_recovery import _IdeaProvider, _confirm_question, _runtime as _owner_runtime
 
@@ -105,11 +107,16 @@ def _authenticated_client(runtime: object) -> TestClient:
     return client
 
 
-def _runtime(reader: StageRootObservationReader) -> object:
+def _runtime(reader: StageRootObservationReader, tmp_path: Path) -> object:
+    data_root = prepare_data_root(tmp_path / "web-runtime")
     configurable = SimpleNamespace(
         configure_resident_mcp_endpoint=lambda _base_url: None
     )
     return SimpleNamespace(
+        system_mcp_registry=SystemMcpRegistry(tmp_path / "system-mcp.json"),
+        data_root=data_root,
+        _database=Database(data_root.database),
+        target_run_authorities=SimpleNamespace(agent_runtime=configurable),
         configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,
@@ -548,7 +555,7 @@ def test_stage_root_observation_route_is_authenticated_bounded_and_redacted(
         ),
     )
     reader = _reader(tmp_path, {str(scope["run_ref"]): scope})
-    client = _authenticated_client(_runtime(reader))
+    client = _authenticated_client(_runtime(reader, tmp_path))
     try:
         response = client.get(
             "/api/v1/stage-runs/plan-run-observed/root-observations",
@@ -618,7 +625,7 @@ def test_stage_raw_output_route_pages_exact_private_provider_stdout(
     )
     expected = (directory / "stdout.jsonl").read_text(encoding="utf-8")
     reader = _reader(tmp_path, {str(scope["run_ref"]): scope})
-    client = _authenticated_client(_runtime(reader))
+    client = _authenticated_client(_runtime(reader, tmp_path))
     try:
         pages: list[dict[str, object]] = []
         chunks: list[str] = []

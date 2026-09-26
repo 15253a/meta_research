@@ -28,6 +28,8 @@ from meta_research.owners.agent_runtime_harness import (
     SQLiteAgentRuntimeHarness,
 )
 from meta_research.owners.common import canonical_hash, canonical_json
+from meta_research.paths import prepare_data_root
+from meta_research.system_mcp import SystemMcpRegistry
 from meta_research.target_raw_output import TargetRawOutputStore
 from meta_research.target_run_runtime_contract import TargetCompletionHandoff
 from meta_research.web import create_app
@@ -546,6 +548,10 @@ def test_target_root_observation_web_page_is_authenticated_bounded_and_redacted(
         configure_resident_mcp_endpoint=lambda _base_url: None
     )
     runtime = SimpleNamespace(
+        system_mcp_registry=SystemMcpRegistry(tmp_path / "system-mcp.json"),
+        data_root=prepare_data_root(tmp_path / "web-runtime"),
+        _database=database,
+        target_run_authorities=SimpleNamespace(agent_runtime=owner),
         configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,
@@ -644,6 +650,10 @@ def test_long_target_root_output_emits_gaps_and_keeps_web_cursor_advancing(
         configure_resident_mcp_endpoint=lambda _base_url: None
     )
     runtime = SimpleNamespace(
+        system_mcp_registry=SystemMcpRegistry(tmp_path / "system-mcp.json"),
+        data_root=prepare_data_root(tmp_path / "web-runtime"),
+        _database=database,
+        target_run_authorities=SimpleNamespace(agent_runtime=owner),
         configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,
@@ -765,6 +775,10 @@ def test_authenticated_target_raw_output_keeps_two_streams_isolated_across_recon
     )
     harness = _raw_output_harness(owner, transport, store, tmp_path)
     runtime = SimpleNamespace(
+        system_mcp_registry=SystemMcpRegistry(tmp_path / "system-mcp.json"),
+        data_root=prepare_data_root(tmp_path / "web-runtime"),
+        _database=database,
+        target_run_authorities=SimpleNamespace(agent_runtime=owner),
         configure_resident_mcp_endpoint=lambda _base_url: None,
         bundle_stage=configurable,
         reasoning_stage=configurable,
