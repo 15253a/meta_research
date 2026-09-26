@@ -53,6 +53,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=18779)
     parser.add_argument("--tag", default="stdio")
     parser.add_argument("--log")
+    parser.add_argument("--require-token")
     options = parser.parse_args()
     if options.http:
         class Handler(BaseHTTPRequestHandler):
@@ -63,6 +64,8 @@ if __name__ == "__main__":
             def do_DELETE(self):
                 self.send_response(200); self.end_headers()
             def do_POST(self):
+                if options.require_token and self.headers.get("Authorization") != "Bearer " + options.require_token:
+                    self.send_response(401); self.send_header("Content-Length", "0"); self.end_headers(); return
                 message = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 result = respond(message, options.tag, options.log)
                 self.send_response(200 if result else 202)

@@ -2,7 +2,7 @@
 
 日期：2026-09-26。设计依据：[系统 MCP 注册与根 Session 注入 Spec](system-mcp-registration-spec.md)。
 
-状态：注册、公共配置构建、生产 Codex 接线及管理界面已实现；本文列出的专项验证与历史能力绑定兼容代码复核已通过。**完整后端回归和 8769 正式部署仍待完成，不能把本记录当作部署成功证明。** 后续应在本文末尾补充实际结果。
+状态：注册、公共配置构建、生产 Codex 接线及管理界面已实现；专项验证、完整后端审计及兼容性复核已完成。完整仓库回归未全绿，详见文末的原始结果与基线差分。**8769 正式部署仍待执行，不能把本记录当作部署成功证明。**
 
 工作基线为从 8769 当前工作树取得的快照 `ebc1cc9`，包括远端原有未提交改动；不是用旧本地副本覆盖部署。原生验证使用部署所锁定的 **Codex CLI 0.156.1**，在隔离测试目录和专用 fixture 上执行，没有连接真实设备或开展研究任务。
 
@@ -103,7 +103,7 @@ stdio 示例：
 
 证据存放于隔离测试工作区的 `native-evidence/`，测试服务源码为 `tests/fixtures/system_mcp_server.py`。不提交或展示测试原生 home 中的认证文件。
 
-四轮真实调用的 `thread.started` 均为 `01a0dd2e-de3f-7590-a8f9-0037a2bb3eb3`，不是新建四个原生会话。
+各轮真实调用的 `thread.started` 均为 `01a0dd2e-de3f-7590-a8f9-0037a2bb3eb3`，没有通过新建原生会话规避配置更新。
 
 | 运行 | 冻结注册修订 | 实际证据 |
 | --- | --- | --- |
@@ -112,6 +112,8 @@ stdio 示例：
 | `resume-changed` | 5 | 修改 stdio 工具集并删除 HTTP 注册后，继续原 session；`receipt_new` 调用成功，原生工具目录查询确认旧 `receipt_stdio` 和 `receipt_http` 不存在；仍记得首次给定词 `ORCHID` |
 | `resume-scope` | 6 | 将 stdio 范围缩为 target 后继续 companion；实际目录查询返回外部工具列表为空、`receipt_new_available=false`，且仍记得 `ORCHID` |
 | `resume-child` | 7 | 恢复 all 范围后，原生父会话创建 `/root/inheritance_check`；子会话实际发现并调用 `receipt_new`，返回确定性 receipt |
+| `resume-disabled` | 8 | 停用 stdio 后继续原 Session，当前目录中 `receipt_new` 不存在，且仍记得 `ORCHID` |
+| `resume-auth-failure` | 10 | 新增返回 HTTP 401 的服务后，健康 stdio 的 `receipt_new` 仍实际调用成功，原会话正常回复 |
 
 子会话证据不仅是父模型总结：原生父 rollout 记录 `SubAgentActivity` started/completed，子原生引用为 `01a0dd30-0692-7cb3-8a4e-20f2b1bd9f41`；子 rollout 于 10:08:35 UTC 记录了 `external_stdio / receipt_new` 的 completed `McpToolCall` 与结构化 receipt。`new.log` 同时记录对应 fixture `tools/call`。紧凑 CLI JSONL 未完整暴露 spawn 细节，因此使用原生 journal 交叉核验。
 
@@ -129,8 +131,27 @@ stdio 示例：
 | `resume-changed.jsonl` | `e34c8fcc92b533a00b204ca3b4ed2e1d58a7c85fd4772525cd2fe0423354ef68` |
 | `resume-scope.jsonl` | `4e29ce1518dd9d4ce39b6013cc331422dfe8ab6986a4f2791ffe393185eb45d3` |
 | `resume-child.jsonl` | `df5ef934174ff9b1df34d724ba4cb8a2a1a6babf4d8b5de53bd5e38948004288` |
+| `resume-disabled.jsonl` | `875139cdec5b9b937eca58605046993d4dfed3bf70b765a763f5333678605d1d` |
+| `resume-auth-failure.jsonl` | `c095bb37e5e0f8ab2791a5ec320cfea16c3ad69fd97d7db48221d8f5140d269e` |
+| `resume-isolated.jsonl` | `9a702ac546b7e81f9624d2b6b3e37a621e59cc16cf23c88ea4b1888724950211` |
 
-范围边界：真实实验直接验证了修改、移除、缩小及恢复范围后的原会话工具目录变化；enabled=false 的选择和持久化由公共合同/UI 测试验证，未额外重复一次真实模型禁用实验。未决恢复使用签名 spool/监督进程测试验证，没有在真实设备动作执行中人为崩溃。HTTP 认证配置编译与错误隔离有合同覆盖，但本次真实 HTTP fixture 未启用认证挑战，不能据此声称已实测所有认证失败模式。
+HTTP 认证挑战补充验证见 `auth-checks.json`：修订 10 未提供认证引用时检查为 failed；修订 11 配置正确 bearer 环境变量引用后检查为 connected，发现 2 项工具。测试仅使用专用 fixture 凭据。
+
+范围边界：真实实验直接验证了修改、移除、停用、缩小及恢复范围后的原会话工具目录变化，以及 HTTP 401 对健康工具的隔离。未决恢复使用签名 spool/监督进程测试验证，没有在真实设备动作执行中人为崩溃；认证验证不代表覆盖全部外部供应商认证机制。
+
+## 宿主配置隔离的原生复验
+
+锁定版本 Codex 0.156.1 的 `--config mcp_servers={}` 会深度合并宿主配置，单独使用不能清空已有服务。因此生产启动会在应用专属的原生 home 中安装固定名称的 `meta-research-system-mcp-v1.config.toml`，内容为 `mcp_servers=[]` 与 `projects=[]`。随后操作 CLI 层重新提供合法的空 projects 表与完整 MCP 表。前一配置层清除继承的服务和项目信任映射，后一层恢复受控配置；工作目录的 `.codex/config.toml` 不再重新引入外部服务。
+
+这个 profile 只在当前部署管理的 home 创建，不修改 `config.toml`、认证、技能、插件安装或原生 Session 文件。既有同名 profile 内容不符或为符号链接时明确失败，避免静默覆盖。非 MCP 的用户全局配置继续加载；AR 显式能力参数、内部 MCP 的 required 与身份保持原合同。此机制会排除项目目录的原生配置层，研究执行继续由 AR 和操作参数控制。
+
+该版本的 `--strict-config` 会提前校验中间配置层，拒绝用于重置的数组。因此仅具有新系统 MCP 快照的启动路径省略该选项，最终合并结果仍由原生类型校验；注册配置另有严格字段与值校验。历史字段缺失的操作仍使用原 `--strict-config` 和封存 argv，不改变其 hash。版本升级需重新执行这项原生合同验证。
+
+真实无模型回归同时设置用户 MCP、已信任项目 MCP，以及与注册项同名的不同 transport 和嵌套环境参数，证明原生目录只剩选中项且没有继承字段；空注册表得到空目录。随后 `resume-isolated` 在同一个原生 Session 中成功：记得 `ORCHID`，当前目录没有 `user_hidden` / `project_hidden`，健康 `receipt_new` 实际调用成功。证据为 `isolated-native-catalog.json`、`resume-isolated.jsonl` 与原生 journal。
+
+隔离后的子会话也有独立工具调用证据：`01a0dd54-9b9d-7703-89a3-adb83cd9d3b7` 的原生 journal 于 10:48:32.880 UTC 记录 `external_stdio / receipt_new` 的 completed `McpToolCall`，结果为 `MCP_RECEIPT_new_7f392bc1`。
+
+该版本的 app-server 不支持选择命名 profile。独立连接检查在其临时 home 的 `config.toml` 写入相同重置层，再由 CLI 提供最终配置，并以临时目录为工作目录；不会改动生产 home。最终真实 app-server 握手/发现检查成功，发现 2 项工具，fixture 未收到业务 `tools/call`。
 
 ## 状态、快照与运维
 
@@ -153,10 +174,22 @@ stdio 示例：
 
 ## 验证进度与复核
 
-- 注册与独立连接检查合同：30 项通过，包括无效字段、敏感引用、并发修订、冻结恢复、全部权威根选择、有限超时与进程退出。
+- 注册与独立连接检查合同：最终 33 项通过，包括无效字段、敏感引用、并发修订、冻结恢复、全部权威根选择、有限超时与进程退出，以及真实原生配置隔离和 app-server 检查。
 - 管理 API：2 项公开边界测试通过，包括持久化、范围、修订冲突、既有 CSRF 和非法配置。
 - 前端：2 项 Playwright 测试通过，包括桌面滚动、移动布局、CRUD/启停/范围、修订冲突后保留编辑；截图 `web/test-results/system-mcp-desktop.png`、`system-mcp-mobile.png` 已检查。应用及测试 TypeScript 类型检查通过。
-- 原生互操作：上述 stdio、HTTP、文本/结构化内容、图片、同 Session 继续、目录移除和子会话继承实验通过。全套后端测试最终数量尚未汇总，不把不同批次通过数相加。
+- 原生互操作：上述 stdio、HTTP、文本/结构化内容、图片、同 Session 继续、目录移除、认证失败、宿主配置隔离和子会话继承实验通过。
 - 覆盖守卫：`test_system_mcp_coverage.py` 的 10 项检查通过。
 - Standards 复核：基于 `git diff ebc1cc9`、`CONTEXT.md` 与相关 ADR，对接线/API/UI 及最终历史绑定兼容补丁的复核为 **0 项规范违背、0 项需要处理的结构气味**。兼容桥仅接受捕获的精确类型、instruction hash 和有序源码摘要；仅归一这次升级前后的已审核字段，其余模型、能力、工具、schema、delegate 等绑定仍完整比较，Owner 保留原已接纳身份。8 个当前源码模块摘要已独立核对与 after fixture 一致。
-- 最终待补：完整后端测试结果、正式部署时间/版本、部署后健康与历史 Session 验证结果。
+- 最终 MCP 专项合并运行：69 项通过，包含全部 `test_system_mcp*.py` 与 13 项公共 provider/生产 composition 测试，实际原生测试开关已启用。证据 `suite-audit/system-mcp-final-focused.xml`。
+- Bundle 策略兼容补充：同一可执行代码的后续文案刷新在应用升级桥之前比较；既有策略、跨升级策略与 Reasoning 兼容合并检查 55 项通过。另 1 项 `bundle_review_result_contract_invalid` 在部署前基线同样失败。证据 `corrected-bundle-policy.xml`。
+- 路由测试桩补齐真实 runtime 的 registry/data root/database 依赖，16 项通过；没有在生产代码中加入空注册表兜底。证据 `corrected-web-runtime-fixtures.xml`。
+
+完整后端审计使用 8 个独立 pytest 进程覆盖全部测试模块，并允许收集错误继续；单测试审计上限 90 秒。首次汇总为 **3,013 passed / 230 failed / 19 errors / 2 skipped（3,264 项）**，这是最终修补前的原始审计结果，不能当作全量通过。日志与 XML 位于隔离测试目录 `suite-audit/shard-*`，原始汇总为 `suite-audit/summary.json`。
+
+收集阶段的 9 个缺失旧符号错误已在实际部署基线源码中完整复现。受本次改动影响的失败模块另做精确基线对照，确认旧 Harness、DeepFetch 原生 CLI 可用性、旧 schema/能力预期、旧超时约定和部分 Owner/阶段合同测试已有失败。审计 PATH 漏加虚拟环境 bin 导致的 8 项产品 CLI 用例已单独校正重跑，7 项通过，剩余旧 Claude 后端预期在基线同样失败。不得把上述不同批次的数字简单相加成“最终全量通过”。
+
+子进程封存测试在全量和单独运行中出现超时；以相同 PATH 交替运行基线及最终代码，两者均复现于未修改的 `quest_drafting.run_durable_job` 等待位置。该既有进程收尾问题未在本次 MCP 注册功能中重写；专项未决恢复、历史 argv/hash、Target 与 DeepFetch segment 对账测试通过。
+
+部署前只读核对：远端源码、冻结基线与旧安装包的 282 个包文件逐字节一致；存在与安装内容完全一致的回滚 wheel，数据库 `integrity_check=ok`，未发现正在执行的原生 Codex 进程。部署脚本在写入前再次核对整个包及每个增量目标，并在服务停止后备份 SQLite、核对 11 个 Session/请求表的行数与内容摘要。
+
+最终待补：正式部署时间/版本、部署后健康和页面检查结果。
