@@ -20,6 +20,7 @@ async function setup(page: Page) {
       else state.servers = [{ ...body.config, revision: state.revision, connection_status: { status: "unknown", revision: state.revision, checked_at: null } }];
       return json(state, request.method() === "POST" ? 201 : 200);
     }
+    if (url.pathname === "/api/v1/preferences") return route.fulfill({ contentType: "application/json", body: '{"output_language":"zh"}' });
     if (url.pathname.startsWith("/api/")) return route.abort();
     const file = resolve(webRoot, url.pathname === "/" ? "index.html" : `.${url.pathname}`);
     return route.fulfill({ contentType: extname(file) === ".js" ? "application/javascript" : extname(file) === ".css" ? "text/css" : "text/html", body: await readFile(file) });
@@ -42,6 +43,9 @@ test("user registers scoped HTTP service, toggles it and removes it", async ({ p
   await expect(page.getByRole("heading", { name: "测试摄像头" })).toBeVisible();
   expect(state.servers[0].scope).toEqual({ mode: "root_kinds", root_kinds: ["companion"] });
   await expect(page.getByText("未知 · 尚无连接证据")).toBeVisible();
+  await page.screenshot({ path: "test-results/system-mcp-desktop.png", fullPage: true });
+  await page.mouse.wheel(0, 600);
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
   await page.getByRole("button", { name: "停用", exact: true }).click();
   await expect(page.getByText("已停用", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "移除", exact: true }).click();
@@ -64,4 +68,5 @@ test("revision conflict preserves typed stdio connection and mobile layout", asy
   await expect(page.getByLabel("命令", { exact: true })).toHaveValue("/usr/bin/python3");
   await expect(page.getByLabel("参数数组（JSON）")).toHaveValue('["/srv/mcp/server.py", "with spaces"]');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: "test-results/system-mcp-mobile.png", fullPage: true });
 });

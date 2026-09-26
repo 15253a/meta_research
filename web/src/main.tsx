@@ -4408,7 +4408,7 @@ function App() {
   if (parameters.get("settings") === "mcp") return <SystemMcpSettings />;
   const detailsRequested = parameters.has("workspace") || parameters.has("panel")
     || parameters.has("view") || parameters.has("inspector") || parameters.has("companion");
-  return detailsRequested ? <DetailedApp /> : <StatusHome />;
+  return <><OutputLanguageControl floating />{detailsRequested ? <DetailedApp /> : <StatusHome />}</>;
 }
 
 function DetailedApp() {
@@ -5613,6 +5613,6 @@ function DetailedApp() {
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <OutputLanguageProvider><OutputLanguageControl floating /><App /></OutputLanguageProvider>
+    <OutputLanguageProvider><App /></OutputLanguageProvider>
   </StrictMode>,
 );
