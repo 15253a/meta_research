@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import json
+import os
 import tomllib
 
 from meta_research.root_capabilities import ROOT_AGENT_KINDS
@@ -119,7 +120,7 @@ def test_native_compilation_keeps_credentials_out_of_snapshot_and_arguments(tmp_
     registry.create(fixture_config(server_id="http", transport="streamable_http", connection={"url": "https://fixture.invalid/mcp", "bearer_token_env_var": "FIXTURE_ACCESS_TOKEN", "http_headers": {"X-Project": "study"}}), expected_revision=1)
     snapshot = registry.snapshot("companion")
     arguments, sensitive = compile_snapshot(snapshot)
-    native = tomllib.loads("\n".join(arguments[1::2]))["mcp_servers"]
+    native = tomllib.loads("\n".join(value for flag, value in zip(arguments[::2], arguments[1::2]) if flag == "--config" and value != "mcp_servers={}"))["mcp_servers"]
     assert set(native) == {"external_fixture", "external_http"}
     assert native["external_fixture"]["env_vars"] == ["FIXTURE_ACCESS_TOKEN"]
     assert native["external_fixture"]["args"][1:] == ['quoted"argument', "line\nbreak"]
@@ -138,7 +139,7 @@ def test_default_stdio_directory_does_not_follow_target_workspace(tmp_path, monk
     workspace.mkdir()
     monkeypatch.chdir(workspace)
     arguments, _ = compile_snapshot(registry.snapshot("target"))
-    native = tomllib.loads("\n".join(arguments[1::2]))["mcp_servers"]
+    native = tomllib.loads("\n".join(value for flag, value in zip(arguments[::2], arguments[1::2]) if flag == "--config" and value != "mcp_servers={}"))["mcp_servers"]
     assert native["external_fixture"]["cwd"] == str(tmp_path)
 
 
@@ -156,3 +157,55 @@ def test_simultaneous_management_writes_cannot_overwrite_each_other(tmp_path):
     saved = SystemMcpRegistry(path).read()
     assert saved["revision"] == 1
     assert len(saved["servers"]) == 1
+
+
+def test_named_native_profile_is_immutable_and_does_not_edit_user_config(tmp_path):
+    from meta_research.system_mcp import ensure_native_mcp_profile, NATIVE_MCP_PROFILE_NAME
+    user_config = tmp_path / "config.toml"
+    user_config.write_text('model="preserved-model"\n', encoding="utf-8")
+    ensure_native_mcp_profile(tmp_path)
+    profile = tmp_path / (NATIVE_MCP_PROFILE_NAME + ".config.toml")
+    assert tomllib.loads(profile.read_text()) == {"mcp_servers": [], "projects": []}
+    ensure_native_mcp_profile(tmp_path)
+    assert user_config.read_text() == 'model="preserved-model"\n'
+    profile.chmod(0o600)
+    profile.write_text("unexpected=true\n", encoding="utf-8")
+    with pytest.raises(SystemMcpLoadError):
+        ensure_native_mcp_profile(tmp_path)
+    assert profile.read_text() == "unexpected=true\n"
+
+
+@pytest.mark.skipif(not os.environ.get("META_RESEARCH_NATIVE_MCP_TEST_CODEX"), reason="requires the pinned native executable")
+def test_native_configuration_excludes_user_and_trusted_project_mcp(tmp_path):
+    import os
+    import subprocess
+    from meta_research.system_mcp import ensure_native_mcp_profile
+    native_home = tmp_path / "native-home"
+    native_home.mkdir()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / ".git").mkdir()
+    (workspace / ".codex").mkdir()
+    (native_home / "config.toml").write_text(
+        'model="preserved-model"\n'
+        f'[projects.{json.dumps(str(workspace))}]\ntrust_level="trusted"\n'
+        '[mcp_servers.user_hidden]\ncommand="never-run-user-command"\n'
+        '[mcp_servers.external_fixture]\nurl="https://unexpected.invalid/mcp"\n'
+        '[mcp_servers.external_fixture.http_headers]\nX-Unexpected="must-not-merge"\n', encoding="utf-8")
+    (workspace / ".codex" / "config.toml").write_text('[mcp_servers.project_hidden]\ncommand="never-run-project-command"\n', encoding="utf-8")
+    ensure_native_mcp_profile(native_home)
+    registry = SystemMcpRegistry(tmp_path / "registry.json")
+    registry.create(fixture_config(), expected_revision=0)
+    for expected_names in [["external_fixture"], []]:
+        arguments, _ = compile_snapshot(registry.snapshot("target"))
+        result = subprocess.run(
+            [os.environ["META_RESEARCH_NATIVE_MCP_TEST_CODEX"], *arguments[:2], "mcp", "list", "--json", *arguments[2:]],
+            capture_output=True, text=True, check=True, cwd=workspace,
+            env=dict(os.environ, CODEX_HOME=str(native_home), CODEX_SQLITE_HOME=str(native_home)), timeout=10)
+        servers = json.loads(result.stdout)
+        assert [server["name"] for server in servers] == expected_names
+        if servers:
+            assert servers[0]["transport"]["type"] == "stdio"
+            assert servers[0]["transport"]["command"] == "python"
+            assert servers[0]["transport"]["env"] == {}
+            registry.delete("fixture", expected_revision=1)

@@ -8,11 +8,13 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from meta_research.provider_supervisor import (
@@ -20,9 +22,11 @@ from meta_research.provider_supervisor import (
     WindowsProviderJob,
 )
 from meta_research.system_mcp import (
+    NATIVE_MCP_PROFILE_NAME,
     SystemMcpConflictError,
     SystemMcpRegistry,
     compile_snapshot,
+    ensure_native_mcp_profile,
 )
 
 
@@ -36,7 +40,7 @@ class _ProbeFailed(Exception):
     pass
 
 
-def _native_status(argv: list[str], environment: dict[str, str], timeout: float) -> dict[str, Any]:
+def _native_status(argv: list[str], environment: dict[str, str], timeout: float, *, cwd: str) -> dict[str, Any]:
     platform = ProviderProcessPlatform()
     job = WindowsProviderJob() if os.name == "nt" else None
     process = None
@@ -61,7 +65,7 @@ def _native_status(argv: list[str], environment: dict[str, str], timeout: float)
             output_overflow.set()
 
     try:
-        options = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL, "env": environment, **platform.provider_spawn_options()}
+        options = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL, "env": environment, "cwd": cwd, **platform.provider_spawn_options()}
         process = job.spawn(argv, **options) if job else subprocess.Popen(argv, **options)
         reader = threading.Thread(target=drain, args=(process.stdout,), daemon=True)
         reader.start()
@@ -150,7 +154,13 @@ def check_system_mcp(
             # external service environment remain identical to real execution.
             with tempfile.TemporaryDirectory(prefix="meta-research-mcp-check-") as native_home:
                 child_environment.update(CODEX_HOME=native_home, CODEX_SQLITE_HOME=native_home)
-                status = _native_status([executable, "app-server", "--strict-config", "--config", "mcp_servers={}", *arguments], child_environment, float(server["startup_timeout_sec"]) + 5)
+                ensure_native_mcp_profile(native_home)
+                # app-server has no named-profile option. Its private user layer
+                # performs the same reset, including inherited system MCP maps.
+                shutil.copyfile(Path(native_home) / (NATIVE_MCP_PROFILE_NAME + ".config.toml"), Path(native_home) / "config.toml")
+                # Per-layer strict validation rejects the deliberate map reset;
+                # the final merged configuration is still native type-validated.
+                status = _native_status([executable, "app-server", *arguments[2:]], child_environment, float(server["startup_timeout_sec"]) + 5, cwd=native_home)
             items = status.get("data", [])
             item = next((item for item in items if isinstance(item, dict) and item.get("name") == "external_" + server_id), None) if isinstance(items, list) else None
             if item is not None and item.get("toolsError") is not None:

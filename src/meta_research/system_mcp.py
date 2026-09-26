@@ -21,6 +21,8 @@ from meta_research.root_capabilities import ROOT_AGENT_KINDS
 
 
 SNAPSHOT_SCHEMA = "meta-research/system-mcp-snapshot/v1"
+NATIVE_MCP_PROFILE_NAME = "meta-research-system-mcp-v1"
+_NATIVE_MCP_PROFILE = "mcp_servers = []\nprojects = []\n"
 DEFAULT_STARTUP_TIMEOUT_SEC = 10
 MAX_STARTUP_TIMEOUT_SEC = 60
 DEFAULT_TOOL_TIMEOUT_SEC = 60
@@ -210,13 +212,21 @@ def _toml(value: Any) -> str:
 
 
 def compile_snapshot(snapshot: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
-    """Compile only external entries; callers reset MCPs then merge their internal channel.
+    """Compile an isolated MCP table; callers merge their internal channel after it.
 
     Codex's stdio allowlist excludes arbitrary parent environment variables.
     Only explicitly listed deployment references are forwarded to those servers.
+    The named managed profile resets inherited maps in an earlier native config
+    layer. An empty CLI table alone only deep-merges and does not clear them.
+    Do not use native --strict-config with this profile: it type-checks each
+    intermediate layer before the CLI restores the final, valid map values.
     """
     snapshot = validate_snapshot(snapshot)
-    arguments: list[str] = []
+    arguments: list[str] = [
+        "--profile", NATIVE_MCP_PROFILE_NAME,
+        "--config", "projects={}",
+        "--config", "mcp_servers={}",
+    ]
     sensitive_environment: dict[str, str] = {}
     for server in snapshot["servers"]:
         name = "external_" + server["server_id"]
@@ -278,6 +288,53 @@ def _write_json(path: Path, value: Any) -> None:
     finally:
         if temporary is not None:
             Path(temporary).unlink(missing_ok=True)
+
+
+def ensure_native_mcp_profile(codex_home: Path | str) -> None:
+    """Install the immutable profile in an explicitly supplied, managed home.
+
+    User config, auth, skills, plugins and native session files are untouched.
+    The profile suppresses project-local config layers during native bootstrap;
+    explicit AR capability and per-operation MCP overrides remain authoritative.
+    Never infer another user's global CODEX_HOME from this helper.
+    """
+    home = Path(codex_home).absolute()
+    profile = home / (NATIVE_MCP_PROFILE_NAME + ".config.toml")
+    with _locked(home / ".system-mcp-profile.lock"):
+        if profile.is_symlink():
+            raise SystemMcpLoadError("system_mcp_native_profile_conflict")
+        try:
+            existing = profile.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            existing = None
+        except (OSError, UnicodeError) as error:
+            raise SystemMcpLoadError("system_mcp_native_profile_unavailable") from error
+        if existing is not None:
+            if existing != _NATIVE_MCP_PROFILE:
+                raise SystemMcpLoadError("system_mcp_native_profile_conflict")
+            return
+        temporary = None
+        try:
+            descriptor, temporary = tempfile.mkstemp(prefix=".system-mcp-profile-", dir=home)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(_NATIVE_MCP_PROFILE)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o400)
+            os.replace(temporary, profile)
+            temporary = None
+            if os.name != "nt":
+                descriptor = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        except OSError as error:
+            raise SystemMcpLoadError("system_mcp_native_profile_unavailable") from error
+        finally:
+            if temporary is not None:
+                os.chmod(temporary, 0o600)
+                Path(temporary).unlink(missing_ok=True)
 
 
 class SystemMcpRegistry:

@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -57,3 +58,23 @@ def test_probe_timeout_is_bounded_and_stops_native_process(tmp_path):
     assert time.monotonic() - started < 9
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_path.read_text()), 0)
+
+
+@pytest.mark.skipif(not os.environ.get("META_RESEARCH_NATIVE_MCP_TEST_CODEX"), reason="requires the pinned native executable")
+def test_native_probe_discovers_fixture_through_isolated_configuration(tmp_path):
+    log = tmp_path / "fixture.jsonl"
+    fixture = Path(__file__).parent / "fixtures" / "system_mcp_server.py"
+    registry = SystemMcpRegistry(tmp_path / "registry.json")
+    registry.create({
+        "server_id": "fixture", "display_name": "Fixture", "transport": "stdio",
+        "connection": {"command": sys.executable, "args": [str(fixture), "--log", str(log)]},
+    }, expected_revision=0)
+    result = check_system_mcp(
+        registry, "fixture", expected_revision=1,
+        executable=os.environ["META_RESEARCH_NATIVE_MCP_TEST_CODEX"], environment=dict(os.environ),
+    )
+    assert result["status"] == "connected"
+    assert result["tool_count"] == 2
+    requests = [json.loads(line) for line in log.read_text().splitlines()]
+    assert "tools/list" in [request["method"] for request in requests]
+    assert "tools/call" not in [request["method"] for request in requests]

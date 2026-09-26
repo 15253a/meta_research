@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from meta_research.system_mcp import SystemMcpRegistry
+from meta_research.system_mcp import SystemMcpRegistry, ensure_native_mcp_profile
 
 import os
 from collections.abc import Callable
@@ -576,6 +576,7 @@ def build_production_runtime(
         protected_environment=data_root.codex_environment
     )
     system_mcp_registry = SystemMcpRegistry(data_root.root / "system-mcp.json")
+    ensure_native_mcp_profile(data_root.codex_home)
     companion_adapter = (
         CodexCompanionAdapter(
             data_root.root / "companion-provider",
