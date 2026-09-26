@@ -6,7 +6,10 @@ policy prose resources. Models, capabilities, tools, executable artifacts and
 output schemas are still compared exactly.
 """
 from typing import TYPE_CHECKING
-from meta_research.system_mcp_binding_compatibility import system_mcp_bindings_compatible
+from meta_research.system_mcp_binding_compatibility import (
+    previous_system_mcp_binding,
+    system_mcp_bindings_compatible,
+)
 
 if TYPE_CHECKING:
     from meta_research.owners.agent_runtime import BundleRuntimeBinding, ReasoningRuntimeBinding
@@ -227,6 +230,11 @@ def bundle_bindings_compatible(left: "BundleRuntimeBinding", right: "BundleRunti
         return True
     if system_mcp_bindings_compatible(left, right):
         return True
+    # Carry the existing Bundle prose contract across only this reviewed MCP
+    # upgrade. The recognized endpoint maps back to its exact prior source and
+    # instruction identities; every other field remains subject to comparison.
+    left = previous_system_mcp_binding(left) or left
+    right = previous_system_mcp_binding(right) or right
     before = _reviewed_conditions_execution_value(left)
     after = _reviewed_conditions_execution_value(right)
     if before is not None and after is not None and before == after:
