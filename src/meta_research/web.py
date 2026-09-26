@@ -59,6 +59,7 @@ from meta_research.root_operation_diagnostics import (
 from meta_research.stage_root_observations import StageRootObservationError
 from meta_research.root_session_observations import RootSessionObservations
 from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
+from meta_research.system_mcp_web import system_mcp_router
 
 
 SESSION_COOKIE = "meta_research_session"
@@ -811,6 +812,7 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+    app.include_router(system_mcp_router(runtime.system_mcp_registry, runtime.data_root))
     web_root = Path(str(files("meta_research") / "web_dist")).resolve()
     expected_host = urlsplit(base_url).netloc
     base_url_host = urlsplit(base_url).hostname

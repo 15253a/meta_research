@@ -12,6 +12,7 @@ import {
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { StatusHome } from "./StatusHome";
+import { SystemMcpSettings } from "./SystemMcpSettings";
 import { humanRequestPresentation } from "./humanRequestPresentation";
 import { OutputLanguageProvider, OutputLanguageControl } from "./OutputLanguage";
 import { observedActiveTarget } from "./activeTargetStatus";
@@ -4404,6 +4405,7 @@ function WorkspaceMain({
 
 function App() {
   const parameters = new URLSearchParams(window.location.search);
+  if (parameters.get("settings") === "mcp") return <SystemMcpSettings />;
   const detailsRequested = parameters.has("workspace") || parameters.has("panel")
     || parameters.has("view") || parameters.has("inspector") || parameters.has("companion");
   return detailsRequested ? <DetailedApp /> : <StatusHome />;
@@ -5317,6 +5319,7 @@ function DetailedApp() {
             {snapshot ? <code>状态 {snapshot.revision}</code> : null}
           </div>
           <RuntimeConditions questRef={overviewQuestRef(snapshot)} questionRef={runtimeConditionsQuestionRef(snapshot)} disabled={humanRequestSurfaceOpen || detailsScopeChanged} />
+          <a href="/?settings=mcp">系统设置</a>
           <ForegroundResearchControlShortcut
             control={snapshot?.research_control}
             commands={snapshot?.human_collaboration?.commands.items}
