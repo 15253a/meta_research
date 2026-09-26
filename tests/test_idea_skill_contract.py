@@ -2622,6 +2622,7 @@ def test_system_mcp_prelaunch_recovery_keeps_frozen_argv_and_legacy_hash(
     supervisor_before = (operation / "supervisor-request.json").read_bytes()
     assert (b"external_fixture" in supervisor_before) is not historical
     assert (b"system_mcp_snapshot" in invocation_before) is not historical
+    assert (b"--strict-config" in supervisor_before) is historical
 
     registry.delete("fixture", expected_revision=1)
     saved_registry = registry_path.read_bytes()
@@ -2641,6 +2642,7 @@ def test_system_mcp_prelaunch_recovery_keeps_frozen_argv_and_legacy_hash(
     assert continued.primary_session_ref == recovered.primary_session_ref
     next_operation = next(path for path in workspace.glob("provider-operations/*/primary") if path != operation)
     assert b"external_fixture" not in (next_operation / "supervisor-request.json").read_bytes()
+    assert b"--strict-config" not in (next_operation / "supervisor-request.json").read_bytes()
     with pytest.raises(IdeaSkillUnavailable, match="idea_runtime_binding_drift"):
         recovered_adapter.generate_draft(replace(next_request, runtime_binding=replace(
             binding, capability_bindings=("unexpected-capability",),

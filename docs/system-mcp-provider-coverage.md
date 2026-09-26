@@ -24,6 +24,8 @@
 
 已通过的恢复回归实际启动测试 supervisor：在原生进程启动前模拟 daemon 崩溃，移除注册项并损坏注册表后恢复。原 `invocation.json` 与 `supervisor-request.json` 字节保持相同；重复对账不重跑；完成后沿同一 native session 开始新操作，不残留已移除服务。新增操作面对坏注册表明确失败，未静默当作空配置。
 
+锁定原生 CLI 会深合并空 MCP 表，因此新操作使用托管 profile 的前置清空层，再合入完整操作配置。该 CLI 的 `--strict-config` 会先拒绝清空层的中间类型；仅有 `system_mcp_snapshot` 的新路径省略此参数，最终配置仍由原生类型检查。历史无字段操作保留原参数，包括 `--strict-config`。公共接线及冻结恢复测试同时验证这两个分支。
+
 ## 部署前绑定兼容
 
 公共 Provider 的长期 Run 绑定原本包含实现文件和 instruction 的哈希。仅保持 spool 字段兼容不足以跨本次部署：原有执行门会先拒绝旧绑定。
@@ -39,9 +41,11 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| baseline 完整 Acquisition binding hash | `d01618d0ed1fdc70be0ee3fb7d0dbc0c7d7e61e67c16b0e95cddfe3874ae08d7` |
-| 新完整 Acquisition binding hash | `c1d6fa3426364ebab23892ad24a82737fd2ba0dbe4530dbf56edd1ff2cd2d5b9` |
+| baseline 完整 Acquisition binding hash | `f8c3d5992fa78b87cf769f1550e0a44db76471ef4da7d711813d4f31e9e14abb` |
+| 新完整 Acquisition binding hash | `e73dc889bfaecb9f8c9404a327ca477d9ed74b2bfcd48ae566968bf3e044bdb8` |
 | 精确旧 binding 可以继续执行 | 通过 |
 | delegate 或 capability 被改动时拒绝兼容 | 通过 |
 
 上述脚本仅使用临时目录和确定性 delegate，不打开生产数据库、不下载材料、不调用设备。Target、DeepFetch 的长期 binding 不包含此次改动的实现文件哈希，不需要此兼容例外。
+
+最终源码上的集中回归包含全部 `test_system_mcp*.py`（启用锁定原生 CLI 的配置与无业务调用探测用例）及上表公共 Provider、生产组合入口，共 **69 passed**。日志与 JUnit 记录位于远端隔离验收目录 `suite-audit/system-mcp-final-focused.{log,xml}`。

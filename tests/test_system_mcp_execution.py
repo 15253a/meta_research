@@ -32,6 +32,7 @@ def test_target_freezes_system_tools_per_operation_and_updates_same_session(tmp_
     invocation = _invocation("codex")
     first = adapter.invoke(invocation)
     first_argv = runner.calls[-1][0]
+    assert "--strict-config" not in first_argv
     assert any('fixture-v1' in argument for argument in first_argv)
     registry.delete("fixture", expected_revision=1)
 
@@ -61,6 +62,7 @@ def test_deepfetch_direct_loads_external_tools_without_internal_channel(tmp_path
     first = _execute(adapter)
     assert all(any('fixture-v1' in argument for argument in argv) for argv, _, _ in runner.calls)
     assert all('mcp_servers={}' in argv for argv, _, _ in runner.calls)
+    assert all("--strict-config" not in argv for argv, _, _ in runner.calls)
     registry.delete("fixture", expected_revision=1)
     runner.calls.clear()
     _execute(adapter, replace(_request(), native_session_ref=first.native_session_ref))
@@ -96,6 +98,7 @@ def test_deepfetch_recovery_segments_freeze_tools_but_next_turn_samples_latest(t
     result = _execute(adapter, request)
     assert result.native_session_ref == "native-many-durable-segments"
     assert len(runner.argvs) == 3
+    assert all("--strict-config" not in argv for argv in runner.argvs)
     assert all(any('fixture-v1' in argument for argument in argv) for argv in runner.argvs[:2])
     assert not any('fixture-v1' in argument for argument in runner.argvs[2])
     # Signed completed segments reconcile without dispatching another tool turn.
@@ -129,6 +132,8 @@ def test_historical_target_spool_replays_original_argv_and_hash_after_registrati
     invocation = _invocation("codex")
     first = legacy.invoke(invocation)
     original_argvs = {str(path): path.read_bytes() for path in workspace.rglob("provider-argv.json")}
+    assert original_argvs
+    assert all(b"--strict-config" in data for data in original_argvs.values())
     registry = SystemMcpRegistry(tmp_path / "registry.json")
     registry.create({
         "server_id": "fixture", "display_name": "Fixture", "transport": "stdio",
@@ -176,6 +181,8 @@ def test_historical_deepfetch_pending_segments_keep_original_snapshot_absence(tm
     result = _execute(upgraded, request)
     assert result.native_session_ref == "native-many-durable-segments"
     assert len(runner.argvs) == 3
+    assert all("--strict-config" in argv for argv in runner.argvs[:2])
+    assert "--strict-config" not in runner.argvs[2]
     assert all(not any('fixture-v1' in argument for argument in argv) for argv in runner.argvs[:2])
     assert any('fixture-v1' in argument for argument in runner.argvs[2])
     assert all(Path(path).read_bytes() == contents for path, contents in original_invocations.items())

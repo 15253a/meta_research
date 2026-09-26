@@ -28,6 +28,7 @@ def scoped_system_mcp(tmp_path: Path):
             }, expected_revision=revision)
 
         def assert_loaded(argv: list[str]):
+            assert "--strict-config" not in argv
             assert 'mcp_servers.external_shared.command="fixture-shared"' in argv
             assert 'mcp_servers.external_selected.command="fixture-selected"' in argv
             assert not any("external_excluded" in argument for argument in argv)

@@ -2867,7 +2867,9 @@ class CodexDeepFetchAdapter:
                 self._executable,
                 "exec",
                 "--skip-git-repo-check",
-                "--strict-config",
+                # Native strict mode rejects the isolation profile's intermediate
+                # reset layer before the compiled final tables are applied.
+                *(("--strict-config",) if system_snapshot is None else ()),
                 *(
                     ("--config", "mcp_servers={}", *system_arguments)
                     if system_snapshot is not None else ()
@@ -3330,7 +3332,8 @@ class CodexDeepFetchAdapter:
             self._executable,
             "exec",
             "--skip-git-repo-check",
-            "--strict-config",
+            # Historical operations keep their original strict-config argv.
+            *(("--strict-config",) if system_mcp_snapshot is None else ()),
             *(
                 ("--config", "mcp_servers={}", *compile_snapshot(system_mcp_snapshot)[0])
                 if system_mcp_snapshot is not None else ()

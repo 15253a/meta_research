@@ -1057,7 +1057,9 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             self.executable,
             "exec",
             "--skip-git-repo-check",
-            "--strict-config",
+            # Native strict mode rejects the isolation profile's intermediate
+            # reset layer before the compiled final tables are applied.
+            *(("--strict-config",) if invocation.system_mcp_snapshot is None else ()),
             *capability_profile.codex_arguments(
                 entry_path=invocation.entry_path,
                 output_language=read_output_language(self._workspace),
