@@ -73,6 +73,9 @@ from meta_research.root_resident_mcp import (
     semantic_mcp_environment,
 )
 from meta_research.semantic_mcp import ROOT_AGENT_ACQUISITION_OPERATION_IDS
+from meta_research.system_mcp import (
+    SystemMcpError, SystemMcpRegistry, compile_snapshot, validate_snapshot,
+)
 
 if TYPE_CHECKING:
     from meta_research.owners.common import AcceptanceReceipt
@@ -742,8 +745,10 @@ class CodexDeepFetchAdapter:
         ) = None,
         codex_ledger_reader: CodexSessionLedgerReader | None = None,
         codex_home: Path | None = None,
+        system_mcp_registry: SystemMcpRegistry | None = None,
     ) -> None:
         self._workspace = workspace
+        self._system_mcp_registry = system_mcp_registry
         self._workspace.mkdir(parents=True, exist_ok=True)
         self._agent_workspace_root = self._workspace / "research-workspaces"
         self._agent_workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1942,6 +1947,7 @@ class CodexDeepFetchAdapter:
             traces: list[str] = []
             native_session_ref = expected_native_session_ref
             enforce_native = enforce_native_session_ref
+            operation_system_snapshot: object = None
             for index, directory in enumerate(directories):
                 segment_name = "initial" if index == 0 else f"resume-{index}"
                 invocation_path = directory / "invocation.json"
@@ -1982,6 +1988,15 @@ class CodexDeepFetchAdapter:
                     "root_capability_profile",
                     "root_capability_profile_hash",
                 }
+                if "system_mcp_snapshot" in invocation:
+                    expected_invocation_keys.add("system_mcp_snapshot")
+                    validate_snapshot(invocation["system_mcp_snapshot"])
+                    if invocation["system_mcp_snapshot"]["root_kind"] != "deepfetch":
+                        raise ValueError("system MCP root kind mismatch")
+                if index == 0:
+                    operation_system_snapshot = invocation.get("system_mcp_snapshot")
+                elif invocation.get("system_mcp_snapshot") != operation_system_snapshot:
+                    raise ValueError("system MCP operation snapshot mismatch")
                 if "mcp_url" in invocation or "mcp_scope_binding_hash" in invocation:
                     expected_invocation_keys |= {"mcp_url", "mcp_scope_binding_hash"}
                     self._verify_existing_mcp_invocation(
@@ -2113,6 +2128,7 @@ class CodexDeepFetchAdapter:
             OSError,
             UnicodeDecodeError,
             ProviderSupervisorError,
+            SystemMcpError,
             ValueError,
         ) as error:
             raise DeepFetchUnavailable(
@@ -2803,6 +2819,21 @@ class CodexDeepFetchAdapter:
                 access=access,
             )
         root_job_ref = request.job_ref or f"{request.run_ref}:direct"
+        try:
+            system_snapshot = (
+                self._system_mcp_registry.snapshot("deepfetch")
+                if self._system_mcp_registry is not None else None
+            )
+            system_arguments, system_environment = (
+                compile_snapshot(system_snapshot) if system_snapshot is not None else ([], {})
+            )
+            if system_snapshot is not None:
+                self._system_mcp_registry.record_loading(
+                    system_snapshot, root_job_ref + ":" + canonical_hash(prompt),
+                    native_session_ref=request.native_session_ref,
+                )
+        except SystemMcpError as error:
+            raise DeepFetchUnavailable("system_mcp_configuration_unavailable") from error
         agent_workspace = self._agent_workspace_for(
             root_job_ref,
             canonical_hash(request.runtime_binding.as_dict()),
@@ -2837,9 +2868,12 @@ class CodexDeepFetchAdapter:
                 "--skip-git-repo-check",
                 "--strict-config",
                 *(
+                    ("--config", "mcp_servers={}", *system_arguments)
+                    if system_snapshot is not None else ()
+                ),
+                *(
                     (
-                        "--config",
-                        "mcp_servers={}",
+                        *(("--config", "mcp_servers={}") if system_snapshot is None else ()),
                         "--config",
                         f'mcp_servers.meta_research.url="{access.url}"',
                         "--config",
@@ -2885,9 +2919,9 @@ class CodexDeepFetchAdapter:
                 argv.extend(["resume", request.native_session_ref, "-"])
             try:
                 environment = (
-                    semantic_mcp_environment(access.token)
+                    {**system_environment, **semantic_mcp_environment(access.token)}
                     if access is not None
-                    else None
+                    else (system_environment or None)
                 )
                 run_job = getattr(self._runner, "run_job", None)
                 if request.job_ref is not None and callable(run_job):
@@ -2989,6 +3023,22 @@ class CodexDeepFetchAdapter:
             _key_path, transport_key = ensure_transport_key(self._workspace)
         except (OSError, ProviderSupervisorError) as error:
             raise DeepFetchUnavailable("deepfetch_provider_spool_invalid") from error
+        try:
+            initial_invocation = operation_root / "deepfetch-initial" / "invocation.json"
+            if initial_invocation.exists():
+                frozen_invocation = read_transport_envelope(initial_invocation, transport_key)
+                system_snapshot = frozen_invocation.get("system_mcp_snapshot")
+                if system_snapshot is not None:
+                    validate_snapshot(system_snapshot)
+                    if system_snapshot["root_kind"] != "deepfetch":
+                        raise ValueError("system MCP root kind mismatch")
+            else:
+                system_snapshot = (
+                    self._system_mcp_registry.snapshot("deepfetch")
+                    if self._system_mcp_registry is not None else None
+                )
+        except (SystemMcpError, ProviderSupervisorError, OSError, ValueError) as error:
+            raise DeepFetchUnavailable("system_mcp_configuration_unavailable") from error
         native_session_ref = request.native_session_ref
         trace_parts: list[str] = []
         segment_number = 0
@@ -3008,6 +3058,7 @@ class CodexDeepFetchAdapter:
                 native_session_ref=native_session_ref,
                 transport_key=transport_key,
                 access=access,
+                system_mcp_snapshot=system_snapshot,
             )
             trace_parts.append(outcome[2])
             if outcome[0] == "completed":
@@ -3051,6 +3102,7 @@ class CodexDeepFetchAdapter:
         native_session_ref: str | None,
         transport_key: bytes,
         access: RootResidentMcpAccess | None = None,
+        system_mcp_snapshot: dict[str, object] | None = None,
     ) -> tuple[str, dict[str, object] | None, str, str | None]:
         directory.mkdir(parents=True, exist_ok=True)
         invocation_path = directory / "invocation.json"
@@ -3103,6 +3155,8 @@ class CodexDeepFetchAdapter:
                     "mcp_scope_binding_hash": access.scope_binding_hash,
                 }
             )
+        if system_mcp_snapshot is not None:
+            invocation["system_mcp_snapshot"] = system_mcp_snapshot
         invocation_hash = canonical_hash(invocation)
         envelope = {
             "payload": invocation,
@@ -3156,11 +3210,23 @@ class CodexDeepFetchAdapter:
                 "result_path": result_path,
                 "native_session_ref": native_session_ref,
             }
-            argv = (
-                self._durable_argv(**durable_argv_kwargs, mcp_url=access.url)
-                if access is not None
-                else self._durable_argv(**durable_argv_kwargs)
-            )
+            if access is not None:
+                durable_argv_kwargs["mcp_url"] = access.url
+            if system_mcp_snapshot is not None:
+                durable_argv_kwargs["system_mcp_snapshot"] = system_mcp_snapshot
+            try:
+                argv = self._durable_argv(**durable_argv_kwargs)
+                system_environment = (
+                    compile_snapshot(system_mcp_snapshot)[1]
+                    if system_mcp_snapshot is not None else {}
+                )
+                if system_mcp_snapshot is not None and self._system_mcp_registry is not None:
+                    self._system_mcp_registry.record_loading(
+                        system_mcp_snapshot, job_ref,
+                        native_session_ref=native_session_ref,
+                    )
+            except SystemMcpError as error:
+                raise DeepFetchUnavailable("system_mcp_configuration_unavailable") from error
             supervisor_request_path = directory / "supervisor-request.json"
             try:
                 write_supervisor_request(
@@ -3194,10 +3260,12 @@ class CodexDeepFetchAdapter:
                     directory / "pid.json",
                     supervisor_request_path,
                 )
-                if access is not None:
+                if access is not None or system_environment:
                     durable_arguments = (
                         *durable_arguments,
-                        semantic_mcp_environment(access.token),
+                        {**system_environment, **(
+                            semantic_mcp_environment(access.token) if access is not None else {}
+                        )},
                     )
                 if isinstance(self._runner, _CancellableProcessRunner):
                     durable_job(
@@ -3251,6 +3319,7 @@ class CodexDeepFetchAdapter:
         result_path: Path,
         native_session_ref: str | None,
         mcp_url: str | None = None,
+        system_mcp_snapshot: dict[str, object] | None = None,
     ) -> list[str]:
         agent_workspace = self._agent_workspace_for(
             job_ref, runtime_binding_hash
@@ -3262,9 +3331,12 @@ class CodexDeepFetchAdapter:
             "--skip-git-repo-check",
             "--strict-config",
             *(
+                ("--config", "mcp_servers={}", *compile_snapshot(system_mcp_snapshot)[0])
+                if system_mcp_snapshot is not None else ()
+            ),
+            *(
                 (
-                    "--config",
-                    "mcp_servers={}",
+                    *(("--config", "mcp_servers={}") if system_mcp_snapshot is None else ()),
                     "--config",
                     f'mcp_servers.meta_research.url="{mcp_url}"',
                     "--config",

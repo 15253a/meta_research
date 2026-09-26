@@ -30,8 +30,13 @@ from meta_research.provider_supervisor import (
     SUPERVISOR_REQUEST_SCHEMA_V2,
     ensure_transport_key,
     read_supervisor_request,
+    read_transport_envelope,
     read_verified_exit_receipt,
     write_supervisor_request,
+    write_transport_envelope,
+)
+from meta_research.system_mcp import (
+    SystemMcpError, SystemMcpRegistry, compile_snapshot, validate_snapshot,
 )
 from meta_research.root_capabilities import (
     CODEX_FEATURE_INVENTORY_TIMEOUT_SECONDS,
@@ -86,6 +91,7 @@ class CodexChildLedgerReader(Protocol):
 
 CLAUDE_LOCKED_VERSION = "2.1.220"
 _MCP_TOKEN_ENV = "META_RESEARCH_MCP_TOKEN"
+_SYSTEM_MCP_SNAPSHOT_ENV = "META_RESEARCH_SYSTEM_MCP_SNAPSHOT_ID"
 _HARNESS_FAMILY_ENV = "META_RESEARCH_HARNESS_FAMILY"
 _HARNESS_WORKSPACE_ENV = "META_RESEARCH_HARNESS_WORKSPACE"
 _PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION_REF"
@@ -165,6 +171,7 @@ class HarnessInvocation:
     root_kind: RootAgentKind | None = None
     entry_path: RootCapabilityEntryPath = "initial"
     authorized_operation_ids: tuple[str, ...] = ()
+    system_mcp_snapshot: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -287,6 +294,7 @@ class _NativeCliHarnessAdapter:
         ),
         codex_child_ledger_reader: CodexChildLedgerReader | None = None,
         codex_home: Path | None = None,
+        system_mcp_registry: SystemMcpRegistry | None = None,
     ) -> None:
         if any(
             value is not None
@@ -302,6 +310,7 @@ class _NativeCliHarnessAdapter:
         ):
             raise ValueError("harness_timeout_invalid")
         self._workspace = workspace
+        self._system_mcp_registry = system_mcp_registry
         self._workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         if executable is not None:
             self.executable = executable
@@ -343,6 +352,7 @@ class _NativeCliHarnessAdapter:
     def recover_terminal_prompt(self, invocation: HarnessInvocation) -> str | None:
         """Read the frozen prompt; Harness still verifies its Owner invocation hash."""
         self._validate_invocation(invocation)
+        invocation = self._with_system_mcp(invocation, terminal_replay_only=True)
         recover = getattr(self._runner, "recover_terminal_prompt", None)
         if not callable(recover):
             return None
@@ -359,6 +369,14 @@ class _NativeCliHarnessAdapter:
 
     def _environment(self, invocation: HarnessInvocation) -> dict[str, str]:
         return {
+            **(
+                compile_snapshot(invocation.system_mcp_snapshot)[1]
+                if invocation.system_mcp_snapshot is not None else {}
+            ),
+            **(
+                {_SYSTEM_MCP_SNAPSHOT_ENV: str(invocation.system_mcp_snapshot["snapshot_id"])}
+                if invocation.system_mcp_snapshot is not None else {}
+            ),
             _MCP_TOKEN_ENV: invocation.mcp_token,
             _HARNESS_FAMILY_ENV: self.family,
             _HARNESS_WORKSPACE_ENV: (
@@ -375,10 +393,56 @@ class _NativeCliHarnessAdapter:
             "no_proxy": _loopback_no_proxy(),
         }
 
+    def _with_system_mcp(
+        self, invocation: HarnessInvocation, *, terminal_replay_only: bool,
+    ) -> HarnessInvocation:
+        if self.family != "codex":
+            return invocation
+        path = self._workspace / "system-mcp-operations" / (
+            canonical_hash(invocation.provider_operation_ref) + ".json"
+        )
+        if not path.exists() and (self._system_mcp_registry is None or terminal_replay_only):
+            return invocation
+        try:
+            _key_path, key = ensure_transport_key(self._workspace)
+            if path.exists():
+                material = read_transport_envelope(path, key)
+                if set(material) != {"provider_operation_ref", "snapshot"} or (
+                    material["provider_operation_ref"] != invocation.provider_operation_ref
+                ):
+                    raise ValueError("system MCP operation identity mismatch")
+                snapshot = material["snapshot"]
+            else:
+                legacy_exists = getattr(self._runner, "has_operation_spool", None)
+                if callable(legacy_exists) and legacy_exists(
+                    self._argv(invocation), invocation.provider_operation_timeout_seconds,
+                    self._environment(invocation),
+                ):
+                    return invocation
+                assert self._system_mcp_registry is not None
+                snapshot = self._system_mcp_registry.snapshot(invocation.root_kind or "target")
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                write_transport_envelope(path, {
+                    "provider_operation_ref": invocation.provider_operation_ref,
+                    "snapshot": snapshot,
+                }, key)
+            validate_snapshot(snapshot)
+            if snapshot["root_kind"] != (invocation.root_kind or "target"):
+                raise ValueError("system MCP root kind mismatch")
+            if self._system_mcp_registry is not None:
+                self._system_mcp_registry.record_loading(
+                    snapshot, invocation.provider_operation_ref,
+                    native_session_ref=invocation.native_session_ref,
+                )
+            return replace(invocation, system_mcp_snapshot=snapshot)
+        except (SystemMcpError, ProviderSupervisorError, OSError, ValueError) as error:
+            raise HarnessAdapterUnavailable("system_mcp_configuration_unavailable") from error
+
     def _invoke(
         self, invocation: HarnessInvocation, *, terminal_replay_only: bool
     ) -> HarnessTurnEvidence:
         self._validate_invocation(invocation)
+        invocation = self._with_system_mcp(invocation, terminal_replay_only=terminal_replay_only)
         provider_version = self._provider_version()
         self._record_provider_capability(provider_version)
         provider_feature_inventory = self._provider_feature_inventory(
@@ -1007,6 +1071,10 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             CODEX_ROOT_REASONING_PRESET_CONFIG,
             "--config",
             "mcp_servers={}",
+            *(
+                compile_snapshot(invocation.system_mcp_snapshot)[0]
+                if invocation.system_mcp_snapshot is not None else ()
+            ),
             *target_environment_arguments,
             "--sandbox",
             self._sandbox_mode(invocation),
@@ -1212,6 +1280,17 @@ class _HarnessStdoutEventTail:
             self._sink(self._operation_ref, tuple(projected))
 
 
+def _transport_environment_names(environment: dict[str, str]) -> list[str]:
+    if _SYSTEM_MCP_SNAPSHOT_ENV not in environment:
+        return sorted(environment)
+    # External references are frozen in the snapshot. Their availability at
+    # recovery time must not change the identity of an already sealed result.
+    return sorted(
+        name for name in environment
+        if name.startswith("META_RESEARCH_") or name.lower() == "no_proxy"
+    )
+
+
 class HarnessSupervisorTransport:
     """Thin Harness adapter over its provider-specific process runner."""
 
@@ -1256,8 +1335,10 @@ class HarnessSupervisorTransport:
             "argv": argv,
             "prompt_hash": canonical_hash(prompt),
             "timeout_seconds": timeout,
-            "environment_names": sorted(environment),
+            "environment_names": _transport_environment_names(environment),
         }
+        if _SYSTEM_MCP_SNAPSHOT_ENV in environment:
+            invocation["system_mcp_snapshot_id"] = environment[_SYSTEM_MCP_SNAPSHOT_ENV]
         invocation_hash = canonical_hash(invocation)
         if self._raw_output_store is not None:
             try:
@@ -1450,6 +1531,28 @@ class HarnessSupervisorTransport:
     ) -> subprocess.CompletedProcess[str]:
         return self(argv, prompt, timeout, environment, _terminal_replay_only=True)
 
+    def has_operation_spool(
+        self, argv: list[str], timeout: float | None, environment: dict[str, str],
+    ) -> bool:
+        """Identify pre-registration operations without changing their frozen argv."""
+        for prompt_path in (self._workspace / "provider-operations").glob("*/*/prompt.txt"):
+            try:
+                prompt = prompt_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as error:
+                raise OSError("provider operation spool unavailable") from error
+            identity = canonical_hash({
+                "schema_ref": "meta-research/harness-provider-operation/v1",
+                "family": environment.get(_HARNESS_FAMILY_ENV),
+                "provider_operation_ref": environment.get(_PROVIDER_OPERATION_ENV),
+                "argv": argv,
+                "prompt_hash": canonical_hash(prompt),
+                "timeout_seconds": timeout,
+                "environment_names": sorted(environment),
+            })
+            if identity == prompt_path.parent.name:
+                return True
+        return False
+
     def recover_terminal_prompt(
         self, argv: list[str], timeout: float | None, environment: dict[str, str]
     ) -> str | None:
@@ -1474,15 +1577,18 @@ class HarnessSupervisorTransport:
             except (OSError, UnicodeDecodeError):
                 continue
             try:
-                invocation_hash = canonical_hash({
+                material = {
                     "schema_ref": "meta-research/harness-provider-operation/v1",
                     "family": family,
                     "provider_operation_ref": operation_ref,
                     "argv": argv,
                     "prompt_hash": canonical_hash(prompt),
                     "timeout_seconds": timeout,
-                    "environment_names": sorted(environment),
-                })
+                    "environment_names": _transport_environment_names(environment),
+                }
+                if _SYSTEM_MCP_SNAPSHOT_ENV in environment:
+                    material["system_mcp_snapshot_id"] = environment[_SYSTEM_MCP_SNAPSHOT_ENV]
+                invocation_hash = canonical_hash(material)
                 if invocation_hash != directory.name:
                     continue
                 self._verify_terminal_request(
