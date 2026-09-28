@@ -57,12 +57,15 @@ class RuntimeStatusReader:
                         with query_section('current_target'):
                             root = c.execute(text('''
                                 SELECT r.target_ref, r.target_run_ref AS run_ref, r.status,
-                                       r.updated_at, r.cancel_reason, t.target_key AS title
+                                       r.updated_at, r.cancel_reason, t.target_key AS title,
+                                       h.status AS execution_status, h.failure_code
                                 FROM ar_target_root_lifecycles r
                                 JOIN ar_target_launches l ON l.launch_ref=r.launch_ref
                                   AND l.target_ref=r.target_ref AND l.target_run_ref=r.target_run_ref
-                                  AND l.root_session_ref=r.root_session_ref
                                 JOIN rg_targets t ON t.target_ref=r.target_ref AND t.graph_ref=l.graph_ref
+                                LEFT JOIN ar_harness_runs h ON h.run_ref=r.target_run_ref
+                                  AND h.root_session_ref=r.root_session_ref
+                                  AND h.attempt_ref=r.target_attempt_ref AND h.fence_ref=r.target_fence_ref
                                 WHERE l.stage_request_ref=:request_ref AND l.quest_ref=:quest_ref
                                   AND r.status NOT IN ('completed','cancelled','failed','interrupted')
                                 ORDER BY r.created_at DESC, r.lifecycle_ref DESC LIMIT 1
@@ -98,6 +101,10 @@ class RuntimeStatusReader:
                 if root is not None:
                     task = {'kind': 'target', 'title': root['title'], 'run_ref': root['run_ref'],
                             'target_ref': root['target_ref'], 'status': root['status']}
+                    # The lifecycle stays open while its exact current execution
+                    # is suspended for a HumanRequest; that is not model activity.
+                    if root['execution_status'] == 'suspended' and root['failure_code'] == 'human_request_wait':
+                        task['status'] = 'waiting_for_human'
                 raw = task['status']
                 state = ('running' if raw in ('running','starting') else 'advancing' if raw == 'active'
                          else 'completed' if raw in ('completed','succeeded') else 'failed' if raw in ('failed','interrupted')
@@ -117,6 +124,8 @@ class RuntimeStatusReader:
                     state, reason = 'waiting', dispatch_wait['rationale']
                 elif raw == 'awaiting_acceptance':
                     reason = '当前阶段输出已生成，等待系统接纳'
+                elif raw == 'waiting_for_human':
+                    reason = '当前实验任务等待人机协作条件，可在「需要你」中查看并回应'
                 elif state == 'waiting':
                     reason = '等待当前任务的继续条件；详情中可查看具体原因'
             observed_at = datetime.now(timezone.utc).isoformat()

@@ -383,7 +383,7 @@ def _baseline_operations(research_graph, agent_runtime):
     return (
         SemanticOperation(
             semantic_operation_id="research_graph.baselines.page", owning_module="research_graph",
-            description="在当前 Quest 发现可复用的 Baseline 方法版本。文本或内容匹配只提供候选，由 Agent 明确选择；沿分页发现，再用选中的 baseline_ref 读取完整不可变方法合同。",
+            description="在当前 Quest 发现可复用的 Baseline 方法版本。query 匹配方法合同、该方法下的 Variant 配方和 Evaluation 协议说明。文本或内容匹配只提供候选，由 Agent 明确选择；沿分页发现，再用选中的 baseline_ref 读取完整不可变方法合同及关联实体。",
             input_schema={"type": "object", "properties": {
                 "query": {"type": "string", "maxLength": 1024},
                 "method_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

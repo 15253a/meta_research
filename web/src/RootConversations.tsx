@@ -5,6 +5,7 @@ import { fetchRootOutput, fetchRootSessions, RootSessionError, type RootOperatio
 import { spectrumStage, spectrumStages, type SpectrumStage } from "./Spectrum";
 import { BoundedDetails, PageWindow } from "./BoundedDetails";
 import { useOutputLanguage } from "./OutputLanguage";
+import type { TargetRetryObservation } from "./targetResearchFacts";
 import "./root-conversations.css";
 
 const statusLabels = { executing: "正在执行", waiting: "等待继续", completed: "已完成", failed: "执行受阻", paused: "已暂停", pending: "等待启动" };
@@ -166,18 +167,20 @@ function sessionScope(session: RootSession, context: RootConversationContext) {
   return session.scope_label || "Quest 资料会话";
 }
 
-export function RootConversations({ model, connected, polling = false }: { model: Model; connected: boolean; polling?: boolean }) {
+export function RootConversations({ model, connected, polling = false, targetRetry }: { model: Model; connected: boolean; polling?: boolean; targetRetry?: TargetRetryObservation | null }) {
   const foreground = model.context.foreground;
   const failure = model.context.checks.find(check => check.status === "unavailable" && (
     check.name === `${foreground?.stage.toLowerCase()}_stage_worker`
     || (foreground?.stage.toLowerCase() === "bundle" && check.name === "target_run_worker")
   ));
+  const usageLimit = failure?.reason?.code === "codex_usage_limit";
+  const retrySummary = failure && targetRetry?.checkName === failure.name && targetRetry.reasonCode === failure.reason?.code ? targetRetry.summary : null;
   return <section className="research-flow root-conversations" id="research-activity" tabIndex={-1} aria-labelledby="research-trace-title">
     <header className="research-flow-heading"><h2 id="research-trace-title">研究过程</h2>
       {(model.selectedStage !== model.currentStage || model.selected?.session_ref !== model.current?.session_ref || model.selectedRole && model.selectedRole !== "reasoning") ? <button className="root-return-current" onClick={model.returnCurrent}>返回当前阶段 ↗</button> : null}
       <span className="research-connection" data-connected={connected || polling}><i />{model.context.stale ? "状态待确认 · 保留记录" : connected ? "实时连接" : polling ? "定时更新" : "连接中断 · 保留记录"}</span>
     </header>
-    {failure ? <div className="lumen-idea-health-blocker" data-testid="research-current-worker-blocker" role="status"><span aria-hidden="true">!</span><div><b>{failure.name === "target_run_worker" ? "Target 启动受阻" : "当前阶段推进受阻"}</b><small>已形成的会话与研究记录仍可查看。</small></div><code title={failure.reason?.code}>{failure.reason?.code ?? "worker_unavailable"}</code></div> : null}
+    {failure ? <div className="lumen-idea-health-blocker" data-testid="research-current-worker-blocker" role="status"><span aria-hidden="true">!</span><div><b>{retrySummary ?? (usageLimit ? "模型额度已用尽" : failure.name === "target_run_worker" ? "Target 推进受阻" : "当前阶段推进受阻")}</b><small>{retrySummary ? "原会话正在继续；上次错误与研究记录仍保留。" : usageLimit ? "原会话和研究记录已保留；额度恢复后可继续研究。" : "已形成的会话与研究记录仍可查看。"}</small></div><code title={failure.reason?.code}>{failure.reason?.code ?? "worker_unavailable"}</code></div> : null}
     {model.error || model.data?.limited ? <div className="root-session-warning" role="status">{model.data ? "会话状态更新不完整，保留已读取记录。" : "暂时无法读取研究会话。"}<button onClick={model.refresh}>重新读取</button>{model.error ? <details><summary>状态详情</summary><code>{model.error}</code></details> : null}</div> : null}
     {model.selected && model.questRef ? <RootSessionTimeline key={model.selected.session_ref} questRef={model.questRef} session={model.selected} scope={sessionScope(model.selected, model.context)} active={model.active} stale={Boolean(model.context.stale || model.error || model.data?.limited)} />
       : model.selectedStage === "reasoning" && model.selectedRole && !model.selectedRef ? <section className="research-conversation root-pending-role" aria-label={`${reasoningRoleLabels[model.selectedRole]} 待启动会话`} data-root-role={model.selectedRole}>

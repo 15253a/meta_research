@@ -41,6 +41,13 @@ _POLICY_CONTRACT = "bundle-execution-contract:policy-refresh/v1"
 _POLICY_PACKAGE = "package:meta_research.skills.bundle_stage/"
 _POLICY_RESOURCES = ("SKILL.md", "references/contract.md")
 
+# Exact reviewed shared adapter revisions: classify signed terminal account
+# usage limits without changing tools, schemas, native identity or sealed files.
+_REVIEWED_USAGE_LIMIT_SHARED_SOURCES = frozenset({
+    "653e4374f2440a6b93ad40b520db472dd9c8b5b6dde80a707a59c380ff3e0a25",
+    "e20a48af0c526466baa2303cd1e9d4f028399da4389faca8b62e13439036d699",
+})
+
 # 09e0ac7 adds current Quest conditions to new calls and retains the sealed
 # conditions/prompt for durable replays. These exact aggregate instruction and
 # two source hashes were checked against the admitted 8768 Bundle and release.
@@ -68,6 +75,48 @@ _REVIEWED_PROTOCOL_BUNDLE_BINDING_PAIRS = frozenset({
         "3dd50f3b14fbf3908a89ee9a2681d817b21292da97e5764509a8c98e80fb570d",
     }),
 })
+
+# 2026-09-29: Bundle17's actual frozen binding and the candidate recomputed
+# from the same deployment artifacts/key. Only the complete root profile hash
+# changes; models, grants, MCP catalog, schemas and all other resources match.
+# The profile differs only in the reviewed research instruction text. This
+# exact pair does not authorize subsequent prompt, model or configuration edits.
+_REVIEWED_ROOT_PROMPT_BUNDLE_BINDING_PAIRS = frozenset({
+    frozenset({
+        "9e877a6aae636809842c44f05b647120e3df7b509c98ca97a80f215a46124ae5",
+        "fcbbf541fb19343e6c033d75ac9c69e612be290d51eadc7224010f1915d095b4",
+    }),
+})
+
+# Directional, complete profile identities for historical reads only. Fixtures
+# retain both full objects and prove all capability/model/config fields equal.
+_REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
+    (
+        "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
+        "15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e",
+    ),
+    # 2026-09-29 Bundle candidate handoff: both deployed profiles differ from
+    # this exact current profile only in research_system_prompt_hash, checked
+    # for all nine root kinds. Keep both direct historical-read transitions;
+    # this does not grant execution compatibility or rewrite signed records.
+    # Full profile evidence: fixtures/root_prompt_bundle_handoff_20260929/.
+    (
+        "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
+        "8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be",
+    ),
+    (
+        "15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e",
+        "8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be",
+    ),
+})
+
+
+def reviewed_historical_root_profile_hashes(current_hash: str) -> frozenset[str]:
+    """Historical identities reviewed for this exact current profile."""
+    return frozenset(
+        before for before, after in _REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS
+        if current_hash == after
+    )
 
 # This adapter revision only adds the contract marker and the previously implicit
 # dispatch-recovery source hash. Future prose edits need no hash-table updates;
@@ -180,6 +229,9 @@ def _same_execution_policy_value(binding: "BundleRuntimeBinding") -> dict[str, o
         if entry is None or not _is_sha256(entry[len(prefix):]):
             return None
     replacements = {}
+    shared = _single_resource(binding, _SHARED_BUNDLE_SOURCE)
+    if shared is not None and shared[len(_SHARED_BUNDLE_SOURCE):] in _REVIEWED_USAGE_LIMIT_SHARED_SOURCES:
+        replacements[shared] = _SHARED_BUNDLE_SOURCE + "reviewed-usage-limit-20260926"
     for name in _POLICY_RESOURCES:
         prefix = f"{_POLICY_PACKAGE}{name}@sha256:"
         entry = _single_resource(binding, prefix)
@@ -233,6 +285,8 @@ def bundle_bindings_compatible(left: "BundleRuntimeBinding", right: "BundleRunti
     if before is not None and after is not None and before == after:
         return True
     pair = frozenset((canonical_hash(left.as_dict()), canonical_hash(right.as_dict())))
+    if len(pair) == 2 and pair in _REVIEWED_ROOT_PROMPT_BUNDLE_BINDING_PAIRS:
+        return True
     if len(pair) == 2 and pair in _REVIEWED_PROTOCOL_BUNDLE_BINDING_PAIRS:
         return True
     before = _reviewed_execution_value(left)
@@ -252,6 +306,23 @@ _REVIEWED_REASONING_BINDING_PAIRS: frozenset[frozenset[str]] = frozenset({
     frozenset({
         "0d926bdb5d90952791279630d8d5e6d6410df41c9b7c3c0424eac7cee655858f",
         "70ac6ea577199bccbc9b837a8aec4557aa2a03f9d60d0b73b55e1d2691b89868",
+    }),
+    # 2026-09-28: only Reasoning SKILL.md and references/contract.md clarify
+    # exact reference arrays and correction after truncated output. Full frozen
+    # Run/candidate bindings are in tests/fixtures/reasoning_binding_compatibility/
+    # reasoning-binding-20260928-{before,after}.json; all execution fields match.
+    frozenset({
+        "1c94cc1e0efa9ff348b1b4e7c8c653b44df119ac732230be948b4f900cf27a51",
+        "d8bdbd84dbbed7f75f54819fa3f3c47d21af8a7ef90d4820c5b6af21b875f74a",
+    }),
+    # 2026-09-28 0651: bound five frozen reference arrays by their actual
+    # request lengths and clarify copying prior outcome refs. The complete
+    # reviewed pair includes the contract, adapter and all three generated
+    # schema hashes; execution identity and frozen receipts remain unchanged.
+    # Fixtures: reasoning-binding-20260928-0651-{before,after}.json.
+    frozenset({
+        "d8bdbd84dbbed7f75f54819fa3f3c47d21af8a7ef90d4820c5b6af21b875f74a",
+        "c846926fd589eed5ea41608fedfabd33ff05b6302f01670fcb6e61d3df7f2243",
     }),
 })
 

@@ -1116,6 +1116,14 @@ def test_historical_direct_bundle_keeps_exact_accepted_formal_plan_readable(
         assert context["accepted_formal_plan_binding"] == (
             accepted_formal_plan.as_dict()
         )
+        display = runtime.owners.advancement_engine.query_cycle_stage_display(
+            str(quest["quest_ref"]), str(successor["cycle_ref"])
+        )
+        assert display is not None
+        assert display["typed_skip_basis_refs_by_stage"] == {
+            "idea": [accepted_idea_set.outcome_ref],
+            "plan": [accepted_formal_plan.formal_plan_ref],
+        }
 
         monkeypatch.setattr(reasoning_contract, "REASONING_SUCCESSOR_ENTRY_STAGES",
                             ("idea", "plan", "reasoning"))

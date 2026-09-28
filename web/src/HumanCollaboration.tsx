@@ -274,7 +274,7 @@ function scopeLabel(request: HumanRequestItem): string {
 function requestStatusLabel(status: HumanRequestItem["status"]): string {
   return {
     open: "待处理",
-    satisfied: "已满足",
+    satisfied: "已处理",
     unsatisfied: "已回应，未满足",
     declined: "已拒绝",
     withdrawn: "已撤回",
@@ -599,9 +599,9 @@ export function QuestCompanion({
         ) : null}
         {!ready ? (
           <article className="lumen-proposal">
-            <small>当前边界 · 无写入</small>
-            <b>对话能力尚未启用</b>
-            <p>这个固定位置不会被 capability list、Owner revision 或 receipt rail 取代。</p>
+            <small>研究助手</small>
+            <b>{companion ? "对话暂不可用" : "正在读取研究上下文"}</b>
+            <p>{companion ? "请稍后刷新研究状态；现有研究记录会保留。" : "上下文载入后即可发送消息，也可以先查看阶段会话与工作记录。"}</p>
           </article>
         ) : null}
       </div>
@@ -2781,9 +2781,8 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
   if (request.status !== "open" || retryStatus === "succeeded") {
     return (
       <div className="hc-response-boundary" role="status">
-        <b>这件事已处理 · {requestStatusLabel(
-          retryStatus === "succeeded" ? "satisfied" : request.status,
-        )}</b><br />
+        <b>这件事已处理{request.status !== "satisfied" && retryStatus !== "succeeded"
+          ? ` · ${requestStatusLabel(request.status)}` : ""}</b><br />
         处理记录可在详情中查看；如果出现后续待办，可在那里补充。
       </div>
     );

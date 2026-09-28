@@ -29,6 +29,8 @@ description: 根据当前研究重心、构想与历史证据选择本轮投入�
 
 先用相关历史或六入口索引发现，再按需分页和读取精确正文。首目录不限制候选全集，同 Quest 后续发现的已接纳来源可正式选用；未取得身份的新发现先作为研究观察。
 
+`research_graph.baselines.page`／`read` 的 `limit` 是条目数，默认 20，范围 1–100；`read` 只传精确 `baseline_ref` 即可读取方法合同，展开关联实体时再按返回的 `next_offset`／`next_evaluation_offset` 分页。各工具的分页单位独立，正文 reader 的字符上限不适用于 Baseline 列表。遇 `baseline_query_invalid` 时按当前 schema 修正参数，再继续读取。
+
 逐 obligation 判断 `covered | gap`，写支持主张及边界。`covered` 至少有一个实际 evidence use；无测量观察、分析、负结果、人类输入等可按真实内容使用，来源类型不预设科学价值。`gap` 说明相对义务还缺什么，可有部分证据，但须由一个或多个 ExperimentBrief 覆盖。仍要消费的历史来源选入 evidence use，不能只在 notes 写“复用”。
 
 Brief 用 goal、characteristics、boundary constraints、semantic delta 和真实 Idea 来源说明目的、可接受观察与局部限制。Target、实现和依赖由 Bundle 决定。全部 covered 且无 Brief 时为 `no_new_experiment_required`；存在 gap 且均被 Brief 覆盖时为 `experiments_required`。

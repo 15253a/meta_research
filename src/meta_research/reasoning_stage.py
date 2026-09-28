@@ -1454,10 +1454,14 @@ class ReasoningStageWorker:
         active = self._discover_active_cycles()
         if active:
             return active[-1]
-        historical: dict[str, _CurrentCycle] = {}
-        for event in self._feed.read_event_type(_STAGE_REQUEST_EVENT):
-            if event.payload.get("stage") != "reasoning":
-                continue
+        historical = [
+            event
+            for event in self._feed.read_event_type(_STAGE_REQUEST_EVENT)
+            if event.payload.get("stage") == "reasoning"
+        ]
+        if historical:
+            # Events select a display candidate; AE/RG still authenticate it.
+            event = max(historical, key=lambda value: value.revision)
             cycle_ref = event.payload.get("cycle_ref")
             if not isinstance(cycle_ref, str) or not cycle_ref:
                 raise OwnerConflict("reasoning_cycle_index_invalid")
@@ -1474,11 +1478,7 @@ class ReasoningStageWorker:
                 or question.as_binding() != request.accepted_question
             ):
                 raise OwnerConflict("reasoning_cycle_index_invalid")
-            historical[cycle_ref] = _CurrentCycle(
-                event.revision, cycle_ref, question
-            )
-        if historical:
-            return max(historical.values(), key=lambda value: value.revision)
+            return _CurrentCycle(event.revision, cycle_ref, question)
 
         # Before AE emits the Reasoning request, the initial-cycle event is a
         # routing index only; current AE/RG reads remain authoritative.

@@ -513,16 +513,18 @@ class PublicProjection:
                     if control_quest_ref is not None
                     else None
                 )
-                successor_context_query = getattr(
+                cycle_stage_display_query = getattr(
                     self._advancement_engine,
-                    "query_reasoning_successor_context",
+                    "query_cycle_stage_display",
                     None,
                 )
-                successor_context = (
-                    successor_context_query(current_foreground["cycle_ref"])
+                cycle_stage_display = (
+                    cycle_stage_display_query(
+                        control_quest_ref, current_foreground["cycle_ref"]
+                    )
                     if isinstance(current_foreground, dict)
                     and isinstance(current_foreground.get("cycle_ref"), str)
-                    and callable(successor_context_query)
+                    and callable(cycle_stage_display_query)
                     else None
                 )
             with query_section("idea_stage"):
@@ -541,25 +543,25 @@ class PublicProjection:
                 idea_stage,
                 stage="idea",
                 foreground=current_foreground,
-                successor_context=successor_context,
+                successor_context=cycle_stage_display,
             )
             plan_stage = _with_typed_stage_skip(
                 plan_stage,
                 stage="plan",
                 foreground=current_foreground,
-                successor_context=successor_context,
+                successor_context=cycle_stage_display,
             )
             bundle_stage = _with_typed_stage_skip(
                 bundle_stage,
                 stage="bundle",
                 foreground=current_foreground,
-                successor_context=successor_context,
+                successor_context=cycle_stage_display,
             )
             reasoning_stage = _with_typed_stage_skip(
                 reasoning_stage,
                 stage="reasoning",
                 foreground=current_foreground,
-                successor_context=successor_context,
+                successor_context=cycle_stage_display,
             )
             autonomous_creation = (
                 None
@@ -584,6 +586,7 @@ class PublicProjection:
                     plan_stage=plan_stage,
                     bundle_stage=bundle_stage,
                     reasoning_stage=reasoning_stage,
+                    stage_display=cycle_stage_display,
                 )
                 writing = (
                     {
@@ -1085,6 +1088,7 @@ def _furthest_accepted_stage_result(
     plan_stage: dict[str, object] | None,
     bundle_stage: dict[str, object] | None,
     reasoning_stage: dict[str, object] | None,
+    stage_display: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
     """Summarize the furthest accepted same-Cycle Stage position."""
 
@@ -1112,12 +1116,14 @@ def _furthest_accepted_stage_result(
             ("outcome_ref",),
         ),
     ):
-        if (
-            projection is None
-            or not _stage_projection_matches_foreground(projection, foreground)
-        ):
-            continue
-        result = projection.get(field)
+        result = (
+            projection.get(field)
+            if projection is not None
+            and _stage_projection_matches_foreground(projection, foreground)
+            else None
+        )
+        if not isinstance(result, dict) or result.get("status") != "accepted":
+            result = _committed_stage_result(stage_display, foreground, stage.lower())
         if isinstance(result, dict) and result.get("status") == "accepted":
             result_ref = next(
                 (
@@ -1147,6 +1153,48 @@ def _furthest_accepted_stage_result(
                 summary["disposition"] = disposition
             return summary
     return None
+
+
+def _committed_stage_result(
+    stage_display: dict[str, object] | None,
+    foreground: dict[str, object] | None,
+    stage: str,
+) -> dict[str, object] | None:
+    """Retain the exact Cycle's completed fact after a worker moves on."""
+    if (
+        not isinstance(stage_display, dict) or not isinstance(foreground, dict)
+        or stage_display.get("cycle_ref") != foreground.get("cycle_ref")
+        or stage_display.get("target_question_ref") != foreground.get("question_ref")
+    ):
+        return None
+    commits = [
+        item for item in stage_display.get("commits", ())
+        if item.cycle_ref == foreground["cycle_ref"]
+        and item.stage == stage and item.disposition == "completed"
+        and isinstance(item.outcome_ref, str) and item.outcome_ref
+    ]
+    if not commits:
+        return None
+    commit = max(commits, key=lambda item: item.epoch)
+    if commit.outcome_kind not in {
+        "idea_set", "no_viable_candidate", "formal_plan", "bundle_report",
+        "reasoning_outcome",
+    }:
+        return None
+    result = {
+        "status": "accepted",
+        "outcome_ref": commit.outcome_ref,
+        "report_ref": commit.outcome_ref,
+        "outcome_kind": {
+            "idea_set": "IdeaSet", "no_viable_candidate": "NoViableCandidate"
+        }.get(commit.outcome_kind),
+    }
+    closure = commit.closure or {}
+    if stage == "bundle" and isinstance(closure.get("bundle_report"), dict):
+        result["disposition"] = closure["bundle_report"].get("disposition")
+    elif stage == "reasoning":
+        result["disposition"] = closure.get("scientific_disposition")
+    return result
 
 
 def _with_typed_stage_skip(

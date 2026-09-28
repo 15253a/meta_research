@@ -1,11 +1,31 @@
 import type { BundleTargetCommitProjection, BundleTargetProjection, HumanRequestItem } from "./api";
+import type { RuntimeStatus } from "./StatusHome";
+import type { RootSessions } from "./rootSessionsApi";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const records = (value: unknown) => Array.isArray(value) ? value.map(record) : [];
 const ref = (value: unknown): string | null => typeof value === "string" && value.length > 0 ? value : null;
 const refs = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 
-export function targetResearchFacts(target: BundleTargetProjection, candidate?: BundleTargetCommitProjection, requests: readonly HumanRequestItem[] = []) {
+export type TargetRetryObservation = { target_ref: string; run_ref: string; checkName: string; reasonCode?: string; summary: string };
+
+export function observedTargetRetry(status: RuntimeStatus | null, roots: RootSessions | null): TargetRetryObservation | null {
+  const task = status?.current_task, foreground = status?.foreground;
+  if (status?.state !== "failed" || task?.kind !== "target" || task.status !== "running" || !task.target_ref || !task.run_ref
+    || foreground?.stage !== "bundle" || foreground.status !== "active" || !roots || roots.limited !== false
+    || roots.quest_ref !== foreground.quest_ref) return null;
+  const failure = status.health.checks.find(check => ["target_run_worker", "target_root_lifecycle"].includes(check.name) && check.status === "unavailable");
+  const executing = roots.sessions.some(session => session.kind === "target" && session.stage === "bundle"
+    && session.target_ref === task.target_ref && session.run_ref === task.run_ref
+    && session.cycle_ref === foreground.cycle_ref && session.question_ref === foreground.question_ref
+    && session.is_current === true && session.is_executing === true && session.status === "executing"
+    && roots.active_session_refs.includes(session.session_ref));
+  if (!failure || !executing) return null;
+  return { target_ref: task.target_ref, run_ref: task.run_ref, checkName: failure.name, reasonCode: failure.reason?.code,
+    summary: failure.reason?.code === "target_root_artifact_storage_unavailable" ? "Target 正在重试，上次入库受阻" : "Target 正在重试，上次推进受阻" };
+}
+
+export function targetResearchFacts(target: BundleTargetProjection, candidate?: BundleTargetCommitProjection, requests: readonly HumanRequestItem[] = [], runtimeStatus?: Pick<RuntimeStatus, "state" | "current_task" | "health"> | null, retry?: TargetRetryObservation | null) {
   // A historical or mismatched Commit must never supply facts for the current Run.
   const commit = candidate?.target_ref === target.target_ref && candidate.target_spec_hash === target.spec_hash
     && (!target.target_run_ref || candidate.target_run_ref === target.target_run_ref) ? candidate : undefined;
@@ -33,10 +53,19 @@ export function targetResearchFacts(target: BundleTargetProjection, candidate?: 
   const answered = related.filter(request => request.responses?.length);
   const blockerCode = ref(target.blocker?.code);
   const coordination = blockerCode === "target_coordination_required" || blockerCode === "target_semantic_change_required";
-  const technicalFailure = !commit && (["failed", "fenced"].includes(target.status) || Boolean(blockerCode && !coordination && !blockerCode.startsWith("target_high_risk_authorization")));
+  // The caller supplies only the selected current scope observation. A worker
+  // failure must still match this exact Target Run, never a historical result.
+  const exactRuntimeTarget = !commit && runtimeStatus?.current_task?.kind === "target"
+    && runtimeStatus.current_task.target_ref === target.target_ref && Boolean(target.target_run_ref)
+    && runtimeStatus.current_task.run_ref === target.target_run_ref;
+  const runtimePaused = exactRuntimeTarget && runtimeStatus?.state === "paused";
+  const runtimeFailure = exactRuntimeTarget && runtimeStatus?.state === "failed"
+    && runtimeStatus.health.checks.some(check => ["target_run_worker", "target_root_lifecycle"].includes(check.name) && check.status === "unavailable");
+  const retrySummary = runtimeFailure && retry?.target_ref === target.target_ref && retry.run_ref === target.target_run_ref ? retry.summary : null;
+  const technicalFailure = Boolean(runtimeFailure) || !commit && (["failed", "fenced"].includes(target.status) || Boolean(blockerCode && !coordination && !blockerCode.startsWith("target_high_risk_authorization")));
   const dispositions: Record<string, string> = { positive: "正面结果", negative: "负面结果", uncertain: "结果不确定", rejected: "方案已否定", inconclusive: "尚无确定结论", insufficient_evidence: "证据不足" };
   const result = commit ? dispositions[commit.result_disposition] ?? commit.result_disposition : "研究结果尚未接纳";
-  const summary = openRequests.length ? "有待人类答复的求助" : technicalFailure ? "技术执行受阻" : coordination ? "等待研究调整" : commit ? `研究记录已接纳 · ${result}` : target.status === "running" ? "Target 正在开展工作" : "等待研究工作接续";
+  const summary = runtimePaused ? "研究已暂停，保留 Target 记录" : retrySummary || (runtimeFailure ? "Target 推进受阻" : openRequests.length ? "有待人类答复的求助" : technicalFailure ? "技术执行受阻" : coordination ? "等待研究调整" : commit ? `研究记录已接纳 · ${result}` : target.status === "running" ? "Target 正在开展工作" : "等待研究工作接续");
   const resultAsset = record(measurement.result_asset);
   const artifactRefs = [...new Set([...refs(measurement.checkpoint_refs), ...records(manifest.entries).map(item => ref(record(item.binding).version_ref)).filter((item): item is string => Boolean(item)), ...refs([resultAsset.version_ref])])];
   const readableAssets = [...new Map([

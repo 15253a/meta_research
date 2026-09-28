@@ -357,6 +357,11 @@ class _NativeCliHarnessAdapter:
                 "provider_io_unavailable", durable_outcome="unknown"
             ) from error
 
+    def recover_transport_receipt(self, operation_ref: str) -> dict[str, object] | None:
+        """Recover display provenance without invoking or accepting a turn."""
+        recover = getattr(self._runner, "recover_transport_receipt", None)
+        return recover(operation_ref, family=self.family) if callable(recover) else None
+
     def _environment(self, invocation: HarnessInvocation) -> dict[str, str]:
         return {
             _MCP_TOKEN_ENV: invocation.mcp_token,
@@ -1504,6 +1509,67 @@ class HarnessSupervisorTransport:
                 matches.append(prompt)
             except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
                 raise OSError("terminal provider input unavailable") from error
+        if len(matches) > 1:
+            raise OSError("terminal provider input ambiguous")
+        return matches[0] if matches else None
+
+    def recover_transport_receipt(
+        self, operation_ref: str, *, family: str
+    ) -> dict[str, object] | None:
+        """Find a sealed historical turn whose transport hash binds this exact ref.
+
+        Human-wait checkpoints can precede capability profile acceptance. Their
+        signed spools remain authority even when no profile index was retained.
+        No Provider is run and no spool or Owner record is changed here.
+        """
+        if family != "codex" or not operation_ref or len(operation_ref) > 128:
+            raise OSError("provider operation identity unavailable")
+        # Keys used by the v1 native CLI transport. Values (including tokens)
+        # are neither read from a live process nor retained in the spool.
+        environment_names = sorted((
+            _MCP_TOKEN_ENV, _HARNESS_FAMILY_ENV, _HARNESS_WORKSPACE_ENV,
+            _PROVIDER_OPERATION_ENV, _HARNESS_EVIDENCE_SCOPE_ENV,
+            _HARNESS_OBSERVATION_SCOPE_ENV, "NO_PROXY", "no_proxy",
+        ))
+        matches = []
+        for receipt_path in (self._workspace / "provider-operations").glob("*/*/supervisor-exit.json"):
+            directory = receipt_path.parent
+            if re.fullmatch(r"[0-9a-f]{64}", directory.name) is None or directory.parent.name != directory.name[:2]:
+                continue
+            try:
+                request = read_supervisor_request(directory / "supervisor-request.json", self._transport_key)
+                prompt_path = directory / "prompt.txt"
+                if prompt_path.stat().st_size > _STREAM_LIMIT:
+                    continue
+                prompt = prompt_path.read_text(encoding="utf-8")
+                argv = json.loads((directory / "provider-argv.json").read_text(encoding="utf-8"))
+                invocation_hash = canonical_hash({
+                    "schema_ref": "meta-research/harness-provider-operation/v1",
+                    "family": family, "provider_operation_ref": operation_ref,
+                    "argv": argv, "prompt_hash": canonical_hash(prompt),
+                    "timeout_seconds": request.get("timeout_seconds"),
+                    "environment_names": environment_names,
+                })
+                if invocation_hash != directory.name:
+                    continue
+                self._verify_terminal_request(directory / "supervisor-request.json",
+                    self._supervisor_request(directory, invocation_hash, family, request.get("timeout_seconds")))
+                receipt, envelope = read_verified_exit_receipt(
+                    receipt_path, key=self._transport_key, invocation_hash=invocation_hash,
+                    prompt_path=prompt_path, schema_path=directory / "output-schema.json",
+                    stdout_path=directory / "stdout.jsonl", result_path=directory / "last-message.json",
+                    expected_schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+                )
+            except (OSError, ValueError, ProviderSupervisorError):
+                continue
+            matches.append({
+                "schema_ref": "meta-research/harness-provider-transport-receipt/v1",
+                "spool_ref": "provider-spool:" + invocation_hash,
+                "transport_invocation_hash": invocation_hash,
+                "supervisor_receipt_hash": canonical_hash(envelope),
+                "termination_reason": receipt["termination_reason"],
+                "provider_returncode": receipt["returncode"],
+            })
         if len(matches) > 1:
             raise OSError("terminal provider input ambiguous")
         return matches[0] if matches else None

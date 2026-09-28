@@ -161,6 +161,9 @@ from meta_research.target_run_runtime_contract import (
 from meta_research.writing_contract import validate_writing_claim_inventory
 
 if TYPE_CHECKING:
+    from meta_research.owners.advancement_engine import StageCommit, StageRunRequest
+    from meta_research.owners.agent_runtime import AttemptExecution
+    from meta_research.owners.research_memory import AcceptedIdeaOutcomeContent, AcceptedPlanDocument
     from meta_research.owners.target_root_lifecycle import (
         AcceptedTargetRootCompletion,
     )
@@ -1275,6 +1278,12 @@ class TargetRootCommitTransitionReader(Protocol):
     ) -> AcceptedTargetCommitTransition | None: ...
 
 
+class AssetQuestScopeVerifier(Protocol):
+    def verify_asset_quest_scope(
+        self, version_ref: str, *, quest_ref: str
+    ) -> AcceptedAssetBinding: ...
+
+
 class TargetCommitEvidenceAuthority(Protocol):
     """Authority behind the Plan Baseline Pool projection.
 
@@ -1715,6 +1724,11 @@ class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetO
         execution_receipt: AcceptanceReceipt,
     ) -> IdeaOutcomeDecision: ...
 
+    def query_stage_decision_display(
+        self, request: StageRunRequest, commit: StageCommit, execution: AttemptExecution,
+        content: AcceptedIdeaOutcomeContent | AcceptedPlanDocument,
+    ) -> IdeaOutcomeDecision | FormalPlanDecision | None: ...
+
     def query_idea_outcome_decision(
         self, submission_ref: str
     ) -> IdeaOutcomeDecision | None: ...
@@ -1728,6 +1742,10 @@ class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetO
     def query_reasoning_outcome_decision(
         self, submission_ref: str
     ) -> ReasoningOutcomeDecision | None: ...
+
+    def query_reasoning_result_display(
+        self, submission_ref: str
+    ) -> dict[str, object] | None: ...
 
     def verify_reasoning_outcome_decision(
         self,
@@ -2132,6 +2150,13 @@ class SQLiteResearchGraphReceiptVerifier:
         self._target_root_commit_transition_reader: (
             TargetRootCommitTransitionReader | None
         ) = None
+        self._asset_quest_scope_verifier: AssetQuestScopeVerifier | None = None
+
+    def bind_asset_quest_scope_verifier(self, verifier: AssetQuestScopeVerifier) -> None:
+        current = self._asset_quest_scope_verifier
+        if current is not None and current is not verifier:
+            raise OwnerConflict("asset_quest_scope_verifier_already_bound")
+        self._asset_quest_scope_verifier = verifier
 
     def bind_autonomous_question_dispatch_verifier(self, verifier) -> None:
         immutable_method = getattr(
@@ -3726,6 +3751,7 @@ class SQLiteResearchGraphReceiptVerifier:
             ),
         )
 
+    @snapshot_cached
     def verify_reasoning_outcome_decision(
         self,
         request_ref: str,
@@ -4723,11 +4749,21 @@ class SQLiteResearchGraphReceiptVerifier:
             if content is None or content.outcome_hash != row.outcome_hash:
                 raise OwnerConflict("idea_outcome_content_hash_invalid")
             verified_evidence_refs = idea_used_evidence_refs(content.outcome)
-        self.verify_evidence_refs(
-            quest_ref=accepted_question.quest_ref,
-            version_refs=tuple(sorted(verified_evidence_refs)),
-            require_current=False,
-        )
+        try:
+            self.verify_idea_outcome_evidence_refs(
+                quest_ref=accepted_question.quest_ref,
+                version_refs=tuple(sorted(verified_evidence_refs)),
+                context_schema_ref=verified_request.context_pack.get("schema_ref"),
+            )
+        except OwnerConflict as error:
+            # Read the signed rejection without requiring its rejected source
+            # to become valid. Content, execution and receipt checks still apply.
+            if not (
+                row.decision == "rejected"
+                and row.reason_code == "asset_quest_scope_invalid"
+                and error.code == row.reason_code
+            ):
+                raise
         if self._idea_content_verifier is not None:
             self._idea_content_verifier.verify_idea_content_receipt(
                 request_ref=row.request_ref,
@@ -4802,6 +4838,7 @@ class SQLiteResearchGraphReceiptVerifier:
             receipt=binding.outcome_receipt,
         )
 
+    @snapshot_cached
     def verify_formal_plan_decision(
         self,
         *,
@@ -4945,18 +4982,27 @@ class SQLiteResearchGraphReceiptVerifier:
         except PlanContractError as error:
             raise OwnerConflict(str(error)) from error
         evidence_revision = len(evidence_catalog)
-        self.verify_plan_evidence_catalog(
-            quest_ref=row.quest_ref,
-            evidence_catalog=evidence_catalog,
-            expected_reference_revision=evidence_revision,
-            # Decision creation already performed the current-state CAS.  A
-            # later Bundle may legitimately add TargetCommit evidence to the
-            # same Quest; historical receipt verification must keep validating
-            # the frozen catalog rather than retroactively invalidating Plan.
-            require_current=False,
-            require_complete=False,
-            selected_evidence_refs=selected_evidence_refs,
-        )
+        try:
+            self.verify_plan_evidence_catalog(
+                quest_ref=row.quest_ref,
+                evidence_catalog=evidence_catalog,
+                expected_reference_revision=evidence_revision,
+                # Decision creation already performed the current-state CAS. A
+                # later Bundle may add evidence without invalidating this cut.
+                require_current=False,
+                require_complete=False,
+                selected_evidence_refs=selected_evidence_refs,
+            )
+        except OwnerConflict as error:
+            # A signed rejection remains readable with the exact source error
+            # it rejects. It never authorizes an accepted FormalPlan or waives
+            # the remaining content, request and execution receipt checks.
+            if not (
+                row.decision == "rejected"
+                and row.reason_code == "plan_evidence_source_invalid"
+                and error.code == row.reason_code
+            ):
+                raise
         if self._execution_verifier is None:
             raise OwnerConflict("attempt_execution_verifier_unavailable")
         self._execution_verifier.verify_attempt_execution_receipt(
@@ -5438,7 +5484,7 @@ class SQLiteResearchGraphReceiptVerifier:
     ) -> None:
         if canonical_hash(binding.plan_document) != binding.plan_document_hash:
             raise OwnerConflict("bundle_formal_plan_binding_invalid")
-        with self._database.read() as connection:
+        with self._database.read_snapshot() as connection:
             row = connection.execute(
                 text(
                     "SELECT * FROM rg_formal_plan_decisions WHERE "
@@ -5446,29 +5492,29 @@ class SQLiteResearchGraphReceiptVerifier:
                 ),
                 {"formal_plan_ref": binding.formal_plan_ref},
             ).first()
-        if row is None or (
-            row.plan_content_ref != binding.content_ref
-            or row.plan_document_hash != binding.plan_document_hash
-            or row.answer_contract_hash != binding.answer_contract_hash
-            or row.plan_content_receipt_ref != binding.content_receipt.receipt_ref
-            or row.plan_content_receipt_hash != binding.content_receipt.payload_hash
-            or binding.content_receipt.issuer != "research_memory"
-            or binding.content_receipt.kind != "plan_document_content_acceptance"
-            or binding.content_receipt.subject_ref != binding.content_ref
-            or row.receipt_ref != binding.formal_plan_receipt.receipt_ref
-            or row.receipt_hash != binding.formal_plan_receipt.payload_hash
-            or binding.formal_plan_receipt.issuer != RG_OWNER
-            or binding.formal_plan_receipt.kind != FORMAL_PLAN_ACCEPTED_RECEIPT_KIND
-            or binding.formal_plan_receipt.subject_ref != binding.formal_plan_ref
-        ):
-            raise OwnerConflict("bundle_formal_plan_binding_invalid")
-        self.verify_formal_plan_decision(
-            request_ref=row.request_ref,
-            submission_ref=row.submission_ref,
-            decision="accepted",
-            formal_plan_ref=binding.formal_plan_ref,
-            receipt=binding.formal_plan_receipt,
-        )
+            if row is None or (
+                row.plan_content_ref != binding.content_ref
+                or row.plan_document_hash != binding.plan_document_hash
+                or row.answer_contract_hash != binding.answer_contract_hash
+                or row.plan_content_receipt_ref != binding.content_receipt.receipt_ref
+                or row.plan_content_receipt_hash != binding.content_receipt.payload_hash
+                or binding.content_receipt.issuer != "research_memory"
+                or binding.content_receipt.kind != "plan_document_content_acceptance"
+                or binding.content_receipt.subject_ref != binding.content_ref
+                or row.receipt_ref != binding.formal_plan_receipt.receipt_ref
+                or row.receipt_hash != binding.formal_plan_receipt.payload_hash
+                or binding.formal_plan_receipt.issuer != RG_OWNER
+                or binding.formal_plan_receipt.kind != FORMAL_PLAN_ACCEPTED_RECEIPT_KIND
+                or binding.formal_plan_receipt.subject_ref != binding.formal_plan_ref
+            ):
+                raise OwnerConflict("bundle_formal_plan_binding_invalid")
+            self.verify_formal_plan_decision(
+                request_ref=row.request_ref,
+                submission_ref=row.submission_ref,
+                decision="accepted",
+                formal_plan_ref=binding.formal_plan_ref,
+                receipt=binding.formal_plan_receipt,
+            )
 
     def query_target_graph_rejection(
         self, submission_ref: str
@@ -5760,9 +5806,13 @@ class SQLiteResearchGraphReceiptVerifier:
             validate_target_launch_request(request)
         except (TypeError, ValueError) as error:
             raise OwnerConflict("target_launch_request_invalid") from error
-        authoritative, verification = self._formal_target_launch_authority(
-            request.target_ref
-        )
+        # Reuse immutable source verification only within this read. AR's
+        # pre-lock and in-lock checks enter separate cuts and still compare
+        # their independently verified results before the first launch write.
+        with self._database.read_snapshot():
+            authoritative, verification = self._formal_target_launch_authority(
+                request.target_ref
+            )
         if request != authoritative:
             raise OwnerConflict("target_launch_authority_stale")
         return verification
@@ -6475,6 +6525,27 @@ class SQLiteResearchGraphReceiptVerifier:
         # evidence that both Idea outcome forms are exhausted.
         raise OwnerConflict("stage_commit_basis_invalid")
 
+    def verify_idea_outcome_evidence_refs(self, *, quest_ref, version_refs, context_schema_ref):
+        # V4's discovery page is not an allowlist. Existing Quest material and
+        # committed Target artifacts retain their exact source without needing
+        # an additional evidence role. Older frozen contracts stay unchanged.
+        if context_schema_ref != IDEA_CONTEXT_PACK_SCHEMA_V4_REF:
+            return self.verify_evidence_refs(quest_ref=quest_ref, version_refs=version_refs)
+        if tuple(sorted(set(version_refs))) != version_refs or len(version_refs) > 100:
+            raise OwnerConflict("idea_context_pack_invalid")
+        if not version_refs:
+            return
+        verifier = self._asset_quest_scope_verifier
+        if verifier is None:
+            raise OwnerConflict("asset_quest_scope_verifier_unavailable")
+        with self._database.read_snapshot():
+            for version_ref in version_refs:
+                binding = verifier.verify_asset_quest_scope(version_ref, quest_ref=quest_ref)
+                self._asset_verifier.verify_asset_receipt(
+                    asset_ref=binding.asset_ref, version_ref=version_ref,
+                    content_hash=binding.content_hash, manifest_hash=binding.manifest_hash,
+                    receipt=binding.receipt)
+
     def _verify_selected_evidence_refs(self, *, quest_ref, version_refs):
         if not version_refs:
             return
@@ -6538,6 +6609,22 @@ class SQLiteResearchGraphReceiptVerifier:
             ("receipt_hash", "reasoning_content_receipt_hash"))):
             raise OwnerConflict("reasoning_content_receipt_invalid")
         return source
+
+    def query_reasoning_result_display(self, submission_ref: str) -> dict[str, object] | None:
+        """Project accepted text through the existing immutable history reader.
+
+        This is not a verified execution receipt or a Writing input closure.
+        """
+        with self._database.read_snapshot() as connection:
+            row = connection.execute(text(
+                "SELECT * FROM rg_reasoning_outcome_decisions WHERE submission_ref=:ref"
+            ), {"ref": submission_ref}).first()
+            if row is None:
+                return None
+            source = self._verified_reasoning_history_source(row)
+            return {**source, "run_ref": row.run_ref, "attempt_ref": row.attempt_ref,
+                    "fence_ref": row.fence_ref, "submission_ref": row.submission_ref,
+                    "outcome_ref": row.outcome_ref, "receipt": _reasoning_decision(row).receipt}
 
     def read_question_scientific_outcome(self, *, quest_ref, question_ref, outcome_ref):
         with self._database.read() as connection:
@@ -6628,6 +6715,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             self
         )
         self._receipt_verifier.bind_target_root_commit_transition_reader(self)
+        self._receipt_verifier.bind_asset_quest_scope_verifier(self)
 
     def bind_target_candidate_proof_verifier(
         self, verifier: TargetCandidateOwnerProofVerifier
@@ -6753,6 +6841,26 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         return accepted_completion, accepted_manifest
 
     def _target_root_domain_context(
+        self,
+        *,
+        completion: AcceptedTargetRootCompletion,
+        manifest: AcceptedTargetRootCompletionManifest,
+        result_document: TargetRootResultDocument,
+    ) -> tuple[
+        AcceptedTarget,
+        AcceptedTargetMeasurementDomainAuthority,
+        AcceptedTargetFormalPlanProjection,
+        AcceptedTargetCandidateProjection,
+    ]:
+        # Each pre-write validation gets its own cut; the second call must see
+        # changes since the first, while nested history reads share its proof.
+        with self._database.read_snapshot():
+            return self._target_root_domain_context_from_current(
+                completion=completion, manifest=manifest,
+                result_document=result_document,
+            )
+
+    def _target_root_domain_context_from_current(
         self,
         *,
         completion: AcceptedTargetRootCompletion,
@@ -6921,10 +7029,22 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             return graph.quest_ref, tuple(assets[ref] for ref in sorted(assets))
 
     def query_target_commit_input_asset_bindings(
-        self, *, quest_ref: str, target_commit_refs: tuple[str, ...]
+        self, *, target_commit_refs: tuple[str, ...], quest_ref: str | None = None,
+        target_ref: str | None = None,
     ) -> dict[str, tuple[AcceptedAssetBinding, ...]]:
         """Read exact companion bindings of already selected accepted results."""
         with self._database.read_snapshot():
+            if target_ref is not None:
+                with self._database.read() as connection:
+                    target_quest = connection.execute(text(
+                        "SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g "
+                        "ON g.graph_ref=t.graph_ref WHERE t.target_ref=:target_ref"
+                    ), {"target_ref": target_ref}).scalar_one_or_none()
+                if target_quest is None or (quest_ref is not None and quest_ref != target_quest):
+                    raise OwnerConflict("target_input_reference_scope_invalid")
+                quest_ref = target_quest
+            if quest_ref is None:
+                raise OwnerConflict("target_input_reference_scope_invalid")
             commits = self.query_target_commits_for_quest(
                 quest_ref, target_commit_refs=target_commit_refs,
             )
@@ -11045,17 +11165,18 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             )
         ):
             raise OwnerConflict("reasoning_outcome_lineage_invalid")
-        self._reasoning_content_verifier.verify_reasoning_content_receipt(
-            request_ref=content.request_ref,
-            submission_ref=content.submission_ref,
-            content_ref=content.content_ref,
-            payload_hash=content.payload_hash,
-            outcome_hash=content.outcome_hash,
-            transition_hash=content.transition_hash,
-            reviewed_draft_hash=content.reviewed_draft_hash,
-            review_hash=content.review_hash,
-            receipt=content.receipt,
-        )
+        with self._database.read_snapshot():
+            self._reasoning_content_verifier.verify_reasoning_content_receipt(
+                request_ref=content.request_ref,
+                submission_ref=content.submission_ref,
+                content_ref=content.content_ref,
+                payload_hash=content.payload_hash,
+                outcome_hash=content.outcome_hash,
+                transition_hash=content.transition_hash,
+                reviewed_draft_hash=content.reviewed_draft_hash,
+                review_hash=content.review_hash,
+                receipt=content.receipt,
+            )
         staged_content_receipt = content.scientific_candidate_content_receipt
         staged_domain_receipt = content.scientific_candidate_domain_receipt
         if staged_content_receipt is None and staged_domain_receipt is None:
@@ -11362,9 +11483,10 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                     "receipt_ref": receipt_ref,
                 },
             )
-        decided = self.query_reasoning_outcome_decision(
-            content.submission_ref
-        )
+        with self._database.read_snapshot():
+            decided = self.query_reasoning_outcome_decision(
+                content.submission_ref
+            )
         if decided is None:
             raise OwnerConflict("reasoning_outcome_decision_missing_after_commit")
         return decided
@@ -11391,6 +11513,9 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             decided.receipt,
         )
         return decided
+
+    def query_reasoning_result_display(self, submission_ref: str) -> dict[str, object] | None:
+        return self._receipt_verifier.query_reasoning_result_display(submission_ref)
 
     def verify_reasoning_outcome_decision(
         self,
@@ -11783,20 +11908,37 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             )
         except IdeaContractError as error:
             raise OwnerConflict(str(error)) from error
-        self._receipt_verifier.verify_evidence_refs(
-            quest_ref=accepted_question.quest_ref,
-            version_refs=tuple(sorted(verified_evidence_refs)),
-            require_current=False,
-        )
         if (
             validated_outcome_hash != content.outcome_hash
             or canonical_hash(content.reviewed_draft) != content.reviewed_draft_hash
             or validated_review_hash != content.review_hash
         ):
             raise OwnerConflict("idea_outcome_content_hash_invalid")
-        decision, reason_code, feedback = _evaluate_idea_outcome(
-            question_content, content.outcome
-        )
+        try:
+            self._receipt_verifier.verify_idea_outcome_evidence_refs(
+                quest_ref=accepted_question.quest_ref,
+                version_refs=tuple(sorted(verified_evidence_refs)),
+                context_schema_ref=verified_request.context_pack.get("schema_ref"),
+            )
+        except OwnerConflict as error:
+            # A candidate's unresolved/foreign source is correctable by the
+            # existing Idea rejection path, not by retrying its sealed content.
+            if error.code != "asset_quest_scope_invalid":
+                raise
+            decision = "rejected"
+            reason_code = error.code
+            feedback = (
+                "One or more Idea evidence references do not resolve to an "
+                "exact accepted asset version in this Quest. Discover and read "
+                "the cited sources, then copy the exact asset version reference "
+                "returned by the tools into accepted_evidence_refs or "
+                "candidate_families_considered[].evidence_refs. Do not guess "
+                "or reconstruct identifiers, or use another Quest's assets.",
+            )
+        else:
+            decision, reason_code, feedback = _evaluate_idea_outcome(
+                question_content, content.outcome
+            )
         feedback_json = canonical_json(list(feedback))
         feedback_hash = canonical_hash(list(feedback))
         bindings = {
@@ -11926,6 +12068,54 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         if decided is None:
             raise OwnerConflict("idea_outcome_decision_missing_after_commit")
         return decided
+
+    def query_stage_decision_display(
+        self, request: StageRunRequest, commit: StageCommit, execution: AttemptExecution,
+        content: AcceptedIdeaOutcomeContent | AcceptedPlanDocument,
+    ) -> IdeaOutcomeDecision | FormalPlanDecision | None:
+        """Read an accepted Idea/Plan fact without re-authorizing its inputs."""
+        if request.stage not in {'idea', 'plan'}:
+            raise OwnerConflict('writing_stage_result_invalid')
+        idea = request.stage == 'idea'
+        table = 'rg_idea_outcome_decisions' if idea else 'rg_formal_plan_decisions'
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                f'SELECT * FROM {table} WHERE submission_ref = :ref'
+            ), {'ref': execution.submission_ref}).first()
+        if row is None:
+            return None
+        decision = _idea_decision(row) if idea else _formal_plan_decision(row)
+        question = request.accepted_question
+        content_ref = row.idea_content_ref if idea else row.plan_content_ref
+        content_receipt_ref = row.idea_content_receipt_ref if idea else row.plan_content_receipt_ref
+        content_receipt_hash = row.idea_content_receipt_hash if idea else row.plan_content_receipt_hash
+        outcome_ref = decision.outcome_ref if idea else decision.formal_plan_ref
+        if (
+            decision.decision != 'accepted'
+            or row.request_ref != request.request_ref
+            or row.initialization_id != question.initialization_id
+            or row.quest_ref != question.quest_ref or row.question_ref != question.question_ref
+            or row.context_pack_ref != request.context_pack_ref
+            or row.question_content_ref != question.content_ref
+            or row.question_content_hash != question.content_hash
+            or row.question_receipt_ref != question.question_receipt.receipt_ref
+            or row.question_receipt_hash != question.question_receipt.payload_hash
+            or row.run_ref != commit.run_ref or outcome_ref != commit.outcome_ref
+            or decision.receipt != commit.outcome_receipt
+            or any(getattr(row, key) != getattr(execution, key)
+                   or getattr(row, key) != getattr(content, key)
+                   for key in ('request_ref', 'run_ref', 'attempt_ref', 'fence_ref', 'submission_ref', 'payload_hash'))
+            or row.execution_receipt_ref != execution.receipt.receipt_ref
+            or row.execution_receipt_hash != execution.receipt.payload_hash
+            or content.execution_receipt != execution.receipt
+            or content_ref != content.content_ref
+            or content_receipt_ref != content.receipt.receipt_ref
+            or content_receipt_hash != content.receipt.payload_hash
+            or row.reviewed_draft_hash != content.reviewed_draft_hash
+            or row.review_hash != content.review_hash
+        ):
+            raise OwnerConflict('writing_stage_result_invalid')
+        return decision
 
     def query_idea_outcome_decision(
         self, submission_ref: str
@@ -12061,14 +12251,6 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             selected_catalog = selected_plan_evidence_catalog(content.plan_document, evidence_catalog)
         except PlanContractError as error:
             raise OwnerConflict(str(error)) from error
-        self._receipt_verifier.verify_plan_evidence_catalog(
-            quest_ref=accepted_question.quest_ref,
-            evidence_catalog=selected_catalog,
-            expected_reference_revision=len(selected_catalog),
-            require_current=True,
-            require_complete=False,
-            selected_evidence_refs=_selected_plan_evidence_refs(content.plan_document),
-        )
         answer_contract = content.plan_document.get("answer_contract")
         if (
             validated_plan_hash != content.plan_document_hash
@@ -12077,10 +12259,38 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             != content.answer_contract_hash
         ):
             raise OwnerConflict("formal_plan_content_hash_invalid")
-        decision, reason_code, feedback = _evaluate_formal_plan(
-            question_content,
-            content.plan_document,
-        )
+        try:
+            self._receipt_verifier.verify_plan_evidence_catalog(
+                quest_ref=accepted_question.quest_ref,
+                evidence_catalog=selected_catalog,
+                expected_reference_revision=len(selected_catalog),
+                require_current=True,
+                require_complete=False,
+                selected_evidence_refs=_selected_plan_evidence_refs(content.plan_document),
+            )
+        except OwnerConflict as error:
+            # An unresolvable candidate reference needs correction by the Plan
+            # Session, not repeated acceptance of the same sealed document.
+            # Receipt, lineage and infrastructure failures still fail closed.
+            if error.code != "plan_evidence_source_invalid":
+                raise
+            decision = "rejected"
+            reason_code = error.code
+            feedback = (
+                "Selected evidence does not resolve to an exact accepted source "
+                "of the declared kind in this Quest. Discover and read the source, "
+                "then correct its evidence_ref and source_ref. For "
+                "LiteratureSnapshot, use the actual literature_snapshot_ref "
+                "returned by the literature tools as both references; a DOI or "
+                "citation_key locates a paper within that snapshot and belongs "
+                "in the supported claim or notes, not in either reference. "
+                "Papers from the same snapshot share one source binding.",
+            )
+        else:
+            decision, reason_code, feedback = _evaluate_formal_plan(
+                question_content,
+                content.plan_document,
+            )
         feedback_json = canonical_json(list(feedback))
         feedback_hash = canonical_hash(list(feedback))
         bundle_disposition = content.plan_document.get("bundle_disposition")
@@ -12263,6 +12473,12 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
     def query_formal_plan_decision(
         self, submission_ref: str
     ) -> FormalPlanDecision | None:
+        with self._database.read_snapshot():
+            return self._query_formal_plan_decision_from_current(submission_ref)
+
+    def _query_formal_plan_decision_from_current(
+        self, submission_ref: str
+    ) -> FormalPlanDecision | None:
         with self._database.read() as connection:
             row = connection.execute(
                 text(
@@ -12432,9 +12648,10 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
     def query_formal_plan_content_acceptance(
         self, formal_plan_ref: str
     ) -> AcceptedFormalPlanContent | None:
-        return self._receipt_verifier.query_formal_plan_content_acceptance(
-            formal_plan_ref
-        )
+        with self._database.read_snapshot():
+            return self._receipt_verifier.query_formal_plan_content_acceptance(
+                formal_plan_ref
+            )
 
     def verify_formal_plan_content_acceptance(self, **values) -> None:
         self._receipt_verifier.verify_formal_plan_content_acceptance(**values)

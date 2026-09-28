@@ -1,0 +1,229 @@
+{
+  "diagnostics": {
+    "availability": {
+      "file_access": {
+        "status": "available"
+      },
+      "fork": {
+        "status": "availability_not_observed"
+      },
+      "hook": {
+        "status": "available"
+      },
+      "interrupt": {
+        "status": "availability_not_observed"
+      },
+      "native_session": {
+        "status": "available"
+      },
+      "plugin": {
+        "status": "available"
+      },
+      "resume": {
+        "status": "availability_not_observed"
+      },
+      "semantic_mcp": {
+        "status": "available"
+      },
+      "shell": {
+        "status": "available"
+      },
+      "skill": {
+        "status": "availability_not_observed"
+      },
+      "steer": {
+        "status": "availability_not_observed"
+      },
+      "stream": {
+        "status": "available"
+      },
+      "subagent": {
+        "status": "available"
+      },
+      "tool_inventory": {
+        "status": "availability_not_observed"
+      },
+      "web_fetch": {
+        "status": "availability_not_observed"
+      },
+      "web_search": {
+        "status": "available"
+      }
+    },
+    "capability_profile_hash": "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
+    "entry_path": "initial",
+    "provider_feature_inventory": {
+      "evidence_refs": [
+        "harness_provider_feature_inventory:810e6cf2fd3dd0858d4cc5610c3b3cd7133dc7c0740c005e6d043d39ea24a7c4"
+      ],
+      "features": {
+        "hooks": true,
+        "multi_agent": true,
+        "plugins": true,
+        "remote_plugin": true,
+        "shell_tool": true,
+        "skill_search": true,
+        "unified_exec": true
+      },
+      "status": "observed"
+    },
+    "root_kind": "idea",
+    "schema_ref": "meta-research/root-capability-diagnostic/v1",
+    "side_effect_authorization": {
+      "operation_ids": [
+        "research_memory.research_notes.read",
+        "research_memory.stage_context.read",
+        "research_graph.questions.page",
+        "research_memory.literature.page",
+        "research_memory.content.read",
+        "human_request.read",
+        "research_graph.baselines.page",
+        "research_graph.baselines.read",
+        "research_graph.target_formal_results.read",
+        "research_graph.formal_results.read",
+        "research_graph.question_history.read",
+        "research_graph.question_relations.read",
+        "research_graph.artifact_roles.adjust",
+        "research_graph.artifact_roles.adjust.reconcile",
+        "research_graph.datasets.page",
+        "research_graph.datasets.read",
+        "research_graph.datasets.register",
+        "research_graph.datasets.register.reconcile",
+        "research_graph.datasets.register_version",
+        "research_graph.datasets.register_version.reconcile",
+        "research_graph.datasets.reference",
+        "research_graph.datasets.reference.reconcile",
+        "research_graph.datasets.derive",
+        "research_graph.datasets.derive.reconcile",
+        "research_graph.environments.page",
+        "research_graph.environments.read",
+        "research_graph.environments.register",
+        "research_graph.environments.register.reconcile",
+        "research_graph.environments.reference",
+        "research_graph.environments.reference.reconcile",
+        "agent_runtime.acquisition.request",
+        "agent_runtime.acquisition.request.reconcile",
+        "human_request.open",
+        "human_request.open.reconcile"
+      ],
+      "status": "operation_local"
+    },
+    "tool_inventory": {
+      "evidence_refs": [],
+      "names": [],
+      "status": "not_reported"
+    },
+    "usage": {
+      "file_access": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "fork": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "hook": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "interrupt": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "native_session": {
+        "evidence_refs": [
+          "codex_turn_event:7995ce12f2fcde22aac675b54b8549ae1299bd4feca549123f7bd20815fcfba8"
+        ],
+        "status": "used"
+      },
+      "plugin": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "resume": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "semantic_mcp": {
+        "evidence_refs": [
+          "codex_turn_event:6fc28b5c7ec07c5b61beeae5cb62e434de1f8fbce1a1d836f1b0cdb20b3bf385",
+          "codex_turn_event:8f40cace2010cd2664a520241838a4275808d0546d8dd01ba8f24f69ecf956f3",
+          "codex_turn_event:6c0cbe0cdebb6b7fd71f94bfaa34c3426a5fa4b5183853afa88876ef60b3c213",
+          "codex_turn_event:0fdea5b72fe697d66524588ef5c663be1bb962f7b3cd5b41af9fa59c31ae413a",
+          "codex_turn_event:6e1cd00d7733ad6b01f9cc722b5f15e2dc4c286db79b3298724d60d2d690a0d7",
+          "codex_turn_event:70cfaefe17d80722f0cff5d53c0a3989389d0229eef8f6ba4d4132f0ce854607",
+          "codex_turn_event:fa422b3344a48f68175547685dbd62454cd826d28936a74424aebda2c8cebbe0",
+          "codex_turn_event:1981a124a3a8d3fde8af72c3bdbda9ed9b23aa8f3ffc4c491b44130468469665",
+          "codex_turn_event:db75723be0d2c38514c67a5cb44370763b2d45dcbcb4cfc696df924b0d90c86e",
+          "codex_turn_event:bd448d985878f7e80455317b49ff06227e561b2932a910a7c55f7510c695d07e",
+          "codex_turn_event:2e1cd5627b34f153740d0d7451d68d5ce9b1d3127d77f528f52fd0b93c0e5c09",
+          "codex_turn_event:e31208654169c666dcfdc180f716858aa0570e49a9834de51e01b5caa1fc1e5e",
+          "codex_turn_event:6285062454d2bec168b74cbfde3027fb74249a5525076cd1019f4f4a34de07c7",
+          "codex_turn_event:96794e17058ceca354e02e8b4ab6af67573dc525d947ebccf0e877eb66d7ada0",
+          "codex_turn_event:4cbb36aaa871cfaebaa02028c7bfe8a7252c70e3e30366fe5de45a491c9c46d9",
+          "codex_turn_event:bb1805684c14bb2260925290d1ee1dfe76e8251274497085fa26a466b7d11222",
+          "codex_turn_event:918fec6f4dcc26f0a3193805bba566df87f9dff697275525f0d8dca19d46ef24",
+          "codex_turn_event:8c51b4f681ca77497312b60ecc810031a5941cdda0f54228a297625c08981bd3",
+          "codex_turn_event:369dc6ef671a5601fccf12a59e8e695544e356e2bebcb34ad5526d67818b965c",
+          "codex_turn_event:9a736cc97c013cb3b83d99a4781758962f9b8272a4b1a8e9414f6624b5be89bf",
+          "codex_turn_event:81683b17c94cae29c68974e81a040c5a52f76de738ccb593ec46f2a289c04e89",
+          "codex_turn_event:9b908a1e526ed501fc7dde935425cae744fd0c105e1bb4f695f50255d0128ad9",
+          "codex_turn_event:0bd8e50faf2d1f74132f9219d8ccf1d4da19da2181288e3e545aa5148b5ddab6",
+          "codex_turn_event:5461d9f6fc855ed6d20e880ff396b4f7c9570211bd76402c277330b5084f2fa8",
+          "codex_turn_event:188e15cf485aaa51a5e8aac3fbe681778138227ec58d2e80b140827169a69e75",
+          "codex_turn_event:f2a348d1188106aeb8a8d09f824334b868c070cb331c11119e8d16f25bea0cc6",
+          "codex_turn_event:08c496f6b00aa5bee290f8e55d08263d89e3b87e6a6e2d91435dbbb0b70c4976",
+          "codex_turn_event:447180437af72bb21e04e7b24408df4224f2c4fefd9beaab51b7bb91d2527faf",
+          "codex_turn_event:9ab6f9e492645c90e2859347d601d72b856a8b1adaf2ddd892b3faae0b264b8e",
+          "codex_turn_event:e55dc9010e5084242f4279ee8ebfe0b4f6d2a0029a80151752c239f67e0f33af"
+        ],
+        "status": "used"
+      },
+      "shell": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "skill": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "steer": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "stream": {
+        "evidence_refs": [
+          "codex_turn_event:7995ce12f2fcde22aac675b54b8549ae1299bd4feca549123f7bd20815fcfba8",
+          "codex_turn_event:4b2a163b36fb5f135e39d60cbcae2d298157b08b26dd39029489d3e61c528598"
+        ],
+        "status": "used"
+      },
+      "subagent": {
+        "evidence_refs": [
+          "codex_turn_event:e8901ef8a003c1cea150b205bd3e41268db42f651b5e5bff75abc9f845e6a942",
+          "codex_turn_event:3361ebe10bf87a99a140a9d938ab975574d9d866426e670d51d9edfed10e99ad",
+          "codex_turn_event:0f4d528fc4575c9ab38f18dc0860b33bab45e3d9b29f1dba0cdfbb0c8df9e4d4"
+        ],
+        "status": "used"
+      },
+      "tool_inventory": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "web_fetch": {
+        "evidence_refs": [],
+        "status": "not_used"
+      },
+      "web_search": {
+        "evidence_refs": [
+          "codex_turn_event:ecd355f2b606a9bc66d71e7e50c219d4f143f7e1b0938c132fab1440f438d2ca"
+        ],
+        "status": "used"
+      }
+    }
+  },
+  "diagnostics_hash": "846b245a65fe00a8ef71b2a52526098543e8e0332d2058cb97187fb1a48ede14",
+  "operation_ref": "root-operation:idea:93ddb684580591dbde80c7ca654bcec23e65b2ccab8835c4c63df31dca450a5b",
+  "root_kind": "idea",
+  "schema_ref": "meta-research/root-operation-diagnostic-record/v1"
+}

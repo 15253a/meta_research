@@ -13,6 +13,12 @@ description: 在已接纳 FormalPlan 内组织并启用 Target，滚动安排材
 
 读取已接纳 FormalPlan、gap Brief、输入索引、权威 frontier 与反馈，选择值得现在投入的工作。局部策略可随结果调整尚未提交的候选和顺序，不要求起步列尽未来路线。研究观察可指导选择，正式 coverage 只用已接纳 TargetCommit。
 
+`stage_context.read` 首次按 reader 传入 `offset=0`；后续仅在返回的 `next_offset` 为整数时将其作为下一页 offset。`next_offset=null` 即结束该正文的分页，按顺序拼接各页 text 后解析 JSON；`complete` 只表示当前响应是否含完整正文，尾页可仍为 false。遇 `semantic_input_schema_mismatch` 时查当前目录的参数 schema，修正具体字段后再调用，不原样重复失败请求。
+
+`research_graph.baselines.page`／`read` 的 `limit` 是条目数，默认 20，范围 1–100；`read` 只传精确 `baseline_ref` 即可读取方法合同，展开关联实体时再按返回的 `next_offset`／`next_evaluation_offset` 分页。各工具的分页单位独立，正文 reader 的字符上限不适用于 Baseline 列表。遇 `baseline_query_invalid` 时按当前 schema 修正参数，再继续读取。
+
+`human_request.read` 先读取当前 Quest 索引，再直接使用返回的 request／response `reader` 参数读取原文；`request_ref` 保留完整修订后缀（如 `:r1`），`response_ref` 使用该 request 返回的绑定。遇 `research_help_request_unbound`／`research_help_response_unbound` 时回到索引核对这对引用，修正后再读。
+
 仅 Bundle 经正式候选接纳与调度启用 Target；其他阶段、Target 和子智能体提供后续建议。Target 有独立可验目的、完成 cells、输入和实际依赖。获取、采集、清洗、整理可独立成 Target，也可与相关研究合并；粒度由研究需要、复用产物和真实依赖决定，湿实验、论证和辅助材料同样适用。
 
 cells 表达应实施及报告的责任，允许负结果、失败原因和未解决判断，范围只含相关 obligations 与 Briefs。只有消费上游新结果才建立依赖，共享已接纳输入可并行。复用按实际需要核对数据、划分、预测、实现和协议，精确绑定资产版本。
@@ -29,9 +35,13 @@ cells 表达应实施及报告的责任，允许负结果、失败原因和未�
 
 用已接纳工作的真实结果更新覆盖，既可有测量，也可为无评价工作。负、零、不显著、不确定和缺测保持各自含义；准备审计只支持准备事实，不代替承诺中的实质研究。
 
-`TargetPlan.notes` 和 `StrategyUpdate.notes` 保存研究判断；系统把最后一条非空且已接纳策略备注及 proposal ref／hash 交给 Reasoning，空值保留前次。封口后未必还有写作回合，应及时写清认识、证据边界与未完成事项。
+`TargetPlan.notes` 和 `StrategyUpdate.notes` 保存研究判断；系统把最后一条非空且已接纳策略备注及 proposal ref／hash 交给 Reasoning，空值保留前次。后续备注保留仍有价值的线索及精确来源，更新认识、证据边界和取舍，避免被新一条备注覆盖后失去上下文。
 
 已接纳 Target 的 `research_notes` 保存当时说明和最终发言。先读摘要，必要时沿 `research_notes_reader`／`research_memory.research_notes.read` 分页；精确正文用 `source=research_note_body`、`source_ref=version_ref`。上一 Question 的入口使用 `predecessor_research_notes_readers`，正文保留对应 `predecessor_ref`。说明有助理解，不替代完整合同与冻结输入。
+
+Bundle 统一保留并筛选 Target 发现的建题线索。跨 Target 合并同一未知，先判断当前或已有 Question 能否承载；值得独立追踪的候选按对研究目标的重要性、已有依据和后续研究价值比较。交给 Reasoning 的建题推荐为零或一个，只选最值得推进的一项，说明来源、与已有题的区别和联系、独立追踪理由及可开展的研究。其余有价值线索留在 notes 中并明确为保留项，不逐 Target 提交、不作为待逐个建题的队列；没有合适候选时明确写本轮不推荐建题。这里的数量约束只针对新 Question 推荐，不限制 Target、Dataset 或 Environment 的合理粒度。
+
+为保留最后一个 Target 后的汇总回合，安排和执行工作时保持 `strategy_complete=false`。全部 Target 已接纳后，读取包括最后结果在内的研究说明、完成候选取舍和独立审阅，再用不新增 Target 的 `StrategyUpdate`（`candidates=[]`、`strategy_complete=true`）提交完整 notes 并封口；科学上的建题推荐写在 notes，不放进用于启用 Target 的 `candidates`。需要继续实施时按现有滚动策略提交实际 Target，保持策略未封口。技术阻塞或语义屏障仍按真实状态交接，不能为凑候选补造工作。
 
 Target 正式接纳后，在同一整理核验环节读取 `dataset_candidates`、`environment_candidates` 和 completion manifest，沿 `artifact_path` 找真实 RM binding 并判断复用价值。Dataset 用 datasets.register／register_version／reference，真实派生用 derive；Environment 用 environments.register 记录含义、真实来源和相同原件 binding，再用 reference 关联当前 Question、原 Target／Run 和用途。六入口按复用目的组织，同一内容可供多个入口引用。
 

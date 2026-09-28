@@ -13,6 +13,8 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 先读本轮结果、上轮及相关问题历史，再按需分页、展开精确原文。保持 request、Question、Quest、Goal、epoch 和来源绑定。Idea／Plan／Bundle 的 Completed、Skipped、Exhausted、NoViableCandidate 是路线状态，本身不证明科学主张。
 
+比较历史结果时，将实验结论对应到实际产生它的 Cycle／ScientificOutcome，区分结果产生轮次与后来转述它的轮次。“上一轮”仅指当前 Cycle 的直接前序；较早试点写明来源轮次，尚未核实轮次时称“既有试点”，保留架构、数据和协议差异。独立审阅据这项对应关系核对比较措辞。
+
 从冻结闭包、Plan 已验证来源绑定或同 Quest 可核验历史引用精确 kind／ref。LiteratureRecord、MetricResult、WorkProduct、日志、分析、checkpoint、人类输入、ScientificOutcome、AssetVersion 等按真实内容支持、反对或限定判断；材料类型和数量不决定科学采用资格。仍须核对 Owner、版本、Quest 权限和接纳链，不能用相近对象 ID 代替真实来源。纯理论综合可无外部引文，明确推导、适用范围和不确定性。
 
 按事实选 `affirmed | denied | uncertain | insufficient_evidence`。affirmed／denied 限定 claim；uncertain 说明有效证据为何未收敛；insufficient_evidence 保持 `claim=null` 并说明缺失。部分证据与仍缺其他证据可以同时存在。未测量、科学证据不足、访问阻塞和程序故障分别表述。
@@ -24,6 +26,8 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 ## 2. 交接前整理已接纳 Target 资源
 
 在同一整理核验环节读取已接纳 Target 的 `dataset_candidates`、`environment_candidates` 和精确 completion manifest，沿 `artifact_path` 找真实 RM binding，判断独立复用价值。交接前用 datasets.register／register_version／reference 登记数据版本与用途，真实派生用 derive；用 environments.register／reference 登记环境含义、真实来源、原件 binding、当前 Question 及原 Target／Run 的用途关系。Target 已正式接纳即满足这些原件的发布前提，primary／draft 阶段可做，不等本次 ScientificOutcome 接纳。现有设备、设施、持久目录、安装或服务可按真实来源直接登记，无须补造 Target。
+
+本轮 Target 闭包从 context pack 的 `accepted_target_commit_closures` 读取；`predecessor_closure` 用于 `prior_accepted_bindings` 中的前序交接。需要原件及登记凭据时，对精确 AssetVersion 调用 `research_memory.content.read`，将 `source_ref`、`version_ref` 都设为该版本引用。目录先省略 `entry_path` 并用 `offset=0, limit=1` 读取条目页，返回的完整 `asset_binding`（含 RM receipt）可原样用于版本登记，无须读取大文件。`formal_results` 提供实施与归属线索；其中未附 receipt 时沿上述原件入口取得凭据，再判断是否存在实际阻塞。
 
 最后一个 Target 后 Bundle 若不再运行，由 Reasoning 承接。先发现或对账既有登记，再复用身份和原件；未知效果沿同一 `effect_id` reconcile。可委派明确资源范围的子智能体登记，根在交接前独立查回资源记录与用途关系；有数字材料时核实精确版本及原件，有真实数据派生时核实派生关系。无保留价值时说明判断；外部条件阻塞时记录未完成步骤和继续条件；暂存、未接纳材料仍在工作区。
 
@@ -37,7 +41,11 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 用 `research_graph.question_relations.read` 读取相关问题。有值得保留的横向关联或重叠时，经 `research_graph.question_relations.record` 提交同 Quest 两个精确已接纳 `question_ref` 与说明；包含关系仍用原 `parent_question_ref`。同一 `effect_id` 对应同一内容，结果不明先 reconcile；关系不表示问题已解决。
 
-拟创建／分解值得近期研究的新问题且需要检索支持时，才走现有 AutonomousCreation 的 DeepFetch 路径。取得标准 `summary.md` 后，本 Reasoning Session 继续读精确摘要、调整科学判断及 Question 六字段，再决定 create／decline；普通综合和补充阅读不强制该路径。新题可宽泛、具体、包含或关联已有问题，边界和可解性可继续澄清。
+建题候选由 Bundle 汇总保留后统一交接。先读 Bundle 已接纳 notes 中明确推荐的零或一个候选，再用各 Target 原始说明及研究历史核对依据；保留项是研究上下文，不逐项转成新题。Bundle 未推荐、被跳过或因阻塞未完成筛选时，按零个候选处理，继续综合当前或已有 Question，把新线索留在 notes，不直接从各 Target 补出建题清单。
+
+对唯一推荐项，先判断当前或已有 Question 能否清楚承载后续研究，能够覆盖的优先留在已有题中。确需独立追踪时，说明与已有题的区别和联系、独立价值及后续可开展的研究，再进入建题流程；“最大”指对研究目标最重要、最值得推进，不靠扩大题目或拆成多个子题充数。一次失败、待办事项或资源缺口本身不足以成为建题理由。不要求每轮建题，也不在放弃推荐项后依次尝试其余保留项。
+
+正式建题必须先走现有 AutonomousCreation 的 DeepFetch 路径，了解当前研究现状。取得标准 `summary.md` 后，本 Reasoning Session 读回精确摘要，结合已有问题重新评估独立研究价值，调整科学判断及 Question 六字段，再决定 create／decline。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题；普通综合和补充阅读不强制该路径。新题可宽泛、具体、包含或关联已有问题，包含关系本身不排除有价值的分解，边界和可解性可继续澄清。
 
 创建前 AR checkpoint 只是不可变执行草稿，不预接纳 ScientificOutcome 或建题。DeepFetch summary 经 RM 接纳后，同一 Session 可修订结果与路线，也可放弃建题完成普通综合。只有决定 create 后才接纳唯一科学结果和修订问题，最后引用真实 accepted QuestionAnchor；failed／cancelled 且无 summary 时按事实决定 retry 或 decline，运行中或等人不算失败。恢复复用已有决定和接纳事实，不重复创建。
 
@@ -46,5 +54,7 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 委派原生独立子智能体检查完整草稿与关键原文，根根据自由格式反馈和自身判断修订最终内容；没有具体问题也可改稿。同根自查不替代独立审阅，Owner 绑定内容 hash 并校验科研来源，不要求审查表单、审阅者身份证明或批准记录。
 
 最终 transition 恰为 `NextCycleProposal | CandidateCompletion` 一项。前者选择已接纳且 present／open 的 Question／Anchor，给出合法入口与精确 skip basis；等待外部条件时明确触发条件，并沿现有 HumanRequest／Owner 路径处理，不用重复 Cycle 轮询同一障碍。后者须有 Quest 整体目标和里程碑依据，并经人类明确确认及 Owner 接纳。
+
+提交前按语义契约核对引用数组，输出一份简短、完整闭合的 JSON。收到截断或引用错误反馈时，在同一会话回到精确来源修正后重新提交完整结果，不沿未闭合字符串继续重复引用或拼接多份结果。
 
 完成条件：科学结果、沉积状态和唯一后继选择清楚，notes 进入正式闭包供下一轮使用；由 RM／RG／AR／AE 接纳链推进。未知结果先对账，必要输入或 currentness 故障保留具体阻塞；仅经公开 Owner 接口操作，不读写私有数据库、spool、seal key 或控制文件绕过边界。

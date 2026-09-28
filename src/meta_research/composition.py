@@ -684,6 +684,7 @@ def build_production_runtime(
         reasoning_outcome_verifier=research_graph_receipts,
         writing_delivery_provider_registry=writing_delivery_provider_registry,
         runtime_protection=runtime_protection,
+        receipt_verifier=attempt_receipts,
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
@@ -837,10 +838,6 @@ def build_production_runtime(
     )
     if callable(bind_dispatch_verifier):
         bind_dispatch_verifier(advancement_engine)
-    attempt_receipts.bind_bundle_exhaustion_verifier(advancement_engine)
-    attempt_receipts.bind_bundle_report_disposition_verifier(
-        advancement_engine
-    )
     agent_runtime.bind_bundle_exhaustion_verifier(advancement_engine)
     agent_runtime.bind_bundle_report_disposition_verifier(advancement_engine)
     human_collaboration = create_human_collaboration_interface(
@@ -875,7 +872,8 @@ def build_production_runtime(
         data_root.root,
         scope_lookup=owners.agent_runtime.query_stage_root_observation_scope,
     )
-    if isinstance(reasoning_skill_provider, CodexReasoningSkillAdapter):
+    if (isinstance(reasoning_skill_provider, CodexReasoningSkillAdapter)
+            or isinstance(bundle_skill_provider, CodexBundleSkillAdapter)):
         agent_runtime.bind_operator_stop_reader(
             StoppedStageProviderRecovery(stage_root_observations).read_for_operator_resume
         )
@@ -912,7 +910,10 @@ def build_production_runtime(
         feed,
         research_memory,
         target_root_lifecycle,
+        recovery_graph=research_graph,
+        recovery_controls=advancement_engine,
     )
+    research_memory.bind_asset_intake_recovery_reader(target_root_memory)
     owners.agent_runtime.bind_target_root_completion_reader(
         target_root_lifecycle
     )
@@ -921,12 +922,6 @@ def build_production_runtime(
         manifest_reader=target_root_memory,
     )
     owners.agent_runtime.bind_target_run_harness_verifier(target_run_agent)
-    # Cross-Owner report/completion reads use this separate receipt verifier.
-    # Bind the same Target authorities used by AR's own receipt reader.
-    attempt_receipts.bind_target_run_harness_verifier(target_run_agent)
-    attempt_receipts.bind_target_root_completion_authorities(
-        target_root_lifecycle, research_graph_receipts
-    )
     owners.research_graph.bind_target_execution_closure_verifier(
         target_run_agent
     )
@@ -1085,6 +1080,7 @@ def build_production_runtime(
         owners.human_collaboration,
         harnesses,
         stopped_provider_checkpoint=StoppedStageProviderRecovery(stage_root_observations),
+        database=database,
     )
     writing = WritingReportService(
         research_graph,

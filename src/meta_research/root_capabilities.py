@@ -575,6 +575,12 @@ def validate_root_capability_diagnostics(
     ):
         raise ValueError("root_capability_diagnostic_invalid")
     profile = root_capability_profile(observed_kind)
+    from meta_research.runtime_binding_compatibility import reviewed_historical_root_profile_hashes
+
+    observed_profile_hash = value.get("capability_profile_hash")
+    allowed_profile_hashes = {
+        profile.digest, *reviewed_historical_root_profile_hashes(profile.digest)
+    }
     entry_path = value.get("entry_path")
     availability = value.get("availability")
     usage = value.get("usage")
@@ -583,7 +589,8 @@ def validate_root_capability_diagnostics(
     provider_inventory = value.get("provider_feature_inventory")
     if (
         value.get("schema_ref") != ROOT_CAPABILITY_DIAGNOSTIC_SCHEMA
-        or value.get("capability_profile_hash") != profile.digest
+        or not isinstance(observed_profile_hash, str)
+        or observed_profile_hash not in allowed_profile_hashes
         or entry_path not in ROOT_CAPABILITY_ENTRY_PATHS
         or not isinstance(availability, dict)
         or set(availability) != set(profile.capabilities)
@@ -682,6 +689,9 @@ def validate_root_capability_diagnostics(
         )
     except (TypeError, ValueError) as error:
         raise ValueError("root_capability_diagnostic_invalid") from error
+    # Reconstruct every field while preserving the actual historical identity.
+    # The only exception is the exact reviewed before/current profile pair.
+    expected["capability_profile_hash"] = observed_profile_hash
     if value != expected:
         raise ValueError("root_capability_diagnostic_invalid")
     return expected
@@ -782,7 +792,7 @@ def project_codex_post_turn_diagnostics(
         for capability, code in unavailable.items()
         if capability not in available
     }
-    return profile.public_diagnostics(
+    projected = profile.public_diagnostics(
         entry_path=entry_path,
         available_capabilities=tuple(
             capability
@@ -806,6 +816,8 @@ def project_codex_post_turn_diagnostics(
             provider_inventory["evidence_refs"]
         ),
     )
+    projected["capability_profile_hash"] = diagnostic["capability_profile_hash"]
+    return projected
 
 
 def _codex_event_capabilities(event: Mapping[str, object]) -> set[str]:

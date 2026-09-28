@@ -16,6 +16,7 @@ from meta_research.dataset_contract import (
     dataset_text, dataset_metadata, dataset_asset_binding,
 )
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash, canonical_json, new_ref
+from meta_research.read_snapshot_cache import snapshot_cached
 
 
 _FACTS = {
@@ -179,6 +180,7 @@ class ResearchDatasetOwnerMixin:
     def query_dataset_derivation(self, dataset_derivation_ref, *, quest_ref=None):
         return self._query_dataset_fact("derive", dataset_derivation_ref, quest_ref=quest_ref)
 
+    @snapshot_cached
     def verify_asset_quest_scope(self, version_ref, *, quest_ref):
         """Use accepted source facts, never the reference that is being written."""
         roles = self.query_asset_roles(quest_ref=quest_ref, version_refs=(version_ref,))
@@ -264,7 +266,16 @@ class ResearchDatasetOwnerMixin:
                 "both": "(source_dataset_version_ref = :filter OR derived_dataset_version_ref = :filter)",
             }[direction]]
         elif query:
-            clauses = ["instr(lower(payload_json), lower(:filter)) > 0"]
+            version_match = (
+                "matched_version.dataset_ref = rg_datasets.dataset_ref "
+                "AND instr(lower(matched_version.payload_json), lower(:filter)) > 0"
+            )
+            if quest_ref is not None:
+                version_match += " AND " + self._dataset_scope_clause("register_version", "matched_version")
+            clauses = [
+                "(instr(lower(rg_datasets.payload_json), lower(:filter)) > 0 OR "
+                "EXISTS (SELECT 1 FROM rg_dataset_versions matched_version WHERE " + version_match + "))"
+            ]
             params["filter"] = query
         table, key, _schema = _FACTS[operation]
         if quest_ref is not None:

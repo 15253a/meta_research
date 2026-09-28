@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import type { PublicSnapshot } from "../src/api.js";
 import type { RootOperation, RootSession, RootSessions } from "../src/rootSessionsApi.js";
+import type { RuntimeStatus } from "../src/StatusHome.js";
 
 test.setTimeout(120_000);
 const sourceTime = Date.parse("2026-09-09T18:47:15+08:00") / 1_000;
@@ -46,7 +47,7 @@ async function fixture(page: Page) {
     ["review", message("同一 Bundle 会话已完成复核。")], ["dispatch-1", message("现在等待两个 Target 的证据。")],
     ["target-turn-1", message("T1 正在执行基线实验。")], ["target-turn-2", message("T2 正在执行对照实验。")], ["idea-primary", message("上一轮 Idea 已完成。")],
   ]);
-  const state = { listFailed: false, outputFailed: false, staleOnce: false, listReads: 0, outputReads: 0, outputSessionRefs: [] as string[], offsets: [] as { ref: string; after: number }[] };
+  const state = { runtimeStatus: null as RuntimeStatus | null, statusFailed: false, listFailed: false, outputFailed: false, staleOnce: false, listReads: 0, outputReads: 0, outputSessionRefs: [] as string[], offsets: [] as { ref: string; after: number }[] };
   const errors: string[] = [], writes: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
   const webRoot = process.env.META_RESEARCH_WEB_DIST ?? resolve(import.meta.dirname, "../../src/meta_research/web_dist");
@@ -55,6 +56,7 @@ async function fixture(page: Page) {
     if (url.origin !== "http://research-trace.test") return route.abort();
     if (request.method() !== "GET") { writes.push(request.method() + " " + url.pathname); return route.abort(); }
     const json = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
+    if (url.pathname === "/api/v1/status" && state.runtimeStatus) return json(state.runtimeStatus, state.statusFailed ? 503 : 200);
     if (url.pathname === "/api/v1/snapshot") return json(snapshot);
     if (url.pathname === "/api/v1/events") return route.fulfill({ contentType: "text/event-stream", body: "event: snapshot.required\ndata: {}\n\n" });
     if (url.pathname === "/api/v1/research-overview") return json({ schema_ref: "meta-research/research-overview/v1", ...foreground, status: "ready", cycle_ordinal: 1, foreground, findings: { quest: [], question: [], cycle: [] }, cycles: [], reason: null });
@@ -144,6 +146,94 @@ test("accepted execution with pending evaluation exposes seven separate research
   expect(f.writes).toEqual([]);
 });
 
+test("current Target facts reflect an exact live worker failure while preserving other runs and recorded output", async ({ page }) => {
+  const f = await fixture(page);
+  const foreground = f.snapshot.research_control.foreground!;
+  foreground.status = "active";
+  f.snapshot.bundle_stage!.target_graph.targets = [f.target1, f.target2].map(session => ({
+    target_ref: session.target_ref!, target_run_ref: session.run_ref!, target_key: session.title,
+    spec_hash: "s".repeat(64), dependency_refs: [], status: "running", blocker: null,
+  }));
+  f.state.runtimeStatus = {
+    schema_ref: "meta-research/runtime-status/v1", revision: f.snapshot.revision + 1,
+    observed_at: new Date().toISOString(), updated_at: new Date().toISOString(), foreground,
+    state: "failed", waiting_reason: "研究推进暂时受阻", pending_requests: 0,
+    current_task: { kind: "target", title: f.target1.title, target_ref: f.target1.target_ref, run_ref: f.target1.run_ref, status: "finalizing" },
+    health: { status: "unavailable", checks: [{ name: "target_run_worker", status: "unavailable", reason: { code: "target_root_artifact_storage_unavailable" } }] },
+  };
+  await page.goto("http://research-trace.test/?workspace=1");
+  const card = page.getByRole("region", { name: "当前研究工作状态" });
+  const activity = page.getByRole("region", { name: "研究光谱" }).locator('.spectrum-stage[data-stage="bundle"]');
+  const trace = page.locator("#research-activity");
+  await expect(card.locator("header > p")).toHaveText("Target 推进受阻");
+  await expect(trace.getByTestId("research-current-worker-blocker")).toContainText("Target 推进受阻");
+  await expect(trace).not.toContainText("Target 启动受阻");
+  await activity.locator('button[data-session-ref="session-t2"]').click();
+  await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
+  await activity.locator('button[data-session-ref="session-t1"]').click();
+  await expect(card.locator("header > p")).toHaveText("Target 推进受阻");
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  f.state.runtimeStatus.current_task!.run_ref = "different-run";
+  await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
+  f.state.runtimeStatus.current_task!.run_ref = f.target1.run_ref;
+  await expect(card.locator("header > p")).toHaveText("Target 推进受阻");
+  f.state.runtimeStatus.state = "paused";
+  await expect(card.locator("header > p")).toHaveText("研究已暂停，保留 Target 记录");
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  await activity.locator('button[data-session-ref="session-t2"]').click();
+  await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
+  await activity.locator('button[data-session-ref="session-t1"]').click();
+  await expect(card.locator("header > p")).toHaveText("研究已暂停，保留 Target 记录");
+  f.state.statusFailed = true;
+  await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  f.state.statusFailed = false;
+  f.snapshot.revision = f.state.runtimeStatus.revision + 1;
+  f.snapshot.observed_at = new Date().toISOString();
+  await page.reload();
+  await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
+  expect(f.errors).toEqual([]);
+  expect(f.writes).toEqual([]);
+});
+
+for (const [code, summary] of [
+  ["target_root_artifact_storage_unavailable", "Target 正在重试，上次入库受阻"],
+  ["provider_transport_unavailable", "Target 正在重试，上次推进受阻"],
+]) test(`active Target retry distinguishes retained ${code} from a stopped finalizer`, async ({ page }) => {
+  const f = await fixture(page);
+  const foreground = f.snapshot.research_control.foreground!;
+  foreground.status = "active"; f.target1.stage = "bundle"; f.target2.stage = "bundle";
+  f.snapshot.bundle_stage!.target_graph.targets = [f.target1, f.target2].map(session => ({
+    target_ref: session.target_ref!, target_run_ref: session.run_ref!, target_key: session.title,
+    spec_hash: "s".repeat(64), dependency_refs: [], status: "running", blocker: null,
+  }));
+  f.state.runtimeStatus = {
+    schema_ref: "meta-research/runtime-status/v1", revision: f.snapshot.revision + 1,
+    observed_at: new Date().toISOString(), updated_at: new Date().toISOString(), foreground,
+    state: "failed", waiting_reason: "研究推进暂时受阻", pending_requests: 0,
+    current_task: { kind: "target", title: f.target1.title, target_ref: f.target1.target_ref, run_ref: f.target1.run_ref, status: "running" },
+    health: { status: "unavailable", checks: [{ name: "target_run_worker", status: "unavailable", reason: { code } }] },
+  };
+  await page.goto("http://research-trace.test/?workspace=1");
+  const card = page.getByRole("region", { name: "当前研究工作状态" });
+  const trace = page.locator("#research-activity");
+  const blocker = trace.getByTestId("research-current-worker-blocker");
+  await expect(card.locator("header > p")).toHaveText(summary);
+  await expect(blocker).toContainText(summary); await expect(blocker).toContainText(code);
+  await page.locator('button[data-session-ref="session-t2"]').click();
+  await expect(card.locator("header > p")).toHaveText("Target 正在开展工作");
+  await page.locator('button[data-session-ref="session-t1"]').click();
+  await expect(card.locator("header > p")).toHaveText(summary);
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  f.state.runtimeStatus.current_task!.status = "finalizing";
+  f.target1.is_executing = false; f.target1.status = "waiting";
+  f.catalog.active_session_refs = f.catalog.active_session_refs.filter(ref => ref !== f.target1.session_ref);
+  await expect(card.locator("header > p")).toHaveText("Target 推进受阻");
+  await expect(blocker).toContainText("Target 推进受阻"); await expect(blocker).toContainText(code);
+  await expect(trace).toContainText("T1 正在执行基线实验。");
+  expect(f.errors).toEqual([]); expect(f.writes).toEqual([]);
+});
+
 test("root sessions preserve continuous work, parallel activity, historical scope and failure recovery", async ({ page }, testInfo) => {
   const f = await fixture(page);
   await page.goto("http://research-trace.test/?workspace=1");
@@ -206,7 +296,7 @@ test("root sessions preserve continuous work, parallel activity, historical scop
   worker.status = "ready"; delete worker.reason; f.snapshot.revision += 1; await expect(trace.getByTestId("research-current-worker-blocker")).toHaveCount(0);
   const targetWorker = f.snapshot.readiness.checks.find(check => check.name === "target_run_worker")!;
   targetWorker.status = "unavailable"; targetWorker.reason = { code: "target_measurement_domain_authority_invalid" }; f.snapshot.revision += 1;
-  await expect(trace.getByTestId("research-current-worker-blocker")).toContainText("Target 启动受阻");
+  await expect(trace.getByTestId("research-current-worker-blocker")).toContainText("Target 推进受阻");
   await expect(trace.getByTestId("research-current-worker-blocker")).toContainText("target_measurement_domain_authority_invalid");
   await expect(trace).toContainText("上一轮 Idea 已完成。");
   targetWorker.status = "ready"; delete targetWorker.reason; f.snapshot.revision += 1;

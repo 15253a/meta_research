@@ -6,6 +6,7 @@ import sys
 import time
 import json
 
+import pytest
 from sqlalchemy import text
 
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -69,7 +70,8 @@ class _Reasoning(_MultiRunReasoningSkill):
             review_mode="advisory_unobserved", reviewer_agent_ref=None)
 
 
-def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_evaluation(tmp_path):
+@pytest.mark.parametrize("input_kind", ["evidence_ref", "asset_version_ref"])
+def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_evaluation(tmp_path, input_kind):
     plan, bundle = _Plan(), _Bundle()
     runtime = fixtures.build_production_runtime(fixtures.prepare_data_root(tmp_path / "workproduct"),
         proposal_drafter=SnapshotAwareProposalDrafter(),
@@ -131,7 +133,7 @@ def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_eva
             target_commit_refs=(completed.target_commit_ref,))
         assert len(entries) == 1
         plan.entry = entries[0]
-        bundle.input_ref = entries[0]["evidence_ref"]
+        bundle.input_ref = entries[0][input_kind]
         _finish_stage(runtime, "reasoning")
         next_cycle = runtime.owners.advancement_engine.query_foreground(quest["quest_ref"])["cycle_ref"]
         assert next_cycle != quest["cycle_ref"]
@@ -159,6 +161,8 @@ def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_eva
         graph.accept_target_candidate_projection(target_ref=target.target_ref,
             idempotency_key="workproduct-candidate-projection")
         authority = runtime.target_run_authorities.research_graph
+        expected_sources = {completed.target_commit_ref: (bundle.input_ref,)}
+        assert authority.selected_evidence_target_commits(target.target_ref) == expected_sources
         assert authority.prepare_input_assets(target.target_ref) is True
         source_asset = runtime.owners.research_memory.query_asset_version(entries[0]["asset_version_ref"]).as_binding()
         projection = authority.query_input_asset_projection(target_ref=target.target_ref, asset_ref=source_asset.asset_ref)
@@ -167,9 +171,9 @@ def test_unmeasured_workproduct_plan_selection_prepares_target_input_with_no_eva
             target_ref=target.target_ref, asset_ref=source_asset.asset_ref) == (source_asset, projection.rm_proof_receipt)
         proof = authority.query_bundle_input_asset_proof(target_ref=target.target_ref, asset_ref=source_asset.asset_ref)
         assert proof.rm_acceptance_receipt.verified and proof.rg_role_receipt.verified
-        assert authority.selected_evidence_target_commits(target.target_ref) == {
-            completed.target_commit_ref: (entries[0]["evidence_ref"],)}
+        assert authority.selected_evidence_target_commits(target.target_ref) == expected_sources
         assert authority.prepare_input_assets(target.target_ref) is False
+        assert authority.selected_evidence_target_commits(target.target_ref) == expected_sources
         assert graph.query_target_formal_results(handle.target_ref) == facts
         print("T16_SUCCESSOR_ADOPTION " + json.dumps({"cleanup":cleanup,
             "source_commit":completed.target_commit_ref,"retained_version":retained.binding.version_ref,
