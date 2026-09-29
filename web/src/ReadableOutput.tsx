@@ -37,17 +37,22 @@ function useParsedOutput(props: ReadableOutputProps): ParsedOutput {
 }
 
 function inlineText(text: string): ReactNode[] {
-  return text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, index) => (
+  return text.split(/(\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|\*\*[^*]+\*\*|`[^`]+`|https?:\/\/[^\s<>]+)/g).map((part, index) => {
+    const link = part.match(/^\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)$/);
+    if (link) return <a key={index} href={link[2]} target="_blank" rel="noreferrer">{link[1]}</a>;
+    if (/^https?:\/\//.test(part)) return <a key={index} href={part} target="_blank" rel="noreferrer">{part}</a>;
+    return (
     part.startsWith("**") && part.endsWith("**")
       ? <strong key={index}>{part.slice(2, -2)}</strong>
       : part.startsWith("`") && part.endsWith("`")
         ? <code key={index}>{part.slice(1, -1)}</code>
         : <Fragment key={index}>{part}</Fragment>
-  ));
+    );
+  });
 }
 
 /** A small text-only Markdown renderer: React escaping is never bypassed. */
-function PublishedText({ text }: { text: string }) {
+export function PublishedText({ text }: { text: string }) {
   const blocks = text.split(/(```[^\n]*\n[\s\S]*?```)/g);
   return <div className="ro-prose">{blocks.map((block, index) => {
     if (block.startsWith("```")) {

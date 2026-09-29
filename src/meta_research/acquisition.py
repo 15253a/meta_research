@@ -545,6 +545,19 @@ class NatureDownloaderAdapter:
         config_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         environment = dict(os.environ)
         environment["LIT_DL_CONFIG_DIR"] = str(config_root)
+        configured_node = environment.get("META_RESEARCH_DOWNLOADER_NODE")
+        if configured_node:
+            node = Path(configured_node)
+            if (
+                not node.is_absolute()
+                or not node.is_file()
+                or not os.access(node, os.X_OK)
+                or node.name.lower() != ("node.exe" if os.name == "nt" else "node")
+            ):
+                raise AcquisitionUnavailable("acquisition_downloader_node_invalid")
+            # The Codex harness binds its own Node identity. Only the downloader
+            # subprocess may select this separately configured runtime.
+            environment["PATH"] = str(node.parent) + os.pathsep + environment.get("PATH", "")
         return environment
 
     def _run_json(

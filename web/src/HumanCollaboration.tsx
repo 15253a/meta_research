@@ -8,6 +8,13 @@ import {
   type ReactNode,
 } from "react";
 import { useReplyStream } from "./chatReplyStream";
+import { PublishedText } from "./ReadableOutput";
+import { humanRequestPresentation, plainRequestText, requestIssueKey } from "./humanRequestPresentation";
+import {
+  HANDOFF_DOCUMENT_PROMPT,
+  buildHumanRequestHandoff,
+  getHumanRequestHandoff,
+} from "./humanRequestHandoff";
 import {
   acknowledgeAssetIntake,
   authorizeHumanCommand,
@@ -86,7 +93,7 @@ const requestCopy: Record<HumanRequestItem["kind"], {
   system_operation_help: {
     list: "系统操作协助",
     draftLabel: "就系统操作失败发消息",
-    draftPlaceholder: "询问错误背景或确认将重试哪个操作……",
+    draftPlaceholder: "例如：我不是服务器维护者，请说明需要找谁、做什么。",
   },
 };
 
@@ -122,7 +129,7 @@ const fallbackCompanionCopy: Record<CompanionShellState, {
   },
   "ready-active": {
     label: "跟随当前研究",
-    message: "我会在这里解释研究状态；普通聊天不会直接写入领域事实。",
+    message: "我会结合当前研究，与你一起搜索、检查和推进下一步。",
   },
 };
 
@@ -215,9 +222,10 @@ function scrollToConversationMessage(element: HTMLElement | null) {
     - chat.getBoundingClientRect().bottom + 18;
 }
 
-function PendingCompanionReply({ message, onChanged }: {
+function PendingCompanionReply({ message, onChanged, richText = false }: {
   message: OptimisticCompanionMessage;
   onChanged: () => void;
+  richText?: boolean;
 }) {
   return <CompanionReplyContent
     message={{
@@ -229,13 +237,15 @@ function PendingCompanionReply({ message, onChanged }: {
     }}
     scopeRef={message.scopeRef}
     onChanged={onChanged}
+    richText={richText}
   />;
 }
 
-function CompanionReplyContent({ message, scopeRef, onChanged }: {
+function CompanionReplyContent({ message, scopeRef, onChanged, richText = false }: {
   message: CompanionMessage;
   scopeRef: string | null;
   onChanged: () => void;
+  richText?: boolean;
 }) {
   const pending = ["queued", "processing", "running"].includes(message.status ?? "");
   const interactionRef = message.message_ref?.endsWith(":assistant")
@@ -246,15 +256,17 @@ function CompanionReplyContent({ message, scopeRef, onChanged }: {
     : null, onChanged);
   const content = pending && preview?.text ? preview.text : messageText(message);
   const replying = pending && (!preview || ["queued", "processing", "running"].includes(preview.status));
-  const contentRef = useRef<HTMLSpanElement>(null);
+  const contentRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     scrollToConversationMessage(contentRef.current);
   }, [content]);
-  return <span ref={contentRef} style={{ whiteSpace: "pre-wrap" }}>{content}{replying ? (
+  const Container = richText ? "div" : "span";
+  return <Container ref={(element) => { contentRef.current = element; }} style={richText ? undefined : { whiteSpace: "pre-wrap" }}>
+    {richText ? <PublishedText text={content} /> : content}{replying ? (
     <span className="lumen-message-state" role="status">
-      {content ? "正在回复…" : "Codex 正在思考…"}
+      {content ? "正在回复…" : richText ? "研究助手正在处理…" : "Codex 正在思考…"}
     </span>
-  ) : null}</span>;
+  ) : null}</Container>;
 }
 
 function openRequests(projection?: HumanCollaborationProjection): HumanRequestItem[] {
@@ -484,7 +496,7 @@ export function QuestCompanion({
           <article className="lumen-human-attention">
             <small>需要你 · {scopeLabel(attention)}</small>
             <b>{requestCopy[attention.kind].list}需要你处理</b>
-            <p>{attention.obligation}</p>
+            <p>{humanRequestPresentation(attention).title}</p>
             <button type="button" onClick={() => onOpenRequest(attention.request_ref)}>
               查看请求
             </button>
@@ -516,7 +528,7 @@ export function QuestCompanion({
                   ? "YOU · CONVERSATION"
                   : message.role === "system"
                     ? "SYSTEM · STATUS"
-                    : "COMPANION · READ-ONLY EXPLANATION"}
+                    : "COMPANION · RESEARCH ASSISTANT"}
               </small>
               {message.role === "assistant" ? (
                 <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
@@ -553,7 +565,7 @@ export function QuestCompanion({
             className="lumen-message lumen-companion-thinking"
             data-message-status="processing"
           >
-            <small>COMPANION · READ-ONLY EXPLANATION</small>
+            <small>COMPANION · RESEARCH ASSISTANT</small>
             <PendingCompanionReply message={message} onChanged={onChanged} />
           </article>
         ))}
@@ -2166,9 +2178,9 @@ function HumanRequestList({
                   className="hc-request-card"
                   key={item.request_ref}
                   onClick={() => onSelect(item.request_ref)}
-                  aria-label={`${requestCopy[kind].list} · ${item.obligation}`}
+                  aria-label={`${requestCopy[kind].list} · ${humanRequestPresentation(item).title}`}
                 >
-                  <span><b>{item.obligation}</b><small>{scopeLabel(item)}</small></span>
+                  <span><b>{humanRequestPresentation(item).title}</b><small>{scopeLabel(item)}</small></span>
                   <i className={item.status === "open" ? "current" : ""}>{requestStatusLabel(item.status)}</i>
                 </button>
               ))}
@@ -2213,6 +2225,15 @@ function HumanRequestView({
   hasNext: boolean;
 }) {
   const waiting = collaboration?.human_requests.waiting;
+  const presentation = humanRequestPresentation(request);
+  const relatedCount = presentation.issueKey
+    ? (collaboration?.human_requests.items ?? []).filter((item) =>
+      item.status === "open"
+      && item.quest_ref === request.quest_ref
+      && item.request_ref !== request.request_ref
+      && requestIssueKey(item) === presentation.issueKey,
+    ).length
+    : 0;
 
   return (
     <>
@@ -2224,8 +2245,8 @@ function HumanRequestView({
               ? `当前待办 · ${queuePosition} / ${queueSize}`
               : scopeLabel(request)}
           </small>
-          <h2>{renderAgentText(request.obligation)}</h2>
-          <p>{renderAgentText(request.business_purpose ?? "")}</p>
+          <h2>{renderAgentText(presentation.title)}</h2>
+          <p>{presentation.summary}</p>
         </div>
         {blocking ? (
           <div className="hc-head-actions">
@@ -2258,7 +2279,40 @@ function HumanRequestView({
         )}
       </header>
       <div className="hc-request-workspace">
+        <IntentDraftingSession
+          key={`${request.request_ref}:${request.revision}`}
+          request={request}
+          scopeRef={collaboration?.companion.scope_ref ?? null}
+          messages={collaboration?.companion.messages ?? []}
+          onChanged={onChanged}
+        />
         <main className="hc-request-core">
+          <header className="hc-request-context">
+            <h3>事项与回应</h3>
+            <p>先和助手一起推进；有结果、限制或决定后，在这里提交。</p>
+          </header>
+          <section className="hc-request-guide" aria-label="处理说明">
+            {relatedCount > 0 ? (
+              <p className="hc-related-requests">另有 {relatedCount} 项待办报告了同样的运行问题。修复后，请逐项检查是否恢复。</p>
+            ) : null}
+            <dl><div><dt>需要谁处理</dt><dd>{presentation.handler}</dd></div></dl>
+            <details className="hc-request-requirements">
+              <summary>查看具体要求与完成条件</summary>
+              <dl>
+                {presentation.issueKey ? (
+                  <div><dt>涉及的工作</dt><dd>{plainRequestText(request.obligation)}</dd></div>
+                ) : null}
+                <div className="hc-request-action"><dt>现在需要做什么</dt><dd>{renderAgentText(presentation.action)}</dd></div>
+                <div><dt>为什么需要处理</dt><dd>{renderAgentText(presentation.reason)}</dd></div>
+                {presentation.checks.length ? (
+                  <div><dt>{request.kind === "system_operation_help" ? "怎样算恢复" : "完成条件"}</dt><dd>
+                    <ul>{presentation.checks.map((check, index) => <li key={index}>{renderAgentText(check)}</li>)}</ul>
+                  </dd></div>
+                ) : null}
+              </dl>
+            </details>
+            <p className="hc-response-hint">{presentation.responseHint}</p>
+          </section>
           <RequestForm
             request={request}
             commands={collaboration?.commands.items ?? []}
@@ -2267,13 +2321,6 @@ function HumanRequestView({
           />
           <RequestDetails request={request} otherBlockers={waiting?.other_blockers ?? []} />
         </main>
-        <IntentDraftingSession
-          key={`${request.request_ref}:${request.revision}`}
-          request={request}
-          scopeRef={collaboration?.companion.scope_ref ?? null}
-          messages={collaboration?.companion.messages ?? []}
-          onChanged={onChanged}
-        />
       </div>
     </>
   );
@@ -2318,8 +2365,10 @@ function RequestDetails({
     : firstDefined(request.disposition ?? {}, "receipt_ref", "disposition_receipt_ref");
   return (
     <details className="hc-request-details">
-      <summary>查看请求身份、验收与恢复票据</summary>
+      <summary>原始请求与技术详情</summary>
       <dl>
+        <Detail label="原始标题" value={request.obligation} />
+        <Detail label="原始说明" value={request.business_purpose ?? undefined} />
         <Detail label="Request identity" value={`${request.request_ref} · current revision ${request.revision}`} />
         <Detail
           label="Issuer / request owner"
@@ -2458,6 +2507,27 @@ function IntentDraftingSession({
   const unprojectedReplies = optimisticMessages.filter((message) =>
     !optimisticReplyIsProjected(message, scoped)
   );
+  const handoff = getHumanRequestHandoff(messages, request, scopeRef);
+  const handoffQueued = optimisticMessages.some((message) =>
+    message.content === HANDOFF_DOCUMENT_PROMPT
+    && !optimisticTurnIsProjected(message, scoped)
+  );
+  const handoffStatus = handoffQueued ? "pending" : handoff.status;
+  const downloadHandoff = (format: "markdown" | "html") => {
+    if (handoffStatus !== "completed" || handoff.status !== "completed") return;
+    const document = buildHumanRequestHandoff(request, handoff);
+    const content = format === "markdown" ? document.markdown : document.html;
+    const extension = format === "markdown" ? "md" : "html";
+    const mediaType = format === "markdown" ? "text/markdown" : "text/html";
+    const url = URL.createObjectURL(new Blob([content], { type: `${mediaType};charset=utf-8` }));
+    const link = window.document.createElement("a");
+    link.href = url;
+    link.download = `${document.filenameBase}.${extension}`;
+    window.document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  };
   const projectionKey = scoped.map((message) => `${message.message_ref}:${message.status}`).join("|");
   useEffect(() => {
     setOptimisticMessages((current) => {
@@ -2470,9 +2540,8 @@ function IntentDraftingSession({
     if (transcript) scrollToConversationMessage(transcript.lastElementChild as HTMLElement | null);
   }, [projectionKey, optimisticMessages]);
 
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    const message = draft.trim();
+  const sendMessage = async (value: string) => {
+    const message = value.trim();
     if (!message || sendingRef.current || !scopeRef || !questRef) return;
     sendingRef.current = true;
     const localRef = ++optimisticSequence.current;
@@ -2481,7 +2550,7 @@ function IntentDraftingSession({
       matchingProjectedMessagesAtSend: scoped.filter((item) => item.role === "user" && messageText(item) === message).length,
       status: "sending",
     }]);
-    setDraft("");
+    setDraft((current) => current.trim() === message ? "" : current);
     setSending(true);
     setError(null);
     try {
@@ -2497,7 +2566,7 @@ function IntentDraftingSession({
       onChanged();
     } catch (caught) {
       setOptimisticMessages((current) => current.filter((item) => item.localRef !== localRef));
-      setDraft((current) => current || message);
+      if (message !== HANDOFF_DOCUMENT_PROMPT) setDraft((current) => current || message);
       setError(reasonCode(caught));
     } finally {
       sendingRef.current = false;
@@ -2505,57 +2574,94 @@ function IntentDraftingSession({
     }
   };
 
+  const firstStepPrompt = "请一步步带我处理这件事。先核对现有上下文，能自己搜索、检查环境或准备材料的部分请直接完成。然后只告诉我现在需要做的第一步、具体怎么做、预期看到什么；需要了解我的环境或权限时，先问最关键的一个问题。我会把结果发给你，再继续下一步。";
+  const quickPrompts = [
+    { label: "下一步怎么做", message: "根据我们的进展，现在下一步应该做什么？能由你完成的请直接做；需要我操作时，只给当前一步的具体操作和预期结果。" },
+    { label: "先帮我搜索", message: "请先搜索与当前事项有关的资料、官方文档和可行办法，给出来源，并据此建议我们现在先做哪一步。" },
+    { label: "一起排查问题", message: "请和我一起排查当前问题。先检查你能访问的环境、文件或日志，必要时编写和运行调试脚本；如果需要我提供信息，先问最关键的一项，再逐步验证。" },
+  ];
+  const unavailable = sending || !scopeRef || !questRef;
+
   return (
     <aside className="hc-request-draft" aria-label={`${requestCopy[request.kind].list}相关交流`}>
       <header>
         <span className="hc-draft-orb" aria-hidden="true" />
-        <div><small>询问与协商</small><b>和研究助手聊一聊</b><span>只讨论当前事项</span></div>
+        <div><small>一起推进这项工作</small><b>研究助手</b><span>一步步指导 · 搜索资料 · 检查环境 · 编写与运行代码</span></div>
       </header>
+      <section className="hc-handoff" aria-label="协作说明文档">
+        <div>
+          <b>交给其他 AI 或自己做</b>
+        </div>
+        <div className="hc-handoff-actions">
+          <button type="button" disabled={unavailable || handoffStatus === "pending"}
+            onClick={() => void sendMessage(HANDOFF_DOCUMENT_PROMPT)}>
+            {handoffStatus === "pending" ? "正在整理文档…" : handoffStatus === "completed" ? "重新生成说明" : "生成协作说明"}
+          </button>
+          {handoffStatus === "completed" ? <>
+            <button type="button" onClick={() => downloadHandoff("markdown")}>下载 Markdown</button>
+            <button type="button" onClick={() => downloadHandoff("html")}>下载阅读版</button>
+          </> : null}
+        </div>
+        {handoffStatus === "pending" ? <small role="status">助手正在结合本次事项与讨论整理，正文会显示在下方。你可以继续交流。</small>
+          : handoffStatus === "failed" ? <small role="status">文档生成失败，请重试。</small>
+            : handoffStatus === "completed" ? <small>Markdown 可交给其他 AI；阅读版可离线打开、打印。继续讨论后可重新生成。</small>
+              : null}
+      </section>
       <div className="hc-draft-transcript" aria-live="polite" ref={transcriptRef}>
         {!scoped.length && !optimisticMessages.length ? (
-          <article>
-            <small>当前事项</small>
-            <p>你可以询问当前状态，或讨论替代路线。</p>
+          <article className="hc-draft-start">
+            <small>从这里开始</small>
+            <h3>先弄清楚第一步，再一起往下做</h3>
+            <button type="button" disabled={unavailable} onClick={() => void sendMessage(firstStepPrompt)}>带我开始第一步 →</button>
+            <p>助手会先查看已有信息，完成它能做的搜索与检查，再带你做当前这一步。把操作结果、报错或疑问发回来，就能继续排查和调整。</p>
           </article>
         ) : scoped.map((message, index) => (
           <article className={message.role === "user" ? "me" : ""} key={message.message_ref ?? index}>
             <small>{message.role === "user" ? "你" : "研究助手"}</small>
-            <p>{message.role === "assistant"
-              ? <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} />
-              : messageText(message)}</p>
+            {message.role === "assistant"
+              ? <CompanionReplyContent message={message} scopeRef={scopeRef} onChanged={onChanged} richText />
+              : <p>{messageText(message) === HANDOFF_DOCUMENT_PROMPT ? "请把当前事项整理成可交给其他 AI 或自行完成的协作说明。" : messageText(message)}</p>}
           </article>
         ))}
         {visibleOptimisticMessages.map((message) => <article className="me" key={`user-${message.localRef}`}>
-          <small>你</small><p>{message.content}</p>
+          <small>你</small><p>{message.content === HANDOFF_DOCUMENT_PROMPT ? "请把当前事项整理成可交给其他 AI 或自行完成的协作说明。" : message.content}</p>
           <span>{message.status === "sending" ? "消息正在发送…" : "消息已发送"}</span>
         </article>)}
         {unprojectedReplies.map((message) => <article key={`reply-${message.localRef}`}>
-          <small>研究助手</small><p><PendingCompanionReply message={message} onChanged={onChanged} /></p>
+          <small>研究助手</small><PendingCompanionReply message={message} onChanged={onChanged} richText />
         </article>)}
       </div>
-      <form className="hc-draft-compose" onSubmit={(event) => void submit(event)}>
+      <form className="hc-draft-compose" onSubmit={(event) => {
+        event.preventDefault();
+        void sendMessage(draft);
+      }}>
+        <div className="hc-draft-prompts" aria-label="协作快捷问题">
+          {quickPrompts.map((prompt) => (
+            <button key={prompt.label} type="button" disabled={unavailable} onClick={() => void sendMessage(prompt.message)}>{prompt.label}</button>
+          ))}
+        </div>
         <label>
-          继续交流
+          和助手一起做
           <span>
             <textarea
               aria-label={requestCopy[request.kind].draftLabel}
-              placeholder={requestCopy[request.kind].draftPlaceholder}
+              placeholder="描述你的情况，粘贴报错、命令结果或文件路径，也可以随时追问……"
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={submitTextareaOnEnter}
-              disabled={sending || !scopeRef || !questRef}
+              disabled={unavailable}
             />
             <button
               type="submit"
-              disabled={sending || !scopeRef || !questRef || !draft.trim()}
+              disabled={unavailable || !draft.trim()}
               aria-label="发送消息"
             >↑</button>
           </span>
         </label>
         <small>{error ? `发送失败 · ${error}` : `${draft.length} 字 · Enter 发送 · Shift+Enter 换行`}</small>
       </form>
-      <div className="hc-draft-status">这里的交流不会提交回应，也不会改变当前事项的处理状态。</div>
-      <div className="hc-draft-boundary">聊天可以帮助理解情况；只有左侧明确提交，才会记录你的回应。</div>
+      <div className="hc-draft-status">助手按当前环境与授权使用工具；可以持续追问、尝试和修正。</div>
+      <div className="hc-draft-boundary">准备好后，在“事项与回应”中提交结果，作为研究继续的依据。</div>
     </aside>
   );
 }
@@ -2645,6 +2751,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
   authorizations: HumanCapabilityAuthorization[];
   onChanged: () => void;
 }) {
+  const presentation = humanRequestPresentation(request);
   const [note, setNote] = useState("");
   const [pending, setPending] = useState(false);
   const [recorded, setRecorded] = useState(false);
@@ -2862,7 +2969,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
             <span aria-hidden="true">↻</span>
             <div>
               <h3>重试进行中</h3>
-              <p>正在执行当前绑定的同一操作；失败会显示新修订，成功后会显示完成。</p>
+              <p>系统正在重新尝试这项操作。完成后会更新结果，请稍候。</p>
             </div>
           </section>
         ) : (
@@ -2871,7 +2978,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
             type="button"
             disabled={pending}
             onClick={() => void retry()}
-          >重试</button>
+          >{pending ? "正在提交…" : presentation.retryLabel}</button>
         )
       ) : null}
       {error || !["library_reconnect", "capability_authorization"].includes(request.kind) ? (
@@ -2879,9 +2986,9 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         {error ? (
           <><b>{request.kind === "system_operation_help" ? "重试未成功" : "回应没有记录"}</b><br />{error}</>
         ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
-          <><b>提交只表示人的回应已接纳</b><br />这不代表材料充分、实验成功或研究结论为真；负责当前请求的 Agent 会解释回应并决定下一步。</>
+          <><b>提交后，系统会核对你的回应</b><br />确认材料和结果满足要求后，相关工作才能继续。</>
         ) : request.kind === "system_operation_help" ? (
-          <><b>只重试当前绑定的失败操作</b><br />成功后只恢复它的精确依赖；失败会保留同一操作链并显示新修订。</>
+          <><b>修复后再试一次</b><br />按钮会重新尝试当前这项操作。系统确认恢复后，相关工作才能继续；仍有问题时会更新说明。</>
         ) : (
           <><b>提交回应不会立即代表条件已经满足</b><br />系统会核对当前任务、材料和授权；只有核对通过且没有其他阻碍，相关工作才会继续。</>
         )}

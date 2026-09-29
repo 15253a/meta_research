@@ -821,7 +821,7 @@ def create_app(
     except ValueError:
         base_url_is_loopback = False
     trust_ssh_loopback = (
-        os.environ.get("META_RESEARCH_TRUST_SSH_LOOPBACK") == "1"
+        os.environ.get("META_RESEARCH_TRUST_SSH_LOOPBACK", "1") == "1"
         and base_url_is_loopback
     )
 
@@ -1105,6 +1105,10 @@ def create_app(
                 }
             },
         )
+
+    @app.get("/internal/browser-access")
+    def browser_access_policy() -> dict[str, bool]:
+        return {"login_required": not trust_ssh_loopback}
 
     @app.post("/internal/bootstrap-token")
     def issue_bootstrap_token() -> dict[str, str]:
@@ -3957,7 +3961,13 @@ async def _process_target_runs(
     flights: dict[str, _TargetRunFlight] = {}
     cancel_flights: dict[str, _TargetRunFlight] = {}
     operation_errors: dict[str, str] = {}
-    idle_sweeps = 0
+    idle_passes: dict[str, int] = {}
+    next_probe_at: dict[str, float] = {}
+
+    def defer_idle_target(target_ref: str) -> None:
+        passes = min(idle_passes.get(target_ref, 0) + 1, 7)
+        idle_passes[target_ref] = passes
+        next_probe_at[target_ref] = time.monotonic() + 0.2 * (2 ** (passes - 1))
 
     def set_health(status: Literal["ready", "unavailable"], code: str | None) -> None:
         changed = health.status != status or health.last_error != code
@@ -3990,10 +4000,16 @@ async def _process_target_runs(
         # returns a valid result or leaves the authoritative work inventory.
         for target_ref in operation_errors.keys() - set(target_refs):
             del operation_errors[target_ref]
+        for target_ref in next_probe_at.keys() - set(target_refs):
+            del next_probe_at[target_ref]
+            idle_passes.pop(target_ref, None)
 
         discovery_error: str | None = None
         for target_ref in target_refs:
-            if target_ref in flights:
+            if (
+                target_ref in flights
+                or time.monotonic() < next_probe_at.get(target_ref, 0.0)
+            ):
                 if target_ref in cancel_flights:
                     continue
                 has_pending_cancel = getattr(
@@ -4021,7 +4037,9 @@ async def _process_target_runs(
                         else type(error).__name__
                     )
                     continue
-                if pending_cancel:
+                if not pending_cancel:
+                    continue
+                if target_ref in flights:
                     operation = _daemon_thread_call(
                         lambda target_ref=target_ref: (
                             runtime.target_run_runtime.process_once(target_ref)
@@ -4031,7 +4049,8 @@ async def _process_target_runs(
                         target_ref=target_ref,
                         operation=operation,
                     )
-                continue
+                    continue
+                # Cancellation of an idle root bypasses its probe delay.
             if target_ref in cancel_flights:
                 continue
             operation = _daemon_thread_call(
@@ -4072,6 +4091,11 @@ async def _process_target_runs(
                         )
                     advanced = advanced or result
                     operation_errors.pop(target_ref, None)
+                    if result:
+                        idle_passes.pop(target_ref, None)
+                        next_probe_at.pop(target_ref, None)
+                    elif flight_map is flights:
+                        defer_idle_target(target_ref)
                 except Exception as error:
                     if not isinstance(
                         error, (OSError, OwnerConflict, SQLAlchemyError)
@@ -4082,6 +4106,8 @@ async def _process_target_runs(
                         if isinstance(error, OwnerConflict)
                         else type(error).__name__
                     )
+                    if flight_map is flights:
+                        defer_idle_target(target_ref)
 
         operation_error = next(iter(operation_errors.values()), None)
         if discovery_error is not None or operation_error is not None:
@@ -4090,19 +4116,15 @@ async def _process_target_runs(
             set_health("ready", None)
 
         if advanced:
-            idle_sweeps = 0
             await asyncio.sleep(0)
         elif flights or cancel_flights:
             # A boundary is still executing; keep collecting promptly.
-            idle_sweeps = 0
             await asyncio.sleep(0.05)
         else:
-            # Every idle sweep re-runs each Target root's full read
-            # verification; polling that at the base rate pins a core
-            # without research progress. Back off while the inventory
-            # stays quiescent and snap back on the first advance.
-            idle_sweeps = min(idle_sweeps + 1, 7)
-            await asyncio.sleep(min(0.2 * (2 ** (idle_sweeps - 1)), 30.0))
+            # Each idle root backs off independently: staggered completions
+            # must not keep re-launching full verification of other idle roots.
+            # Inventory and cancellation checks remain responsive.
+            await asyncio.sleep(0.2)
 
 
 async def _process_bundle_stage(

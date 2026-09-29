@@ -31,7 +31,9 @@ def run_cli_json(*args: str) -> dict[str, object]:
 
 
 @pytest.fixture
-def running_product(tmp_path: Path):
+def running_product(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # These legacy authentication tests explicitly exercise the opt-in login mode.
+    monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", "0")
     data_root = tmp_path / "isolated data root"
     started = run_cli_json(
         "start",
@@ -47,7 +49,41 @@ def running_product(tmp_path: Path):
         run_cli("stop", "--data-root", str(data_root), "--json", check=False)
 
 
-def test_clean_start_exposes_only_authenticated_production_snapshots(
+def test_default_launch_returns_a_reusable_http_url_without_login(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("META_RESEARCH_TRUST_SSH_LOOPBACK", raising=False)
+    data_root = tmp_path / "direct browser data"
+    started = run_cli_json(
+        "start", "--data-root", str(data_root), "--port", "0", "--json"
+    )
+    try:
+        assert started["browser_login_required"] is False
+        assert "bootstrap" not in cli_module._start_human(started)
+        # CLI environment changes must not override the running daemon's policy.
+        monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", "0")
+        launched = run_cli_json(
+            "launch", "--data-root", str(data_root), "--no-browser", "--json"
+        )
+        base_url = str(started["base_url"])
+        assert launched["browser_url"] == base_url == launched["target_url"]
+        assert not list((data_root / "run").glob("browser-launch-*.html"))
+        with httpx.Client(base_url=base_url, timeout=5, trust_env=False) as browser:
+            shell = browser.get("/")
+            assert shell.status_code == 200
+            assert 'id="root"' in shell.text
+            assert browser.get("/api/v1/snapshot").status_code == 200
+            browser.cookies.clear()
+            browser.cookies.set("meta_research_session", "expired-session")
+            assert browser.get("/").status_code == 200
+            assert browser.get("/api/v1/snapshot").status_code == 200
+            assert browser.cookies.get("meta_research_csrf")
+    finally:
+        run_cli("stop", "--data-root", str(data_root), "--json", check=False)
+
+
+def test_explicit_login_mode_exposes_only_authenticated_production_snapshots(
     running_product,
 ) -> None:
     data_root, started = running_product
@@ -55,6 +91,7 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
     bootstrap_token = str(started["bootstrap_token"])
 
     assert started["status"] == "started"
+    assert started["browser_login_required"] is True
     assert base_url.startswith("http://127.0.0.1:")
     assert bootstrap_token not in base_url
     assert bootstrap_token not in str(started["web_url"])
@@ -587,7 +624,16 @@ def test_start_refuses_to_adopt_an_unmarked_existing_data_directory(
     assert "refusing non-empty directory without a vNext marker" in result["reason"]
 
 
-def test_ipv6_loopback_is_a_supported_authenticated_listener(tmp_path: Path) -> None:
+@pytest.mark.parametrize("require_login", (False, True))
+def test_ipv6_loopback_supports_default_access_and_explicit_login(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    require_login: bool,
+) -> None:
+    if require_login:
+        monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", "0")
+    else:
+        monkeypatch.delenv("META_RESEARCH_TRUST_SSH_LOOPBACK", raising=False)
     try:
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
             probe.bind(("::1", 0))
@@ -609,6 +655,7 @@ def test_ipv6_loopback_is_a_supported_authenticated_listener(tmp_path: Path) -> 
         base_url = str(started["base_url"])
         assert base_url.startswith("http://[::1]:")
         with httpx.Client(base_url=base_url, timeout=5, trust_env=False) as client:
+            assert client.get("/").status_code == (401 if require_login else 200)
             exchanged = client.post(
                 "/auth/bootstrap",
                 headers={"Origin": base_url},

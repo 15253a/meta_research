@@ -12,6 +12,7 @@ import {
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { StatusHome } from "./StatusHome";
+import { humanRequestPresentation } from "./humanRequestPresentation";
 import { OutputLanguageProvider, OutputLanguageControl } from "./OutputLanguage";
 import { observedActiveTarget } from "./activeTargetStatus";
 import { targetResearchFacts } from "./targetResearchFacts";
@@ -4214,7 +4215,7 @@ function WorkspaceMain({
           <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} observationPointers={targetRootObservationPointers} />
           <div><button onClick={onBrowseAssets}>研究资料 ↗</button><button onClick={onBrowseQuestions}>问题树 ↗</button></div>
         </div>
-        {requests.length ? <button className="research-human-request" onClick={() => onBrowseHumanRequests(requests[0].request_ref)}><span><b>需要你回应 · {requests.length} 项</b><span>{requests[0].obligation}</span></span><b>查看并回应 ↗</b></button> : null}
+        {requests.length ? <button className="research-human-request" onClick={() => onBrowseHumanRequests(requests[0].request_ref)}><span><b>需要你回应 · {requests.length} 项</b><span>{humanRequestPresentation(requests[0]).title}</span></span><b>查看并回应 ↗</b></button> : null}
         {rootConversations.selectedStage === "bundle" && displayedTarget && displayedTargetFacts ? <section className="research-target-status" aria-label="当前研究工作状态">
           <header><h2>{displayedTarget.target_key}</h2><p>{displayedTargetFacts.summary}</p></header>
           <BoundedDetails key={displayedTarget.target_ref} className="research-target-details" summary="查看输入、产物与交接">{() => <TargetResearchFactsView facts={displayedTargetFacts} label={displayedTarget.target_key} />}</BoundedDetails>

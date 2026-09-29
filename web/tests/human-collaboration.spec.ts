@@ -1,11 +1,14 @@
 import {
   expect,
   test,
+  type Download,
   type Page,
   type Response,
   type Route,
 } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 import { DeterministicProduct } from "./support/deterministic-product";
+import { HANDOFF_DOCUMENT_PROMPT } from "../src/humanRequestHandoff";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -312,6 +315,57 @@ async function keepProjectionRoutesAcrossPages(
     });
   });
   await context.route("**/api/v1/events*", (route) => route.abort("connectionrefused"));
+}
+
+async function installWorkspaceRepairSnapshot(page: Page) {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  const humanRequests = (snapshot.human_collaboration as JsonRecord)
+    .human_requests as JsonRecord;
+  const items = ["双手接口核验", "摄像头采集", "会话代码", "测量协议"].map(
+    (work, index) => {
+      const item = request(
+        "system_operation_help",
+        `agent_runtime:HR-workspace-${index + 1}:r1`,
+        "agent_runtime",
+        `恢复${work} Target 的本地工作区读写`,
+        `root_run:target_run_${index + 1}`,
+      );
+      item.business_purpose = `${work}需读取冻结 manifest 并保存 implementation/ 和 outputs/result.json。`
+        + "根会话与独立子会话的只读命令均在启动前返回 bwrap: Failed to make / slave: Permission denied。"
+        + "apply_patch 写入无害探针也返回 Failed to write file。请修复当前执行容器，并保持原 Target、fence 与工作区。";
+      item.target_assertion = {
+        condition: {
+          safe_response: "请由系统维护者修复当前 Target 的命令执行与文件读写，确认冻结 manifest 可读，工作区可写。无需授予新的外部权限。",
+          impact: "本 Target 的实现和结果文件无法验证或提交；恢复后才能继续同一研究工作。",
+        },
+        root: {
+          target_ref: `target_${index + 1}`,
+          fence_ref: `harness_fence_${"8".repeat(96)}_${index + 1}`,
+          run_ref: `target_run_${index + 1}`,
+          root_session_ref: `harness_session_${index + 1}`,
+          root_kind: "target",
+          phase: "target_root_lifecycle",
+          operation_id: "human_request.open",
+          waiter_generation: 3,
+        },
+      };
+      item.acceptance_conditions = [
+        "当前 Target 的 exec_command 能成功执行只读 pwd 并读取冻结 manifest。",
+        "当前 Target 能创建并读回无害测试文件，再写入 implementation/ 和 outputs/。",
+        "保留原 Target、fence 与输入归属。",
+      ];
+      return item;
+    },
+  );
+  items.push(request(
+    "system_operation_help",
+    "writing:HR-independent:r1",
+    "writing",
+    "重新生成排版预览。",
+    "writing-preview-independent",
+  ));
+  humanRequests.items = items;
+  return { snapshot, items };
 }
 
 async function fulfillJson(route: Route, body: object) {
@@ -1135,7 +1189,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     (commands.authorizations as JsonRecord[]).push(authorization);
     await fulfillJson(route, authorization);
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?workspace`, { waitUntil: "domcontentloaded" });
 
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await expect(dialog).toBeVisible();
@@ -1153,7 +1207,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog).not.toContainText("不要粘贴密码");
   await expect(dialog.getByText("Human Waiting Projection", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText(
-    "聊天可以帮助理解情况；只有左侧明确提交，才会记录你的回应。",
+    "准备好后，在“事项与回应”中提交结果，作为研究继续的依据。",
     { exact: true },
   )).toBeVisible();
   const libraryDraft = dialog.getByLabel("就图书馆恢复事项发消息");
@@ -1244,7 +1298,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await nextRequest.click();
   await expect(queue).toContainText("3 / 5");
   await expect(dialog.getByRole("heading", {
-    name: "按已接纳协议完成线下校准并交回原始结果。",
+    name: "按已确认协议完成线下校准并交回原始结果。",
   })).toBeVisible();
   await expect(dialog).toContainText("交回原始校准结果；不要代写摘要。");
   await expect(dialog.getByLabel("就线下操作事项发消息")).toBeVisible();
@@ -1272,10 +1326,10 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("heading", {
     name: "决定是否允许当前 Run 访问一个新增外部目的地。",
   })).toBeVisible();
-  await expect(dialog.getByRole("button", { name: "提交", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "稍后处理", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "拒绝", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "接受", exact: true })).toBeVisible();
-  await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await dialog.getByRole("button", { name: "稍后处理", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/agent_runtime%3AHR-63%3Ar1/responses",
     body: { decision: "deferred", facts: {}, note: "" },
@@ -1286,13 +1340,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     waitUntil: "domcontentloaded",
   });
   await dialog.getByRole("button", { name: "接受", exact: true }).click();
-  await dialog.getByRole("button", { name: "建立授权草案" }).click();
-  await dialog.getByRole("button", { name: "生成并核对影响说明" }).click();
-  await dialog.getByText("查看本次授权会发生什么", { exact: true }).click();
-  await dialog.getByRole("button", { name: "确认当前草案与影响说明" }).click();
-  await dialog.getByRole("button", { name: "签发仅限本次任务的授权" }).click();
-  await dialog.getByRole("button", { name: "提交授权回应" }).click();
-  expect(permissionWrites.map((item) => item.path)).toEqual([
+  await expect.poll(() => permissionWrites.map((item) => item.path)).toEqual([
     "/api/v1/human-collaboration/commands",
     "/api/v1/human-collaboration/commands/intent-permission-63/previews",
     "/api/v1/human-collaboration/commands/intent-permission-63/confirmations",
@@ -1331,7 +1379,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("heading", {
     name: "重试失败的 Writing 操作：https://status.example.invalid/run-219",
   })).toBeVisible();
-  await expect(dialog.getByRole("link", {
+  await expect(dialog.locator(".hc-head").getByRole("link", {
     name: "https://status.example.invalid/run-219",
   })).toHaveAttribute("href", "https://status.example.invalid/run-219");
   await expect(dialog).toContainText("只重试上述同一操作，不展开根因分析。");
@@ -2412,7 +2460,7 @@ test("human obligation copy keeps operation facts inside verification details", 
   for (const item of humanRequests.items as JsonRecord[]) item.status = "satisfied";
   (humanRequests.items as JsonRecord[]).at(-1)!.status = "unsatisfied";
 
-  await page.goto(product!.baseUrl, {
+  await page.goto(`${product!.baseUrl}/?workspace`, {
     waitUntil: "domcontentloaded",
   });
   await page.getByRole("button", { name: "需要你" }).click();
@@ -2434,7 +2482,7 @@ test("human obligation copy keeps operation facts inside verification details", 
   ).allTextContents()).join(" ");
   expect(ordinaryRequest).toContain("恢复当前图书馆会话");
   expect(ordinaryRequest).not.toMatch(/HumanRequest|Owner|waiter|Projection|receipt|current revision/);
-  await dialog.getByText("查看请求身份、验收与恢复票据", { exact: true }).click();
+  await dialog.getByText("原始请求与技术详情", { exact: true }).click();
   await expect(dialog).toContainText("agent_runtime");
   await expect(dialog).toContainText("acquisition-primary");
   await expect(dialog).toContainText("attempt-17 · generation 3");
@@ -2450,6 +2498,156 @@ test("human obligation copy keeps operation facts inside verification details", 
   await expect(dialog).toContainText("generation 4 · blocked · local");
   await expect(dialog).toContainText("policy-review");
   await expect(dialog).toContainText("not recorded");
+});
+
+test("workspace repair requests explain the action and keep each recovery check independent", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const { items } = await installWorkspaceRepairSnapshot(page);
+  const writes: Array<{ path: string; body: JsonRecord }> = [];
+  page.on("request", (outgoing) => {
+    if (["GET", "HEAD", "OPTIONS"].includes(outgoing.method())) return;
+    const path = new URL(outgoing.url()).pathname;
+    if (!path.startsWith("/api/v1/")) return;
+    writes.push({ path, body: (outgoing.postDataJSON() ?? {}) as JsonRecord });
+  });
+  await page.route("**/api/v1/human-requests/*/retry", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const requestRef = decodeURIComponent(path.split("/").at(-2)!);
+    const item = items.find((candidate) => candidate.request_ref === requestRef)!;
+    item.responses = [{
+      response_ref: `response-${item.request_id}`,
+      decision: "provided",
+      facts: { action: "retry", effect_id: `effect-${item.request_id}` },
+      note: "",
+    }];
+    await fulfillJson(route, { ...item, retry: { status: "processing" } });
+  });
+
+  await page.goto(`${product!.baseUrl}/?panel=system-operation-help`, {
+    waitUntil: "domcontentloaded",
+  });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  const queue = dialog.getByRole("navigation", { name: "当前待办队列" });
+  await expect(dialog.getByRole("heading", {
+    name: "研究程序无法运行命令或保存文件",
+    exact: true,
+  })).toBeVisible();
+  await expect(queue).toContainText("1 / 5");
+  await expect(dialog.locator(".hc-request-requirements")).not.toHaveAttribute("open");
+  await dialog.getByText("查看具体要求与完成条件", { exact: true }).click();
+  for (const text of ["需要谁处理", "服务器维护者", "现在需要做什么", "为什么需要处理", "怎样算恢复"]) {
+    await expect(dialog.getByText(text, { exact: true })).toBeVisible();
+  }
+  expect(await dialog.innerText()).toMatch(/另有\s*3\s*项/);
+  expect(await dialog.innerText()).not.toMatch(/bwrap|Target|fence|manifest/);
+  const checkRecovery = dialog.getByRole("button", { name: "检查是否恢复", exact: true });
+  await expect(checkRecovery).toBeVisible();
+  await expect(dialog.getByRole("button", { name: /授予|授权|允许访问|批量/ })).toHaveCount(0);
+  expect(writes).toEqual([]);
+
+  const details = dialog.locator("details.hc-request-details");
+  await expect(details).not.toHaveAttribute("open");
+  await dialog.getByText("原始请求与技术详情", { exact: true }).click();
+  await expect(details).toHaveAttribute("open", "");
+  await expect(details).toContainText(items[0].obligation as string);
+  await expect(details).toContainText(items[0].business_purpose as string);
+  await expect(details).toContainText("bwrap: Failed to make / slave: Permission denied");
+  await expect(details).toContainText(`harness_fence_${"8".repeat(96)}_1`);
+  await dialog.getByText("原始请求与技术详情", { exact: true }).click();
+  expect(writes).toEqual([]);
+  const desktopScreenshot = testInfo.outputPath("workspace-repair-1440.png");
+  await dialog.screenshot({ path: desktopScreenshot });
+  await testInfo.attach("workspace-repair-1440", {
+    path: desktopScreenshot,
+    contentType: "image/png",
+  });
+
+  await checkRecovery.click();
+  await expect.poll(() => writes).toEqual([{
+    path: "/api/v1/human-requests/agent_runtime%3AHR-workspace-1%3Ar1/retry",
+    body: {},
+  }]);
+  await expect(checkRecovery).toHaveCount(0);
+  expect(items.slice(1).every((item) => (item.responses as unknown[]).length === 0)).toBe(true);
+
+  await dialog.getByRole("button", { name: "查看下一个待办" }).click();
+  await expect(queue).toContainText("2 / 5");
+  await expect(checkRecovery).toBeVisible();
+  expect(writes).toHaveLength(1);
+  await checkRecovery.click();
+  await expect.poll(() => writes).toEqual([
+    { path: "/api/v1/human-requests/agent_runtime%3AHR-workspace-1%3Ar1/retry", body: {} },
+    { path: "/api/v1/human-requests/agent_runtime%3AHR-workspace-2%3Ar1/retry", body: {} },
+  ]);
+  expect(items.slice(2).every((item) => (item.responses as unknown[]).length === 0)).toBe(true);
+});
+
+test("workspace repair guidance and its original technical detail fit a 390px screen", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installWorkspaceRepairSnapshot(page);
+  await page.goto(`${product!.baseUrl}/?panel=system-operation-help`, {
+    waitUntil: "domcontentloaded",
+  });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  await expect(dialog.getByRole("heading", {
+    name: "研究程序无法运行命令或保存文件",
+  })).toBeVisible();
+  const measureOverflow = () => dialog.evaluate((root) => ({
+    page: document.documentElement.scrollWidth - window.innerWidth,
+    dialog: root.scrollWidth - root.clientWidth,
+    core: (() => {
+      const core = root.querySelector(".hc-request-core")!;
+      return core.scrollWidth - core.clientWidth;
+    })(),
+  }));
+  for (const overflow of Object.values(await measureOverflow())) {
+    expect(overflow).toBeLessThanOrEqual(1);
+  }
+  expect(await dialog.innerText()).not.toMatch(/bwrap|Target|fence|manifest/);
+  const mobileScreenshot = testInfo.outputPath("workspace-repair-390.png");
+  await dialog.screenshot({ path: mobileScreenshot });
+  await testInfo.attach("workspace-repair-390", {
+    path: mobileScreenshot,
+    contentType: "image/png",
+  });
+  await dialog.getByText("原始请求与技术详情", { exact: true }).click();
+  await expect(dialog.locator("details.hc-request-details")).toContainText("bwrap: Failed to make / slave: Permission denied");
+  for (const overflow of Object.values(await measureOverflow())) {
+    expect(overflow).toBeLessThanOrEqual(1);
+  }
+});
+
+test("ordinary requests explain the supplied action, impact and acceptance without hiding their source", async ({
+  page,
+}) => {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  const humanRequests = (snapshot.human_collaboration as JsonRecord)
+    .human_requests as JsonRecord;
+  const item = (humanRequests.items as JsonRecord[])[1];
+  item.business_purpose = "外部材料申请 Target 的技术背景；保留原始 manifest 供维护者追查。";
+  item.target_assertion = {
+    ...(item.target_assertion as JsonRecord),
+    condition: {
+      safe_response: "请上传供应方已经批准的材料，或提供可以访问的下载地址。",
+      impact: "缺少这些材料，研究程序无法核对实验结果。",
+    },
+  };
+  item.acceptance_conditions = ["文件包含供应方的批准结果，并且能够完整打开。"];
+  await page.goto(`${product!.baseUrl}/?panel=external-request`, {
+    waitUntil: "domcontentloaded",
+  });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  await dialog.getByText("查看具体要求与完成条件", { exact: true }).click();
+  await expect(dialog.getByText("请上传供应方已经批准的材料，或提供可以访问的下载地址。", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("缺少这些材料，研究程序无法核对实验结果。", { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel("处理说明").getByText("文件包含供应方的批准结果，并且能够完整打开。", { exact: true })).toBeVisible();
+  expect(await dialog.innerText()).not.toMatch(/Target|manifest/);
+  await dialog.getByText("原始请求与技术详情", { exact: true }).click();
+  await expect(dialog.locator("details.hc-request-details")).toContainText(item.business_purpose as string);
 });
 
 test("HumanRequest deep links select the exact route and keep the background inert", async ({
@@ -2477,7 +2675,7 @@ test("HumanRequest deep links select the exact route and keep the background ine
     waitUntil: "domcontentloaded",
   });
   await expect(dialog.getByRole("heading", {
-    name: "按已接纳协议完成线下校准并交回原始结果。",
+    name: "按已确认协议完成线下校准并交回原始结果。",
   }))
     .toBeVisible();
   await expect(page).toHaveURL(/\?panel=offline-operation$/);
@@ -2513,22 +2711,23 @@ test("HumanRequest deep links select the exact route and keep the background ine
   await expect(page).toHaveURL(/\?panel=human-request$/);
 });
 
-test("the HumanRequest workspace preserves order and overflow at 1440/800/390", async ({
+test("the HumanRequest workspace puts the assistant first at 1440/800/390", async ({
   page,
-}) => {
-  await installHumanCollaborationSnapshot(page);
+}, testInfo) => {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  const requests = ((snapshot.human_collaboration as JsonRecord).human_requests as JsonRecord).items as JsonRecord[];
+  const offlineRequest = requests.find((request) => request.kind === "offline_action")!;
+  offlineRequest.obligation = "取得两只 OmniHand 的现场访问与安全停止依据，并逐步检查设备连接、接口文档和操作结果。";
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?panel=offline-operation`, { waitUntil: "domcontentloaded" });
   const railEntry = page.getByRole("button", { name: "需要你" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   const closeButton = dialog.getByRole("button", { name: "关闭需要你处理的事项" });
   await expect(closeButton).toBeVisible();
   expect(await page.getByTestId("product-shell").evaluate((element) => (element as HTMLElement).inert))
     .toBe(true);
-  await expect(dialog).toHaveScreenshot("d7-human-request-1440.png", {
-    animations: "disabled",
-    maxDiffPixels: 0,
-  });
+  await expect(dialog.getByRole("button", { name: "带我开始第一步 →" })).toBeInViewport();
+  await expect(dialog.locator(".hc-request-requirements")).not.toHaveAttribute("open");
 
   const regions = () => dialog.evaluate((root) => {
     const box = (selector: string) => {
@@ -2539,37 +2738,103 @@ test("the HumanRequest workspace preserves order and overflow at 1440/800/390", 
     return {
       core: box(".hc-request-core"),
       draft: box(".hc-request-draft"),
+      dialogOverflow: root.scrollWidth - root.clientWidth,
       pageWidth: document.documentElement.scrollWidth,
       viewportWidth: window.innerWidth,
     };
   });
 
   const desktop = await regions();
-  expect(desktop.core.x + desktop.core.width).toBeLessThanOrEqual(desktop.draft.x + 1);
+  expect(desktop.draft.x + desktop.draft.width).toBeLessThanOrEqual(desktop.core.x + 1);
+  expect(desktop.draft.width).toBeGreaterThan(desktop.core.width);
   expect(desktop.pageWidth).toBeLessThanOrEqual(desktop.viewportWidth);
+  expect(desktop.dialogOverflow).toBeLessThanOrEqual(1);
+  const desktopScreenshot = testInfo.outputPath("human-request-assistant-1440.png");
+  await dialog.screenshot({ path: desktopScreenshot });
+  await testInfo.attach("human-request-assistant-1440", {
+    path: desktopScreenshot, contentType: "image/png",
+  });
 
   await page.setViewportSize({ width: 800, height: 900 });
   const tablet = await regions();
-  expect(tablet.draft.y).toBeGreaterThanOrEqual(tablet.core.y + tablet.core.height - 1);
+  expect(tablet.core.y).toBeGreaterThanOrEqual(tablet.draft.y + tablet.draft.height - 1);
   expect(tablet.pageWidth).toBeLessThanOrEqual(tablet.viewportWidth);
-  await expect(dialog).toHaveScreenshot("d7-human-request-800.png", {
-    animations: "disabled",
-    maxDiffPixels: 0,
+  expect(tablet.dialogOverflow).toBeLessThanOrEqual(1);
+  await expect(dialog.getByRole("button", { name: "带我开始第一步 →" })).toBeInViewport();
+  const tabletScreenshot = testInfo.outputPath("human-request-assistant-800.png");
+  await dialog.screenshot({ path: tabletScreenshot });
+  await testInfo.attach("human-request-assistant-800", {
+    path: tabletScreenshot, contentType: "image/png",
   });
 
   await page.setViewportSize({ width: 390, height: 844 });
   const mobile = await regions();
-  expect(mobile.draft.y).toBeGreaterThanOrEqual(mobile.core.y + mobile.core.height - 1);
+  expect(mobile.core.y).toBeGreaterThanOrEqual(mobile.draft.y + mobile.draft.height - 1);
   expect(mobile.pageWidth).toBeLessThanOrEqual(mobile.viewportWidth);
-  await expect(dialog).toHaveScreenshot("d7-human-request-390.png", {
-    animations: "disabled",
-    maxDiffPixels: 0,
+  expect(mobile.dialogOverflow).toBeLessThanOrEqual(1);
+  await dialog.locator(".hc-draft-transcript").evaluate((transcript) => {
+    transcript.scrollTop = 0;
+  });
+  const firstStep = dialog.getByRole("button", { name: "带我开始第一步 →" });
+  const firstStepClip = await firstStep.evaluate((button) => {
+    const transcript = button.closest(".hc-draft-transcript")!;
+    const buttonRect = button.getBoundingClientRect();
+    const transcriptRect = transcript.getBoundingClientRect();
+    return {
+      scrollTop: transcript.scrollTop,
+      visibleHeight: Math.min(buttonRect.bottom, transcriptRect.bottom, window.innerHeight)
+        - Math.max(buttonRect.top, transcriptRect.top, 0),
+    };
+  });
+  expect(firstStepClip.scrollTop).toBe(0);
+  expect(firstStepClip.visibleHeight).toBeGreaterThan(0);
+  await expect(firstStep).toBeInViewport();
+  const mobileScreenshot = testInfo.outputPath("human-request-assistant-390.png");
+  await dialog.screenshot({ path: mobileScreenshot });
+  await testInfo.attach("human-request-assistant-390", {
+    path: mobileScreenshot, contentType: "image/png",
   });
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(railEntry).toBeVisible();
   expect(await page.getByTestId("product-shell").evaluate((element) => (element as HTMLElement).inert))
     .toBe(false);
+});
+
+test("human request first-step and tool shortcuts send scoped messages without submitting a response", async ({ page }) => {
+  await installHumanCollaborationSnapshot(page);
+  const writes: Array<{ path: string; body: JsonRecord }> = [];
+  page.on("request", (request) => {
+    if (request.method() !== "POST") return;
+    writes.push({ path: new URL(request.url()).pathname, body: request.postDataJSON() as JsonRecord });
+  });
+  await page.route("**/api/v1/companion/messages", (route) => route.fulfill({
+    json: { interaction_ref: `guided-turn-${writes.length}`, status: "queued" },
+  }));
+  await page.goto(`${product!.baseUrl}/?panel=offline-operation`, { waitUntil: "domcontentloaded" });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  const input = dialog.getByLabel("就线下操作事项发消息");
+  expect(writes).toEqual([]);
+  await dialog.getByRole("button", { name: "带我开始第一步 →" }).click();
+  await expect.poll(() => writes.length).toBe(1);
+  expect(writes[0].body.message).toMatch(/第一步.*具体怎么做.*预期看到什么/);
+  expect(writes[0].body.view_context).toEqual({
+    kind: "human_request", quest_ref: "quest_chrome_1",
+    request_ref: "research_graph:HR-52:r1", revision: 1,
+  });
+  await expect(input).toBeEnabled();
+  await input.fill("这是我正在整理的错误日志");
+  await dialog.getByRole("button", { name: "先帮我搜索", exact: true }).click();
+  await expect.poll(() => writes.length).toBe(2);
+  expect(writes[1].body.message).toMatch(/搜索.*官方文档.*来源/);
+  await expect(input).toHaveValue("这是我正在整理的错误日志");
+  await expect(input).toBeEnabled();
+  await dialog.getByRole("button", { name: "一起排查问题", exact: true }).click();
+  await expect.poll(() => writes.length).toBe(3);
+  expect(writes[2].body.message).toContain("编写和运行调试脚本");
+  expect(writes.every((write) => write.path === "/api/v1/companion/messages")).toBe(true);
+  await expect(dialog.locator(".hc-draft-transcript .me")).toHaveCount(3);
+  await expect(dialog.locator(".hc-request-requirements")).not.toHaveAttribute("open");
 });
 
 test("human request Draft echoes immediately while its POST is pending", async ({ page }) => {
@@ -2582,7 +2847,7 @@ test("human request Draft echoes immediately while its POST is pending", async (
     await gate;
     await route.fulfill({ status: 503, json: { error: { code: "temporarily_unavailable" } } });
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?panel=human-request`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   const input = dialog.getByLabel("就图书馆恢复事项发消息");
   await input.fill("请立即显示本条讨论消息");
@@ -2625,7 +2890,7 @@ test("human request Draft streams before its snapshot and keeps request conversa
   });
   await page.route("**/api/v1/companion/messages", (route) =>
     route.fulfill({ json: { interaction_ref: "request-stream", status: "queued" } }));
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?panel=human-request`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await dialog.getByLabel("就图书馆恢复事项发消息").fill("这个事项请分段解释");
   await dialog.getByRole("button", { name: "发送消息" }).click();
@@ -2639,16 +2904,191 @@ test("human request Draft streams before its snapshot and keeps request conversa
   const context = { kind: "human_request", quest_ref: "quest_chrome_1", request_ref: "agent_runtime:HR-27:r1", revision: 1 };
   messages.push(
     { message_ref: "request-stream:user", scope_ref: "quest_chrome_1", role: "user", content: "这个事项请分段解释", status: "completed", view_context: context },
-    { message_ref: "request-stream:assistant", scope_ref: "quest_chrome_1", role: "assistant", content: "事项正式完整回答。", status: "completed", view_context: context },
+    { message_ref: "request-stream:assistant", scope_ref: "quest_chrome_1", role: "assistant", content: "事项正式完整回答。\n\n1. 查看连接状态。\n2. 把结果发回来。\n\n```shell\nprintf 'ok'\n```\n\n[官方文档](https://example.org/docs)", status: "completed", view_context: context },
   );
   (snapshot as JsonRecord).revision = Number((snapshot as JsonRecord).revision) + 1;
   await page.evaluate(() => [...window.replyStreams.values()][0].emit({ text: "事项正式完整回答。", status: "completed" }));
   await expect(dialog.locator(".hc-draft-transcript .me")).toHaveCount(1);
   await expect(dialog.locator(".hc-draft-transcript article:not(.me)")).toHaveCount(1);
   await expect(dialog.locator(".hc-draft-transcript")).toContainText("事项正式完整回答。");
+  await expect(dialog.locator(".hc-draft-transcript ol li")).toHaveCount(2);
+  await expect(dialog.locator(".hc-draft-transcript pre code")).toHaveText("printf 'ok'");
+  await expect(dialog.getByRole("link", { name: "官方文档" })).toHaveAttribute("href", "https://example.org/docs");
   await expect(dialog.getByText("正在回复…", { exact: true })).toHaveCount(0);
   await dialog.getByRole("button", { name: "查看下一个待办" }).click();
   await expect(dialog.getByLabel("就外部材料事项发消息")).toHaveValue("");
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("事项正式完整回答。");
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("这个事项请分段解释");
+});
+
+async function downloadedText(download: Download): Promise<string> {
+  const path = await download.path();
+  if (!path) throw new Error("download did not produce a local file");
+  return readFile(path, "utf8");
+}
+
+test("human request handoff generates an exact scoped document and downloads the completed turn after reopening", async ({ page }, testInfo) => {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  const collaboration = snapshot.human_collaboration as JsonRecord;
+  const messages = (collaboration.companion as JsonRecord).messages as JsonRecord[];
+  const requests = (collaboration.human_requests as JsonRecord).items as JsonRecord[];
+  const context = {
+    kind: "human_request", quest_ref: "quest_chrome_1",
+    request_ref: "research_graph:HR-52:r1", revision: 1,
+  };
+  const body = [
+    "# 线下校准协作说明",
+    "",
+    "先确认设备断电，再核对接口文档。",
+    "",
+    "1. 找到设备型号。",
+    "2. 将原始读数与操作结果带回来。",
+    "",
+    "```text",
+    `outputs/${"long-result-path-".repeat(30)}.txt`,
+    "```",
+    "",
+    "[官方资料](https://example.org/official-protocol)",
+    "",
+    '<script>window.handoffExecuted = true</script>',
+    "![remote](https://example.invalid/tracker.png)",
+    "[unsafe](javascript:alert(1))",
+  ].join("\n");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const writes: Array<{ path: string; body: JsonRecord }> = [];
+  page.on("request", (request) => {
+    if (request.method() === "POST") writes.push({
+      path: new URL(request.url()).pathname, body: request.postDataJSON() as JsonRecord,
+    });
+  });
+  await page.route("**/api/v1/companion/messages", async (route) => {
+    messages.push(
+      { message_ref: "handoff-1:user", scope_ref: "quest_chrome_1", role: "user", content: HANDOFF_DOCUMENT_PROMPT, status: "completed", view_context: context },
+      { message_ref: "handoff-1:assistant", scope_ref: "quest_chrome_1", role: "assistant", content: "尚未完成的文档片段", status: "processing", view_context: context },
+      { message_ref: "later-chat:assistant", scope_ref: "quest_chrome_1", role: "assistant", content: "LATER CHAT MUST NOT BE EXPORTED", status: "completed", view_context: context },
+      { message_ref: "wrong-revision:user", scope_ref: "quest_chrome_1", role: "user", content: HANDOFF_DOCUMENT_PROMPT, status: "completed", view_context: { ...context, revision: 2 } },
+      { message_ref: "wrong-revision:assistant", scope_ref: "quest_chrome_1", role: "assistant", content: "WRONG REVISION MUST NOT BE EXPORTED", status: "completed", view_context: { ...context, revision: 2 } },
+    );
+    (snapshot as JsonRecord).revision = Number((snapshot as JsonRecord).revision) + 1;
+    await gate;
+    await route.fulfill({ json: { interaction_ref: "handoff-1", status: "queued" } });
+  });
+  await page.route("**/api/v1/companion/messages/*/stream*", (route) => route.abort());
+  await page.goto(`${product!.baseUrl}/?panel=offline-operation`, { waitUntil: "domcontentloaded" });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  const document = dialog.getByRole("region", { name: "协作说明文档" });
+  const input = dialog.getByLabel("就线下操作事项发消息");
+  await expect(document.getByText("交给其他 AI 或自己做", { exact: true })).toBeVisible();
+  await expect(document.getByRole("button", { name: "下载 Markdown" })).toHaveCount(0);
+  await input.fill("这段尚未发送的设备情况需要保留");
+  await document.getByRole("button", { name: "生成协作说明", exact: true }).click();
+  try {
+    await expect.poll(() => writes.length).toBe(1);
+    expect(writes[0]).toEqual({ path: "/api/v1/companion/messages", body: {
+      message: HANDOFF_DOCUMENT_PROMPT, scope_ref: "quest_chrome_1", view_context: context,
+    } });
+    await expect(document.getByRole("button", { name: "正在整理文档…", exact: true })).toBeDisabled();
+    await expect(document.getByRole("button", { name: "下载 Markdown" })).toHaveCount(0);
+    await expect(input).toHaveValue("这段尚未发送的设备情况需要保留");
+  } finally { release(); }
+  await expect(input).toBeEnabled();
+  await expect(document.getByRole("button", { name: "正在整理文档…", exact: true })).toBeDisabled();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(document.getByRole("button", { name: "正在整理文档…", exact: true })).toBeDisabled();
+  await expect(document.getByRole("button", { name: "下载阅读版" })).toHaveCount(0);
+
+  const reply = messages.find((message) => message.message_ref === "handoff-1:assistant")!;
+  reply.content = body;
+  reply.status = "completed";
+  (snapshot as JsonRecord).revision = Number((snapshot as JsonRecord).revision) + 1;
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(document.getByRole("button", { name: "重新生成说明", exact: true })).toBeEnabled();
+  const [markdownDownload] = await Promise.all([
+    page.waitForEvent("download"), document.getByRole("button", { name: "下载 Markdown", exact: true }).click(),
+  ]);
+  expect(markdownDownload.suggestedFilename()).toMatch(/\.md$/);
+  const markdown = await downloadedText(markdownDownload);
+  expect(markdown).toContain(body);
+  expect(markdown).toContain("research_graph:HR-52:r1");
+  expect(markdown).toContain("按已接纳协议完成线下校准并交回原始结果。");
+  expect(markdown).not.toContain("LATER CHAT MUST NOT BE EXPORTED");
+  expect(markdown).not.toContain("WRONG REVISION MUST NOT BE EXPORTED");
+  expect(markdown).not.toContain("REQUEST-ONLY transcript marker");
+  const [htmlDownload] = await Promise.all([
+    page.waitForEvent("download"), document.getByRole("button", { name: "下载阅读版", exact: true }).click(),
+  ]);
+  expect(htmlDownload.suggestedFilename()).toMatch(/\.html$/);
+  const html = await downloadedText(htmlDownload);
+  const reader = await page.context().newPage();
+  await reader.route("**/*", (route) => route.abort());
+  await reader.setContent(html);
+  await expect(reader.locator("body")).toContainText("先确认设备断电，再核对接口文档。");
+  await expect(reader.locator("script,iframe,object,embed,form,img,link[rel=stylesheet]")).toHaveCount(0);
+  expect(await reader.locator("[href]").evaluateAll((elements) =>
+    elements.every((element) => !/^(?:javascript|data|vbscript):/i.test(element.getAttribute("href")?.trim() ?? "")),
+  )).toBe(true);
+  await reader.close();
+
+  await dialog.getByRole("button", { name: "查看下一个待办" }).click();
+  await expect(document.getByRole("button", { name: "下载 Markdown" })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "查看上一个待办" }).click();
+  await expect(document.getByRole("button", { name: "下载 Markdown" })).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const overflow = await document.evaluate((root) => ({
+    page: window.document.documentElement.scrollWidth - window.innerWidth,
+    section: root.scrollWidth - root.clientWidth,
+    dialog: root.closest("dialog")!.scrollWidth - root.closest("dialog")!.clientWidth,
+  }));
+  for (const amount of Object.values(overflow)) expect(amount).toBeLessThanOrEqual(1);
+  const screenshot = testInfo.outputPath("human-request-handoff-390.png");
+  await document.screenshot({ path: screenshot });
+  await testInfo.attach("human-request-handoff-390", { path: screenshot, contentType: "image/png" });
+  expect(writes).toHaveLength(1);
+  expect(requests.every((request) => (request.responses as unknown[]).length === 0)).toBe(true);
+});
+
+test("human request handoff hides an older document when the newest generation fails and allows retry", async ({ page }) => {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  const messages = ((snapshot.human_collaboration as JsonRecord).companion as JsonRecord).messages as JsonRecord[];
+  const context = {
+    kind: "human_request", quest_ref: "quest_chrome_1",
+    request_ref: "agent_runtime:HR-27:r1", revision: 1,
+  };
+  messages.push(
+    { message_ref: "older-handoff:user", scope_ref: "quest_chrome_1", role: "user", content: HANDOFF_DOCUMENT_PROMPT, status: "completed", view_context: context },
+    { message_ref: "older-handoff:assistant", scope_ref: "quest_chrome_1", role: "assistant", content: "这份旧说明不能替代失败的新一轮整理。", status: "completed", view_context: context },
+  );
+  let posts = 0;
+  await page.route("**/api/v1/companion/messages", async (route) => {
+    posts += 1;
+    const interactionRef = `retry-handoff-${posts}`;
+    messages.push(
+      { message_ref: `${interactionRef}:user`, scope_ref: "quest_chrome_1", role: "user", content: HANDOFF_DOCUMENT_PROMPT, status: "completed", view_context: context },
+      { message_ref: `${interactionRef}:assistant`, scope_ref: "quest_chrome_1", role: "assistant", content: posts === 1 ? "仅有未完成片段" : "# 新的完整协作说明\n\n先查看图书馆登录状态。", status: posts === 1 ? "failed" : "completed", view_context: context },
+    );
+    (snapshot as JsonRecord).revision = Number((snapshot as JsonRecord).revision) + 1;
+    await route.fulfill({ json: { interaction_ref: interactionRef, status: "queued" } });
+  });
+  await page.route("**/api/v1/companion/messages/*/stream*", (route) => route.abort());
+  await page.goto(`${product!.baseUrl}/?panel=human-request`, { waitUntil: "domcontentloaded" });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  const document = dialog.getByRole("region", { name: "协作说明文档" });
+  await expect(document.getByRole("button", { name: "下载 Markdown" })).toBeVisible();
+  await document.getByRole("button", { name: "重新生成说明", exact: true }).click();
+  await expect(document.getByRole("status")).toHaveText("文档生成失败，请重试。");
+  await expect(document.getByRole("button", { name: "下载 Markdown" })).toHaveCount(0);
+  await expect(document.getByRole("button", { name: "下载阅读版" })).toHaveCount(0);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(document.getByRole("status")).toHaveText("文档生成失败，请重试。");
+  await document.getByRole("button", { name: "生成协作说明", exact: true }).click();
+  await expect(document.getByRole("button", { name: "下载 Markdown" })).toBeVisible();
+  const [download] = await Promise.all([
+    page.waitForEvent("download"), document.getByRole("button", { name: "下载 Markdown", exact: true }).click(),
+  ]);
+  const markdown = await downloadedText(download);
+  expect(markdown).toContain("先查看图书馆登录状态。");
+  expect(markdown).not.toContain("这份旧说明不能替代失败的新一轮整理。");
+  expect(markdown).not.toContain("仅有未完成片段");
+  expect(posts).toBe(2);
 });

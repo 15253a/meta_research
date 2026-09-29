@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from meta_research.chat_progress import read_chat_reply
 
 
@@ -208,7 +210,9 @@ def test_drafting_preview_checks_job_and_excludes_proposals(tmp_path):
 
 def test_reply_providers_request_public_paragraph_progress(tmp_path, monkeypatch):
     from meta_research.chat_progress import CHAT_REPLY_PROGRESS_INSTRUCTION
-    from meta_research.companion import CodexCompanionAdapter
+    from meta_research.companion import (
+        COMPANION_REPLY_PROGRESS_INSTRUCTION, CodexCompanionAdapter,
+    )
     from meta_research.quest_drafting import CodexDraftingAdapter, IntentTurnRequest
     request = IntentTurnRequest(
         initialization_id="init", draft_revision=1, draft_hash="a" * 64,
@@ -228,7 +232,8 @@ def test_reply_providers_request_public_paragraph_progress(tmp_path, monkeypatch
     monkeypatch.setattr(drafting, "_invoke", drafting_invoke)
     assert drafting.reply(request).reply == "Complete answer"
     assert len(prompts) == 2
-    assert all(CHAT_REPLY_PROGRESS_INSTRUCTION in prompt for prompt in prompts)
+    assert COMPANION_REPLY_PROGRESS_INSTRUCTION in prompts[0]
+    assert CHAT_REPLY_PROGRESS_INSTRUCTION in prompts[1]
 
 
 def test_supervisor_progress_preserves_byte_limit_and_overflow():
@@ -316,7 +321,9 @@ def test_drafting_recovers_existing_job_with_original_prompt(tmp_path, monkeypat
 def test_companion_keeps_original_prompt_for_signed_existing_job(tmp_path, monkeypatch):
     from dataclasses import replace
     from meta_research.chat_progress import CHAT_REPLY_PROGRESS_INSTRUCTION
-    from meta_research.companion import CodexCompanionAdapter
+    from meta_research.companion import (
+        COMPANION_REPLY_PROGRESS_INSTRUCTION, CodexCompanionAdapter,
+    )
     from meta_research.idea_skill import _read_operation_invocation, _sealed_operation_invocation
     from meta_research.owners.common import canonical_hash
     from meta_research.quest_drafting import IntentTurnRequest
@@ -328,7 +335,7 @@ def test_companion_keeps_original_prompt_for_signed_existing_job(tmp_path, monke
         return {"reply": "Saved answer"}, "session", ""
     monkeypatch.setattr(adapter, "_invoke_optional_root_task_operation", capture)
     adapter.reply(request)
-    legacy_prompt = captured[0].replace(CHAT_REPLY_PROGRESS_INSTRUCTION, "", 1)
+    legacy_prompt = captured[0].replace(COMPANION_REPLY_PROGRESS_INSTRUCTION, "", 1)
     job = "old-companion-job"
     directory = tmp_path / "provider-operations" / canonical_hash({"job_ref": job}) / "companion-turn"
     directory.mkdir(parents=True)
@@ -353,6 +360,61 @@ def test_companion_keeps_original_prompt_for_signed_existing_job(tmp_path, monke
     monkeypatch.setattr(adapter, "_invoke_optional_root_task_operation", recover)
     assert adapter.reply(replace(request, job_ref=job)).reply == "Saved answer"
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("had_progress", [False, True])
+def test_companion_recovers_prior_advisory_turn_but_new_turn_uses_mentoring(tmp_path, monkeypatch, had_progress):
+    from dataclasses import replace
+    from meta_research.chat_progress import CHAT_REPLY_PROGRESS_INSTRUCTION
+    from meta_research.companion import (
+        COMPANION_REPLY_PROGRESS_INSTRUCTION, CodexCompanionAdapter,
+        _COMPANION_ROLE_INSTRUCTION, _LEGACY_COMPANION_ROLE_INSTRUCTION,
+    )
+    from meta_research.idea_skill import _read_operation_invocation, _sealed_operation_invocation
+    from meta_research.owners.common import canonical_hash
+    from meta_research.quest_drafting import IntentTurnRequest
+
+    adapter = CodexCompanionAdapter(tmp_path)
+    request = IntentTurnRequest(
+        "quest:1", 0, "a" * 64, {"interaction_kind": "conversation"},
+        "请告诉我第一步，并搜索 SDK", "existing-session",
+    )
+    prompts = []
+    def capture(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return {"reply": "下一步", "agent_proposal": None}, "existing-session", ""
+    monkeypatch.setattr(adapter, "_invoke_optional_root_task_operation", capture)
+    adapter.reply(request)
+    legacy_prompt = prompts[-1].replace(_COMPANION_ROLE_INSTRUCTION, _LEGACY_COMPANION_ROLE_INSTRUCTION, 1).replace(
+        COMPANION_REPLY_PROGRESS_INSTRUCTION,
+        CHAT_REPLY_PROGRESS_INSTRUCTION if had_progress else "", 1,
+    )
+    job = "in-flight-advisory-turn"
+    directory = tmp_path / "provider-operations" / canonical_hash({"job_ref": job}) / "companion-turn"
+    directory.mkdir(parents=True)
+    invocation = {
+        "schema_ref": "meta-research/codex-provider-operation/v3",
+        "job_ref": job, "operation_name": "companion-turn",
+        "prompt_hash": canonical_hash(legacy_prompt),
+        "transport_mode": "durable_supervisor",
+        "prompt_max_bytes": 1024 * 1024, "stream_max_bytes": 1024 * 1024,
+        "result_max_bytes": 1024 * 1024,
+    }
+    _key_path, key = adapter._transport_key()
+    path = directory / "invocation.json"
+    path.write_text(_sealed_operation_invocation(invocation, key))
+    before = path.read_bytes()
+    adapter.reply(replace(request, job_ref=job))
+    assert prompts[-1] == legacy_prompt
+    expected = {name: value for name, value in invocation.items() if name != "transport_mode"}
+    expected["prompt_hash"] = canonical_hash(prompts[-1])
+    _read_operation_invocation(path, key=key, expected_base=expected)
+    assert path.read_bytes() == before
+    adapter.reply(replace(request, job_ref="next-turn"))
+    assert _COMPANION_ROLE_INSTRUCTION in prompts[-1]
+    assert COMPANION_REPLY_PROGRESS_INSTRUCTION in prompts[-1]
+    adapter.reply(replace(request, job_ref=job, message="changed user instruction"))
+    assert prompts[-1] != legacy_prompt  # an unrelated prompt cannot select old work
 
 
 def test_progress_cache_resets_on_truncation_and_same_size_replacement(tmp_path):

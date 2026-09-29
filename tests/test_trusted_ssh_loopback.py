@@ -35,11 +35,16 @@ def _open_test_app(
         runtime.close()
 
 
-def test_explicit_ssh_loopback_trust_issues_a_real_session_for_anonymous_read(
+@pytest.mark.parametrize("environment_value", (None, "1"))
+def test_default_and_explicit_loopback_access_need_no_browser_login(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    environment_value: str | None,
 ) -> None:
-    monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", "1")
+    if environment_value is None:
+        monkeypatch.delenv("META_RESEARCH_TRUST_SSH_LOOPBACK", raising=False)
+    else:
+        monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", environment_value)
 
     with _open_test_app(tmp_path / "trusted-anonymous-read") as (
         runtime,
@@ -61,6 +66,11 @@ def test_explicit_ssh_loopback_trust_issues_a_real_session_for_anonymous_read(
         assert second.status_code == 200
         assert second.json() == {"status": "authenticated"}
         assert "set-cookie" not in second.headers
+
+        assert runtime.authentication.revoke_session(session_token, csrf_token)
+        renewed = client.get("/api/v1/session")
+        assert renewed.status_code == 200
+        assert client.cookies.get("meta_research_session") != session_token
 
 
 def test_explicit_ssh_loopback_trust_bootstraps_only_the_first_write(
@@ -117,11 +127,16 @@ def test_explicit_ssh_loopback_trust_bootstraps_only_the_first_write(
         assert logout_without_csrf.json()["detail"]["code"] == "csrf_invalid"
 
 
-def test_explicit_ssh_loopback_trust_preserves_http_internal_and_mcp_boundaries(
+@pytest.mark.parametrize("environment_value", (None, "1"))
+def test_loopback_access_preserves_http_internal_and_mcp_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    environment_value: str | None,
 ) -> None:
-    monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", "1")
+    if environment_value is None:
+        monkeypatch.delenv("META_RESEARCH_TRUST_SSH_LOOPBACK", raising=False)
+    else:
+        monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", environment_value)
     base_url = "http://127.0.0.1:8123"
 
     with _open_test_app(
@@ -145,6 +160,7 @@ def test_explicit_ssh_loopback_trust_preserves_http_internal_and_mcp_boundaries(
             content="{}",
         )
         internal = client.post("/internal/browser-grant", json={})
+        browser_policy = client.get("/internal/browser-access")
         initialize = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -177,6 +193,7 @@ def test_explicit_ssh_loopback_trust_preserves_http_internal_and_mcp_boundaries(
         assert wrong_content_type.json()["detail"]["code"] == "json_required"
         assert client.cookies.get("meta_research_session") is None
         assert internal.status_code == 401
+        assert browser_policy.status_code == 401
         assert internal.json()["detail"]["code"] == (
             "control_authentication_required"
         )
@@ -222,17 +239,23 @@ def test_explicit_ssh_loopback_trust_allows_logout_without_a_session(
 @pytest.mark.parametrize(
     ("environment_value", "base_url"),
     [
+        ("0", "http://127.0.0.1:8123"),
         ("true", "http://127.0.0.1:8123"),
         ("1", "http://testserver"),
+        (None, "http://testserver"),
+        (None, "http://192.0.2.1:8123"),
     ],
 )
-def test_ssh_loopback_trust_requires_exact_opt_in_and_a_loopback_base_url(
+def test_login_remains_required_when_disabled_or_not_loopback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    environment_value: str,
+    environment_value: str | None,
     base_url: str,
 ) -> None:
-    monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", environment_value)
+    if environment_value is None:
+        monkeypatch.delenv("META_RESEARCH_TRUST_SSH_LOOPBACK", raising=False)
+    else:
+        monkeypatch.setenv("META_RESEARCH_TRUST_SSH_LOOPBACK", environment_value)
 
     with _open_test_app(
         tmp_path / f"untrusted-{environment_value}-{base_url.rsplit('/', 1)[-1]}",

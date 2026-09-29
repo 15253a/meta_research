@@ -145,12 +145,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.command == "start":
             state, started = _ensure_daemon(data_root, args.host, args.port)
+            browser_access = _internal_request(
+                data_root, state, "/internal/browser-access", method="GET"
+            )
             token = _internal_request(data_root, state, "/internal/bootstrap-token")
             result = _public_runtime_result(data_root, state)
             result.update(
                 {
                     "status": "started" if started else "already_running",
                     "bootstrap_token": token["bootstrap_token"],
+                    "browser_login_required": browser_access["login_required"],
                 }
             )
             return _emit(result, args.as_json, human=_start_human(result))
@@ -203,6 +207,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.command == "launch":
             state, _started = _ensure_daemon(data_root, args.host, args.port)
+            browser_access = _internal_request(
+                data_root, state, "/internal/browser-access", method="GET"
+            )
+            if browser_access["login_required"] is False:
+                result = _public_runtime_result(data_root, state)
+                result.update(
+                    status="launch_ready",
+                    browser_url=state.base_url,
+                    target_url=state.base_url,
+                )
+                if not args.no_browser and not webbrowser.open(state.base_url):
+                    raise CliError("the system browser could not be opened")
+                return _emit(
+                    result,
+                    args.as_json,
+                    human=f"{'Open' if args.no_browser else 'Opened'} {state.base_url}",
+                )
             issued = _internal_request(data_root, state, "/internal/browser-grant")
             browser_grant = str(issued["browser_grant"])
             launch_document = _create_launch_document(
@@ -777,6 +798,8 @@ def _doctor_current_owners(value: object) -> str:
 
 
 def _start_human(result: dict[str, object]) -> str:
+    if result.get("browser_login_required") is False:
+        return f"Daemon {result['status']} at {result['base_url']}"
     return (
         f"Daemon {result['status']} at {result['base_url']}\n"
         f"One-use bootstrap token: {result['bootstrap_token']}"

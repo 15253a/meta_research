@@ -1,18 +1,64 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from meta_research.acquisition import (
     AcquisitionBatchRequest,
     AcquisitionPaper,
     AcquisitionPreflightRequest,
+    AcquisitionUnavailable,
     NatureDownloaderAdapter,
 )
 from meta_research.provider_tools.authorized_resource_probe import (
     _authorization_expression,
 )
+
+
+def test_downloader_node_override_preserves_the_parent_runtime_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_path = os.environ.get("PATH", "")
+    node = tmp_path / "download-node" / ("node.exe" if os.name == "nt" else "node")
+    node.parent.mkdir()
+    node.write_bytes(b"test executable")
+    node.chmod(0o755)
+    monkeypatch.setenv("META_RESEARCH_DOWNLOADER_NODE", str(node))
+
+    environment = NatureDownloaderAdapter._private_environment(str(tmp_path / "state"))
+
+    assert Path(shutil.which("node", path=environment["PATH"])) == node
+    assert environment["PATH"] == str(node.parent) + os.pathsep + original_path
+    assert os.environ.get("PATH", "") == original_path
+
+
+def test_downloader_without_node_override_keeps_the_existing_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("META_RESEARCH_DOWNLOADER_NODE", raising=False)
+    original_path = os.environ.get("PATH", "")
+
+    environment = NatureDownloaderAdapter._private_environment(str(tmp_path / "state"))
+
+    assert environment.get("PATH", "") == original_path
+
+
+@pytest.mark.parametrize("configured", ["relative/node", "missing", "directory"])
+def test_downloader_node_override_rejects_invalid_executables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str,
+) -> None:
+    selected = "relative/node" if configured == "relative/node" else str(tmp_path / configured)
+    if configured == "directory":
+        Path(selected).mkdir()
+    monkeypatch.setenv("META_RESEARCH_DOWNLOADER_NODE", selected)
+
+    with pytest.raises(AcquisitionUnavailable, match="acquisition_downloader_node_invalid"):
+        NatureDownloaderAdapter._private_environment(str(tmp_path / "state"))
 
 
 class RecordingNatureRunner:

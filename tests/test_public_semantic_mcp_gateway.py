@@ -17,7 +17,10 @@ from meta_research.semantic_mcp import (
     SemanticMcpGateway,
     SemanticOperation,
 )
-from meta_research.semantic_owner_gateway import ROOT_AGENT_SEMANTIC_OPERATION_IDS
+from meta_research.semantic_owner_gateway import (
+    ROOT_AGENT_SEMANTIC_OPERATION_IDS,
+    _root_agent_human_request_operations,
+)
 from meta_research.web import create_app
 from test_public_acquisition_session import (
     HumanRequestAcquisitionProvider,
@@ -26,6 +29,54 @@ from test_public_acquisition_session import (
     _authenticated_client,
     _open_ready_acquisition,
 )
+
+
+def test_human_request_guidance_refresh_reaches_agents_without_rebinding() -> None:
+    # Only the operation description is revisable prose. Schema changes must
+    # still change the binding of an existing research session.
+    operation, reconcile = _root_agent_human_request_operations(
+        agent_runtime=None, research_memory=None
+    )
+    previous_operation = replace(operation, description="Previous writing guidance.")
+    previous_gateway = SemanticMcpGateway((previous_operation, reconcile))
+    gateway = SemanticMcpGateway((operation, reconcile))
+    operation_ids = (operation.semantic_operation_id, reconcile.semantic_operation_id)
+
+    assert gateway.required_bindings(operation_ids) == previous_gateway.required_bindings(
+        operation_ids
+    )
+    assert gateway.query_status()["catalog_hash"] == previous_gateway.query_status()[
+        "catalog_hash"
+    ]
+    changed_schema = replace(
+        operation, input_schema={**operation.input_schema, "description": "New schema"}
+    )
+    assert changed_schema.binding() != operation.binding()
+
+    connection, _binding = gateway.issue_channel(
+        run_ref="run:human-request-guidance",
+        attempt_ref="attempt:human-request-guidance",
+        root_session_ref="session:human-request-guidance",
+        fence_ref="fence:human-request-guidance",
+        capability_binding_hash="a" * 64,
+        operation_ids=operation_ids,
+        root_kind="target",
+        phase="target_root_lifecycle",
+    )
+    status, response = gateway.dispatch(
+        connection.token,
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    )
+    assert status == 200
+    listed = next(
+        tool
+        for tool in response["result"]["tools"]
+        if tool["name"] == operation.semantic_operation_id
+    )
+    assert listed["description"] == operation.description
+    assert listed["description"] != previous_operation.description
+    assert listed["inputSchema"] == previous_operation.input_schema
+    assert listed["outputSchema"] == previous_operation.output_schema
 
 
 def test_effectful_semantic_operation_fails_closed_without_reconciliation() -> None:

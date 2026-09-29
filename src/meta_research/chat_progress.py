@@ -33,8 +33,9 @@ def preserve_existing_reply_prompt(
     job_ref: str,
     hash_prompt: Callable[[str], str],
     operation_name: str | None = None,
+    previous_prompts: tuple[str, ...] = (),
 ) -> str:
-    """Select the pre-progress prompt only when this job already bound its hash.
+    """Keep an explicitly known prior prompt when this job already bound its hash.
 
     This does not accept or modify a durable operation: the normal invocation
     path still verifies its signature, full identity and result before reuse.
@@ -57,9 +58,13 @@ def preserve_existing_reply_prompt(
         or (operation_name is not None and invocation.get("operation_name") != operation_name)
     ):
         return prompt
-    legacy_prompt = prompt.replace(CHAT_REPLY_PROGRESS_INSTRUCTION, "", 1)
-    if invocation.get("prompt_hash") == hash_prompt(legacy_prompt):
-        return legacy_prompt
+    for candidate in (prompt, *previous_prompts):
+        for prior in (
+            candidate,
+            candidate.replace(CHAT_REPLY_PROGRESS_INSTRUCTION, "", 1),
+        ):
+            if invocation.get("prompt_hash") == hash_prompt(prior):
+                return prior
     return prompt
 
 

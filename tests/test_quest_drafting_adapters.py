@@ -300,6 +300,68 @@ def test_companion_proposal_fork_returns_public_content_without_replacing_root_s
     assert result.proposal_fork_native_session_ref == "proposal-drafter-native-1"
 
 
+def test_companion_guides_action_and_resumes_with_normal_tools(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    runner = RecordingRunner(
+        {"reply": "先在控制电脑运行 `hostname`，把输出发给我。", "agent_proposal": None},
+        thread_id="research-assistant-session",
+    )
+    adapter = CodexCompanionAdapter(tmp_path / "companion", process_runner=runner)
+    request = IntentTurnRequest(
+        initialization_id="quest:robot-hands",
+        draft_revision=0,
+        draft_hash="a" * 64,
+        draft={
+            "interaction_kind": "conversation",
+            "current_context": {
+                "context_kind": "human_request",
+                "human_request": {
+                    "request_ref": "request:device-access",
+                    "obligation": "取得两只 OmniHand 的现场访问与安全停止依据",
+                },
+            },
+        },
+        message="第一步做什么？你先搜索公开 SDK，帮我一起调试。",
+        native_session_ref=None,
+    )
+    first = adapter.reply(request)
+    workspace = Path(runner.calls[0][0][runner.calls[0][0].index("--cd") + 1])
+    (workspace / "diagnostic-notes.txt").write_text("first inspection", encoding="utf-8")
+    runner.output = {"reply": "保留这个结果，现在检查设备连接。", "agent_proposal": None}
+    second = adapter.reply(replace(
+        request, native_session_ref=first.native_session_ref,
+        message="输出是 lab-controller，下一步呢？",
+    ))
+
+    assert first.native_session_ref == second.native_session_ref == "research-assistant-session"
+    assert "`hostname`" in first.reply
+    assert first.agent_proposal is None
+    assert (workspace / "diagnostic-notes.txt").read_text(encoding="utf-8") == "first inspection"
+    initial_argv = runner.calls[0][0]
+    assert "resume" not in initial_argv
+    assert runner.calls[1][0][-3:] == ["resume", first.native_session_ref, "-"]
+    for argv, prompt, timeout in runner.calls:
+        assert 'web_search="live"' in argv
+        assert 'approval_policy="never"' in argv
+        assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
+        assert Path(argv[argv.index("--cd") + 1]) == workspace
+        assert not {"--ignore-user-config", "--ignore-rules", "--ephemeral"} & set(argv)
+        disabled = {argv[index + 1] for index, value in enumerate(argv[:-1]) if value == "--disable"}
+        assert not {"shell_tool", "unified_exec", "plugins", "remote_plugin", "multi_agent", "skill_search"} & disabled
+        assert not any(value.startswith("model_catalog_json=") for value in argv)
+        assert all(feature in argv for feature in ("plugins", "remote_plugin", "hooks", "multi_agent"))
+        assert "current_draft" in prompt and "request:device-access" in prompt
+        assert "一个现在就能完成的动作" in prompt
+        assert "本次工作的指令与授权" in prompt
+        assert "先自己查" in prompt and "先自己做" in prompt
+        assert "角色描述已经更新" in prompt
+        assert "不自动提交 human_request 回应" in prompt
+        assert "可复制的命令" in prompt and "必要的输出片段" in prompt
+        assert "不输出内部推理、工具命令、工具结果" not in prompt
+        assert timeout is None
+
+
 def test_codex_proposal_marks_a_literature_snapshot_as_untrusted_data(
     tmp_path: Path,
 ) -> None:
