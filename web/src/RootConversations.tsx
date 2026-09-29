@@ -291,8 +291,13 @@ function RootOperationOutput({ questRef, sessionRef, operation, ordinal, active,
     return () => { controller.abort(); clearTimeout(timer); };
   }, [questRef, sessionRef, operation.operation_ref, operation.status, active, retry, browseOffset]);
   useEffect(onOutput, [page?.next_offset, page?.stream_ref, onOutput]);
+  const sourceUpdatedAt = page?.source_updated_at;
   return <article className="root-operation" data-operation-ref={operation.operation_ref}>
-    <div className="root-operation-time"><span>工作记录 {ordinal}{operation.label ? ` · ${operation.label}` : ""}</span><time>{timeText(operation.created_at)}</time></div>
+    <div className="root-operation-time"><span>工作记录 {ordinal}{operation.label ? ` · ${operation.label}` : ""}</span>
+      {typeof sourceUpdatedAt === "number" && Number.isFinite(sourceUpdatedAt) && sourceUpdatedAt > 0
+        ? <time>输出更新 · {timeText(sourceUpdatedAt)}</time>
+        : <span>输出时间待确认</span>}
+    </div>
     {error ? <div className="root-session-warning" role="status">记录暂时无法更新，已保留上次内容。<button onClick={() => setRetry(value => value + 1)}>重试</button><details><summary>读取详情</summary><code>{error}</code></details></div> : null}
     {page ? <>{(chunks[0]?.offset ?? 0) > 0 && browseOffset === null ? <p className="root-output-truncated">这次调用较早的记录已收起，可通过分页回看。</p> : null}
       <StageReadableOutput rawText={page.text} chunks={chunks} streamKey={page.stream_ref} rootNativeSessionRef={page.native_session_ref} isTerminal={page.status === "terminal"} publicOnly />

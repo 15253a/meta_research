@@ -715,7 +715,9 @@ def strategy_update_from_dict(
     )
     validate_closed_bundle_projection(update, "StrategyUpdate")
     result = FormalStrategyUpdate(update=update, candidates=candidates, notes=document.get("notes"))
-    _validate_json_root(value, "FormalStrategyUpdate")
+    _validate_json_root(
+        value, "FormalStrategyUpdate", free_text_fields=frozenset({"notes"})
+    )
     return result
 
 
@@ -739,7 +741,9 @@ def strategy_update_to_dict(
     }
     if update.notes is not None:
         value["notes"] = update.notes
-    _validate_json_root(value, "FormalStrategyUpdate")
+    _validate_json_root(
+        value, "FormalStrategyUpdate", free_text_fields=frozenset({"notes"})
+    )
     return value
 
 
@@ -1565,10 +1569,12 @@ def _validate_domain_document_root(
             pending.extend(cast(list[object], value))
 
 
-def _validate_json_root(value: object, name: str) -> str:
+def _validate_json_root(
+    value: object, name: str, *, free_text_fields: frozenset[str] = frozenset()
+) -> str:
     state = {"nodes": 0}
 
-    def visit(item: object, depth: int) -> None:
+    def visit(item: object, depth: int, *, free_text: bool = False) -> None:
         if depth > _BUNDLE_ROOT_MAX_DEPTH:
             raise BundleTargetContractError(f"{name} exceeds depth budget")
         state["nodes"] += 1
@@ -1581,7 +1587,10 @@ def _validate_json_root(value: object, name: str) -> str:
                 if type(key) is not str:
                     raise BundleTargetContractError(f"{name} has non-string key")
                 _utf8(key, name)
-                visit(nested, depth + 1)
+                visit(
+                    nested, depth + 1,
+                    free_text=depth == 0 and key in free_text_fields,
+                )
             return
         if type(item) is list:
             if len(item) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS:
@@ -1590,7 +1599,12 @@ def _validate_json_root(value: object, name: str) -> str:
                 visit(nested, depth + 1)
             return
         if type(item) is str:
-            if len(_utf8(item, name)) > BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES:
+            # Research notes are free prose, not short projection identifiers.
+            # They still count towards this document's complete UTF-8 budget.
+            if (
+                len(_utf8(item, name)) > BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES
+                and not free_text
+            ):
                 raise BundleTargetContractError(f"{name} has oversized text")
             return
         if type(item) is bool or item is None:
