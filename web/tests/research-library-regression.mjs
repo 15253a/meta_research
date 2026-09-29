@@ -9,6 +9,10 @@ await mkdir(evidence,{recursive:true});
 const snapshot=JSON.parse(await readFile(new URL("./snapshot-before.json",import.meta.url),"utf8"));
 snapshot.human_collaboration.human_requests.items=[];
 snapshot.human_collaboration.human_requests.waiting={scope:"none",safe_meaningful_runnable_exists:true};
+// The snapshot reports the stored inventory total without loading storage cards.
+// Library tabs load their own research records independently.
+snapshot.research_assets.items=[];
+snapshot.research_assets.total_count=1089;
 let language="zh"; let input=null; let failContentOnce=true;
 const requests=[]; const errors=[];
 const server=createServer(async(req,res)=>{
@@ -23,6 +27,7 @@ const server=createServer(async(req,res)=>{
     if(u.pathname.startsWith("/api/v1/research-library/")){
       const entry=u.pathname.split("/").at(-1);
       const offset=Number(u.searchParams.get("offset")??0);
+      if(u.searchParams.get("query")==="no-library-match")return send({items:[],next_offset:null});
       if(entry==="human"&&u.searchParams.has("request_cursor"))return send({items:[{ref:"later-response",name:"Later request response",summary:"A second page of human guidance."}],next_offset:null,request_next_cursor:null});
       if(entry==="questions") return send({items:u.searchParams.has("question_ref")
         ?[{ref:"outcome-"+offset,name:"Preserved conclusion "+offset,summary:"A previous accepted research finding.",reader:{source_ref:"outcome-"+offset,version_ref:"outcome-"+offset}}]
@@ -77,6 +82,16 @@ try{
   const dialog=page.locator(".asset-dialog");
   await expect(dialog.getByRole("tab",{name:"研究问题",exact:true})).toBeVisible();
   await expect(dialog.getByText("questions material 0",{exact:true})).toBeVisible();
+  await expect(dialog.locator(".library-card")).toHaveCount(1);
+  await expect(dialog.locator(".asset-header-chip")).toHaveText("已保存内容版本：1089");
+  await dialog.getByLabel("查找研究材料",{exact:true}).fill("no-library-match");
+  await dialog.getByRole("button",{name:"查找",exact:true}).click();
+  await expect(dialog.getByText("没有找到匹配材料。试试其他线索或入口。",{exact:true})).toBeVisible();
+  await expect(dialog.locator(".library-card")).toHaveCount(0);
+  await expect(dialog.locator(".asset-header-chip")).toHaveText("已保存内容版本：1089");
+  await dialog.getByLabel("查找研究材料",{exact:true}).fill("");
+  await dialog.getByRole("button",{name:"查找",exact:true}).click();
+  await expect(dialog.getByText("questions material 0",{exact:true})).toBeVisible();
   await dialog.getByRole("button",{name:"下一页",exact:true}).click();
   await expect(dialog.getByText("questions material 12",{exact:true})).toBeVisible();
   await dialog.getByRole("button",{name:"阅读研究历史",exact:true}).click();
@@ -95,6 +110,7 @@ try{
   await dialog.getByRole("button",{name:"阅读原文",exact:true}).click();
   await expect(dialog.getByText("Exact original paragraph.",{exact:false})).toBeVisible();
   await dialog.getByRole("tab",{name:"数据集",exact:true}).click();
+  await expect(dialog.locator(".asset-header-chip")).toHaveText("已保存内容版本：1089");
   await dialog.getByRole("button",{name:"查看数据版本",exact:true}).click();
   await expect(dialog.getByText("Data version one",{exact:true})).toBeVisible();
   await dialog.getByRole("button",{name:"阅读原文",exact:true}).click();
@@ -133,6 +149,7 @@ try{
   await expect(dialog.getByText("Exact simulator configuration.",{exact:true})).toBeVisible();
   await dialog.getByRole("combobox",{name:"输出语言 / Output language"}).selectOption("en");
   await expect(dialog.getByRole("tab",{name:"Human input",exact:true})).toBeVisible();
+  await expect(dialog.locator(".asset-header-chip")).toHaveText("Saved content versions: 1089");
   await dialog.getByRole("tab",{name:"Human input",exact:true}).click();
   await dialog.getByRole("button",{name:"More request responses",exact:true}).click();
   await expect(dialog.getByText("Later request response",{exact:true})).toBeVisible();
@@ -147,5 +164,5 @@ try{
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   await page.screenshot({path:evidence+"/library-mobile.png"});
   assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({status:"passed",checks:["six-entry-navigation","independent-pagination","question-research-history-pages-and-original","exact-content-continuation","baseline-variant-run-output","dataset-version-directory-file","environment-physical-resource-without-digital-material","environment-research-use-pagination","environment-multiple-exact-material-bindings","failed-content-retains-read-pages-and-retries","language-save-and-render","human-input-csrf-idempotency","independent-human-response-cursor","desktop-mobile-no-overflow"],requests:requests.filter(x=>x.includes("research-library")||x.includes("research-content")||x.includes("research-formal"))}));
+  console.log(JSON.stringify({status:"passed",checks:["inventory-total-distinct-from-library-tab-cards","library-empty-state-independent-from-inventory-total","six-entry-navigation","independent-pagination","question-research-history-pages-and-original","exact-content-continuation","baseline-variant-run-output","dataset-version-directory-file","environment-physical-resource-without-digital-material","environment-research-use-pagination","environment-multiple-exact-material-bindings","failed-content-retains-read-pages-and-retries","language-save-and-render","human-input-csrf-idempotency","independent-human-response-cursor","desktop-mobile-no-overflow"],requests:requests.filter(x=>x.includes("research-library")||x.includes("research-content")||x.includes("research-formal"))}));
 }finally{await browser.close();server.closeAllConnections();await new Promise(done=>server.close(done));}

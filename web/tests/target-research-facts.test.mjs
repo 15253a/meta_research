@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { targetResearchFacts } from "../src/targetResearchFacts.ts";
+import { observedTargetRetry, targetResearchFacts } from "../src/targetResearchFacts.ts";
 
 const target = { target_ref: "target:1", target_key: "trial", target_run_ref: "work:1", spec_hash: "hash:1", dependency_refs: [], status: "committed" };
 const commit = (measurement, disposition = "uncertain") => ({ target_ref: "target:1", target_run_ref: "work:1", target_spec_hash: "hash:1", commit_ref: "commit:1", result_disposition: disposition,
@@ -68,4 +68,77 @@ test("research coordination is shown as adjustment rather than technical failure
   const facts = targetResearchFacts({ ...target, status: "blocked", blocker: { code: "target_semantic_change_required" } });
   assert.equal(facts.technicalFailure, false);
   assert.equal(facts.summary, "等待研究调整");
+});
+
+const workerFailure = {
+  state: "failed",
+  current_task: { kind: "target", target_ref: "target:1", run_ref: "work:1" },
+  health: { checks: [{ name: "target_run_worker", status: "unavailable", reason: { code: "target_root_artifact_storage_unavailable" } }] },
+};
+
+test("an exact live Target worker failure overrides a still-running frontier without inventing accepted work", () => {
+  const facts = targetResearchFacts({ ...target, status: "running" }, undefined, [], workerFailure);
+  assert.equal(facts.summary, "Target 推进受阻");
+  assert.equal(facts.technicalFailure, true);
+  assert.equal(facts.result, "研究结果尚未接纳");
+  assert.deepEqual(facts.artifactRefs, []);
+});
+
+test("runtime failures never leak into another Target, another Run, or accepted research facts", () => {
+  for (const observation of [
+    { ...workerFailure, current_task: { ...workerFailure.current_task, target_ref: "target:other" } },
+    { ...workerFailure, current_task: { ...workerFailure.current_task, run_ref: "work:old" } },
+    { ...workerFailure, current_task: { ...workerFailure.current_task, run_ref: null } },
+    { ...workerFailure, state: "running" },
+    { ...workerFailure, health: { checks: [{ name: "bundle_stage_worker", status: "unavailable" }] } },
+    null,
+  ]) {
+    const facts = targetResearchFacts({ ...target, status: "running" }, undefined, [], observation);
+    assert.equal(facts.summary, "Target 正在开展工作");
+    assert.equal(facts.technicalFailure, false);
+  }
+  const accepted = targetResearchFacts(target, commit({ formal_entities: [] }), [], workerFailure);
+  assert.match(accepted.summary, /研究记录已接纳/);
+  assert.equal(accepted.technicalFailure, false);
+});
+
+test("a paused current Target keeps its records and never pauses another Run or an accepted result", () => {
+  const paused = { ...workerFailure, state: "paused" };
+  const facts = targetResearchFacts({ ...target, status: "running" }, undefined, [], paused);
+  assert.equal(facts.summary, "研究已暂停，保留 Target 记录");
+  assert.equal(facts.technicalFailure, false);
+  assert.equal(facts.sources.target_run_ref, "work:1");
+  assert.deepEqual(facts.artifactRefs, []);
+  assert.equal(targetResearchFacts({ ...target, target_run_ref: "work:other", status: "running" }, undefined, [], paused).summary, "Target 正在开展工作");
+  assert.match(targetResearchFacts(target, commit({}), [], paused).summary, /研究记录已接纳/);
+});
+
+const retryStatus = { ...workerFailure, current_task: { ...workerFailure.current_task, status: "running" },
+  foreground: { quest_ref: "quest:1", cycle_ref: "cycle:1", question_ref: "question:1", stage: "bundle", status: "active" } };
+const retryRoots = { quest_ref: "quest:1", limited: false, active_session_refs: ["session:1"], sessions: [{ session_ref: "session:1",
+  kind: "target", stage: "bundle", cycle_ref: "cycle:1", question_ref: "question:1", target_ref: "target:1", run_ref: "work:1",
+  is_current: true, is_executing: true, status: "executing" }] };
+
+test("an exact active retry retains the previous error without presenting the Target as stalled", () => {
+  const retry = observedTargetRetry(retryStatus, retryRoots);
+  const facts = targetResearchFacts({ ...target, status: "running" }, undefined, [], retryStatus, retry);
+  assert.equal(facts.summary, "Target 正在重试，上次入库受阻");
+  assert.equal(facts.technicalFailure, true);
+  assert.deepEqual(facts.artifactRefs, []);
+  const otherFailure = { ...retryStatus, health: { checks: [{ ...workerFailure.health.checks[0], reason: { code: "provider_transport_unavailable" } }] } };
+  assert.equal(observedTargetRetry(otherFailure, retryRoots).summary, "Target 正在重试，上次推进受阻");
+  assert.match(targetResearchFacts(target, commit({}), [], retryStatus, retry).summary, /已接纳/);
+  assert.equal(targetResearchFacts({ ...target, target_run_ref: "work:other", status: "running" }, undefined, [], retryStatus, retry).summary, "Target 正在开展工作");
+});
+
+test("finalizing, uncertain or mismatched sessions cannot claim an active retry", () => {
+  assert.equal(observedTargetRetry({ ...retryStatus, current_task: { ...retryStatus.current_task, status: "finalizing" } }, retryRoots), null);
+  assert.equal(observedTargetRetry({ ...retryStatus, state: "paused" }, retryRoots), null);
+  for (const roots of [null, { ...retryRoots, limited: true }, { ...retryRoots, quest_ref: "quest:other" },
+    { ...retryRoots, active_session_refs: [] }, ...[
+      { run_ref: "work:old" }, { target_ref: "target:other" }, { cycle_ref: "cycle:old" },
+      { question_ref: "question:other" }, { is_current: false }, { is_executing: false }, { status: "waiting" },
+    ].map(change => ({ ...retryRoots, sessions: [{ ...retryRoots.sessions[0], ...change }] }))]) {
+    assert.equal(observedTargetRetry(retryStatus, roots), null);
+  }
 });

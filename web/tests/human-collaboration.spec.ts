@@ -1420,7 +1420,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     .toBeVisible();
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "重试", exact: true }).click();
-  await expect(dialog).toContainText("这件事已处理 · 已满足");
+  await expect(dialog.locator(".hc-response-boundary b")).toHaveText("这件事已处理");
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
 });
 
@@ -2468,6 +2468,8 @@ test("human obligation copy keeps operation facts inside verification details", 
   const ordinaryList = (await dialog.locator(".hc-head, .hc-list").allTextContents()).join(" ");
   expect(ordinaryList).toContain("需要你处理的事项");
   expect(ordinaryList).toContain("处理记录");
+  expect(ordinaryList).toContain("已处理");
+  expect(ordinaryList).not.toContain("已满足");
   expect(ordinaryList).toContain("已回应，未满足");
   expect(ordinaryList).toContain("只有条件满足且其他阻碍已解除，相关任务才会继续");
   expect(ordinaryList).not.toContain("Resume only");

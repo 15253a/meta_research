@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import cast
 
 from meta_research.bundle_protocol import BUNDLE_ROOT_MAX_SERIALIZED_BYTES
@@ -30,7 +31,18 @@ MAX_BUNDLE_TARGET_PLAN_BYTES = BUNDLE_ROOT_MAX_SERIALIZED_BYTES
 
 
 class BundleContractError(ValueError):
-    pass
+    def __init__(self, diagnostic: str) -> None:
+        # Transport stores a short machine code. Preserve prose diagnostics
+        # in the existing exception chain without making error recording fail.
+        code = diagnostic
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", code) is None:
+            code = {
+                "FormalStrategyUpdate has oversized text": "formal_strategy_update_text_too_large",
+                "FormalStrategyUpdate exceeds byte budget": "formal_strategy_update_byte_budget_exceeded",
+            }.get(diagnostic, "bundle_result_contract_invalid")
+        super().__init__(code)
+        if code != diagnostic:
+            self.add_note(diagnostic)
 
 
 def target_execution_assertion(

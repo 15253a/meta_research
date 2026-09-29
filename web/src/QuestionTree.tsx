@@ -183,7 +183,7 @@ function furthestAcceptedStageResultCopy(item: QuestionTreeItem): string {
     return "Projection 未提供";
   }
   const result = item.furthest_accepted_stage_result;
-  if (!result) return "没有已接纳结果";
+  if (!result) return "当前摘要暂未提供已接纳结果；可查看阶段结果与历史记录";
   return [result.kind, result.status, result.disposition]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .join(" · ");

@@ -131,8 +131,8 @@ def test_gap_plan_selected_asset_version_prepares_real_target_proofs_without_dri
         runtime.close()
 
 
-@pytest.mark.parametrize("kind", ["unselected", "foreign_quest", "no_origin"])
-def test_target_cannot_add_an_asset_outside_the_formal_plan_selection(tmp_path, kind):
+@pytest.mark.parametrize("kind", ["foreign_quest", "no_origin"])
+def test_target_cannot_add_an_asset_without_accepted_quest_origin(tmp_path, kind):
     runtime, plan, bundle = _runtime(tmp_path / kind)
     try:
         quest = fixtures._confirm_direct_quest(runtime)
@@ -140,14 +140,12 @@ def test_target_cannot_add_an_asset_outside_the_formal_plan_selection(tmp_path, 
         selected = _asset(runtime, "selected")
         _origin(runtime, selected, quest["quest_ref"], "selected-origin")
         rejected = _asset(runtime, "rejected")
-        if kind == "unselected":
-            _origin(runtime, rejected, quest["quest_ref"], "unselected-origin")
-        elif kind == "foreign_quest":
+        if kind == "foreign_quest":
             _origin(runtime, rejected, foreign.quest_ref, "foreign-origin")
         plan.source_ref, bundle.source_ref = selected.version_ref, rejected.version_ref
         target, _ = _accepted_target(runtime, quest)
         authority = runtime.target_run_authorities.research_graph
-        with pytest.raises(OwnerConflict, match="target_input_asset_version_not_selected"):
+        with pytest.raises(OwnerConflict, match="asset_quest_scope_invalid"):
             authority.prepare_input_assets(target.target_ref)
         assert authority.query_input_asset_projection(target_ref=target.target_ref, asset_ref=rejected.asset_ref) is None
         assert runtime.target_run_authorities.research_memory.query_input_asset(

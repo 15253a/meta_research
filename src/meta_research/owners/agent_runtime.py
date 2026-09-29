@@ -1390,6 +1390,10 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, request_ref: str
     ) -> ReasoningStageRun | None: ...
 
+    def query_reasoning_completion_display(
+        self, request: StageRunRequest
+    ) -> dict[str, object] | None: ...
+
     def verify_reasoning_runtime_scope(
         self,
         *,
@@ -1642,6 +1646,10 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         target_graph_receipt: AcceptanceReceipt,
         idempotency_key: str,
     ) -> VerifiedBundleReportReceipt: ...
+
+    def query_bundle_report_display(
+        self, request: StageRunRequest
+    ) -> dict[str, object] | None: ...
 
     def query_bundle_report(
         self, report_ref: str
@@ -6038,6 +6046,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             WritingDeliveryProviderRegistry | None
         ) = None,
         runtime_protection: RuntimeProtection | None = None,
+        receipt_verifier: SQLiteAgentRuntimeReceiptVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -6082,7 +6091,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             runtime_protection=runtime_protection,
         )
         self._acquisition_private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._receipt_verifier = SQLiteAgentRuntimeReceiptVerifier(
+        self._receipt_verifier = receipt_verifier or SQLiteAgentRuntimeReceiptVerifier(
             database,
             stage_request_verifier,
             human_response_verifier,
@@ -6128,16 +6137,19 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         if self._operator_stop_reader is None:
             return checkpoints
         for row in affected_runs:
-            if row["run_kind"] != "reasoning_stage" or row["status"] != "suspended":
+            if row["run_kind"] not in {"reasoning_stage", "bundle_stage", "plan_stage"} or row["status"] != "suspended":
                 continue
             with self._database.read() as connection:
                 request_ref = connection.execute(text(
                     "SELECT request_ref FROM ar_stage_runs WHERE run_ref = :run_ref"
                 ), {"run_ref": row["run_ref"]}).scalar_one()
-            run = self.query_reasoning_stage_run(request_ref)
+            is_review = row["run_kind"] == "plan_stage"
+            run = (self.query_plan_stage_run(request_ref) if is_review
+                   else self.query_bundle_stage_run(request_ref) if row["run_kind"] == "bundle_stage"
+                   else self.query_reasoning_stage_run(request_ref))
             if run is None:
                 raise OwnerConflict("operator_stop_checkpoint_invalid")
-            if run.primary_draft is not None or run.execution is not None:
+            if (run.primary_draft is not None) != is_review or run.execution is not None:
                 continue
             checkpoint = self._operator_stop_reader(row["run_ref"])
             if checkpoint is not None:
@@ -11906,15 +11918,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "suspended_fenced",
                         "reconciliation_required",
                     }:
+                        saved = _query_managed_safe_point(connection, row)
+                        usage_wait = (saved is not None
+                            and saved["checkpoint"].get("action") == "provider_hard_ceiling"
+                            and saved["checkpoint"].get("failure", {}).get("code") == "codex_usage_limit")
                         row = self._replace_fenced_managed_attempt(
                             connection,
                             row,
                             now,
                             reuse_checkpoint=(
-                                _stage_resume_reuses_checkpoint(connection, row)
+                                usage_wait or _stage_resume_reuses_checkpoint(connection, row)
                                 if _is_formal_stage_run_kind(row.run_kind)
                                 else True
                             ),
+                            reuse_operation_refs=False if usage_wait else None,
+                            preserve_native_session=True if usage_wait else None,
                         )
                     next_status = "running"
                     cleanup_status = "none"
@@ -12150,13 +12168,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         return _runtime_control_receipt(row)
 
     def _resume_operator_stopped_primary(self, connection, row, checkpoint, operation_ref, now):
-        """Replace only a signed stopped primary behind an accepted pause."""
+        """Replace a verified stopped call, retaining an accepted primary draft."""
         saved = _query_managed_safe_point(connection, row)
         scope = checkpoint.get("scope", {})
         native = checkpoint.get("native_session_ref")
+        is_review = row.run_kind == "plan_stage"
+        phase = "review" if is_review else "primary"
+        unit_kind = ("plan_review" if is_review else "bundle_primary"
+                     if row.run_kind == "bundle_stage" else "reasoning_primary")
+        reason_code = f"operator_stopped_{phase}_resumed"
         if (saved is None or saved["checkpoint"].get("action") != "pause"
-                or checkpoint.get("schema_ref") != "meta-research/operator-stopped-primary/v1"
-                or row.run_kind != "reasoning_stage" or row.status != "suspended"
+                or checkpoint.get("schema_ref") != f"meta-research/operator-stopped-{phase}/v1"
+                or row.run_kind not in {"reasoning_stage", "bundle_stage", "plan_stage"} or row.status != "suspended"
                 or any(scope.get(name) != getattr(row, name) for name in (
                     "run_ref", "run_kind", "attempt_ref", "root_session_ref", "fence_ref"))
                 or scope.get("status") != "completed"
@@ -12182,11 +12205,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         ), {"run_ref": row.run_ref, "attempt_ref": row.attempt_ref,
             "fence_ref": row.fence_ref}).first()
         if (run.current_attempt_ref != row.attempt_ref or run.current_fence_ref != row.fence_ref
-                or attempt.primary_draft_json is not None or attempt.submission_ref is not None
+                or (attempt.primary_draft_json is not None) != is_review or attempt.submission_ref is not None
                 or attempt.status != "running" or fence.status != "current"
                 or session.status != "active" or session.native_session_ref not in {None, native}
                 or unit is None or unit.unit_ref != scope.get("unit_ref")
-                or unit.status != "completed" or unit.unit_kind != "reasoning_primary"
+                or unit.status != "completed" or unit.unit_kind != unit_kind
                 or (unit.run_ref, unit.attempt_ref, unit.fence_ref, unit.operation_ref) != (
                     row.run_ref, row.attempt_ref, row.fence_ref, scope.get("operation_ref"))
                 or connection.execute(text(
@@ -12204,16 +12227,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         connection.execute(text(
             "INSERT INTO ar_fence_revocations (fence_ref, operation_ref, run_ref, attempt_ref, "
             "reason_code, revoked_at) VALUES (:fence_ref, :operation_ref, :run_ref, :attempt_ref, "
-            "'operator_stopped_primary_resumed', :now)"
+            ":reason_code, :now)"
         ), {"fence_ref": row.fence_ref, "operation_ref": operation_ref,
-            "run_ref": row.run_ref, "attempt_ref": row.attempt_ref, "now": now})
+            "run_ref": row.run_ref, "attempt_ref": row.attempt_ref,
+            "reason_code": reason_code, "now": now})
         connection.execute(text(
             "UPDATE ar_execution_fences SET status = 'rejected', closed_at = :now "
             "WHERE fence_ref = :fence_ref"
         ), {"fence_ref": row.fence_ref, "now": now})
         return self._replace_fenced_managed_attempt(
             connection, row, now, reuse_checkpoint=True, reuse_operation_refs=False,
-            preserve_native_session=True, replacement_reason_code="operator_stopped_primary_resumed",
+            preserve_native_session=True, replacement_reason_code=reason_code,
         )
 
     def _retire_quiesced_provider_attempt(self, connection, row, now):
@@ -18908,6 +18932,92 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise OwnerConflict("bundle_report_missing_after_commit")
         return accepted
 
+    def query_bundle_report_display(
+        self, request: StageRunRequest
+    ) -> dict[str, object] | None:
+        """Read accepted report text without rebuilding undisplayed inputs.
+
+        This projection cannot authorize completion or advancement. Writing
+        and execution continue to use the full Bundle report verifier.
+        """
+        plan = request.accepted_formal_plan
+        if request.stage != "bundle" or plan is None:
+            raise OwnerConflict("writing_bundle_request_invalid")
+        with self._database.read_snapshot() as connection:
+            run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE request_ref = :request_ref "
+                     "AND stage = 'bundle'"),
+                {"request_ref": request.request_ref},
+            ).first()
+            if run is None:
+                return None
+            _runtime_binding_from_row(run)
+            if (
+                run.cycle_ref != request.cycle_ref or int(run.epoch) != request.epoch
+                or run.request_receipt_ref != request.receipt.receipt_ref
+                or run.request_receipt_hash != request.receipt.payload_hash
+                or run.context_pack_ref != request.context_pack_ref
+                or run.context_pack_hash != request.context_pack_hash
+            ):
+                raise OwnerConflict("writing_bundle_result_invalid")
+            row = connection.execute(
+                text("SELECT * FROM ar_bundle_reports WHERE run_ref = :run_ref "
+                     "ORDER BY ordinal DESC LIMIT 1"),
+                {"run_ref": run.run_ref},
+            ).first()
+            if row is None:
+                return None
+            report = _stored_bundle_record(row.report_json, row.report_hash,
+                                           BundleReport, "bundle_report_receipt_invalid")
+            try:
+                validate_bundle_report(report)
+            except BundleProtocolError as error:
+                raise OwnerConflict("bundle_report_receipt_invalid") from error
+            for column in ("target_refs", "notice_refs", "handoff_manifest_refs"):
+                _bundle_report_ref_tuple(getattr(row, column + "_json"),
+                    getattr(row, column + "_hash"), error_code="bundle_report_receipt_invalid")
+            _bundle_report_receipt_tuple(row.target_commit_receipts_json,
+                                         row.target_commit_receipts_hash)
+            if (
+                row.receipt_hash != _owner_receipt_hash(
+                    BUNDLE_REPORT_RECEIPT_KIND, row.report_ref,
+                    _bundle_report_row_bindings(row))
+                or row.request_ref != request.request_ref
+                or row.run_ref != run.run_ref
+                or row.attempt_ref != run.current_attempt_ref
+                or row.fence_ref != run.current_fence_ref
+                or row.formal_plan_ref != plan.formal_plan_ref
+                or row.plan_document_hash != plan.plan_document_hash
+                or report.formal_plan_ref != row.formal_plan_ref
+                or report.stage_request_ref != row.request_ref
+                or report.disposition != row.disposition
+                or any(type(v) is not str or not v for v in (
+                    row.formal_plan_projection_digest,
+                    row.formal_plan_projection_receipt_ref,
+                    row.formal_plan_projection_receipt_hash,
+                    row.completion_contract_hash, row.formal_plan_briefs_hash))
+            ):
+                raise OwnerConflict("bundle_report_receipt_invalid")
+            receipt = AcceptanceReceipt(issuer=AR_OWNER,
+                kind=BUNDLE_REPORT_RECEIPT_KIND, receipt_ref=row.receipt_ref,
+                subject_ref=row.report_ref, payload_hash=row.receipt_hash)
+            completion = None
+            if run.status == "completed":
+                attempt = connection.execute(
+                    text("SELECT * FROM ar_stage_attempts WHERE attempt_ref = :ref"),
+                    {"ref": run.current_attempt_ref},
+                ).first()
+                if attempt is None or attempt.run_ref != run.run_ref:
+                    raise OwnerConflict("run_completion_invalid")
+                completion = _run_completion(run, attempt,
+                    decision_receipt_issuer=AR_OWNER,
+                    decision_receipt_kind=BUNDLE_REPORT_RECEIPT_KIND)
+                if completion.outcome_ref != row.report_ref or completion.decision_receipt != receipt:
+                    raise OwnerConflict("writing_bundle_result_invalid")
+            return {"run_ref": row.run_ref, "report_ref": row.report_ref,
+                    "report_hash": row.report_hash, "report": projection_plain_value(report),
+                    "receipt": receipt, "completion": completion}
+
     def query_bundle_report(
         self, report_ref: str
     ) -> VerifiedBundleReportReceipt | None:
@@ -18922,6 +19032,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             return None
         return self._receipt_verifier.verify_bundle_report_receipt(
             report_ref=report_ref,
+            expected_disposition=None,
             receipt=AcceptanceReceipt(
                 issuer=AR_OWNER,
                 kind=BUNDLE_REPORT_RECEIPT_KIND,
@@ -18947,6 +19058,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     def verify_bundle_report_receipt(
         self, **values
     ) -> VerifiedBundleReportReceipt:
+        values.setdefault("expected_disposition", None)
         return self._receipt_verifier.verify_bundle_report_receipt(**values)
 
     def retire_bundle_run_for_replan(
@@ -20510,6 +20622,47 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self, request_ref: str
     ) -> ReasoningStageRun | None:
         return self._query_stage_run(request_ref, "reasoning")
+
+    def query_reasoning_completion_display(
+        self, request: StageRunRequest
+    ) -> dict[str, object] | None:
+        """Read a completed history identity, not an execution authorization.
+
+        The overview separately checks RG/RM's immutable accepted text. The
+        authoritative Run/Completion verifiers still replay execution inputs.
+        """
+        if request.stage != "reasoning":
+            raise OwnerConflict("writing_reasoning_result_invalid")
+        with self._database.read_snapshot() as connection:
+            run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE request_ref = :ref "
+                     "AND stage = 'reasoning'"), {"ref": request.request_ref},
+            ).first()
+            if run is None or run.status != "completed":
+                return None
+            _runtime_binding_from_row(run)
+            if (
+                run.cycle_ref != request.cycle_ref or int(run.epoch) != request.epoch
+                or run.request_receipt_ref != request.receipt.receipt_ref
+                or run.request_receipt_hash != request.receipt.payload_hash
+                or run.context_pack_ref != request.context_pack_ref
+                or run.context_pack_hash != request.context_pack_hash
+            ):
+                raise OwnerConflict("writing_reasoning_result_invalid")
+            attempt = connection.execute(
+                text("SELECT * FROM ar_stage_attempts WHERE attempt_ref = :ref"),
+                {"ref": run.current_attempt_ref},
+            ).first()
+            if (
+                attempt is None or attempt.run_ref != run.run_ref
+                or attempt.root_session_ref != run.root_session_ref
+                or attempt.fence_ref != run.current_fence_ref
+                or not attempt.submission_ref
+            ):
+                raise OwnerConflict("run_completion_invalid")
+            return {"run_ref": run.run_ref, "attempt_ref": attempt.attempt_ref,
+                    "fence_ref": attempt.fence_ref, "submission_ref": attempt.submission_ref,
+                    "completion": _run_completion(run, attempt)}
 
     def query_reasoning_autonomous_checkpoint(
         self, checkpoint_ref: str
@@ -24742,6 +24895,7 @@ class SQLiteAgentRuntimeReceiptVerifier:
         if report_row is not None:
             accepted_report = self.verify_bundle_report_receipt(
                 report_ref=report_row.report_ref,
+                expected_disposition=None,
                 receipt=AcceptanceReceipt(
                     issuer=AR_OWNER,
                     kind=BUNDLE_REPORT_RECEIPT_KIND,
@@ -24800,6 +24954,7 @@ class SQLiteAgentRuntimeReceiptVerifier:
                 ),
             )
 
+    @snapshot_cached
     def verify_deepfetch_execution_receipt(
         self,
         *,
@@ -24846,7 +25001,10 @@ class SQLiteAgentRuntimeReceiptVerifier:
         # Receipt verification binds the immutable result hash, not the result
         # body. Avoid loading and re-serializing a potentially very large
         # DeepFetch payload on every public snapshot/readiness projection.
-        runtime_binding = _deepfetch_runtime_binding(row.runtime_binding_json)
+        runtime_binding = _deepfetch_runtime_binding(
+            row.runtime_binding_json,
+            allow_historical_root_profile=row.status == "executed",
+        )
         if (
             canonical_json(runtime_binding.as_dict()) != row.runtime_binding_json
             or canonical_hash(runtime_binding.as_dict()) != row.runtime_binding_hash
@@ -25479,7 +25637,9 @@ def _reconciliation_acquisition_item(paper_id: str) -> AcquisitionItemResult:
     )
 
 
-def _deepfetch_runtime_binding(value: str) -> DeepFetchRuntimeBinding:
+def _deepfetch_runtime_binding(
+    value: str, *, allow_historical_root_profile: bool = False
+) -> DeepFetchRuntimeBinding:
     try:
         decoded = decoded_object(value)
         if (
@@ -25507,7 +25667,31 @@ def _deepfetch_runtime_binding(value: str) -> DeepFetchRuntimeBinding:
             harness_ref=str(decoded["harness_ref"]),
             capability_bindings=tuple(capabilities),
         )
-        validate_runtime_binding(binding)
+        validation_binding = binding
+        if allow_historical_root_profile:
+            from meta_research.runtime_binding_compatibility import (
+                reviewed_historical_root_profile_hashes,
+            )
+
+            profile = root_capability_profile("deepfetch")
+            historical = {
+                "root-capability-profile:sha256:" + digest
+                for digest in reviewed_historical_root_profile_hashes(profile.digest)
+            }
+            # Only project the reviewed prose identity for validation. Return
+            # the original binding so stored hashes and receipts stay exact.
+            # Only executed historical rows opt in. Admission, execution and
+            # recovery of unfinished work still use the current profile.
+            validation_binding = replace(
+                binding,
+                capability_bindings=tuple(
+                    "root-capability-profile:sha256:" + profile.digest
+                    if item in historical
+                    else item
+                    for item in binding.capability_bindings
+                ),
+            )
+        validate_runtime_binding(validation_binding)
         return binding
     except (
         KeyError,
@@ -25520,7 +25704,10 @@ def _deepfetch_runtime_binding(value: str) -> DeepFetchRuntimeBinding:
 
 
 def _deepfetch_run_from_row(row) -> DeepFetchRun:
-    runtime_binding = _deepfetch_runtime_binding(row.runtime_binding_json)
+    runtime_binding = _deepfetch_runtime_binding(
+        row.runtime_binding_json,
+        allow_historical_root_profile=row.status == "executed",
+    )
     provider_operation_generation = int(row.provider_operation_generation)
     provider_operation_ref = str(row.provider_operation_ref)
     if (
@@ -27573,6 +27760,7 @@ def _validated_runtime_binding(
     *,
     stage: str | None = None,
     allow_legacy_full_conformance: bool = False,
+    allow_historical_root_profile: bool = False,
 ) -> tuple[
     IdeaRuntimeBinding
     | PlanRuntimeBinding
@@ -27760,6 +27948,15 @@ def _validated_runtime_binding(
             and not operation_binding_resources
         )
     )
+    profile = root_capability_profile(cast(RootAgentKind, stage))
+    allowed_root_bindings = set(profile.runtime_bindings())
+    if allow_historical_root_profile:
+        from meta_research.runtime_binding_compatibility import reviewed_historical_root_profile_hashes
+
+        allowed_root_bindings.update(
+            "root-capability-profile:sha256:" + digest
+            for digest in reviewed_historical_root_profile_hashes(profile.digest)
+        )
     if (
         (stage == "bundle" and not bundle_binding_valid)
         or (stage == "reasoning" and not reasoning_binding_valid)
@@ -27768,11 +27965,7 @@ def _validated_runtime_binding(
             capability
             not in (
                 _IDEA_SAFE_CAPABILITIES
-                | set(
-                    root_capability_profile(
-                        cast(RootAgentKind, stage)
-                    ).runtime_bindings()
-                )
+                | allowed_root_bindings
             )
             for capability in binding.capability_bindings
         )
@@ -27940,6 +28133,7 @@ def _runtime_binding_from_row(
             binding,
             stage=row.stage,
             allow_legacy_full_conformance=True,
+            allow_historical_root_profile=True,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise OwnerConflict("idea_runtime_binding_invalid") from error
@@ -29231,6 +29425,42 @@ def _assert_bundle_report_unlaunched_targets(connection, target_refs) -> None:
 
 
 def _prepare_bundle_report_material(
+    database: Database,
+    verifier: BundleReportEvidenceVerifier,
+    *,
+    target_run_verifier: TargetRunHarnessVerifier | None,
+    target_root_completion_reader: TargetRootCompletionReader | None,
+    target_graph_verifier: TargetGraphReceiptVerifier | None,
+    request_ref: str,
+    run_ref: str,
+    disposition: str,
+    formal_plan_content_receipt: AcceptanceReceipt,
+    formal_plan_projection_receipt: AcceptanceReceipt,
+    target_graph_ref: str,
+    target_graph_receipt: AcceptanceReceipt,
+    expected_report: BundleReport | None = None,
+) -> _BundleReportMaterial:
+    # Reuse upstream proofs within this pure preparation only. Acceptance's
+    # subsequent write transaction keeps its existing currentness checks.
+    with database.read_snapshot():
+        return _prepare_bundle_report_material_in_snapshot(
+            database,
+            verifier,
+            target_run_verifier=target_run_verifier,
+            target_root_completion_reader=target_root_completion_reader,
+            target_graph_verifier=target_graph_verifier,
+            request_ref=request_ref,
+            run_ref=run_ref,
+            disposition=disposition,
+            formal_plan_content_receipt=formal_plan_content_receipt,
+            formal_plan_projection_receipt=formal_plan_projection_receipt,
+            target_graph_ref=target_graph_ref,
+            target_graph_receipt=target_graph_receipt,
+            expected_report=expected_report,
+        )
+
+
+def _prepare_bundle_report_material_in_snapshot(
     database: Database,
     verifier: BundleReportEvidenceVerifier,
     *,
@@ -31595,6 +31825,7 @@ def _validated_stage_provider_hard_ceiling(
             "codex_operation_failed": frozenset(
                 {"completed", "descendant_process", "launch_failed"}
             ),
+            "codex_usage_limit": frozenset({"completed"}),
             "codex_operation_timeout": frozenset({"timeout"}),
             "codex_operation_output_limit": frozenset({"output_limit"}),
             "codex_operation_stopped": frozenset({"stopped"}),
@@ -32300,6 +32531,7 @@ def create_agent_runtime_interface(
     reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
     writing_delivery_provider_registry: WritingDeliveryProviderRegistry | None = None,
     runtime_protection: RuntimeProtection | None = None,
+    receipt_verifier: SQLiteAgentRuntimeReceiptVerifier | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
         database=database,
@@ -32318,6 +32550,7 @@ def create_agent_runtime_interface(
         reasoning_outcome_verifier=reasoning_outcome_verifier,
         writing_delivery_provider_registry=writing_delivery_provider_registry,
         runtime_protection=runtime_protection,
+        receipt_verifier=receipt_verifier,
     )
 
 

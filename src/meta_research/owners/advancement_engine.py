@@ -342,6 +342,14 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
         self, quest_ref: str
     ) -> tuple[QuestCycleStageHistory, ...]: ...
 
+    def query_quest_stage_history_display(
+        self, quest_ref: str
+    ) -> tuple[QuestCycleStageHistory, ...]: ...
+
+    def query_cycle_stage_display(
+        self, quest_ref: str, cycle_ref: str
+    ) -> dict[str, object] | None: ...
+
     def query_reasoning_successor_context(
         self, cycle_ref: str
     ) -> dict[str, object] | None: ...
@@ -2184,6 +2192,70 @@ class SQLiteAdvancementEngine(
         and mutable Foreground/worker state do not belong to this fact history.
         """
 
+        return self._query_quest_stage_history(quest_ref, verify_lineage=True)
+
+    def query_quest_stage_history_display(
+        self, quest_ref: str
+    ) -> tuple[QuestCycleStageHistory, ...]:
+        """Project accepted local records for display, without replaying admission.
+
+        Preserve row hashes and Quest/Question/Cycle/request/commit bindings.
+        The overview reads each displayed artifact through its existing Owner
+        source checks. Execution and Writing retain full history verification.
+        """
+        return self._query_quest_stage_history(quest_ref, verify_lineage=False)
+
+    def query_cycle_stage_display(
+        self, quest_ref: str, cycle_ref: str
+    ) -> dict[str, object] | None:
+        """Read accepted display facts without replaying successor admission.
+
+        Local request/commit hashes and bindings use the same checks as the
+        history display. Execution keeps query_reasoning_successor_context.
+        """
+        with self._database.read_snapshot():
+            history = self.query_quest_stage_history_display(quest_ref)
+        current = next((item for item in history if item.cycle_ref == cycle_ref), None)
+        if current is None:
+            return None
+        commits = {
+            commit.commit_ref: commit
+            for item in history for commit in item.commits
+        }
+        questions = {item.cycle_ref: item.question_ref for item in history}
+        typed_skips: dict[str, list[str]] = {}
+        for skipped in current.commits:
+            if (skipped.disposition != SKIPPED_DISPOSITION
+                or skipped.basis_kind not in REASONING_SUCCESSOR_ROUTE_SKIP_BASIS_KINDS):
+                continue
+            if skipped.basis_kind == AUTONOMOUS_REASONING_SKIP_BASIS_KIND:
+                source = next((item for item in commits.values()
+                    if item.stage == REASONING_STAGE
+                    and item.outcome_ref == skipped.basis_ref
+                    and item.outcome_receipt == skipped.basis_receipt), None)
+            else:
+                source = commits.get(skipped.basis_ref)
+                if (source is not None and (
+                    source.stage != skipped.stage
+                    or source.receipt != skipped.basis_receipt
+                    or questions[source.cycle_ref] != current.question_ref
+                )):
+                    raise OwnerConflict("cycle_stage_display_skip_invalid")
+            if (source is None or source.disposition != COMPLETED_DISPOSITION
+                or not isinstance(source.outcome_ref, str)
+                or skipped.stage in typed_skips):
+                raise OwnerConflict("cycle_stage_display_skip_invalid")
+            typed_skips[skipped.stage] = [source.outcome_ref]
+        return {
+            "cycle_ref": current.cycle_ref,
+            "target_question_ref": current.question_ref,
+            "commits": current.commits,
+            "typed_skip_basis_refs_by_stage": typed_skips,
+        }
+
+    def _query_quest_stage_history(
+        self, quest_ref: str, *, verify_lineage: bool
+    ) -> tuple[QuestCycleStageHistory, ...]:
         with self._database.read() as connection:
             cycles = connection.execute(
                 text(
@@ -2218,7 +2290,9 @@ class SQLiteAdvancementEngine(
         requests_by_cycle = {ref: [] for ref in cycle_questions}
         commits_by_cycle = {ref: [] for ref in cycle_questions}
         for row in request_rows:
-            request = self._stage_request_from_row(row)
+            request = (
+                self._stage_request_from_row(row) if verify_lineage else _stage_request(row)
+            )
             if (
                 request.accepted_question.quest_ref != quest_ref
                 or request.accepted_question.question_ref
@@ -2228,7 +2302,9 @@ class SQLiteAdvancementEngine(
             requests[request.request_ref] = request
             requests_by_cycle[request.cycle_ref].append(request)
         for row in commit_rows:
-            commit = self._stage_commit_from_row(row)
+            commit = self._stage_commit_from_row(row) if verify_lineage else _stage_commit(row)
+            if not verify_lineage and row.receipt_hash != _stage_commit_receipt_hash(row):
+                raise OwnerConflict("stage_commit_receipt_invalid")
             request = requests.get(commit.request_ref)
             if commit.cycle_ref not in cycle_questions or (
                 commit.request_ref is not None
@@ -2295,6 +2371,15 @@ class SQLiteAdvancementEngine(
         self, cycle_ref: str
     ) -> dict[str, object] | None:
         """Return the immutable Owner-authenticated basis of a Reasoning successor."""
+
+        # Worker reads need the same bounded proof reuse as public snapshots.
+        # The cut ends before callers perform any subsequent write guards.
+        with self._database.read_snapshot():
+            return self._query_reasoning_successor_context(cycle_ref)
+
+    def _query_reasoning_successor_context(
+        self, cycle_ref: str
+    ) -> dict[str, object] | None:
 
         _control_ref(cycle_ref, "cycle_ref")
         with self._database.read() as connection:
@@ -2526,6 +2611,33 @@ class SQLiteAdvancementEngine(
                 )
             ).all()
         return tuple(self._control_operation_from_row(row) for row in rows)
+
+    def query_completed_resume_after(
+        self, *, stage_request_ref: str, failed_at: float,
+    ) -> dict[str, object] | None:
+        """Return a completed same-Cycle resume authorizing one storage retry."""
+        request = self._query_stage_request_by_ref(stage_request_ref)
+        if request.stage != BUNDLE_STAGE:
+            raise OwnerConflict("asset_intake_recovery_scope_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT op.* FROM ae_control_operations op "
+                "JOIN ae_cycles c ON c.cycle_ref = :cycle_ref "
+                "JOIN ae_foreground_heads h ON h.quest_ref = c.quest_ref "
+                "WHERE op.quest_ref = c.quest_ref AND op.action = 'resume' "
+                "AND op.status = 'completed' AND op.updated_at > :failed_at "
+                "AND (op.source_cycle_ref = c.cycle_ref OR op.target_cycle_ref = c.cycle_ref) "
+                "AND h.cycle_ref = c.cycle_ref AND h.status = 'active' "
+                "AND h.stage = :stage AND h.epoch = :epoch "
+                "AND h.pending_operation_ref IS NULL AND c.status = 'ongoing' "
+                "ORDER BY op.updated_at DESC LIMIT 1"
+            ), {"cycle_ref": request.cycle_ref, "failed_at": failed_at,
+                "stage": request.stage, "epoch": request.epoch}).first()
+        if row is None:
+            return None
+        result = self._control_operation_from_row(row)
+        return {**result, "completed_at": float(row.updated_at),
+                "stage_request_ref": stage_request_ref}
 
     def preview_foreground_control(
         self, payload: dict[str, object]
@@ -4130,7 +4242,7 @@ class SQLiteAdvancementEngine(
 
     @snapshot_cached
     def query_idea_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
-        with self._database.read() as connection:
+        with self._database.read_snapshot() as connection:
             head = connection.execute(
                 text(
                     "SELECT * FROM ae_foreground_heads WHERE cycle_ref = :cycle_ref "
@@ -4159,9 +4271,7 @@ class SQLiteAdvancementEngine(
                     ),
                     {"cycle_ref": cycle_ref},
                 ).first()
-        if row is None:
-            return None
-        return self._stage_request_from_row(row)
+            return None if row is None else self._stage_request_from_row(row)
 
     def ensure_plan_stage_request(
         self,
@@ -4402,7 +4512,7 @@ class SQLiteAdvancementEngine(
 
     @snapshot_cached
     def query_plan_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
-        with self._database.read() as connection:
+        with self._database.read_snapshot() as connection:
             head = connection.execute(
                 text(
                     "SELECT * FROM ae_foreground_heads WHERE cycle_ref = :cycle_ref "
@@ -4431,9 +4541,7 @@ class SQLiteAdvancementEngine(
                     ),
                     {"cycle_ref": cycle_ref},
                 ).first()
-        if row is None:
-            return None
-        return self._stage_request_from_row(row)
+            return None if row is None else self._stage_request_from_row(row)
 
     def ensure_bundle_stage_request(
         self,
@@ -4488,10 +4596,13 @@ class SQLiteAdvancementEngine(
             )
         except BundleContractError as error:
             raise OwnerConflict(str(error)) from error
-        self._verify_cycle_question(cycle_ref, accepted_question)
-        if accepted_idea_set is not None:
-            self._verify_plan_idea_set(cycle_ref, accepted_idea_set)
-        self._verify_bundle_formal_plan(cycle_ref, accepted_formal_plan)
+        # Reuse strict source proofs only for this read-only validation phase.
+        # Release the cut before the write-side currentness check and admission.
+        with self._database.read_snapshot():
+            self._verify_cycle_question(cycle_ref, accepted_question)
+            if accepted_idea_set is not None:
+                self._verify_plan_idea_set(cycle_ref, accepted_idea_set)
+            self._verify_bundle_formal_plan(cycle_ref, accepted_formal_plan)
 
         with self._database.write() as connection:
             replay_ref = _ae_command_replay(
@@ -4602,7 +4713,7 @@ class SQLiteAdvancementEngine(
 
     @snapshot_cached
     def query_bundle_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
-        with self._database.read() as connection:
+        with self._database.read_snapshot() as connection:
             head = connection.execute(
                 text(
                     "SELECT * FROM ae_foreground_heads WHERE cycle_ref = :cycle_ref "
@@ -4631,7 +4742,7 @@ class SQLiteAdvancementEngine(
                     ),
                     {"cycle_ref": cycle_ref},
                 ).first()
-        return None if row is None else self._stage_request_from_row(row)
+            return None if row is None else self._stage_request_from_row(row)
 
     def ensure_reasoning_stage_request(
         self,
@@ -4892,7 +5003,7 @@ class SQLiteAdvancementEngine(
     def query_reasoning_stage_request(
         self, cycle_ref: str
     ) -> StageRunRequest | None:
-        with self._database.read() as connection:
+        with self._database.read_snapshot() as connection:
             head = connection.execute(
                 text(
                     "SELECT * FROM ae_foreground_heads WHERE cycle_ref = :cycle_ref"
@@ -4922,7 +5033,7 @@ class SQLiteAdvancementEngine(
                     ),
                     {"cycle_ref": cycle_ref},
                 ).first()
-        return None if row is None else self._stage_request_from_row(row)
+            return None if row is None else self._stage_request_from_row(row)
 
     def _ensure_reasoning_route_closure(
         self,
@@ -5118,7 +5229,7 @@ class SQLiteAdvancementEngine(
             raise OwnerConflict("bundle_formal_plan_stage_commit_invalid")
 
     def _query_stage_request_ref(self, request_ref: str) -> StageRunRequest:
-        with self._database.read() as connection:
+        with self._database.read_snapshot() as connection:
             row = connection.execute(
                 text(
                     "SELECT * FROM ae_stage_run_requests WHERE request_ref = "
@@ -5126,9 +5237,9 @@ class SQLiteAdvancementEngine(
                 ),
                 {"request_ref": request_ref},
             ).first()
-        if row is None:
-            raise OwnerConflict("stage_command_result_missing")
-        return self._stage_request_from_row(row)
+            if row is None:
+                raise OwnerConflict("stage_command_result_missing")
+            return self._stage_request_from_row(row)
 
     def _stage_request_from_row(self, row) -> StageRunRequest:
         requested = _stage_request(row)

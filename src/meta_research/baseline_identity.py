@@ -264,7 +264,18 @@ class BaselineIdentityQueries:
         if method_contract_hash is not None and (not isinstance(method_contract_hash, str)
                 or len(method_contract_hash) != 64 or any(c not in "0123456789abcdef" for c in method_contract_hash)):
             raise OwnerConflict("baseline_query_invalid")
-        where = "WHERE (:quest IS NULL OR b.quest_ref=:quest) AND (:query = '' OR instr(lower(b.forward_contract_json), lower(:query)) > 0) "
+        where = (
+            "WHERE (:quest IS NULL OR b.quest_ref=:quest) AND (:query = '' "
+            "OR instr(lower(b.forward_contract_json), lower(:query)) > 0 "
+            "OR EXISTS (SELECT 1 FROM rg_experiment_variants v "
+            "WHERE v.baseline_ref = b.baseline_ref "
+            "AND instr(lower(v.recipe_json), lower(:query)) > 0) "
+            "OR EXISTS (SELECT 1 FROM rg_experiment_variants v "
+            "JOIN rg_evaluations e ON e.variant_ref = v.variant_ref "
+            "JOIN rg_protocol_versions p ON p.protocol_version_ref = e.protocol_version_ref "
+            "WHERE v.baseline_ref = b.baseline_ref "
+            "AND instr(lower(p.protocol_json), lower(:query)) > 0)) "
+        )
         if method_contract_hash is not None:
             where += "AND COALESCE(m.method_contract_hash, b.forward_contract_hash) = :hash "
         with self._database.read_snapshot() as connection:

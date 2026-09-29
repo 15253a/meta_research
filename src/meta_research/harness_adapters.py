@@ -31,6 +31,7 @@ from meta_research.provider_supervisor import (
     ensure_transport_key,
     read_supervisor_request,
     read_transport_envelope,
+    read_transport_key_for_operation,
     read_verified_exit_receipt,
     write_supervisor_request,
     write_transport_envelope,
@@ -367,6 +368,43 @@ class _NativeCliHarnessAdapter:
                 "provider_io_unavailable", durable_outcome="unknown"
             ) from error
 
+    def recover_transport_receipt(self, operation_ref: str) -> dict[str, object] | None:
+        """Recover display provenance without invoking or accepting a turn."""
+        recover = getattr(self._runner, "recover_transport_receipt", None)
+        if not callable(recover):
+            return None
+        snapshot = (
+            self._read_system_mcp_snapshot(operation_ref)
+            if self.family == "codex" else None
+        )
+        if snapshot is None:
+            return recover(operation_ref, family=self.family)
+        return recover(
+            operation_ref, family=self.family,
+            system_mcp_snapshot_id=str(snapshot["snapshot_id"]),
+        )
+
+    def _read_system_mcp_snapshot(self, operation_ref: str) -> dict[str, object] | None:
+        """Read only the operation's sealed configuration, never the live registry."""
+        digest = canonical_hash(operation_ref)
+        path = self._workspace / "system-mcp-operations" / (digest + ".json")
+        if not path.exists():
+            return None
+        try:
+            # The adapter and supervisor may have separate workspaces/keys.
+            # Read the existing adapter key without creating a missing key.
+            _, key = read_transport_key_for_operation(
+                self._workspace / "provider-operations" / digest[:2] / digest
+            )
+            material = read_transport_envelope(path, key)
+            if set(material) != {"provider_operation_ref", "snapshot"} or (
+                material["provider_operation_ref"] != operation_ref
+            ):
+                raise ValueError("system MCP operation identity mismatch")
+            return validate_snapshot(material["snapshot"])
+        except (SystemMcpError, ProviderSupervisorError, OSError, ValueError) as error:
+            raise HarnessAdapterUnavailable("system_mcp_configuration_unavailable") from error
+
     def _environment(self, invocation: HarnessInvocation) -> dict[str, str]:
         return {
             **(
@@ -406,12 +444,7 @@ class _NativeCliHarnessAdapter:
         try:
             _key_path, key = ensure_transport_key(self._workspace)
             if path.exists():
-                material = read_transport_envelope(path, key)
-                if set(material) != {"provider_operation_ref", "snapshot"} or (
-                    material["provider_operation_ref"] != invocation.provider_operation_ref
-                ):
-                    raise ValueError("system MCP operation identity mismatch")
-                snapshot = material["snapshot"]
+                snapshot = self._read_system_mcp_snapshot(invocation.provider_operation_ref)
             else:
                 legacy_exists = getattr(self._runner, "has_operation_spool", None)
                 if callable(legacy_exists) and legacy_exists(
@@ -1293,6 +1326,24 @@ def _transport_environment_names(environment: dict[str, str]) -> list[str]:
     )
 
 
+def _transport_invocation(
+    argv: list[str], prompt: str, timeout: float | None, environment: dict[str, str],
+) -> dict[str, object]:
+    """The same frozen identity is used for execution and historical reads."""
+    invocation: dict[str, object] = {
+        "schema_ref": "meta-research/harness-provider-operation/v1",
+        "family": environment.get(_HARNESS_FAMILY_ENV),
+        "provider_operation_ref": environment.get(_PROVIDER_OPERATION_ENV),
+        "argv": argv,
+        "prompt_hash": canonical_hash(prompt),
+        "timeout_seconds": timeout,
+        "environment_names": _transport_environment_names(environment),
+    }
+    if _SYSTEM_MCP_SNAPSHOT_ENV in environment:
+        invocation["system_mcp_snapshot_id"] = environment[_SYSTEM_MCP_SNAPSHOT_ENV]
+    return invocation
+
+
 class HarnessSupervisorTransport:
     """Thin Harness adapter over its provider-specific process runner."""
 
@@ -1330,17 +1381,7 @@ class HarnessSupervisorTransport:
         operation_ref = environment.get(_PROVIDER_OPERATION_ENV)
         if not operation_ref or len(operation_ref) > 128:
             raise OSError("provider operation identity unavailable")
-        invocation = {
-            "schema_ref": "meta-research/harness-provider-operation/v1",
-            "family": family,
-            "provider_operation_ref": operation_ref,
-            "argv": argv,
-            "prompt_hash": canonical_hash(prompt),
-            "timeout_seconds": timeout,
-            "environment_names": _transport_environment_names(environment),
-        }
-        if _SYSTEM_MCP_SNAPSHOT_ENV in environment:
-            invocation["system_mcp_snapshot_id"] = environment[_SYSTEM_MCP_SNAPSHOT_ENV]
+        invocation = _transport_invocation(argv, prompt, timeout, environment)
         invocation_hash = canonical_hash(invocation)
         if self._raw_output_store is not None:
             try:
@@ -1579,17 +1620,7 @@ class HarnessSupervisorTransport:
             except (OSError, UnicodeDecodeError):
                 continue
             try:
-                material = {
-                    "schema_ref": "meta-research/harness-provider-operation/v1",
-                    "family": family,
-                    "provider_operation_ref": operation_ref,
-                    "argv": argv,
-                    "prompt_hash": canonical_hash(prompt),
-                    "timeout_seconds": timeout,
-                    "environment_names": _transport_environment_names(environment),
-                }
-                if _SYSTEM_MCP_SNAPSHOT_ENV in environment:
-                    material["system_mcp_snapshot_id"] = environment[_SYSTEM_MCP_SNAPSHOT_ENV]
+                material = _transport_invocation(argv, prompt, timeout, environment)
                 invocation_hash = canonical_hash(material)
                 if invocation_hash != directory.name:
                     continue
@@ -1612,6 +1643,68 @@ class HarnessSupervisorTransport:
                 matches.append(prompt)
             except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
                 raise OSError("terminal provider input unavailable") from error
+        if len(matches) > 1:
+            raise OSError("terminal provider input ambiguous")
+        return matches[0] if matches else None
+
+    def recover_transport_receipt(
+        self, operation_ref: str, *, family: str,
+        system_mcp_snapshot_id: str | None = None,
+    ) -> dict[str, object] | None:
+        """Find a sealed historical turn whose transport hash binds this exact ref.
+
+        Human-wait checkpoints can precede capability profile acceptance. Their
+        signed spools remain authority even when no profile index was retained.
+        No Provider is run and no spool or Owner record is changed here.
+        """
+        if family != "codex" or not operation_ref or len(operation_ref) > 128:
+            raise OSError("provider operation identity unavailable")
+        # Keys used by the v1 native CLI transport. Values (including tokens)
+        # are neither read from a live process nor retained in the spool.
+        environment = dict.fromkeys((
+            _MCP_TOKEN_ENV, _HARNESS_FAMILY_ENV, _HARNESS_WORKSPACE_ENV,
+            _PROVIDER_OPERATION_ENV, _HARNESS_EVIDENCE_SCOPE_ENV,
+            _HARNESS_OBSERVATION_SCOPE_ENV, "NO_PROXY", "no_proxy",
+        ), "")
+        environment[_HARNESS_FAMILY_ENV] = family
+        environment[_PROVIDER_OPERATION_ENV] = operation_ref
+        if system_mcp_snapshot_id is not None:
+            environment[_SYSTEM_MCP_SNAPSHOT_ENV] = system_mcp_snapshot_id
+        matches = []
+        for receipt_path in (self._workspace / "provider-operations").glob("*/*/supervisor-exit.json"):
+            directory = receipt_path.parent
+            if re.fullmatch(r"[0-9a-f]{64}", directory.name) is None or directory.parent.name != directory.name[:2]:
+                continue
+            try:
+                request = read_supervisor_request(directory / "supervisor-request.json", self._transport_key)
+                prompt_path = directory / "prompt.txt"
+                if prompt_path.stat().st_size > _STREAM_LIMIT:
+                    continue
+                prompt = prompt_path.read_text(encoding="utf-8")
+                argv = json.loads((directory / "provider-argv.json").read_text(encoding="utf-8"))
+                invocation_hash = canonical_hash(_transport_invocation(
+                    argv, prompt, request.get("timeout_seconds"), environment,
+                ))
+                if invocation_hash != directory.name:
+                    continue
+                self._verify_terminal_request(directory / "supervisor-request.json",
+                    self._supervisor_request(directory, invocation_hash, family, request.get("timeout_seconds")))
+                receipt, envelope = read_verified_exit_receipt(
+                    receipt_path, key=self._transport_key, invocation_hash=invocation_hash,
+                    prompt_path=prompt_path, schema_path=directory / "output-schema.json",
+                    stdout_path=directory / "stdout.jsonl", result_path=directory / "last-message.json",
+                    expected_schema_ref=SUPERVISOR_EXIT_SCHEMA_V2,
+                )
+            except (OSError, ValueError, ProviderSupervisorError):
+                continue
+            matches.append({
+                "schema_ref": "meta-research/harness-provider-transport-receipt/v1",
+                "spool_ref": "provider-spool:" + invocation_hash,
+                "transport_invocation_hash": invocation_hash,
+                "supervisor_receipt_hash": canonical_hash(envelope),
+                "termination_reason": receipt["termination_reason"],
+                "provider_returncode": receipt["returncode"],
+            })
         if len(matches) > 1:
             raise OSError("terminal provider input ambiguous")
         return matches[0] if matches else None

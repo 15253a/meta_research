@@ -821,7 +821,7 @@ export function ResearchAssetsWorkbench({
           </div>
           <OutputLanguageControl />
           <span className="asset-header-chip">
-            {view.items.length} / {view.total_count} {t("个版本", "versions")}
+            {t("已保存内容版本：", "Saved content versions: ")}{view.total_count}
           </span>
           <button
             ref={closeRef}

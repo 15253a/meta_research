@@ -72,9 +72,9 @@ def test_wrong_accepted_outcome_reference_stays_a_gap(tmp_path: Path, monkeypatc
     try:
         quest = _confirm_direct_quest(runtime)
         _finish_idea_stage(runtime)
-        original = runtime.owners.research_graph.query_idea_outcome_decision
-        monkeypatch.setattr(runtime.owners.research_graph, 'query_idea_outcome_decision',
-                            lambda ref: replace(original(ref), outcome_ref='wrong-outcome'))
+        original = runtime.owners.research_graph.query_stage_decision_display
+        monkeypatch.setattr(runtime.owners.research_graph, 'query_stage_decision_display',
+                            lambda *args: replace(original(*args), outcome_ref='wrong-outcome'))
         actual = reader(runtime).query(quest['quest_ref'])
         assert actual['status'] == 'limited'
         artifact = actual['cycles'][0]['stages']['idea'][0]

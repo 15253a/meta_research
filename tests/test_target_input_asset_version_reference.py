@@ -16,6 +16,9 @@ def _version_owner(refs=("asset_version_1",)):
     original_reader = owner._domain_reader
     original_reader.query_target_dependency_asset_bindings = lambda _: ("quest", (role.asset_binding(),))
     original_reader.query_asset_roles = lambda **kw: (role,) if role.version_ref in kw["version_refs"] else ()
+    def verify_scope(version_ref, *, quest_ref):
+        raise OwnerConflict("asset_quest_scope_invalid")
+    original_reader.verify_asset_quest_scope = verify_scope
     accepted = {}
     issued = []
     original_reader.accept_asset_role = lambda **kw: issued.append(kw) or role
@@ -60,7 +63,7 @@ def test_ambiguous_dependency_asset_identity_cannot_choose_a_version():
 
 def test_unknown_version_cannot_issue_a_target_proof():
     owner, _role, accepted, issued = _version_owner(("asset_version_foreign",))
-    with pytest.raises(OwnerConflict, match="target_input_asset_version_not_selected"):
+    with pytest.raises(OwnerConflict, match="asset_quest_scope_invalid"):
         owner.prepare_input_assets("target")
     assert not accepted and not issued
 

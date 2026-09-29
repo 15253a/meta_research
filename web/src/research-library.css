@@ -19,6 +19,7 @@
 .library-card,.library-original,.library-guidance { border:1px solid #d5dfe9; border-radius:13px; background:white; padding:16px; margin:0 0 12px; }
 .library-card h4,.library-original h4,.library-guidance h4 { margin:0 0 9px; font-size:16px; }
 .library-card p { margin:8px 0; line-height:1.65; }
+.library-card h4,.library-card p,.library-runs b,.library-original h4,.library-original button { overflow-wrap:anywhere; }
 .library-card details,.library-original details { margin-top:12px; font-size:12px; color:#526c86; }
 .research-library pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:420px; overflow:auto; font-size:12px; line-height:1.6; }
 .research-library .library-prose { font:inherit; white-space:pre-wrap; line-height:1.8; max-height:560px; color:#26394e; }

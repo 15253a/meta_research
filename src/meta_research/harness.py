@@ -1873,6 +1873,21 @@ class HarnessRuntime:
             if isinstance(receipts, list)
             else []
         )
+        if not matching:
+            generation = operation_ref.removeprefix(run_ref + ":harness_turn:")
+            if (not generation.isdigit() or int(generation) < 1
+                    or operation_ref != provider_operation_ref(run_ref, "harness_turn", int(generation))):
+                raise HarnessAdmissionError("target_raw_output_binding_unavailable")
+            run = self._owner.query_target_run_by_ref(run_ref)
+            adapter = None if run is None else self._adapters.get(run.harness_family)
+            recover = getattr(adapter, "recover_transport_receipt", None)
+            if callable(recover):
+                try:
+                    recovered = recover(operation_ref)
+                except (OSError, HarnessAdapterUnavailable) as error:
+                    raise HarnessAdmissionError("target_raw_output_binding_unavailable") from error
+                if recovered is not None:
+                    matching = [recovered]
         if len(matching) != 1:
             raise HarnessAdmissionError(
                 "target_raw_output_binding_unavailable"

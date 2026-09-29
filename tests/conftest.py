@@ -40,14 +40,22 @@ def scoped_system_mcp(tmp_path: Path):
 
 @pytest.fixture
 def pre_system_mcp_binding():
-    """Use source/instruction identities captured from the actual 8769 baseline."""
+    """Use the reviewed pre-MCP source for the actual current adapter revision.
+
+    The original 8769 identities remain in their immutable fixtures and are
+    exercised separately. Combining them with this release's new skills and
+    schemas would construct an unreviewed binding rather than a prior release.
+    """
     from dataclasses import replace
     import json
 
-    revisions = json.loads((Path(__file__).parent / "fixtures" / "system_mcp_binding_before.json").read_text())
+    revisions = json.loads((Path(__file__).parent / "fixtures" / "system_mcp_test_merge_sources.json").read_text())["revisions"]
 
     def restore(binding, profile=None):
-        revision = next(item for item in revisions if item["binding_type"] == type(binding).__name__ and item["profile"] == profile)
+        pair = next(item for item in revisions if item["after"]["binding_type"] == type(binding).__name__ and item["after"]["profile"] == profile)
+        assert binding.instruction_set_hash == pair["after"]["instruction_set_hash"]
+        assert [item for item in binding.resource_bindings if item.startswith("adapter-source:")] == pair["after"]["sources"]
+        revision = pair["before"]
         sources = {entry.split("@sha256:")[0]: entry for entry in revision["sources"]}
         return replace(binding,
             instruction_set_hash=revision["instruction_set_hash"],

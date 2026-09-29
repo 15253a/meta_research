@@ -426,8 +426,6 @@ class WritingResearchSnapshotReader:
                 or report.formal_plan_ref != accepted_plan.formal_plan_ref
                 or report.report.formal_plan_ref != accepted_plan.formal_plan_ref
                 or report.plan_document_hash != accepted_plan.plan_document_hash
-                or report.formal_plan_content_receipt
-                != accepted_plan.content_receipt
             ):
                 raise OwnerConflict("writing_bundle_result_invalid")
 

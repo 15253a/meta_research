@@ -212,6 +212,13 @@ class _QuestionForegroundOwner(_StaticOwner):
         assert cycle_ref == "cycle_projection_root"
         return self._successor_context
 
+    def query_cycle_stage_display(
+        self, quest_ref: str, cycle_ref: str
+    ) -> dict[str, object] | None:
+        assert quest_ref == "quest_projection"
+        assert cycle_ref == "cycle_projection_root"
+        return self._successor_context
+
 
 class _RacingResearchGraph:
     def __init__(self, feed: _MutableFeed) -> None:

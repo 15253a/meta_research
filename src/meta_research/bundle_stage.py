@@ -5,6 +5,7 @@ from meta_research.baseline_identity import BASELINE_METHOD_REJECTION_FEEDBACK
 
 import json
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from typing import Callable, cast
 
@@ -49,6 +50,7 @@ from meta_research.bundle_target_contract import (
     BundleTargetContractError,
     normalized_completion_contract_from_dict,
 )
+from meta_research.database import Database
 from meta_research.feed import DurableFeed
 from meta_research.harness import HarnessAdmissionError, HarnessRuntime
 from meta_research.idea_stage import _public_run
@@ -157,7 +159,9 @@ class BundleStageWorker:
         stopped_provider_checkpoint: (
             Callable[[str], dict[str, object] | None] | None
         ) = None,
+        database: Database | None = None,
     ) -> None:
+        self._database = database
         self._feed = feed
         self._advancement_engine = advancement_engine
         self._agent_runtime = agent_runtime
@@ -249,10 +253,13 @@ class BundleStageWorker:
             or foreground.get("status") != "active"
         ):
             return False
-        eligible, _reason, _next = self._qualify(current)
-        if eligible is None:
-            return False
-        request = self._advancement_engine.query_bundle_stage_request(current.cycle_ref)
+        # Reuse upstream proofs across both pure preflight reads. Leave the
+        # snapshot before any advancement/provider effects and their checks.
+        with self._database.read_snapshot() if self._database is not None else nullcontext():
+            eligible, _reason, _next = self._qualify(current)
+            if eligible is None:
+                return False
+            request = self._advancement_engine.query_bundle_stage_request(current.cycle_ref)
         if request is None:
             foreground = self._advancement_engine.query_foreground(
                 current.question.quest_ref
@@ -1067,7 +1074,7 @@ class BundleStageWorker:
     ) -> str | None:
         """Read current AR terminal projections without inventing completion."""
 
-        terminals: list[object] = []
+        handoff_manifest_refs: list[str] = []
         unlaunched = False
         for target in graph.targets:
             frontier = self._agent_runtime.query_target_frontier_entry(
@@ -1089,9 +1096,11 @@ class BundleStageWorker:
                 raise OwnerConflict("bundle_report_handoff_missing")
             if notice.target_ref != target.target_ref:
                 raise OwnerConflict("bundle_report_handoff_invalid")
-            handoff = self._agent_runtime.read_target_run_handoff(
-                notice.handoff_manifest_ref
-            )
+            handoff_manifest_refs.append(notice.handoff_manifest_ref)
+
+        terminals: list[object] = []
+        for manifest_ref in handoff_manifest_refs:
+            handoff = self._agent_runtime.read_target_run_handoff(manifest_ref)
             terminals.append(handoff.terminal)
 
         # The fixed prototype gives a technical blocker precedence.  Targets
@@ -2295,6 +2304,14 @@ class BundleStageWorker:
         }
 
     def _qualify(
+        self, current: _CurrentCycle
+    ) -> tuple[_EligibleBundle | None, str | None, str | None]:
+        # Qualifying reads share a proof cut; advancement/provider effects
+        # happen only after it exits and keep their own currentness checks.
+        with self._database.read_snapshot() if self._database is not None else nullcontext():
+            return self._qualify_from_current(current)
+
+    def _qualify_from_current(
         self, current: _CurrentCycle
     ) -> tuple[_EligibleBundle | None, str | None, str | None]:
         successor = self._advancement_engine.query_reasoning_successor_context(

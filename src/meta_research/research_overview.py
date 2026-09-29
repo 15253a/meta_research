@@ -43,7 +43,7 @@ class ResearchOverviewReader(WritingResearchSnapshotReader):
         # Owner order is created_at, cycle_ref; do not use foreground epoch or
         # question-tree order as a cycle number, including revisited questions.
         for ordinal, cycle in enumerate(
-            self._advancement_engine.query_quest_stage_history(quest_ref), 1
+            self._advancement_engine.query_quest_stage_history_display(quest_ref), 1
         ):
             stages: dict[str, list[dict[str, Any]]] = {stage: [] for stage in STAGES}
             requests = {item.request_ref: item for item in cycle.requests}
@@ -101,6 +101,92 @@ class ResearchOverviewReader(WritingResearchSnapshotReader):
         # Equality/ETag-like identity contains only this exact read cut.
         payload["projection_hash"] = canonical_hash(payload)
         return payload
+
+    def _stage_value(self, request: Any, commit: Any) -> dict[str, Any]:
+        """Display the accepted text; retain its local identity and custody checks."""
+        stage = request.stage
+        run = (self._agent_runtime.query_idea_stage_run(request.request_ref) if stage == 'idea'
+               else self._agent_runtime.query_plan_stage_run(request.request_ref))
+        if run is None or run.execution is None or run.completion is None:
+            raise OwnerConflict('writing_stage_result_missing')
+        if (run.run_ref != commit.run_ref or run.request_ref != request.request_ref
+            or run.cycle_ref != request.cycle_ref or run.epoch != request.epoch
+            or run.completion.receipt != commit.run_completion_receipt
+            or run.completion.outcome_ref != commit.outcome_ref
+            or run.completion.decision_receipt != commit.outcome_receipt):
+            raise OwnerConflict('writing_stage_result_invalid')
+        content = (self._research_memory.query_idea_outcome_content(run.execution.submission_ref) if stage == 'idea'
+                   else self._research_memory.query_plan_document(run.execution.submission_ref))
+        if content is None:
+            raise OwnerConflict('writing_stage_result_invalid')
+        decision = self._research_graph.query_stage_decision_display(request, commit, run.execution, content)
+        if (decision is None or decision.decision != 'accepted'
+            or decision.receipt != commit.outcome_receipt
+            or decision.content_ref != content.content_ref
+            or (decision.outcome_ref if stage == 'idea' else decision.formal_plan_ref)
+            != commit.outcome_ref):
+            raise OwnerConflict('writing_stage_result_invalid')
+        if stage == 'idea':
+            if content.outcome_hash != decision.outcome_hash:
+                raise OwnerConflict('writing_stage_result_invalid')
+            result = {'content_ref': content.content_ref, 'content_hash': content.payload_hash,
+                      'outcome_hash': content.outcome_hash, 'outcome': content.outcome,
+                      'content_receipt': content.receipt.as_public_dict(),
+                      'acceptance_receipt': decision.receipt.as_public_dict()}
+        else:
+            if content.plan_document_hash != decision.plan_document_hash:
+                raise OwnerConflict('writing_stage_result_invalid')
+            result = {'content_ref': content.content_ref, 'content_hash': content.payload_hash,
+                      'plan_document_hash': content.plan_document_hash, 'plan_document': content.plan_document,
+                      'content_receipt': content.receipt.as_public_dict(),
+                      'acceptance_receipt': decision.receipt.as_public_dict()}
+        return {**self._commit_value(commit), 'result': result}
+
+    def _reasoning_stage_value(self, request: Any, commit: Any) -> dict[str, Any]:
+        run = self._agent_runtime.query_reasoning_completion_display(request)
+        if run is None:
+            raise OwnerConflict("writing_reasoning_result_missing")
+        completion = run["completion"]
+        result = self._research_graph.query_reasoning_result_display(run["submission_ref"])
+        if (
+            result is None
+            or run["run_ref"] != commit.run_ref
+            or completion.receipt != commit.run_completion_receipt
+            or completion.request_ref != request.request_ref
+            or completion.outcome_ref != commit.outcome_ref
+            or completion.decision_receipt != commit.outcome_receipt
+            or any(result[key] != run[key] for key in (
+                "run_ref", "attempt_ref", "fence_ref", "submission_ref"))
+            or result["request_ref"] != request.request_ref
+            or result["cycle_ref"] != request.cycle_ref
+            or result["outcome_ref"] != commit.outcome_ref
+            or result["receipt"] != commit.outcome_receipt
+            or result["scientific_outcome"].get("foreground_epoch") != request.epoch
+        ):
+            raise OwnerConflict("writing_reasoning_result_invalid")
+        return {"result": {"content_ref": result["content_ref"],
+                           "content_hash": result["payload_hash"],
+                           "outcome": {"scientific_outcome": result["scientific_outcome"]}}}
+
+    def _bundle_stage_value(self, request: Any, commit: Any) -> dict[str, Any] | None:
+        report = self._agent_runtime.query_bundle_report_display(request)
+        if report is None:
+            if commit is not None:
+                raise OwnerConflict("writing_bundle_result_invalid")
+            return None
+        if commit is not None:
+            completion = report["completion"]
+            if (
+                commit.run_ref != report["run_ref"]
+                or commit.outcome_ref != report["report_ref"]
+                or commit.outcome_kind != "bundle_report"
+                or commit.outcome_receipt != report["receipt"]
+                or completion is None
+                or commit.run_completion_receipt != completion.receipt
+                or completion.request_ref != request.request_ref
+            ):
+                raise OwnerConflict("writing_bundle_result_invalid")
+        return {"report": report}
 
     def _artifact(self, quest_ref: str, cycle: Any, request: Any, commit: Any) -> dict[str, Any] | None:
         fact = commit or request

@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from meta_research.bundle_protocol import projection_plain_value
 from meta_research.formal_entities import (
-    _checkpoint_paths, _ensure_input, _insert, _ref, _register_run_checkpoints,
+    _checkpoint_paths, _default_checkpoint_paths, _ensure_input, _insert, _ref, _register_run_checkpoints,
     _variant_declaration, explicit_unexecuted_root_evidence, insert_variant_run,
     verified_target_input_asset_refs,
 )
@@ -74,6 +74,10 @@ def _source_inputs(completion, manifest, target, authority, run, *, source_owner
     allowed = set(defaults) | verified_target_input_asset_refs(
         source_owner, target_ref=target.target_ref, proofs=proofs)
     selected = run.get("input_refs", defaults)
+    if isinstance(selected, list) and any(isinstance(ref, str) and ref not in allowed for ref in selected):
+        allowed |= verified_target_input_asset_refs(
+            source_owner, target_ref=target.target_ref, proofs=[],
+            target_commit_refs=completion.handle.accepted_input_target_commit_refs)
     if (not isinstance(selected, list) or any(not isinstance(ref, str) for ref in selected)
             or len(set(selected)) != len(selected) or not set(selected) <= allowed):
         raise OwnerConflict("target_formal_input_reference_invalid")
@@ -222,9 +226,9 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
 
     _check_source_rows(connection, completion, manifest, target, authority)
     entries = [entry.as_dict() for entry in manifest.entries if entry.role == "checkpoint"]
-    new_runs = [run for run in runs if not run.get("variant_run_ref")]
-    if len(new_runs) > 1 and entries and any(run.get("checkpoint_paths") is None for run in new_runs):
-        raise OwnerConflict("target_formal_checkpoint_assignment_required")
+    checkpoint_defaults = _default_checkpoint_paths(
+        {run['run_key']: run.get('checkpoint_paths') for run in runs
+         if not run.get('variant_run_ref')}, entries)
     _resolve_run_variant_declarations(connection, runs=runs, target=target,
                                       accepted_at=completion.accepted_at,
                                       verify_only=verify_only)
@@ -280,7 +284,8 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
                   "checkpoint_paths": run.get("checkpoint_paths"),
                   "checkpoint_role_refs": run.get("checkpoint_role_refs"),
                   "checkpoint_version_refs": run.get("checkpoint_version_refs"),
-                  "frozen_checkpoint_role_refs": frozen_refs}, entries=entries, accepted_at=at)
+                  "frozen_checkpoint_role_refs": frozen_refs}, entries=entries, accepted_at=at,
+            default_paths=checkpoint_defaults)
         if not reused:
             actual_roles = connection.execute(text("SELECT role_ref FROM rg_experiment_asset_roles WHERE "
                 "subject_kind='variant_run' AND subject_ref=:ref AND role='checkpoint_artifact' ORDER BY ordinal,accepted_at,role_ref"),

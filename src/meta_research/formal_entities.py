@@ -14,8 +14,8 @@ from meta_research.owners.common import OwnerConflict, canonical_hash, canonical
 _REUSED_EVALUATION_SOURCES = ContextVar('reused_evaluation_sources', default=frozenset())
 
 
-def verified_target_input_asset_refs(owner, *, target_ref, proofs):
-    """Resolve versions only from the issuer projection matching the frozen proof."""
+def verified_target_input_asset_refs(owner, *, target_ref, proofs, target_commit_refs=()):
+    """Resolve direct proofs and artifacts of the completion's frozen commits."""
     from meta_research.bundle_protocol import projection_plain_value
 
     refs = set()
@@ -28,6 +28,12 @@ def verified_target_input_asset_refs(owner, *, target_ref, proofs):
                 or projection_plain_value(projection.as_bundle_proof()) != proof):
             raise OwnerConflict("target_run_input_asset_proof_invalid")
         refs.update((projection.asset.asset_ref, projection.asset.version_ref))
+    if target_commit_refs and owner is not None:
+        bindings = owner.query_target_commit_input_asset_bindings(
+            target_ref=target_ref, target_commit_refs=tuple(target_commit_refs))
+        for assets in bindings.values():
+            for asset in assets:
+                refs.update((asset.asset_ref, asset.version_ref))
     return refs
 
 
@@ -490,13 +496,15 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
     allowed_inputs = set(variant_proof['input_refs']) | verified_target_input_asset_refs(
         source_owner, target_ref=root['target_ref'],
         proofs=handle.get('accepted_input_asset_proofs', []))
+    if any(isinstance(item.get('input_refs'), list)
+           and any(isinstance(ref, str) and ref not in allowed_inputs for ref in item['input_refs'])
+           for item in items if not item['reuse_variant_run']):
+        allowed_inputs |= verified_target_input_asset_refs(
+            source_owner, target_ref=root['target_ref'], proofs=[],
+            target_commit_refs=handle.get('accepted_input_target_commit_refs', ()))
     written_runs = set()
     inserted = {}
     checkpoint_entries = [entry for entry in entries if entry['role'] == 'checkpoint']
-    new_runs = {item['variant_run_ref'] for item in items if not item['reuse_variant_run']}
-    if len(new_runs) > 1 and checkpoint_entries and any(
-            not item['reuse_variant_run'] and item.get('checkpoint_paths') is None for item in items):
-        raise OwnerConflict('target_formal_checkpoint_assignment_required')
     run_checkpoint_cache = {}
     run_artifact_cache = set()
     # Default artifact attribution is an acceptance-time decision frozen by
@@ -508,6 +516,9 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
     # document's own view of its runs.
     documented_items = items if work_items is None else root_work_items(
         payload=payload, identities=identities, result_document=result)
+    checkpoint_defaults = _default_checkpoint_paths(
+        {item['variant_run_ref']: item.get('checkpoint_paths') for item in documented_items
+         if not item['reuse_variant_run']}, checkpoint_entries)
     artifact_defaults = _default_subject_artifacts(documented_items, entries)
     verified_artifact_rows = {}
 
@@ -701,7 +712,7 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
                     'checkpoint_version_refs', 'evaluation_checkpoint_paths',
                     'evaluation_checkpoint_role_refs', 'evaluation_checkpoint_version_refs')):
                 available = _register_run_checkpoints(connection, ensure=ensure, item=item,
-                    entries=checkpoint_entries, accepted_at=at)
+                    entries=checkpoint_entries, accepted_at=at, default_paths=checkpoint_defaults)
                 selected = _select_checkpoint_records(available, item.get('evaluation_checkpoint_paths'),
                     item.get('evaluation_checkpoint_role_refs'), item.get('evaluation_checkpoint_version_refs'))
                 if [record['role_ref'] for record in selected] != old_checkpoints:
@@ -722,7 +733,8 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
             ('checkpoint_paths', 'checkpoint_role_refs', 'checkpoint_version_refs', 'frozen_checkpoint_role_refs')}))
         if checkpoint_cache_key not in run_checkpoint_cache:
             run_checkpoint_cache[checkpoint_cache_key] = _register_run_checkpoints(
-                connection, ensure=ensure, item=item, entries=checkpoint_entries, accepted_at=at)
+                connection, ensure=ensure, item=item, entries=checkpoint_entries, accepted_at=at,
+                default_paths=checkpoint_defaults)
         run_checkpoints = run_checkpoint_cache[checkpoint_cache_key]
         if run_without_evaluation:
             _ensure_link(ensure, root, item, commit_ref)
@@ -964,13 +976,28 @@ def _existing_checkpoint_records(connection, run_ref, frozen_refs=None):
     return records
 
 
-def _register_run_checkpoints(connection, *, ensure, item, entries, accepted_at):
+def _default_checkpoint_paths(new_runs, entries):
+    """Only a unique producer defaults to all retained states.
+
+    Multiple producers declare actual ownership; once every retained state is
+    assigned, an omitted selection means no checkpoints for that Run.
+    """
+    if len(new_runs) <= 1:
+        return None
+    assigned = {path for paths in new_runs.values() for path in paths or []}
+    if any(entry['declared_relative_path'] not in assigned for entry in entries):
+        raise OwnerConflict('target_formal_checkpoint_assignment_required')
+    return []
+
+
+def _register_run_checkpoints(connection, *, ensure, item, entries, accepted_at, default_paths=None):
     run_ref = item['variant_run_ref']
     if item['reuse_variant_run']:
         records = _existing_checkpoint_records(connection, run_ref, item.get('frozen_checkpoint_role_refs'))
         return _select_checkpoint_records(records, item.get('checkpoint_paths'),
             item.get('checkpoint_role_refs'), item.get('checkpoint_version_refs'))
-    selected = _select_checkpoint_records(entries, item.get('checkpoint_paths'))
+    paths = item.get('checkpoint_paths')
+    selected = _select_checkpoint_records(entries, default_paths if paths is None else paths)
     records = []
     for ordinal, entry in enumerate(selected):
         binding = entry['binding']

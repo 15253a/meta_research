@@ -36,7 +36,7 @@ from meta_research.plan_contract import (
     validate_plan_document,
     validate_plan_review,
 )
-from meta_research.read_snapshot_cache import snapshot_cached
+from meta_research.read_snapshot_cache import snapshot_cached, snapshot_file_check
 from meta_research.reasoning_contract import (
     AUTONOMOUS_QUESTION_PROPOSAL_SCHEMA_REF,
     REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF,
@@ -1983,6 +1983,34 @@ class SQLiteResearchMemoryReceiptVerifier:
         review_hash: str,
         receipt: AcceptanceReceipt,
     ) -> None:
+        # Direct RG/AR/AE callers need the same bounded proof scope as RM reads.
+        # It closes here, before any caller can begin an acceptance write.
+        with self._database.read_snapshot():
+            self._verify_reasoning_content_receipt_in_snapshot(
+                request_ref=request_ref,
+                submission_ref=submission_ref,
+                content_ref=content_ref,
+                payload_hash=payload_hash,
+                outcome_hash=outcome_hash,
+                transition_hash=transition_hash,
+                reviewed_draft_hash=reviewed_draft_hash,
+                review_hash=review_hash,
+                receipt=receipt,
+            )
+
+    def _verify_reasoning_content_receipt_in_snapshot(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str,
+        content_ref: str,
+        payload_hash: str,
+        outcome_hash: str,
+        transition_hash: str,
+        reviewed_draft_hash: str,
+        review_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
         if (
             receipt.issuer != RM_OWNER
             or receipt.kind != REASONING_CONTENT_RECEIPT_KIND
@@ -3141,6 +3169,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         )
         self._stage_request_verifier = stage_request_verifier
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
+        self._asset_intake_recovery_reader = None
         # Handoff can perform durable, crash-recoverable object repair. Keep a
         # single in-process performer so timeout followers replay or alias the
         # finished command instead of duplicating object I/O and racing the
@@ -3151,6 +3180,66 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         self._asset_content_pages = AssetContentPageReader(object_store, receipt_verifier)
         self._literature_content_pages = LiteratureContentPageReader(self._object_store)
         self._recover_asset_intakes()
+
+    def bind_asset_intake_recovery_reader(self, reader) -> None:
+        self._asset_intake_recovery_reader = reader
+
+    def retry_asset_intake_after_resume(
+        self, request: AssetIntakeRequest, *, idempotency_key: str,
+    ) -> AssetIntakeResult:
+        """Rehydrate an exhausted exact request once per later formal resume.
+
+        Keep the cumulative attempt count: an unsuccessful recovery attempt
+        reaches the existing terminal-failure boundary immediately.
+        """
+        document = _asset_request_document(request)
+        request_hash = canonical_hash(document)
+        key = _asset_intake_storage_key(idempotency_key, document, operation_namespace=None)
+        with self._database.read() as connection:
+            existing = connection.execute(text(
+                "SELECT * FROM rm_asset_intakes WHERE idempotency_key = :key"
+            ), {"key": key}).first()
+        if existing is None:
+            raise OwnerConflict("asset_intake_not_found")
+        if existing.request_hash != request_hash:
+            raise OwnerConflict("asset_intake_idempotency_conflict")
+        if (existing.status != "failed"
+                or existing.failure_code != "asset_intake_retry_exhausted"
+                or self._asset_intake_recovery_reader is None):
+            return self.query_asset_intake(existing.job_ref)
+        _verified_scrubbed_asset_request_summary(existing)
+        recovery = self._asset_intake_recovery_reader.query_asset_intake_recovery(
+            document, failed_at=float(existing.completed_at),
+        )
+        if recovery is None:
+            return self.query_asset_intake(existing.job_ref)
+        now = time.time()
+        with self._database.write() as connection:
+            # A competing recovery or completion must win without resetting
+            # its request or consuming the same control a second time.
+            changed = connection.execute(text(
+                "UPDATE rm_asset_intakes SET status = 'queued', request_json = :request, "
+                "request_payload_scrubbed = 0, failure_code = NULL, started_at = NULL, "
+                "completed_at = NULL, next_attempt_at = :now, updated_at = :now "
+                "WHERE job_ref = :job AND status = 'failed' "
+                "AND failure_code = 'asset_intake_retry_exhausted' "
+                "AND request_hash = :hash AND completed_at = :failed_at"
+            ), {"request": canonical_json(document), "now": now,
+                "job": existing.job_ref, "hash": request_hash,
+                "failed_at": existing.completed_at}).rowcount
+            if changed:
+                connection.execute(text(
+                    "UPDATE research_memory_state SET revision = revision + 1, "
+                    "pending_intake_count = pending_intake_count + 1 WHERE singleton = 'owner'"
+                ))
+                self._feed.record(connection, "research_memory.asset_intake_recovery_authorized", {
+                    "job_ref": existing.job_ref, "request_hash": request_hash,
+                    "previous_failure_code": existing.failure_code,
+                    "previous_completed_at": float(existing.completed_at),
+                    "previous_attempt_count": int(existing.attempt_count),
+                    "recovery": recovery,
+                })
+        return self.submit_asset_intake(request, idempotency_key=idempotency_key)
 
     def _recover_asset_intakes(self) -> None:
         now = time.time()
@@ -3684,6 +3773,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             stored_request_json = row.request_json
             stored_request_hash = row.request_hash
             stored_request_scrubbed = bool(row.request_payload_scrubbed)
+        phase = "prepare_asset"
         try:
             if stored_request_scrubbed:
                 raise OwnerConflict("asset_intake_request_invalid")
@@ -3691,19 +3781,21 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 stored_request_json, stored_request_hash
             )
             prepared = self._prepare_asset(request_document)
+            phase = "accept_prepared_asset"
             self._accept_prepared_asset(job_ref, request_document, prepared)
         except OwnerConflict as error:
             if error.code in TRANSIENT_ASSET_INTAKE_CONFLICTS:
-                self._requeue_asset_intake(job_ref)
+                self._requeue_asset_intake(job_ref, error=error, phase=phase)
             else:
                 self._fail_asset_intake(job_ref, error.code)
         except ValueError:
             self._fail_asset_intake(job_ref, "asset_intake_io_error")
-        except Exception:
-            self._requeue_asset_intake(job_ref)
+        except Exception as error:
+            self._requeue_asset_intake(job_ref, error=error, phase=phase)
             raise
 
-    def _requeue_asset_intake(self, job_ref: str) -> None:
+    def _requeue_asset_intake(self, job_ref: str, *, error: Exception | None = None,
+                             phase: str | None = None) -> None:
         """Return a claimed job to the durable queue after transient failure."""
 
         with self._database.write() as connection:
@@ -3750,6 +3842,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     {
                         "job_ref": job_ref,
                         "failure_code": "asset_intake_retry_exhausted",
+                        **_asset_intake_error_details(error, phase),
                     },
                 )
             else:
@@ -8104,14 +8197,15 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             context_pack_hash=context_pack_hash,
             receipt=stage_request_receipt,
         )
-        _verify_reasoning_plan_evidence_reuse_authority(
-            context_pack,
-            getattr(
-                self._reference_reader,
-                "resolve_plan_evidence_reuse_leaves",
-                None,
-            ),
-        )
+        with self._database.read_snapshot():
+            _verify_reasoning_plan_evidence_reuse_authority(
+                context_pack,
+                getattr(
+                    self._reference_reader,
+                    "resolve_plan_evidence_reuse_leaves",
+                    None,
+                ),
+            )
         frozen_evidence_closure = _frozen_reasoning_evidence_closure(
             context_pack,
             revision_verifier=(
@@ -8527,6 +8621,12 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         return self._receipt_verifier.query_reasoning_history_source(submission_ref)
 
     def query_reasoning_content(
+        self, submission_ref: str
+    ) -> AcceptedReasoningContent | None:
+        with self._database.read_snapshot():
+            return self._query_reasoning_content_from_current(submission_ref)
+
+    def _query_reasoning_content_from_current(
         self, submission_ref: str
     ) -> AcceptedReasoningContent | None:
         with self._database.read() as connection:
@@ -10602,6 +10702,23 @@ def _verify_literature_snapshot_authority_row(
         )
 
 
+def _asset_intake_error_details(error: Exception | None, phase: str | None) -> dict[str, object]:
+    if error is None:
+        return {}
+    details: dict[str, object] = {
+        "phase": phase, "error_code": getattr(error, "code", type(error).__name__),
+    }
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno is not None:
+            details["errno"] = current.errno
+            break
+        current = current.__cause__ or current.__context__
+    return details
+
+
 def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
     if request.source_kind not in {
         "text",
@@ -12466,6 +12583,7 @@ def _plan_evidence_provenance(
     return target, tuple(closure), tuple(capabilities)
 
 
+@snapshot_file_check
 def _verify_object(object_store: Path, row) -> None:
     root = object_store.resolve()
     candidate = (root / row.object_path).resolve()
@@ -12482,6 +12600,7 @@ def _verify_object(object_store: Path, row) -> None:
         raise OwnerConflict("question_content_custody_unavailable")
 
 
+@snapshot_file_check
 def _verify_idea_object(object_store: Path, row) -> None:
     root = object_store.resolve()
     candidate = (root / row.object_path).resolve()
@@ -12584,11 +12703,8 @@ def _verify_plan_document_projection(row, plan_document: dict[str, object]) -> N
         raise OwnerConflict("plan_content_invalid")
 
 
-def _read_verified_plan_payload(
-    object_store: Path,
-    row,
-    verified_request,
-) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+@snapshot_file_check
+def _read_plan_object(object_store: Path, row) -> bytes:
     _verify_plan_object_path_shape(row)
     root = object_store.resolve()
     candidate = (root / row.object_path).resolve()
@@ -12600,6 +12716,15 @@ def _read_verified_plan_payload(
         raise OwnerConflict("plan_content_custody_unavailable") from error
     if hashlib.sha256(content).hexdigest() != row.payload_hash:
         raise OwnerConflict("plan_content_custody_unavailable")
+    return content
+
+
+def _read_verified_plan_payload(
+    object_store: Path,
+    row,
+    verified_request,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    content = _read_plan_object(object_store, row)
     try:
         payload_json = content.decode("utf-8")
         payload = decoded_object(payload_json)
@@ -12883,6 +13008,7 @@ def _validate_reasoning_review(review: dict[str, object], *, final_output_hash: 
     return canonical_hash(review)
 
 
+@snapshot_file_check
 def _verify_reasoning_scientific_candidate_object(object_store: Path, row) -> None:
     root = object_store.resolve()
     candidate = (root / row.object_path).resolve()
@@ -13032,6 +13158,7 @@ def _verify_reasoning_scientific_candidate_payload(
     )
 
 
+@snapshot_file_check
 def _verify_reasoning_object(object_store: Path, row) -> None:
     root = object_store.resolve()
     candidate = (root / row.object_path).resolve()
@@ -14171,6 +14298,7 @@ def _verify_autonomous_question_content_object_path_shape(row) -> None:
         raise OwnerConflict("autonomous_question_content_custody_unavailable")
 
 
+@snapshot_file_check
 def _verify_autonomous_question_content_object(
     object_store: Path, row
 ) -> None:

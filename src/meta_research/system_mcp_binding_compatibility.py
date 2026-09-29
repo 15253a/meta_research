@@ -1,7 +1,7 @@
 """Execution-only bridge for the reviewed 8769 system MCP deployment.
 
 Never rewrite admission bindings, source provenance, receipts or operation
-identities. Only the exact captured source/instruction revisions below bridge
+identities. Only the exact reviewed source/instruction revisions below bridge
 this additive transport change. Every other binding field remains exact.
 """
 from dataclasses import replace
@@ -104,9 +104,113 @@ _REVIEWED_REVISIONS: tuple[dict[str, Any], ...] = ({'before': {'binding_type': '
                         'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']}})
 
 
+# 2026-09-29: v1-test 829b701 plus the reviewed System MCP integration.
+# These are recomputed Git source/instruction identities, not invented deployed
+# bindings. The v1-test skills, output schemas and root profile are unchanged
+# across this transport-only pair. Their full binding fields, including the
+# seal key and capability grants, must still compare exactly. The original 8769
+# bridge above remains immutable; this does not authorize its older profile or
+# Reasoning schema to execute as the new research policy. Source evidence:
+# tests/fixtures/system_mcp_test_merge_sources.json.
+_REVIEWED_TEST_MERGE_REVISIONS: tuple[dict[str, Any], ...] = ({'before': {'binding_type': 'IdeaRuntimeBinding',
+             'profile': None,
+             'instruction_set_hash': '7d6e03322602a792c11ae0bdd6db6ef674f5f64c4ac0f7cbd98ca86ab8a750ae',
+             'sources': ['adapter-source:meta_research.idea_skill@sha256:e20a48af0c526466baa2303cd1e9d4f028399da4389faca8b62e13439036d699',
+                         'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                         'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']},
+  'after': {'binding_type': 'IdeaRuntimeBinding',
+            'profile': None,
+            'instruction_set_hash': '26c73db315a99716019adb871787a357dc000b1270f39d98c9376f6c99c8b8de',
+            'sources': ['adapter-source:meta_research.idea_skill@sha256:fffedc566be7dc9c82dea96378e712d38f4aebe751432c7a60dd72118d657936',
+                        'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                        'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']}},
+ {'before': {'binding_type': 'PlanRuntimeBinding',
+             'profile': None,
+             'instruction_set_hash': '6d32653bb1048332c1fb4969556dfdf3a71b75b7d8c5931b5e46f2b6b748ae5c',
+             'sources': ['adapter-source:meta_research.plan_skill@sha256:03ab1bc17b8bfc35089df02e5603a2605a8de466c2c0c7de49b4a44931f45c75',
+                         'adapter-source:meta_research.idea_skill@sha256:e20a48af0c526466baa2303cd1e9d4f028399da4389faca8b62e13439036d699',
+                         'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                         'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']},
+  'after': {'binding_type': 'PlanRuntimeBinding',
+            'profile': None,
+            'instruction_set_hash': 'abee90ed77a5c79a3342aede44171373d9f017e5309a222b0171ee386ddaa023',
+            'sources': ['adapter-source:meta_research.plan_skill@sha256:179f512a5da940b1c686ae3cc44e916118a302a0e588d2a0c187e878add9d100',
+                        'adapter-source:meta_research.idea_skill@sha256:fffedc566be7dc9c82dea96378e712d38f4aebe751432c7a60dd72118d657936',
+                        'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                        'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']}},
+ {'before': {'binding_type': 'BundleRuntimeBinding',
+             'profile': None,
+             'instruction_set_hash': '484957d57d243859af2ba2caccf925b2e620ab4989e4647be67f8db01294a1da',
+             'sources': ['adapter-source:meta_research.bundle_dispatch_recovery@sha256:91a310631a65c2992e097d96b082904c4dc4366a3afb7c610b4c1fe42556def5',
+                         'adapter-source:meta_research.bundle_skill@sha256:524ffd9419ee36ca50e9a58da740234caf8bd2d5c55deec51c3b17b4439e3335',
+                         'adapter-source:meta_research.idea_skill@sha256:e20a48af0c526466baa2303cd1e9d4f028399da4389faca8b62e13439036d699',
+                         'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']},
+  'after': {'binding_type': 'BundleRuntimeBinding',
+            'profile': None,
+            'instruction_set_hash': '91337d0c986f99d9b5159f81d9bbd9c081e061124ada2d82b285a66e62eb47b3',
+            'sources': ['adapter-source:meta_research.bundle_dispatch_recovery@sha256:91a310631a65c2992e097d96b082904c4dc4366a3afb7c610b4c1fe42556def5',
+                        'adapter-source:meta_research.bundle_skill@sha256:e7a6501f533ba3d35e7fccfcaaf6ae4d6c2ff931f18b43e59b0eddb23b9c732a',
+                        'adapter-source:meta_research.idea_skill@sha256:fffedc566be7dc9c82dea96378e712d38f4aebe751432c7a60dd72118d657936',
+                        'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']}},
+ {'before': {'binding_type': 'ReasoningRuntimeBinding',
+             'profile': None,
+             'instruction_set_hash': 'd17bf1c909539be7311cdc3beab29b75e2283b825025826a8c452c2b0823d6bd',
+             'sources': ['adapter-source:meta_research.reasoning_skill@sha256:4413a4af6b88670f5c06939a25246835cec3f1af22f45198ae0d007486f4d442',
+                         'adapter-source:meta_research.idea_skill@sha256:e20a48af0c526466baa2303cd1e9d4f028399da4389faca8b62e13439036d699',
+                         'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']},
+  'after': {'binding_type': 'ReasoningRuntimeBinding',
+            'profile': None,
+            'instruction_set_hash': '1ac6c9957680243fccb4d6898733904f67faba7cd32afd563ae5cada48ea4a14',
+            'sources': ['adapter-source:meta_research.reasoning_skill@sha256:082c7248dea06a39a946d74296b1d271e7acf445dd888df9d20d4194e95a94dd',
+                        'adapter-source:meta_research.idea_skill@sha256:fffedc566be7dc9c82dea96378e712d38f4aebe751432c7a60dd72118d657936',
+                        'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']}},
+ {'before': {'binding_type': 'WritingRuntimeBinding',
+             'profile': 'report',
+             'instruction_set_hash': '2dee231f549885ab12734fa86665099acd77e3f19a0dda9afea182d5646f3ca0',
+             'sources': ['adapter-source:meta_research.writing_skill@sha256:19415372a7d1a42845ba07f0729280ef881933b266b639384b4c80e33b383c42',
+                         'adapter-source:meta_research.idea_skill@sha256:e20a48af0c526466baa2303cd1e9d4f028399da4389faca8b62e13439036d699',
+                         'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                         'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']},
+  'after': {'binding_type': 'WritingRuntimeBinding',
+            'profile': 'report',
+            'instruction_set_hash': '2d5bc374d2e01ae751bc242daa7f5dfbcb37c43f977051ba3835ad909ba94ff0',
+            'sources': ['adapter-source:meta_research.writing_skill@sha256:90d484e00df31723cd348c162076fd119a25fa3f9f1f8a16986574be70576b2f',
+                        'adapter-source:meta_research.idea_skill@sha256:fffedc566be7dc9c82dea96378e712d38f4aebe751432c7a60dd72118d657936',
+                        'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                        'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']}},
+ {'before': {'binding_type': 'WritingRuntimeBinding',
+             'profile': 'paper',
+             'instruction_set_hash': 'cbb5eadf32b7df0103fe8a0c6b2cf13073993f7e352af167d05d1b403a177d50',
+             'sources': ['adapter-source:meta_research.writing_skill@sha256:19415372a7d1a42845ba07f0729280ef881933b266b639384b4c80e33b383c42',
+                         'adapter-source:meta_research.idea_skill@sha256:e20a48af0c526466baa2303cd1e9d4f028399da4389faca8b62e13439036d699',
+                         'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                         'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']},
+  'after': {'binding_type': 'WritingRuntimeBinding',
+            'profile': 'paper',
+            'instruction_set_hash': '45925ccde9f088e12d5519a6e07fc26d7ec5f04bfb7470da073adbc05145b375',
+            'sources': ['adapter-source:meta_research.writing_skill@sha256:90d484e00df31723cd348c162076fd119a25fa3f9f1f8a16986574be70576b2f',
+                        'adapter-source:meta_research.idea_skill@sha256:fffedc566be7dc9c82dea96378e712d38f4aebe751432c7a60dd72118d657936',
+                        'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                        'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']}},
+ {'before': {'binding_type': 'WritingRuntimeBinding',
+             'profile': 'presentation',
+             'instruction_set_hash': '3a106dd1364a62018d1f4953589ca5d8bd97690fb54f20af9885d77db003e263',
+             'sources': ['adapter-source:meta_research.writing_skill@sha256:19415372a7d1a42845ba07f0729280ef881933b266b639384b4c80e33b383c42',
+                         'adapter-source:meta_research.idea_skill@sha256:e20a48af0c526466baa2303cd1e9d4f028399da4389faca8b62e13439036d699',
+                         'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                         'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']},
+  'after': {'binding_type': 'WritingRuntimeBinding',
+            'profile': 'presentation',
+            'instruction_set_hash': '3b34c5db8fcdfd9eebe82248dec1ef484fd01491878e536d4b270b50edec63ac',
+            'sources': ['adapter-source:meta_research.writing_skill@sha256:90d484e00df31723cd348c162076fd119a25fa3f9f1f8a16986574be70576b2f',
+                        'adapter-source:meta_research.idea_skill@sha256:fffedc566be7dc9c82dea96378e712d38f4aebe751432c7a60dd72118d657936',
+                        'adapter-source:meta_research.root_resident_mcp@sha256:f87d3afd46e3b0c4459b1910e06ed3772d49aa28bf470c9bd624e5b157fd051f',
+                        'adapter-source:meta_research.provider_supervisor@sha256:b2c92ca7eba00714ed4bdfbe549f0977a7a4603101d0a77d2f8e1352c3da3f4c']}})
+
+
 def previous_system_mcp_binding(binding: Any) -> Any | None:
     sources = [entry for entry in binding.resource_bindings if entry.startswith("adapter-source:")]
-    for pair in _REVIEWED_REVISIONS:
+    for pair in (*_REVIEWED_REVISIONS, *_REVIEWED_TEST_MERGE_REVISIONS):
         before, after = pair["before"], pair["after"]
         if (
             type(binding).__name__ != after["binding_type"]

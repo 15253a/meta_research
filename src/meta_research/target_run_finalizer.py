@@ -15,6 +15,7 @@ import os
 import shutil
 import stat
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -332,6 +333,10 @@ class TargetRootAssetMemory(Protocol):
         operation_namespace: str | None = None,
     ) -> object: ...
 
+    def retry_asset_intake_after_resume(
+        self, request: AssetIntakeRequest, *, idempotency_key: str,
+    ) -> object: ...
+
     def verify_asset_binding(self, **values: object) -> None: ...
 
     def verify_asset_projection_binding(self, **values: object) -> None: ...
@@ -425,11 +430,44 @@ class SQLiteTargetRootCompletionMemoryAuthority:
         feed: DurableFeed,
         asset_memory: TargetRootAssetMemory,
         lifecycle: SQLiteTargetRootLifecycleAuthority,
+        *, recovery_graph=None, recovery_controls=None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._asset_memory = asset_memory
         self._lifecycle = lifecycle
+        self._recovery_graph = recovery_graph
+        self._recovery_controls = recovery_controls
+
+    def query_asset_intake_recovery(self, request: dict[str, object], *, failed_at: float):
+        """Resolve recovery through the actual AR, RG and AE authorities."""
+        if self._recovery_graph is None or self._recovery_controls is None:
+            return None
+        provenance = request.get("provenance")
+        if not isinstance(provenance, dict) or provenance.get("schema_ref") != (
+            "meta-research/target-root-artifact-provenance/v1"
+        ):
+            return None
+        completion = self._lifecycle.query_completion_by_ref(provenance.get("completion_ref"))
+        if completion is None or (
+            self._lifecycle.query_completion(completion.handle.target_ref) != completion
+            or self._lifecycle.query_completion_rejection(completion.completion_ref) is not None
+            or provenance.get("target_ref") != completion.handle.target_ref
+            or provenance.get("target_run_ref") != completion.handle.target_run_ref
+        ):
+            raise OwnerConflict("asset_intake_recovery_scope_invalid")
+        authority = self._recovery_graph.query_target_measurement_domain_authority(
+            completion.handle.target_ref
+        )
+        if authority is None:
+            raise OwnerConflict("asset_intake_recovery_scope_invalid")
+        recovery = self._recovery_controls.query_completed_resume_after(
+            stage_request_ref=authority.stage_request_ref, failed_at=failed_at,
+        )
+        if recovery is None:
+            return None
+        return {**recovery, "completion_ref": completion.completion_ref,
+                "target_run_ref": completion.handle.target_run_ref}
 
     def accept_historical_research_note(self, *, manifest_ref: str,
                                        evidence: TargetRootCompletionEvidence,
@@ -545,8 +583,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
                 }
             )
             try:
-                intake = self._asset_memory.submit_asset_intake(
-                    AssetIntakeRequest(
+                request = AssetIntakeRequest(
                         source_kind=("local_path" if artifact.source_path is not None else "file"),
                         custody_mode="managed",
                         display_name=f"target-root-artifact-{artifact.ordinal:04d}",
@@ -565,9 +602,19 @@ class SQLiteTargetRootCompletionMemoryAuthority:
                             **({"predecessor_version_ref": predecessor["version_ref"]}
                                if predecessor else {}),
                         },
-                    ),
-                    idempotency_key=intake_key,
+                    )
+                intake = self._asset_memory.submit_asset_intake(
+                    request, idempotency_key=intake_key,
                 )
+                if (getattr(intake, "status", None) == "failed"
+                        and getattr(intake, "failure_code", None) == "asset_intake_retry_exhausted"):
+                    intake = self._asset_memory.retry_asset_intake_after_resume(
+                        request, idempotency_key=intake_key,
+                    )
+                    if getattr(intake, "status", None) == "failed":
+                        # Storage recovery is an operator boundary, not a new
+                        # scientific candidate for the root agent to recreate.
+                        raise OwnerConflict("target_root_artifact_intake_unavailable")
                 asset = getattr(intake, "asset", None)
                 if getattr(intake, "status", None) == "failed":
                     raise OwnerConflict("target_root_artifact_intake_failed")
@@ -1255,6 +1302,7 @@ class TargetRunFinalizer:
                         system_owned=evidence.handoff is None,
                         final_text=evidence.final_text,
                         staging_directory=Path(staging_directory),
+                        retained_completion=completion,
                     )
                 except OwnerConflict as error:
                     feedback = self._memory.candidate_rejection_feedback(error.code)
@@ -1574,6 +1622,7 @@ class TargetRunFinalizer:
         system_owned: bool,
         final_text: str | None = None,
         staging_directory: Path | None = None,
+        retained_completion: AcceptedTargetRootCompletion | None = None,
     ) -> _FrozenWorkspace:
         workspace_ref = resolved_workspace.workspace_ref
         root_descriptor = resolved_workspace.descriptor
@@ -1591,13 +1640,20 @@ class TargetRunFinalizer:
                 raise OwnerConflict("target_implementation_workspace_invalid")
         frozen_artifacts: list[_FrozenArtifact] = []
         for ordinal, artifact in enumerate(handoff.artifacts):
-            frozen_artifact = _freeze_artifact(
-                root_descriptor,
-                ordinal,
-                artifact.role,
-                artifact.relative_path,
-                staging_directory=staging_directory,
-            )
+            frozen_artifact = None
+            if retained_completion is not None:
+                frozen_artifact = _reuse_frozen_artifact(
+                    _frozen_sources_root(resolved_workspace.path.parent, retained_completion),
+                    ordinal, artifact.role, artifact.relative_path,
+                )
+            if frozen_artifact is None:
+                frozen_artifact = _freeze_artifact(
+                    root_descriptor,
+                    ordinal,
+                    artifact.role,
+                    artifact.relative_path,
+                    staging_directory=staging_directory,
+                )
             frozen_artifacts.append(frozen_artifact)
         if system_owned and final_text is not None:
             # These are verified Harness bytes, not a filesystem claim. Keep
@@ -1736,7 +1792,7 @@ def _system_target_completion_handoff(
 
 def _declared_artifact_boundaries(document, relative_path, role):
     """Honor actual producers' exact selections; RG owns semantic rejection."""
-    if role not in {'data', 'analysis', 'log'}:
+    if role not in {'data', 'analysis', 'log', 'checkpoint'}:
         return ()
     selected = []
     for run in document.get('formal_runs', []):
@@ -1749,7 +1805,7 @@ def _declared_artifact_boundaries(document, relative_path, role):
                 and attempt.get('status', 'executed') in {'executed', 'failed'}
                 and not attempt.get('evaluation_attempt_ref'))
         for producer in producers:
-            declared = producer.get('artifact_paths')
+            declared = producer.get('checkpoint_paths' if role == 'checkpoint' else 'artifact_paths')
             if isinstance(declared, list) and len(declared) <= 100:
                 selected.extend(declared)
     for field in ('dataset_candidates', 'environment_candidates'):
@@ -2027,6 +2083,47 @@ def _completion_staging_directory(workspace: _PinnedWorkspaceRoot):
         raise OwnerConflict("target_root_artifact_storage_unavailable") from error
 
 
+def _frozen_sources_root(workspace_parent: Path,
+                         completion: AcceptedTargetRootCompletion) -> Path:
+    return workspace_parent / ".target-completion-intakes" / canonical_hash({
+        "completion_ref": completion.completion_ref,
+        "artifact_snapshot_hash": completion.artifact_snapshot_hash,
+    })
+
+
+def _reuse_frozen_artifact(root: Path, ordinal: int, role: str,
+                          relative_path: str) -> _FrozenArtifact | None:
+    """Read private custody without recopying it; AR still checks the whole snapshot.
+
+    Only an exact verified completion supplies this root. Inline artifacts are
+    rebuilt from the workspace, and accept_completion compares every resulting
+    hash with the original request before any RM handoff.
+    """
+    try:
+        root.lstat()
+    except FileNotFoundError:
+        return None
+    pinned = _pin_workspace_root("retained-target-completion", root)
+    try:
+        try:
+            descriptor, info = _open_artifact_component(
+                pinned.descriptor, f"artifact-{ordinal:04d}"
+            )
+        except OwnerConflict as error:
+            if error.code == "target_root_artifact_missing":
+                return None
+            raise
+        try:
+            return _freeze_streamed_artifact(
+                descriptor, info, ordinal, role, relative_path, None,
+                retained_source=root / f"artifact-{ordinal:04d}",
+            )
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(pinned.descriptor)
+
+
 def _persist_frozen_sources(frozen: _FrozenWorkspace, completion: AcceptedTargetRootCompletion,
                             workspace_parent: Path) -> _FrozenWorkspace:
     try:
@@ -2047,8 +2144,7 @@ def _publish_frozen_sources(frozen: _FrozenWorkspace, completion: AcceptedTarget
     if not any(artifact.source_path for artifact in frozen.artifacts):
         return frozen
     parent = workspace_parent / ".target-completion-intakes"
-    root = parent / canonical_hash({"completion_ref": completion.completion_ref,
-                                   "artifact_snapshot_hash": frozen.artifact_snapshot_hash})
+    root = _frozen_sources_root(workspace_parent, completion)
     for directory in (parent, root):
         directory.mkdir(mode=0o700, exist_ok=True)
         if not stat.S_ISDIR(directory.lstat().st_mode):
@@ -2096,17 +2192,21 @@ def _remove_frozen_sources(frozen: _FrozenWorkspace) -> None:
 
 def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: int,
                               role: str, relative_path: str,
-                              staging_directory: Path | None) -> _FrozenArtifact:
+                              staging_directory: Path | None, *,
+                              retained_source: Path | None = None) -> _FrozenArtifact:
     """Copy from pinned descriptors to a private snapshot using bounded reads.
 
     RM receives this service-owned snapshot, never a reopened mutable Target
     path. Its accepted hash must match this independently frozen content. The
     caller keeps staging outside the Target workspace, on its storage volume,
     and removes it after acceptance or failure.
+
+    A retained_source is already private custody for the exact AR completion:
+    read and hash it with the same descriptor checks, without another copy.
     """
-    if staging_directory is None:
+    if staging_directory is None and retained_source is None:
         raise OwnerConflict("target_root_artifact_storage_unavailable")
-    destination = staging_directory / f"artifact-{ordinal:04d}"
+    destination = retained_source if retained_source is not None else staging_directory / f"artifact-{ordinal:04d}"
     states: dict[str, tuple[object, ...]] = {}
     directories: list[str] = []
     entries: list[dict[str, object]] = []
@@ -2117,12 +2217,13 @@ def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: in
         digest = hashlib.sha256()
         size = 0
         os.lseek(fd, 0, os.SEEK_SET)
-        with output.open("xb") as stream:
+        with (output.open("xb") if retained_source is None else nullcontext()) as stream:
             while size < before.st_size:
                 chunk = os.read(fd, min(1024 * 1024, before.st_size - size))
                 if not chunk:
                     break
-                stream.write(chunk)
+                if stream is not None:
+                    stream.write(chunk)
                 digest.update(chunk)
                 size += len(chunk)
         if size != before.st_size or _descriptor_stat_identity(before) != _descriptor_stat_identity(os.fstat(fd)):
@@ -2147,7 +2248,8 @@ def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: in
             try:
                 if stat.S_ISDIR(child_info.st_mode):
                     if not verify:
-                        (destination / path).mkdir()
+                        if retained_source is None:
+                            (destination / path).mkdir()
                         directories.append(path)
                     walk(child, child_info, path, verify=verify)
                 elif stat.S_ISREG(child_info.st_mode):
@@ -2170,7 +2272,8 @@ def _freeze_streamed_artifact(descriptor: int, info: os.stat_result, ordinal: in
             digest, size = copy_file(descriptor, info, destination)
             kind, media_type = "file", "application/octet-stream"
         elif stat.S_ISDIR(info.st_mode):
-            destination.mkdir()
+            if retained_source is None:
+                destination.mkdir()
             walk(descriptor, info, "", verify=False)
             walk(descriptor, os.fstat(descriptor), "", verify=True)
             if role == "implementation" and not entries:

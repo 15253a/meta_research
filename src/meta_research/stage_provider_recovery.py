@@ -46,20 +46,23 @@ class StoppedStageProviderRecovery:
             return None
 
     def read_for_operator_resume(self, run_ref: str) -> dict[str, object] | None:
-        """Verify a paused primary's exact stopped transport without replaying it."""
+        """Verify the exact stopped transport before replacing a paused call."""
         try:
             scope = self._reader._validated_scope(
                 self._reader._scope_lookup(run_ref), run_ref=run_ref
             )
-            if (scope["status"] != "completed"
-                    or scope["run_kind"] != "reasoning_stage"
-                    or scope["unit_kind"] != "reasoning_primary"):
+            expected_phase = {
+                ("reasoning_stage", "reasoning_primary"): "primary",
+                ("bundle_stage", "bundle_primary"): "primary",
+                ("plan_stage", "plan_review"): "review",
+            }.get((scope["run_kind"], scope["unit_kind"]))
+            if scope["status"] != "completed" or expected_phase is None:
                 return None
             operation = self._reader._resolve_operation(scope)
             if operation is None:
                 raise OwnerConflict("operator_stop_checkpoint_unavailable")
             directory, invocation_hash, phase, expected_native = operation
-            if phase != "primary":
+            if phase != expected_phase:
                 raise OwnerConflict("operator_stop_checkpoint_invalid")
             receipt_path = directory / "supervisor-exit.json"
             if not receipt_path.exists():
@@ -80,7 +83,7 @@ class StoppedStageProviderRecovery:
                 raise OwnerConflict("operator_stop_checkpoint_invalid")
             native = _verified_native_session(stdout, expected=expected_native)
             return {
-                "schema_ref": "meta-research/operator-stopped-primary/v1",
+                "schema_ref": f"meta-research/operator-stopped-{phase}/v1",
                 "scope": scope,
                 "native_session_ref": native,
                 "invocation_hash": invocation_hash,

@@ -18,9 +18,10 @@ def _load(name):
     return ReasoningRuntimeBinding(**value)
 
 
-@pytest.fixture
-def pair():
-    return _load("reasoning-binding-before.json"), _load("reasoning-binding-after.json")
+@pytest.fixture(params=["", "20260928-", "20260928-0651-"])
+def pair(request):
+    prefix = "reasoning-binding-" + request.param
+    return _load(prefix + "before.json"), _load(prefix + "after.json")
 
 
 def test_actual_deployment_pair_preserves_frozen_bindings(pair):
@@ -35,7 +36,7 @@ def test_actual_deployment_pair_preserves_frozen_bindings(pair):
     assert (before.as_dict(), after.as_dict()) == original
 
 
-def test_release_diff_contains_only_reviewed_prose_and_adapter(pair):
+def test_release_diff_contains_only_reviewed_resources(pair):
     before, after = pair
     assert len(before.resource_bindings) == len(after.resource_bindings)
     assert before.model_ref == after.model_ref
@@ -51,8 +52,31 @@ def test_release_diff_contains_only_reviewed_prose_and_adapter(pair):
     )
     changed = [(old, new) for old, new in zip(before.resource_bindings, after.resource_bindings) if old != new]
     assert changed
+    if canonical_hash(before.as_dict()) == "1c94cc1e0efa9ff348b1b4e7c8c653b44df119ac732230be948b4f900cf27a51":
+        allowed = allowed[:2]
+        assert len(changed) == 2
+    elif canonical_hash(before.as_dict()) == "d8bdbd84dbbed7f75f54819fa3f3c47d21af8a7ef90d4820c5b6af21b875f74a":
+        allowed = (
+            allowed[1], allowed[3],
+            "output-schema:reasoning-primary-output@sha256:",
+            "output-schema:reasoning-review@sha256:",
+            "output-schema:reasoning-autonomous-review@sha256:",
+        )
+        assert len(changed) == 5
     for old, new in changed:
         assert any(old.startswith(prefix) and new.startswith(prefix) for prefix in allowed)
+
+
+def test_20260928_0651_fixture_retains_reviewed_deployment_identity():
+    # This is an immutable deployment record, not the current prompt/adapter.
+    # Later instruction releases must not rewrite its history or inherit it.
+    fixture = Path(__file__).parent / "fixtures" / "reasoning_binding_compatibility" / "reasoning-binding-20260928-0651-after.json"
+    document = json.loads(fixture.read_text(encoding="utf-8"))
+    after = _load(fixture.name)
+    assert document["run_ref"] == "reasoning_run_f957df900e0441d792d3d78a51c16e7e"
+    assert document["source_commit"] == "2c7abb80b1b9d649167e6ed310ec39657c5c5ef5"
+    assert document["runtime_binding_hash"] == canonical_hash(after.as_dict())
+    assert document["runtime_binding_hash"] == "c846926fd589eed5ea41608fedfabd33ff05b6302f01670fcb6e61d3df7f2243"
 
 
 @pytest.mark.parametrize("side", (0, 1))

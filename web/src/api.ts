@@ -6297,23 +6297,26 @@ export function followProjection(
     const update = (event: Event) => {
       if (stopped || stream !== next) return;
       if (!acceptCursor(event)) return;
-      if (onResearchActivity && event.type === "projection.updated") {
+      let observationsOnly = false;
+      if (event.type === "projection.updated") {
         try {
           const payload = JSON.parse((event as MessageEvent<string>).data) as {
             event_type?: unknown;
           };
           if (typeof payload.event_type === "string" && payload.event_type) {
-            onResearchActivity({
+            onResearchActivity?.({
               event_type: payload.event_type,
               revision: cursor,
               observed_at: Date.now(),
             });
+            observationsOnly = payload.event_type
+              === "agent_runtime.target_root_observations_available";
           }
         } catch {
           // Activity copy is advisory. Snapshot reload remains authoritative.
         }
       }
-      scheduleSnapshotReload();
+      if (!observationsOnly) scheduleSnapshotReload();
     };
     next.addEventListener(
       "agent_runtime.target_root_observations_available",

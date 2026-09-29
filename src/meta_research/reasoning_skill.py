@@ -1189,10 +1189,15 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "不得输出看似成功的候选。若目标是已存在且可选择的 Question，或提出完成，"
             "返回闭合 reasoning-stage-output：ScientificOutcomeCandidate 必须是 "
             "affirmed | denied | uncertain | insufficient_evidence 之一，并且恰有一个 "
-            "NextCycleProposal | CandidateCompletion。若科学上必须新建或分解 Question，"
+            "NextCycleProposal | CandidateCompletion。按上述 Skill 评估 Bundle 统一交接的"
+            "唯一建题推荐；没有推荐时完成普通综合，保留项不逐个升级为新题。"
+            "比较已有题覆盖范围与独立研究价值后，若保留"
+            "新建或分解 Question 的候选，"
             "改为返回非终态 reasoning-autonomous-checkpoint：同一 scientific_outcome 加"
             "一个 internal AutonomousQuestionScope；它只包含 reviewed question blueprint、"
             "mode、entry stage 与 typed skip basis，绝不能伪装成 outward transition。"
+            "正式建题必须先经现有 AutonomousCreation 的 DeepFetch 了解当前研究现状，"
+            "再按上述 Skill 调整候选并决定是否创建。"
             "NextCycleProposal 必须闭合 entry_stage 与 exact typed skip basis；"
             "下一 Cycle 只能进入 idea、plan 或 reasoning，不能直接进入 bundle。"
             "继续实施前由 Plan 根据最新证据重新选择本轮工作；进入 plan 可复用已接纳 IdeaSet。"
@@ -1354,7 +1359,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         schema = {"type": "object", "additionalProperties": False,
             "properties": {"action": {"type": "string", "enum": ["create", "decline", "retry"]}, "final_output": final_schema},
             "required": ["action", "final_output"]}
-        prompt = (_reasoning_skill_instructions() + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。依据新材料重新判断，可改变结论及拟题六字段。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
+        prompt = (_reasoning_skill_instructions() + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。继续评估已进入本次 DeepFetch 的唯一候选，保留其实际交接来源；新建题推荐按上述 Skill 由 Bundle 统一交接。依据摘要中的当前研究现状、已有题覆盖范围及后续可开展的研究，判断其是否值得独立追踪，可调整结论及拟题六字段，再决定是否创建，不扩为多个问题或轮流启动其余保留项。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
             + "completion_feedback=" + canonical_json(list(request.continuation_feedback)) + "\ncheckpoint=" + canonical_json(checkpoint) + "\nfacts=" + canonical_json(facts) + "\nsummary=" + canonical_json(summary))
         decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref)
         if native_session != request.native_session_ref:
@@ -1826,7 +1831,17 @@ def _scientific_outcome_schema(
             "type": "array",
             "minItems": len(cast(list[object], frozen_causal[field])),
             "maxItems": len(cast(list[object], frozen_causal[field])),
-            "items": text,
+            "items": {
+                **text,
+                "maxLength": max(
+                    (len(ref) for ref in cast(list[str], frozen_causal[field])),
+                    default=1,
+                ),
+            },
+            "description": (
+                f"Copy research_context.causal_context.{field} in its frozen "
+                "order, with one complete, unmodified reference per string."
+            ),
         }
         for field in (
             "target_commit_refs",
@@ -1907,10 +1922,21 @@ def _scientific_outcome_schema(
                             "question_ref": {"const": request.question_ref},
                             "prior_accepted_outcome_refs": {
                                 "type": "array",
-                                "items": text,
+                                "items": {
+                                    **text,
+                                    "maxLength": max(
+                                        (len(ref) for ref in prior_refs), default=1
+                                    ),
+                                },
                                 "minItems": len(prior_refs),
                                 "maxItems": len(prior_refs),
                                 "uniqueItems": True,
+                                "description": (
+                                    "Copy each outcome_ref from the frozen "
+                                    "research_context.graph_binding."
+                                    "prior_current_question_outcomes in order; "
+                                    "each string contains one complete reference exactly once."
+                                ),
                             },
                             "progress": text,
                         },

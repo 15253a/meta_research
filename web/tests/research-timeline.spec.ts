@@ -552,6 +552,44 @@ test("the independent tree displays saved recorder sentences verbatim and keeps 
   expect(errors).toEqual([]);
 });
 
+test("saved summary time separates an old Target sentence from its completed live state", async ({ page }) => {
+  const { timeline, recorder, catalog, snapshot, errors } = await openTimeline(page);
+  const key = `target:${CYCLE_REF}:target-143-a`;
+  const oldSentence = "本项目尚无独立资格判断结果。";
+  updateSummary(recorder, key, { summary: oldSentence, updated_at: SOURCE_TIME });
+  snapshot.bundle_stage.target_graph.targets[0].status = "completed";
+  Object.assign(catalog.sessions.find(session => session.target_ref === "target-143-a")!, {
+    status: "completed", is_executing: false,
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const target = cycleNode(timeline).locator('.research-timeline-target[data-target-ref="target-143-a"]');
+  await expect(target.locator(".research-timeline-target-state")).toHaveText("已完成");
+  await expect(target.locator(".timeline-summary-text")).toHaveText(oldSentence);
+  await expect(target.locator(".timeline-summary-saved-at")).toHaveText(/^记录员独立摘要 · 保存于 2026\/09\/09 \d{2}:\d{2}$/);
+  await expect(summaryNode(timeline, key)).toHaveAttribute("data-summary-stale", "false");
+  expect(errors).toEqual([]);
+});
+
+test("saved summary time separates old Reasoning prose and preserves missing-time pending and failed notices", async ({ page }) => {
+  const { timeline, recorder, errors } = await openTimeline(page);
+  const key = `stage:${CYCLE_REF}:reasoning`;
+  const oldSentence = "本轮尚无可供综合核对的研究结果或实验依据。";
+  updateSummary(recorder, key, { summary: oldSentence, updated_at: SOURCE_TIME });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const reasoning = summaryNode(timeline, key);
+  await expect(reasoning.locator(".timeline-summary-text")).toHaveText(oldSentence);
+  await expect(reasoning.locator(".timeline-summary-saved-at")).toHaveText(/^记录员独立摘要 · 保存于 2026\/09\/09 \d{2}:\d{2}$/);
+  await expect(cycleNode(timeline).locator('[data-stage="reasoning"] .research-timeline-stage-state')).toContainText("当前阶段");
+  updateSummary(recorder, key, { updated_at: null, status: "pending" });
+  await expect(reasoning.locator(".timeline-summary-saved-at")).toHaveText("记录员独立摘要（保存时间未知）");
+  await expect(reasoning.locator(".timeline-summary-status")).toHaveText("总结待更新");
+  updateSummary(recorder, key, { status: "failed" });
+  await expect(reasoning.locator(".timeline-summary-status")).toHaveText("更新暂不可用");
+  await expect(reasoning.locator(".timeline-summary-saved-at")).toHaveText("记录员独立摘要（保存时间未知）");
+  await expect(reasoning.locator(".timeline-summary-text")).toHaveText(oldSentence);
+  expect(errors).toEqual([]);
+});
+
 test("missing recorder sentences never fall back to clipped source text or assembled status strings", async ({ page }) => {
   const { timeline, recorder, errors } = await openTimeline(page, { runningBundle: true, summaryMode: "pending" });
   const plan = summaryNode(timeline, `stage:${CYCLE_REF}:plan`);

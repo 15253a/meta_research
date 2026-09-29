@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import type { OverviewCycle, OverviewStageArtifact } from "./ResearchOverview";
+import type { RootSession } from "./rootSessionsApi";
 
 export type TimelineSummaryNode = {
   node_key: string;
@@ -23,6 +25,23 @@ export type TimelineSummaries = {
   nodes: TimelineSummaryNode[];
 };
 
+export function summaryNeedsAcceptedResultReview(node: TimelineSummaryNode | undefined, cycle: OverviewCycle,
+  artifacts: OverviewStageArtifact[], sessions: RootSession[], sourcesObservedAt: number): boolean {
+  if (!node?.summary?.trim() || !Number.isFinite(sourcesObservedAt) || sourcesObservedAt <= 0
+    || node.cycle_ref !== cycle.cycle_ref || node.question_ref !== cycle.question_ref
+    || (node.kind !== "cycle" && node.kind !== "stage")) return false;
+  // observed_at marks the start of this Quest's source scan, not its WAL cut.
+  // A later completed run warrants checking the saved prose against the
+  // accepted result; it does not prove that the scan omitted that result.
+  return artifacts.some(artifact => artifact.status === "accepted" && artifact.source.commit_ref
+    && artifact.source.run_ref && (node.kind !== "stage" || node.stage === artifact.stage)
+    && sessions.some(session => session.kind === "stage" && session.status === "completed" && !session.is_executing
+      && session.run_ref === artifact.source.run_ref && session.stage === artifact.stage
+      && session.cycle_ref === cycle.cycle_ref && session.question_ref === cycle.question_ref
+      && typeof session.updated_at === "number" && Number.isFinite(session.updated_at)
+      && session.updated_at > sourcesObservedAt));
+}
+
 const nullableText = (value: unknown) => value === null || typeof value === "string";
 
 function validNode(node: TimelineSummaryNode): boolean {
@@ -45,9 +64,10 @@ export function useTimelineSummaries(questRef: string | null) {
   const [result, setResult] = useState<{
     questRef: string | null;
     revision: number;
+    observedAt: number;
     nodes: Record<string, TimelineSummaryNode>;
     error: boolean;
-  }>({ questRef: null, revision: -1, nodes: {}, error: false });
+  }>({ questRef: null, revision: -1, observedAt: 0, nodes: {}, error: false });
   useEffect(() => {
     const changed = () => setVisible(document.visibilityState !== "hidden");
     document.addEventListener("visibilitychange", changed);
@@ -84,11 +104,11 @@ export function useTimelineSummaries(questRef: string | null) {
                 updated_at: saved.updated_at, sources: saved.sources }
               : node;
           }
-          return { questRef, revision: data.revision, nodes, error: false };
+          return { questRef, revision: data.revision, observedAt: data.observed_at, nodes, error: false };
         });
       } catch {
         if (!stopped) setResult(previous => previous.questRef === questRef ? { ...previous, error: true }
-          : { questRef, revision: -1, nodes: {}, error: true });
+          : { questRef, revision: -1, observedAt: 0, nodes: {}, error: true });
       } finally {
         window.clearTimeout(deadline);
         if (!stopped) timer = window.setTimeout(read, 5_000);
@@ -97,5 +117,5 @@ export function useTimelineSummaries(questRef: string | null) {
     void read();
     return () => { stopped = true; request?.abort(); window.clearTimeout(timer); };
   }, [questRef, visible]);
-  return result.questRef === questRef ? result : { questRef, revision: -1, nodes: {}, error: false };
+  return result.questRef === questRef ? result : { questRef, revision: -1, observedAt: 0, nodes: {}, error: false };
 }

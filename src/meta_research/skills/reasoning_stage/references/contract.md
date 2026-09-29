@@ -23,6 +23,10 @@ candidate_completion: CandidateCompletion | null
 
 每项科学引用恰含 `kind + ref + finding`，引用冻结闭包、Plan 精确复用或同 Quest 可核验历史。Owner 逐条检查精确版本、范围和来源；引用类别、数量和是否测量不预设科研资格。纯理论可零外部引用，仍说明推导和局限。disposition 对 claim、missing 和 uncertainty 的具体形状由当前 `reasoning_contract.py` 校验。
 
+以字符串 ref 为元素的引用数组，每项只放一个原样精确 ref，数组内不重复；多个来源用独立数组项，不用分号、逗号或说明文字拼进同一字符串。`causal_interpretation` 的 `target_commit_refs`、`changed_axis_fact_refs`、`held_fixed_fact_refs`、`provenance_refs` 分别原样采用 ContextPack `research_context.causal_context` 中的对应完整数组，保持顺序与空数组，不跨字段搬移引用；`attribution_basis_refs` 只列实际引用的依据，解释写入 statement、finding 等正文。
+
+`research_synthesis.current_question.prior_accepted_outcome_refs` 按冻结 `research_context.graph_binding.prior_current_question_outcomes` 的顺序逐项复制完整 `outcome_ref`，没有历史时写 `[]`。每个字符串写完一个完整 ref 就闭合引号，再进入下一项；逐项核对整个列表，认识变化写入 `progress`。
+
 `support_scope`、`limitations`、`causal_interpretation` 和四尺度 `research_synthesis` 表达认识和继续／改变／等待理由，允许认识未变。AE 冻结 graph revision、活动问题、父链、当前 Question 历史页、Goal revision、上游 Commit 和 Target 来源；有界历史页含总量与继续入口，不代表完整历史。正文按当前冻结版本核验，恢复不切换 latest。
 
 ## NextCycleProposal
@@ -39,4 +43,4 @@ RG 在 transition 接纳时重验 QuestionAnchor、present／open 和各依据�
 
 ## AutonomousCreation 与恢复
 
-初始 AR checkpoint 保存执行草稿和 hash；DeepFetch summary 接纳后，同一 native Session 读回并决定 create／decline，failed／cancelled 无 summary 时还可 retry。create 修订后才接纳唯一 ScientificOutcome，再经 HC／RM／AE／RG 创建 Question 并挂文献；decline 直接完成普通综合。最终同一 Session 可选择当前、已有或新 Question。原 checkpoint、科学内容、DeepFetch 尝试及决定不可变，重启按已有事实继续，不重复 summary、候选或 Question。
+初始 AR checkpoint 保存执行草稿和 hash；正式建题以 DeepFetch summary 接纳及同一 native Session 读回后的 create 决定为前提。Session 根据摘要中的研究现状、已有题覆盖范围和独立研究价值调整候选并决定 create／decline；摘要接纳本身不要求创建问题。failed／cancelled 无 summary 时还可 retry。create 修订后才接纳唯一 ScientificOutcome，再经 HC／RM／AE／RG 创建 Question 并挂文献；decline 直接完成普通综合。最终同一 Session 可选择当前、已有或新 Question。原 checkpoint、科学内容、DeepFetch 尝试及决定不可变，重启按已有事实继续，不重复 summary、候选或 Question。

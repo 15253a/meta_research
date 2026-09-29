@@ -2246,6 +2246,19 @@ class SQLiteTargetRunGraphAuthority:
         NormalizedCompletionContract,
         tuple[ExperimentBrief, ...],
     ]:
+        # Standalone Target preparation shares historical proofs only for this
+        # read. Callers retain their separate write and workspace boundaries.
+        with self._database.read_snapshot():
+            return self._read_current_formal_plan_facts(graph_ref)
+
+    def _read_current_formal_plan_facts(
+        self, graph_ref: str
+    ) -> tuple[
+        AcceptedTargetGraph,
+        AcceptedFormalPlanContent,
+        NormalizedCompletionContract,
+        tuple[ExperimentBrief, ...],
+    ]:
         with self._database.read() as connection:
             row = connection.execute(
                 text(
@@ -2590,13 +2603,19 @@ class SQLiteTargetRunGraphAuthority:
     def _selected_input_assets(
         self, target_ref: str, *, commit_sources: dict[str, list[str]] | None = None
     ) -> tuple[tuple[str, ...], dict[str, _SelectedTargetInput]]:
-        """Resolve exact Plan selections and accepted dependency artifacts.
+        """Resolve Plan evidence selections and Bundle's exact asset inputs.
 
         Catalog evidence identities remain distinct from RM asset identities.
         The existing RG leaf resolver authenticates the Plan selection, source
         TargetCommit and bytes; the catalog-entry hash fixes the wrapper asset
         even when a legacy leaf cites a more specific experimental role.
         """
+        with self._database.read_snapshot():
+            return self._read_selected_input_assets(target_ref, commit_sources=commit_sources)
+
+    def _read_selected_input_assets(
+        self, target_ref: str, *, commit_sources: dict[str, list[str]] | None = None
+    ) -> tuple[tuple[str, ...], dict[str, _SelectedTargetInput]]:
         refs = self._declared_input_asset_refs(target_ref)
         _quest_ref, dependency_assets = self._dependency_input_assets(target_ref, refs)
         resolved: dict[str, _SelectedTargetInput] = {}
@@ -2676,7 +2695,7 @@ class SQLiteTargetRunGraphAuthority:
         commit_leaves = [leaf for leaf in leaves if leaf.role in {"MetricResult", "WorkProduct"}]
         asset_leaves = [leaf for leaf in leaves if leaf.role == "AssetVersion"]
         if not commit_leaves and not asset_leaves:
-            return tuple(refs), resolved
+            return self._resolve_remaining_quest_inputs(refs, resolved, quest_ref=row.quest_ref)
         with self._database.read() as connection:
             plan = connection.execute(text(
                 "SELECT r.context_pack_json, r.context_pack_hash FROM "
@@ -2795,7 +2814,26 @@ class SQLiteTargetRunGraphAuthority:
                     if commit_sources is not None:
                         selected = commit_sources.setdefault(commit_ref, [])
                         selected.extend(ref for ref in sorted(relevant_refs) if ref not in selected)
-        return tuple(refs), resolved
+        return self._resolve_remaining_quest_inputs(refs, resolved, quest_ref=row.quest_ref)
+
+    def _resolve_remaining_quest_inputs(
+        self, refs: tuple[str, ...], resolved: dict[str, _SelectedTargetInput], *, quest_ref: str
+    ) -> tuple[tuple[str, ...], dict[str, _SelectedTargetInput]]:
+        # Preserve Plan/dependency provenance first, including companion source
+        # trees already frozen by earlier inputs. Plan evidence is not an asset
+        # allowlist: Bundle may also name an exact accepted version in this Quest.
+        # Never infer a bare asset's version from its latest content.
+        selected_assets = {item.asset.asset_ref: item.asset for item in resolved.values()}
+        for ref in refs:
+            if ref in resolved or not ref.startswith("asset_version_"):
+                continue
+            asset = self._domain_reader.verify_asset_quest_scope(ref, quest_ref=quest_ref)
+            previous = selected_assets.get(asset.asset_ref)
+            if previous is not None and previous != asset:
+                raise OwnerConflict("target_input_evidence_version_conflict")
+            selected_assets[asset.asset_ref] = asset
+            resolved[ref] = _SelectedTargetInput(asset, quest_ref)
+        return refs, resolved
 
     def _dependency_input_assets(
         self, target_ref: str, refs: tuple[str, ...]
@@ -2993,7 +3031,7 @@ class SQLiteTargetRunGraphAuthority:
         return current
 
     def prepare_input_assets(self, target_ref: str) -> bool:
-        """Issue exact Target proofs from Plan selections or accepted dependencies."""
+        """Issue exact proofs from Plan evidence or Bundle's accepted Quest inputs."""
         refs = self._declared_input_asset_refs(target_ref)
         quest_ref, dependency_assets = self._dependency_input_assets(target_ref, refs)
         dependency_progress = False

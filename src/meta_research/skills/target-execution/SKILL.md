@@ -43,6 +43,8 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 维护 `outputs/analysis/research-note.md`：开头给出短摘要，再说明认识、支持与缺失证据、继续／改向／等待的理由。交接或压缩后续接前更新；沿精确旧版本核查先前边界。当前及上游 `research_notes` 提供摘要和正文入口；历史分页用 `research_memory.research_notes.read` 的 `research_notes_reader` 与 `index_page.next_offset`。精确正文用 `source=research_note_body`、`source_ref=version_ref`；Target 调用省略 `context_pack_ref` 与 `predecessor_ref`。说明不替代正式输入绑定或实际指标。
 
+执行中发现新未知时，在研究说明中向调用本 Target 的 Bundle 交接发现依据、与当前或已有问题的关系及值得继续研究的线索。能够在已有题内处理的，保留为该题的后续工作；确有独立追踪价值时说明理由和可能开展的研究。Target 按当前合同交回实际结果与线索，不直接向 Reasoning 提交建题候选；由 Bundle 汇总多个 Target、保留并筛选后统一交接。一次失败、待办事项或资源缺口本身不足以成为建题理由。
+
 完成条件：拟保留产物稳定、来源和实际生产者明确，所有想长期使用的材料都已选入交接；临时工作区不承担永久保存。
 
 ## 4. 独立审阅并交接

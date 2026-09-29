@@ -15,6 +15,8 @@ Use Python 3.11–3.13 and the checked-in `uv.lock` for the Python environment. 
 
 Current design work: [memory-system map](https://github.com/15253a/meta_research/issues/148) and [evidence documents](docs/memory/README.md).
 
+Branch synchronization: [v1-test integration into v1-enginer](docs/v1-test-integration.md), including incremental merge steps, validation results, and deployment compatibility boundaries.
+
 ## Browser access
 
 Local loopback and SSH-forwarded browser access needs no login by default. Open the daemon's fixed HTTP address directly, for example `http://127.0.0.1:8769`. `meta-research launch` opens that address, and `launch --no-browser` returns the same reusable URL instead of a short-lived HTML login file. Missing or expired browser sessions are renewed automatically.

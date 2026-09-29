@@ -2844,6 +2844,21 @@ def _write_exit_marker(
             raise IdeaSkillUnavailable("codex_operation_spool_invalid")
     if marker["returncode"] == 0 and not result_path.is_file():
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+    if termination_reason == "completed" and effective_returncode != 0:
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            detail = (event if event.get("type") == "error" else event.get("error")
+                      if event.get("type") == "turn.failed" else None)
+            message = detail.get("message") if isinstance(detail, dict) else None
+            if isinstance(message, str) and message.replace("’", "'").startswith("You've hit your usage limit."):
+                # Derived only after the signed terminal stdout is verified;
+                # keep the existing sealed exit marker bytes unchanged.
+                return {**marker, "failure_code": "codex_usage_limit"}
     return marker
 
 
@@ -2898,7 +2913,7 @@ def _provider_hard_ceiling_error(
     returncode = marker.get("returncode")
     if not isinstance(returncode, int) or isinstance(returncode, bool):
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
-    failure_code = {
+    failure_code = "codex_usage_limit" if marker.get("failure_code") == "codex_usage_limit" else {
         "timeout": "codex_operation_timeout",
         "output_limit": "codex_operation_output_limit",
     }.get(termination_reason)

@@ -21,6 +21,8 @@ HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 按系统提�
 
 `source_kind` 选实际单一类别，不写四类拼接值；coverage 的 evidence use 使用同一 ref。Target 证据使用工具返回的完整 EvidenceRef。`additional_evidence_bindings` 只提交本轮读过并实际采用的条目，最多 32 项；adapter 写入 `source_bindings.selected_evidence_catalog`，RG 重验真实接纳事实、同 Quest 范围和内容，并供后续读回。
 
+采用文献时，`LiteratureSnapshot` 的 `source_ref` 和 `evidence_ref` 都复制已接纳文献修订返回的 `literature_snapshot_ref`（`literature_snapshot_...`）。DOI、URL 和 `citation_key` 定位快照中的具体论文，写在 `supported_claim`、`support_boundary` 或 notes 中；它们不是快照身份。同一快照的多篇论文共用一个来源 binding，各 evidence use 分别说明所读论文、主张及适用边界。提交前逐项对照工具返回的来源类型和精确 ref。
+
 Dataset／Environment 的登记与用途关系帮助发现；实际实施需要数字材料时，由 Bundle 绑定所需 AssetVersion；实体资源与现成服务按真实来源及已知使用条件安排，需适配的工作在相关 Brief 中说明。Environment 含义和使用知识供判断，本轮资源选择与预算读取当前运行条件，登记记录本身不证明资源可用或权限已授予。人类意见可供判断，不能替代执行授权或 HumanRequest 已满足事实。
 
 ## 职责与顺序
