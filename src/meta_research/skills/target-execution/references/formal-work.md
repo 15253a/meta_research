@@ -49,7 +49,11 @@ Run 可选字段包括 `variant_ref`、`baseline_forward_contract`、`variant_re
 
 修订实现前保留每个实际 Run 使用的快照。多版本可放在 `implementation/run-a/`、`implementation/run-b/`，各 Run 用 `implementation_paths` 精确选择；多个 Run 可选择同一快照。只有一份普通 `implementation/` 时可省略选择器，多条目时逐 Run 明确指定。系统派生实现版本，显式 `implementation_revision_ref` 仅断言该精确值。记录真实命令和观察输出，hash 本身不证明实施。
 
-按研究需要保留状态；`checkpoint_policy` 不要求数量，也不把产物存在作为门槛。多个新 Run 共同交接时，产出状态的 Run 用 `checkpoint_paths` 声明精确归属；全部保留状态已有归属后，无状态的 Run 可省略该字段，也可写 `[]`。仅一个新 Run 时，省略该字段默认采用本次全部保留状态。混合目录不能说明跨 Run 归属。评价可用 `checkpoint_paths` 选择实际评价的子集，否则使用该 Run 的保留状态。需要独立评价的状态应独立可寻址；未保留重要中间状态时说明局限。
+按研究需要保留状态；`checkpoint_policy` 不要求数量，也不把产物存在作为门槛。需按 checkpoint 交接的新状态，按 `completion_binding.optional_workspace_paths.checkpoint` 保存在 `outputs/checkpoints/`，`checkpoint_paths` 引用其中实际文件或目录的精确工作区相对路径。宿主按保存目录区分角色；`outputs/data/` 内的文件按 data 交接，单独将其列入 `checkpoint_paths` 不会改变角色。
+
+多个新 Run 共同交接时，产出状态的 Run 用 `checkpoint_paths` 声明精确归属；全部保留状态已有归属后，无状态的 Run 可省略该字段，也可写 `[]`。仅一个新 Run 时，省略该字段默认采用本次全部保留状态。混合目录不能说明跨 Run 归属。评价可用 `checkpoint_paths` 选择实际评价的子集，否则使用该 Run 的保留状态。需要独立评价的状态应独立可寻址；未保留重要中间状态时说明局限。
+
+因状态保存目录或选择器错配收到修订时，复用已有状态，校正存放位置及对应 Run／评价的精确路径，保持状态内容、已有训练记录、指标和来源 hash 不变，再沿同一 Session 正常交接；这类交接修订无需重训。
 
 对复用 `variant_run_ref` 的新评价选择当前状态角色；路径匹配多个移入状态时，以 `checkpoint_role_refs` 或 `checkpoint_version_refs` 选择精确对象。复用已接纳评价则保持其原冻结角色引用，不随归属变更而改写。
 

@@ -1314,6 +1314,48 @@ def _verify_declared_subject_artifact_bindings(work, entries):
             raise error
 
 
+def _verify_new_checkpoint_selections(items, entries):
+    """Return new-work path mistakes through the existing revision boundary."""
+    checkpoints = [entry for entry in entries if entry['role'] == 'checkpoint']
+    new_runs = {item['variant_run_ref']: item.get('checkpoint_paths')
+                for item in items if not item['reuse_variant_run']}
+    defaults = _default_checkpoint_paths(new_runs, checkpoints)
+
+    def select(records, paths, kind, run_key):
+        try:
+            return _select_checkpoint_records(records, paths)
+        except OwnerConflict as cause:
+            if cause.code != 'target_formal_checkpoint_path_not_bound':
+                raise
+            available = {record['declared_relative_path'] for record in records}
+            missing = [path for path in paths if path not in available]
+            roles = {entry['declared_relative_path']: entry['role'] for entry in entries}
+            examples = [{'path': path, 'manifest_role': roles.get(path)} for path in missing[:8]]
+            error = OwnerConflict('target_root_commit_domain_invalid')
+            error.feedback = (
+                kind + ' checkpoint_paths are not bound to this Run\'s exact retained checkpoint assets '
+                + '(run_key=' + repr(run_key) + '): ' + canonical_json(examples) + '. '
+                'New checkpoint files must be retained under outputs/checkpoints/ with role checkpoint; '
+                'files under outputs/data/ remain data assets. Evaluation checkpoint_paths must select '
+                'a subset of its own Run checkpoints. Correct the file organization and exact handoff '
+                'paths while preserving the trained bytes, metrics and existing results; do not rerun '
+                'training. Any retained data copy still needs its actual Run or Evaluation artifact_paths '
+                'owner. Finish another normal root turn to freeze the corrected completion; the previous '
+                'manifest remains unchanged.'
+            )
+            raise error from cause
+
+    for item in items:
+        # Reused state is authenticated against its historical role receipts by
+        # registration/replay, not against this completion's new manifest.
+        if item['reuse_variant_run']:
+            continue
+        paths = item.get('checkpoint_paths')
+        selected = select(checkpoints, defaults if paths is None else paths, 'Run', item['run_key'])
+        if item['evaluation_attempt_ref'] is not None and not item['reuse_evaluation_attempt']:
+            select(selected, item.get('evaluation_checkpoint_paths'), 'Evaluation', item['run_key'])
+
+
 def verify_retained_products(document, entries):
     """Every retained scientific product has an explicit or unique producer."""
     if explicit_unexecuted_root_evidence(document) is not None:
@@ -1345,6 +1387,7 @@ def verify_retained_products(document, entries):
             + canonical_json(missing) + '. Assign these exact frozen paths with artifact_paths or '
             'checkpoint_paths in formal_runs. Preserve the existing work; correct its handoff attribution.')
         raise error
+    _verify_new_checkpoint_selections(items, entries)
     implementation = [entry['declared_relative_path'] for entry in entries
                       if entry['role'] == 'implementation']
     for item in items:
