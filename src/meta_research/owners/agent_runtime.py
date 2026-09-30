@@ -11900,8 +11900,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     cleanup_status = "none"
                     safe_point_ref = safe_point["safe_point_ref"]
                 elif action == "resume":
+                    human_wait_pending = _managed_run_has_pending_root_human_request(
+                        connection, row
+                    )
                     stopped_primary = stopped_primaries.get(row.run_ref)
-                    if stopped_primary is not None:
+                    if human_wait_pending:
+                        # Releasing an operator pause does not consume an exact
+                        # Root HumanRequest. Its Owner must still evaluate and
+                        # consume the waiter while this identity is suspended.
+                        pass
+                    elif stopped_primary is not None:
                         row = self._resume_operator_stopped_primary(
                             connection, row, stopped_primary, operation_ref, now
                         )
@@ -11934,7 +11942,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                             reuse_operation_refs=False if usage_wait else None,
                             preserve_native_session=True if usage_wait else None,
                         )
-                    next_status = "running"
+                    next_status = "suspended" if human_wait_pending else "running"
                     cleanup_status = "none"
                     safe_point_ref = row.safe_point_ref
                 elif action == "restore":
@@ -12045,6 +12053,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "terminal_reason": (
                             f"runtime_control_{action}"
                             if action in TERMINAL_ACTIONS
+                            else "human_request_wait"
+                            if action == "resume" and human_wait_pending
                             else None
                         ),
                         "cleanup_status": cleanup_status,
@@ -31566,6 +31576,40 @@ def _target_terminal_notice_values(
             tuple(item.disposition_ref for item in terminal.route_dispositions),
         )
     raise OwnerConflict("target_run_handoff_terminal_invalid")
+
+
+def _managed_run_has_pending_root_human_request(connection, row) -> bool:
+    """Keep an exact unconsumed Root waiter separate from operator resume."""
+
+    effects = connection.execute(
+        text(
+            "SELECT effects.operation_binding_json, effects.operation_binding_hash "
+            "FROM owner_human_request_open_effects AS effects JOIN "
+            "owner_human_request_waiters AS waiters ON "
+            "waiters.request_ref = effects.request_ref AND "
+            "waiters.waiter_ref = effects.waiter_ref AND "
+            "waiters.generation = effects.generation JOIN "
+            "owner_human_requests AS requests ON requests.request_ref = "
+            "effects.request_ref WHERE effects.issuer = :issuer AND "
+            "requests.issuer = :issuer AND requests.is_current = 1 AND "
+            "effects.waiter_ref = :waiter_ref AND waiters.status IN "
+            "('blocked', 'released')"
+        ),
+        {"issuer": AR_OWNER, "waiter_ref": f"root_run:{row.run_ref}"},
+    ).all()
+    for effect in effects:
+        binding = decoded_object(effect.operation_binding_json)
+        if canonical_hash(binding) != effect.operation_binding_hash:
+            raise OwnerConflict("root_human_request_operation_binding_invalid")
+        if (
+            binding.get("request_owner") == AR_OWNER
+            and binding.get("task_ref") == row.run_ref
+            and binding.get("attempt_ref") == row.attempt_ref
+            and binding.get("root_session_ref") == row.root_session_ref
+            and binding.get("fence_ref") == row.fence_ref
+        ):
+            return True
+    return False
 
 
 def _controlled_runs_for_target(

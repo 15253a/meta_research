@@ -63,6 +63,7 @@ from meta_research.idea_skill import (
     _compile_codex_output_schema,
     _codex_harness_manifest,
     _file_sha256,
+    _read_spool_text,
     _shared_codex_adapter_source_hash,
 )
 from meta_research.harness import (
@@ -82,6 +83,7 @@ from meta_research.plan_contract import MAX_PLAN_EXPERIMENT_BRIEFS
 from meta_research.plan_skill import CodexPlanSkillAdapter
 from meta_research.provider_supervisor import transport_key_hash
 from meta_research.root_capabilities import merge_root_capability_bindings
+from meta_research.runtime_conditions import split_runtime_prompt
 BundleSkillContractError = BundleContractError
 BundleSkillUnavailable = IdeaSkillUnavailable
 
@@ -1048,6 +1050,24 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         )
         if not bundle_bindings_compatible(rebound, runtime_binding):
             raise BundleSkillUnavailable("bundle_runtime_binding_drift")
+        if job_ref is not None:
+            directory = (
+                self._workspace / "provider-operations"
+                / canonical_hash({"job_ref": job_ref}) / operation_name
+            )
+            if (directory / "invocation.json").exists():
+                try:
+                    sealed_prompt = _read_spool_text(
+                        directory / "prompt.txt",
+                        self._provider_transport_limits.prompt_max_bytes,
+                    )
+                    prompt = _restore_frozen_bundle_instruction_prefix(
+                        prompt, sealed_prompt, runtime_binding
+                    )
+                except (OSError, UnicodeDecodeError, ValueError) as error:
+                    raise BundleSkillUnavailable(
+                        "codex_operation_spool_invalid"
+                    ) from error
         channel_key = (job_ref or run_ref, operation_name)
         channel = self._resident_mcp_channels.get(channel_key)
         if channel is None:
@@ -1776,6 +1796,58 @@ def _bundle_skill_instructions() -> str:
         f"<!-- bundled resource: {name} -->\n{content}"
         for name, content in _bundle_skill_instruction_resources().items()
     )
+
+
+def _restore_frozen_bundle_instruction_prefix(
+    prompt: str,
+    sealed_prompt: str,
+    runtime_binding: BundleRuntimeBinding,
+) -> str:
+    """Restore reviewed Bundle prose, leaving the exact request and seal checks intact."""
+
+    current_instructions = _bundle_skill_instructions()
+    if not prompt.startswith(current_instructions):
+        return prompt
+    try:
+        _conditions, original = split_runtime_prompt(sealed_prompt)
+    except ValueError as error:
+        raise BundleSkillUnavailable("codex_operation_spool_invalid") from error
+    if original.startswith(current_instructions):
+        return prompt
+    tail = prompt[len(current_instructions):]
+    offset = original.find(tail) if tail.startswith("\n\n") else -1
+    if offset < 0:
+        raise BundleSkillUnavailable("codex_operation_spool_invalid")
+    frozen_instructions = original[:offset]
+    names = tuple(_bundle_skill_instruction_resources())
+    if frozen_instructions.count("<!-- bundled resource: ") != len(names):
+        raise BundleSkillUnavailable("codex_operation_spool_invalid")
+    remaining = frozen_instructions
+    resources = {}
+    for index, name in enumerate(names):
+        marker = f"<!-- bundled resource: {name} -->\n"
+        if not remaining.startswith(marker):
+            raise BundleSkillUnavailable("codex_operation_spool_invalid")
+        remaining = remaining[len(marker):]
+        if index + 1 < len(names):
+            separator = f"\n\n<!-- bundled resource: {names[index + 1]} -->\n"
+            content, found, next_resource = remaining.partition(separator)
+            if not found:
+                raise BundleSkillUnavailable("codex_operation_spool_invalid")
+            remaining = separator[2:] + next_resource
+        else:
+            content = remaining
+        resources[name] = content
+        prefix = f"package:meta_research.skills.bundle_stage/{name}@sha256:"
+        matches = [value for value in runtime_binding.resource_bindings if value.startswith(prefix)]
+        if matches != [prefix + canonical_hash(content)]:
+            raise BundleSkillUnavailable("codex_operation_spool_invalid")
+    if canonical_hash(resources) != runtime_binding.packaged_skill_bundle_hash:
+        raise BundleSkillUnavailable("codex_operation_spool_invalid")
+    # The shared adapter still regenerates transport suffixes and verifies the
+    # entire sealed prompt, invocation HMAC, native/model/MCP identity and output.
+    # Never return the stored request tail or rewrite any persisted spool file.
+    return frozen_instructions + tail
 
 
 def _schema_template_request() -> BundleSkillRequest:

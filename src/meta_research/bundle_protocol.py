@@ -670,6 +670,8 @@ def validate_closed_bundle_projection(
 ) -> str:
     """Validate one closed, exact-type, bounded Bundle-facing root value."""
 
+    from meta_research.plan_contract import PLAN_TEXT_MAX_CHARS
+
     if (
         type(max_serialized_bytes) is not int
         or max_serialized_bytes < 1
@@ -683,7 +685,7 @@ def validate_closed_bundle_projection(
         if state["scalar_bytes"] > max_serialized_bytes:
             raise BundleProtocolError(name + " exceeds the root projection byte budget")
 
-    def visit(item_value: object, *, metric: bool = False) -> None:
+    def visit(item_value: object, *, metric: bool = False, plan_text: bool = False) -> None:
         state["nodes"] += 1
         if state["nodes"] > BUNDLE_ROOT_MAX_NODES:
             raise BundleProtocolError(name + " exceeds the root projection node budget")
@@ -702,14 +704,21 @@ def validate_closed_bundle_projection(
                     raise BundleProtocolError(
                         f"{name} field {item.name} has a non-canonical schema type"
                     )
-                visit(field_value)
+                # These fields copy accepted Plan prose verbatim.  They retain
+                # its character budget while references keep the byte budget.
+                inherited_plan_text = (
+                    type(item_value) is ExperimentBrief and item.name == "semantic_delta"
+                ) or (
+                    type(item_value) is CodeReviewScope and item.name == "semantic_deltas"
+                )
+                visit(field_value, plan_text=inherited_plan_text)
             return
         if type(item_value) is tuple:
             if len(item_value) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS:
                 raise BundleProtocolError(name + " contains an oversized tuple")
             seen: set[object] = set()
             for nested in item_value:
-                visit(nested, metric=metric)
+                visit(nested, metric=metric, plan_text=plan_text)
                 if type(nested) in _DUPLICATE_SENSITIVE_TYPES:
                     if nested in seen:
                         raise BundleProtocolError(name + " contains an exact duplicate proof")
@@ -729,7 +738,10 @@ def validate_closed_bundle_projection(
                 encoded = item_value.encode("utf-8")
             except UnicodeError as error:
                 raise BundleProtocolError(name + " is not valid UTF-8 text") from error
-            if len(encoded) > BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES:
+            if (
+                len(item_value) > PLAN_TEXT_MAX_CHARS if plan_text
+                else len(encoded) > BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES
+            ):
                 raise BundleProtocolError(name + " contains oversized text")
             add_scalar_bytes(len(canonical_projection_bytes(item_value, name + " text")))
             return

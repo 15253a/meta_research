@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from meta_research.codex_runtime import CODEX_LOCKED_VERSION, CODEX_MODEL_REF
 from meta_research.harness_adapters import (
     HARNESS_CAPABILITIES,
     CodexHarnessAdapter,
@@ -43,7 +44,7 @@ class _NoActivityCodexRunner:
         self.calls.append(list(argv))
         if "--version" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, "codex-cli 0.156.1\n", ""
+                argv, 0, f"codex-cli {CODEX_LOCKED_VERSION}\n", ""
             )
         if argv[-2:] == ["features", "list"]:
             # An unavailable optional inventory is diagnostic-only. Do not
@@ -82,7 +83,7 @@ def _invoke_root_without_tool_activity(
             attempt_generation=1,
             root_session_ref=f"root-session:{root_kind}",
             fence_ref=f"fence:{root_kind}:{entry_path}",
-            model_ref="gpt-6-sol",
+            model_ref=CODEX_MODEL_REF,
             prompt="Return the operation result without ceremonial tool calls.",
             mcp_url="http://127.0.0.1:0/mcp",
             mcp_token="test-operation-bearer",
@@ -283,7 +284,7 @@ def test_root_launch_uses_one_native_ultra_preset_and_effective_max(
     _, argv = _invoke_root_without_tool_activity(
         tmp_path, root_kind=root_kind, entry_path=entry_path,
     )
-    assert argv[argv.index("--model") + 1] == "gpt-6-sol"
+    assert argv[argv.index("--model") + 1] == CODEX_MODEL_REF
     assert [x for x in argv if x.startswith("model_reasoning_effort=")] == [
         'model_reasoning_effort="ultra"'
     ]
@@ -320,7 +321,7 @@ def test_formal_root_binding_accepts_exact_effective_reasoning_identity(stage, e
         "bundle": BundleRuntimeBinding, "reasoning": ReasoningRuntimeBinding}[stage]
     binding = kind(
         packaged_skill_bundle_hash="1" * 64, instruction_set_hash="2" * 64,
-        model_ref="gpt-6-sol", harness_adapter_ref="codex-cli/0.156.1",
+        model_ref=CODEX_MODEL_REF, harness_adapter_ref=f"codex-cli/{CODEX_LOCKED_VERSION}",
         mcp_bindings=(
             "harness-operation-binding:semantic-mcp-catalog@sha256:" + "3" * 64,
             "harness-operation-binding:semantic-mcp-operation-bindings@sha256:" + "4" * 64,

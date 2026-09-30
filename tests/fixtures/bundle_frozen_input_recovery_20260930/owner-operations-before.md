@@ -26,14 +26,12 @@ AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan�
 | 结果 | 动作 |
 | --- | --- |
 | `accepted` | 保存精确引用并重读 frontier／coverage。 |
-| `rejected` | 读具体字段与原因，修订当前候选中可修改的内容；冻结输入按下述分支处理。 |
+| `rejected` | 读具体字段与原因，由相关根在来源链上修订后继，必要时升级语义修改。 |
 | `stale` | 重验 request、spec、输入、claim 和 handoff，不切到 latest。 |
 | `needs_input` | 绑定具体 HumanRequest，待 Owner satisfied 再继续；回复存在不自动等于满足。 |
 | `outcome_unknown` | 对账原 identity，明确结果前不重放。 |
 | `technical_blocker` | 保留具体范围和恢复条件，可修复则沿同一工作继续。 |
 | `idempotency_conflict` | 保存冲突并停止该写入。 |
 | `already_accepted` | 验证同 payload／hash 后复用原接纳事实。 |
-
-反馈指向已接纳 FormalPlan／ContextPack 时，沿精确 reader 读回原件并核对绑定。若确认是冻结输入与系统校验不兼容、修订当前候选无法解决，保留原件、候选和审阅结果，携带错误码、字段、绑定及已核对事实提出 `system_operation_help`，说明所需系统修复和恢复条件；不截断或重写已接纳 Plan，也不把技术故障改称科学上的 `replan_required`。同一阻塞复用已打开请求，按 Owner 等待状态交接，不重复原样提交或新建求助；Owner satisfied 后沿保留的根会话及正式恢复身份重新核验并继续。普通候选错误仍自主修订，已授权的独立工作可继续。
 
 认证 Web 展示有界事件、当前／历史身份和连接状态；断线、重连、日志缺口或重复不改变研究事实。正式结果仅来自 Owner 验证的接纳链。

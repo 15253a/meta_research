@@ -1,0 +1,195 @@
+<!-- bundled resource: research-guidance.md -->
+# Meta Research：投入与上下文
+
+科研元循环、研究方法、阶段交接与正式人类协作的共同指令由本根 Session 的系统提示提供。结合当前 Stage 的具体职责执行，按实际需要读取相关材料。
+
+Quest 的研究时长预算由各 Cycle 累计使用，进入下一轮不重置，也不以用满为目标。用系统明确提供的已用、剩余和资源状态比较研究价值、成本与可行性。缺少动态预算信息时如实保留未知，不能把静态上限当作当前剩余；暂停、等待和并行的计时口径以已提供规则为准。
+
+当前 Session 的上下文容量是另一项资源。按实际上下文信息和任务复杂度控制展开量，为核实与交接保留余量；接近容量时停止扩展新工作，整理已取得的证据、当前判断和可恢复的未完成事项。没有计量时保留不确定性，不自设固定 token 阈值、小时数或 Cycle 数量。这个软约束不改变已承诺工作的完成条件；真实在途、技术阻塞与等待继续由既有 Owner 执行和恢复路径处理，不能以容量不足宣告完成。阶段可能使用不同 native Session，通过正式研究材料和待办接续。
+
+## 检索责任与委派
+
+按系统提示中的六入口发现已有研究与资源，按本阶段的问题选择入口。数字材料沿精确版本读取，实体资源与现成服务核对来源、位置、能力及已知条件；资源登记与本次运行条件的边界见系统提示的 Environment 规则。资料规模较大时，将聚焦检索、对比或资源回顾委派给独立子智能体。子智能体自行沿分页与共用 reader 读取获授材料，不要求根先加载全库。
+
+委派时由根 Session 给出研究范围、检索问题、相关入口和需要确认的内容。检索子智能体在本研究的范围与授权内检索，返回简明候选、每条的精确读取入口、相关理由、关键证据边界、已检索范围和值得注意的未检索部分；没有匹配就如实报告，不回传整池文件或完整检索过程。
+
+根 Session 对实际采纳的内容亲自抽查阅读，保留方法、证据、投入与资产组织方面的判断；候选不会自动成为正式证据或执行输入。子智能体同样可用于对比、分析、实施或评价等工作。
+
+当整理、归类或入库工作量较大（如同批 Target 完成后产物较多、研究资产持续增长），按生产者或明确资产范围委派独立子智能体：在授予的任务权限内读取相关材料、确定归属并完成登记，返回对象／内容引用、整理说明与未决项；权威接纳仍由对应 Owner 承担，不设固定数量或阈值。各根 Session 的 review 由独立子智能体检查并提供自由格式反馈，主 Agent 自主修订；没有具体问题也可以改稿。同根 turn 的自查不构成独立 review。最终提交字段遵循当前阶段输出契约，审阅反馈本身不要求固定表单或 Owner 审阅者身份证明。
+
+
+<!-- bundled resource: SKILL.md -->
+---
+name: bundle-stage
+description: 在已接纳 FormalPlan 内组织并启用 Target，滚动安排材料获取、整理、实验或其他研究，用真实接纳结果收口或说明语义修订理由。
+---
+
+# Bundle：组织实际研究
+
+负责本轮工作范围、真实依赖与滚动安排；Target 根 Session 负责实施、检查、局部修订和结果交接。保持 Plan 承诺与 Idea 来源，在新结果出现时补充判断依据。按根系统提示执行六入口、预算、人类输入和语言偏好，子智能体继承范围及语言。
+
+粒度、风险、正式工作与依赖查[Bundle 契约](references/contract.md)；调用与反馈查[Owner 操作](references/owner-operations.md)。Target 按运行时注入的 target-execution Skill、measurement_contract、result_schema 执行，Bundle 不重建另一套交接协议。
+
+## 1. 读取与滚动安排
+
+读取已接纳 FormalPlan、gap Brief、输入索引、权威 frontier 与反馈，选择值得现在投入的工作。局部策略可随结果调整尚未提交的候选和顺序，不要求起步列尽未来路线。研究观察可指导选择，正式 coverage 只用已接纳 TargetCommit。
+
+`stage_context.read` 首次按 reader 传入 `offset=0`；后续仅在返回的 `next_offset` 为整数时将其作为下一页 offset。`next_offset=null` 即结束该正文的分页，按顺序拼接各页 text 后解析 JSON；`complete` 只表示当前响应是否含完整正文，尾页可仍为 false。遇 `semantic_input_schema_mismatch` 时查当前目录的参数 schema，修正具体字段后再调用，不原样重复失败请求。
+
+`research_graph.baselines.page`／`read` 的 `limit` 是条目数，默认 20，范围 1–100；`read` 只传精确 `baseline_ref` 即可读取方法合同，展开关联实体时再按返回的 `next_offset`／`next_evaluation_offset` 分页。各工具的分页单位独立，正文 reader 的字符上限不适用于 Baseline 列表。遇 `baseline_query_invalid` 时按当前 schema 修正参数，再继续读取。
+
+`human_request.read` 先读取当前 Quest 索引，再直接使用返回的 request／response `reader` 参数读取原文；`request_ref` 保留完整修订后缀（如 `:r1`），`response_ref` 使用该 request 返回的绑定。遇 `research_help_request_unbound`／`research_help_response_unbound` 时回到索引核对这对引用，修正后再读。
+
+仅 Bundle 经正式候选接纳与调度启用 Target；其他阶段、Target 和子智能体提供后续建议。Target 有独立可验目的、完成 cells、输入和实际依赖。获取、采集、清洗、整理可独立成 Target，也可与相关研究合并；粒度由研究需要、复用产物和真实依赖决定，湿实验、论证和辅助材料同样适用。
+
+cells 表达应实施及报告的责任，允许负结果、失败原因和未解决判断，范围只含相关 obligations 与 Briefs。只有消费上游新结果才建立依赖，共享已接纳输入可并行。复用按实际需要核对数据、划分、预测、实现和协议，精确绑定资产版本。
+
+按实际动作及 Quest 授权填 `risk_class`；已授权获取、整理、实施、分析和大型保存自主进行，仅为具体外部权限、资源或人类动作提出 HumanRequest。体积或耗时本身不构成额外授权门槛。
+
+## 2. 据结果调整
+
+首次 admission 仅处理未启动工作；已 claimed、running、recovering、finalizing 的工作沿既有 TargetRun 观察、wake 或 reconcile；已接纳 TargetCommit 用于收口。按证据、价值、资源与依赖选择 dispatch、wait 或 replan_required，说明理由。
+
+给 Target 留出方法复用／新建、实际归属（含跨 Baseline）、实现和补充检查空间。保持 FormalPlan 的 Goal、Characteristics、BoundaryConstraints、SemanticDelta、required Metric 和 held-fixed 条件；实质变化交给 Reasoning 与后继 Cycle，同一 Cycle 不回 Plan。
+
+## 3. 保存认识和可复用资源
+
+用已接纳工作的真实结果更新覆盖，既可有测量，也可为无评价工作。负、零、不显著、不确定和缺测保持各自含义；准备审计只支持准备事实，不代替承诺中的实质研究。
+
+`TargetPlan.notes` 和 `StrategyUpdate.notes` 保存研究判断；系统把最后一条非空且已接纳策略备注及 proposal ref／hash 交给 Reasoning，空值保留前次。后续备注保留仍有价值的线索及精确来源，更新认识、证据边界和取舍，避免被新一条备注覆盖后失去上下文。
+
+已接纳 Target 的 `research_notes` 保存当时说明和最终发言。先读摘要，必要时沿 `research_notes_reader`／`research_memory.research_notes.read` 分页；精确正文用 `source=research_note_body`、`source_ref=version_ref`。上一 Question 的入口使用 `predecessor_research_notes_readers`，正文保留对应 `predecessor_ref`。说明有助理解，不替代完整合同与冻结输入。
+
+Bundle 统一保留并筛选 Target 发现的建题线索。跨 Target 合并同一未知，先判断当前或已有 Question 能否承载；值得独立追踪的候选按对研究目标的重要性、已有依据和后续研究价值比较。交给 Reasoning 的建题推荐为零或一个，只选最值得推进的一项，说明来源、与已有题的区别和联系、独立追踪理由及可开展的研究。其余有价值线索留在 notes 中并明确为保留项，不逐 Target 提交、不作为待逐个建题的队列；没有合适候选时明确写本轮不推荐建题。这里的数量约束只针对新 Question 推荐，不限制 Target、Dataset 或 Environment 的合理粒度。
+
+为保留最后一个 Target 后的汇总回合，安排和执行工作时保持 `strategy_complete=false`。全部 Target 已接纳后，读取包括最后结果在内的研究说明、完成候选取舍和独立审阅，再用不新增 Target 的 `StrategyUpdate`（`candidates=[]`、`strategy_complete=true`）提交完整 notes 并封口；科学上的建题推荐写在 notes，不放进用于启用 Target 的 `candidates`。需要继续实施时按现有滚动策略提交实际 Target，保持策略未封口。技术阻塞或语义屏障仍按真实状态交接，不能为凑候选补造工作。
+
+Target 正式接纳后，在同一整理核验环节读取 `dataset_candidates`、`environment_candidates` 和 completion manifest，沿 `artifact_path` 找真实 RM binding 并判断复用价值。Dataset 用 datasets.register／register_version／reference，真实派生用 derive；Environment 用 environments.register 记录含义、真实来源和相同原件 binding，再用 reference 关联当前 Question、原 Target／Run 和用途。六入口按复用目的组织，同一内容可供多个入口引用。
+
+先发现或对账已有登记，复用身份和原件；可委派明确范围的整理，根独立查回记录、用途关系及适用的精确内容。最后一个 Target 后 Bundle 若不再运行，由 Reasoning 在其综合交接前承接；暂存和未接纳产物留工作区。已有设备、设施、持久目录、安装或服务按真实来源可直接登记，详见根系统提示的 Environment 语义。
+
+## 4. 复核与收口
+
+重大候选与终态交接按研究需要委派原生独立子智能体审阅，根核对完整结果及必要原文并自主修订；最终交接的独立审阅不能用同根自查替代，不要求固定反馈数量或审查表单。
+
+全部完成 cells 有 current accepted TargetCommit 覆盖时为 `realized`；需改变冻结语义时说明 `replan_required` 与剩余义务；真实阻塞、在途工作和未知效果保持实际状态。完成条件是本轮承诺已核对、结果与未决项已交接，Owner 接纳链可验证；执行结束、保存、TargetCommit 和科学结论分别成立。
+
+
+<!-- bundled resource: references/contract.md -->
+# Bundle 契约
+
+## 调用闭包与阶段范围
+
+`BundleStageRunRequest` 冻结 stage request、Cycle、epoch、Bundle Run、根 Fence、ContextPack ref／hash、已接纳 FormalPlan ref／内容 hash／receipt、EvidenceReuseSet、GapSet、全部 gap Brief，以及 Quest 授权、Harness 和资源边界。消费 current FormalPlan 的精确内容，稳定 ref 本身不替代绑定；草稿或漂移的 latest 不能启用 Target。
+
+没有 gap Brief 时由 AE 验证正式 Plan 及 receipts 并形成 `StageCommit(Skipped)`，不建立 Bundle Run 或 Target。冻结核心承诺的实质改变通过 `replan_required` 交给 Reasoning 与后继 Cycle。
+
+## 策略、粒度与风险
+
+Bundle 在 Session 内维护可修改的滚动策略：未解 Brief／cells、已接纳上游闭包、候选和真实依赖、方法复用、资源并行、结果覆盖、阻塞及语义风险。它是决策材料，不是正式 Target、frontier、Run 或 receipt。先形成可启动的局部工作，再随已接纳结果补充，不要求一次列尽。
+
+RG 冻结 Target 的 ExperimentKey、目标、输入、cells、初始 implementation_revision_ref、承诺和依赖。实际 Target 工作按所用方法、实现版本和输入如实交接；初始方法建议不锁死跨 Baseline 归属。仅真正消费新产物或以其自适应选择后续路线时建立依赖；共享已接纳材料可以并行。
+
+每个新候选明确 `risk_class=normal | high`。已有授权内的本地实施、调试、研究、评估与保存为 normal；GPU、长耗时、已授权健康数据和大产物本身不要求再次授权。尚未批准的破坏性修改、受限数据外传、访问权限变更、外部费用或超出资源／用途范围为 high，说明具体动作和最小缺少权限。边界不明先核对已接纳输入及授权事实；已授权的独立部分继续。
+
+已接纳 spec 与风险记录保持不可变。技术重试、页面刷新、Attempt／Fence 轮换和恢复同一执行不扩大授权范围；明确拒绝、撤销或范围改变由 Owner 处理。运行／完成事实与 admission 投影冲突时请求 Owner 对账，继续其他可行工作，否则等待具体冲突解决，不生成重复 Target 或虚假人类请求。
+
+## 方法、实施与评价
+
+领域身份按真实方法与因果语义划分，不按文件数、进程数、工具次数或并发划分：
+
+| 对象 | 真实含义 |
+| --- | --- |
+| Baseline | 可复用方法、对象、输入输出关系及适用边界，可含材料来源与获取方法。 |
+| Variant | 具体配方、干预、材料处理或状态形成方式。 |
+| VariantRun | 精确输入下的实际实施、取得材料与状态。 |
+| ProtocolVersion | 证据、评价／论证程序、指标、停止与聚合语义。 |
+| Evaluation | 精确 Variant × ProtocolVersion 配对。 |
+| EvaluationAttempt | 对指定 Run／状态的一次实际评价及报告。 |
+| MetricResult | 已接纳成功评价的声明指标与结果文档，可为空指标报告。 |
+
+一个 Target 可以有多个 Run、跨 Baseline 方法、交替评价或无评价工作。实际实施可先交接为待评价事实，只有真实评价才生成 EvaluationAttempt；失败评价不补造 MetricResult。定量、定性、理论或报告式评价按具体研究标准表达。
+
+沿用 `baseline_forward_contract`、`variant_recipe`、`evaluation_data`、`split`、`preprocessing` 等字段，不意味着必须计算建模；不适用项用有理由的非空对象表达。required Metric 可为数量、类别、布尔或允许的缺测，纯报告 Protocol 可无指标，结果和分析保存论证与局限。`result_schema` 初始实例形状是指导，Protocol 指标集合、合法 JSON、数值安全、身份及来源仍须有效。
+
+先用 `research_graph.baselines.page`／`read` 发现并读完整候选方法。复用声明 `{"baseline_ref":"实际读取的引用"}`；新方法可声明 `{"method_key":"稳定名称","method_version":"1","method_contract":{"meaning":"方法含义","inputs":{},"outputs":{}}}`，输入输出按领域组织。方法实质改变才形成新版本或方法；换数据、上游 Commit 或备注不改变方法身份。相似候选只帮助发现，不自动合并。
+
+Variant 保存具体配方；Protocol 保存评价规则和稳定划分／预处理语义。本轮精确数据、实现、输入和产物由运行绑定携带，必要的附带 `baseline_forward_contract.run_bindings` 不进入方法身份也不替代正式输入。`code_changed` 表示实际 implementation 内容变化，包含非代码方法材料。
+
+`implementation/` 可以是规程、方法说明、推导或代码；checkpoint 是可复用研究状态，不限于模型权重。按价值、复核、复用与成本保存多个、部分或不保存；`checkpoint_policy` 的 required／forbidden 是建议，不作产物有无门槛。正式 Run、生产者归属、局部输入和具体交接格式由 Target 的正式工作交接 reference 说明，Target 按其运行时提供的入口读取实际 schema。
+
+技术重试或调试不自动产生新 Run／评价；独立实施或独立评价才按真实身份登记。seed、replicate、k-fold 等若由冻结 Protocol 定义完整 part 集及聚合且不相互自适应影响，可作为同一评价；被独立消费或用于改变后续状态时按实际因果关系区分。准备检查只证明自身事实，不能覆盖要求实质研究的 cell。
+
+## 历史输入与精确复用
+
+当前 FormalPlan 的已选证据给出来源 TargetCommit 及资产索引。按新 Target 实际用途读取数据、划分、预测、实现和协议；结果或 notes 的阅读不等于输入绑定。将所需 Evidence、精确 AssetVersion 或由该 Commit 冻结版本的 Asset 放入 `direct_accepted_input_asset_refs`，由系统验证来源及解析配套内容。
+
+资产索引不是整包照搬要求，Baseline／实现验证也不能证明历史数据已准入。缺必需输入时指出具体来源和缺口。图内依赖只指本图 Target，历史输入沿正式资产路径继承；新图 cells 只表本轮承诺，不说明全库是否有旧结果。
+
+实现不是计划变量时，比较绑定同一 held-fixed 精确内容。保留实际生成各 Run 结果的实现；若必要修复改变 held-fixed 承诺，升级语义修订而非静默替换。
+
+## Target 执行、恢复与交接
+
+Target 是 RG 工作身份，TargetRun 是 AR 可恢复执行，根 Session 是 Harness 当前唯一实施会话。根负责方法、实施、观察、局部修订、保留策略及最终交接；可给原生子智能体明确范围和授权，按文件或对象划分写入，仍由根作整体判断。长期观察任务可聚焦日志，不新增 daemon 策略控制层。
+
+daemon 仅 claim、wake、single-flight、cancel、reconcile 和事件转发。claim 只授予当前执行资格，不批准结果；wake 只提示重新读取权威事实。stdout、进度和工具事件供观察，不形成 Metric 或 receipt。
+
+恢复先对账在途命令、未知效果和 durable checkpoint。优先继续同一 claim／Session／workspace；无法恢复时由 AR 退役旧身份并建立明确后继，保持单一 current 根。取消由授权请求触发，待真实 Harness 确认和清理；取消前已完整冻结的交接按其精确身份核验，迟到输出和活动路径不越过边界。
+
+冻结前满足：候选对应实际实现，命令与写入已对账，合同／输入／spec 仍可验证，独立审阅和根自查已完成，所选路径稳定。中间产物留可恢复工作区，正式发布发生在 completion handoff 之后。root 不生成 Owner 身份或 receipt。
+
+AR 核实 current 执行与终态交接；RM 接纳所选真实内容；RG 据冻结合同和 `formal_runs` 登记真实方法、Run、评价／待评价事实及产物角色，再接纳 TargetCommit。可有多个实际测量，也可没有评价；不要求每个 Target 都产生唯一 MetricResult。Bundle 重读接纳事实后更新 coverage。结果已接纳但 Dataset／Environment 尚未登记时，按主 Skill 的整理步骤处理并读回，不重复实施。
+
+## Bundle 收口
+
+| disposition | 依据 |
+| --- | --- |
+| `realized` | 所需 cells 有 current accepted TargetCommit，结果方向不限。 |
+| `blocked` | 技术、权限、资源、currentness 或未知结果阻止可信继续。 |
+| `replan_required` | 剩余有效路线必须改变冻结科学承诺。 |
+| `ExhaustionProposal` | 冻结范围内已无实质不同路线，全部执行、交接、取消、人类待办和未知效果已对账。 |
+
+负、零、不显著或不确定结果可以实现承诺；真实未完成工作不能靠耗尽或修订标签隐藏。BundleReport 候选包含当前 request／Plan、逐 Brief 覆盖、已接纳 Commit 与交接来源、剩余工作及真实阻塞。它不把 live workspace、未冻结指标或子会话全文作为正式结果。AE 在当前范围与接纳链验证后形成 StageCommit。
+
+
+<!-- bundled resource: references/owner-operations.md -->
+# Bundle 的 Owner 操作
+
+读取、候选接纳、执行调度、恢复和收口均使用当前 scoped 工具目录与参数 schema；本文件描述职责，不发明可直接调用的伪函数名。合同和产物语义见[Bundle 契约](contract.md)，Target 的字段由实际注入合同提供。
+
+## 职责
+
+AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan、Target／依赖／frontier、方法、Run／评价及领域接纳；RM 管不可变内容、AssetVersion、保管和完整性；AR 管执行、根会话、Fence、single-flight 和恢复；Harness 运行原生工具与子智能体。Bundle 管候选、范围、顺序和跨 Target 依赖，Target 根管实际实施与最终交接。
+
+子智能体在明确任务及所授权限内读取、分析、实施或整理，按文件／对象划分写入，返回结果、精确来源和自由格式反馈。整理已接纳材料可沿已授 Dataset／Environment 接口登记；未接纳 Target 中间产物仍留工作区，不提前进入 RM／RG 正式内容链。
+
+## 正常流程
+
+1. 观察当前 Bundle 请求及运行绑定，读取精确 FormalPlan、内容 hash 和直接绑定它的 current receipt。
+2. 提出科学候选和真实依赖，由 RG 接纳身份和 spec；重读其内容绑定及 current frontier。
+3. 仅对未启动、ready 且获授权的 Target 发起 admission／dispatch。claim 验证 spec、输入、资源、授权和 Harness，并确保至多一个 current 根。
+4. 已执行工作沿原 TargetRun 观察、wake 或 reconcile；wake 只带重新读事实的信号，不携带研究结果作为权威依据。
+5. Target 形成稳定交接后，由 AR／RM／RG 核验、保存并接纳真实 Run、产物和适用评价；Bundle 读回 TargetCommit 后更新覆盖。
+6. 独立审阅最终策略及交接，提交真实 BundleReport 候选，由 AE 验证阶段收口。
+
+根与系统的执行分工不要求 Agent 重建 receipts、固定内部调用签名或 daemon 私有流程。仅凭 Session 完成、退出码、日志标签和页面进度不能认定正式科学结果。
+
+## 恢复、取消和反馈
+
+同一幂等身份仅对应同一 payload，已冻结交接仅查询原 identity，不从活动工作区重新 capture。取消需授权、投递与真实确认，迟到事件保留为历史观察，不形成新 current effect。Host pause／resume 沿权威控制事实进行，Agent 不读取或修改私有 SQLite、spool、密钥或控制文件来伪造恢复。
+
+| 结果 | 动作 |
+| --- | --- |
+| `accepted` | 保存精确引用并重读 frontier／coverage。 |
+| `rejected` | 读具体字段与原因，由相关根在来源链上修订后继，必要时升级语义修改。 |
+| `stale` | 重验 request、spec、输入、claim 和 handoff，不切到 latest。 |
+| `needs_input` | 绑定具体 HumanRequest，待 Owner satisfied 再继续；回复存在不自动等于满足。 |
+| `outcome_unknown` | 对账原 identity，明确结果前不重放。 |
+| `technical_blocker` | 保留具体范围和恢复条件，可修复则沿同一工作继续。 |
+| `idempotency_conflict` | 保存冲突并停止该写入。 |
+| `already_accepted` | 验证同 payload／hash 后复用原接纳事实。 |
+
+认证 Web 展示有界事件、当前／历史身份和连接状态；断线、重连、日志缺口或重复不改变研究事实。正式结果仅来自 Owner 验证的接纳链。
+
+
+Frozen Bundle request: generation=2; output schema and identity remain exact.

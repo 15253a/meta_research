@@ -158,7 +158,7 @@ class BootstrapExchange(BaseModel):
 class StartHarnessConformanceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    codex_model_ref: Literal["gpt-6-sol"] = CODEX_MODEL_REF
+    codex_model_ref: Literal["gpt-6.1-sol"] = CODEX_MODEL_REF
     codex_auth_profile_ref: str = Field(min_length=1, max_length=160)
     # Accepted only so an older diagnostic client does not fail at the HTTP
     # decoder boundary.  Production selection is Codex-only and ignores them.

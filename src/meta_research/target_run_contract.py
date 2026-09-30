@@ -588,7 +588,8 @@ def validate_target_execution_preflight(
     if len(scope.semantic_deltas) != len(scope.experiment_keys):
         _fail("review scope SemanticDelta coverage is incomplete")
     for delta in scope.semantic_deltas:
-        _require_ref(delta, "SemanticDelta")
+        if type(delta) is not str or not delta.strip():
+            _fail("SemanticDelta is absent")
     if scope.reuse_provenance_refs != tuple(sorted(set(scope.reuse_provenance_refs))):
         _fail("review scope reuse provenance is not canonical and unique")
     for ref in scope.reuse_provenance_refs:

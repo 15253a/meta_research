@@ -21,6 +21,7 @@ MAX_PLAN_OBLIGATIONS = 64
 MAX_PLAN_EVIDENCE_REFS = 256
 MAX_PLAN_EXPERIMENT_BRIEFS = 64
 MAX_SELECTED_PLAN_EVIDENCE_REFS = 32
+PLAN_TEXT_MAX_CHARS = 8_192
 
 _QUESTION_TRACE_FIELDS = {
     "unknown_statement",
@@ -846,7 +847,7 @@ def _exact_keys(value: dict[str, object], expected: set[str], code: str) -> None
 
 
 def _text(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip()) and len(value) <= 8_192
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= PLAN_TEXT_MAX_CHARS
 
 
 def _require_text(value: object, code: str) -> None:

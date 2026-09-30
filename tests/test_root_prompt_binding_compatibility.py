@@ -65,10 +65,13 @@ def test_actual_pair_changes_only_reviewed_research_text(pair):
 @pytest.mark.parametrize("root_kind", root_capabilities.ROOT_AGENT_KINDS)
 def test_handoff_profiles_change_only_research_text_for_every_root(root_kind):
     document = json.loads(HANDOFF_PROFILES.read_text(encoding="utf-8"))
-    current = root_capabilities.root_capability_profile(root_kind)
+    # This immutable fixture describes the preceding prompt-only deployment.
+    # The current model upgrade has its own full-profile fixture and tests.
+    reviewed_profile = document["current_profile"]
+    reviewed_hash = canonical_hash(reviewed_profile)
     assert document["reviewed_root_kinds"] == list(root_capabilities.ROOT_AGENT_KINDS)
-    assert current.as_dict() == document["current_profile"]
-    assert current.digest == document["current_profile_hash"]
+    assert root_kind in document["reviewed_root_kinds"]
+    assert reviewed_hash == document["current_profile_hash"]
     historical_hashes = set()
     for historical in document["historical_profiles"]:
         original = load(historical["original_fixture"])
@@ -77,10 +80,10 @@ def test_handoff_profiles_change_only_research_text_for_every_root(root_kind):
         assert canonical_hash(historical["root_profile"]) == historical["root_profile_hash"]
         assert [
             key for key in historical["root_profile"]
-            if historical["root_profile"][key] != current.as_dict()[key]
+            if historical["root_profile"][key] != reviewed_profile[key]
         ] == ["research_system_prompt_hash"]
         historical_hashes.add(historical["root_profile_hash"])
-    assert reviewed_historical_root_profile_hashes(current.digest) == historical_hashes
+    assert reviewed_historical_root_profile_hashes(reviewed_hash) == historical_hashes
 
 
 @pytest.mark.parametrize("root_kind", root_capabilities.ROOT_AGENT_KINDS)

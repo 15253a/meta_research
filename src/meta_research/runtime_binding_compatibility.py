@@ -88,8 +88,27 @@ _REVIEWED_ROOT_PROMPT_BUNDLE_BINDING_PAIRS = frozenset({
     }),
 })
 
+# 2026-09-30: the active Bundle's exact frozen profile and the candidate with
+# reviewed frozen-input/system-help guidance in owner-operations.md. Only that
+# resource and its instruction/package aggregate hashes differ. Preserve every
+# execution field, sealed prompt and historical admission identity; this pair
+# does not make owner-operation prose generally revisable.
+# Full profiles and original prose: fixtures/bundle_frozen_input_recovery_20260930/.
+_REVIEWED_FROZEN_INPUT_RECOVERY_BUNDLE_BINDING_PAIRS = frozenset({
+    frozenset({
+        "43b138c196cae3a8e205c2b8b66fc2c9d6ce3b71bf041bede7283ad1e18f95ad",
+        "a39e08787040ff56118d56a9d8a646a8f145122c22391f762de918fb7f11a718",
+    }),
+    # The final adapter restores only the original instruction prefix for an
+    # existing sealed call; its full invocation and request remain unchanged.
+    frozenset({
+        "43b138c196cae3a8e205c2b8b66fc2c9d6ce3b71bf041bede7283ad1e18f95ad",
+        "a72d15e5a107435726c06beccfbe4178c6dad3cabd8a9d826876a57c1fad8996",
+    }),
+})
+
 # Directional, complete profile identities for historical reads only. Fixtures
-# retain both full objects and prove all capability/model/config fields equal.
+# retain the full objects and their reviewed capability/model/config differences.
 _REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
     (
         "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
@@ -107,6 +126,22 @@ _REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
     (
         "15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e",
         "8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be",
+    ),
+    # 2026-09-30 authorized model upgrade. The preceding current profile
+    # changes only model_ref to gpt-6.1-sol; preserve all three exact historical
+    # identities for reads, without granting execution or rewriting receipts.
+    # Complete profile evidence: fixtures/model_upgrade_20260930/profiles.json.
+    (
+        "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
+        "708321017aed3c4c4cf3085b00ed447c380306cfb45a71857263ab0cebec486d",
+    ),
+    (
+        "15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e",
+        "708321017aed3c4c4cf3085b00ed447c380306cfb45a71857263ab0cebec486d",
+    ),
+    (
+        "8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be",
+        "708321017aed3c4c4cf3085b00ed447c380306cfb45a71857263ab0cebec486d",
     ),
 })
 
@@ -285,6 +320,8 @@ def bundle_bindings_compatible(left: "BundleRuntimeBinding", right: "BundleRunti
     if before is not None and after is not None and before == after:
         return True
     pair = frozenset((canonical_hash(left.as_dict()), canonical_hash(right.as_dict())))
+    if len(pair) == 2 and pair in _REVIEWED_FROZEN_INPUT_RECOVERY_BUNDLE_BINDING_PAIRS:
+        return True
     if len(pair) == 2 and pair in _REVIEWED_ROOT_PROMPT_BUNDLE_BINDING_PAIRS:
         return True
     if len(pair) == 2 and pair in _REVIEWED_PROTOCOL_BUNDLE_BINDING_PAIRS:

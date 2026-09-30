@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-CODEX_MODEL_REF = "gpt-6-sol"
-CODEX_LOCKED_VERSION = "0.156.1"
+CODEX_MODEL_REF = "gpt-6.1-sol"
+CODEX_LOCKED_VERSION = "0.159.0"
 # Model effort is distinct from the CLI preset, which also enables Ultra.
 CODEX_REASONING_EFFORT = "max"
 CODEX_ROOT_REASONING_PRESET = "ultra"

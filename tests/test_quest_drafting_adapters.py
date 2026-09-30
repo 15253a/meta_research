@@ -50,7 +50,7 @@ def _locked_codex_version(
 ) -> subprocess.CompletedProcess[str]:
     del timeout
     return subprocess.CompletedProcess(
-        argv, 0, stdout="codex-cli 0.156.1\n", stderr=""
+        argv, 0, stdout="codex-cli 0.159.0\n", stderr=""
     )
 
 
@@ -219,7 +219,7 @@ def _fake_drafting_codex(path: Path) -> Path:
         "from pathlib import Path\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('codex-cli 0.156.1')\n"
+        "    print('codex-cli 0.159.0')\n"
         "    raise SystemExit(0)\n"
         "sys.stdin.buffer.read()\n"
         "args = sys.argv[1:]\n"
@@ -386,7 +386,9 @@ def test_codex_drafting_does_not_require_user_namespaces_on_the_deployed_host(
 ) -> None:
     runner = NamespaceRestrictedDraftingRunner(QUESTION)
     workspace = tmp_path / "drafting-provider"
-    adapter = CodexDraftingAdapter(workspace, process_runner=runner)
+    adapter = CodexDraftingAdapter(
+        workspace, process_runner=runner, version_runner=_locked_codex_version,
+    )
 
     result = adapter.draft(
         ProposalDraftRequest(
@@ -419,7 +421,7 @@ def test_codex_drafting_does_not_require_user_namespaces_on_the_deployed_host(
     assert set(model_catalog) == {"models"}
     assert len(model_catalog["models"]) == 1
     drafting_model = model_catalog["models"][0]
-    assert drafting_model["slug"] == "gpt-6-sol"
+    assert drafting_model["slug"] == "gpt-6.1-sol"
     assert drafting_model["default_reasoning_level"] == "max"
     assert drafting_model["supported_reasoning_levels"] == [
         {
@@ -475,7 +477,7 @@ def test_codex_drafting_does_not_require_user_namespaces_on_the_deployed_host(
         "view_image",
         "workspace_dependencies",
     }
-    assert argv[argv.index("--model") + 1] == "gpt-6-sol"
+    assert argv[argv.index("--model") + 1] == "gpt-6.1-sol"
 
 
 def test_codex_drafting_fails_closed_if_the_managed_model_catalog_drifts(
@@ -660,7 +662,7 @@ def test_durable_drafting_recovers_signed_result_without_provider_replay(
     assert contract["model_catalog_hash"] == hashlib.sha256(
         catalog_path.read_bytes()
     ).hexdigest()
-    assert contract["model_ref"] == "gpt-6-sol"
+    assert contract["model_ref"] == "gpt-6.1-sol"
     _key_path, key = read_transport_key_for_operation(directory)
     supervisor = read_supervisor_request(
         directory / "supervisor-request.json", key
@@ -1114,7 +1116,7 @@ def test_existing_oversized_effect_waits_for_receipt_and_rejects_sealed_output(
         ephemeral=True,
         job_ref=job_ref,
         directory=directory,
-        provider_version="0.156.1",
+        provider_version="0.159.0",
     )
     directory.mkdir(parents=True)
     quest_drafting._write_durable_json(

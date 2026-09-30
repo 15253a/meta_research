@@ -37,7 +37,7 @@ from meta_research.bundle_protocol import (
     projection_plain_value,
     validate_closed_bundle_projection,
 )
-from meta_research.plan_contract import PLAN_DOCUMENT_SCHEMA_REF
+from meta_research.plan_contract import PLAN_DOCUMENT_SCHEMA_REF, PLAN_TEXT_MAX_CHARS
 
 
 NORMALIZED_COMPLETION_CONTRACT_SCHEMA_REF = (
@@ -89,6 +89,13 @@ _PLAN_BRIEF_FIELDS = frozenset(
         "semantic_delta",
         "contributing_idea_refs",
     }
+)
+_PLAN_PROSE_FIELDS = frozenset(
+    {"goal", "characteristics", "boundary_constraints", "semantic_delta"}
+)
+_PLAN_SEMANTIC_FIELDS = _PLAN_PROSE_FIELDS | {"experiment_key"}
+_NORMALIZED_BRIEF_FIELDS = frozenset(
+    {"experiment_key", "semantic_delta", "held_fixed_slots", "required_measurement_unit_keys"}
 )
 _TARGET_CANDIDATE_FIELDS = frozenset(
     {
@@ -297,14 +304,14 @@ def build_normalized_completion_contract(
         )
         semantic = FrozenSemanticInputs(
             experiment_key=key,
-            goal=_text(plan_brief["goal"], "Goal"),
-            characteristics=_text(
+            goal=_plan_text(plan_brief["goal"], "Goal"),
+            characteristics=_plan_text(
                 plan_brief["characteristics"], "Characteristics"
             ),
-            boundary_constraints=_text(
+            boundary_constraints=_plan_text(
                 plan_brief["boundary_constraints"], "BoundaryConstraints"
             ),
-            semantic_delta=_text(
+            semantic_delta=_plan_text(
                 plan_brief["semantic_delta"], "SemanticDelta"
             ),
         )
@@ -341,7 +348,7 @@ def normalized_completion_contract_to_dict(
             for item in contract.experiments
         ],
     }
-    _validate_json_root(value, "NormalizedCompletionContract")
+    _validate_json_root(value, "NormalizedCompletionContract", plan_projection=True)
     return value
 
 
@@ -377,7 +384,7 @@ def normalized_completion_contract_from_dict(
         ),
         experiments=tuple(experiments),
     )
-    _validate_json_root(value, "NormalizedCompletionContract")
+    _validate_json_root(value, "NormalizedCompletionContract", plan_projection=True)
     _validate_completion_contract(contract, plan_document)
     return contract
 
@@ -386,6 +393,7 @@ def completion_contract_hash(contract: NormalizedCompletionContract) -> str:
     return _canonical_hash(
         normalized_completion_contract_to_dict(contract),
         "NormalizedCompletionContract",
+        plan_projection=True,
     )
 
 
@@ -652,7 +660,7 @@ def formal_target_candidate_from_dict(
         ),
         risk_class=_risk_class(document["risk_class"]),
     )
-    _validate_json_root(value, "FormalTargetCandidate")
+    _validate_json_root(value, "FormalTargetCandidate", plan_projection=True)
     _validate_formal_candidate(result, completion_contract)
     return result
 
@@ -674,7 +682,7 @@ def formal_target_candidate_to_dict(
         ),
         "risk_class": candidate.risk_class,
     }
-    _validate_json_root(value, "FormalTargetCandidate")
+    _validate_json_root(value, "FormalTargetCandidate", plan_projection=True)
     return value
 
 
@@ -716,7 +724,8 @@ def strategy_update_from_dict(
     validate_closed_bundle_projection(update, "StrategyUpdate")
     result = FormalStrategyUpdate(update=update, candidates=candidates, notes=document.get("notes"))
     _validate_json_root(
-        value, "FormalStrategyUpdate", free_text_fields=frozenset({"notes"})
+        value, "FormalStrategyUpdate", free_text_fields=frozenset({"notes"}),
+        plan_projection=True,
     )
     return result
 
@@ -742,7 +751,8 @@ def strategy_update_to_dict(
     if update.notes is not None:
         value["notes"] = update.notes
     _validate_json_root(
-        value, "FormalStrategyUpdate", free_text_fields=frozenset({"notes"})
+        value, "FormalStrategyUpdate", free_text_fields=frozenset({"notes"}),
+        plan_projection=True,
     )
     return value
 
@@ -824,7 +834,7 @@ def rolling_strategy_state_to_dict(
         ],
         "strategy_complete": state.strategy.strategy_complete,
     }
-    _validate_json_root(value, "RollingStrategyState")
+    _validate_json_root(value, "RollingStrategyState", plan_projection=True)
     return value
 
 
@@ -870,7 +880,7 @@ def rolling_strategy_state_from_dict(
         ),
         candidates=candidates,
     )
-    _validate_json_root(value, "RollingStrategyState")
+    _validate_json_root(value, "RollingStrategyState", plan_projection=True)
     _validate_state(result, completion_contract)
     if previous_state is not None:
         _validate_state(previous_state, completion_contract)
@@ -987,6 +997,7 @@ def _validate_completion_contract(
     _validate_json_root(
         normalized_completion_contract_to_dict(contract),
         "NormalizedCompletionContract",
+        plan_projection=True,
     )
 
 
@@ -1382,7 +1393,7 @@ def _brief_from_dict(value: object) -> ExperimentBrief:
     )
     return ExperimentBrief(
         experiment_key=_ref(document["experiment_key"], "ExperimentKey"),
-        semantic_delta=_text(document["semantic_delta"], "SemanticDelta"),
+        semantic_delta=_plan_text(document["semantic_delta"], "SemanticDelta"),
         held_fixed_slots=_string_tuple(
             document["held_fixed_slots"], "held_fixed_slots", allow_empty=True
         ),
@@ -1407,12 +1418,12 @@ def _semantic_from_dict(value: object) -> FrozenSemanticInputs:
     )
     return FrozenSemanticInputs(
         experiment_key=_ref(document["experiment_key"], "ExperimentKey"),
-        goal=_text(document["goal"], "Goal"),
-        characteristics=_text(document["characteristics"], "Characteristics"),
-        boundary_constraints=_text(
+        goal=_plan_text(document["goal"], "Goal"),
+        characteristics=_plan_text(document["characteristics"], "Characteristics"),
+        boundary_constraints=_plan_text(
             document["boundary_constraints"], "BoundaryConstraints"
         ),
-        semantic_delta=_text(document["semantic_delta"], "SemanticDelta"),
+        semantic_delta=_plan_text(document["semantic_delta"], "SemanticDelta"),
     )
 
 
@@ -1433,7 +1444,9 @@ def _semantic_to_dict(value: FrozenSemanticInputs) -> dict[str, object]:
 def _plan_briefs(
     plan_document: dict[str, object],
 ) -> tuple[str, dict[str, dict[str, object]]]:
-    _validate_json_root(plan_document, "PlanDocument")
+    # An accepted upstream Plan is a complete document, not a short Bundle
+    # projection. Keep its exact bytes/hash under the complete root budget.
+    plan_hash = _validate_json_root(plan_document, "PlanDocument", plan_document=True)
     if (
         plan_document.get("schema_ref") != PLAN_DOCUMENT_SCHEMA_REF
         or plan_document.get("kind") != "PlanDocument"
@@ -1455,8 +1468,8 @@ def _plan_briefs(
         brief_gaps = set(_string_list(brief["gap_obligation_keys"], "brief gaps"))
         if not brief_gaps or not brief_gaps <= gaps:
             raise BundleTargetContractError("plan_brief_gap_invalid")
-        for field in ("goal", "characteristics", "boundary_constraints", "semantic_delta"):
-            _text(brief[field], field)
+        for field in _PLAN_PROSE_FIELDS:
+            _plan_text(brief[field], field)
         _string_list(
             brief["contributing_idea_refs"],
             "contributing idea refs",
@@ -1466,7 +1479,7 @@ def _plan_briefs(
         covered.update(brief_gaps)
     if covered != gaps:
         raise BundleTargetContractError("plan_brief_gap_set_incomplete")
-    return _canonical_hash(plan_document, "PlanDocument"), result
+    return plan_hash, result
 
 
 def _freeze_legacy_execution(value: object) -> FrozenJsonObject:
@@ -1570,11 +1583,15 @@ def _validate_domain_document_root(
 
 
 def _validate_json_root(
-    value: object, name: str, *, free_text_fields: frozenset[str] = frozenset()
+    value: object, name: str, *, free_text_fields: frozenset[str] = frozenset(),
+    plan_document: bool = False, plan_projection: bool = False,
 ) -> str:
     state = {"nodes": 0}
 
-    def visit(item: object, depth: int, *, free_text: bool = False) -> None:
+    def visit(
+        item: object, depth: int, *, free_text: bool = False,
+        plan_text: bool = False,
+    ) -> None:
         if depth > _BUNDLE_ROOT_MAX_DEPTH:
             raise BundleTargetContractError(f"{name} exceeds depth budget")
         state["nodes"] += 1
@@ -1583,13 +1600,19 @@ def _validate_json_root(
         if type(item) is dict:
             if len(item) > BUNDLE_PROJECTION_MAX_TUPLE_ITEMS:
                 raise BundleTargetContractError(f"{name} has oversized object")
+            # Only closed records carrying exact inherited Plan prose use
+            # its text contract; other fields retain short projection limits.
+            plan_prose = plan_projection and set(item) in (
+                _PLAN_SEMANTIC_FIELDS, _NORMALIZED_BRIEF_FIELDS
+            )
             for key, nested in item.items():
                 if type(key) is not str:
                     raise BundleTargetContractError(f"{name} has non-string key")
                 _utf8(key, name)
                 visit(
                     nested, depth + 1,
-                    free_text=depth == 0 and key in free_text_fields,
+                    free_text=(depth == 0 and key in free_text_fields),
+                    plan_text=(plan_prose and key in _PLAN_PROSE_FIELDS),
                 )
             return
         if type(item) is list:
@@ -1599,11 +1622,13 @@ def _validate_json_root(
                 visit(nested, depth + 1)
             return
         if type(item) is str:
+            if plan_text and len(item) > PLAN_TEXT_MAX_CHARS:
+                raise BundleTargetContractError(f"{name} has oversized Plan text")
             # Research notes are free prose, not short projection identifiers.
             # They still count towards this document's complete UTF-8 budget.
             if (
                 len(_utf8(item, name)) > BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES
-                and not free_text
+                and not free_text and not plan_document and not plan_text
             ):
                 raise BundleTargetContractError(f"{name} has oversized text")
             return
@@ -1642,8 +1667,10 @@ def _canonical_json(value: object, name: str) -> str:
         raise BundleTargetContractError(f"{name} is not canonical UTF-8 JSON") from error
 
 
-def _canonical_hash(value: object, name: str) -> str:
-    return _validate_json_root(value, name)
+def _canonical_hash(
+    value: object, name: str, *, plan_projection: bool = False,
+) -> str:
+    return _validate_json_root(value, name, plan_projection=plan_projection)
 
 
 def _exact_dict(value: object, fields: set[str], code: str) -> dict[str, object]:
@@ -1695,6 +1722,14 @@ def _text(value: object, name: str) -> str:
         raise BundleTargetContractError(f"{name}_invalid")
     if len(_utf8(value, name)) > BUNDLE_PROJECTION_STRING_MAX_UTF8_BYTES:
         raise BundleTargetContractError(f"{name}_invalid")
+    return value
+
+
+def _plan_text(value: object, name: str) -> str:
+    """Use the upstream Plan contract for inherited research prose."""
+    if type(value) is not str or not value.strip() or len(value) > PLAN_TEXT_MAX_CHARS:
+        raise BundleTargetContractError(f"{name}_invalid")
+    _utf8(value, name)
     return value
 
 
