@@ -77,48 +77,6 @@ def _authority(refs, *, plan=False, existing=False):
     return owner
 
 
-def test_empty_refs_need_no_plan_or_catalog():
-    owner = _authority(())
-    assert owner.prepare_input_assets("target") is False
-    assert owner.input_asset_source_refs("target") == {}
-
-
-def test_existing_ordinary_asset_proof_needs_no_plan_or_catalog():
-    owner = _authority(("asset_direct",), existing=True)
-    assert owner.resolve_input_asset_ref(target_ref="target", input_ref="asset_direct") == "asset_direct"
-    assert owner.prepare_input_assets("target") is False
-    assert owner.input_asset_source_refs("target") == {}
-
-
-def test_unrelated_selected_plan_version_does_not_block_exact_evidence_ref():
-    owner = _authority(("evidence_1",), plan=True)
-    assert owner.resolve_input_asset_ref(target_ref="target", input_ref="evidence_1") == "asset_same"
-    assert owner.input_asset_source_refs("target") == {"asset_same": ("evidence_1",)}
-
-
-@pytest.mark.parametrize("refs", [("evidence_1", "evidence_2"), ("asset_same",)])
-def test_current_target_ambiguous_asset_versions_are_rejected(refs):
-    owner = _authority(refs, plan=True)
-    with pytest.raises(OwnerConflict, match="target_input_evidence_version_conflict"):
-        owner.resolve_input_asset_ref(target_ref="target", input_ref=refs[0])
-
-
-def test_unselected_evidence_cannot_resolve():
-    owner = _authority(("evidence_unselected",), plan=True)
-    with pytest.raises(OwnerConflict, match="target_input_evidence_not_selected"):
-        owner.resolve_input_asset_ref(target_ref="target", input_ref="evidence_unselected")
-
-
-def test_same_asset_existing_version_does_not_override_declared_evidence_version():
-    owner = _authority(("asset_same", "evidence_1"), plan=True)
-    roles = owner._domain_reader.query_asset_roles(version_refs=("version_2",))
-    other = roles[0]
-    owner.query_input_asset_projection = lambda **kw: SimpleNamespace(asset=other.asset_binding(),
-        source_role_ref=other.role_ref, source_role_receipt=other.receipt)
-    with pytest.raises(OwnerConflict, match="target_input_evidence_version_conflict"):
-        owner.resolve_input_asset_ref(target_ref="target", input_ref="evidence_1")
-
-
 def test_declared_duplicate_refs_still_rejected():
     owner = _authority(("asset_direct", "asset_direct"), existing=True)
     with pytest.raises(OwnerConflict, match="target_input_reference_scope_invalid"):

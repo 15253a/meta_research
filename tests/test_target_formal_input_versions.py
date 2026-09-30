@@ -126,11 +126,27 @@ def test_formal_run_uses_only_exact_admitted_input_version(tmp_path, assessed, u
             workspace_resolver=runtime.target_run_authorities.agent_runtime,
             evidence_reader=_SystemEvidenceReader(), measurement_authority=graph, graph_authority=graph)
         if use_newer:
-            with pytest.raises(OwnerConflict, match="target_formal_input_reference_invalid"):
-                finalizer.finalize(handle=handle, evidence=evidence)
+            rejected = finalizer.finalize(handle=handle, evidence=evidence)
+            assert rejected.status == "revision_required"
+            assert rejected.pending_code == "target_formal_input_reference_invalid"
+            assert rejected.rejection_issuer == "research_graph"
+            assert "input_refs" in rejected.rejection_feedback
+            assert rejected.target_commit_ref is None
+            original = lifecycle.query_completion(handle.target_ref)
+            rejection = lifecycle.query_completion_rejection(original.completion_ref)
+            assert rejection.code == rejected.pending_code
+            assert rejection.receipt.subject_ref == original.completion_ref
+            assert rejection.manifest_ref == rejected.manifest_ref
+            assert original.handle == handle
+            assert lifecycle.query(handle.target_ref).status == "running"
+            assert lifecycle.query(handle.target_ref).completion_ref is None
+            assert memory.query(rejected.manifest_ref).result_document.as_dict()["formal_runs"][0]["input_refs"] == [newer.version_ref]
+            assert finalizer.finalize(handle=handle, evidence=evidence) == rejected
             with runtime._database.read() as connection:
-                assert connection.execute(text("SELECT COUNT(*) FROM rg_variant_runs")).scalar_one() == 0
-                assert connection.execute(text("SELECT COUNT(*) FROM rg_target_commits")).scalar_one() == 0
+                for table in ("rg_variant_runs", "rg_evaluation_attempts", "rg_metric_results",
+                              "rg_target_root_measurements", "rg_target_commits"):
+                    assert connection.execute(text("SELECT COUNT(*) FROM " + table)).scalar_one() == 0
+                assert connection.execute(text("SELECT COUNT(*) FROM ar_target_root_completion_rejections")).scalar_one() == 1
             return
         completed = finalizer.finalize(handle=handle, evidence=evidence)
         assert completed.status == "completed"

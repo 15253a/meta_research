@@ -15,10 +15,11 @@ _REUSED_EVALUATION_SOURCES = ContextVar('reused_evaluation_sources', default=fro
 
 
 def verified_target_input_asset_refs(owner, *, target_ref, proofs, target_commit_refs=()):
-    """Resolve direct proofs and artifacts of the completion's frozen commits."""
+    """Resolve exact input proofs, their selected aliases, and frozen commits."""
     from meta_research.bundle_protocol import projection_plain_value
 
     refs = set()
+    direct_assets = []
     for proof in proofs:
         if owner is None:
             raise OwnerConflict("target_launch_asset_proof_verifier_unavailable")
@@ -28,6 +29,10 @@ def verified_target_input_asset_refs(owner, *, target_ref, proofs, target_commit
                 or projection_plain_value(projection.as_bundle_proof()) != proof):
             raise OwnerConflict("target_run_input_asset_proof_invalid")
         refs.update((projection.asset.asset_ref, projection.asset.version_ref))
+        direct_assets.append(projection.asset)
+    alias_reader = getattr(owner, "query_target_input_asset_aliases", None)
+    if direct_assets and callable(alias_reader):
+        refs.update(alias_reader(target_ref=target_ref, assets=tuple(direct_assets)))
     if target_commit_refs and owner is not None:
         bindings = owner.query_target_commit_input_asset_bindings(
             target_ref=target_ref, target_commit_refs=tuple(target_commit_refs))

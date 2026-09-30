@@ -1216,6 +1216,8 @@ class TargetInputAssetProofReader(Protocol):
 
     def resolve_input_asset_ref(self, *, target_ref: str, input_ref: str) -> str: ...
 
+    def input_asset_source_refs(self, target_ref: str) -> dict[str, tuple[str, ...]]: ...
+
     def query_bundle_input_asset_proof(
         self, *, target_ref: str, asset_ref: str
     ) -> AcceptedInputAssetProof | None: ...
@@ -1980,6 +1982,10 @@ class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetO
     def query_target_input_asset_projection(
         self, *, target_ref: str, asset_ref: str
     ) -> AcceptedTargetInputAssetProjection | None: ...
+
+    def query_target_input_asset_aliases(
+        self, *, target_ref: str, assets: tuple[AcceptedAssetBinding, ...]
+    ) -> tuple[str, ...]: ...
 
     def prepare_target_input_assets(self, target_ref: str) -> bool: ...
 
@@ -5784,6 +5790,48 @@ class SQLiteResearchGraphReceiptVerifier:
         if reader is None:
             raise OwnerConflict("target_launch_asset_proof_verifier_unavailable")
         return reader.query_input_asset_projection(target_ref=target_ref, asset_ref=asset_ref)
+
+    def query_target_input_asset_aliases(
+        self, *, target_ref: str, assets: tuple[AcceptedAssetBinding, ...]
+    ) -> tuple[str, ...]:
+        """Authenticate selected Plan names against the completion's exact assets."""
+        if not assets:
+            return ()
+        reader = self._target_input_asset_proof_reader
+        if reader is None:
+            raise OwnerConflict("target_launch_asset_proof_verifier_unavailable")
+        source_reader = getattr(reader, "input_asset_source_refs", None)
+        if not callable(source_reader):
+            # Historical direct-asset adapters have no catalog aliases.
+            return ()
+        admitted = {asset.asset_ref: asset for asset in assets}
+        with self._database.read_snapshot():
+            sources = source_reader(target_ref)
+            selected = {
+                ref: admitted[asset_ref]
+                for asset_ref, source_refs in sources.items()
+                if asset_ref in admitted
+                for ref in source_refs
+                if ref.startswith("evidence_")
+            }
+            aliases = tuple(sorted(selected))
+            if not aliases:
+                return ()
+            batch_resolver = getattr(reader, "resolve_input_asset_refs", None)
+            resolved = (batch_resolver(target_ref=target_ref, input_refs=aliases)
+                        if callable(batch_resolver) else tuple(
+                            reader.resolve_input_asset_ref(target_ref=target_ref, input_ref=ref)
+                            for ref in aliases))
+            if not isinstance(resolved, tuple) or len(resolved) != len(aliases):
+                raise OwnerConflict("target_run_input_asset_proof_invalid")
+            for alias, asset_ref in zip(aliases, resolved):
+                projection = reader.query_input_asset_projection(
+                    target_ref=target_ref, asset_ref=asset_ref)
+                if (asset_ref != selected[alias].asset_ref or projection is None
+                        or projection.target_ref != target_ref
+                        or projection.asset != selected[alias]):
+                    raise OwnerConflict("target_run_input_asset_proof_invalid")
+        return aliases
 
     def prepare_target_input_assets(self, target_ref: str) -> bool:
         """Explicitly prepare issuer-backed inputs before the read-only launch check."""
@@ -15827,6 +15875,12 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         return self._receipt_verifier.query_target_input_asset_projection(
             target_ref=target_ref, asset_ref=asset_ref)
 
+    def query_target_input_asset_aliases(
+        self, *, target_ref: str, assets: tuple[AcceptedAssetBinding, ...]
+    ) -> tuple[str, ...]:
+        return self._receipt_verifier.query_target_input_asset_aliases(
+            target_ref=target_ref, assets=assets)
+
     def prepare_target_input_assets(self, target_ref: str) -> bool:
         return self._receipt_verifier.prepare_target_input_assets(target_ref)
 
@@ -15861,6 +15915,57 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             manifest=manifest,
             result_document=result_document,
         )
+
+        def reject_candidate(error: OwnerConflict) -> TargetRootOwnerRejection:
+            if error.code == "target_formal_input_reference_invalid":
+                feedback = (
+                    "A formal run input_refs declaration is invalid for this Target. "
+                    "Use only the exact admitted input asset, version, or Evidence "
+                    "references supplied by the Owner; each reference must be a "
+                    "unique string. Correct the affected formal_runs input_refs "
+                    "and finish a normal turn in the same Root. The frozen rejected "
+                    "artifacts remain saved in RM."
+                )
+            else:
+                feedback = getattr(error, "feedback", (
+                    "The selected result or checkpoint roles do not satisfy "
+                    "execution_contract.measurement_contract in the Owner prompt. "
+                    "Check the exact schema_ref, required/optional metric keys, "
+                    "metric value definitions, and checkpoint_policy. Repair "
+                    "the affected workspace artifacts and finish a normal root turn."
+                ))
+            rejection_material = {
+                "schema_ref": "meta-research/target-root-rg-rejection/v1",
+                "completion_ref": completion.completion_ref,
+                "manifest_ref": manifest.manifest_ref,
+                "target_ref": completion.handle.target_ref,
+                "target_run_ref": completion.handle.target_run_ref,
+                "code": error.code,
+                "feedback": feedback,
+            }
+            rejection_hash = canonical_hash(rejection_material)
+            rejection_ref = "rg_target_root_rejection_" + rejection_hash[:32]
+            receipt_ref = "rg_target_root_rejection_receipt_" + rejection_hash[:24]
+            receipt = AcceptanceReceipt(
+                issuer="research_graph",
+                kind="target_root_completion_rejected",
+                receipt_ref=receipt_ref,
+                subject_ref=completion.completion_ref,
+                payload_hash=canonical_hash(
+                    {
+                        **rejection_material,
+                        "rejection_ref": rejection_ref,
+                        "receipt_ref": receipt_ref,
+                    }
+                ),
+            )
+            return TargetRootOwnerRejection(
+                issuer="research_graph",
+                rejection_ref=rejection_ref,
+                code=error.code,
+                feedback=rejection_material["feedback"],
+                receipt=receipt,
+            )
         try:
             target, authority, projection, candidate_projection = (
                 self._target_root_domain_context(
@@ -15892,44 +15997,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             if error.code not in {"target_root_commit_domain_invalid",
                                    "target_measurement_result_content_invalid"}:
                 raise
-            rejection_material = {
-                "schema_ref": "meta-research/target-root-rg-rejection/v1",
-                "completion_ref": completion.completion_ref,
-                "manifest_ref": manifest.manifest_ref,
-                "target_ref": completion.handle.target_ref,
-                "target_run_ref": completion.handle.target_run_ref,
-                "code": error.code,
-                "feedback": getattr(error, "feedback", (
-                    "The selected result or checkpoint roles do not satisfy "
-                    "execution_contract.measurement_contract in the Owner prompt. "
-                    "Check the exact schema_ref, required/optional metric keys, "
-                    "metric value definitions, and checkpoint_policy. Repair "
-                    "the affected workspace artifacts and finish a normal root turn."
-                )),
-            }
-            rejection_hash = canonical_hash(rejection_material)
-            rejection_ref = "rg_target_root_rejection_" + rejection_hash[:32]
-            receipt_ref = "rg_target_root_rejection_receipt_" + rejection_hash[:24]
-            receipt = AcceptanceReceipt(
-                issuer="research_graph",
-                kind="target_root_completion_rejected",
-                receipt_ref=receipt_ref,
-                subject_ref=completion.completion_ref,
-                payload_hash=canonical_hash(
-                    {
-                        **rejection_material,
-                        "rejection_ref": rejection_ref,
-                        "receipt_ref": receipt_ref,
-                    }
-                ),
-            )
-            return TargetRootOwnerRejection(
-                issuer="research_graph",
-                rejection_ref=rejection_ref,
-                code=error.code,
-                feedback=rejection_material["feedback"],
-                receipt=receipt,
-            )
+            return reject_candidate(error)
         request_hash = _target_root_commit_request_hash(
             completion=completion,
             manifest=manifest,
@@ -16240,6 +16308,12 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                         "receipt_ref": commit_receipt_ref,
                     },
                 )
+        except OwnerConflict as error:
+            if error.code != "target_formal_input_reference_invalid":
+                raise
+            # fenced_write has rolled back every formal and Commit row before
+            # this immutable Owner rejection can reopen the same Root.
+            return reject_candidate(error)
         except IntegrityError as error:
             with self._database.read() as connection:
                 raced = connection.execute(

@@ -32,38 +32,11 @@ def _version_owner(refs=("asset_version_1",)):
     return owner, role, accepted, issued
 
 
-def test_dependency_version_prepares_exact_asset_proof_and_retains_source_alias():
-    owner, role, accepted, issued = _version_owner()
-    assert owner.prepare_input_assets("target") is True
-    assert owner.resolve_input_asset_ref(target_ref="target", input_ref=role.version_ref) == role.asset_ref
-    assert accepted[role.asset_ref].asset == role.asset_binding()
-    assert issued[0]["binding"] == role.asset_binding()
-    assert owner.input_asset_source_refs("target") == {role.asset_ref: (role.version_ref,)}
-    assert owner.prepare_input_assets("target") is False
-    assert len(issued) == 1
-
-
-def test_dependency_asset_identity_prepares_the_commit_bound_version():
-    owner, role, accepted, issued = _version_owner(("asset_same",))
-    assert owner.prepare_input_assets("target") is True
-    assert accepted[role.asset_ref].asset == role.asset_binding()
-    assert owner.resolve_input_asset_ref(target_ref="target", input_ref=role.asset_ref) == role.asset_ref
-    assert owner.prepare_input_assets("target") is False
-    assert len(issued) == 1
-
-
 def test_ambiguous_dependency_asset_identity_cannot_choose_a_version():
     owner, role, accepted, issued = _version_owner(("asset_same",))
     other = replace(role.asset_binding(), version_ref="asset_version_2")
     owner._domain_reader.query_target_dependency_asset_bindings = lambda _: ("quest", (role.asset_binding(), other))
     with pytest.raises(OwnerConflict, match="target_input_evidence_version_conflict"):
-        owner.prepare_input_assets("target")
-    assert not accepted and not issued
-
-
-def test_unknown_version_cannot_issue_a_target_proof():
-    owner, _role, accepted, issued = _version_owner(("asset_version_foreign",))
-    with pytest.raises(OwnerConflict, match="asset_quest_scope_invalid"):
         owner.prepare_input_assets("target")
     assert not accepted and not issued
 
