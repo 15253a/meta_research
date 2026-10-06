@@ -29,8 +29,9 @@ export default defineConfig({
     "{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{-snapshotSuffix}{ext}",
   use: {
     headless: true,
+    channel: process.env.META_RESEARCH_CHROME ? undefined : "chrome",
     launchOptions: {
-      executablePath: process.env.META_RESEARCH_CHROME ?? "/usr/bin/google-chrome",
+      executablePath: process.env.META_RESEARCH_CHROME,
     },
     trace: "retain-on-failure",
   },

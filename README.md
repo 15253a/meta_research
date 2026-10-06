@@ -14,3 +14,7 @@ The repository contains source, tests, pinned Python and frontend dependencies, 
 Use Python 3.11–3.13 and the checked-in `uv.lock` for the Python environment. The frontend source and npm lockfile live in `web/`; the deployed static assets live in `src/meta_research/web_dist/`. The source-preservation and design pass does not restart or migrate the running service.
 
 Current design work: [memory-system map](https://github.com/15253a/meta_research/issues/148) and [evidence documents](docs/memory/README.md).
+
+Implementation of [spec #169](https://github.com/15253a/meta_research/issues/169)
+starts with [the recovered baseline and verification entrypoints](docs/implementation-baseline.md).
+Frontend behavior tests and typechecks are described in [web/README.md](web/README.md).

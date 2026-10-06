@@ -9,12 +9,12 @@ import { chromium } from "playwright";
 const require = createRequire(import.meta.url);
 const playwrightVersion = require("playwright/package.json").version;
 const statePath = process.argv[2];
-const chromePath = "/usr/bin/google-chrome";
+const chromePath = process.env.META_RESEARCH_CHROME;
 
 assert.equal(playwrightVersion, "1.55.1", "installed Web acceptance must use locked Playwright 1.55.1");
 assert.ok(statePath, "usage: installed-product-browser.mjs <browser-session.json>");
 assert.ok(existsSync(resolve(statePath)), `browser session does not exist: ${statePath}`);
-assert.ok(existsSync(chromePath), `system Chrome does not exist: ${chromePath}`);
+if (chromePath) assert.ok(existsSync(chromePath), `configured Chrome does not exist: ${chromePath}`);
 
 const state = JSON.parse(readFileSync(resolve(statePath), "utf8"));
 const baseUrl = new URL(state.base_url);
@@ -30,6 +30,7 @@ assert.equal(baseUrl.protocol, "http:", "installed browser expects loopback HTTP
 assert.ok(Array.isArray(state.cookies) && state.cookies.length >= 2, "authenticated cookie state is incomplete");
 
 const browser = await chromium.launch({
+  channel: chromePath ? undefined : "chrome",
   executablePath: chromePath,
   headless: true,
 });
