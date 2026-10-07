@@ -221,6 +221,25 @@ export function ResearchAssetsWorkbench({
   );
   const activeHold = selectedHolds.find((item) => item.active)?.hold_ref ?? null;
   const lifecycle = lifecycleDetail?.versionRef === selectedRef ? lifecycleDetail.lifecycle : null;
+  const selectedLifecycle = lifecycle?.versions.find((item) => item.version_ref === selectedRef);
+  const canChangeSelected = Boolean(
+    selected && lifecycle && selectedLifecycle
+    && selectedLifecycle.state !== "retired"
+    && (lifecycle.current_version_ref === null || lifecycle.current_version_ref === selectedRef),
+  );
+  const changeBasisHint = !selected
+    ? null
+    : !lifecycle
+      ? "正在读取所选版本的状态。"
+      : selectedLifecycle?.state === "retired"
+        ? "所选版本已退役。请打开当前版本，或保存为全新资产。"
+        : lifecycle.current_version_ref !== null && lifecycle.current_version_ref !== selectedRef
+          ? "当前复用入口已指向其他版本。请在版本详情中打开当前版本。"
+          : lifecycle.current_version_ref === null
+            ? selectedLifecycle?.state === "unselected"
+              ? "这份历史版本尚未选为当前。提交变更将明确选择其后继版本作为当前版本。"
+              : "当前复用入口为空。提交变更将选择所选历史版本的后继作为当前版本。"
+            : null;
 
   useEffect(() => {
     selectedRefRef.current = selectedRef;
@@ -772,7 +791,7 @@ export function ResearchAssetsWorkbench({
         provenance: { submitted_via: "lumen_research_asset_workbench" },
       };
       if (createNextVersion && selected) {
-        if (!lifecycle || lifecycle.current_version_ref !== selected.memory_ref) {
+        if (!lifecycle || !canChangeSelected) {
           throw new ProductError("asset_current_version_required");
         }
         const basis = {
@@ -888,8 +907,8 @@ export function ResearchAssetsWorkbench({
         ? "上次提交仍在恢复中，请等待结果。"
         : sourceKind === "file" && fileContent === null
           ? fileReadError ?? "请先选择一个文件。"
-          : createNextVersion && lifecycle?.current_version_ref !== selectedRef
-            ? "请先读取并选择当前版本，再提交变更。"
+          : createNextVersion && !canChangeSelected
+            ? changeBasisHint ?? "所选版本目前不能作为变更基础。"
             : createNextVersion && !changeDraft.explanation.trim()
               ? "请说明这次变更及其影响。"
               : createNextVersion && changeDraft.kind === "correction"
@@ -1046,7 +1065,7 @@ export function ResearchAssetsWorkbench({
                   aria-label="作为所选 AssetRef 的下一版本"
                   type="checkbox"
                   checked={createNextVersion}
-                  disabled={busy !== null || !selected || lifecycle?.current_version_ref !== selectedRef}
+                  disabled={busy !== null || !canChangeSelected}
                   onChange={(event) => setCreateNextVersion(event.target.checked)}
                 />
                 <span>
@@ -1055,9 +1074,7 @@ export function ResearchAssetsWorkbench({
                     : "先从盘点中选择一个 AssetRef，或创建全新资产"}
                 </span>
               </label>
-              {selected && lifecycle?.current_version_ref !== selectedRef ? (
-                <small>变更以当前版本为基础。请在版本详情中打开当前版本。</small>
-              ) : null}
+              {changeBasisHint ? <small>{changeBasisHint}</small> : null}
               {createNextVersion ? (
                 <ChangeFields
                   draft={changeDraft}
