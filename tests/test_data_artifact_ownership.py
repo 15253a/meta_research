@@ -14,8 +14,8 @@ from test_root_formal_entities import _accept
 from test_target_root_finalizer import _root_finalizer_fixture
 
 
-@pytest.mark.parametrize('multiple,explicit', [(False, False), (True, False), (True, True)])
-def test_data_products_are_defaulted_only_for_one_actual_producer(tmp_path, multiple, explicit):
+@pytest.mark.parametrize('multiple,explicit', [(False, False), (False, True), (True, False), (True, True)])
+def test_data_products_require_an_explicit_actual_producer(tmp_path, multiple, explicit):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         path = workspace / 'outputs/data/observations.txt'
@@ -38,7 +38,7 @@ def test_data_products_are_defaulted_only_for_one_actual_producer(tmp_path, mult
         facts = runtime.owners.research_graph.query_target_formal_results(handle.target_ref)
         data = next(entry for entry in manifest.entries if entry.role == 'data')
         assert runtime.owners.research_memory.materialize_asset(data.binding.version_ref).content == path.read_bytes()
-        if multiple and not explicit:
+        if not explicit:
             assert isinstance(accepted, TargetRootOwnerRejection)
             assert accepted.code == 'target_root_commit_domain_invalid'
             assert relative in accepted.feedback and 'actual Run or Evaluation owner' in accepted.feedback
@@ -50,8 +50,7 @@ def test_data_products_are_defaulted_only_for_one_actual_producer(tmp_path, mult
             return
         assert accepted.target_commit_ref
         data_roles = [item for item in facts[0]['run_artifacts'] if item['role'] == 'data_asset']
-        assert [item['version_ref'] for item in data_roles] == (
-            [data.binding.version_ref] if not multiple or explicit else [])
+        assert [item['version_ref'] for item in data_roles] == [data.binding.version_ref]
         assert not any(item['role'] == 'data_asset' for fact in facts for item in fact['evaluation_artifacts'])
         if multiple:
             assert not any(item['role'] == 'data_asset' for item in facts[1]['run_artifacts'])

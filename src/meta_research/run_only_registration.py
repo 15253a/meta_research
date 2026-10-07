@@ -228,7 +228,7 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
     entries = [entry.as_dict() for entry in manifest.entries if entry.role == "checkpoint"]
     checkpoint_defaults = _default_checkpoint_paths(
         {run['run_key']: run.get('checkpoint_paths') for run in runs
-         if not run.get('variant_run_ref')}, entries)
+         if not run.get('variant_run_ref')}, entries, require_explicit=not verify_only)
     _resolve_run_variant_declarations(connection, runs=runs, target=target,
                                       accepted_at=completion.accepted_at,
                                       verify_only=verify_only)
@@ -279,9 +279,13 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
         prior = connection.execute(text('SELECT checkpoint_roles_json FROM rg_target_root_unassessed_runs '
             'WHERE association_ref=:ref'), {'ref': association_ref}).first()
         frozen_refs = [row['role_ref'] for row in json.loads(prior.checkpoint_roles_json)] if prior else None
+        checkpoint_paths = run.get("checkpoint_paths")
+        if verify_only and checkpoint_paths is None and prior is not None and not reused:
+            checkpoint_paths = [record["declared_relative_path"]
+                                for record in json.loads(prior.checkpoint_roles_json)]
         checkpoints = _register_run_checkpoints(connection, ensure=ensure,
             item={"variant_run_ref": run_ref, "reuse_variant_run": reused,
-                  "checkpoint_paths": run.get("checkpoint_paths"),
+                  "checkpoint_paths": checkpoint_paths,
                   "checkpoint_role_refs": run.get("checkpoint_role_refs"),
                   "checkpoint_version_refs": run.get("checkpoint_version_refs"),
                   "frozen_checkpoint_role_refs": frozen_refs}, entries=entries, accepted_at=at,

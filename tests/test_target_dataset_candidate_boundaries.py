@@ -100,7 +100,9 @@ def test_frozen_parent_dataset_mismatch_returns_feedback_and_can_be_corrected_in
         _data(workspace)
         result_path = workspace / "outputs/metrics.json"
         document = json.loads(result_path.read_text())
-        assert "formal_runs" not in document
+        document["formal_runs"][0]["artifact_paths"].extend([
+            DATASET_PATH, OTHER_PATH, PARENT_PATH + "/download-notes.txt",
+        ])
         document["dataset_candidates"] = [_candidate()]
         result_path.write_text(canonical_json(document), encoding="utf-8")
         evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
@@ -180,7 +182,9 @@ def test_frozen_parent_dataset_mismatch_returns_feedback_and_can_be_corrected_in
 
 
 def test_parent_directory_never_substitutes_for_the_declared_dataset_contents() -> None:
-    document = {"metrics": {}, "dataset_candidates": [_candidate()]}
+    document = {"metrics": {}, "dataset_candidates": [_candidate()],
+                "formal_runs": [{"run_key": "acquisition", "artifact_paths": [PARENT_PATH],
+                                 "checkpoint_paths": [], "evaluations": []}]}
     before = deepcopy(document)
     entries = [{"role": "data", "declared_relative_path": PARENT_PATH}]
 
@@ -193,6 +197,8 @@ def test_parent_directory_never_substitutes_for_the_declared_dataset_contents() 
 def test_overlapping_dataset_declarations_request_correction_instead_of_unchanged_retry() -> None:
     document = {
         "metrics": {},
+        "formal_runs": [{"run_key": "acquisition", "artifact_paths": [PARENT_PATH],
+                         "checkpoint_paths": [], "evaluations": []}],
         "dataset_candidates": [_candidate(PARENT_PATH), _candidate(DATASET_PATH)],
     }
     entries = [{"role": "data", "declared_relative_path": PARENT_PATH}]
@@ -209,7 +215,9 @@ def test_overlapping_dataset_declarations_request_correction_instead_of_unchange
 
 @pytest.mark.parametrize("path", ["outputs/data/ad/../missing", "/outputs/data/ad", "outputs\\data\\ad"])
 def test_invalid_dataset_paths_request_canonical_path_correction(path: str) -> None:
-    document = {"metrics": {}, "dataset_candidates": [_candidate(path)]}
+    document = {"metrics": {}, "dataset_candidates": [_candidate(path)],
+                "formal_runs": [{"run_key": "acquisition", "artifact_paths": [PARENT_PATH],
+                                 "checkpoint_paths": [], "evaluations": []}]}
     entries = [{"role": "data", "declared_relative_path": PARENT_PATH}]
 
     with pytest.raises(OwnerConflict) as failure:

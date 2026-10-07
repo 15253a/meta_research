@@ -25,7 +25,11 @@ def _candidate(path):
     ("log", "logs/train.log"),
 ])
 def test_environment_candidate_uses_the_existing_retained_run_artifact(role, path):
-    document = {"metrics": {"observed": 1}, "environment_candidates": [_candidate(path)]}
+    document = {"metrics": {"observed": 1}, "environment_candidates": [_candidate(path)],
+                "formal_runs": [{"run_key": "construct", "evaluations": [],
+                    "artifact_paths": [path] if role in {"data", "analysis", "log"} else [],
+                    "checkpoint_paths": [path] if role == "checkpoint" else [],
+                    **({"implementation_paths": [path]} if role == "implementation" else {})}]}
     entries = [{"role": role, "declared_relative_path": path}]
     before = deepcopy((document, entries))
 
@@ -37,7 +41,9 @@ def test_environment_candidate_uses_the_existing_retained_run_artifact(role, pat
 def test_dataset_and_environment_can_reference_one_exact_asset():
     path = "outputs/data/simulator-fixtures"
     document = {"metrics": {"observed": 1}, "dataset_candidates": [_candidate(path)],
-                "environment_candidates": [_candidate(path)]}
+                "environment_candidates": [_candidate(path)],
+                "formal_runs": [{"run_key": "construct", "artifact_paths": [path],
+                                 "checkpoint_paths": [], "evaluations": []}]}
     entries = [{"role": "data", "declared_relative_path": path}]
 
     verify_retained_products(document, entries)
@@ -91,7 +97,9 @@ def test_environment_candidate_requires_canonical_relative_path(path):
 
 @pytest.mark.parametrize("other_field", ["dataset_candidates", "environment_candidates"])
 def test_candidate_parent_child_overlap_is_rejected_across_both_indexes(other_field):
-    document = {"metrics": {"observed": 1}, "environment_candidates": [_candidate("outputs/data/environment")]}
+    document = {"metrics": {"observed": 1}, "environment_candidates": [_candidate("outputs/data/environment")],
+                "formal_runs": [{"run_key": "construct", "artifact_paths": ["outputs/data/environment"],
+                                 "checkpoint_paths": [], "evaluations": []}]}
     document.setdefault(other_field, []).append(_candidate("outputs/data/environment/fixtures"))
     with pytest.raises(OwnerConflict) as failure:
         verify_retained_products(document, [{"role": "data", "declared_relative_path": "outputs/data/environment"}])
@@ -111,6 +119,8 @@ def test_environment_subpath_cannot_substitute_for_an_existing_implementation_sn
 def test_environment_data_subpath_requests_a_new_exact_completion_boundary():
     with pytest.raises(OwnerConflict) as failure:
         verify_retained_products({"metrics": {"observed": 1},
+            "formal_runs": [{"run_key": "construct", "artifact_paths": ["outputs/data"],
+                             "checkpoint_paths": [], "evaluations": []}],
             "environment_candidates": [_candidate("outputs/data/environment")]},
             [{"role": "data", "declared_relative_path": "outputs/data"}])
     assert "keep environment_candidates unchanged" in failure.value.feedback
@@ -126,7 +136,9 @@ def test_discovery_keeps_one_shared_candidate_boundary_and_all_neighboring_conte
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_text(name)
     document = {"metrics": {"observed": 1}, "dataset_candidates": [_candidate(path)],
-                "environment_candidates": [_candidate(path), _candidate("implementation")]}
+                "environment_candidates": [_candidate(path), _candidate("implementation")],
+                "formal_runs": [{"run_key": "construct", "artifact_paths": [path, "outputs/data/collected/other"],
+                                 "checkpoint_paths": [], "evaluations": []}]}
     (tmp_path / "outputs/result.json").write_text(canonical_json(document))
     handle = SimpleNamespace(target_ref="environment-target", target_run_ref="environment-run")
     text = "Retained simulator and fixtures."

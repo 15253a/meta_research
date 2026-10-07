@@ -106,6 +106,18 @@ _SYSTEM_TARGET_COMPLETION_OPTIONAL_ARTIFACTS = (
 # Retain old rejection text so historical signed rejections remain replayable.
 # New path-backed artifacts do not use the historical byte/directory ceilings.
 _RM_RECOVERABLE_CANDIDATE_FEEDBACK = {
+    "target_root_retained_artifacts_invalid": (
+        "retained_artifacts must contain at most 100 unique canonical workspace paths, "
+        "each with exactly relative_path and role (log, analysis, data or checkpoint). "
+        "Select exact files or directories outside inputs/, implementation/, handoff/ "
+        "and the result document. Keep the existing work, correct its retention "
+        "declaration and finish another normal root turn."
+    ),
+    "target_root_retained_artifact_unbound": (
+        "A retained_artifacts selection is not bound to its exact path and declared "
+        "role in this completion. Preserve the content and correct the handoff "
+        "selection before finishing another normal root turn."
+    ),
     "target_root_artifact_intake_failed": (
         "Research Memory could not retain a selected artifact after storage retries. "
         "Inspect the failed intake and available storage, preserve the research "
@@ -1106,6 +1118,20 @@ class SQLiteTargetRootCompletionMemoryAuthority:
                     or note.get("source_bytes_sha256") != source.sha256
                     or note.get("source_utf8_bytes") != source.size):
                 raise OwnerConflict("target_root_manifest_integrity_invalid")
+            if "note_only" in note:
+                note_only = (description.kind == "file" and source_path is None
+                             or description.kind == "directory"
+                             and len(description.entries) == 1
+                             and description.entries[0].path == source_path)
+                if type(note["note_only"]) is not bool or note["note_only"] != note_only:
+                    raise OwnerConflict("target_root_manifest_integrity_invalid")
+            if "other_content_bytes" in note:
+                other_content_bytes = sum(item.size for item in description.entries
+                                          if item.path != source_path)
+                if (description.kind != "directory"
+                        or type(note["other_content_bytes"]) is not int
+                        or note["other_content_bytes"] != other_content_bytes):
+                    raise OwnerConflict("target_root_manifest_integrity_invalid")
         return description
 
     def _verify_binding(
@@ -1697,6 +1723,10 @@ class TargetRunFinalizer:
         if len(result_matches) != 1 or result_matches[0].artifact_kind != "file":
             raise OwnerConflict("target_root_result_document_invalid")
         result = _decode_result_document_bytes(result_matches[0].content)
+        retained = _retained_artifact_declarations(result.as_dict())
+        frozen_roles = {item.declared_relative_path: item.role for item in artifacts}
+        if any(frozen_roles.get(item.relative_path) != item.role for item in retained):
+            raise OwnerConflict("target_root_retained_artifact_unbound")
         return _FrozenWorkspace(
             workspace_ref=workspace_ref,
             artifacts=artifacts,
@@ -1723,7 +1753,7 @@ def _system_target_completion_handoff(
     evidence: TargetRootCompletionEvidence,
     root_descriptor: int,
 ) -> TargetCompletionHandoff:
-    """Derive the internal handoff from fixed, descriptor-safe Owner paths."""
+    """Derive the handoff from declared and conventional descriptor-safe paths."""
 
     if evidence.final_text is None or evidence.final_text_sha256 is None:
         raise OwnerConflict("target_root_completion_evidence_invalid")
@@ -1741,6 +1771,7 @@ def _system_target_completion_handoff(
             raise OwnerConflict('target_root_result_document_invalid')
     finally:
         os.close(descriptor)
+    retained = _retained_artifact_declarations(document, strict=False)
     selected_paths = []
     for run in document.get('formal_runs', []):
         if not isinstance(run, dict) or run.get('variant_run_ref') or run.get('status', 'executed') not in {'executed', 'failed'}:
@@ -1773,6 +1804,12 @@ def _system_target_completion_handoff(
                 )
                 for path in paths
             )
+    # Retention purpose is declared independently of the directory convention.
+    # One exact path is frozen once; its producing work is resolved by RG from
+    # formal_runs, never by these storage-role selections.
+    retained_by_path = {item.relative_path: item for item in retained}
+    artifacts = [retained_by_path.pop(item.relative_path, item) for item in artifacts]
+    artifacts.extend(retained_by_path.values())
     final_text_bytes = evidence.final_text.encode("utf-8")
     summary = (
         "System-bound Target root completion; final_text_sha256="
@@ -1791,10 +1828,12 @@ def _system_target_completion_handoff(
 
 
 def _declared_artifact_boundaries(document, relative_path, role):
-    """Honor actual producers' exact selections; RG owns semantic rejection."""
+    """Honor exact retention and production selections; RG owns attribution."""
     if role not in {'data', 'analysis', 'log', 'checkpoint'}:
         return ()
     selected = []
+    selected.extend(item.relative_path
+                    for item in _retained_artifact_declarations(document, strict=False))
     for run in document.get('formal_runs', []):
         if not isinstance(run, dict) or run.get('status', 'executed') not in {'executed', 'failed'}:
             continue
@@ -1822,6 +1861,37 @@ def _declared_artifact_boundaries(document, relative_path, role):
         if path == relative_path or path.startswith(relative_path + '/'):
             paths.add(path)
     return tuple(sorted(paths))
+
+
+def _retained_artifact_declarations(document, *, strict=True):
+    """Validate optional exact retention selections without inventing identities."""
+    try:
+        selected = document.get("retained_artifacts", [])
+        if not isinstance(selected, list) or len(selected) > 100:
+            raise OwnerConflict("target_root_retained_artifacts_invalid")
+        artifacts, paths = [], set()
+        for item in selected:
+            if (not isinstance(item, dict) or set(item) != {"relative_path", "role"}
+                    or not isinstance(item["role"], str)
+                    or item["role"] not in {"log", "analysis", "data", "checkpoint"}):
+                raise OwnerConflict("target_root_retained_artifacts_invalid")
+            try:
+                path = validate_bundle_relative_path(item["relative_path"])
+            except TargetImplementationBundleError as error:
+                raise OwnerConflict("target_root_retained_artifacts_invalid") from error
+            if (path in paths or path.split("/")[0] in {"inputs", "implementation", "handoff"}
+                    or path == "outputs" or path == "outputs/result.json"
+                    or path.startswith("outputs/result.json/")):
+                raise OwnerConflict("target_root_retained_artifacts_invalid")
+            paths.add(path)
+            artifacts.append(TargetCompletionArtifact(role=item["role"], relative_path=path))
+        return tuple(artifacts)
+    except OwnerConflict:
+        if strict:
+            raise
+        # Discovery precedes the candidate rejection boundary. Freeze performs
+        # strict validation and records the recoverable RM rejection instead.
+        return ()
 
 
 def _declared_boundary_artifact_paths(root_descriptor, relative_path, boundaries):
@@ -2508,6 +2578,7 @@ def _target_root_utf8_size(value: str, *, invalid_code: str) -> int:
 def _decode_result_document_value(value: object) -> TargetRootResultDocument:
     if type(value) is not dict or not TARGET_ROOT_RESULT_DOCUMENT_FIELDS <= set(value):
         raise OwnerConflict("target_root_result_document_invalid")
+    _retained_artifact_declarations(value)
     schema_ref = value.get("schema_ref")
     metrics = value.get("metrics")
     disposition = value.get("result_disposition")

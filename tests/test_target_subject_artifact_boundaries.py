@@ -73,6 +73,8 @@ def test_frozen_split_logs_reject_recoverably_and_same_run_accepts_exact_parent(
         path = workspace / 'outputs/metrics.json'
         document = json.loads(path.read_text())
         document['formal_runs'] = [{'run_key': 'audit', 'artifact_paths': ['logs'],
+            'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+                                 if artifact.role == 'checkpoint'],
             'evaluations': [{'attempt_key': 'check', 'metrics': document['metrics']}]}]
         path.write_text(canonical_json(document))
         kwargs = dict(lifecycle=lifecycle, memory=memory,

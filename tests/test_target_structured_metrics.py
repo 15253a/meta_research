@@ -58,6 +58,7 @@ def test_structured_measurements_survive_owner_commit_bundle_and_evidence_reuse(
         result_path = workspace / "outputs/metrics.json"
         document = json.loads(result_path.read_bytes())
         document["metrics"] = deepcopy(METRICS)
+        document["formal_runs"][0]["evaluations"][0]["metrics"] = document["metrics"]
         raw = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
         result_path.write_bytes(raw)
         frozen_schema_hash = canonical_hash(authority.measurement_contract.result_schema.as_dict())
@@ -158,6 +159,7 @@ def test_initial_schema_allows_well_formed_evolved_structured_measurements(tmp_p
         result_path = workspace / "outputs/metrics.json"
         document = json.loads(result_path.read_bytes())
         document["metrics"] = deepcopy(METRICS)
+        document["formal_runs"][0]["evaluations"][0]["metrics"] = document["metrics"]
         document["metrics"]["patient_level_performance"][0]["f1"] = "not_estimable"
         raw = json.dumps(document).encode()
         result_path.write_bytes(raw)
