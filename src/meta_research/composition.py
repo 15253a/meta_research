@@ -135,6 +135,7 @@ from meta_research.writing_delivery import WritingDeliveryProviderRegistry
 from meta_research.writing_renderer import WritingRendererRegistry
 from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillProvider
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
+from meta_research.root_workspace import RootWorkspaces
 
 
 @dataclass(frozen=True)
@@ -268,6 +269,7 @@ class ProductionRuntime:
     deepfetch: FirstQuestionDeepFetchWorker
     writing: WritingReportService
     harnesses: HarnessRuntime
+    root_workspaces: RootWorkspaces
     target_run_authorities: TargetRunAuthorities
     target_run_runtime: TargetRunRuntime
     target_root_lifecycle: SQLiteTargetRootLifecycleAuthority
@@ -929,7 +931,27 @@ def build_production_runtime(
     # Replay only after every proof/scope verifier has been bound.
     owners.agent_runtime.recover_root_human_requests()
     owners.human_collaboration.recover_root_library_reconnect_responses()
+    workspace_providers = {
+        "idea": idea_skill_provider, "plan": plan_skill_provider,
+        "bundle": bundle_skill_provider, "reasoning": reasoning_skill_provider,
+        "companion": intent_drafting_provider, "acquisition": acquisition_provider,
+        "writing": writing_skill_provider,
+    }
+    root_workspaces = RootWorkspaces(
+        advancement_engine=advancement_engine, agent_runtime=agent_runtime,
+        human_collaboration=human_collaboration, research_graph=research_graph,
+        target_run_agent=target_run_agent,
+        bases={kind: getattr(provider, "research_workspace_root",
+            data_root.root / (kind + "-workspace") / "research-workspace")
+            for kind, provider in workspace_providers.items()},
+        deepfetch_locator=getattr(deepfetch_provider, "research_workspace_path", None),
+    )
+    for provider in (*workspace_providers.values(), proposal_drafter):
+        bind_workspaces = getattr(provider, "bind_workspaces", None)
+        if callable(bind_workspaces):
+            bind_workspaces(root_workspaces)
     semantic_gateway = create_semantic_owner_gateway(
+        root_workspaces=root_workspaces,
         research_graph=owners.research_graph,
         advancement_engine=owners.advancement_engine,
         research_memory=owners.research_memory,
@@ -1159,6 +1181,7 @@ def build_production_runtime(
         },
         runtime_protection=runtime_protection,
         root_operation_diagnostics=root_operation_diagnostics,
+        root_workspaces=root_workspaces,
         stage_root_observations=stage_root_observations,
         _database=database,
         _telemetry_exporter_factory=(

@@ -18547,6 +18547,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 },
             )
 
+    def query_deepfetch_run_by_ref(self, run_ref: str) -> DeepFetchRun:
+        with self._database.read() as connection:
+            request_ref = connection.execute(text(
+                "SELECT request_ref FROM ar_deepfetch_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref}).scalar_one_or_none()
+        run = None if request_ref is None else self.query_deepfetch_run(request_ref)
+        if run is None or run.run_ref != run_ref:
+            raise OwnerConflict("deepfetch_run_not_found")
+        return run
+
     def query_deepfetch_run(self, request_ref: str) -> DeepFetchRun | None:
         with self._database.read() as connection:
             row = connection.execute(
@@ -20611,6 +20621,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             },
         )
         return request.request_ref
+
+    def query_stage_run_by_ref(self, run_ref: str) -> IdeaStageRun:
+        managed = self.query_managed_run(run_ref)
+        stage = None if managed is None else str(managed["run_kind"]).removesuffix("_stage")
+        if stage not in FORMAL_STAGES:
+            raise OwnerConflict("stage_run_not_found")
+        return self._query_stage_run_by_ref(run_ref, stage)
 
     def query_idea_stage_run(self, request_ref: str) -> IdeaStageRun | None:
         return self._query_stage_run(request_ref, "idea")

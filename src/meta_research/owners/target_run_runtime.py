@@ -6105,6 +6105,12 @@ class SQLiteTargetRunAgentAuthority:
                     "target_root_workspace_continuity_conflict"
                 )
 
+    def read_target_workspace_location(self, target_run_ref: str) -> tuple[TargetRunWorkspace, Path]:
+        workspace = self.query_target_workspace(target_run_ref)
+        if workspace is None or self._workspace_root is None:
+            raise OwnerConflict("target_run_workspace_unavailable")
+        return workspace, self._workspace_root / canonical_hash({"workspace_ref": workspace.workspace_ref})
+
     def resolve_target_workspace(
         self,
         *,
