@@ -10,6 +10,10 @@ from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.root_workspace import _read_bytes
 
 
+_MAX_MATERIAL_BYTES = 64 * 1024 * 1024
+_MAX_MATERIAL_FILES = 10000
+
+
 def deliver_materials(owner, initialization_id, payload, idempotency_key):
     creation = owner.query_quest_creation(initialization_id)
     draft_key = creation["quest_draft"]
@@ -30,28 +34,49 @@ def deliver_materials(owner, initialization_id, payload, idempotency_key):
         raise OwnerConflict("quest_draft_stale")
     if existing is not None and (existing["complete"] or any(batch["idempotency_key"] == idempotency_key for batch in existing["batches"])):
         raise OwnerConflict("creation_material_delivery_conflict")
+    files = []
+    total_bytes = 0
     origin_kind = "browser_folder" if payload.get("folder") else "browser_file"
     if payload.get("locator") is not None:
         origin_kind = "server_path"
         root = Path(payload["locator"])
         if not root.is_absolute() or not root.is_dir() or root.is_symlink():
             raise OwnerConflict("creation_material_path_invalid")
-        files = []
         for current, directories, names in os.walk(root, followlinks=False):
             if any((Path(current) / name).is_symlink() for name in (*directories, *names)):
                 raise OwnerConflict("workspace_file_unsafe")
             for name in sorted(names):
-                relative = (Path(current) / name).relative_to(root).as_posix()
-                files.append((relative, _read_bytes(root, relative)))
-                if len(files) > 10000:
+                if len(files) >= _MAX_MATERIAL_FILES:
                     raise OwnerConflict("creation_material_count_exceeded")
+                relative = (Path(current) / name).relative_to(root).as_posix()
+                try:
+                    size = (Path(current) / name).stat().st_size
+                except OSError as error:
+                    raise OwnerConflict("workspace_file_unsafe") from error
+                if total_bytes + size > _MAX_MATERIAL_BYTES:
+                    raise OwnerConflict("creation_material_size_exceeded")
+                content = _read_bytes(root, relative)
+                total_bytes += len(content)
+                if total_bytes > _MAX_MATERIAL_BYTES:
+                    raise OwnerConflict("creation_material_size_exceeded")
+                files.append((relative, content))
     else:
+        if len(payload["files"]) > _MAX_MATERIAL_FILES:
+            raise OwnerConflict("creation_material_count_exceeded")
         try:
-            files = [(item["relative_path"], base64.b64decode(item["content_base64"], validate=True)) for item in payload["files"]]
+            for item in payload["files"]:
+                encoded = item["content_base64"]
+                padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
+                size = (len(encoded) + 3) // 4 * 3 - padding
+                if total_bytes + size > _MAX_MATERIAL_BYTES:
+                    raise OwnerConflict("creation_material_size_exceeded")
+                content = base64.b64decode(encoded, validate=True)
+                total_bytes += len(content)
+                if total_bytes > _MAX_MATERIAL_BYTES:
+                    raise OwnerConflict("creation_material_size_exceeded")
+                files.append((item["relative_path"], content))
         except (binascii.Error, ValueError) as error:
             raise OwnerConflict("creation_material_content_invalid") from error
-    if sum(len(content) for _, content in files) > 64 * 1024 * 1024:
-        raise OwnerConflict("creation_material_size_exceeded")
     if not files:
         raise OwnerConflict("creation_material_delivery_empty")
     batch_records = []

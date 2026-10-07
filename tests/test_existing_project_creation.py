@@ -287,6 +287,63 @@ def test_literature_revision_updates_source_coverage_without_changing_the_prepar
         runtime.close()
 
 
+@pytest.mark.parametrize("origin", ["browser_folder", "server_path"])
+@pytest.mark.parametrize("second_size", [6, 8])
+def test_material_aggregate_limit_is_checked_before_reading_or_decoding_the_next_file(tmp_path, monkeypatch, origin, second_size):
+    from meta_research import initialization_materials
+    monkeypatch.setattr(initialization_materials, "_MAX_MATERIAL_BYTES", 10)
+    files = [("01.txt", b"a" * 4), ("02.txt", b"b" * second_size)]
+    encoded_files = [{"relative_path": path, "content_base64": base64.b64encode(content).decode()} for path, content in files]
+    observed = []
+    if origin == "server_path":
+        source = tmp_path / "project"
+        source.mkdir()
+        for name, content in files:
+            (source / name).write_bytes(content)
+        original_read = initialization_materials._read_bytes
+
+        def record_read(root, relative):
+            observed.append(relative)
+            return original_read(root, relative)
+
+        monkeypatch.setattr(initialization_materials, "_read_bytes", record_read)
+        transport = {"locator": str(source)}
+        endpoint = "material-paths"
+    else:
+        original_decode = initialization_materials.base64.b64decode
+        names = {item["content_base64"]: item["relative_path"] for item in encoded_files}
+
+        def record_decode(value, *args, **kwargs):
+            if isinstance(value, str) and value in names:
+                observed.append(names[value])
+            return original_decode(value, *args, **kwargs)
+
+        monkeypatch.setattr(initialization_materials.base64, "b64decode", record_decode)
+        transport = {"folder": True, "files": encoded_files}
+        endpoint = "material-deliveries"
+    runtime = build_production_runtime(prepare_data_root(tmp_path / "data"), proposal_drafter=ExistingWorkAdapter())
+    client, headers = _authenticate(runtime)
+    try:
+        opened = client.post("/api/v1/quest-initializations", headers=_write_headers(headers, "open-bounded"), json={}).json()
+        response = client.post(f"/api/v1/quest-initializations/{opened['initialization_id']}/{endpoint}",
+            headers=_write_headers(headers, "bounded-folder"), json={"expected_draft_revision": opened["quest_draft"]["revision"],
+                "expected_draft_hash": opened["quest_draft"]["hash"], "submission_ref": "bounded-folder", **transport})
+        if second_size == 6:
+            assert response.status_code == 200, response.json()
+            assert observed == ["01.txt", "02.txt"]
+            assert sum(item["bytes"] for item in response.json()["quest_draft"]["value"]["material_manifest"]["entries"]) == 10
+        else:
+            assert response.status_code == 409, response.json()
+            assert response.json()["detail"]["code"] == "creation_material_size_exceeded"
+            assert observed == ["01.txt"]
+            current = client.get(f"/api/v1/quest-initializations/{opened['initialization_id']}").json()
+            assert current["quest_draft"] == opened["quest_draft"]
+        assert _count(runtime, "rm_asset_versions") == 0
+    finally:
+        client.close()
+        runtime.close()
+
+
 def test_draft_change_keeps_generation_basis_distinct_from_explicit_human_review(tmp_path):
     runtime = build_production_runtime(prepare_data_root(tmp_path / "data"), proposal_drafter=ExistingWorkAdapter(), host_compute_probe=DeterministicProbe())
     client, headers = _authenticate(runtime)
