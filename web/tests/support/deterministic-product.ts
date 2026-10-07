@@ -62,7 +62,10 @@ export class DeterministicProduct {
     options: DeterministicProductOptions = {},
   ): Promise<DeterministicProduct> {
     const dataRoot = mkdtempSync(join(tmpdir(), "meta-research-chrome-states-"));
-    const argv = ["run", "python", serverScript, "--data-root", dataRoot];
+    const python = process.env.META_RESEARCH_TEST_PYTHON;
+    const argv = python
+      ? [serverScript, "--data-root", dataRoot]
+      : ["run", "python", serverScript, "--data-root", dataRoot];
     const sourceWebRoot = process.env.META_RESEARCH_TEST_WEB_ROOT;
     if (sourceWebRoot) {
       argv.push("--web-root", sourceWebRoot);
@@ -80,7 +83,7 @@ export class DeterministicProduct {
       argv.push("--writing-delivery-faults", options.writingDeliveryFaults);
     }
     const child = spawn(
-      "uv",
+      python ?? "uv",
       argv,
       {
         cwd: repositoryRoot,
@@ -408,5 +411,5 @@ export async function openAuthenticatedProduct(
   product: DeterministicProduct,
 ): Promise<void> {
   await product.authenticate(page);
-  await page.goto(product.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product.baseUrl}/?workspace=1`, { waitUntil: "domcontentloaded" });
 }

@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "npm run test:app-types && npm run test:e2e-types",
-    "test:app-types": "tsc --noEmit",
-    "test:e2e-types": "tsc --noEmit -p tsconfig.tests.json",
-    "build": "npm test && vite build",
+    "test": "node --test tests/*.test.mjs",
+    "typecheck": "npm run typecheck:app && npm run typecheck:e2e",
+    "typecheck:app": "tsc --noEmit",
+    "typecheck:e2e": "tsc --noEmit -p tsconfig.tests.json",
+    "build": "npm run typecheck && vite build",
     "test:e2e": "npm run build && playwright test"
   },
   "dependencies": {
