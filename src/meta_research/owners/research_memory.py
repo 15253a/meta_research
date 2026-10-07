@@ -247,6 +247,7 @@ class AssetIntakeRequest:
     asset_ref: str | None = None
     asynchronous: bool = False
     change: dict[str, object] | None = None
+    origin_quest_ref: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -260,6 +261,7 @@ class AssetIntakeRequest:
             "asset_ref": self.asset_ref,
             "asynchronous": self.asynchronous,
             "change": self.change,
+            "origin_quest_ref": self.origin_quest_ref,
         }
 
     def validate(self) -> None:
@@ -2860,6 +2862,7 @@ class SQLiteResearchMemoryReceiptVerifier:
         self.verify_asset_receipt(**values)
         version_ref = values.get("version_ref")
         with self._database.read() as connection:
+            assert_asset_usable(connection, version_ref)
             row = connection.execute(
                 text(
                     "SELECT * FROM rm_asset_versions WHERE version_ref = "
@@ -4303,7 +4306,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 },
             )
             self._accept_asset_lifecycle(connection, asset_ref=asset_ref, version_ref=version_ref,
-                change=request.get("change"), idempotency_key=job.idempotency_key)
+                change=request.get("change"), origin_quest_ref=request.get("origin_quest_ref"),
+                idempotency_key=job.idempotency_key)
             connection.execute(
                 text(
                     "UPDATE rm_asset_verification_observations SET integrity = "
@@ -4883,8 +4887,10 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
     def read_asset_content_page(self, memory_ref: str, *, entry_path: str | None = None,
                                 offset: int = 0, limit: int = 8192) -> dict[str, object]:
         """Read an exact bounded page in original custody after receipt verification."""
-        return self._asset_content_pages.read_page(
+        page = self._asset_content_pages.read_page(
             memory_ref, entry_path=entry_path, offset=offset, limit=limit)
+        version = self.query_asset_version(memory_ref)
+        return {**page, "lifecycle": self.query_asset_lifecycle(version.asset_ref)}
 
     def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
         return self._receipt_verifier.describe_asset_export(memory_ref)
@@ -10820,6 +10826,11 @@ def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
         not asset_ref.strip() or len(asset_ref) > 64 or "\x00" in asset_ref
     ):
         raise OwnerConflict("asset_ref_invalid")
+    if request.origin_quest_ref is not None and (
+        not isinstance(request.origin_quest_ref, str) or not request.origin_quest_ref
+        or len(request.origin_quest_ref) > 128
+    ):
+        raise OwnerConflict("asset_origin_quest_invalid")
     return {
         "source_kind": request.source_kind,
         "custody_mode": request.custody_mode,
@@ -10835,6 +10846,7 @@ def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
         "asset_ref": None if asset_ref is None else asset_ref.strip(),
         "asynchronous": bool(request.asynchronous),
         **({"change": validate_asset_change(request.change, asset_ref)} if request.change is not None else {}),
+        **({"origin_quest_ref": request.origin_quest_ref} if request.origin_quest_ref is not None else {}),
     }
 
 
@@ -10848,7 +10860,7 @@ def _validated_stored_asset_request(
         document = decoded_object(stored_request_json)
         if (
             canonical_json(document) != stored_request_json
-            or set(document)
+            or set(document) - {"change", "origin_quest_ref"}
             != {
                 "source_kind",
                 "custody_mode",
@@ -10860,7 +10872,6 @@ def _validated_stored_asset_request(
                 "asset_ref",
                 "asynchronous",
             }
-            and set(document) != {"source_kind", "custody_mode", "display_name", "media_type", "content_base64", "source_locator", "provenance", "asset_ref", "asynchronous", "change"}
         ):
             raise ValueError("durable asset request binding mismatch")
         encoded = document["content_base64"]
@@ -10883,6 +10894,7 @@ def _validated_stored_asset_request(
             asset_ref=document["asset_ref"],
             asynchronous=document["asynchronous"],
             change=document.get("change"),
+            origin_quest_ref=document.get("origin_quest_ref"),
         )
         normalized = _asset_request_document(request)
         if normalized != document:

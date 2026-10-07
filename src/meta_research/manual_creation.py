@@ -10,6 +10,7 @@ from sqlalchemy.engine import Connection, Row
 
 from meta_research.acquisition import AcquisitionProvider
 from meta_research.database import Database
+from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
@@ -694,7 +695,7 @@ class ManualQuestionCreation:
         with self._database.read() as connection:
             initial = self._require_context(connection, context_ref)
         self._require_row_target_current(initial)
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = self._query_command(
                 connection, idempotency_key, "confirm_seed", request_hash
             )
@@ -725,6 +726,7 @@ class ManualQuestionCreation:
                     receipt_hash = _receipt_hash(
                         SEED_RECEIPT_KIND, seed_ref, bindings
                     )
+                    assert_asset_payload_usable(connection, normalized)
                     session_ref = new_ref("manual_drafting_session")
                     connection.execute(
                         text(

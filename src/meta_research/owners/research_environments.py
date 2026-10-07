@@ -10,6 +10,7 @@ import time
 from typing import Protocol
 
 from sqlalchemy import text
+from meta_research.owners.asset_lifecycle import assert_asset_usable
 
 from meta_research.dataset_contract import dataset_asset_binding, dataset_metadata, dataset_text
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash, canonical_json, new_ref
@@ -68,10 +69,18 @@ class ResearchEnvironmentOwnerMixin:
             _validate(dataset_text, quest_ref, "quest_ref")
         if source_environment_ref is not None:
             _validate(dataset_text, source_environment_ref, "source_environment_ref")
+        with self._database.read() as connection:
+            existing = connection.execute(text("SELECT 1 FROM rg_environments WHERE payload_hash=:hash"),
+                {"hash": canonical_hash(payload)}).first()
+        if existing is None:
+            for binding in bindings:
+                self._verify_environment_asset(binding, current=True)
 
         def verify_new():
             for binding in bindings:
-                self._verify_environment_asset(binding, current=True)
+                self._verify_environment_asset(binding, current=False)
+                with self._database.read() as connection:
+                    assert_asset_usable(connection, binding.version_ref)
 
         return self._accept_environment_fact("register", payload, idempotency_key,
                                              effect_scope=effect_scope, verify_new=verify_new)

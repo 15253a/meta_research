@@ -10,6 +10,7 @@ import time
 from typing import Protocol
 
 from sqlalchemy import text
+from meta_research.owners.asset_lifecycle import assert_asset_usable, _verified_lifecycle
 
 from meta_research.dataset_contract import (
     DATASET_SCHEMA, DATASET_VERSION_SCHEMA, DATASET_REFERENCE_SCHEMA, DATASET_DERIVATION_SCHEMA,
@@ -112,9 +113,17 @@ class ResearchDatasetOwnerMixin:
             "metadata": dataset_metadata(metadata),
             "notes": dataset_text(notes, "notes", optional=True),
         }
-        def verify_current():
+        with self._database.read() as connection:
+            existing = connection.execute(text("SELECT 1 FROM rg_dataset_versions WHERE dataset_ref=:ref AND version_label=:label"),
+                {"ref": dataset_ref, "label": payload["version_label"]}).first()
+        if existing is None:
             for binding in bindings:
                 self._verify_dataset_asset(binding, current=True)
+        def verify_current():
+            for binding in bindings:
+                self._verify_dataset_asset(binding, current=False)
+                with self._database.read() as connection:
+                    assert_asset_usable(connection, binding.version_ref)
         return self._accept_dataset_fact("register_version", payload, idempotency_key,
             {"dataset_ref": dataset_ref, "version_label": payload["version_label"]},
             verify_new=verify_current, effect_scope=effect_scope)
@@ -190,6 +199,18 @@ class ResearchDatasetOwnerMixin:
             return AcceptedAssetBinding(asset_ref=role.asset_ref,version_ref=role.version_ref,
                 content_hash=role.asset_hash,manifest_hash=role.manifest_hash,receipt=role.asset_receipt)
         with self._database.read_snapshot() as connection:
+            asset = connection.execute(text("SELECT * FROM rm_asset_versions WHERE version_ref=:ref"), {"ref": version_ref}).first()
+            if asset is not None:
+                _, changes, _ = _verified_lifecycle(connection, asset.asset_ref)
+                family_roles = connection.execute(text("SELECT version_ref FROM rg_asset_roles WHERE asset_ref=:asset AND quest_ref=:quest ORDER BY role_ref"),
+                    {"asset": asset.asset_ref, "quest": quest_ref}).scalars().all()
+                origin = any(change["kind"] == "initial" and change.get("origin_quest_ref") == quest_ref for change in changes)
+                if origin or family_roles and self.query_asset_roles(quest_ref=quest_ref, version_refs=(family_roles[0],)):
+                    from meta_research.owners.common import AcceptanceReceipt, AcceptedAssetBinding
+                    binding = AcceptedAssetBinding(asset.asset_ref, version_ref, asset.content_hash, asset.manifest_hash,
+                        AcceptanceReceipt("research_memory", asset.acceptance_kind, asset.receipt_ref, version_ref, asset.receipt_hash))
+                    self._verify_dataset_asset(binding, current=False)
+                    return binding
             rows = connection.execute(text(
                 "SELECT DISTINCT t.target_ref,m.manifest_ref FROM rm_target_root_completion_manifests m "
                 "JOIN rg_targets t ON t.target_ref=m.target_ref "

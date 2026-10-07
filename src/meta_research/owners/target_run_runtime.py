@@ -64,6 +64,7 @@ from meta_research.bundle_target_contract import (
     normalized_completion_contract_to_dict,
 )
 from meta_research.database import Database
+from meta_research.owners.asset_lifecycle import assert_asset_usable, assert_asset_payload_usable
 from meta_research.read_snapshot_cache import snapshot_cached
 from meta_research.experiment_contract import EXPERIMENT_RESULT_DISPOSITIONS
 from meta_research.feed import DurableFeed
@@ -759,7 +760,7 @@ class SQLiteTargetRunMemoryAuthority:
         payload_hash = canonical_hash(payload)
         request_hash = canonical_hash({"command": "accept", "payload": payload})
         now = time.time()
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = connection.execute(
                 text(
                     "SELECT * FROM rm_target_implementation_artifacts WHERE "
@@ -774,6 +775,7 @@ class SQLiteTargetRunMemoryAuthority:
                 if replay.request_hash != request_hash:
                     raise OwnerConflict("target_implementation_artifact_conflict")
             else:
+                assert_asset_usable(connection, artifact.version_ref)
                 receipt_ref = new_ref("rm_target_implementation_receipt")
                 bindings = {
                     **payload,
@@ -882,7 +884,7 @@ class SQLiteTargetRunMemoryAuthority:
             {"command": "accept_target_implementation_bundle", **payload}
         )
         now = time.time()
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             row = connection.execute(
                 text(
                     "SELECT * FROM rm_target_implementation_bundles WHERE "
@@ -898,6 +900,7 @@ class SQLiteTargetRunMemoryAuthority:
                 if row.request_hash != request_hash:
                     raise OwnerConflict("target_implementation_bundle_conflict")
             else:
+                assert_asset_usable(connection, artifact.version_ref)
                 receipt = _receipt(
                     "research_memory",
                     RM_TARGET_IMPLEMENTATION_BUNDLE_RECEIPT_KIND,
@@ -1407,7 +1410,7 @@ class SQLiteTargetRunMemoryAuthority:
         bindings = {"target_ref": target_ref, "asset": asset.as_dict()}
         request_hash = canonical_hash(bindings)
         now = time.time()
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             row = connection.execute(
                 text(
                     "SELECT * FROM rm_target_input_asset_proofs WHERE "
@@ -1424,6 +1427,7 @@ class SQLiteTargetRunMemoryAuthority:
                 if row.request_hash != request_hash:
                     raise OwnerConflict("target_input_asset_proof_conflict")
                 return self._rm_asset_proof_receipt(row, asset)
+            assert_asset_usable(connection, asset.version_ref)
             proof_ref = new_ref("rm_target_input_asset_proof")
             receipt_ref = new_ref("rm_target_input_asset_receipt")
             receipt = _receipt(
@@ -1610,6 +1614,7 @@ class SQLiteTargetRunMemoryAuthority:
                     raise OwnerConflict("target_generic_result_manifest_conflict")
                 manifest_ref = row.manifest_ref
             else:
+                assert_asset_payload_usable(connection, payload)
                 manifest_ref = new_ref("target_generic_result_manifest")
                 receipt = _receipt(
                     "research_memory",

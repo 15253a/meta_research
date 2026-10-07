@@ -17,6 +17,7 @@ from meta_research.control_contract import (
     validate_control_payload,
 )
 from meta_research.database import Database
+from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
 from meta_research.manual_creation import (
@@ -3951,6 +3952,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     "note": note,
                 }
                 receipt_hash = canonical_hash(payload)
+                assert_asset_payload_usable(connection, facts)
                 connection.execute(
                     text(
                         "INSERT INTO hc_human_request_responses (response_ref, "
@@ -4486,7 +4488,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         if current is not None:
             current_draft = cast(dict[str, object], current["quest_draft"])
             result_ref = cast(str, current["initialization_id"])
-            with self._database.write() as connection:
+            with self._database.fenced_write() as connection:
                 replay = self._query_command(
                     connection, idempotency_key, "create", request_hash
                 )
@@ -4505,7 +4507,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     result_ref = replay
             return self.query_quest_creation(result_ref)
         now = time.time()
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = self._query_command(
                 connection, idempotency_key, "create", request_hash
             )
@@ -4526,6 +4528,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     initialization_id = active.initialization_id
                 else:
                     initialization_id = new_ref("quest_init")
+                    assert_asset_payload_usable(connection, normalized)
                     connection.execute(
                         text(
                             "INSERT INTO hc_quest_initializations "
@@ -4625,7 +4628,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         if replay is not None:
             return self.query_quest_creation(initialization_id)
         self._verify_material_bindings(normalized)
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = self._query_command(
                 connection, idempotency_key, "revise_draft", request_hash
             )
@@ -4704,6 +4707,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                                 "now": now,
                             },
                         )
+                    assert_asset_payload_usable(connection, normalized)
                     connection.execute(
                         text(
                             "UPDATE hc_quest_initializations SET status = 'draft', "
