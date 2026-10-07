@@ -32,13 +32,16 @@ class WorkspaceLocation:
     request_ref: str | None = None
     target_ref: str | None = None
     initialization_id: str | None = None
+    context_generation: int | None = None
 
     def source(self) -> dict[str, object]:
         return {"workspace_ref": self.workspace_ref, "root_kind": self.root_kind,
                 "root_session_ref": self.root_session_ref, "work_ref": self.work_ref,
                 "quest_ref": self.quest_ref, "cycle_ref": self.cycle_ref,
                 "request_ref": self.request_ref, "target_ref": self.target_ref,
-                "initialization_id": self.initialization_id, "status": "working_material"}
+                "initialization_id": self.initialization_id, "status": "working_material",
+                **({"context_generation": self.context_generation}
+                   if self.context_generation is not None else {})}
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,7 @@ class WorkspaceDestination:
     owner: str
     request_ref: str
     waiter_ref: str
+    creation_context_kind: str | None = None
 
 
 class RootWorkspaces:
@@ -179,7 +183,44 @@ class RootWorkspaces:
 
     def destination_for_initialization(self, initialization_id: str, root_session_ref: str) -> WorkspaceDestination:
         return WorkspaceDestination(self.bind_initialization(initialization_id, root_session_ref).location,
-            "human_collaboration", initialization_id, root_session_ref)
+            "human_collaboration", initialization_id, root_session_ref, "quest_initialization")
+
+    def bind_manual_creation(self, context_ref: str, root_session_ref: str,
+                             context_generation: int) -> WorkspaceBinding:
+        return self._manual_creation_binding(context_ref, root_session_ref, context_generation,
+            require_open=True)
+
+    def _manual_creation_binding(self, context_ref: str, root_session_ref: str,
+                                 context_generation: int, *, require_open: bool) -> WorkspaceBinding:
+        if (not isinstance(context_ref, str) or not context_ref
+            or not isinstance(root_session_ref, str) or not root_session_ref
+            or type(context_generation) is not int or context_generation < 1):
+            raise SemanticMcpError("workspace_manual_creation_scope_invalid")
+        try:
+            creation = self._hc.query_manual_question_creation(context_ref)
+        except OwnerConflict as error:
+            raise SemanticMcpError(error.code) from error
+        session = creation.get("drafting_session")
+        if (creation.get("context_ref") != context_ref
+            or creation.get("generation") != context_generation
+            or not isinstance(session, dict) or session.get("ref") != root_session_ref
+            or require_open and session.get("status") != "open"):
+            raise SemanticMcpError("workspace_manual_creation_scope_invalid")
+        identity = {"creation_context_ref": context_ref, "root_session_ref": root_session_ref}
+        location = WorkspaceLocation("workspace:" + canonical_hash(identity), "companion",
+            root_session_ref, context_ref, self._bases["companion"] / canonical_hash(identity),
+            quest_ref=creation["quest_ref"], request_ref=context_ref,
+            initialization_id=creation["quest_initialization_id"],
+            context_generation=context_generation)
+        self._ensure_directory(location.directory)
+        return WorkspaceBinding(location, canonical_hash({"owner": "human_collaboration",
+            **identity, "context_generation": context_generation}))
+
+    def destination_for_manual_creation(self, context_ref: str, root_session_ref: str,
+                                        context_generation: int) -> WorkspaceDestination:
+        return WorkspaceDestination(self._manual_creation_binding(context_ref, root_session_ref,
+            context_generation, require_open=False).location, "human_collaboration", context_ref, root_session_ref,
+            "manual_question_creation")
 
     def bind_acquisition_session(self, session_ref: str) -> WorkspaceBinding:
         session = self._ar.query_acquisition_session(session_ref=session_ref)
@@ -268,6 +309,11 @@ class RootWorkspaces:
     def discover_initialization(self, initialization_id: str, root_session_ref: str, **arguments):
         return self._discover((self.bind_initialization(initialization_id, root_session_ref).location,), **arguments)
 
+    def discover_manual_creation(self, context_ref: str, root_session_ref: str,
+                                 context_generation: int, **arguments):
+        return self._discover((self._manual_creation_binding(context_ref, root_session_ref,
+            context_generation, require_open=False).location,), **arguments)
+
     def _discover(self, locations, *, prefix="", offset=0, limit=50):
         if prefix:
             _relative_parts(prefix.rstrip("/"))
@@ -314,6 +360,11 @@ class RootWorkspaces:
     def read_initialization(self, initialization_id: str, root_session_ref: str, **arguments):
         return self._read((self.bind_initialization(initialization_id, root_session_ref).location,), **arguments)
 
+    def read_manual_creation(self, context_ref: str, root_session_ref: str,
+                             context_generation: int, **arguments):
+        return self._read((self._manual_creation_binding(context_ref, root_session_ref,
+            context_generation, require_open=False).location,), **arguments)
+
     def _read(self, locations, *, workspace_ref, path, expected_sha256=None, offset=0, max_bytes=65536):
         if type(offset) is not int or offset < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
             raise SemanticMcpError("workspace_page_invalid")
@@ -336,9 +387,13 @@ class RootWorkspaces:
                 files: tuple[tuple[str, bytes], ...]) -> dict[str, object]:
         if not isinstance(delivery_ref, str) or not delivery_ref or len(delivery_ref) > 256:
             raise SemanticMcpError("workspace_delivery_ref_invalid")
-        fresh = (self.destination_for_initialization(destination.request_ref, destination.waiter_ref)
-                 if destination.owner == "human_collaboration" and destination.location.initialization_id
-                 else self.destination_for_human_request(request_ref=destination.request_ref, waiter_ref=destination.waiter_ref))
+        if destination.creation_context_kind == "quest_initialization":
+            fresh = self.destination_for_initialization(destination.request_ref, destination.waiter_ref)
+        elif destination.creation_context_kind == "manual_question_creation":
+            fresh = self.destination_for_manual_creation(destination.request_ref, destination.waiter_ref,
+                destination.location.context_generation)
+        else:
+            fresh = self.destination_for_human_request(request_ref=destination.request_ref, waiter_ref=destination.waiter_ref)
         if fresh != destination:
             raise SemanticMcpError("workspace_destination_changed")
         if not files or len(files) > 100:

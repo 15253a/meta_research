@@ -1050,13 +1050,23 @@ class CodexIdeaSkillAdapter:
         except SemanticMcpError as error:
             raise IdeaSkillUnavailable(error.code) from error
 
-    def _initialization_workspace(self, request) -> WorkspaceBinding | None:
+    def _creation_workspace(self, request) -> WorkspaceBinding | None:
         if self._workspaces is None:
             return None
         root_ref = request.root_session_ref
         if not root_ref:
-            raise IdeaSkillUnavailable("workspace_initialization_scope_invalid")
+            raise IdeaSkillUnavailable("workspace_manual_creation_scope_invalid"
+                if request.creation_context_kind == "manual_question_creation"
+                else "workspace_initialization_scope_invalid")
         try:
+            if request.creation_context_kind == "manual_question_creation":
+                binding = self._workspaces.bind_manual_creation(request.creation_context_ref,
+                    root_ref, request.context_generation)
+                if binding.location.initialization_id != request.initialization_id:
+                    raise IdeaSkillUnavailable("workspace_manual_creation_scope_invalid")
+                return binding
+            if request.creation_context_kind != "quest_initialization":
+                raise IdeaSkillUnavailable("workspace_creation_scope_invalid")
             return self._workspaces.bind_initialization(request.initialization_id, root_ref)
         except SemanticMcpError as error:
             raise IdeaSkillUnavailable(error.code) from error

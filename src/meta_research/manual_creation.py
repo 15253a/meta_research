@@ -2008,6 +2008,7 @@ class ManualQuestionCreation:
                     creation_context_kind="manual_question_creation",
                     creation_context_ref=str(creation.context_ref),
                     context_generation=int(creation.generation),
+                    root_session_ref=str(session.session_ref),
                 )
             )
             if not isinstance(result.reply, str):
