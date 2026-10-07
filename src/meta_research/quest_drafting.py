@@ -36,6 +36,7 @@ from meta_research.provider_supervisor import (
     request_supervisor_stop,
     supervisor_request_never_started,
     write_supervisor_request,
+    validated_working_directory,
 )
 
 QUESTION_FIELD_MAX_LENGTHS = {
@@ -127,6 +128,7 @@ class ProposalDraftRequest:
     creation_context_ref: str | None = None
     context_generation: int | None = None
     companion_native_session_ref: str | None = None
+    root_session_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ class IntentTurnRequest:
     creation_context_ref: str | None = None
     context_generation: int | None = None
     root_runtime_scope: dict[str, object] | None = None
+    root_session_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +299,24 @@ def _read_bounded_provider_stream(
     with path.open("rb") as source:
         value = source.read(max_bytes + 1)
     return value.decode("utf-8", errors="replace")
+
+
+def provider_working_directory(argv: list[str], environment: dict[str, str] | None) -> Path | None:
+    values = [value for name in ("META_RESEARCH_PROVIDER_CWD", "META_RESEARCH_HARNESS_WORKSPACE")
+        if (value := (environment or {}).get(name)) is not None]
+    if "--cd" in argv:
+        try:
+            values.append(argv[argv.index("--cd") + 1])
+        except IndexError as error:
+            raise OSError("provider_working_directory_invalid") from error
+    if not values:
+        return None
+    if len(set(values)) != 1:
+        raise OSError("provider_working_directory_conflict")
+    try:
+        return validated_working_directory(values[0])
+    except ProviderSupervisorError as error:
+        raise OSError(error.code) from error
 
 
 class _CancellableProcessRunner:
@@ -473,6 +494,7 @@ class _CancellableProcessRunner:
                 stderr=subprocess.DEVNULL,
                 start_new_session=os.name == "posix",
                 env=self._subprocess_environment(environment),
+                cwd=provider_working_directory(argv, environment),
             )
             process_group = os.getpgid(process.pid) if os.name == "posix" else None
             self._processes[process] = process_group

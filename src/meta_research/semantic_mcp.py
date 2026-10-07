@@ -41,6 +41,8 @@ ROOT_AGENT_ENVIRONMENT_OPERATION_IDS = (
     "research_graph.environments.reference.reconcile",
 )
 ROOT_AGENT_COMMON_OPERATION_IDS = (
+    "research_workspace.discover",
+    "research_workspace.read",
     "research_memory.assets.page",
     "research_memory.assets.lifecycle",
     "research_memory.assets.current",

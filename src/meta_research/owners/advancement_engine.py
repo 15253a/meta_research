@@ -334,6 +334,10 @@ def _bundle_stage_report_closure(
 class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for Cycle, Stage, and Foreground authority."""
 
+    def query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest: ...
+
+    def query_cycle_stage_requests(self, cycle_ref: str) -> tuple[StageRunRequest, ...]: ...
+
     def query_snapshot(self) -> OwnerSnapshot: ...
 
     def query_foreground(self, quest_ref: str) -> dict[str, object] | None: ...
@@ -5227,6 +5231,16 @@ class SQLiteAdvancementEngine(
             or commit.receipt != binding.stage_commit_receipt
         ):
             raise OwnerConflict("bundle_formal_plan_stage_commit_invalid")
+
+    def query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest:
+        return self._query_stage_request_ref(request_ref)
+
+    def query_cycle_stage_requests(self, cycle_ref: str) -> tuple[StageRunRequest, ...]:
+        with self._database.read_snapshot() as connection:
+            rows = connection.execute(text(
+                "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = :cycle_ref "
+                "ORDER BY epoch, stage, request_ref"), {"cycle_ref": cycle_ref}).all()
+            return tuple(self._stage_request_from_row(row) for row in rows)
 
     def _query_stage_request_ref(self, request_ref: str) -> StageRunRequest:
         with self._database.read_snapshot() as connection:

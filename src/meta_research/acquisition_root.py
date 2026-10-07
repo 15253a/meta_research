@@ -29,6 +29,7 @@ from meta_research.root_operation_diagnostics import (
     RootOperationDiagnosticRecorder,
 )
 from meta_research.root_resident_mcp import RootResidentMcpAuthority
+from meta_research.root_workspace import RootWorkspaces
 
 
 _ROOT_SESSION_RECEIPT_SCHEMA = "meta-research/acquisition-root-session/v1"
@@ -100,6 +101,13 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
         self, authority: RootResidentMcpAuthority
     ) -> None:
         self._root.bind_resident_mcp_authority(authority)
+
+    @property
+    def research_workspace_root(self) -> Path:
+        return self._root.research_workspace_root
+
+    def bind_workspaces(self, workspaces: RootWorkspaces) -> None:
+        self._root.bind_workspaces(workspaces)
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         self._root.configure_resident_mcp_endpoint(base_url)
@@ -293,6 +301,8 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
                     native_session_ref=previous_native_session_ref,
                     job_ref=job_ref,
                     root_runtime_scope=root_runtime_scope,
+                    workspace_binding=(self._root._session_workspace(session_ref)
+                        if root_runtime_scope is None else None),
                 )
             )
         except IdeaSkillUnavailable as error:
@@ -403,6 +413,11 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
 
 class _AcquisitionCodexAdapter(CodexIdeaSkillAdapter):
     _root_agent_kind = "acquisition"
+
+    def _session_workspace(self, session_ref):
+        if self._workspaces is None:
+            return None
+        return self._workspaces.bind_acquisition_session(session_ref)
     _reconciliation_operation_names = ("acquisition-root-turn",)
 
     def _transport_contract_failure_code(self, operation_name: str) -> str:

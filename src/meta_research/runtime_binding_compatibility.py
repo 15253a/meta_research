@@ -143,6 +143,22 @@ _REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
         "8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be",
         "708321017aed3c4c4cf3085b00ed447c380306cfb45a71857263ab0cebec486d",
     ),
+    (
+        "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
+        "b2830836c03bdeadf7be7bf824c273c010106dcd553ae7a6d73b2881cf7adf30",
+    ),
+    (
+        "15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e",
+        "b2830836c03bdeadf7be7bf824c273c010106dcd553ae7a6d73b2881cf7adf30",
+    ),
+    (
+        "8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be",
+        "b2830836c03bdeadf7be7bf824c273c010106dcd553ae7a6d73b2881cf7adf30",
+    ),
+    (
+        "708321017aed3c4c4cf3085b00ed447c380306cfb45a71857263ab0cebec486d",
+        "b2830836c03bdeadf7be7bf824c273c010106dcd553ae7a6d73b2881cf7adf30",
+    ),
 })
 
 

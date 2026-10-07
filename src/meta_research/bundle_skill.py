@@ -1121,6 +1121,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 semantic_mcp_protected_environment=True,
                 authorized_operation_ids=operation_ids,
                 run_ref=run_ref,
+                workspace_binding=self._workspace_binding(run_ref=run_ref, attempt_ref=attempt_ref,
+                    root_session_ref=root_session_ref, fence_ref=fence_ref,
+                    runtime_binding_hash=canonical_hash(runtime_binding.as_dict())),
             )
         except BundleSkillUnavailable as error:
             if error.code != "codex_operation_reconciliation_pending":

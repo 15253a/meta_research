@@ -258,6 +258,8 @@ class HumanCollaborationInterface(Protocol):
 
     def query_companion(self, scope_ref: str) -> dict[str, object]: ...
 
+    def query_companion_work_context(self, session_ref: str) -> dict[str, object] | None: ...
+
     def query_companion_reply(
         self, scope_ref: str, interaction_ref: str
     ) -> dict[str, object]: ...
@@ -2037,6 +2039,14 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
         return self._collaboration_ladder.query_companion(scope_ref)
+
+    def query_companion_work_context(self, session_ref: str) -> dict[str, object] | None:
+        session = self._collaboration_ladder.query_companion_session(session_ref)
+        if session is None:
+            return None
+        context = self._resolve_companion_context(session["scope_ref"])
+        return {name: session[name] for name in ("scope_ref", "session_ref", "status")} | {
+            "quest_ref": context.get("quest_ref")}
 
     def query_companion_reply(
         self, scope_ref: str, interaction_ref: str
@@ -6212,6 +6222,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     job_ref=provider_job_ref,
                     literature_snapshot=literature_snapshot,
                     companion_native_session_ref=companion_native_session_ref,
+                    root_session_ref=self.query_quest_creation(job.initialization_id)["intent_session"]["ref"],
                 )
             )
             content = _validate_question_content(result.content)
@@ -6706,6 +6717,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     message=turn.user_content,
                     native_session_ref=native_session_ref,
                     job_ref=provider_job_ref,
+                    root_session_ref=turn.session_ref,
                 )
             )
             if not isinstance(result.reply, str):

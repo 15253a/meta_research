@@ -1290,6 +1290,18 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def validated_working_directory(value: object) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ProviderSupervisorError("provider_working_directory_invalid")
+    path = Path(value)
+    try:
+        if not path.is_absolute() or not path.is_dir() or path.resolve(strict=True) != path:
+            raise ProviderSupervisorError("provider_working_directory_invalid")
+    except OSError as error:
+        raise ProviderSupervisorError("provider_working_directory_invalid") from error
+    return path
+
+
 def _validated_request_paths(
     request_path: Path, payload: dict[str, object]
 ) -> tuple[list[str], dict[str, Path], float | None, int, int]:
@@ -1322,6 +1334,9 @@ def _validated_request_paths(
     }
     if schema_ref == CODEX_SUPERVISOR_REQUEST_SCHEMA_V2:
         expected_fields.add("prompt_max_bytes")
+    if "working_directory" in payload:
+        expected_fields.add("working_directory")
+        validated_working_directory(payload["working_directory"])
     # ``None`` is the normal long-running Provider policy: a valid operation
     # ends because the Provider exits, the Owner requests stop, or a bounded
     # output/process-integrity check fails.  A numeric wall-clock ceiling is an
@@ -1360,6 +1375,13 @@ def _validated_request_paths(
     ):
         raise ProviderSupervisorError("provider_supervisor_request_invalid")
     typed_argv = cast(list[str], argv)
+    if "working_directory" in payload and "--cd" in typed_argv:
+        try:
+            cwd_arg = typed_argv[typed_argv.index("--cd") + 1]
+        except IndexError as error:
+            raise ProviderSupervisorError("provider_working_directory_invalid") from error
+        if cwd_arg != payload["working_directory"]:
+            raise ProviderSupervisorError("provider_working_directory_conflict")
     try:
         schema_arg = typed_argv[typed_argv.index("--output-schema") + 1]
         result_arg = typed_argv[typed_argv.index("--output-last-message") + 1]
@@ -1638,6 +1660,8 @@ def supervise(
             ),
             process_platform=platform,
             provider_job_factory=provider_job_factory,
+            working_directory=(validated_working_directory(payload["working_directory"])
+                if "working_directory" in payload else None),
         )
 
 
@@ -1655,6 +1679,7 @@ def _supervise_locked(
     exit_schema_ref: str,
     process_platform: ProviderProcessPlatform,
     provider_job_factory: ProviderProcessJobFactory | None,
+    working_directory: Path | None = None,
 ) -> None:
     prompt_path = paths["prompt_path"]
     schema_path = paths["schema_path"]
@@ -1723,11 +1748,18 @@ def _supervise_locked(
                 if provider_environment.get("CODEX_HOME"):
                     invocation_codex_home = Path(provider_environment["CODEX_HOME"])
                 provider_environment[PROVIDER_OPERATION_ENV] = str(operation_path)
+                if working_directory is not None:
+                    for name in ("META_RESEARCH_PROVIDER_CWD", "META_RESEARCH_HARNESS_WORKSPACE"):
+                        supplied = provider_environment.get(name)
+                        if supplied is not None and supplied != str(working_directory):
+                            raise ProviderSupervisorError("provider_working_directory_conflict")
+                    provider_environment["META_RESEARCH_PROVIDER_CWD"] = str(working_directory)
                 spawn_options: dict[str, object] = {
                     "stdin": prompt_stream,
                     "stdout": subprocess.PIPE,
                     "stderr": subprocess.DEVNULL,
                     "env": provider_environment,
+                    "cwd": working_directory,
                     **process_platform.provider_spawn_options(),
                 }
                 process = (

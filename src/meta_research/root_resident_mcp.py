@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+from pathlib import Path
 import threading
 from dataclasses import dataclass
 from typing import Protocol
@@ -8,7 +10,8 @@ from urllib.parse import urlsplit
 
 from meta_research.owners.common import canonical_hash
 from meta_research.root_capabilities import RootAgentKind, root_operation_catalog
-from meta_research.semantic_mcp import ROOT_AGENT_COMMON_OPERATION_IDS
+from meta_research.semantic_mcp import ROOT_AGENT_COMMON_OPERATION_IDS, SemanticCallContext, SemanticMcpError
+from meta_research.root_workspace import RootWorkspaces, WorkspaceBinding
 
 
 _OPERATION_BINDING_CONTRACT = "meta-research/harness-operation-binding/v1"
@@ -100,6 +103,7 @@ class RootResidentMcpAccess:
     token: str
     scope_binding_hash: str
     operation_ids: tuple[str, ...]
+    workspace_binding: WorkspaceBinding | None = None
 
 
 RootResidentMcpChannelKey = tuple[str, str, str]
@@ -114,6 +118,7 @@ class RootResidentMcpChannels:
             root_kind,
             common_operation_ids=ROOT_AGENT_COMMON_OPERATION_IDS,
         )
+        self._workspaces: RootWorkspaces | None = None
         self._authority: RootResidentMcpAuthority | None = None
         self._base_url: str | None = None
         self._channels: dict[RootResidentMcpChannelKey, _ResidentMcpChannel] = {}
@@ -127,6 +132,11 @@ class RootResidentMcpChannels:
     @property
     def enabled(self) -> bool:
         return self._authority is not None or self._base_url is not None
+
+    def bind_workspaces(self, workspaces: RootWorkspaces) -> None:
+        if self._workspaces is not None and self._workspaces is not workspaces:
+            raise RootResidentMcpError("workspace_service_conflict")
+        self._workspaces = workspaces
 
     def bind_authority(self, authority: RootResidentMcpAuthority) -> None:
         if self._authority is not None and self._authority is not authority:
@@ -170,6 +180,8 @@ class RootResidentMcpChannels:
                 "semantic-mcp-resident",
             ),
             resource_bindings=(
+                "adapter-source:meta_research.root_workspace@sha256:" + hashlib.sha256(
+                    Path(__file__).with_name("root_workspace.py").read_bytes()).hexdigest(),
                 _OPERATION_BINDING_RESOURCE_PREFIX
                 + "contract:"
                 + binding.contract_ref
@@ -278,7 +290,13 @@ class RootResidentMcpChannels:
                     token=channel.connection.token,
                     scope_binding_hash=scope_binding_hash,
                     operation_ids=self._operation_ids,
+                    workspace_binding=(None if self._workspaces is None else self._workspaces.bind_runtime(
+                        SemanticCallContext(run_ref, attempt_ref, root_session_ref, fence_ref,
+                            capability_binding_hash, self._root_kind, phase, "research_workspace.read"))),
                 )
+            except SemanticMcpError as error:
+                self.release(key)
+                raise RootResidentMcpError(error.code) from error
             except Exception:
                 self.release(key)
                 raise

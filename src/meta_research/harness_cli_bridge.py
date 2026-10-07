@@ -42,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     workspace = Path(workspace_value)
     if not workspace.is_absolute() or not workspace.is_dir():
         return 64
+    signed_workspace = child_environment.pop("META_RESEARCH_PROVIDER_CWD", None)
+    if signed_workspace is not None and (signed_workspace != str(workspace) or Path.cwd() != workspace):
+        return 64
     redactions = _sensitive_environment_values(child_environment)
     try:
         process = subprocess.Popen(

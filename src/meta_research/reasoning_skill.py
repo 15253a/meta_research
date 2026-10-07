@@ -1012,6 +1012,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 semantic_mcp_protected_environment=human_request_enabled,
                 authorized_operation_ids=operation_ids,
                 run_ref=request.run_ref,
+                workspace_binding=self._workspace_binding(run_ref=request.run_ref,
+                    attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
+                    fence_ref=request.fence_ref, runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict())),
             )
             # The sealed stream remains diagnostic evidence.  The scoped
             # channel already owns authorization, so a Root may use only the

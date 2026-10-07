@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from meta_research.context_presentation import stage_context_view
+from meta_research.root_workspace import RootWorkspaces, WorkspaceBinding
+from meta_research.semantic_mcp import SemanticCallContext, SemanticMcpError
 
 import base64
 import hashlib
@@ -978,7 +980,7 @@ class CodexIdeaSkillAdapter:
     _provider_transport_limits = DEFAULT_PROVIDER_TRANSPORT_LIMITS
 
     def _sandbox_arguments(
-        self, sandbox_read_root: Path | None
+        self, sandbox_read_root: Path | None, *, working_directory: Path | None = None
     ) -> tuple[str, ...]:
         if sandbox_read_root is not None:
             raise IdeaSkillUnavailable("codex_sandbox_read_root_unsupported")
@@ -1010,6 +1012,7 @@ class CodexIdeaSkillAdapter:
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
+        self._workspaces: RootWorkspaces | None = None
         self._agent_workspace = self._workspace / "research-workspace"
         self._agent_workspace.mkdir(parents=True, exist_ok=True)
         self._executable = executable
@@ -1025,6 +1028,52 @@ class CodexIdeaSkillAdapter:
         self._root_resident_mcp = RootResidentMcpChannels(
             self._root_agent_kind
         )
+
+    @property
+    def research_workspace_root(self) -> Path:
+        return self._agent_workspace
+
+    def bind_workspaces(self, workspaces: RootWorkspaces) -> None:
+        if self._workspaces is not None and self._workspaces is not workspaces:
+            raise IdeaSkillUnavailable("workspace_service_conflict")
+        self._workspaces = workspaces
+        self._root_resident_mcp.bind_workspaces(workspaces)
+
+    def _workspace_binding(self, *, run_ref, attempt_ref, root_session_ref,
+                           fence_ref, runtime_binding_hash) -> WorkspaceBinding | None:
+        if self._workspaces is None:
+            return None
+        try:
+            return self._workspaces.bind_runtime(SemanticCallContext(run_ref, attempt_ref,
+                root_session_ref, fence_ref, runtime_binding_hash, self._root_agent_kind,
+                "primary", "research_workspace.read"))
+        except SemanticMcpError as error:
+            raise IdeaSkillUnavailable(error.code) from error
+
+    def _creation_workspace(self, request) -> WorkspaceBinding | None:
+        if self._workspaces is None:
+            return None
+        root_ref = request.root_session_ref
+        if not root_ref:
+            raise IdeaSkillUnavailable("workspace_manual_creation_scope_invalid"
+                if request.creation_context_kind == "manual_question_creation"
+                else "workspace_initialization_scope_invalid")
+        try:
+            if request.creation_context_kind == "companion_conversation":
+                if request.creation_context_ref != request.initialization_id:
+                    raise IdeaSkillUnavailable("workspace_companion_scope_invalid")
+                return self._workspaces.bind_companion_session(request.creation_context_ref, root_ref)
+            if request.creation_context_kind == "manual_question_creation":
+                binding = self._workspaces.bind_manual_creation(request.creation_context_ref,
+                    root_ref, request.context_generation)
+                if binding.location.initialization_id != request.initialization_id:
+                    raise IdeaSkillUnavailable("workspace_manual_creation_scope_invalid")
+                return binding
+            if request.creation_context_kind != "quest_initialization":
+                raise IdeaSkillUnavailable("workspace_creation_scope_invalid")
+            return self._workspaces.bind_initialization(request.initialization_id, root_ref)
+        except SemanticMcpError as error:
+            raise IdeaSkillUnavailable(error.code) from error
 
     def bind_resident_mcp_authority(
         self, authority: RootResidentMcpAuthority
@@ -1251,6 +1300,7 @@ class CodexIdeaSkillAdapter:
                     *transport_limits.as_dict(),
                     "root_capability_profile",
                     "root_capability_profile_hash",
+                    *_operation_workspace_fields(invocation),
                 }
                 if (
                     set(invocation) != expected_fields
@@ -1521,6 +1571,7 @@ class CodexIdeaSkillAdapter:
                 "transport_mode",
                 "root_capability_profile",
                 "root_capability_profile_hash",
+                *_operation_workspace_fields(invocation),
                 *transport_limits.as_dict(),
             }
             if (
@@ -1864,6 +1915,7 @@ class CodexIdeaSkillAdapter:
                 schema=schema,
                 native_session_ref=native_session_ref,
                 job_ref=job_ref,
+                workspace_binding=access.workspace_binding,
                 mcp_url=access.url,
                 mcp_token=access.token,
                 mcp_scope_binding_hash=access.scope_binding_hash,
@@ -1901,6 +1953,7 @@ class CodexIdeaSkillAdapter:
         job_ref: str | None,
         root_runtime_scope: object,
         sandbox_read_root: Path | None = None,
+        workspace_binding: WorkspaceBinding | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         """Use a server-derived external Root scope when one is present."""
 
@@ -1912,6 +1965,7 @@ class CodexIdeaSkillAdapter:
                 native_session_ref=native_session_ref,
                 job_ref=job_ref,
                 sandbox_read_root=sandbox_read_root,
+                workspace_binding=workspace_binding,
             )
         required_fields = {
             "quest_ref",
@@ -1967,10 +2021,17 @@ class CodexIdeaSkillAdapter:
         authorized_operation_ids: tuple[str, ...] = (),
         sandbox_read_root: Path | None = None,
         run_ref: str | None = None,
+        workspace_binding: WorkspaceBinding | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
         )
+        if workspace_binding is not None:
+            prompt += "\n\nYour working directory is " + str(workspace_binding.directory) + ". " + (
+                "Use research_workspace.discover and research_workspace.read for pending material "
+                "from this actual work and eligible earlier work."
+                if mcp_url is not None else "Read pending files only within this actual work, including its inbox.")
+            prompt += " File presence does not admit a formal asset."
         raw_schema = schema
         if isinstance(raw_schema.get("oneOf"), list):
             prompt = (
@@ -2017,6 +2078,7 @@ class CodexIdeaSkillAdapter:
                 authorized_operation_ids=authorized_operation_ids,
                 sandbox_read_root=sandbox_read_root,
                 transport_limits=transport_limits,
+                workspace_binding=workspace_binding,
                 run_ref=run_ref,
             )
         else:
@@ -2048,6 +2110,7 @@ class CodexIdeaSkillAdapter:
                     ),
                     sandbox_read_root=sandbox_read_root,
                     transport_limits=transport_limits,
+                    workspace_binding=workspace_binding,
                 )
                 result = (*invoked, pre_turn_diagnostics)
         self._record_root_operation_diagnostics(
@@ -2092,6 +2155,7 @@ class CodexIdeaSkillAdapter:
         sandbox_read_root: Path | None,
         transport_limits: ProviderTransportLimits,
         run_ref: str | None = None,
+        workspace_binding: WorkspaceBinding | None = None,
     ) -> tuple[dict[str, object], str | None, str, dict[str, object]]:
         directory.mkdir(parents=True, exist_ok=True)
         invocation_path = directory / "invocation.json"
@@ -2126,6 +2190,8 @@ class CodexIdeaSkillAdapter:
             "schema_ref": _CODEX_PROVIDER_OPERATION_SCHEMA,
             "job_ref": job_ref,
             "operation_name": operation_name,
+            "workspace_binding": None if workspace_binding is None else workspace_binding.seal(),
+            "working_directory": str(workspace_binding.directory if workspace_binding else self._agent_workspace.resolve()),
             "prompt_hash": canonical_hash(prompt),
             "output_schema_hash": canonical_hash(schema),
             "native_session_ref": native_session_ref,
@@ -2226,6 +2292,7 @@ class CodexIdeaSkillAdapter:
                 ),
                 sandbox_read_root=sandbox_read_root,
                 transport_limits=transport_limits,
+                workspace_binding=workspace_binding,
             )
         except IdeaSkillUnavailable as error:
             if error.code in _SEALED_TRANSPORT_CONTRACT_FAILURES:
@@ -2266,7 +2333,9 @@ class CodexIdeaSkillAdapter:
         mcp_scope_binding_hash: str | None = None,
         semantic_mcp_protected_environment: bool = False,
         sandbox_read_root: Path | None = None,
+        workspace_binding: WorkspaceBinding | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
+        working_directory = workspace_binding.directory if workspace_binding else self._agent_workspace.resolve()
         mcp_values = (mcp_url, mcp_token, mcp_scope_binding_hash)
         if any(value is not None for value in mcp_values) and (
             any(not isinstance(value, str) or not value for value in mcp_values)
@@ -2339,11 +2408,11 @@ class CodexIdeaSkillAdapter:
                 for feature in _DISABLED_CODEX_FEATURES
                 for value in ("--disable", feature)
             ),
-            *self._sandbox_arguments(sandbox_read_root),
+            *self._sandbox_arguments(sandbox_read_root, working_directory=working_directory),
             "--model",
             self._model_ref,
             "--cd",
-            str(self._agent_workspace),
+            str(working_directory),
             "--json",
             "--output-schema",
             str(schema_path),
@@ -2364,6 +2433,8 @@ class CodexIdeaSkillAdapter:
                 if semantic_mcp_enabled
                 else None
             )
+            if workspace_binding is not None:
+                environment = {**(environment or {}), "META_RESEARCH_PROVIDER_CWD": str(working_directory)}
             if job_ref is None:
                 completed = (
                     self._runner(
@@ -2392,6 +2463,7 @@ class CodexIdeaSkillAdapter:
                         supervisor_payload: dict[str, object] = {
                             "schema_ref": CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
                             "invocation_hash": invocation_hash,
+                            "working_directory": str(working_directory),
                             "argv": argv,
                             "timeout_seconds": self._timeout_seconds,
                             "stream_max_bytes": (
@@ -2586,6 +2658,19 @@ def _sealed_operation_invocation(
             ).hexdigest(),
         }
     )
+
+
+def _operation_workspace_fields(invocation: dict[str, object]) -> set[str]:
+    fields = {"workspace_binding", "working_directory"}
+    if not fields.intersection(invocation):
+        return set()
+    directory = invocation.get("working_directory")
+    binding = invocation.get("workspace_binding")
+    if (not isinstance(directory, str) or not Path(directory).is_absolute()
+        or binding is not None and (not isinstance(binding, dict)
+            or binding.get("working_directory") != directory)):
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+    return fields
 
 
 def _operation_transport_limits(
@@ -3441,7 +3526,9 @@ def _file_sha256(path: Path) -> str:
 def _shared_codex_adapter_source_hash() -> str:
     """Hash the shared compiler/transport seam inherited by stage adapters."""
 
-    return _file_sha256(Path(__file__).resolve())
+    return canonical_hash({name: _file_sha256(Path(__file__).with_name(name)) for name in (
+        "idea_skill.py", "root_workspace.py", "root_resident_mcp.py",
+        "provider_supervisor.py", "quest_drafting.py")})
 
 
 def _idea_skill_resources() -> dict[str, str]:

@@ -575,7 +575,9 @@ def test_production_acquisition_owner_injects_scope_into_actual_root_adapter(
             root_scope["run_ref"]
         )
         assert completed is not None and completed["status"] == "completed"
-        assert runner.environments[0] is None
+        preflight_workspace = runtime.root_workspaces.bind_acquisition_session(session.session_ref)
+        assert runner.environments[0] == {"META_RESEARCH_PROVIDER_CWD": str(preflight_workspace.directory)}
+        assert "META_RESEARCH_MCP_TOKEN" not in runner.environments[0]
         assert runner.environments[1] is not None
         assert "META_RESEARCH_MCP_TOKEN" in runner.environments[1]
     finally:
