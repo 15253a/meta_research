@@ -1370,7 +1370,7 @@ def seed_legacy_current(human_collaboration, legacy_state: str) -> None:
         raise RuntimeError(f"legacy fixture did not enter recovering: {recovered['status']}")
 
 
-def seed_manual_root(human_collaboration) -> None:
+def seed_manual_root(human_collaboration) -> dict[str, object]:
     opened = human_collaboration.create_quest({}, "chrome-manual-root-open")
     first_probe = human_collaboration.observe_host_compute(
         opened["initialization_id"],
@@ -1443,6 +1443,7 @@ def seed_manual_root(human_collaboration) -> None:
         raise RuntimeError(
             f"manual fixture root did not complete: {completed['status']}"
         )
+    return completed
 
 
 async def serve(
@@ -1452,6 +1453,8 @@ async def serve(
     web_root: Path | None,
     stage_pipeline: str | None,
     writing_delivery_faults: str | None,
+    human_request_handoff: bool,
+    human_request_handoff_kind: str,
 ) -> None:
     intent_started = threading.Event()
     adapter = DeterministicDraftingAdapter(intent_started)
@@ -1540,8 +1543,61 @@ async def serve(
                     "deterministic Harness full conformance did not advance"
                 )
     human_collaboration = runtime.owners.human_collaboration
-    if manual_root:
-        seed_manual_root(human_collaboration)
+    if manual_root or human_request_handoff:
+        completed_root = seed_manual_root(human_collaboration)
+    if human_request_handoff:
+        assertion = {"condition": {
+            "background": "温度传感器审计需要对齐设备原始记录。",
+            "attempted_work": [{
+                "action": "读取导出的设备日志并核对时间戳。",
+                "result": "两台设备记录相差九分钟，现有日志未注明校准时间。",
+            }],
+            "problem": "缺少现场校准时间，无法判断真实测量时差。",
+            "requested_delivery": "提供原始校准记录和设备编号，不改写原始数值。",
+            "impact": "确认后只继续本次设备审计，其他研究任务仍可推进。",
+            "safe_response": "回到这张请求，选择原始校准文件并明确提交回应。",
+        }}
+        library_handoff = human_request_handoff_kind == "library_reconnect"
+        system_handoff = human_request_handoff_kind == "system_operation_help"
+        if library_handoff:
+            assertion = {"condition": {
+                "background": "设备时差审计需要核对论文中的原始校准方法和适用范围。",
+                "attempted_work": [{
+                    "action": "检索公开全文并访问机构图书馆的论文入口。",
+                    "result": "公开来源只有摘要，机构入口提示会话已失效，尚未取得全文。",
+                }],
+                "problem": "缺少论文全文，无法核对校准方法是否适用于当前设备。",
+                "requested_delivery": "恢复机构访问，或提供合法取得的原始全文及来源。",
+                "impact": "取得全文后继续核对校准方法；其他设备审计工作仍可推进。",
+                "safe_response": "回到本请求，选择实际恢复路线，或提交合法全文来源回应。",
+            }}
+        if system_handoff:
+            assertion = {"condition": {
+                "background": "本轮报告已生成，需要交付到研究者指定的目标目录。",
+                "attempted_work": [{
+                    "action": "执行当前绑定的报告交付操作。",
+                    "result": "目标目录暂时不可写，交付失败，原报告仍保留。",
+                }],
+                "problem": "当前报告交付操作失败，需要研究者决定是否重试。",
+                "requested_delivery": "确认当前绑定的失败操作后，在本请求页面选择重试。",
+                "impact": "重试成功后恢复当前报告的精确交付依赖。",
+            }}
+        runtime.owners.research_graph.open_human_request(
+            request_kind=human_request_handoff_kind,
+            obligation="重试当前报告交付操作。" if system_handoff else "恢复校准方法论文的全文访问。" if library_handoff else "提供温度传感器原始校准记录。",
+            business_purpose="恢复本次已生成报告的交付。" if system_handoff else "核对论文校准方法的适用范围。" if library_handoff else "判断设备时差是否影响本次审计。",
+            target_assertion=assertion,
+            acceptance_conditions=("重试结果属于当前绑定的同一交付操作。" if system_handoff else "合法全文包含论文题名和来源。" if library_handoff else "原始记录包含设备编号和校准时间。",),
+            direct_waiter={
+                "waiter_ref": "calibration-audit",
+                "generation": 1,
+                "target_assertion": assertion,
+                "wait_scope": "local",
+                "other_blockers": [],
+            },
+            idempotency_key="browser-human-request-handoff",
+            quest_ref=completed_root["quest_ref"],
+        )
     human_collaboration._research_graph = TransientResearchGraph(  # noqa: SLF001
         runtime.owners.research_graph,
         failure_limit=1_000 if legacy_state == "recovering" else 3,
@@ -1604,6 +1660,8 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--legacy-state", choices=("draft", "recovering"))
     parser.add_argument("--manual-root", action="store_true")
+    parser.add_argument("--human-request-handoff", action="store_true")
+    parser.add_argument("--human-request-handoff-kind", choices=("offline_action", "library_reconnect", "system_operation_help"), default="offline_action")
     parser.add_argument(
         "--stage-pipeline",
         choices=(
@@ -1627,6 +1685,8 @@ def main() -> None:
             args.web_root,
             args.stage_pipeline,
             args.writing_delivery_faults,
+            args.human_request_handoff,
+            args.human_request_handoff_kind,
         )
     )
 

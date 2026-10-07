@@ -229,7 +229,9 @@ class HumanCollaborationInterface(Protocol):
         self, *, quest_ref: str
     ) -> tuple[dict[str, object], ...]: ...
 
-    def query_human_request(self, request_ref: str) -> dict[str, object] | None: ...
+    def query_human_request(
+        self, request_ref: str, *, materialize_expiration: bool = True
+    ) -> dict[str, object] | None: ...
 
     def query_research_help_page(
         self, *, quest_ref: str, cursor: str | None = None, limit: int = 12
@@ -1971,11 +1973,15 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 by_ref[request_ref] = request
         return tuple(by_ref[key] for key in sorted(by_ref))
 
-    def query_human_request(self, request_ref: str) -> dict[str, object] | None:
+    def query_human_request(
+        self, request_ref: str, *, materialize_expiration: bool = True
+    ) -> dict[str, object] | None:
         """Read one exact HumanRequest across the established issuing Owners."""
 
         try:
-            return self._query_issuing_owner_request(request_ref)
+            return self._query_issuing_owner_request(
+                request_ref, materialize_expiration=materialize_expiration
+            )
         except OwnerConflict as error:
             if error.code == "human_request_not_found":
                 return None
@@ -4014,14 +4020,20 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         self._reconcile_issuing_owner_human_request(request_ref)
         return response
 
-    def _query_issuing_owner_request(self, request_ref: str) -> dict[str, object]:
+    def _query_issuing_owner_request(
+        self, request_ref: str, *, materialize_expiration: bool = True
+    ) -> dict[str, object]:
         for owner in (
             self._research_graph,
             self._research_memory,
             self._agent_runtime,
             self._advancement_engine,
         ):
-            request = owner.query_human_request(request_ref)
+            request = (
+                owner.query_human_request(request_ref)
+                if materialize_expiration
+                else owner.query_human_request(request_ref, materialize_expiration=False)
+            )
             if request is not None:
                 return request
         raise OwnerConflict("human_request_not_found")

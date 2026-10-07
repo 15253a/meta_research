@@ -96,6 +96,7 @@ from meta_research.bundle_contract import (
     BundleContractError,
     target_execution_assertion,
     target_execution_authorization_requirement,
+    target_execution_help_context,
     validate_bundle_context_pack,
     validate_target_graph_append_proposal,
     validate_target_plan,
@@ -1122,7 +1123,7 @@ def _verify_bundle_high_risk_coordination(
     }:
         raise OwnerConflict("bundle_dispatch_frontier_invalid")
     wrapper = arguments.get("condition")
-    if not isinstance(wrapper, dict) or set(wrapper) != {
+    if not isinstance(wrapper, dict) or set(wrapper) - {"help_context"} != {
         "schema_ref",
         "root",
         "condition",
@@ -1171,6 +1172,8 @@ def _verify_bundle_high_risk_coordination(
         "root": root,
         "condition": assertion,
     }
+    if "help_context" in wrapper:
+        expected_wrapper["help_context"] = target_execution_help_context(target.spec)
     expected_command = {
         "semantic_operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
         "reconciliation_operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],

@@ -186,7 +186,7 @@ class HumanRequestOwnerInterface(Protocol):
     ) -> dict[str, object]: ...
 
     def query_human_request(
-        self, request_ref: str
+        self, request_ref: str, *, materialize_expiration: bool = True
     ) -> dict[str, object] | None: ...
 
     def query_human_requests(
@@ -265,9 +265,11 @@ class HumanRequestOwnerMixin:
         )
 
     def query_human_request(
-        self, request_ref: str
+        self, request_ref: str, *, materialize_expiration: bool = True
     ) -> dict[str, object] | None:
-        return self._human_request_owner.query_human_request(request_ref)
+        return self._human_request_owner.query_human_request(
+            request_ref, materialize_expiration=materialize_expiration
+        )
 
     def query_human_requests(self, **values) -> tuple[dict[str, object], ...]:
         return self._human_request_owner.query_human_requests(**values)
@@ -1303,9 +1305,10 @@ class SQLiteHumanRequestOwner:
         return result
 
     def query_human_request(
-        self, request_ref: str
+        self, request_ref: str, *, materialize_expiration: bool = True
     ) -> dict[str, object] | None:
-        self._materialize_expiration_if_due(request_ref)
+        if materialize_expiration:
+            self._materialize_expiration_if_due(request_ref)
         with self._database.read() as connection:
             row = _request_row(connection, self._issuer, request_ref)
             if row is None:

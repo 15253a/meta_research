@@ -14,6 +14,8 @@ from meta_research.bundle_contract import (
     BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF,
     target_execution_assertion,
     target_execution_authorization_requirement,
+    target_execution_help_context,
+    target_execution_technical_binding,
 )
 from meta_research.bundle_exhaustion import (
     BUNDLE_EXHAUSTION_BASIS_KIND,
@@ -1377,7 +1379,11 @@ class BundleStageWorker:
             )
             if request.get("kind") == "capability_authorization"
             and request.get("issuer") == "agent_runtime"
-            and request.get("target_assertion") in assertions
+            and (
+                target_execution_technical_binding(cast(dict[str, object], request["target_assertion"]))
+                if isinstance(request.get("target_assertion"), dict)
+                else request.get("target_assertion")
+            ) in assertions
             and request.get("required_authorization") == requirement
             and request.get("obligation") == _TARGET_AUTHORIZATION_OBLIGATION
             and request.get("business_purpose") == _TARGET_AUTHORIZATION_PURPOSE
@@ -1401,7 +1407,9 @@ class BundleStageWorker:
         if request_assertion == assertion:
             waiter_ref = target.target_ref
             generation = 1
-        elif request_assertion == _root_target_authorization_assertion(run, assertion):
+        elif isinstance(request_assertion, dict) and target_execution_technical_binding(
+            request_assertion
+        ) == _root_target_authorization_assertion(run, assertion):
             waiter_ref = f"root_run:{run.run_ref}"
             generation = run.attempt_generation
         else:
@@ -1727,6 +1735,7 @@ class BundleStageWorker:
                 run=run,
                 assertion=assertion,
                 requirement=requirement,
+                human_request=human_request,
             )
         return value
 
@@ -3640,7 +3649,15 @@ def _target_authorization_command(
     run: BundleStageRun,
     assertion: dict[str, object],
     requirement: dict[str, object],
+    human_request: dict[str, object] | None,
 ) -> dict[str, object]:
+    condition = _root_target_authorization_assertion(run, assertion)
+    recorded = None if human_request is None else human_request.get("target_assertion")
+    if isinstance(recorded, dict) and target_execution_technical_binding(recorded) == condition:
+        # Replay the original request's frozen facts, including legacy absence.
+        condition = recorded
+    else:
+        condition["help_context"] = target_execution_help_context(target.spec)
     return {
         "semantic_operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[0],
         "reconciliation_operation_id": ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
@@ -3657,7 +3674,7 @@ def _target_authorization_command(
             "request_kind": "capability_authorization",
             "obligation": _TARGET_AUTHORIZATION_OBLIGATION,
             "business_purpose": _TARGET_AUTHORIZATION_PURPOSE,
-            "condition": _root_target_authorization_assertion(run, assertion),
+            "condition": condition,
             "acceptance_conditions": list(
                 _TARGET_AUTHORIZATION_ACCEPTANCE_CONDITIONS
             ),
