@@ -6,6 +6,9 @@ import {
   type Route,
 } from "@playwright/test";
 import { DeterministicProduct } from "./support/deterministic-product";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -1135,7 +1138,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     (commands.authorizations as JsonRecord[]).push(authorization);
     await fulfillJson(route, authorization);
   });
-  await page.goto(product!.baseUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(`${product!.baseUrl}/?panel=human-request`, { waitUntil: "domcontentloaded" });
 
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await expect(dialog).toBeVisible();
@@ -1199,43 +1202,24 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     "/api/v1/research-assets/research_asset_version-guidance-41/content",
   );
   await expect(dialog.getByLabel("自然语言回应")).toBeVisible();
-  await expect(dialog.getByLabel("回应文件")).toBeVisible();
+  await expect(dialog.getByLabel("回应文件", { exact: true })).toBeVisible();
   await expect(dialog.getByLabel("绝对本地文件或目录路径")).toBeVisible();
   await expect(dialog.getByRole("button", { name: "提交", exact: true })).toHaveCount(1);
   await expect(dialog).toContainText("REQUEST-ONLY transcript marker");
   await dialog.getByLabel("自然语言回应").fill("批准已返回；按原始结果处理。");
-  await dialog.getByLabel("回应文件").setInputFiles({
+  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({
     name: "approval.pdf",
     mimeType: "application/pdf",
     buffer: Buffer.from("approved"),
   });
-  await expect(dialog.getByLabel("绝对本地文件或目录路径")).toBeDisabled();
+  await expect(dialog.getByLabel("绝对本地文件或目录路径")).toBeEnabled();
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
-  await expect.poll(() => assetIntakes.at(-1)).toEqual({
-    source_kind: "file",
-    custody_mode: "managed",
-    display_name: "approval.pdf",
-    media_type: "application/pdf",
-    content_base64: "YXBwcm92ZWQ=",
-    provenance: {
-      submitted_via: "human_request_response",
-      human_request_ref: "research_memory:HR-41:r1",
-      evidence_kind: "external_approval",
-    },
-    asynchronous: false,
-  });
+  expect(assetIntakes).toHaveLength(0);
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/research_memory%3AHR-41%3Ar1/responses",
     body: {
-      decision: "provided",
-      facts: {
-        material_source_ref: "research_asset_version-1",
-        material_version_ref: "research_asset_version-1",
-        material_content_hash: "5".repeat(64),
-        material_manifest_hash: "6".repeat(64),
-        material_acceptance_receipt_ref: "asset-receipt-1",
-      },
-      note: "批准已返回；按原始结果处理。",
+      decision: "provided", facts: {}, note: "批准已返回；按原始结果处理。",
+      materials: [{kind: "upload", relative_path: "approval.pdf", media_type: "application/pdf", content_base64: "YXBwcm92ZWQ="}],
     },
   });
   await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
@@ -1251,7 +1235,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("link", { name: "下载参考材料 ↓" })).toHaveCount(0);
   await dialog.getByLabel("自然语言回应").fill("校准完成，原始目录如下。");
   await dialog.getByLabel("绝对本地文件或目录路径").fill("/data/research/raw-calibration");
-  await expect(dialog.getByLabel("回应文件")).toBeDisabled();
+  await expect(dialog.getByLabel("回应文件", { exact: true })).toBeEnabled();
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/research_graph%3AHR-52%3Ar1/responses",
@@ -1259,12 +1243,10 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
       decision: "provided",
       facts: {},
       note: "校准完成，原始目录如下。",
-      linked_local_material: {
-        source_locator: "/data/research/raw-calibration",
-      },
+      materials: [{kind: "linked_local", locator: "/data/research/raw-calibration", description: "校准完成，原始目录如下。"}],
     },
   });
-  expect(assetIntakes).toHaveLength(1);
+  expect(assetIntakes).toHaveLength(0);
   await expect(dialog.getByRole("button", { name: "提交", exact: true })).toHaveCount(0);
 
   await nextRequest.click();
@@ -1272,10 +1254,10 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("heading", {
     name: "决定是否允许当前 Run 访问一个新增外部目的地。",
   })).toBeVisible();
-  await expect(dialog.getByRole("button", { name: "提交", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "稍后处理", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "拒绝", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "接受", exact: true })).toBeVisible();
-  await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await dialog.getByRole("button", { name: "稍后处理", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/agent_runtime%3AHR-63%3Ar1/responses",
     body: { decision: "deferred", facts: {}, note: "" },
@@ -1286,12 +1268,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     waitUntil: "domcontentloaded",
   });
   await dialog.getByRole("button", { name: "接受", exact: true }).click();
-  await dialog.getByRole("button", { name: "建立授权草案" }).click();
-  await dialog.getByRole("button", { name: "生成并核对影响说明" }).click();
-  await dialog.getByText("查看本次授权会发生什么", { exact: true }).click();
-  await dialog.getByRole("button", { name: "确认当前草案与影响说明" }).click();
-  await dialog.getByRole("button", { name: "签发仅限本次任务的授权" }).click();
-  await dialog.getByRole("button", { name: "提交授权回应" }).click();
+  await expect.poll(() => permissionWrites.length).toBe(4);
   expect(permissionWrites.map((item) => item.path)).toEqual([
     "/api/v1/human-collaboration/commands",
     "/api/v1/human-collaboration/commands/intent-permission-63/previews",
@@ -1376,53 +1353,6 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
 });
 
-test("a legal library fulltext response binds the Owner-projected acquisition paper id", async ({
-  page,
-}) => {
-  await installHumanCollaborationSnapshot(page);
-  const responseAttempts: JsonRecord[] = [];
-  await page.route("**/api/v1/research-assets/intakes", async (route) => {
-    const body = route.request().postDataJSON() as JsonRecord;
-    await fulfillJson(route, acceptedAssetIntake(body, "library-bound"));
-  });
-  await page.route(
-    "**/api/v1/human-requests/agent_runtime%3AHR-27%3Ar1/responses",
-    async (route) => {
-      responseAttempts.push(route.request().postDataJSON() as JsonRecord);
-      await fulfillJson(route, {
-        response_ref: "response-library-bound",
-        status: "recorded",
-      });
-    },
-  );
-
-  await page.goto(`${product!.baseUrl}/?panel=human-request`, {
-    waitUntil: "domcontentloaded",
-  });
-  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-  await dialog.getByRole("button", { name: /手动上传该文献/ }).click();
-  await expect(dialog.getByLabel(/acquisition_paper_id/i)).toHaveCount(0);
-  await dialog.getByLabel("合法全文 PDF").setInputFiles({
-    name: "paper.pdf",
-    mimeType: "application/pdf",
-    buffer: Buffer.from("lawfully acquired fulltext"),
-  });
-  await dialog.getByRole("button", { name: "提交全文来源回应" }).click();
-
-  await expect.poll(() => responseAttempts.at(-1)).toMatchObject({
-    decision: "provided",
-    facts: {
-      acquisition_paper_id: "paper-ACQ-17",
-      material_source_ref: "research_asset_version-library-bound",
-      material_version_ref: "research_asset_version-library-bound",
-      material_content_hash: "5".repeat(64),
-      material_manifest_hash: "6".repeat(64),
-      material_acceptance_receipt_ref: "asset-receipt-library-bound",
-    },
-    note: "",
-  });
-  await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
-});
 
 test("a non-asset HumanRequestResponse reloads the same sealed body and key when the first send never commits", async ({
   page,
@@ -1745,277 +1675,8 @@ test("an aborted atomic recovery cleanup retains its manifest and payload for th
   await recoveredPage.close();
 });
 
-test("an RM commit with a lost intake ACK reloads the sealed operation without duplicating a 6 MiB asset", async ({
-  page,
-}) => {
-  const snapshot = await installHumanCollaborationSnapshot(page);
-  await keepProjectionRoutesAcrossPages(page, snapshot);
-  const context = page.context();
-  const assetAttempts: Array<{ key: string; body: JsonRecord }> = [];
-  const responseAttempts: Array<{ key: string; body: JsonRecord }> = [];
-  const committedAssets = new Map<string, JsonRecord>();
-  let assetCommitCount = 0;
-  await context.route("**/api/v1/research-assets/intakes", async (route) => {
-    const key = route.request().headers()["idempotency-key"] ?? "";
-    const body = route.request().postDataJSON() as JsonRecord;
-    assetAttempts.push({ key, body });
-    const committed = committedAssets.get(key);
-    if (committed) {
-      await fulfillJson(route, committed);
-      return;
-    }
-    assetCommitCount += 1;
-    committedAssets.set(key, acceptedAssetIntake(body, "before-hc"));
-    await route.abort("connectionreset");
-  });
-  await context.route("**/api/v1/human-requests/research_memory%3AHR-41%3Ar1/responses", async (route) => {
-    responseAttempts.push({
-      key: route.request().headers()["idempotency-key"] ?? "",
-      body: route.request().postDataJSON() as JsonRecord,
-    });
-    const humanRequests = (snapshot.human_collaboration as JsonRecord)
-      .human_requests as JsonRecord;
-    const item = (humanRequests.items as JsonRecord[]).find(
-      (candidate) => candidate.request_ref === "research_memory:HR-41:r1",
-    )!;
-    item.responses = [{
-      response_ref: "response-before-hc",
-      status: "recorded",
-      ...route.request().postDataJSON() as JsonRecord,
-    }];
-    item.status = "satisfied";
-    item.evaluation = { evaluation_ref: "evaluation-before-hc", decision: "satisfied" };
-    item.disposition = { disposition_ref: "disposition-before-hc", decision: "satisfied" };
-    await fulfillJson(route, { response_ref: "response-before-hc", status: "recorded" });
-  });
 
-  await page.goto(`${product!.baseUrl}/?panel=external-request`, {
-    waitUntil: "domcontentloaded",
-  });
-  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-  await dialog.getByLabel("回应文件").setInputFiles({
-    name: "approval.pdf",
-    mimeType: "application/pdf",
-    buffer: Buffer.alloc(6 * 1024 * 1024, 0x61),
-  });
-  await dialog.getByLabel("自然语言回应").fill(
-    "PRIVATE RECOVERY NOTE SHOULD NEVER BE PLAINTEXT",
-  );
-  await dialog.getByRole("button", { name: "提交", exact: true }).click();
-  await expect.poll(() => assetAttempts.length).toBe(1);
-  expect(responseAttempts).toHaveLength(0);
 
-  const operation = await page.evaluate(() => {
-    const value = sessionStorage.getItem(
-      "meta_research_pending_human_request_asset_intake_operation",
-    );
-    return value ? JSON.parse(value) as JsonRecord : null;
-  });
-  expect(operation).toMatchObject({
-    schema: "meta-research/human-request-asset-intake/v1",
-    request_ref: "research_memory:HR-41:r1",
-    intake_path: "/api/v1/research-assets/intakes",
-    asset_idempotency_key: assetAttempts[0].key,
-    sealed_operation: {
-      algorithm: "AES-GCM",
-      key_ref: expect.any(String),
-      iv_base64: expect.any(String),
-      ciphertext_ref: expect.any(String),
-      body_hash: expect.any(String),
-      binding_hash: expect.any(String),
-    },
-  });
-  expect(JSON.stringify(operation).length).toBeLessThan(5_000);
-  expect(operation).not.toHaveProperty("intake");
-  expect(operation).not.toHaveProperty("response");
-  const sessionStorageDump = await page.evaluate(() => JSON.stringify(
-    Object.fromEntries(Object.entries(sessionStorage)),
-  ));
-  expect(sessionStorageDump).not.toContain("PRIVATE RECOVERY NOTE SHOULD NEVER BE PLAINTEXT");
-  expect(sessionStorageDump.length).toBeLessThan(10_000);
-  const durableBeforeRestart = await humanRequestRecoveryDatabaseState(page);
-  expect(durableBeforeRestart).toMatchObject({ keyCount: 1, ciphertextCount: 1 });
-  expect(durableBeforeRestart.manifests).toHaveLength(1);
-  expect(JSON.stringify(durableBeforeRestart.manifests)).not.toContain(
-    "PRIVATE RECOVERY NOTE SHOULD NEVER BE PLAINTEXT",
-  );
-
-  await page.close();
-  const recoveredPage = await context.newPage();
-  await recoveredPage.goto(`${product!.baseUrl}/?panel=external-request`, {
-    waitUntil: "domcontentloaded",
-  });
-  await expect.poll(() => assetAttempts.length).toBe(2);
-  expect(assetAttempts[1].key).toBe(assetAttempts[0].key);
-  expect(JSON.stringify(assetAttempts[1].body)).toBe(JSON.stringify(assetAttempts[0].body));
-  await expect.poll(() => responseAttempts.length).toBe(1);
-  expect(responseAttempts[0].body.note).toBe(
-    "PRIVATE RECOVERY NOTE SHOULD NEVER BE PLAINTEXT",
-  );
-  expect(assetCommitCount).toBe(1);
-  expect(committedAssets.size).toBe(1);
-  await expect.poll(() => recoveredPage.evaluate(() => sessionStorage.getItem(
-    "meta_research_pending_human_request_asset_intake_operation",
-  ))).toBeNull();
-  expect(await recoveredPage.evaluate(() => sessionStorage.getItem(
-    "meta_research_pending_asset_intake",
-  ))).toBeNull();
-  expect(await humanRequestRecoveryDatabaseState(recoveredPage)).toEqual({
-    keyCount: 0,
-    ciphertextCount: 0,
-    manifests: [],
-  });
-});
-
-test("an HC commit with a lost ACK reloads under the same response identity without duplicating the asset", async ({
-  page,
-}) => {
-  const snapshot = await installHumanCollaborationSnapshot(page);
-  await keepProjectionRoutesAcrossPages(page, snapshot);
-  const context = page.context();
-  const assetIntakes: JsonRecord[] = [];
-  const responseAttempts: Array<{ key: string; body: JsonRecord }> = [];
-  const committedResponses = new Map<string, JsonRecord>();
-  let ownerCommitCount = 0;
-  await context.route("**/api/v1/research-assets/intakes", async (route) => {
-    const body = route.request().postDataJSON() as JsonRecord;
-    assetIntakes.push(body);
-    await fulfillJson(route, acceptedAssetIntake(body, "ack-loss"));
-  });
-  await context.route("**/api/v1/human-requests/research_memory%3AHR-41%3Ar1/responses", async (route) => {
-    const key = route.request().headers()["idempotency-key"] ?? "";
-    const body = route.request().postDataJSON() as JsonRecord;
-    responseAttempts.push({ key, body });
-    const committed = committedResponses.get(key);
-    if (committed) {
-      await fulfillJson(route, committed);
-      return;
-    }
-
-    ownerCommitCount += 1;
-    const response = { response_ref: "response-ack-loss", status: "recorded" };
-    committedResponses.set(key, response);
-    const humanRequests = (snapshot.human_collaboration as JsonRecord)
-      .human_requests as JsonRecord;
-    const item = (humanRequests.items as JsonRecord[]).find(
-      (candidate) => candidate.request_ref === "research_memory:HR-41:r1",
-    )!;
-    item.responses = [{ ...response, ...body }];
-    item.evaluation = { evaluation_ref: "evaluation-ack-loss", decision: "satisfied" };
-    item.disposition = { disposition_ref: "disposition-ack-loss", decision: "satisfied" };
-    item.status = "satisfied";
-    await route.abort("connectionreset");
-  });
-
-  await page.goto(`${product!.baseUrl}/?panel=external-request`, {
-    waitUntil: "domcontentloaded",
-  });
-  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-  await dialog.getByLabel("回应文件").setInputFiles({
-    name: "approval.pdf",
-    mimeType: "application/pdf",
-    buffer: Buffer.from("approved"),
-  });
-  await dialog.getByRole("button", { name: "提交", exact: true }).click();
-  await expect.poll(() => responseAttempts.length).toBe(1);
-  await expect.poll(() => page.evaluate(() => sessionStorage.getItem(
-    "meta_research_pending_human_request_asset_response",
-  ))).not.toBeNull();
-  const delivery = await page.evaluate(() => JSON.parse(sessionStorage.getItem(
-    "meta_research_pending_human_request_asset_response",
-  )!) as JsonRecord);
-  expect(delivery).toMatchObject({
-    request_ref: "research_memory:HR-41:r1",
-    asset_job_ref: "asset-intake-ack-loss",
-    fact_prefix: "material",
-    accepted_asset: {
-      version_ref: "research_asset_version-ack-loss",
-      content_hash: "5".repeat(64),
-      manifest_hash: "6".repeat(64),
-      receipt: {
-        receipt_ref: "asset-receipt-ack-loss",
-        payload_hash: "7".repeat(64),
-      },
-    },
-    sealed_response: {
-      algorithm: "AES-GCM",
-      ciphertext_ref: expect.any(String),
-      body_hash: expect.any(String),
-      binding_hash: expect.any(String),
-    },
-    response_idempotency_key: responseAttempts[0].key,
-  });
-  expect(delivery).not.toHaveProperty("response");
-
-  await page.close();
-  const recoveredPage = await context.newPage();
-  await recoveredPage.goto(`${product!.baseUrl}/?panel=external-request`, {
-    waitUntil: "domcontentloaded",
-  });
-  await expect.poll(() => responseAttempts.length).toBe(2);
-  expect(responseAttempts[1]).toEqual(responseAttempts[0]);
-  expect(ownerCommitCount).toBe(1);
-  expect(committedResponses.size).toBe(1);
-  expect(assetIntakes).toHaveLength(1);
-  await expect.poll(() => recoveredPage.evaluate(() => sessionStorage.getItem(
-    "meta_research_pending_human_request_asset_response",
-  ))).toBeNull();
-  expect(await recoveredPage.evaluate(() => sessionStorage.getItem(
-    "meta_research_pending_asset_intake",
-  ))).toBeNull();
-  expect(await humanRequestRecoveryDatabaseState(recoveredPage)).toEqual({
-    keyCount: 0,
-    ciphertextCount: 0,
-    manifests: [],
-  });
-});
-
-test("a HumanRequest response preserves the human's raw note without secret-content classification", async ({
-  page,
-}) => {
-  await installHumanCollaborationSnapshot(page);
-  const assetIntakes: JsonRecord[] = [];
-  const responseAttempts: JsonRecord[] = [];
-  await page.route("**/api/v1/research-assets/intakes", async (route) => {
-    const body = route.request().postDataJSON() as JsonRecord;
-    assetIntakes.push(body);
-    await fulfillJson(route, acceptedAssetIntake(body, "secret-retry"));
-  });
-  await page.route("**/api/v1/human-requests/research_memory%3AHR-41%3Ar1/responses", async (route) => {
-    const body = route.request().postDataJSON() as JsonRecord;
-    responseAttempts.push(body);
-    await fulfillJson(route, { response_ref: "response-raw-note", status: "recorded" });
-  });
-
-  await page.goto(`${product!.baseUrl}/?panel=external-request`, {
-    waitUntil: "domcontentloaded",
-  });
-  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-  await dialog.getByLabel("回应文件").setInputFiles({
-    name: "approval.pdf",
-    mimeType: "application/pdf",
-    buffer: Buffer.from("approved"),
-  });
-  await dialog.getByLabel("自然语言回应").fill("token: ghp_examplecredential");
-  await dialog.getByRole("button", { name: "提交", exact: true }).click();
-  await expect.poll(() => responseAttempts.length).toBe(1);
-  expect(responseAttempts[0]).toMatchObject({
-    decision: "provided",
-    facts: {
-      material_source_ref: "research_asset_version-secret-retry",
-      material_version_ref: "research_asset_version-secret-retry",
-      material_acceptance_receipt_ref: "asset-receipt-secret-retry",
-    },
-    note: "token: ghp_examplecredential",
-  });
-  expect(assetIntakes).toHaveLength(1);
-  await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
-  expect(await humanRequestRecoveryDatabaseState(page)).toEqual({
-    keyCount: 0,
-    ciphertextCount: 0,
-    manifests: [],
-  });
-});
 
 test("an orphaned material delivery is discarded when its request revision is no longer current", async ({
   page,
@@ -2051,7 +1712,7 @@ test("an orphaned material delivery is discarded when its request revision is no
     waitUntil: "domcontentloaded",
   });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-  await dialog.getByLabel("回应文件").setInputFiles({
+  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({
     name: "approval.pdf",
     mimeType: "application/pdf",
     buffer: Buffer.from("approved"),
@@ -2066,7 +1727,7 @@ test("an orphaned material delivery is discarded when its request revision is no
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect.poll(() => externalAttempt).toBe(2);
   await expect.poll(() => page.evaluate(() => sessionStorage.getItem(
-    "meta_research_pending_human_request_asset_response",
+    "meta_research_pending_human_request_response",
   ))).toBeNull();
   await dialog.getByRole("button", { name: "我已重连" }).click();
   await expect.poll(() => responseAttempts.at(-1)?.path).toContain(
@@ -2653,4 +2314,140 @@ test("human request Draft streams before its snapshot and keeps request conversa
   await expect(dialog.getByLabel("就外部材料事项发消息")).toHaveValue("");
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("事项正式完整回答。");
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("这个事项请分段解释");
+});
+
+
+for (const selection of ["files", "folder", "library"] as const) {
+  test(`explicit browser ${selection} deliver original relative paths without RM intake`, async ({ page }) => {
+    await installHumanCollaborationSnapshot(page);
+    const posts: JsonRecord[] = [];
+    const intakes: JsonRecord[] = [];
+    await page.route("**/api/v1/research-assets/intakes", async (route) => {
+      intakes.push(route.request().postDataJSON() as JsonRecord);
+      await route.abort();
+    });
+    await page.route("**/api/v1/human-requests/*/responses", async (route) => {
+      posts.push(route.request().postDataJSON() as JsonRecord);
+      await fulfillJson(route, { response_ref: "delivered-response", delivery: { root_session_ref: "original-root" } });
+    });
+    await page.goto(`${product!.baseUrl}/?panel=${selection === "library" ? "human-request" : "external-request"}`, { waitUntil: "domcontentloaded" });
+    const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+    if (selection === "library") {
+      await dialog.getByRole("button", { name: "手动上传该文献" }).click();
+      await dialog.getByPlaceholder("例如：先暂停这篇；或者改为向作者索取全文。").fill("Read these exact observations.");
+    } else await dialog.getByLabel("自然语言回应").fill("Read these exact observations.");
+    if (selection !== "folder") {
+      await dialog.getByLabel("回应文件", { exact: true }).setInputFiles([
+        { name: "observations.csv", mimeType: "text/csv", buffer: Buffer.from("x,y\n1,7\n") },
+        { name: "method.txt", mimeType: "text/plain", buffer: Buffer.from("Wait 15 minutes.") },
+      ]);
+    } else {
+      const directory = await mkdtemp(join(tmpdir(), "reply-folder-"));
+      const folder = join(directory, "observations");
+      await mkdir(join(folder, "nested"), { recursive: true });
+      await writeFile(join(folder, "run.csv"), "x,y\n1,7\n");
+      await writeFile(join(folder, "nested/method.txt"), "Wait 15 minutes.");
+      await dialog.getByLabel("回应文件夹").setInputFiles(folder);
+    }
+    await dialog.getByLabel("绝对本地文件或目录路径").fill("/data/original-observations");
+    await dialog.getByRole("button", { name: selection === "library" ? "提交全文来源回应" : "提交", exact: true }).click();
+    await expect.poll(() => posts.length).toBe(1);
+    const materials = posts[0].materials as JsonRecord[];
+    const uploaded = materials.filter((item) => item.kind === "upload").map((item) => ({
+      path: item.relative_path, text: Buffer.from(String(item.content_base64), "base64").toString(),
+    })).sort((a, b) => String(a.path).localeCompare(String(b.path)));
+    expect(uploaded).toEqual(selection !== "folder" ? [
+      { path: "method.txt", text: "Wait 15 minutes." },
+      { path: "observations.csv", text: "x,y\n1,7\n" },
+    ] : [
+      { path: "observations/nested/method.txt", text: "Wait 15 minutes." },
+      { path: "observations/run.csv", text: "x,y\n1,7\n" },
+    ]);
+    expect(materials.at(-1)).toEqual({ kind: "linked_local", locator: "/data/original-observations",
+      description: "Read these exact observations." });
+    expect(posts[0].facts).toEqual(selection === "library" ? { route: "provided_material", acquisition_paper_id: "paper-ACQ-17" } : {});
+    expect(intakes).toEqual([]);
+    await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
+  });
+}
+
+test("legacy material recovery requires reselection and never replays intake", async ({ page }) => {
+  await installHumanCollaborationSnapshot(page);
+  const intakes: JsonRecord[] = [];
+  const replies: JsonRecord[] = [];
+  await page.route("**/api/v1/research-assets/intakes", async (route) => {
+    intakes.push(route.request().postDataJSON() as JsonRecord);
+    await route.abort();
+  });
+  await page.route("**/api/v1/human-requests/*/responses", async (route) => {
+    replies.push(route.request().postDataJSON() as JsonRecord);
+    await fulfillJson(route, { response_ref: "reselected-reply" });
+  });
+  await page.addInitScript(() => sessionStorage.setItem("meta_research_pending_human_request_asset_intake_operation", JSON.stringify({
+    schema: "meta-research/human-request-asset-intake/v1", request_ref: "research_memory:HR-41:r1",
+    sealed_operation: { storage_ref: "obsolete-missing-cipher" },
+  })));
+  await page.goto(`${product!.baseUrl}/?panel=external-request`, { waitUntil: "domcontentloaded" });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  await expect(dialog).toContainText("请重新选择文件或原路径后提交");
+  await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await expect(dialog).toContainText("human_response_material_reselection_required");
+  expect(replies).toHaveLength(0);
+  expect(intakes).toHaveLength(0);
+  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({ name: "fresh.txt", mimeType: "text/plain", buffer: Buffer.from("Fresh exact original.") });
+  await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await expect.poll(() => replies.length).toBe(1);
+  expect(replies[0].materials).toEqual([{kind: "upload", relative_path: "fresh.txt", media_type: "text/plain", content_base64: "RnJlc2ggZXhhY3Qgb3JpZ2luYWwu"}]);
+  expect(intakes).toHaveLength(0);
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_asset_intake_operation"))).toBeNull();
+});
+
+test("sealed upload reply survives lost ACK and reload with visible edits", async ({ page }) => {
+  const snapshot = await installHumanCollaborationSnapshot(page);
+  await keepProjectionRoutesAcrossPages(page, snapshot);
+  const context = page.context();
+  const attempts: Array<{ key: string; body: JsonRecord }> = [];
+  const intakes: JsonRecord[] = [];
+  let commits = 0;
+  let releaseReplay: (() => void) | undefined;
+  const replayGate = new Promise<void>((resolve) => { releaseReplay = resolve; });
+  await context.route("**/api/v1/research-assets/intakes", async (route) => {
+    intakes.push(route.request().postDataJSON() as JsonRecord);
+    await route.abort();
+  });
+  await context.route("**/api/v1/human-requests/*/responses", async (route) => {
+    attempts.push({ key: route.request().headers()["idempotency-key"], body: route.request().postDataJSON() as JsonRecord });
+    if (attempts.length === 1) {
+      commits += 1;
+      await route.abort("connectionreset");
+      return;
+    }
+    await replayGate;
+    await fulfillJson(route, { response_ref: "one-original-response", delivery: { root_session_ref: "original-root" } });
+  });
+  await page.goto(`${product!.baseUrl}/?panel=external-request`, { waitUntil: "domcontentloaded" });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  await dialog.getByLabel("自然语言回应").fill("Original sealed reply.");
+  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({
+    name: "exact.txt", mimeType: "text/plain", buffer: Buffer.from("Exact original bytes."),
+  });
+  await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await expect.poll(() => attempts.length).toBe(1);
+  const pending = await page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"));
+  expect(pending).toContain("AES-GCM");
+  expect(pending).not.toContain("Exact original bytes.");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect.poll(() => attempts.length).toBe(2);
+  await dialog.getByLabel("自然语言回应").fill("Visible edited reply.");
+  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({
+    name: "changed.txt", mimeType: "text/plain", buffer: Buffer.from("Changed visible bytes."),
+  });
+  releaseReplay!();
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"))).toBeNull();
+  expect(attempts[1]).toEqual(attempts[0]);
+  expect(attempts[1].body).toEqual({ decision: "provided", facts: {}, note: "Original sealed reply.",
+    materials: [{ kind: "upload", relative_path: "exact.txt", media_type: "text/plain",
+      content_base64: Buffer.from("Exact original bytes.").toString("base64") }] });
+  expect(commits).toBe(1);
+  expect(intakes).toEqual([]);
 });
