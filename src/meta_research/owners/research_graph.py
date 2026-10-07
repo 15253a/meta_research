@@ -71,7 +71,7 @@ from meta_research.baseline_identity import (
 from meta_research.read_snapshot_cache import snapshot_cached
 from meta_research.experiment_contract import (
     EXPERIMENT_INPUT_BINDING_SCHEMA,
-    EXPERIMENT_RESULT_DISPOSITIONS,
+    valid_optional_result_disposition,
     AcceptedExperimentInputBinding,
     AcceptedExperimentAssetRole,
     FormalMetricResult,
@@ -919,7 +919,7 @@ class TargetCommit:
     target_spec_hash: str
     closure: dict[str, object]
     closure_hash: str
-    result_disposition: str
+    result_disposition: str | None
     receipt: AcceptanceReceipt
 
 
@@ -1001,7 +1001,7 @@ class _NativeTargetCommitMaterial:
     canonical_terminal: AcceptedMeasurementClosure
     closure: dict[str, object]
     closure_hash: str
-    result_disposition: str
+    result_disposition: str | None
     execution_closure: AcceptedTargetNativeExecutionClosure
     execution_closure_payload: dict[str, object]
 
@@ -1013,7 +1013,7 @@ class _TargetRootCommitMaterial:
     canonical_terminal: AcceptedMeasurementClosure
     closure: dict[str, object]
     closure_hash: str
-    result_disposition: str
+    result_disposition: str | None
     measurement_ref: str
     metrics: dict[str, TargetMetricValue]
     checkpoint_refs: tuple[str, ...]
@@ -6970,6 +6970,59 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         policy = authority.measurement_contract.checkpoint_policy
         from meta_research.formal_entities import explicit_run_only
         run_only = explicit_run_only(result_document.as_dict())
+        result_content = result_document.as_dict()
+        authoritative_fields = {
+            "target_ref": target.target_ref,
+            "target_run_ref": completion.handle.target_run_ref,
+            "root_session_ref": completion.handle.root_session_ref,
+            "graph_ref": authority.graph_ref,
+            "target_spec_hash": authority.target_spec_hash,
+            "protocol_version_ref": authority.identities.protocol_version_ref,
+            "result_schema_ref": authority.measurement_contract.result_schema_ref,
+            "execution_attempt_ref": completion.handle.execution_attempt_ref,
+            "execution_fence_ref": completion.handle.execution_fence_ref,
+            "execution_input_binding_ref": completion.handle.execution_input_binding_ref,
+        }
+        if result_document.schema_ref is not None:
+            authoritative_fields["schema_ref"] = authority.measurement_contract.result_schema_ref
+        if "target_spec_binding" in result_content:
+            authoritative_fields["target_spec_binding"] = projection_plain_value(
+                ContentBindingProof(subject_ref=target.target_ref,
+                                    content_hash_ref=candidate_projection.projection_digest)
+            )
+        if "question_ref" in result_content:
+            with self._database.read() as connection:
+                authoritative_fields["question_ref"] = connection.execute(text(
+                    "SELECT question_ref FROM ae_stage_run_requests WHERE request_ref = :ref"
+                ), {"ref": authority.stage_request_ref}).scalar_one()
+        for field, expected in authoritative_fields.items():
+            if field in result_content and result_content[field] != expected:
+                conflict = OwnerConflict("target_root_commit_domain_invalid")
+                conflict.feedback = (
+                    f"$.{field} supplied {result_content[field]!r}, but the accepted source "
+                    f"for Target {target.target_ref!r} records {expected!r}. Correct or omit "
+                    "that copied identity in the result document and finish another normal "
+                    "turn in this Root. The system carries the accepted identity; preserve "
+                    "the metrics, artifacts and actual work, which need no rerun for this conflict."
+                )
+                raise conflict
+        if not run_only and not required_keys <= metric_keys <= allowed_keys:
+            from meta_research.formal_entities import _declared_work
+            run, attempt = _declared_work(result_content)[0]
+            missing = sorted(required_keys - metric_keys)
+            unexpected = sorted(metric_keys - allowed_keys)
+            conflict = OwnerConflict("target_root_commit_domain_invalid")
+            conflict.feedback = (
+                f"Run {run['run_key']!r}, Evaluation {attempt['attempt_key']!r} has "
+                f"missing required metric keys {missing!r} and unexpected metric keys "
+                f"{unexpected!r} under ProtocolVersion {authority.identities.protocol_version_ref!r}. "
+                "Correct that evaluation's metric declaration or add its genuinely missing "
+                "research evidence; preserve the valid metrics, artifacts and actual work. "
+                "If the assessment did not produce measurements, record its actual pending, blocked or "
+                "failed state rather than inventing measurements. Finish another normal turn "
+                "in this Root; no overall result classification is required."
+            )
+            raise conflict
         if (
             target.spec.get("schema_ref") != FORMAL_TARGET_CANDIDATE_SCHEMA_REF
             or authority.target_ref != target.target_ref
@@ -6979,15 +7032,14 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             or candidate.experiment_keys != authority.experiment_keys
             or candidate.measurement_unit_keys
             != (authority.measurement_unit_key,)
-            or result_document.schema_ref
-            != authority.measurement_contract.result_schema_ref
+            or (result_document.schema_ref is not None and result_document.schema_ref
+                != authority.measurement_contract.result_schema_ref)
             or (not run_only and not required_keys <= metric_keys <= allowed_keys)
             or any(
                 not valid_target_metric_value(value)
                 for value in actual_metrics.values()
             )
-            or result_document.result_disposition
-            not in EXPERIMENT_RESULT_DISPOSITIONS
+            or not valid_optional_result_disposition(result_document.result_disposition)
             or policy not in {"required", "optional", "forbidden"}
         ):
             raise OwnerConflict("target_root_commit_domain_invalid")
@@ -14926,7 +14978,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         AcceptedExperimentAssetRole,
         dict[str, object],
         dict[str, float],
-        str,
+        str | None,
     ]:
         """Rebuild one current Target result solely from native Owner facts."""
 
@@ -15007,12 +15059,19 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         if hashlib.sha256(raw_content).hexdigest() != result_role.binding.content_hash:
             raise OwnerConflict("target_formal_measurement_result_content_invalid")
         result_content = _decode_target_result_content(raw_content)
-        if result_content.get("schema_ref") != authority.measurement_contract.result_schema_ref:
-            raise OwnerConflict("target_measurement_result_schema_ref_invalid")
+        if (result_content.get("schema_ref") is not None and result_content.get("schema_ref")
+                != authority.measurement_contract.result_schema_ref):
+            conflict = OwnerConflict("target_measurement_result_schema_ref_invalid")
+            conflict.feedback = (
+                f"$.schema_ref supplied {result_content.get('schema_ref')!r}, but Target "
+                f"{authority.target_ref!r} uses {authority.measurement_contract.result_schema_ref!r}. "
+                "Correct or omit this copied field; the system carries the accepted schema identity. "
+                "Preserve the actual work and result bytes that do not need correction."
+            )
+            raise conflict
         result_disposition = result_content.get("result_disposition")
         if (
-            type(result_disposition) is not str
-            or result_disposition not in EXPERIMENT_RESULT_DISPOSITIONS
+            not valid_optional_result_disposition(result_disposition)
         ):
             raise OwnerConflict("target_measurement_result_disposition_invalid")
         schema = authority.measurement_contract.result_schema.as_dict()
@@ -15961,11 +16020,12 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                 )
             else:
                 feedback = getattr(error, "feedback", (
-                    "The selected result or checkpoint roles do not satisfy "
-                    "execution_contract.measurement_contract in the Owner prompt. "
-                    "Check the exact schema_ref, required/optional metric keys, "
-                    "metric value definitions, and checkpoint_policy. Repair "
-                    "the affected workspace artifacts and finish a normal root turn."
+                    "The result's metric keys, explicitly supplied source identities or "
+                    "artifact/source bindings conflict with the accepted Target contract. "
+                    "The system carries frozen identities and inputs; no overall result "
+                    "classification or copied schema_ref is required. Correct the affected "
+                    "declaration or missing research evidence and finish a normal turn in "
+                    "this Root, preserving the valid metrics, artifacts and actual work."
                 ))
             rejection_material = {
                 "schema_ref": "meta-research/target-root-rg-rejection/v1",
@@ -16342,7 +16402,8 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                     },
                 )
         except OwnerConflict as error:
-            if error.code != "target_formal_input_reference_invalid":
+            if error.code not in {"target_formal_input_reference_invalid",
+                                  "target_formal_metric_definition_invalid"}:
                 raise
             # fenced_write has rolled back every formal and Commit row before
             # this immutable Owner rejection can reopen the same Root.
@@ -17347,7 +17408,7 @@ def _target_formal_measurement_receipt_bindings(
     manifest: AcceptedTargetGenericResultManifest,
     result_role: AcceptedExperimentAssetRole,
     result_schema_hash: str,
-    result_disposition: str,
+    result_disposition: str | None,
     metrics_hash: str,
 ) -> dict[str, object]:
     protocol = authority.measurement_contract.protocol_version
@@ -20286,8 +20347,7 @@ def _target_commit(row) -> TargetCommit:
     if (
         canonical_json(closure) != row.closure_json
         or canonical_hash(closure) != row.closure_hash
-        or row.result_disposition
-        not in {"positive", "negative", "zero", "nonsignificant", "denied", "uncertain"}
+        or not valid_optional_result_disposition(row.result_disposition)
         or row.receipt_hash
         != _receipt_hash(TARGET_COMMIT_RECEIPT_KIND, row.commit_ref, bindings)
     ):
@@ -20541,7 +20601,7 @@ def _native_target_commit_material(
     result_disposition = result_content.get("result_disposition")
     if (
         len(result_entries) != 1
-        or result_disposition not in EXPERIMENT_RESULT_DISPOSITIONS
+        or not valid_optional_result_disposition(result_disposition)
     ):
         raise OwnerConflict("formal_v3_result_content_invalid")
 
@@ -20670,7 +20730,7 @@ def _native_target_commit_material(
         canonical_terminal=measurement_closure,
         closure=closure,
         closure_hash=canonical_hash(closure),
-        result_disposition=cast(str, result_disposition),
+        result_disposition=cast(str | None, result_disposition),
         execution_closure=execution_closure,
         execution_closure_payload=execution_closure_payload,
     )
@@ -20738,14 +20798,17 @@ def _target_root_commit_material(
         for entry in manifest.entries
         if entry.role == "checkpoint"
     )
+    from meta_research.formal_entities import _declared_work
+    primary_run, _primary_attempt = _declared_work(result_document.as_dict())[0]
+    selected_inputs = primary_run.get("input_refs")
+    selected_refs = (selected_inputs if isinstance(selected_inputs, list)
+                     and all(isinstance(ref, str) for ref in selected_inputs) else ())
+    # Frozen inputs are available sources, not evidence that this work used
+    # them. A reused execution supplies its original accepted binding below.
     variant_inputs = tuple(
         dict.fromkeys(
             (
-                *completion.handle.accepted_input_target_commit_refs,
-                *(
-                    proof.asset_ref
-                    for proof in completion.handle.accepted_input_asset_proofs
-                ),
+                *selected_refs,
                 manifest.implementation_revision_ref,
             )
         )
@@ -21014,13 +21077,18 @@ def _target_root_commit_material(
                                      "receipt": manifest.receipt.as_public_dict()},
             "root_measurement": {**measurement_payload, "receipt": measurement_receipt.as_public_dict()},
             "result_content": {"asset": measurement_payload["result_asset"],
-                               "schema_ref": result_document.schema_ref,
+                               "schema_ref": authority.measurement_contract.result_schema_ref,
                                "result_disposition": result_document.result_disposition,
                                "metrics": metrics,
                                "summary": str(result_document.domain_fields.get("summary", ""))[:2048]},
             "research_notes": manifest_research_notes(manifest),
             "protocol": closure["protocol"],
             "implementation": closure["implementation"],
+            "frozen_inputs": {
+                "accepted_input_target_commit_refs": list(completion.handle.accepted_input_target_commit_refs),
+                "accepted_input_asset_proofs": projection_plain_value(completion.handle.accepted_input_asset_proofs),
+                "execution_input_binding_ref": completion.handle.execution_input_binding_ref,
+            },
         }
     return _TargetRootCommitMaterial(
         canonical_terminal=terminal,

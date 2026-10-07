@@ -38,7 +38,6 @@ from meta_research.research_notes import (
     FINAL_STATEMENT_PATH, research_note_metadata, research_note_metadata_from_path,
 )
 from meta_research.query_timing import measured_owner_operation
-from meta_research.experiment_contract import EXPERIMENT_RESULT_DISPOSITIONS
 from meta_research.feed import DurableFeed
 from meta_research.owners.common import (
     AcceptanceReceipt,
@@ -81,6 +80,7 @@ from meta_research.target_run_runtime_contract import (
 TARGET_ROOT_RESULT_DOCUMENT_FIELDS = frozenset(
     {"schema_ref", "metrics", "result_disposition"}
 )
+TARGET_ROOT_REQUIRED_RESULT_DOCUMENT_FIELDS = frozenset({"metrics"})
 RM_TARGET_ROOT_COMPLETION_MANIFEST_RECEIPT_KIND = (
     "target_root_completion_manifest_accepted"
 )
@@ -195,18 +195,19 @@ for _role, _path in (("checkpoint", "outputs/checkpoints"),
 
 @dataclass(frozen=True, slots=True)
 class TargetRootResultDocument:
-    schema_ref: str
+    schema_ref: str | None
     metrics: dict[str, TargetMetricValue]
-    result_disposition: str
+    result_disposition: str | None
     content_hash: str
     domain_fields: dict[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_ref": self.schema_ref,
+            **({"schema_ref": self.schema_ref} if self.schema_ref is not None else {}),
             **self.domain_fields,
             "metrics": self.metrics,
-            "result_disposition": self.result_disposition,
+            **({"result_disposition": self.result_disposition}
+               if self.result_disposition is not None else {}),
         }
 
 
@@ -831,10 +832,15 @@ class SQLiteTargetRootCompletionMemoryAuthority:
         return None
 
     @staticmethod
-    def candidate_rejection_feedback(code: str) -> str | None:
+    def candidate_rejection_feedback(
+        code: str, *, result_document_path: str | None = None,
+    ) -> str | None:
         """Describe only root-correctable RM candidate failures."""
 
-        return _RM_RECOVERABLE_CANDIDATE_FEEDBACK.get(code)
+        feedback = _RM_RECOVERABLE_CANDIDATE_FEEDBACK.get(code)
+        if feedback is not None and result_document_path is not None:
+            feedback = feedback.replace("outputs/result.json", result_document_path)
+        return feedback
 
     def issue_candidate_rejection(
         self,
@@ -859,7 +865,12 @@ class SQLiteTargetRootCompletionMemoryAuthority:
             current != completion
             or type(code) is not str
             or type(feedback) is not str
-            or _RM_RECOVERABLE_CANDIDATE_FEEDBACK.get(code) != feedback
+            or feedback not in {
+                _RM_RECOVERABLE_CANDIDATE_FEEDBACK.get(code),
+                self.candidate_rejection_feedback(
+                    code, result_document_path=completion.handoff.result_document_path,
+                ),
+            }
             or (
                 stored_code is not None
                 and (
@@ -1333,7 +1344,9 @@ class TargetRunFinalizer:
                         retained_completion=completion,
                     )
                 except OwnerConflict as error:
-                    feedback = self._memory.candidate_rejection_feedback(error.code)
+                    feedback = self._memory.candidate_rejection_feedback(
+                        error.code, result_document_path=handoff.result_document_path,
+                    )
                     if feedback is None:
                         raise
                     completion = self._lifecycle.accept_completion(
@@ -1396,7 +1409,9 @@ class TargetRunFinalizer:
                         completion=completion, frozen=frozen
                     )
                 except OwnerConflict as error:
-                    feedback = self._memory.candidate_rejection_feedback(error.code)
+                    feedback = self._memory.candidate_rejection_feedback(
+                        error.code, result_document_path=completion.handoff.result_document_path,
+                    )
                     if feedback is None:
                         raise
                     memory_result = self._memory.issue_candidate_rejection(
@@ -2578,7 +2593,7 @@ def _target_root_utf8_size(value: str, *, invalid_code: str) -> int:
 
 
 def _decode_result_document_value(value: object) -> TargetRootResultDocument:
-    if type(value) is not dict or not TARGET_ROOT_RESULT_DOCUMENT_FIELDS <= set(value):
+    if type(value) is not dict or not TARGET_ROOT_REQUIRED_RESULT_DOCUMENT_FIELDS <= set(value):
         raise OwnerConflict("target_root_result_document_invalid")
     _retained_artifact_declarations(value)
     schema_ref = value.get("schema_ref")
@@ -2593,19 +2608,22 @@ def _decode_result_document_value(value: object) -> TargetRootResultDocument:
         except OwnerConflict:
             pass
     if (
-        type(schema_ref) is not str
-        or not schema_ref
-        or schema_ref != schema_ref.strip()
-        or (
-            _target_root_utf8_size(
-                schema_ref,
-                invalid_code="target_root_result_document_invalid",
-            )
-            > 256
-        )
+        (schema_ref is not None and (
+            type(schema_ref) is not str
+            or not schema_ref
+            or schema_ref != schema_ref.strip()
+            or _target_root_utf8_size(
+                schema_ref, invalid_code="target_root_result_document_invalid"
+            ) > 256
+        ))
         or type(metrics) is not dict
         or (not metrics and not explicit_work)
-        or disposition not in EXPERIMENT_RESULT_DISPOSITIONS
+        or (disposition is not None and (
+            type(disposition) is not str
+            or not disposition
+            or disposition != disposition.strip()
+            or _target_root_utf8_size(disposition, invalid_code="target_root_result_document_invalid") > 256
+        ))
     ):
         raise OwnerConflict("target_root_result_document_invalid")
     if len(metrics) > TARGET_ROOT_MAX_RESULT_METRICS:
@@ -2639,10 +2657,11 @@ def _decode_result_document_value(value: object) -> TargetRootResultDocument:
     return TargetRootResultDocument(
         schema_ref=schema_ref,
         metrics=normalized,
-        result_disposition=cast(str, disposition),
+        result_disposition=cast(str | None, disposition),
         content_hash=canonical_hash(document),
         domain_fields={key: item for key, item in document.items()
-                       if key not in TARGET_ROOT_RESULT_DOCUMENT_FIELDS},
+                       if key not in TARGET_ROOT_RESULT_DOCUMENT_FIELDS
+                       or (key in {"schema_ref", "result_disposition"} and item is None)},
     )
 
 

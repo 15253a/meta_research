@@ -17,9 +17,19 @@ PROTOCOL_EXPERIMENT_DEFINITION_SCHEMA = (
     "meta-research/protocol-experiment-definition/v2"
 )
 PROTOCOL_EXPERIMENT_RESULT_SCHEMA = "meta-research/protocol-experiment-result/v2"
-EXPERIMENT_RESULT_DISPOSITIONS = frozenset(
-    {"positive", "negative", "zero", "nonsignificant", "denied", "uncertain"}
-)
+
+
+def valid_optional_result_disposition(value: object) -> bool:
+    """An old descriptive field may remain; Target results need no verdict."""
+
+    if value is None:
+        return True
+    if type(value) is not str or not value or value != value.strip():
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 256
+    except UnicodeEncodeError:
+        return False
 
 
 @dataclass(frozen=True)

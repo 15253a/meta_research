@@ -64,8 +64,10 @@ export function targetResearchFacts(target: BundleTargetProjection, candidate?: 
   const retrySummary = runtimeFailure && retry?.target_ref === target.target_ref && retry.run_ref === target.target_run_ref ? retry.summary : null;
   const technicalFailure = Boolean(runtimeFailure) || !commit && (["failed", "fenced"].includes(target.status) || Boolean(blockerCode && !coordination && !blockerCode.startsWith("target_high_risk_authorization")));
   const dispositions: Record<string, string> = { positive: "正面结果", negative: "负面结果", uncertain: "结果不确定", rejected: "方案已否定", inconclusive: "尚无确定结论", insufficient_evidence: "证据不足" };
-  const result = commit ? dispositions[commit.result_disposition] ?? commit.result_disposition : "研究结果尚未接纳";
-  const summary = runtimePaused ? "研究已暂停，保留 Target 记录" : retrySummary || (runtimeFailure ? "Target 推进受阻" : openRequests.length ? "有待人类答复的求助" : technicalFailure ? "技术执行受阻" : coordination ? "等待研究调整" : commit ? `研究记录已接纳 · ${result}` : target.status === "running" ? "Target 正在开展工作" : "等待研究工作接续");
+  const disposition = ref(commit?.result_disposition);
+  const result = commit ? disposition ? dispositions[disposition] ?? disposition : null : "研究结果尚未接纳";
+  const acceptance = result ? `研究记录已接纳 · ${result}` : "研究记录已接纳";
+  const summary = runtimePaused ? "研究已暂停，保留 Target 记录" : retrySummary || (runtimeFailure ? "Target 推进受阻" : openRequests.length ? "有待人类答复的求助" : technicalFailure ? "技术执行受阻" : coordination ? "等待研究调整" : commit ? acceptance : target.status === "running" ? "Target 正在开展工作" : "等待研究工作接续");
   const resultAsset = record(measurement.result_asset);
   const artifactRefs = [...new Set([...refs(measurement.checkpoint_refs), ...records(manifest.entries).map(item => ref(record(item.binding).version_ref)).filter((item): item is string => Boolean(item)), ...refs([resultAsset.version_ref])])];
   const readableAssets = [...new Map([
@@ -80,12 +82,12 @@ export function targetResearchFacts(target: BundleTargetProjection, candidate?: 
       { label: "实际执行", text: runRefs.length ? `${runRefs.length} 项方法执行已记录${failedRuns ? ` · ${failedRuns} 项执行失败` : ""}` : target.target_run_ref ? "Target 工作已建立 · 方法执行待记录" : "尚未建立执行" },
       { label: "产物", text: artifactRefs.length ? `${artifactRefs.length} 项已记录资产引用` : manifest.manifest_ref ? "已有精确产物清单 · 可按引用读取" : "尚无可确认的产物清单" },
       { label: "评价", text: evaluation },
-      { label: "接纳", text: commit ? `研究记录已接纳 · ${result}` : "尚未接纳研究结果" },
+      { label: "接纳", text: commit ? acceptance : "尚未接纳研究结果" },
       { label: "交接", text: notes.length ? `${notes.length} 项版本化交接说明` : commit ? "结果与精确来源可供后续读取" : "工作记录中保留尝试与未决事项" },
       { label: "求助", text: openRequests.length ? `${openRequests.length} 项待人类答复 · 独立工作可继续` : answered.length ? `${answered.length} 项已有人类回复 · 见协作记录` : "当前未显示关联的待答复请求" },
     ],
     sources: { target_ref: target.target_ref, target_run_ref: target.target_run_ref, target_spec_hash: target.spec_hash, dependency_refs: target.dependency_refs,
-      input_bindings: inputs, variant_run_refs: runRefs, evaluation_attempt_refs: attemptRefs, result_asset: resultAsset, artifact_refs: artifactRefs,
+      input_bindings: inputs, root_measurement: measurement, variant_run_refs: runRefs, evaluation_attempt_refs: attemptRefs, result_asset: resultAsset, artifact_refs: artifactRefs,
       manifest, research_notes: notes, commit_ref: commit?.commit_ref, closure_hash: commit?.closure_hash,
       human_requests: related.map(request => ({ request_ref: request.request_ref, status: request.status, obligation: request.obligation, responses: request.responses })) },
   };

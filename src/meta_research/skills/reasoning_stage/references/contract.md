@@ -6,6 +6,8 @@
 
 Plan 复用保持精确 FormalPlan 和原样 `evidence_reuse_set`，各 `EvidenceReuseLeaf/v1` 绑定 catalog entry／use hashes 与真实来源：测量叶保留实际 MetricResult、EvaluationAttempt、Run／Commit 及 RM／RG receipts；无评价 WorkProduct 保留真实 Run／Commit，不补 EvaluationAttempt；HumanInput、ScientificOutcome、AssetVersion、LiteratureSnapshot 使用各自核实的 `source_binding`，不强加 Target 测量身份。
 
+Target 结果可以没有总分类。沿精确结果版本、真实指标、评价或未评价状态、缺测说明、技术失败及研究记录独立综合科学支持与不确定性；历史结果的描述性分类只是原文材料。冻结来源说明可用依据，实际采用与用途以相应研究记录为准。本阶段 ScientificOutcome 继续表达自身的科学判断与边界。
+
 adapter 先核验静态 identity／hash／closure，provider 通过获授 scoped MCP 核实当前 AR／AE 范围。未知 currentness 不能当作 current。
 
 ## 封闭输出

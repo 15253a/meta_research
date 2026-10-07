@@ -65,7 +65,8 @@ def target_commit_evidence_provenance(
         "provenance_closure_refs": list(target_commit_evidence_closure_refs(commit)),
         "capabilities": list(_evidence_capabilities(commit)),
         "target_commit_closure_hash": commit.closure_hash,
-        "result_disposition": commit.result_disposition,
+        **({"result_disposition": commit.result_disposition}
+           if commit.result_disposition is not None else {}),
     }
 
 
@@ -115,7 +116,8 @@ def target_commit_evidence_document(
         "evaluation_attempt_ref": commit.evaluation_attempt_ref,
         "target_spec_hash": commit.target_spec_hash,
         "target_commit_closure_hash": commit.closure_hash,
-        "result_disposition": commit.result_disposition,
+        **({"result_disposition": commit.result_disposition}
+           if commit.result_disposition is not None else {}),
         "metric_result": _target_commit_metric_document(commit),
         "result_content": commit.closure["result_content"],
         "target_commit_receipt": commit.receipt.as_public_dict(),
@@ -363,8 +365,9 @@ class TargetCommitEvidenceCatalog(TargetCommitEvidenceAuthority):
                         "target_spec_hash": commit.target_spec_hash,
                         "research_summary": evidence_discovery_summary(
                             spec, _target_commit_metric_document(commit),
-                            commit.closure.get("result_content", {}), commit.result_disposition),
-                        "result_disposition": commit.result_disposition,
+                            commit.closure.get("result_content", {})),
+                        **({"result_disposition": commit.result_disposition}
+                           if commit.result_disposition is not None else {}),
                         "exact_content_reader": "research_memory.plan_evidence.read",
                     }
         catalog = tuple(

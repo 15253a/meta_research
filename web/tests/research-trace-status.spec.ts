@@ -129,6 +129,7 @@ test("accepted execution with pending evaluation exposes seven separate research
   await page.goto("http://research-trace.test/?workspace=1");
   const card = page.getByRole("region", { name: "当前研究工作状态" });
   await expect(card).toBeVisible();
+  await card.getByText("查看输入、产物与交接", { exact: true }).click();
   await expect(card).toContainText("执行已记录 · 评价待办");
   await expect(card).toContainText("研究记录已接纳 · 结果不确定");
   await expect(card.locator(".target-research-facts dt")).toHaveText(["输入", "实际执行", "产物", "评价", "接纳", "交接", "求助"]);
@@ -142,6 +143,47 @@ test("accepted execution with pending evaluation exposes seven separate research
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   await card.scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath("target-facts-mobile.png"), fullPage: true });
+  expect(f.errors).toEqual([]);
+  expect(f.writes).toEqual([]);
+});
+
+test("accepted work without an overall classification shows its evaluation and exact metric sources", async ({ page }, testInfo) => {
+  const f = await fixture(page);
+  const target = { target_ref: "target-unclassified", target_key: "保留实际测量", target_run_ref: "target-work-unclassified", spec_hash: "u".repeat(64), dependency_refs: [], status: "committed", blocker: null };
+  f.snapshot.bundle_stage!.target_graph.targets = [target];
+  f.snapshot.bundle_stage!.target_graph.status = "accepted";
+  f.snapshot.bundle_stage!.target_commits = [{
+    status: "realized", commit_ref: "commit-unclassified", target_ref: target.target_ref,
+    target_run_ref: target.target_run_ref, evaluation_attempt_ref: "evaluation-completed",
+    target_spec_hash: target.spec_hash, closure_hash: "d".repeat(64),
+    closure: { root_measurement: {
+      execution_status: "executed", evaluation_status: "completed",
+      metrics: { observed_loss: 0.25, validation_accuracy: null },
+      formal_entities: [{ variant_run_ref: "actual-run-unclassified", evaluation_attempt_ref: "evaluation-completed", evaluation_status: "completed" }],
+      result_asset: { asset_ref: "measured-result", version_ref: "measured-result:v2" },
+    } },
+  }];
+  await page.goto("http://research-trace.test/?workspace=1");
+  const card = page.getByRole("region", { name: "当前研究工作状态" });
+  await expect(card.locator("header > p")).toHaveText("研究记录已接纳");
+  await card.getByText("查看输入、产物与交接", { exact: true }).click();
+  await expect(card.locator(".target-research-facts > div").filter({ has: page.getByText("接纳", { exact: true }) }).locator("dd")).toHaveText("研究记录已接纳");
+  await expect(card).toContainText("已形成评价记录");
+  await expect(card).not.toContainText("结果不确定");
+  await expect(card).not.toContainText("技术执行受阻");
+  await card.getByText("查看精确输入、产物与交接来源", { exact: true }).click();
+  await expect(card.locator("pre")).toContainText('"observed_loss": 0.25');
+  await expect(card.locator("pre")).toContainText('"validation_accuracy": null');
+  await expect(card.locator("pre")).toContainText('"evaluation_attempt_ref": "evaluation-completed"');
+  await expect(card.locator("pre")).toContainText('"version_ref": "measured-result:v2"');
+  await expect(card.locator("pre")).toContainText('"commit_ref": "commit-unclassified"');
+  await expect(card.locator("pre")).toContainText(target.spec_hash);
+  await card.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("unclassified-target-desktop.png"), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await card.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("unclassified-target-mobile.png"), fullPage: true });
   expect(f.errors).toEqual([]);
   expect(f.writes).toEqual([]);
 });

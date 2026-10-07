@@ -83,7 +83,6 @@ _FORMAL_TARGET_SYMBOLS = {
     "AcceptedExperimentInputBinding",
     "AcceptedExperimentAssetRole",
     "FormalMetricResult",
-    "EXPERIMENT_RESULT_DISPOSITIONS",
 }
 
 _MICRO_RUNTIME_SYMBOLS = {
