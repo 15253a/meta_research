@@ -200,7 +200,7 @@ class CodexCompanionAdapter(
                 "sealed_context": request.context, "output_schema": child_schema})
         )
         prompt = (
-            "You are the persistent Companion. Call spawn_agent exactly once with fork_turns=all for a fresh short-lived first Question drafter. "
+            "You are the persistent Companion. Call spawn_agent exactly once with fork_context=true for a fresh short-lived first Question drafter. "
             "Its short message points to BEGIN_FIRST_QUESTION_TASK through END_FIRST_QUESTION_TASK in inherited context. "
             "Save the actual child identifier returned by spawn, wait for its final result, validate it against the schema, "
             "and return {proposal_fork_native_session_ref,result}. Do not reuse an old proposal child. "

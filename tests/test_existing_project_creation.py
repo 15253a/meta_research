@@ -346,7 +346,8 @@ def test_production_synthesis_prompt_and_spool_bind_actual_loaded_skill_and_fres
     assert result.revision == revision
     argv, prompt, _ = runner.calls[0]
     assert "resume" in argv and "persistent-parent" in argv
-    assert "spawn_agent exactly once with fork_turns=all" in prompt
+    assert "spawn_agent exactly once with fork_context=true" in prompt
+    assert "fork_turns" not in prompt
     assert first_creation_instructions()["bundle_hash"] in prompt
     assert "creation_basis_test" in prompt and "sealed/cache" in prompt
     schema = runner.schemas[0]
