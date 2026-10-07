@@ -44,10 +44,12 @@ from meta_research.reasoning_contract import (
     NEXT_CYCLE_PROPOSAL_SCHEMA_REF,
     REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF,
     REASONING_REVIEW_SCHEMA_REF,
+    REASONING_AUTHORITATIVE_RESEARCH_CONTEXT_SCHEMA_REF,
     REASONING_STAGE_OUTPUT_SCHEMA_REF,
     REASONING_SUCCESSOR_ENTRY_STAGES,
     SCIENTIFIC_OUTCOME_SCHEMA_REF,
     ReasoningContractError,
+    assemble_reasoning_authoritative_metadata,
     completion_milestone_basis_refs,
     plan_evidence_reuse_leaves,
     validate_reasoning_autonomous_checkpoint,
@@ -814,6 +816,26 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
 
     _provider_transport_limits = REASONING_PROVIDER_TRANSPORT_LIMITS
 
+    def _assemble_provider_output(
+        self,
+        request: ReasoningSkillRequest,
+        output: dict[str, object],
+        *,
+        operation_name: str,
+        native_session_ref: str,
+    ) -> dict[str, object]:
+        try:
+            return _assemble_reasoning_output(request, output)
+        except ReasoningContractError as error:
+            raise self._sealed_result_failure(
+                job_ref=request.job_ref,
+                operation_name=operation_name,
+                native_session_ref=native_session_ref,
+                failure_code=self._transport_contract_failure_code(operation_name),
+                detail_code=str(error),
+                rejected_candidate=output,
+            ) from error
+
     def _is_reconciliation_operation_name(self, operation_name: str) -> bool:
         return operation_name == "autonomous-resume" or (
             super()._is_reconciliation_operation_name(operation_name)
@@ -1173,7 +1195,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "信息是否足够；旧 receipt 不能释放新的 waiter。\n"
         )
         prompt = (
-            f"{_reasoning_skill_instructions()}\n\n"
+            f"{_reasoning_skill_instructions(request)}\n\n"
             f"{human_resume}"
             "本回合仅执行 Primary draft phase；必须先返回 frozen draft。Advisory "
             "finalization 只能在 Owner 记录该 draft 后的下一次 resumed review turn 中进行。"
@@ -1235,6 +1257,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         )
         if session_ref is None or not isinstance(output, dict):
             raise ReasoningSkillUnavailable("codex_reasoning_primary_invalid")
+        output = self._assemble_provider_output(
+            request, output, operation_name="primary", native_session_ref=session_ref
+        )
         # Collaboration trace is advisory provenance.  The frozen Reasoning
         # artifact is accepted or rejected by its Stage contract below.
         draft = ReasoningSkillDraft(
@@ -1261,7 +1286,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable(error.args[0]) from error
         lineage = _owner_rejection_prompt(request)
         prompt = (
-            f"{_reasoning_skill_instructions()}\n\n"
+            f"{_reasoning_skill_instructions(request)}\n\n"
             "本回合在原根 Session 中完成独立审查后的修订。使用原生子智能体审查完整草稿和必要原文，"
             "让它独立核查来源、推理、研究边界及后继选择。根据反馈和你的判断修订；没有发现问题也可改稿。"
             "根负责最终研究判断和交接，子智能体使用已授予的工具与当前 fence。"
@@ -1306,6 +1331,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 rejected_candidate=reviewed,
             )
         final_output = cast(dict[str, object], reviewed["final_output"])
+        final_output = self._assemble_provider_output(
+            request, final_output, operation_name="review", native_session_ref=draft.primary_session_ref
+        )
         if (
             draft.draft.get("schema_ref")
             == REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF
@@ -1358,11 +1386,15 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         schema = {"type": "object", "additionalProperties": False,
             "properties": {"action": {"type": "string", "enum": ["create", "decline", "retry"]}, "final_output": final_schema},
             "required": ["action", "final_output"]}
-        prompt = (_reasoning_skill_instructions() + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。继续评估已进入本次 DeepFetch 的唯一候选，保留其实际交接来源；新建题推荐按上述 Skill 由 Bundle 统一交接。依据摘要中的当前研究现状、已有题覆盖范围及后续可开展的研究，判断其是否值得独立追踪，可调整结论及拟题六字段，再决定是否创建，不扩为多个问题或轮流启动其余保留项。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
+        prompt = (_reasoning_skill_instructions(request) + "\n在原 Reasoning Session 中阅读下面精确 DeepFetch summary；当前 checkpoint 只是执行草稿，尚未接纳科学判断。继续评估已进入本次 DeepFetch 的唯一候选，保留其实际交接来源；新建题推荐按上述 Skill 由 Bundle 统一交接。依据摘要中的当前研究现状、已有题覆盖范围及后续可开展的研究，判断其是否值得独立追踪，可调整结论及拟题六字段，再决定是否创建，不扩为多个问题或轮流启动其余保留项。已有题足以承载且无需独立追踪，或独立价值不成立时选择 decline，检索完成本身不要求建题。委派独立子智能体审查后由你完成决定。create 返回修订后的完整 checkpoint；decline 返回普通最终 Reasoning output，不创建问题。若事实明确失败/取消且没有摘要，可 retry（final_output=null）或 decline，禁止伪造摘要。\n"
             + "completion_feedback=" + canonical_json(list(request.continuation_feedback)) + "\ncheckpoint=" + canonical_json(checkpoint) + "\nfacts=" + canonical_json(facts) + "\nsummary=" + canonical_json(summary))
         decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref)
         if native_session != request.native_session_ref:
             raise ReasoningSkillUnavailable("codex_primary_session_changed")
+        if isinstance(decision.get("final_output"), dict):
+            decision["final_output"] = self._assemble_provider_output(
+                request, decision["final_output"], operation_name="autonomous-resume", native_session_ref=native_session
+            )
         try:
             validate_reasoning_deepfetch_decision(request, decision, facts)
         except (ReasoningContractError, ReasoningSkillContractError) as error:
@@ -1395,7 +1427,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             raise ReasoningSkillUnavailable("reasoning_native_session_missing")
         lineage = _owner_rejection_prompt(request)
         prompt = (
-            f"{_reasoning_skill_instructions()}\n\n"
+            f"{_reasoning_skill_instructions(request)}\n\n"
             "本回合是同一 Reasoning root/native Session 的 autonomous finalization phase。"
             "create_question 已返回 accepted QuestionAnchor、present/open facts 和真实 "
             "QuestionLiteratureRevision。结合新信息检查当前选择事实及已有成果。创建新问题"
@@ -1438,6 +1470,9 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 rejected_candidate=reviewed,
             )
         final_output = cast(dict[str, object], reviewed["final_output"])
+        final_output = self._assemble_provider_output(
+            request, final_output, operation_name="autonomous-resume", native_session_ref=request.native_session_ref
+        )
         outcome = final_output.get("scientific_outcome")
         next_cycle = final_output.get("next_cycle_proposal")
         completion = final_output.get("candidate_completion")
@@ -1551,6 +1586,7 @@ def _reasoning_skill_resources() -> dict[str, str]:
         ("SKILL.md", package / "SKILL.md"),
         ("agents/openai.yaml", package / "agents" / "openai.yaml"),
         ("references/contract.md", package / "references" / "contract.md"),
+        ("references/legacy-v2-contract.md", package / "references" / "legacy-v2-contract.md"),
         (
             "references/owner-operations.md",
             package / "references" / "owner-operations.md",
@@ -1570,16 +1606,33 @@ def _reasoning_skill_resources() -> dict[str, str]:
         ) from error
 
 
-def _reasoning_skill_instructions() -> str:
+def _reasoning_skill_instructions(request: ReasoningSkillRequest | None = None) -> str:
     resources = _reasoning_skill_resources()
+    names = [
+        "research-guidance.md",
+        "SKILL.md",
+        "references/contract.md",
+        "references/owner-operations.md",
+    ]
+    if request is not None and not _uses_authoritative_metadata(request):
+        names.append("references/legacy-v2-contract.md")
     return "\n\n".join(
         f"<!-- bundled resource: {name} -->\n{resources[name]}"
-        for name in (
-            "research-guidance.md",
-            "SKILL.md",
-            "references/contract.md",
-            "references/owner-operations.md",
-        )
+        for name in names
+    )
+
+
+def _uses_authoritative_metadata(request: ReasoningSkillRequest) -> bool:
+    research = cast(dict[str, object], request.context_pack["research_context"])
+    return research.get("schema_ref") == REASONING_AUTHORITATIVE_RESEARCH_CONTEXT_SCHEMA_REF
+
+
+def _assemble_reasoning_output(
+    request: ReasoningSkillRequest, output: dict[str, object]
+) -> dict[str, object]:
+    return assemble_reasoning_authoritative_metadata(
+        output,
+        frozen_research_context=cast(dict[str, object], request.context_pack["research_context"]),
     )
 
 
@@ -1598,7 +1651,7 @@ def _schema_template_request() -> ReasoningSkillRequest:
             {"stage": "bundle", "commit_ref": "__bundle_stage_commit_ref__"},
         ],
         "research_context": {
-            "schema_ref": "meta-research/reasoning-research-context/v2",
+            "schema_ref": REASONING_AUTHORITATIVE_RESEARCH_CONTEXT_SCHEMA_REF,
             "cycle_ref": "__cycle_ref__",
             "question_ref": "__question_ref__",
             "quest_ref": "__quest_ref__",
@@ -1823,9 +1876,10 @@ def _scientific_outcome_schema(
     )
     parent_refs = [cast(str, value["question_ref"]) for value in parent_bindings]
     prior_refs = [cast(str, value["outcome_ref"]) for value in prior_outcomes]
+    system_metadata = _uses_authoritative_metadata(request)
     frozen_causal = cast(dict[str, object], research_context["causal_context"])
     text_array = {"type": "array", "items": text, "uniqueItems": True}
-    causal_ref_arrays = {
+    causal_ref_arrays = {} if system_metadata else {
         field: {
             "type": "array",
             "minItems": len(cast(list[object], frozen_causal[field])),
@@ -1901,8 +1955,7 @@ def _scientific_outcome_schema(
                     "confounders": text_array,
                 },
                 "required": [
-                    "target_commit_refs", "changed_axis_fact_refs", "held_fixed_fact_refs",
-                    "provenance_refs", "attribution_basis_refs", "claim_scope", "statement",
+                    *causal_ref_arrays, "attribution_basis_refs", "claim_scope", "statement",
                     "sufficiency_rationale", "confounders",
                 ],
             },
@@ -1919,7 +1972,7 @@ def _scientific_outcome_schema(
                         "type": "object", "additionalProperties": False,
                         "properties": {
                             "question_ref": {"const": request.question_ref},
-                            "prior_accepted_outcome_refs": {
+                            **({} if system_metadata else {"prior_accepted_outcome_refs": {
                                 "type": "array",
                                 "items": {
                                     **text,
@@ -1936,13 +1989,15 @@ def _scientific_outcome_schema(
                                     "prior_current_question_outcomes in order; "
                                     "each string contains one complete reference exactly once."
                                 ),
-                            },
+                            }}),
                             "progress": text,
                         },
-                        "required": ["question_ref", "prior_accepted_outcome_refs", "progress"],
+                        "required": ["question_ref", "progress"] + ([] if system_metadata else ["prior_accepted_outcome_refs"]),
                     },
                     "parent_questions": {
-                        "type": "array", "minItems": len(parent_refs), "maxItems": len(parent_refs),
+                        "type": "array",
+                        **({} if system_metadata else {"minItems": len(parent_refs), "maxItems": len(parent_refs)}),
+                        **({"description": "Give each frozen parent Question its own impact and statement. question_ref associates the judgment with its subject; order is chosen by the system."} if system_metadata else {}),
                         "items": {
                             "type": "object", "additionalProperties": False,
                             "properties": {
