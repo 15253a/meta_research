@@ -45,6 +45,64 @@ def channel(runtime, question, generation=1):
     return call
 
 
+def test_scoped_intake_retry_waits_for_a_current_caller_after_storage_failure(
+    tmp_path, monkeypatch
+):
+    from sqlalchemy import text
+    from meta_research.owners.common import OwnerConflict
+    import meta_research.owners.research_memory as memory_module
+
+    runtime = _runtime(tmp_path / "scoped-retry")
+    try:
+        question = _quest(runtime, "retry")
+        call = channel(runtime, question)
+        memory = runtime.owners.research_memory
+        original = memory._accept_prepared_asset
+
+        def fail_once(*args, **values):
+            monkeypatch.setattr(memory, "_accept_prepared_asset", original)
+            raise OwnerConflict("asset_source_unavailable")
+
+        monkeypatch.setattr(memory_module, "ASSET_INTAKE_RETRY_BASE_SECONDS", 0)
+        monkeypatch.setattr(memory, "_accept_prepared_asset", fail_once)
+        arguments = dict(
+            effect_id="recoverable",
+            intake={
+                "source_kind": "text",
+                "custody_mode": "managed",
+                "display_name": "recoverable.txt",
+                "text": "Exact retry content.\n",
+            },
+        )
+        before = [
+            memory.query_asset_version(item.memory_ref)
+            for item in memory.query_asset_inventory()
+        ]
+        result = call("research_memory.assets.intake", **arguments)
+        assert not result["isError"], result
+        assert result["structuredContent"]["status"] == "queued"
+        job_ref = result["structuredContent"]["job_ref"]
+        next_call = channel(runtime, question, generation=2)
+        assert call("research_memory.assets.intake", **arguments)["isError"]
+        assert memory.process_asset_intake_once() is False
+        assert memory.query_asset_intake(job_ref).status == "queued"
+        assert memory.query_asset_intake(job_ref).asset is None
+        after = [
+            memory.query_asset_version(item.memory_ref)
+            for item in memory.query_asset_inventory()
+        ]
+        assert after == before
+        accepted = next_call("research_memory.assets.intake", **arguments)
+        assert not accepted["isError"], accepted
+        assert accepted["structuredContent"]["status"] == "accepted"
+        version_ref = accepted["structuredContent"]["asset"]["version_ref"]
+        assert (
+            memory.materialize_asset(version_ref).content == b"Exact retry content.\n"
+        )
+    finally:
+        runtime.close()
+
+
 def test_http_and_semantic_share_exact_correction_and_retirement_contract(tmp_path):
     runtime = _runtime(tmp_path / "adapters")
     client, headers = _authenticated_client(runtime)

@@ -1307,6 +1307,12 @@ def test_memory_ref_always_materializes_the_exact_version_not_latest(
                 media_type="text/plain",
                 content=b"version two\n",
                 asset_ref=first.asset.asset_ref,
+                change={
+                    "kind": "substantive_change",
+                    "predecessor_version_ref": first.asset.version_ref,
+                    "expected_revision": 1,
+                    "explanation": "The second observation replaces the active notes.",
+                },
             ),
             idempotency_key="version-2",
         )

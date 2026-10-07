@@ -25,10 +25,12 @@ The retirement body contains `expected_revision`, `expected_reference_revision`,
 
 Root agents discover `research_memory.assets.page`, `.lifecycle`, and `.current`. They use `.intake` and `.retire` with their corresponding `.reconcile` operation. Every operation verifies the current Quest and runtime fence. Intake records the accepting Quest as an immutable origin fact. That access fact does not manufacture a scientific use. Exact content uses the existing `research_memory.content.read` tool.
 
+A semantic intake durably records that it requires an effect scope in its canonical request. After a transient storage failure, it remains queued until an authorized caller retries the same effect ID and payload with its current runtime scope. Background workers skip these jobs. The final fenced acceptance checks that scope and the original asset revision and predecessor again. Reconciliation reports the queued state; it does not grant acceptance permission.
+
 ## Migration and verification
 
 Migration `0060_asset_lifecycle` leaves previous content and receipts unchanged. Legacy versions remain `unselected` with revision zero. No latest version becomes current by inference. The first explicit change selects its stated predecessor and creates an accepted current selection. Owner-bound formal content remains protected by its existing owner.
 
-The public owner probes are in `tests/test_public_asset_lifecycle.py`. HTTP and actual semantic dispatch share the contract in `tests/test_asset_lifecycle_adapters.py`. Target production and completion protection use the existing finalizer fixtures. Backend tests run on Linux because the runtime requires `fcntl`. Workspace handoff notes provide the isolated Linux runner. Frontend checks use `npm test`, `npm run typecheck`, and `npm run build` from `web`.
+The public owner probes are in `tests/test_public_asset_lifecycle.py`. HTTP and actual semantic dispatch share the contract in `tests/test_asset_lifecycle_adapters.py`. `tests/test_asset_lifecycle_protection.py` verifies Target production, pending inputs, completion protection, human responses, and shared directory entries with real owner fixtures. Backend tests run on Linux because the runtime requires `fcntl`. Workspace handoff notes provide the isolated Linux runner. Frontend checks use `npm test`, `npm run typecheck`, and `npm run build` from `web`.
 
 The local engineering checks use temporary content and independent data roots. They do not establish long-term scientific benefit or mutate deployed research assets.

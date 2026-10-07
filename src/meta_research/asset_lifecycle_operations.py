@@ -87,6 +87,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
                 values = dict(arguments["intake"])
                 values["content"] = values.pop("text").encode("utf-8")
                 values["origin_quest_ref"] = quest
+                values["effect_scope_required"] = True
                 request = AssetIntakeRequest(**values)
                 change = request.change
                 if change is not None:
@@ -116,41 +117,19 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
                 return result.as_public_dict()
             version_ref = arguments["version_ref"]
             scope(context, version_ref)
-            if reconcile:
-                with memory._database.read() as connection:
-                    row = connection.execute(
-                        text(
-                            "SELECT * FROM rm_asset_changes WHERE idempotency_key=:key"
-                        ),
-                        {"key": "retire:" + effect_key},
-                    ).first()
-                    from meta_research.owners.asset_lifecycle import (
-                        _accepted_change,
-                        _description,
-                    )
-
-                    payload = {
-                        name: value
-                        for name, value in arguments.items()
-                        if name != "effect_id"
-                    }
-                    payload["kind"] = "retirement"
-                    payload["explanation"] = _description(
-                        payload["explanation"], "explanation"
-                    )
-                    if row is not None and row.request_hash != canonical_hash(payload):
-                        raise OwnerConflict("asset_retirement_idempotency_conflict")
-
-                    result = None if row is None else _accepted_change(row)
-                return {
-                    "status": "not_found" if result is None else "accepted",
-                    "result": result,
-                }
             payload = {
                 name: value
                 for name, value in arguments.items()
                 if name not in {"effect_id", "version_ref"}
             }
+            if reconcile:
+                result = memory.query_retirement_by_idempotency_key(
+                    version_ref, **payload, idempotency_key=effect_key
+                )
+                return {
+                    "status": "not_found" if result is None else "accepted",
+                    "result": result,
+                }
             return memory.retire_asset_version(
                 version_ref,
                 **payload,
@@ -323,7 +302,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
                     reconciliation_operation_id=None
                     if reconcile
                     else name + ".reconcile",
-                    description="Accept an asset supplement, substantive change, or correction atomically with its exact predecessor, explanation and current selection. Correction requires error, exact evidence bindings, scope, and per-work recheck/redo/unaffected/unknown judgments. Retirement requires confirmed low value, obsolescence and error, understood impact and no explanatory value; fresh references and holds block it. Failure, negative results and goal changes never trigger retirement. All historical bytes are retained. Keep the same effect_id and exact payload when reconciling.",
+                    description="Accept an asset supplement, substantive change, or correction atomically with its exact predecessor, explanation and current selection. Correction requires error, exact evidence bindings, scope, and per-work recheck/redo/unaffected/unknown judgments. Retirement requires confirmed low value, obsolescence and error, understood impact and no explanatory value; fresh references and holds block it. Failure, negative results and goal changes never trigger retirement. All historical bytes are retained. Keep the same effect_id and exact payload when reconciling. A queued intake awaits an authorized caller: retry the same effect and payload with the current root scope; background workers cannot accept it without that scope.",
                     input_schema={
                         "type": "object",
                         "properties": properties,

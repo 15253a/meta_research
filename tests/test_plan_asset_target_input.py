@@ -53,9 +53,15 @@ def _runtime(path):
 
 
 def _asset(runtime, key, *, asset_ref=None):
+    change = None
+    if asset_ref is not None:
+        lifecycle = runtime.owners.research_memory.query_asset_lifecycle(asset_ref)
+        change = {"kind": "substantive_change", "expected_revision": lifecycle["revision"],
+                  "predecessor_version_ref": lifecycle["current_version_ref"],
+                  "explanation": "Later observations produce a materially different input."}
     return runtime.owners.research_memory.submit_asset_intake(AssetIntakeRequest(
         source_kind="text", custody_mode="managed", display_name=key, asset_ref=asset_ref,
-        content=(key + ": observed input bytes\n").encode()), idempotency_key=key).asset.as_binding()
+        content=(key + ": observed input bytes\n").encode(), change=change), idempotency_key=key).asset.as_binding()
 
 
 def _origin(runtime, binding, quest_ref, key):

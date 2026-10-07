@@ -248,6 +248,7 @@ class AssetIntakeRequest:
     asynchronous: bool = False
     change: dict[str, object] | None = None
     origin_quest_ref: str | None = None
+    effect_scope_required: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -262,6 +263,7 @@ class AssetIntakeRequest:
             "asynchronous": self.asynchronous,
             "change": self.change,
             "origin_quest_ref": self.origin_quest_ref,
+            "effect_scope_required": self.effect_scope_required,
         }
 
     def validate(self) -> None:
@@ -936,6 +938,30 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     def query_asset_version(
         self, memory_ref: str
     ) -> AcceptedAssetVersion | None: ...
+
+    def query_asset_lifecycle(self, asset_ref: str) -> dict[str, object]: ...
+
+    def query_current_asset(self, asset_ref: str) -> AcceptedAssetVersion | None: ...
+
+    def query_retirement_by_idempotency_key(
+        self, memory_ref: str, *, idempotency_key: str, **judgment
+    ) -> dict[str, object] | None: ...
+
+    def retire_asset_version(
+        self,
+        memory_ref: str,
+        *,
+        expected_revision: int,
+        expected_reference_revision: int,
+        explanation: str,
+        low_value: bool,
+        obsolete: bool,
+        incorrect: bool,
+        impact_understood: bool,
+        has_explanation_value: bool,
+        idempotency_key: str,
+        effect_scope: Callable[[], None] | None = None,
+    ) -> dict[str, object]: ...
 
     def query_asset_inventory(self) -> tuple[AssetInventoryItem, ...]: ...
 
@@ -3447,6 +3473,10 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         if not idempotency_key or len(idempotency_key) > 128:
             raise OwnerConflict("asset_intake_idempotency_key_invalid")
         request_document = _asset_request_document(request)
+        if effect_scope is not None:
+            request_document["effect_scope_required"] = True
+        if request_document.get("effect_scope_required") and effect_scope is None:
+            raise OwnerConflict("asset_effect_scope_required")
         request_json = canonical_json(request_document)
         request_hash = canonical_hash(request_document)
         provenance = request_document.get("provenance")
@@ -3598,6 +3628,7 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             row = connection.execute(
                 text(
                     "SELECT job_ref FROM rm_asset_intakes WHERE status = 'queued' "
+                    "AND CASE WHEN json_valid(request_json) THEN COALESCE(json_extract(request_json, '$.effect_scope_required'),0) ELSE 0 END=0 "
                     "AND next_attempt_at <= :now ORDER BY next_attempt_at, "
                     "updated_at, created_at, job_ref LIMIT 1"
                 ),
@@ -3757,6 +3788,12 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
             if row is None:
                 raise OwnerConflict("asset_intake_not_found")
             if row.status in {"accepted", "failed"}:
+                return
+            try:
+                requires_scope = decoded_object(row.request_json).get("effect_scope_required")
+            except (TypeError, ValueError):
+                requires_scope = False
+            if requires_scope and effect_scope is None:
                 return
             if already_claimed:
                 if row.status != "processing":
@@ -4176,6 +4213,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         provenance_json = canonical_json(provenance)
         provenance_hash = canonical_hash(provenance)
         with self._database.fenced_write() as connection:
+            if request.get("effect_scope_required") and effect_scope is None:
+                raise OwnerConflict("asset_effect_scope_required")
             if effect_scope is not None:
                 effect_scope()
             job = connection.execute(
@@ -10831,6 +10870,8 @@ def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
         or len(request.origin_quest_ref) > 128
     ):
         raise OwnerConflict("asset_origin_quest_invalid")
+    if type(request.effect_scope_required) is not bool:
+        raise OwnerConflict("asset_effect_scope_invalid")
     return {
         "source_kind": request.source_kind,
         "custody_mode": request.custody_mode,
@@ -10847,6 +10888,7 @@ def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
         "asynchronous": bool(request.asynchronous),
         **({"change": validate_asset_change(request.change, asset_ref)} if request.change is not None else {}),
         **({"origin_quest_ref": request.origin_quest_ref} if request.origin_quest_ref is not None else {}),
+        **({"effect_scope_required": True} if request.effect_scope_required else {}),
     }
 
 
@@ -10860,7 +10902,7 @@ def _validated_stored_asset_request(
         document = decoded_object(stored_request_json)
         if (
             canonical_json(document) != stored_request_json
-            or set(document) - {"change", "origin_quest_ref"}
+            or set(document) - {"change", "origin_quest_ref", "effect_scope_required"}
             != {
                 "source_kind",
                 "custody_mode",
@@ -10895,6 +10937,7 @@ def _validated_stored_asset_request(
             asynchronous=document["asynchronous"],
             change=document.get("change"),
             origin_quest_ref=document.get("origin_quest_ref"),
+            effect_scope_required=document.get("effect_scope_required", False),
         )
         normalized = _asset_request_document(request)
         if normalized != document:

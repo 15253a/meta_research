@@ -13157,7 +13157,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                 self._target_candidate_proof_verifier,
             )
 
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             _acquire_research_graph_writer_lock(connection)
             locked_verified = (
                 self._stage_request_verifier.query_verified_bundle_stage_request(
@@ -15560,7 +15560,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             )
 
         new_head: TargetGraphHead | None = None
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = connection.execute(
                 text(
                     "SELECT * FROM rg_target_graph_appends WHERE proposal_ref = "
@@ -18076,6 +18076,12 @@ def _insert_target_with_measurement_authority(
         != formal_candidate.candidate.measurement_unit_keys[0]
     ):
         raise OwnerConflict("target_measurement_contract_binding_invalid")
+    for version_ref in _target_direct_accepted_input_asset_refs(target.spec):
+        if connection.execute(
+            text("SELECT 1 FROM rm_asset_versions WHERE version_ref=:ref"),
+            {"ref": version_ref},
+        ).first() is not None:
+            assert_asset_usable(connection, version_ref)
     connection.execute(
         text(
             "INSERT INTO rg_targets (target_ref, graph_ref, target_key, ordinal, "

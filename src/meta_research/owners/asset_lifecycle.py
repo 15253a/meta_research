@@ -126,6 +126,17 @@ def assert_asset_payload_usable(connection, value):
 
 def retained_asset_references(connection, version_ref):
     references = []
+    target_rows = (
+        connection.execute(
+            text(
+                "SELECT t.target_ref FROM rg_targets t WHERE EXISTS (SELECT 1 FROM json_each(t.spec_json, '$.candidate.direct_accepted_input_asset_refs') j WHERE j.value=:ref) ORDER BY t.target_ref"
+            ),
+            {"ref": version_ref},
+        )
+        .scalars()
+        .all()
+    )
+    references.extend(f"rg_targets:{ref}" for ref in target_rows)
     direct = (
         ("rm_target_implementation_artifacts", "implementation_revision_ref"),
         ("rm_target_implementation_bundles", "implementation_revision_ref"),
@@ -258,6 +269,53 @@ def _verified_lifecycle(connection, asset_ref):
     if any(row.state != states[row.version_ref] for row in versions):
         raise OwnerConflict("asset_lifecycle_state_invalid")
     return head, changes, states
+
+
+def _retirement_payload(
+    memory_ref,
+    *,
+    expected_revision,
+    expected_reference_revision,
+    explanation,
+    low_value,
+    obsolete,
+    incorrect,
+    impact_understood,
+    has_explanation_value,
+    idempotency_key,
+):
+    explanation = _description(explanation, "explanation")
+    if (
+        not isinstance(idempotency_key, str)
+        or not idempotency_key
+        or len(idempotency_key) > 128
+    ):
+        raise OwnerConflict("asset_retirement_idempotency_key_invalid")
+    if (
+        type(expected_revision) is not int
+        or expected_revision < 0
+        or type(expected_reference_revision) is not int
+        or expected_reference_revision < 0
+    ):
+        raise OwnerConflict("asset_revision_invalid")
+    judgments = {
+        "low_value": low_value,
+        "obsolete": obsolete,
+        "incorrect": incorrect,
+        "impact_understood": impact_understood,
+        "has_explanation_value": has_explanation_value,
+    }
+    if any(type(v) is not bool for v in judgments.values()):
+        raise OwnerConflict("asset_retirement_judgment_invalid")
+    payload = {
+        "kind": "retirement",
+        "version_ref": memory_ref,
+        "expected_revision": expected_revision,
+        "expected_reference_revision": expected_reference_revision,
+        "explanation": explanation,
+        **judgments,
+    }
+    return payload
 
 
 class AssetLifecycleOwnerMixin:
@@ -453,6 +511,23 @@ class AssetLifecycleOwnerMixin:
             idempotency_key="intake:" + idempotency_key,
         )
 
+    def query_retirement_by_idempotency_key(
+        self, memory_ref, *, idempotency_key, **judgment
+    ):
+        payload = _retirement_payload(
+            memory_ref, idempotency_key=idempotency_key, **judgment
+        )
+        with self._database.read() as connection:
+            row = connection.execute(
+                text("SELECT * FROM rm_asset_changes WHERE idempotency_key=:key"),
+                {"key": "retire:" + idempotency_key},
+            ).first()
+            if row is None:
+                return None
+            if row.request_hash != canonical_hash(payload):
+                raise OwnerConflict("asset_retirement_idempotency_conflict")
+            return _accepted_change(row)
+
     def retire_asset_version(
         self,
         memory_ref,
@@ -468,37 +543,18 @@ class AssetLifecycleOwnerMixin:
         idempotency_key,
         effect_scope=None,
     ):
-        explanation = _description(explanation, "explanation")
-        if (
-            not isinstance(idempotency_key, str)
-            or not idempotency_key
-            or len(idempotency_key) > 128
-        ):
-            raise OwnerConflict("asset_retirement_idempotency_key_invalid")
-        if (
-            type(expected_revision) is not int
-            or expected_revision < 0
-            or type(expected_reference_revision) is not int
-            or expected_reference_revision < 0
-        ):
-            raise OwnerConflict("asset_revision_invalid")
-        judgments = {
-            "low_value": low_value,
-            "obsolete": obsolete,
-            "incorrect": incorrect,
-            "impact_understood": impact_understood,
-            "has_explanation_value": has_explanation_value,
-        }
-        if any(type(v) is not bool for v in judgments.values()):
-            raise OwnerConflict("asset_retirement_judgment_invalid")
-        payload = {
-            "kind": "retirement",
-            "version_ref": memory_ref,
-            "expected_revision": expected_revision,
-            "expected_reference_revision": expected_reference_revision,
-            "explanation": explanation,
-            **judgments,
-        }
+        payload = _retirement_payload(
+            memory_ref,
+            expected_revision=expected_revision,
+            expected_reference_revision=expected_reference_revision,
+            explanation=explanation,
+            low_value=low_value,
+            obsolete=obsolete,
+            incorrect=incorrect,
+            impact_understood=impact_understood,
+            has_explanation_value=has_explanation_value,
+            idempotency_key=idempotency_key,
+        )
         with self._database.fenced_write() as connection:
             if effect_scope is not None:
                 effect_scope()

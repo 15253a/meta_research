@@ -3907,7 +3907,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         request = self._query_issuing_owner_request(request_ref)
         if not request["current"] or request["status"] != "open":
             raise OwnerConflict("human_request_not_current")
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             rejected = connection.execute(
                 text(
                     "SELECT rejection_ref FROM "
