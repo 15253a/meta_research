@@ -14557,6 +14557,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             return None
         kind = request.get("kind")
         if kind == "library_reconnect":
+            if facts.get("route") == "provided_material" and self._authorization_verifier is not None:
+                try:
+                    delivery = self._authorization_verifier.verify_reply_delivery(
+                        request_ref=request["request_ref"], response_ref=response_ref)
+                    binding = request["open_effect"]["operation_binding"]
+                    if (delivery["root_session_ref"] == binding["root_session_ref"]
+                        and (delivery["work_ref"] == binding["task_ref"] or delivery["request_ref"] == binding["task_ref"])
+                        and (delivery["uploaded_readers"] or delivery["linked_locators"])):
+                        return "workspace_material_delivery_verified", (delivery["delivery_ref"],), None
+                except OwnerConflict:
+                    return None
             if facts.get("route") == "oa_only":
                 evidence_ref = "human_request_route:" + canonical_hash(
                     {

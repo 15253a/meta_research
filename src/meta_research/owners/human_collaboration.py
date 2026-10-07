@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+import subprocess
+import sys
+from pathlib import Path
 import math
 import threading
 import time
@@ -17,6 +22,7 @@ from meta_research.control_contract import (
     validate_control_payload,
 )
 from meta_research.database import Database
+from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload
 from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
@@ -239,9 +245,10 @@ class HumanCollaborationInterface(Protocol):
         self,
         request_ref: str,
         *,
-        decision: str,
-        facts: dict[str, object],
-        note: str,
+        decision: str | None = None,
+        facts: dict[str, object] | None = None,
+        note: str = "",
+        reply: ProvidedReply | OtherReply | None = None,
         idempotency_key: str,
     ) -> dict[str, object]: ...
 
@@ -958,6 +965,20 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         if row is None:
             raise OwnerConflict("human_response_receipt_invalid")
         return _public_human_response(row)
+
+    def verify_reply_delivery(self, *, request_ref: str, response_ref: str) -> dict[str, object]:
+        response = self.verify_human_response(request_ref=request_ref, response_ref=response_ref)
+        with self._database.read() as connection:
+            row = connection.execute(text("SELECT * FROM hc_reply_deliveries WHERE request_ref = :request "
+                "AND response_ref = :response AND state = 'ready'"),
+                {"request": request_ref, "response": response_ref}).first()
+        if row is None:
+            raise OwnerConflict("human_response_delivery_unverified")
+        receipt = decoded_object(row.receipt_json)
+        if (response.get("delivery") != receipt or receipt.get("manifest_hash") != row.manifest_hash
+            or receipt.get("human_request_ref") != request_ref or receipt.get("response_ref") != response_ref):
+            raise OwnerConflict("human_response_delivery_unverified")
+        return receipt
 
     def verify_guidance_snapshot(
         self,
@@ -1769,6 +1790,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         self._preview_refresh_attempts: dict[str, tuple[str, float]] = {}
         self._drafting_schedule_lock = threading.Lock()
         self._prefer_companion_drafting = True
+        self._root_workspaces = None
         self._upgrade_active_legacy_draft()
         self._recover_interrupted_drafting()
         self._recover_interrupted_control_commands()
@@ -3850,11 +3872,15 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         self,
         request_ref: str,
         *,
-        decision: str,
-        facts: dict[str, object],
-        note: str,
+        decision: str | None = None,
+        facts: dict[str, object] | None = None,
+        note: str = "",
+        reply: ProvidedReply | OtherReply | None = None,
         idempotency_key: str,
+        _delivery_row=None,
     ) -> dict[str, object]:
+        if reply is not None:
+            decision, facts, note = reply.decision, reply.facts, reply.note
         if decision not in HUMAN_RESPONSE_DECISIONS:
             raise OwnerConflict("human_response_decision_invalid")
         if not isinstance(facts, dict):
@@ -3863,7 +3889,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
             facts = cast(dict[str, object], json.loads(canonical_json(facts)))
         except (TypeError, ValueError) as error:
             raise OwnerConflict("human_response_facts_invalid") from error
-        if len(canonical_json(facts).encode("utf-8")) > 64 * 1024:
+        if len(canonical_json(facts).encode("utf-8")) > (4 * 1024 * 1024 if _delivery_row is not None else 64 * 1024):
             raise OwnerConflict("human_response_facts_too_large")
         if not isinstance(note, str) or len(note) > 4000:
             raise OwnerConflict("human_response_note_invalid")
@@ -3880,7 +3906,15 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
             "facts": facts,
             "note": note,
         }
+        if reply is not None:
+            if any(name in facts for name in ("workspace_delivery", "delivery_ref", "delivery_manifest_hash")):
+                raise OwnerConflict("human_response_reserved_facts")
+            delivered = self._respond_with_delivery(request_ref, reply, command, idempotency_key)
+            if delivered is not None:
+                return delivered
         command_hash = canonical_hash(command)
+        if _delivery_row is not None:
+            command_hash = _delivery_row.command_hash
         rejection_idempotency_hash = canonical_hash(
             {
                 "kind": "human_response_rejection",
@@ -3918,6 +3952,10 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         if not request["current"] or request["status"] != "open":
             raise OwnerConflict("human_request_not_current")
         with self._database.fenced_write() as connection:
+            pending = connection.execute(text("SELECT * FROM hc_reply_deliveries WHERE idempotency_key = :key"),
+                                         {"key": idempotency_key}).first()
+            if pending is not None and (_delivery_row is None or pending.state == "aborted"):
+                raise OwnerConflict("idempotency_conflict")
             rejected = connection.execute(
                 text(
                     "SELECT rejection_ref FROM "
@@ -3947,7 +3985,8 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     request_id=cast(str, request["request_id"]),
                     revision=cast(int, request["revision"]),
                 )
-                response_ref = new_ref("human_response")
+                response_ref = (new_ref("human_response") if _delivery_row is None
+                                else _delivery_row.response_ref)
                 receipt_ref = new_ref("hc_receipt")
                 now = time.time()
                 payload = {
@@ -4008,11 +4047,174 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                         "decision": decision,
                     },
                 )
+                if _delivery_row is not None:
+                    connection.execute(text("UPDATE hc_reply_deliveries SET state = 'ready', "
+                        "receipt_json = :receipt WHERE delivery_ref = :ref AND state = 'pending'"),
+                        {"receipt": canonical_json(facts["workspace_delivery"]), "ref": _delivery_row.delivery_ref})
         response = self._fact_verifier.verify_human_response(
             request_ref=request_ref, response_ref=response_ref
         )
         self._reconcile_issuing_owner_human_request(request_ref)
         return response
+
+    def bind_reply_workspaces(self, workspaces) -> None:
+        self._root_workspaces = workspaces
+
+    def _respond_with_delivery(self, request_ref, reply, command, idempotency_key):
+        from meta_research.semantic_mcp import SemanticMcpError
+        materials = reply.materials if isinstance(reply, ProvidedReply) else ()
+        normalized = []
+        names = set()
+        total = 0
+        for material in materials:
+            if isinstance(material, Upload):
+                from meta_research.root_workspace import _relative_parts
+                _relative_parts(material.relative_path)
+                if (len(material.relative_path) > 900 or material.relative_path in names
+                    or material.relative_path.split("/")[0] == "reply.json"
+                    or any(part.startswith(".delivery-") or part == ".delivery.json"
+                           for part in material.relative_path.split("/"))):
+                    raise OwnerConflict("human_response_upload_path_invalid")
+                names.add(material.relative_path)
+                total += len(material.content)
+                if sum(item["kind"] == "upload" for item in normalized) >= 99 or len(material.content) > 64 * 1024 * 1024 or total > 64 * 1024 * 1024:
+                    raise OwnerConflict("human_response_material_too_large")
+                normalized.append({"kind": "upload", "relative_path": material.relative_path,
+                    "media_type": material.media_type, "sha256": hashlib.sha256(material.content).hexdigest(),
+                    "content_base64": base64.b64encode(material.content).decode("ascii")})
+            else:
+                if (not Path(material.locator).is_absolute() or len(material.locator) > 16000
+                    or not material.description or len(material.description) > 4000
+                    or material.locator in names):
+                    raise OwnerConflict("human_response_linked_path_invalid")
+                names.add(material.locator)
+                normalized.append({"kind": "linked_local", "locator": material.locator,
+                                   "description": material.description})
+        command = {**command, "materials": normalized}
+        command_hash = canonical_hash(command)
+        with self._database.read() as connection:
+            row = connection.execute(text("SELECT * FROM hc_reply_deliveries WHERE idempotency_key = :key"),
+                                     {"key": idempotency_key}).first()
+            public = connection.execute(text("SELECT command_hash FROM hc_human_request_responses WHERE idempotency_key = :key"),
+                                        {"key": idempotency_key}).first()
+        if row is not None:
+            if row.command_hash != command_hash:
+                raise OwnerConflict("idempotency_conflict")
+            return self._complete_reply_delivery(row)
+        if public is not None:
+            if materials or public.command_hash != canonical_hash({key: value for key, value in command.items() if key != "materials"}):
+                raise OwnerConflict("idempotency_conflict")
+            return None
+        current = self._query_issuing_owner_request(request_ref)
+        if not current["current"] or current["status"] != "open":
+            raise OwnerConflict("human_request_not_current")
+        waiters = current.get("direct_waiters", [])
+        if self._root_workspaces is None or len(waiters) != 1:
+            if materials:
+                raise OwnerConflict("human_response_destination_unbound")
+            return None
+        try:
+            destination = self._root_workspaces.destination_for_human_request(
+                request_ref=request_ref, waiter_ref=waiters[0]["waiter_ref"])
+        except SemanticMcpError as error:
+            if materials:
+                raise OwnerConflict("human_response_destination_unbound") from error
+            return None
+        if materials and current.get("kind") not in {"library_reconnect", "external_material_api_access", "offline_action"}:
+            raise OwnerConflict("human_request_material_response_invalid")
+        linked = [{**item, **_probe_linked_reply(item["locator"])}
+                  for item in normalized if item["kind"] == "linked_local"]
+        delivery_ref = "human_reply:" + canonical_hash({"request_ref": request_ref, "idempotency_key": idempotency_key})
+        binding = {**destination.location.source(), "owner": destination.owner,
+                   "human_request_ref": request_ref, "waiter_ref": destination.waiter_ref}
+        manifest_hash = canonical_hash({"command_hash": command_hash, "destination": binding})
+        with self._database.fenced_write() as connection:
+            existing = connection.execute(text("SELECT * FROM hc_reply_deliveries WHERE idempotency_key = :key"),
+                                          {"key": idempotency_key}).first()
+            if existing is None:
+                if connection.execute(text("SELECT response_ref FROM hc_human_request_responses WHERE idempotency_key = :key"),
+                                      {"key": idempotency_key}).first() is not None:
+                    raise OwnerConflict("idempotency_conflict")
+                verify_human_request_response_target(connection, request_ref=request_ref,
+                    issuer=current["issuer"], request_id=current["request_id"], revision=current["revision"])
+                connection.execute(text("INSERT INTO hc_reply_deliveries (delivery_ref, response_ref, request_ref, "
+                    "idempotency_key, command_hash, command_json, destination_json, manifest_hash, state, created_at) "
+                    "VALUES (:ref, :response, :request, :key, :hash, :command, :destination, :manifest, 'pending', :now)"),
+                    {"ref": delivery_ref, "response": new_ref("human_response"), "request": request_ref,
+                     "key": idempotency_key, "hash": command_hash,
+                     "command": canonical_json({"reply": command, "linked_probes": linked}),
+                     "destination": canonical_json(binding), "manifest": manifest_hash, "now": time.time()})
+            elif existing.command_hash != command_hash:
+                raise OwnerConflict("idempotency_conflict")
+            row = connection.execute(text("SELECT * FROM hc_reply_deliveries WHERE delivery_ref = :ref"),
+                                     {"ref": delivery_ref}).one()
+        return self._complete_reply_delivery(row)
+
+    def _complete_reply_delivery(self, row):
+        from meta_research.semantic_mcp import SemanticMcpError
+        if row.state == "ready":
+            response = self._fact_verifier.verify_human_response(request_ref=row.request_ref, response_ref=row.response_ref)
+            self._reconcile_issuing_owner_human_request(row.request_ref)
+            return response
+        if row.state == "aborted":
+            raise OwnerConflict(row.failure_code or "human_response_delivery_aborted")
+        spool = decoded_object(row.command_json)
+        command = spool["reply"]
+        binding = decoded_object(row.destination_json)
+        if (canonical_hash(command) != row.command_hash
+            or canonical_hash({"command_hash": row.command_hash, "destination": binding}) != row.manifest_hash):
+            raise OwnerConflict("human_response_spool_invalid")
+        try:
+            destination = self._root_workspaces.destination_for_human_request(
+                request_ref=row.request_ref, waiter_ref=binding["waiter_ref"])
+            if {**destination.location.source(), "owner": destination.owner,
+                "human_request_ref": row.request_ref, "waiter_ref": destination.waiter_ref} != binding:
+                raise OwnerConflict("human_response_destination_changed")
+            linked = []
+            for saved in spool["linked_probes"]:
+                probe = _probe_linked_reply(saved["locator"])
+                if any(saved[name] != probe[name] for name in ("device", "inode", "observed_kind")):
+                    raise OwnerConflict("human_response_linked_path_changed")
+                linked.append({name: saved[name] for name in ("kind", "locator", "description", "observed_kind")})
+            envelope = {"schema_ref": "meta-research/human-reply-envelope/v1",
+                "human_request_ref": row.request_ref, "response_ref": row.response_ref,
+                "decision": command["decision"], "note": command["note"], "facts": command["facts"],
+                "linked_locators": linked, "uploads": [{key: item[key] for key in ("relative_path", "media_type", "sha256")}
+                    for item in command["materials"] if item["kind"] == "upload"]}
+            files = (("reply.json", canonical_json(envelope).encode("utf-8")), *(
+                (item["relative_path"], base64.b64decode(item["content_base64"], validate=True))
+                for item in command["materials"] if item["kind"] == "upload"))
+            published = self._root_workspaces.deliver(destination, delivery_ref=row.delivery_ref, files=files)
+            for saved in spool["linked_probes"]:
+                probe = _probe_linked_reply(saved["locator"])
+                if any(saved[name] != probe[name] for name in ("device", "inode", "observed_kind")):
+                    raise OwnerConflict("human_response_linked_path_changed")
+            readers = {item["path"].split("/", 2)[-1]: {"workspace_ref": published["workspace_ref"],
+                "path": item["path"], "expected_sha256": item["sha256"]} for item in published["files"]}
+            delivery = {"schema_ref": "meta-research/workspace-reply-receipt/v1",
+                "delivery_ref": row.delivery_ref, "manifest_hash": row.manifest_hash,
+                "human_request_ref": row.request_ref, "response_ref": row.response_ref,
+                **destination.location.source(), "reply_reader": readers["reply.json"],
+                "uploaded_readers": [readers[item["relative_path"]] for item in command["materials"] if item["kind"] == "upload"],
+                "linked_locators": linked}
+            return self.respond_to_human_request(row.request_ref, decision=command["decision"],
+                facts={**command["facts"], "delivery_ref": row.delivery_ref,
+                       "delivery_manifest_hash": row.manifest_hash, "workspace_delivery": delivery},
+                note=command["note"], idempotency_key=row.idempotency_key, _delivery_row=row)
+        except (SemanticMcpError, OwnerConflict) as error:
+            with self._database.fenced_write() as connection:
+                connection.execute(text("UPDATE hc_reply_deliveries SET state = 'aborted', failure_code = :code "
+                    "WHERE delivery_ref = :ref AND state = 'pending'"), {"ref": row.delivery_ref, "code": error.code})
+            raise OwnerConflict(error.code) from error
+
+    def recover_response_deliveries(self) -> None:
+        with self._database.read() as connection:
+            rows = connection.execute(text("SELECT * FROM hc_reply_deliveries WHERE state = 'pending' ORDER BY created_at")).all()
+        for row in rows:
+            try:
+                self._complete_reply_delivery(row)
+            except OwnerConflict:
+                continue
 
     def _query_issuing_owner_request(self, request_ref: str) -> dict[str, object]:
         for owner in (
@@ -10418,6 +10620,40 @@ def _confirmation_receipt_hash(request: dict[str, object]) -> str:
     )
 
 
+def _probe_linked_reply(locator: str) -> dict[str, object]:
+    script = """
+import json, os, stat, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+fd = os.open(p.anchor, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for part in p.parts[1:]:
+        next_fd = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        os.close(fd)
+        fd = next_fd
+    value = os.fstat(fd)
+    if stat.S_ISDIR(value.st_mode):
+        with os.scandir(fd) as entries:
+            next(entries, None)
+        kind = 'directory'
+    elif stat.S_ISREG(value.st_mode):
+        os.read(fd, 1)
+        kind = 'file'
+    else:
+        raise ValueError('unsupported linked original')
+    print(json.dumps({'observed_kind': kind, 'device': value.st_dev, 'inode': value.st_ino}))
+finally:
+    os.close(fd)
+"""
+    try:
+        result = subprocess.run([sys.executable, "-c", script, locator], capture_output=True, timeout=3, check=True)
+        return json.loads(result.stdout)
+    except subprocess.TimeoutExpired as error:
+        raise OwnerConflict("human_response_linked_probe_timeout") from error
+    except (subprocess.CalledProcessError, OSError, ValueError) as error:
+        raise OwnerConflict("human_response_linked_path_unreadable") from error
+
+
 def _public_human_response(row) -> dict[str, object]:
     try:
         facts = decoded_object(row.facts_json)
@@ -10456,6 +10692,7 @@ def _public_human_response(row) -> dict[str, object]:
             payload_hash=row.receipt_hash,
         ).as_public_dict(),
         "created_at": float(row.created_at),
+        **({"delivery": facts["workspace_delivery"]} if "workspace_delivery" in facts else {}),
     }
 
 

@@ -291,6 +291,7 @@ class RootWorkspaces:
         if (location.root_session_ref != caller.get("root_session_ref")
             or original_task_ref != caller.get("task_ref")):
             raise SemanticMcpError("workspace_destination_unbound")
+        self._ensure_directory(location.directory)
         return WorkspaceDestination(location, request["issuer"], request_ref, waiter_ref)
 
     def _visible(self, context: SemanticCallContext) -> tuple[WorkspaceLocation, ...]:

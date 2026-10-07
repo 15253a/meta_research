@@ -473,48 +473,53 @@ class CompanionMessageRequest(BaseModel):
     ) = None
 
 
-class HumanRequestLinkedLocalMaterialRequest(BaseModel):
+class HumanReplyUploadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    kind: Literal["upload"]
+    relative_path: str = Field(min_length=1, max_length=1024)
+    media_type: str = Field(default="application/octet-stream", max_length=256)
+    content_base64: str = Field(max_length=89_478_488)
 
-    source_locator: str = Field(min_length=1, max_length=16_000)
 
-    def as_owner_request(
-        self,
-        *,
-        request_ref: str,
-        evidence_kind: Literal["external_approval", "offline_result"],
-        asynchronous: bool,
-    ) -> AssetIntakeRequest:
-        request = AssetIntakeRequest(
-            source_kind="local_path",
-            custody_mode="linked_local",
-            display_name=Path(self.source_locator).name or self.source_locator,
-            media_type="application/octet-stream",
-            source_locator=self.source_locator,
-            provenance={
-                "submitted_via": "human_request_response",
-                "human_request_ref": request_ref,
-                "evidence_kind": evidence_kind,
-            },
-            asynchronous=asynchronous,
-        )
-        try:
-            request.validate()
-        except OwnerConflict as error:
-            raise HTTPException(
-                status_code=422,
-                detail={"code": error.code},
-            ) from error
-        return request
+class HumanReplyLinkedRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["linked_local"]
+    locator: str = Field(min_length=1, max_length=16_000)
+    description: str = Field(min_length=1, max_length=4000)
 
 
 class HumanRequestResponseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
     decision: Literal["provided", "declined", "deferred"]
     facts: dict[str, object] = Field(default_factory=dict)
     note: str = Field(default="", max_length=4000)
-    linked_local_material: HumanRequestLinkedLocalMaterialRequest | None = None
+    materials: list[HumanReplyUploadRequest | HumanReplyLinkedRequest] = Field(default_factory=list, max_length=100)
+
+    def as_reply(self):
+        from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload
+        from meta_research.root_workspace import _relative_parts
+        from meta_research.semantic_mcp import SemanticMcpError
+        if self.decision != "provided":
+            if self.materials:
+                raise OwnerConflict("human_request_material_response_invalid")
+            return OtherReply(self.decision, self.note, self.facts)
+        if any(name in self.facts for name in ("workspace_delivery", "delivery_ref", "delivery_manifest_hash")):
+            raise OwnerConflict("human_response_reserved_facts")
+        total_encoded = sum(len(item.content_base64) for item in self.materials if isinstance(item, HumanReplyUploadRequest))
+        if total_encoded > 89_478_488:
+            raise OwnerConflict("human_response_material_too_large")
+        materials = []
+        for item in self.materials:
+            if isinstance(item, HumanReplyLinkedRequest):
+                materials.append(LinkedLocal(item.locator, item.description))
+            else:
+                try:
+                    _relative_parts(item.relative_path)
+                    content = base64.b64decode(item.content_base64, validate=True)
+                except (ValueError, binascii.Error, SemanticMcpError) as error:
+                    raise OwnerConflict("human_response_upload_invalid") from error
+                materials.append(Upload(item.relative_path, item.media_type, content))
+        return ProvidedReply(self.note, self.facts, tuple(materials))
 
 
 class AgentProposalRequest(BaseModel):
@@ -1027,7 +1032,8 @@ def create_app(
             if json_auth_route or unsafe_api_route or mcp_route:
                 request_body_limit = (
                     MAX_ASSET_INTAKE_REQUEST_BODY_BYTES
-                    if is_asset_intake
+                    if is_asset_intake or (request.method == "POST"
+                        and path.startswith("/api/v1/human-requests/") and path.endswith("/responses"))
                     else (
                         MAX_MCP_REQUEST_BODY_BYTES
                         if mcp_route
@@ -1432,185 +1438,11 @@ def create_app(
         request: Request,
         response: HumanRequestResponseRequest,
     ) -> dict[str, object]:
-        idempotency_key = _idempotency_key(request)
-        material = response.linked_local_material
-        if material is None:
-            return runtime.owners.human_collaboration.respond_to_human_request(
-                request_ref,
-                decision=response.decision,
-                facts=response.facts,
-                note=response.note,
-                idempotency_key=idempotency_key,
-            )
-
-        current = runtime.owners.human_collaboration.query_human_request(request_ref)
-        expected_material = {
-            "external_material_api_access": ("material", "external_approval"),
-            "offline_action": ("result", "offline_result"),
-        }.get(None if current is None else current.get("kind"))
-        if current is None or response.decision != "provided" or expected_material is None:
-            raise OwnerConflict("human_request_material_response_invalid")
-        fact_prefix, evidence_kind = expected_material
-
-        sync_request = material.as_owner_request(
-            request_ref=request_ref,
-            evidence_kind=evidence_kind,
-            asynchronous=False,
-        )
-        intake_key = "human-request-linked:" + canonical_hash(
-            {
-                "request_ref": request_ref,
-                "response_idempotency_key": idempotency_key,
-                "source_locator": material.source_locator,
-                "fact_prefix": fact_prefix,
-            }
-        )
-        facts = {
-            **response.facts,
-            f"{fact_prefix}_path": material.source_locator,
-        }
-        if current.get("status") != "open":
-            responses = current.get("responses")
-            if (
-                not isinstance(responses, list)
-                or not responses
-                or not isinstance(responses[-1], dict)
-                or not isinstance(responses[-1].get("facts"), dict)
-            ):
-                raise OwnerConflict("human_request_material_response_invalid")
-            recorded_facts = responses[-1]["facts"]
-            binding_names = tuple(
-                f"{fact_prefix}_{suffix}"
-                for suffix in (
-                    "source_ref",
-                    "version_ref",
-                    "content_hash",
-                    "manifest_hash",
-                    "acceptance_receipt_ref",
-                )
-            )
-            for name in binding_names:
-                if name in recorded_facts:
-                    facts[name] = recorded_facts[name]
-            recorded = runtime.owners.human_collaboration.respond_to_human_request(
-                request_ref,
-                decision=response.decision,
-                facts=facts,
-                note=response.note,
-                idempotency_key=idempotency_key,
-            )
-            replay_request = (
-                sync_request
-                if all(name in recorded_facts for name in binding_names)
-                else material.as_owner_request(
-                    request_ref=request_ref,
-                    evidence_kind=evidence_kind,
-                    asynchronous=True,
-                )
-            )
-            intake = runtime.owners.research_memory.query_asset_intake_by_idempotency_key(
-                intake_key,
-                replay_request,
-            )
-            if intake is None and replay_request.asynchronous:
-                try:
-                    intake = runtime.owners.research_memory.submit_asset_intake(
-                        replay_request,
-                        idempotency_key=intake_key,
-                    )
-                except Exception:
-                    # The HumanResponse replay already succeeded. A later replay
-                    # may retry this existing queue seam without gating it.
-                    pass
-            return {
-                **recorded,
-                "asset_intake": (
-                    {
-                        "job_ref": None,
-                        "status": "not_queued",
-                        "failure": {"code": "asset_intake_not_queued"},
-                    }
-                    if intake is None
-                    else intake.as_public_dict()
-                ),
-            }
-        try:
-            intake_mode = await _await_bounded_asset_io(
-                lambda: runtime.owners.research_memory.linked_local_intake_mode(
-                    material.source_locator
-                ),
-                slots=asset_io_slots,
-                timeout_code="asset_intake_classification_timeout",
-            )
-        except HTTPException:
-            # A stalled mount is precisely the uncertain case: preserve the
-            # human response first and let the existing durable worker inspect it.
-            intake_mode = "asynchronous"
-        if intake_mode == "synchronous":
-            intake = await _await_bounded_asset_io(
-                lambda: runtime.owners.research_memory.submit_asset_intake(
-                    sync_request,
-                    idempotency_key=intake_key,
-                ),
-                slots=asset_io_slots,
-                timeout_code="asset_intake_operation_timeout",
-            )
-            if intake.status != "accepted" or intake.asset is None:
-                raise OwnerConflict(
-                    intake.failure_code or "asset_intake_not_terminal"
-                )
-            asset = intake.asset
-            facts.update(
-                {
-                    f"{fact_prefix}_source_ref": asset.memory_ref,
-                    f"{fact_prefix}_version_ref": asset.version_ref,
-                    f"{fact_prefix}_content_hash": asset.content_hash,
-                    f"{fact_prefix}_manifest_hash": asset.manifest_hash,
-                    f"{fact_prefix}_acceptance_receipt_ref": (
-                        asset.receipt.receipt_ref
-                    ),
-                }
-            )
-            recorded = runtime.owners.human_collaboration.respond_to_human_request(
-                request_ref,
-                decision=response.decision,
-                facts=facts,
-                note=response.note,
-                idempotency_key=idempotency_key,
-            )
-            return {**recorded, "asset_intake": intake.as_public_dict()}
-
-        recorded = runtime.owners.human_collaboration.respond_to_human_request(
-            request_ref,
-            decision=response.decision,
-            facts=facts,
-            note=response.note,
-            idempotency_key=idempotency_key,
-        )
-        async_request = material.as_owner_request(
-            request_ref=request_ref,
-            evidence_kind=evidence_kind,
-            asynchronous=True,
-        )
-        try:
-            intake = runtime.owners.research_memory.submit_asset_intake(
-                async_request,
-                idempotency_key=intake_key,
-            )
-            intake_public = intake.as_public_dict()
-        except Exception as error:
-            intake_public = {
-                "job_ref": None,
-                "status": "not_queued",
-                "failure": {
-                    "code": (
-                        error.code
-                        if isinstance(error, OwnerConflict)
-                        else "asset_intake_enqueue_unavailable"
-                    )
-                },
-            }
-        return {**recorded, "asset_intake": intake_public}
+        reply = response.as_reply()
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.respond_to_human_request(
+                request_ref, reply=reply, idempotency_key=_idempotency_key(request)),
+            slots=asset_io_slots, timeout_code="human_response_delivery_timeout")
 
     @app.post("/api/v1/human-requests/{request_ref}/retry")
     def retry_human_request_operation(

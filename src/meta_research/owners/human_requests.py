@@ -75,6 +75,10 @@ class HumanResponseVerifier(Protocol):
         self, *, request_ref: str, response_ref: str
     ) -> dict[str, object]: ...
 
+    def verify_reply_delivery(
+        self, *, request_ref: str, response_ref: str
+    ) -> dict[str, object]: ...
+
     def verify_capability_authorization(
         self,
         *,
