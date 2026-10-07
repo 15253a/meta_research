@@ -151,6 +151,7 @@ def test_unmeasured_result_survives_owner_commit_and_bundle_projection(tmp_path,
         result_path = workspace / "outputs/metrics.json"
         value = json.loads(result_path.read_text())
         value["metrics"]["metric:effect"] = None
+        value["formal_runs"][0]["evaluations"][0]["metrics"] = value["metrics"]
         value["result_disposition"] = "denied"
         original = (json.dumps(value, indent=2) + "\n").encode()
         result_path.write_bytes(original)

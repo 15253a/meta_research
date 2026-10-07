@@ -6,7 +6,6 @@ The root and execution-port adapters share the same native entity tables.
 from __future__ import annotations
 
 import json
-import re
 from contextvars import ContextVar
 from sqlalchemy import text
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
@@ -429,25 +428,43 @@ def verify_report_only_assessments(document, entries):
     _verify_declared_subject_artifact_bindings(work, entries)
     new_attempts = [attempt for _, attempt in work
                     if attempt is not None and not attempt.get('evaluation_attempt_ref')]
-    claimed = {path for run, attempt in work for producer in (run, attempt)
-               if producer is not None for path in producer.get('artifact_paths') or []}
     for attempt in new_attempts:
         if attempt.get('status', 'executed') != 'executed' or attempt.get('metrics') != {}:
             continue
         paths = attempt.get('artifact_paths')
-        if paths is None:
-            paths = [entry['declared_relative_path'] for entry in entries
-                     if len(new_attempts) == 1
-                     and _conventional_artifact_subject(entry) == 'evaluation_attempt'
-                     and entry['declared_relative_path'] not in claimed]
-        _require_assessment_report(entries, paths)
+        _require_assessment_report(entries, paths or [])
 
 
 def _require_assessment_report(entries, paths):
     reports = _selected_subject_artifacts(entries, paths)
-    if not any(entry['role'] == 'analysis' and entry['byte_count'] > 0
-               and not entry.get('research_note') for entry in reports):
-        raise OwnerConflict('target_formal_evaluation_report_required')
+    for entry in reports:
+        if entry['role'] != 'analysis' or _is_target_note(entry):
+            continue
+        byte_count = entry['byte_count']
+        metadata = entry.get('research_note')
+        if (entry.get('artifact_kind') == 'directory'
+                and entry.get('declared_relative_path') == 'outputs/analysis'
+                and isinstance(metadata, dict) and 'other_content_bytes' in metadata):
+            byte_count = metadata['other_content_bytes']
+        if type(byte_count) is int and byte_count > 0:
+            return
+    raise OwnerConflict('target_formal_evaluation_report_required')
+
+
+def _is_target_note(entry):
+    """Only a canonical note file or a proven note-only snapshot is Target content."""
+    from meta_research.research_notes import FINAL_STATEMENT_PATH
+
+    metadata = entry.get('research_note')
+    if entry.get('role') != 'analysis' or not isinstance(metadata, dict) or not metadata:
+        return False
+    if entry.get('artifact_kind') == 'file':
+        return entry.get('declared_relative_path') in {
+                'outputs/analysis/research-note.md', FINAL_STATEMENT_PATH,
+            }
+    return (entry.get('artifact_kind') == 'directory'
+            and entry.get('declared_relative_path') == 'outputs/analysis'
+            and metadata.get('note_only') is True)
 
 
 def primary_reused_references(result_document):
@@ -512,19 +529,17 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
     checkpoint_entries = [entry for entry in entries if entry['role'] == 'checkpoint']
     run_checkpoint_cache = {}
     run_artifact_cache = set()
-    # Default artifact attribution is an acceptance-time decision frozen by
-    # the immutable completion document. A replay's reuse flags (a later
-    # Target reusing completed subjects) remove runs from the set of actual
-    # producers; recomputing defaults over flagged items would shift
-    # conventional outputs onto the remaining runs and expect roles the
-    # original acceptance never wrote. Attribution always derives from the
-    # document's own view of its runs.
+    # The immutable completion document names new production selections.
+    # Historical replays use authenticated recorded productions, including
+    # earlier accepted default selections and later attribution corrections.
     documented_items = items if work_items is None else root_work_items(
         payload=payload, identities=identities, result_document=result)
     checkpoint_defaults = _default_checkpoint_paths(
         {item['variant_run_ref']: item.get('checkpoint_paths') for item in documented_items
-         if not item['reuse_variant_run']}, checkpoint_entries)
-    artifact_defaults = _default_subject_artifacts(documented_items, entries)
+         if not item['reuse_variant_run']}, checkpoint_entries,
+        require_explicit=not verify_only)
+    artifact_defaults = (_recorded_subject_artifacts(connection, documented_items, entries)
+                         if verify_only else {})
     verified_artifact_rows = {}
 
     def ensure(table, key, values, writer=None):
@@ -981,13 +996,13 @@ def _existing_checkpoint_records(connection, run_ref, frozen_refs=None):
     return records
 
 
-def _default_checkpoint_paths(new_runs, entries):
-    """Only a unique producer defaults to all retained states.
+def _default_checkpoint_paths(new_runs, entries, *, require_explicit=False):
+    """New work declares production; historical replay can verify old defaults.
 
     Multiple producers declare actual ownership; once every retained state is
     assigned, an omitted selection means no checkpoints for that Run.
     """
-    if len(new_runs) <= 1:
+    if len(new_runs) <= 1 and not require_explicit:
         return None
     assigned = {path for paths in new_runs.values() for path in paths or []}
     if any(entry['declared_relative_path'] not in assigned for entry in entries):
@@ -1023,53 +1038,36 @@ def _register_run_checkpoints(connection, *, ensure, item, entries, accepted_at,
     return records
 
 
-def _conventional_artifact_subject(entry):
-    """Only documented dedicated paths imply execution or assessment ownership."""
-    if entry.get('research_note'):
-        return None
-    path = entry['declared_relative_path']
-    if entry['role'] == 'data' and (path == 'outputs/data' or path.startswith('outputs/data/')):
-        return 'variant_run'
-    if entry['role'] == 'log' and path.startswith('logs/'):
-        name = path.removeprefix('logs/').split('/')[0]
-        if name in {'execution', 'training'} or re.fullmatch(r'train(?:[-.].+)', name):
-            return 'variant_run'
-        if name == 'evaluation' or re.fullmatch(r'eval(?:[-.].+)', name):
-            return 'evaluation_attempt'
-    if entry['role'] == 'analysis' and path.startswith('outputs/analysis/'):
-        name = path.removeprefix('outputs/analysis/').split('/')[0]
-        if name in {'raw', 'observations', 'data', 'execution'}:
-            return 'variant_run'
-        if name in {'evaluation', 'assessment', 'evaluation-report.md'}:
-            return 'evaluation_attempt'
-    return None
-
-
-def _default_subject_artifacts(items, entries):
-    """Default conventional outputs only when there is a unique actual producer.
-
-    Explicit assignments take precedence. Multiple actual producers must name
-    their products; unrelated Target notes and ambiguous directories stay RM
-    handoff content and are never guessed to be execution/assessment products.
-    """
-    subjects = {}
-    for item in items:
-        for kind, key, reuse, paths_key in (
-            ('variant_run', 'variant_run_ref', 'reuse_variant_run', 'artifact_paths'),
-            ('evaluation_attempt', 'evaluation_attempt_ref', 'reuse_evaluation_attempt', 'evaluation_artifact_paths'),
-        ):
-            if item[key] is not None and not item[reuse]:
-                subjects[(kind, item[key])] = item.get(paths_key)
-    claimed = {path for paths in subjects.values() if paths is not None for path in paths}
+def _recorded_subject_artifacts(connection, items, entries):
+    """Read accepted production selections when replaying historical work."""
+    by_version = {entry['binding']['version_ref']: entry['declared_relative_path']
+                  for entry in entries if entry['role'] in {'log', 'analysis', 'data'}}
+    if not by_version:
+        return {}
+    subjects = {(kind, item[key]) for item in items
+                for kind, key in (('variant_run', 'variant_run_ref'),
+                                  ('evaluation_attempt', 'evaluation_attempt_ref'))
+                if item[key] is not None}
+    parameters = {f'version_{index}': version for index, version in enumerate(by_version)}
+    placeholders = ','.join(':' + key for key in parameters)
+    rows = connection.execute(text(
+        'SELECT r.*, (SELECT a.from_subject_kind FROM rg_experiment_asset_role_adjustments a '
+        'WHERE a.role_ref=r.role_ref ORDER BY a.accepted_at,a.rowid LIMIT 1) AS _adjusted_from_kind, '
+        '(SELECT a.from_subject_ref FROM rg_experiment_asset_role_adjustments a '
+        'WHERE a.role_ref=r.role_ref ORDER BY a.accepted_at,a.rowid LIMIT 1) AS _adjusted_from_ref '
+        'FROM rg_experiment_asset_roles r WHERE r.version_ref IN (' + placeholders + ') '
+        "AND r.role IN ('log_asset','analysis_asset','data_asset') "
+        'ORDER BY r.role,r.ordinal,r.accepted_at,r.role_ref'), parameters).all()
     defaults = {}
-    for entry in entries:
-        kind = _conventional_artifact_subject(entry)
-        path = entry['declared_relative_path']
-        if kind is None or path in claimed:
-            continue
-        possible = [subject for subject in subjects if subject[0] == kind]
-        if len(possible) == 1 and subjects[possible[0]] is None:
-            defaults.setdefault(possible[0], []).append(path)
+    for row in rows:
+        try:
+            _accepted_asset_role_for_replay(connection, row)
+        except OwnerConflict as error:
+            raise OwnerConflict('target_formal_entity_integrity_invalid') from error
+        subject = (row._adjusted_from_kind or row.subject_kind,
+                   row._adjusted_from_ref or row.subject_ref)
+        if subject in subjects:
+            defaults.setdefault(subject, []).append(by_version[row.version_ref])
     return defaults
 
 
@@ -1310,7 +1308,7 @@ def _verify_declared_subject_artifact_bindings(work, entries):
                    'unchanged and finish another normal root turn; the host will freeze the new '
                    'completion at those exact file or directory boundaries. '
                    if related else
-                   'Check that each path exists under logs/, outputs/analysis/ or outputs/data/ '
+                   'Check that each path exists as a retained log, analysis or data asset '
                    'and belongs to this actual producer. Correct missing, mistyped or wrong-role '
                    'declarations, then finish another normal root turn. ')
                 + 'Preserve existing results; do not rerun the research or broaden a selected '
@@ -1319,12 +1317,12 @@ def _verify_declared_subject_artifact_bindings(work, entries):
             raise error
 
 
-def _verify_new_checkpoint_selections(items, entries):
+def _verify_new_checkpoint_selections(items, entries, *, require_explicit=False):
     """Return new-work path mistakes through the existing revision boundary."""
     checkpoints = [entry for entry in entries if entry['role'] == 'checkpoint']
     new_runs = {item['variant_run_ref']: item.get('checkpoint_paths')
                 for item in items if not item['reuse_variant_run']}
-    defaults = _default_checkpoint_paths(new_runs, checkpoints)
+    defaults = _default_checkpoint_paths(new_runs, checkpoints, require_explicit=require_explicit)
 
     def select(records, paths, kind, run_key):
         try:
@@ -1340,8 +1338,8 @@ def _verify_new_checkpoint_selections(items, entries):
             error.feedback = (
                 kind + ' checkpoint_paths are not bound to this Run\'s exact retained checkpoint assets '
                 + '(run_key=' + repr(run_key) + '): ' + canonical_json(examples) + '. '
-                'New checkpoint files must be retained under outputs/checkpoints/ with role checkpoint; '
-                'files under outputs/data/ remain data assets. Evaluation checkpoint_paths must select '
+                'New checkpoint files must be retained with role checkpoint in the completion; '
+                'a data role alone does not declare a checkpoint. Evaluation checkpoint_paths must select '
                 'a subset of its own Run checkpoints. Correct the file organization and exact handoff '
                 'paths while preserving the trained bytes, metrics and existing results; do not rerun '
                 'training. Any retained data copy still needs its actual Run or Evaluation artifact_paths '
@@ -1362,7 +1360,7 @@ def _verify_new_checkpoint_selections(items, entries):
 
 
 def verify_retained_products(document, entries):
-    """Every retained scientific product has an explicit or unique producer."""
+    """Every new retained scientific product has an explicitly declared producer."""
     if explicit_unexecuted_root_evidence(document) is not None:
         return
     work = _declared_work(document)
@@ -1371,28 +1369,26 @@ def verify_retained_products(document, entries):
         'evaluation_attempt_ref': 'assessment', 'metric_result_ref': 'result'},
         identities={'variant_ref': 'inventory', 'evaluation_ref': 'inventory'}, result_document=document)
     _verify_declared_subject_artifact_bindings(work, entries)
-    defaults = _default_subject_artifacts(items, entries)
-    assigned = {path for paths in defaults.values() for path in paths}
-    new_runs = {item['variant_run_ref'] for item in items if not item['reuse_variant_run']}
+    assigned = set()
     for item in items:
         if not item['reuse_variant_run']:
             assigned.update(item.get('artifact_paths') or [])
-            if item.get('checkpoint_paths') is None and len(new_runs) == 1:
-                assigned.update(entry['declared_relative_path'] for entry in entries if entry['role'] == 'checkpoint')
-            else:
-                assigned.update(item.get('checkpoint_paths') or [])
+            assigned.update(item.get('checkpoint_paths') or [])
         if item['evaluation_attempt_ref'] is not None and not item['reuse_evaluation_attempt']:
             assigned.update(item.get('evaluation_artifact_paths') or [])
     missing = [entry['declared_relative_path'] for entry in entries
-               if entry['role'] in {'analysis', 'data', 'checkpoint'} and not entry.get('research_note')
+               if entry['role'] in {'analysis', 'data', 'checkpoint'} and not _is_target_note(entry)
                and entry['declared_relative_path'] not in assigned]
     if missing:
         error = OwnerConflict('target_root_commit_domain_invalid')
         error.feedback = ('Retained research products need their actual Run or Evaluation owner: '
             + canonical_json(missing) + '. Assign these exact frozen paths with artifact_paths or '
-            'checkpoint_paths in formal_runs. Preserve the existing work; correct its handoff attribution.')
+            'checkpoint_paths in formal_runs. A selected directory containing a Target note still '
+            'needs attribution for its other contents. A canonical note file or a verified '
+            'note-only directory can remain Target content; do not invent an '
+            'execution. Preserve the existing work; correct its handoff attribution.')
         raise error
-    _verify_new_checkpoint_selections(items, entries)
+    _verify_new_checkpoint_selections(items, entries, require_explicit=True)
     implementation = [entry['declared_relative_path'] for entry in entries
                       if entry['role'] == 'implementation']
     for item in items:

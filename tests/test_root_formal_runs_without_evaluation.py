@@ -119,7 +119,10 @@ def test_target_with_only_blocked_evaluation_commits_work_without_formal_result(
     try:
         path = workspace / 'outputs/metrics.json'
         document = json.loads(path.read_text())
-        document['formal_runs'] = [{'run_key': 'executed', 'evaluations': [{'status': 'blocked'}]}]
+        document['formal_runs'] = [{'run_key': 'executed',
+            'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+                                 if artifact.role == 'checkpoint'],
+            'artifact_paths': ['logs/train.log'], 'evaluations': [{'status': 'blocked'}]}]
         document['metrics'] = {}
         path.write_text(canonical_json(document))
         accepted, manifest = _accept(runtime, lifecycle, memory, handle, evidence)

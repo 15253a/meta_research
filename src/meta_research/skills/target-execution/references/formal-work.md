@@ -12,10 +12,13 @@
     {
       "run_key": "cohort-a-audit",
       "status": "executed",
+      "artifact_paths": [],
+      "checkpoint_paths": [],
       "evaluations": [
         {
           "attempt_key": "initial-assessment",
           "status": "executed",
+          "artifact_paths": [],
           "metrics": {"declared_metric_key": 8}
         }
       ]
@@ -28,9 +31,25 @@
 
 状态为 `executed | failed | blocked | cancelled | not_executed`。`failed` 仅用于已实施且失败的工作，保留日志和产物；失败 EvaluationAttempt 不产生 MetricResult，可省略 `metrics`、用 `{}` 或保留部分观察但不称其为完成测量。其余未实施状态按事实填写。已执行 Run 可以没有评价或带被阻塞的评价，不补造结果。
 
-单一生产者可使用默认归属：实施日志为 `logs/train.log`、`logs/train-*.log`、`logs/execution/` 或 `logs/training/`；数据为 `outputs/data/`，原始观察也可用 `outputs/analysis/raw/`、`observations/`、`data/`、`execution/`；评价日志为 `logs/eval.log`、`logs/eval-*.log` 或 `logs/evaluation/`，报告为 `outputs/analysis/evaluation/`、`assessment/`、`evaluation-report.md`。路径必须与实际用途一致。研究说明和最终发言保留 Target 级含义，技术日志可作为 Target 诊断材料。
+显式设置每个真实生产者的 `artifact_paths` 为实际产生的精确文件或目录，没有则为 `[]`；Run 的保留状态用 `checkpoint_paths`。即使只有一个生产者也声明实际归属。目录和字节相同都不证明生产事实。诊断日志可以留在 Target 交接，不据其名称补造实施或评价。
 
-存在多个实际生产者或采用其他路径时，显式设置每个生产者的 `artifact_paths` 为工作区中实际存在的精确文件或目录，没有则为 `[]`。新产物使用 `logs/`、`outputs/analysis/` 或 `outputs/data/` 内的规范相对路径。宿主按声明边界冻结资产：选择 `logs` 就保留整个目录，选择深层报告文件就保留该文件，并保留相邻的其他产物；相同精确路径可由不同生产者引用。默认归属只适用于该类唯一生产者。按生产者或研究状态组织目录，大文件同样声明真实归属并流式保存。
+Target 整体说明按 `role=analysis` 单独保留规范文件 `outputs/analysis/research-note.md`；最终发言由宿主单独保存，二者保持 Target 级含义。目录中的研究说明摘录服务于后继阅读，归属核对仍针对所选的整份内容：若同时保留说明与具体科研报告的目录，为该目录声明真实实施／评价归属，或将说明文件和各项科研产物分别选入交接。只有整体说明时选择规范说明文件；为保存说明补造 Run 会歪曲真实工作。
+
+常规保存位置仍为 `logs/`、`outputs/analysis/`、`outputs/data/` 和 `outputs/checkpoints/`。需要采用其他工作区路径，或让内容承担与其目录不同的角色时，在结果中添加 `retained_artifacts`：
+
+```json
+{
+  "retained_artifacts": [
+    {"relative_path": "materials/cohort", "role": "data"},
+    {"relative_path": "fieldnotes/observation.md", "role": "analysis"},
+    {"relative_path": "outputs/data/saved-state.bin", "role": "checkpoint"}
+  ]
+}
+```
+
+每项只含 `relative_path` 与 `role`，最多 100 项；role 为 `log | analysis | data | checkpoint`。路径是当前可写工作区内实际存在的规范相对文件或目录，避开冻结 `inputs/`、宿主 `handoff/`、`implementation/` 与结果文档；实现仍用 `implementation_paths`。一组不连续路径就是集合选择，沿每项已有内容保存，不新造集合身份。相同精确路径只声明一次；此字段选择内容及用途，生产者另由实际 Run／评价的选择器声明。显式 role 优先于常规目录角色。
+
+宿主按声明边界冻结资产：选择目录就保留整个目录，选择深层文件就保留该文件，并保留常规目录内相邻的其他产物；相同精确路径可由不同真实工作引用。独立工作产生相同字节时分别声明实际工作，底层内容可以共享；采用既有原件增加用途时复用精确引用，不声明为本次重新产生。外部历史成果沿真实外部来源和既有输入接纳，不冒充当前 Run 的新产出。按研究需要组织目录，大文件同样声明真实归属并流式保存。
 
 若收尾反馈称声明路径未绑定，先核实路径存在、内容范围和实际生产者。若只是旧清单曾拆分或合并该目录，保持正确的声明，在同一 Session 正常结束下一轮，由宿主按精确边界重新交接；旧清单保持不变。拼写、路径或归属确有错误时修正声明，保留已有研究成果，无需重跑实验。
 
@@ -49,11 +68,11 @@ Run 可选字段包括 `variant_ref`、`baseline_forward_contract`、`variant_re
 
 修订实现前保留每个实际 Run 使用的快照。多版本可放在 `implementation/run-a/`、`implementation/run-b/`，各 Run 用 `implementation_paths` 精确选择；多个 Run 可选择同一快照。只有一份普通 `implementation/` 时可省略选择器，多条目时逐 Run 明确指定。系统派生实现版本，显式 `implementation_revision_ref` 仅断言该精确值。记录真实命令和观察输出，hash 本身不证明实施。
 
-按研究需要保留状态；`checkpoint_policy` 不要求数量，也不把产物存在作为门槛。需按 checkpoint 交接的新状态，按 `completion_binding.optional_workspace_paths.checkpoint` 保存在 `outputs/checkpoints/`，`checkpoint_paths` 引用其中实际文件或目录的精确工作区相对路径。宿主按保存目录区分角色；`outputs/data/` 内的文件按 data 交接，单独将其列入 `checkpoint_paths` 不会改变角色。
+按研究需要保留状态；`checkpoint_policy` 不要求数量，也不把产物存在作为门槛。checkpoint 通常保存在 `outputs/checkpoints/`；其他位置用 `retained_artifacts` 明确 `role=checkpoint`。`checkpoint_paths` 声明该 Run 实际产生的精确状态路径，单独列路径不会改变保留角色。
 
-多个新 Run 共同交接时，产出状态的 Run 用 `checkpoint_paths` 声明精确归属；全部保留状态已有归属后，无状态的 Run 可省略该字段，也可写 `[]`。仅一个新 Run 时，省略该字段默认采用本次全部保留状态。混合目录不能说明跨 Run 归属。评价可用 `checkpoint_paths` 选择实际评价的子集，否则使用该 Run 的保留状态。需要独立评价的状态应独立可寻址；未保留重要中间状态时说明局限。
+每个新 Run 用 `checkpoint_paths` 声明状态归属，无状态写 `[]`。混合目录不能说明跨 Run 归属。评价可用 `checkpoint_paths` 选择实际评价的子集，否则使用该 Run 的保留状态。需要独立评价的状态应独立可寻址；未保留重要中间状态时说明局限。
 
-因状态保存目录或选择器错配收到修订时，复用已有状态，校正存放位置及对应 Run／评价的精确路径，保持状态内容、已有训练记录、指标和来源 hash 不变，再沿同一 Session 正常交接；这类交接修订无需重训。
+因状态角色或选择器错配收到修订时，复用已有状态，校正 `retained_artifacts` 角色及对应 Run／评价的精确路径，保持状态内容、已有训练记录、指标和来源 hash 不变，再沿同一 Session 正常交接；这类交接修订无需重训。
 
 对复用 `variant_run_ref` 的新评价选择当前状态角色；路径匹配多个移入状态时，以 `checkpoint_role_refs` 或 `checkpoint_version_refs` 选择精确对象。复用已接纳评价则保持其原冻结角色引用，不随归属变更而改写。
 
@@ -67,7 +86,7 @@ Run 可选字段包括 `variant_ref`、`baseline_forward_contract`、`variant_re
 
 ## 可复用 Dataset 与 Environment 候选
 
-有独立数据或环境复用价值的已保存产物，在结果中分别列 `dataset_candidates`／`environment_candidates`，每项含 `artifact_path`、`name`、`purpose`。Dataset 使用 `outputs/data/` 或 `outputs/analysis/` 内的实际精确文件或目录；Environment 也可引用既有 `implementation/` 实现快照、checkpoint 或日志条目，保存环境代码、配置、运行说明或已知条件。候选名称与用途对应所选精确范围；环境说明写清资源位置、实际构建或改动、已知使用条件及尚未核实的事项，供后继登记和采用。
+有独立数据或环境复用价值的已保存产物，在结果中分别列 `dataset_candidates`／`environment_candidates`，每项含 `artifact_path`、`name`、`purpose`。Dataset 选择实际保留为 data／analysis 的精确文件或目录；Environment 也可引用既有 `implementation/` 实现快照、checkpoint 或日志条目，保存环境代码、配置、运行说明或已知条件。其他工作区位置先用 `retained_artifacts` 选择保留内容及角色。候选名称与用途对应所选精确范围；环境说明写清资源位置、实际构建或改动、已知使用条件及尚未核实的事项，供后继登记和采用。
 
 已有资源的直接登记按根系统提示的 Environment 规则执行；本 Target 新建或改动的成果先走这里的候选交接。现成持久目录、安装或服务的跨机器适配不构成入库前提；设备说明与使用记录作为数字材料保存，设备本体按真实来源表达。
 

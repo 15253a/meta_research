@@ -22,7 +22,9 @@ def _accepted_run_with_two_work_items(tmp_path):
     document = json.loads(path.read_text())
     metrics = document["metrics"]
     document["formal_runs"] = [
-        {"run_key": "measured-work", "evaluations": [{"attempt_key": "main", "metrics": metrics}]},
+        {"run_key": "measured-work", "checkpoint_paths": [artifact.relative_path
+            for artifact in evidence.handoff.artifacts if artifact.role == "checkpoint"],
+         "evaluations": [{"attempt_key": "main", "metrics": metrics}]},
         {"run_key": "audit-work", "artifact_paths": ["logs/train.log"], "evaluations": []},
     ]
     document["metrics"] = {}
@@ -137,7 +139,9 @@ def test_historical_acceptance_replay_tolerates_adjusted_attribution(tmp_path):
         document = json.loads(path.read_text())
         metrics = document["metrics"]
         document["formal_runs"] = [
-            {"run_key": "measured-work", "evaluations": [{"attempt_key": "main", "metrics": metrics}]},
+            {"run_key": "measured-work", "checkpoint_paths": [artifact.relative_path
+                for artifact in evidence.handoff.artifacts if artifact.role == "checkpoint"],
+             "evaluations": [{"attempt_key": "main", "metrics": metrics}]},
             {"run_key": "audit-work", "artifact_paths": ["logs/train.log"], "evaluations": []},
         ]
         document["metrics"] = {}
@@ -397,6 +401,8 @@ def test_reuse_reconciles_after_artifact_moved_away(tmp_path):
         metrics = document["metrics"]
         document["formal_runs"] = [
             {"run_key": "measured-work",
+             "checkpoint_paths": [artifact.relative_path for artifact in evidence.handoff.artifacts
+                                  if artifact.role == "checkpoint"],
              "evaluations": [{"attempt_key": "main", "metrics": metrics}]},
             {"run_key": "audit-work", "evaluations": [],
              "artifact_paths": ["logs/train.log"]},

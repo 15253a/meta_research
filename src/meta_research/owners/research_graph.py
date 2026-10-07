@@ -7002,8 +7002,8 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             correction = OwnerConflict('target_root_commit_domain_invalid')
             correction.feedback = (
                 'The executed report-only assessment needs its nonempty assessment report in '
-                'the completion artifacts, assigned to that evaluation through artifact_paths '
-                'or its single-producer evaluation directory. Preserve the actual research and '
+                'the completion artifacts, explicitly assigned to that evaluation through artifact_paths. '
+                'Preserve the actual research and '
                 'supply or assign the missing report in another root turn. If no assessment '
                 'was performed, record its actual pending, blocked or failed status instead.'
             )
@@ -10598,6 +10598,30 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                 ),
                 {"version_ref": version_ref},
             ).all()
+            experiment_role_rows = connection.execute(
+                text(
+                    "SELECT * FROM rg_experiment_asset_roles WHERE version_ref = "
+                    ":version_ref ORDER BY role_ref"
+                ),
+                {"version_ref": version_ref},
+            ).all()
+            experiment_roles = tuple(
+                _accepted_experiment_asset_role_tolerant(connection, row)
+                for row in experiment_role_rows
+            )
+            commit_rows = connection.execute(
+                text(
+                    "SELECT c.* FROM rg_target_commits c WHERE EXISTS ("
+                    "SELECT 1 FROM json_tree(c.closure_json) j WHERE "
+                    "j.key = 'version_ref' AND j.value = :version_ref) OR EXISTS ("
+                    "SELECT 1 FROM rm_target_root_completion_manifests m, "
+                    "json_tree(m.entries_json) j WHERE m.manifest_ref = "
+                    "json_extract(c.closure_json, '$.target_root_manifest.manifest_ref') "
+                    "AND j.key = 'version_ref' AND j.value = :version_ref) "
+                    "ORDER BY c.commit_ref"
+                ),
+                {"version_ref": version_ref},
+            ).all()
             question_rows = connection.execute(
                 text(
                     "SELECT * FROM rg_questions WHERE content_ref = "
@@ -10613,6 +10637,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                 {"version_ref": version_ref},
             ).all()
         roles = tuple(_accepted_asset_role(row) for row in role_rows)
+        commits = tuple(_target_commit(row) for row in commit_rows)
         for role in roles:
             self._verify_asset_role(role, current=False)
         questions = tuple(_accepted_question(row) for row in question_rows)
@@ -10636,6 +10661,8 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         references = tuple(
             sorted(
                 [f"asset-role:{item.role_ref}" for item in roles]
+                + [f"experiment-asset-role:{item.role_ref}" for item in experiment_roles]
+                + [f"target-commit:{item.commit_ref}" for item in commits]
                 + [f"formal-question:{item.question_ref}" for item in questions]
                 + [f"idea-outcome:{item.decision_ref}" for item in decisions]
                 + list(self.query_dataset_asset_references(version_ref))

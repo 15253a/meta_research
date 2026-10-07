@@ -15,6 +15,29 @@ from meta_research.target_implementation_bundle import parse_target_implementati
 FINAL_STATEMENT_PATH = "handoff/final-message.md"
 
 
+def _directory_note_scope(source_path: Path) -> tuple[bool, int]:
+    """Stream the frozen scope's file inventory; empty folders are not reports."""
+    pending = [source_path]
+    found_note = False
+    found_other = False
+    other_content_bytes = 0
+    while pending:
+        parent = pending.pop()
+        with os.scandir(parent) as inventory:
+            for entry in inventory:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    if parent != source_path or entry.name != "research-note.md":
+                        found_other = True
+                        other_content_bytes += entry.stat(follow_symlinks=False).st_size
+                    else:
+                        found_note = True
+                else:
+                    raise OSError("The frozen note scope contains a non-regular entry")
+    return found_note and not found_other, other_content_bytes
+
+
 def research_note_metadata_from_path(*, role: str, declared_relative_path: str,
                                     artifact_kind: str, source_path: Path,
                                     tree_hash: str) -> dict[str, object] | None:
@@ -24,8 +47,16 @@ def research_note_metadata_from_path(*, role: str, declared_relative_path: str,
         return None
     entry_path = None
     kind = "research_note"
+    note_only = False
+    other_content_bytes = 0
     if artifact_kind == "directory" and declared_relative_path == "outputs/analysis":
         entry_path = "research-note.md"
+        # The frozen snapshot, rather than an Agent declaration or the note
+        # excerpt, proves whether the whole selected scope is a Target note.
+        try:
+            note_only, other_content_bytes = _directory_note_scope(source_path)
+        except OSError as error:
+            raise OwnerConflict("research_note_source_invalid") from error
         source_path = source_path / entry_path
     elif artifact_kind == "file" and declared_relative_path in {
         "outputs/analysis/research-note.md", FINAL_STATEMENT_PATH,
@@ -73,6 +104,8 @@ def research_note_metadata_from_path(*, role: str, declared_relative_path: str,
         "schema_ref": "meta-research/research-note-reference/v1",
         "kind": kind,
         "entry_path": entry_path,
+        **({"note_only": note_only, "other_content_bytes": other_content_bytes}
+           if artifact_kind == "directory" else {}),
         "source_bytes_sha256": digest.hexdigest(),
         "source_utf8_bytes": byte_count,
         "summary": {"text": prefix.decode("utf-8", errors="ignore"),
@@ -89,12 +122,17 @@ def research_note_metadata(*, role: str, declared_relative_path: str,
         return None
     entry_path = None
     kind = "research_note"
+    note_only = False
+    other_content_bytes = 0
     if artifact_kind == "directory" and declared_relative_path == "outputs/analysis":
         bundle = parse_target_implementation_bundle(content, expected_tree_sha256=tree_hash)
         entry = next((entry for entry in bundle.entries
                       if entry.relative_path == "research-note.md"), None)
         if entry is None:
             return None
+        note_only = len(bundle.entries) == 1
+        other_content_bytes = sum(len(item.content) for item in bundle.entries
+                                  if item.relative_path != entry.relative_path)
         content, entry_path = entry.content, entry.relative_path
     elif artifact_kind == "file" and declared_relative_path in {
         "outputs/analysis/research-note.md", FINAL_STATEMENT_PATH,
@@ -113,6 +151,8 @@ def research_note_metadata(*, role: str, declared_relative_path: str,
         "schema_ref": "meta-research/research-note-reference/v1",
         "kind": kind,
         "entry_path": entry_path,
+        **({"note_only": note_only, "other_content_bytes": other_content_bytes}
+           if artifact_kind == "directory" else {}),
         "source_bytes_sha256": hashlib.sha256(content).hexdigest(),
         "source_utf8_bytes": len(content),
         "summary": bounded_text(body, 2048),

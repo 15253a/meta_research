@@ -24,6 +24,8 @@ def _prepare(workspace, evidence):
     result = workspace / 'outputs/metrics.json'
     document = json.loads(result.read_text())
     document['formal_runs'] = [{'run_key': 'observed',
+        'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+                             if artifact.role == 'checkpoint'],
         'artifact_paths': ['logs/train.log', 'outputs/observations.json'],
         'evaluations': [{'attempt_key': 'assessed', 'metrics': document['metrics'],
             'artifact_paths': ['logs/evaluate.log', 'outputs/evaluation-report.md']}]}]
@@ -80,7 +82,7 @@ def test_unbound_subject_artifact_rolls_back_graph_facts(tmp_path):
 
 
 @pytest.mark.parametrize('grouped_logs', [False, True])
-def test_single_implicit_assessment_defaults_bind_only_dedicated_product_paths(tmp_path, grouped_logs):
+def test_explicit_assessment_collections_keep_target_notes_separate(tmp_path, grouped_logs):
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
         run_log = 'logs/execution' if grouped_logs else 'logs/train.log'
@@ -107,7 +109,15 @@ def test_single_implicit_assessment_defaults_bind_only_dedicated_product_paths(t
         evidence = replace(evidence, handoff=replace(evidence.handoff, artifacts=(
             *evidence.handoff.artifacts,
             *(TargetCompletionArtifact(role=role, relative_path=path) for role, path in paths))))
-        assert 'formal_runs' not in json.loads((workspace / 'outputs/metrics.json').read_text())
+        result_path = workspace / 'outputs/metrics.json'
+        document = json.loads(result_path.read_text())
+        document['formal_runs'] = [{'run_key': 'primary',
+            'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+                                 if artifact.role == 'checkpoint'],
+            'artifact_paths': [run_log, 'outputs/analysis/raw'],
+            'evaluations': [{'attempt_key': 'primary', 'metrics': document['metrics'],
+                'artifact_paths': [evaluation_log, 'outputs/analysis/evaluation']}]}]
+        result_path.write_text(canonical_json(document))
         accepted, manifest = _accept(runtime, lifecycle, memory, handle, evidence)
         graph = runtime.owners.research_graph
         facts = graph.query_target_formal_results(handle.target_ref)

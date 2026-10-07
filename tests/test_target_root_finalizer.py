@@ -255,9 +255,6 @@ def _root_finalizer_fixture(tmp_path: Path, *, runtime=None, ready=None):
         "result_disposition": "positive",
         "schema_ref": authority.measurement_contract.result_schema_ref,
     }
-    (workspace / "outputs" / "metrics.json").write_text(
-        canonical_json(result_document), encoding="utf-8"
-    )
     (workspace / "logs" / "train.log").write_text(
         "epoch 1 complete\n", encoding="utf-8"
     )
@@ -272,6 +269,16 @@ def _root_finalizer_fixture(tmp_path: Path, *, runtime=None, ready=None):
             1,
             {"role": "checkpoint", "relative_path": "outputs/final.ckpt"},
         )
+    result_document["formal_runs"] = [{
+        "run_key": "primary",
+        "artifact_paths": ["logs/train.log"],
+        "checkpoint_paths": [artifact["relative_path"] for artifact in artifacts
+                             if artifact["role"] == "checkpoint"],
+        "evaluations": [{"attempt_key": "primary", "metrics": metrics, "artifact_paths": []}],
+    }]
+    (workspace / "outputs" / "metrics.json").write_text(
+        canonical_json(result_document), encoding="utf-8"
+    )
     handoff = canonical_json(
         {
             "artifacts": artifacts,

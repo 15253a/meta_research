@@ -42,7 +42,10 @@ def _report_work(workspace, evidence, *, report=True, status='executed', artifac
     attempt = {'attempt_key': 'material-inspection', 'status': status, 'metrics': {}}
     if artifact_paths is not None:
         attempt['artifact_paths'] = artifact_paths
-    document['formal_runs'] = [{'run_key': 'material-collection', 'evaluations': [attempt]}]
+    document['formal_runs'] = [{'run_key': 'material-collection',
+        'checkpoint_paths': [artifact.relative_path for artifact in evidence.handoff.artifacts
+                             if artifact.role == 'checkpoint'],
+        'artifact_paths': ['logs/train.log'], 'evaluations': [attempt]}]
     document_path.write_text(canonical_json(document))
     return evidence, report_path
 
@@ -59,6 +62,13 @@ def test_report_only_assessment_is_accepted_queryable_and_replayable(tmp_path, m
         accepted, manifest = _accept(runtime, lifecycle, memory, handle, evidence)
         graph = runtime.owners.research_graph
         facts = graph.query_target_formal_results(handle.target_ref)
+        if not explicit_assignment:
+            from meta_research.target_run_finalizer import TargetRootOwnerRejection
+            assert isinstance(accepted, TargetRootOwnerRejection)
+            assert accepted.code == 'target_root_commit_domain_invalid'
+            assert 'report-only assessment' in accepted.feedback
+            assert facts == ()
+            return
         assert len(facts) == 1
         fact = facts[0]
         assert fact['evaluation_attempt']['status'] == 'measurement_accepted'
@@ -131,7 +141,8 @@ def test_report_file_does_not_turn_unperformed_or_failed_assessment_into_result(
     _report_protocol(monkeypatch)
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
     try:
-        evidence, report_path = _report_work(workspace, evidence, status=status)
+        evidence, report_path = _report_work(workspace, evidence, status=status,
+            artifact_paths=['outputs/analysis/evaluation/report.md'] if status == 'failed' else None)
         if status == 'blocked':
             # The retained report belongs to the work that actually happened;
             # an unperformed Evaluation cannot own a report artifact.
@@ -178,7 +189,8 @@ def test_missing_report_returns_owner_feedback_and_next_root_turn_completes(tmp_
         original = lifecycle.query_completion(handle.target_ref)
         rejection = lifecycle.query_completion_rejection(original.completion_ref)
         assert finalizer(evidence).finalize(handle=handle, evidence=evidence) == first
-        revised, _ = _report_work(workspace, evidence)
+        revised, _ = _report_work(workspace, evidence,
+            artifact_paths=['outputs/analysis/evaluation/report.md'])
         revised = replace(revised, operation_ref='root-report-correction',
             operation_generation=evidence.operation_generation + 1,
             evidence_ref='root-report-correction-evidence', evidence_sequence=evidence.evidence_sequence + 1,

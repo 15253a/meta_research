@@ -2,7 +2,7 @@
 
 获取与整理本身可以是 Target 的研究工作。按研究价值、替代成本和预计复用决定保存源材料、处理结果、划分或标注；保留有价值派生物时尽可能保存稳定源副本，并在研究说明记录来源、处理和局限。版本及关系应有研究意义，无需逐文件或逐中间步骤登记。
 
-将选定数据放在 `outputs/data/`，需按 checkpoint 交接的状态放在 `outputs/checkpoints/`，其精确归属与修订方式见[正式工作交接](formal-work.md#实现快照状态与局部输入)；实现、分析和日志沿现有交接路径保存。按 `execution_contract.artifact_limits` 核实本次行为；正常交接会流式保存大型文件和目录，无需另填大小模式。多 GB 本身不要求拆成小压缩包或请人导入。各 Run 的数据归入 `formal_runs[].artifact_paths`，评价报告归入对应评价，需独立复用的生产者和状态分别寻址。
+选定数据通常放在 `outputs/data/`，checkpoint 状态通常放在 `outputs/checkpoints/`；其他工作区位置或不同角色用结果中的 `retained_artifacts` 明确选择，其精确归属与修订方式见[正式工作交接](formal-work.md#实现快照状态与局部输入)。实现、分析和日志沿现有交接路径保存。按 `execution_contract.artifact_limits` 核实本次行为；正常交接会流式保存大型文件和目录，无需另填大小模式。多 GB 本身不要求拆成小压缩包或请人导入。各 Run 的数据归入 `formal_runs[].artifact_paths`，评价报告归入对应评价，需独立复用的生产者和状态分别寻址。
 
 最终交接前完成写入，并保持所选路径稳定至 Owner 接纳。持久保存由 Owner 接纳的精确版本与内容 receipt 证明；说明中的路径、hash 或单独 Dataset／Environment 登记都不能代替。暂存、未接纳材料留在工作区。原始数据、派生数据、文字、湿实验记录和辅助材料走相同保存路径。
 

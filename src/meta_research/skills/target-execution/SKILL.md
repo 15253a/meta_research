@@ -33,7 +33,7 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 写 `outputs/result.json`，包含 `schema_ref`、`metrics`、`result_disposition` 及忠实表达研究的领域字段。初始 `result_schema` 是表达指导，字段、嵌套和类型可随真实观察演化；Protocol 指标集合、精确身份、来源、合法 JSON 与有限数值检查仍有效。实测零为 `0`，合同允许的未测量值为 `null`，类别、数组和对象保留真实 JSON 值；缺测原因写入结果或 `outputs/analysis`。
 
-出现多个实际 Run、分离或交替评价、无指标报告评价、待评价实施、复用已接纳 Run，或交接可复用 Dataset／Environment 候选时，读取[正式工作交接](references/formal-work.md)。以 `formal_runs` 声明真实生产者、实现版本、输入和产物路径。`evaluations: []` 表示尚未评价；空指标的已执行评价必须有真实评价记录及归属报告。一次工具调用或技术重试本身不构成新的科研 Run。
+保存具体实施／评价产物，出现多个实际 Run、分离或交替评价、无指标报告评价、待评价实施、复用已接纳 Run，或交接可复用 Dataset／Environment 候选时，读取[正式工作交接](references/formal-work.md)。以 `formal_runs` 声明真实生产者、实现版本、输入和精确产物路径；需要独立选择文件、目录或一组不连续路径及其用途时，用 `retained_artifacts` 声明保留范围和角色。`evaluations: []` 表示尚未评价；空指标的已执行评价必须有真实评价记录及归属报告。一次工具调用或技术重试本身不构成新的科研 Run。
 
 `implementation/` 保存足以核查实际方法的说明、规程、推导、编码框架或代码。按研究价值、可复核性、复用和存储成本决定每个 Run／评价的保留产物与粒度；checkpoint 可有多个、部分或没有，不限于模型权重。`checkpoint_policy` 的 `required`／`forbidden` 是先前保存建议，不是产物有无的接纳门槛。把重要取舍和局限写入研究说明。
 
@@ -41,7 +41,7 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 日志按真实工作命名。实际训练的完整 stdout／stderr 才写 `logs/train.log` 或 `train-*.log`；实际模型或实验系统评价才写 `logs/eval.log` 或 `eval-*.log`。从进程开始保留原始输出和退出状态，每次重试用独立路径。可用 `logs/audit.log`、`logs/protocol-check.log`、`logs/gate-closure.log`、`logs/verify.log` 保存可用性、来源、准入及结构检查；准备检查只支持其自身事实。没有训练或模型评价时，相应日志保持不存在。
 
-维护 `outputs/analysis/research-note.md`：开头给出短摘要，再说明认识、支持与缺失证据、继续／改向／等待的理由。交接或压缩后续接前更新；沿精确旧版本核查先前边界。当前及上游 `research_notes` 提供摘要和正文入口；历史分页用 `research_memory.research_notes.read` 的 `research_notes_reader` 与 `index_page.next_offset`。精确正文用 `source=research_note_body`、`source_ref=version_ref`；Target 调用省略 `context_pack_ref` 与 `predecessor_ref`。说明不替代正式输入绑定或实际指标。
+维护 `outputs/analysis/research-note.md`：开头给出短摘要，再说明认识、支持与缺失证据、继续／改向／等待的理由。交接或压缩后续接前更新；沿精确旧版本核查先前边界。整份目录含具体科研产物时，按[正式工作交接](references/formal-work.md#实际-run评价与产物)核对文件与容器的选择边界和真实归属。当前及上游 `research_notes` 提供摘要和正文入口；历史分页用 `research_memory.research_notes.read` 的 `research_notes_reader` 与 `index_page.next_offset`。精确正文用 `source=research_note_body`、`source_ref=version_ref`；Target 调用省略 `context_pack_ref` 与 `predecessor_ref`。说明不替代正式输入绑定或实际指标。
 
 执行中发现新未知时，在研究说明中向调用本 Target 的 Bundle 交接发现依据、与当前或已有问题的关系及值得继续研究的线索。能够在已有题内处理的，保留为该题的后续工作；确有独立追踪价值时说明理由和可能开展的研究。Target 按当前合同交回实际结果与线索，不直接向 Reasoning 提交建题候选；由 Bundle 汇总多个 Target、保留并筛选后统一交接。一次失败、待办事项或资源缺口本身不足以成为建题理由。
 

@@ -140,6 +140,36 @@ def test_note_metadata_validates_utf8_beyond_the_summary_prefix(tmp_path: Path) 
     ) is None
 
 
+@pytest.mark.parametrize("report", [None, b"", b"Actual independent assessment.\n"],
+                         ids=["only-note", "empty-report", "note-and-report"])
+def test_streamed_note_scope_comes_from_actual_managed_directory(tmp_path: Path, report: bytes | None) -> None:
+    source = tmp_path / "analysis"
+    source.mkdir()
+    (source / "empty-context/details").mkdir(parents=True)
+    digest = _write_note(source / "research-note.md", 70 * 1024)
+    if report is not None:
+        (source / "assessment-report.md").write_bytes(report)
+    runtime = build_production_runtime(prepare_data_root(tmp_path / "data"))
+    try:
+        intake = runtime.owners.research_memory.submit_asset_intake(AssetIntakeRequest(
+            source_kind="directory", custody_mode="managed", display_name="analysis",
+            source_locator=str(source), provenance={"note_only": True, "other_content_bytes": 500},
+        ), idempotency_key="streamed-note-scope")
+        assert intake.asset is not None
+        metadata = research_note_metadata_from_path(
+            role="analysis", declared_relative_path="outputs/analysis",
+            artifact_kind="directory", source_path=source, tree_hash=intake.asset.content_hash,
+        )
+        assert metadata["note_only"] is (report is None)
+        assert metadata["other_content_bytes"] == len(report or b"")
+        assert metadata["source_bytes_sha256"] == digest
+        assert metadata["source_utf8_bytes"] == 70 * 1024
+        note = _bound_note(metadata, intake.asset)
+        assert hashlib.sha256(read_note_body(runtime.owners.research_memory, note).encode()).hexdigest() == digest
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("directory", [False, True], ids=["standalone", "native-directory"])
 def test_finalizer_keeps_long_note_identity_across_query_and_replay(tmp_path: Path, directory: bool) -> None:
     runtime, lifecycle, memory, _, handle, workspace, evidence = _root_finalizer_fixture(tmp_path)
