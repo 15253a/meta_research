@@ -142,8 +142,8 @@ class HumanGuidanceMixin:
                     "deliveries": [_summary(item) for item in cut.deliveries]}
             delivery = _delivery(cut, delivery_ref)
             guide = decoded_object(delivery.guide_json)
-            document = canonical_json(guide["guidance"])
-            if offset >= len(document):
+            document = canonical_json(guide["guidance"]).encode("utf-8")
+            if offset >= len(document) or document[offset] & 0xC0 == 0x80:
                 raise OwnerConflict("guidance_read_bounds_invalid")
             command = {"delivery_ref": delivery_ref, "offset": offset, "limit": limit}
             key = _effect_key(binding, "read", effect_id)
@@ -153,6 +153,10 @@ class HumanGuidanceMixin:
             if reconcile:
                 raise OwnerConflict("guidance_effect_not_found")
             end = min(len(document), offset + limit)
+            while end < len(document) and document[end] & 0xC0 == 0x80:
+                end -= 1
+            if end == offset:
+                raise OwnerConflict("guidance_read_bounds_invalid")
             pages = connection.execute(text(
                 "SELECT start_offset,end_offset FROM hc_guidance_read_pages "
                 "WHERE delivery_ref=:delivery_ref ORDER BY start_offset"
@@ -171,7 +175,7 @@ class HumanGuidanceMixin:
                 "original_text": guide["guidance"].get("text") if offset == 0
                     and end == len(document) else None,
                 "strength": guide["guidance"].get("strength", 3),
-                "text": document[offset:end], "offset": offset,
+                "text": document[offset:end].decode("utf-8"), "offset": offset,
                 "next_offset": None if end == len(document) else end,
                 "complete": offset == 0 and end == len(document),
                 "full_read": full_read, "document_length": len(document),

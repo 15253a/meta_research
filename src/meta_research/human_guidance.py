@@ -114,7 +114,7 @@ class FrozenGuidanceCut:
         }
 
 
-def guidance_prompt(cut: FrozenGuidanceCut) -> str:
+def guidance_prompt(cut: FrozenGuidanceCut, *, resident: bool = True) -> str:
     items = [{
         "delivery_ref": item.delivery_ref,
         "constraint_ref": decoded_object(item.guide_json)["constraint_ref"],
@@ -122,7 +122,7 @@ def guidance_prompt(cut: FrozenGuidanceCut) -> str:
         "needs_treatment": item.needs_treatment,
     } for item in cut.deliveries]
     from meta_research.owners.common import canonical_json
-    return (
+    rendered = (
         "\n\n## 本次操作的正式人类指导\n"
         + canonical_json({"binding": cut.binding.as_dict(), "deliveries": items})
         + "\n用 human_guidance.read 列表发现本次冻结指导，再精确完整读取各 delivery_ref。"
@@ -132,3 +132,6 @@ def guidance_prompt(cut: FrozenGuidanceCut) -> str:
         "本次操作之后提交的指导由下一逻辑操作接续。力度5的目标更新仍待目标演化流程，"
         "收到、读取或反馈不表示目标已切换。HumanRequest 答复仍归原请求根。\n"
     )
+    if not resident:
+        rendered += "\n冻结原文如下。工具通道未建立时，不记录收到、读取或反馈事实。\n" + canonical_json(cut.as_dict())
+    return rendered

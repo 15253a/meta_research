@@ -51,7 +51,7 @@ from meta_research.idea_contract import (
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.research_guidance import shared_research_guidance
+from meta_research.research_guidance import shared_research_guidance, shared_human_guidance
 from meta_research.provider_supervisor import (
     CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
     PROVIDER_SUPERVISOR_MAX_CONTENT_BYTES,
@@ -1079,10 +1079,12 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable(error.code) from error
 
     def bind_human_guidance_authority(self, authority) -> None:
+        if self._human_guidance_authority is not None and self._human_guidance_authority is not authority:
+            raise IdeaSkillUnavailable("human_guidance_authority_conflict")
         self._human_guidance_authority = authority
 
     def _prepare_stage_guidance(self, *, run_ref, attempt_ref, root_session_ref,
-            fence_ref, runtime_binding_hash, job_ref, operation_name, prompt):
+            fence_ref, runtime_binding_hash, job_ref, operation_name, prompt, resident=True):
         authority = self._human_guidance_authority
         if authority is None or self._root_agent_kind not in GUIDANCE_ROOT_KINDS:
             return prompt, None
@@ -1095,7 +1097,7 @@ class CodexIdeaSkillAdapter:
             cut = authority.freeze_operation_guidance(operation)
         except Exception as error:
             raise IdeaSkillUnavailable(str(getattr(error, "code", "guidance_preparation_failed"))) from error
-        return prompt + guidance_prompt(cut), cut.binding
+        return prompt + guidance_prompt(cut, resident=resident), cut.binding
 
     def bind_resident_mcp_authority(
         self, authority: RootResidentMcpAuthority
@@ -1323,6 +1325,7 @@ class CodexIdeaSkillAdapter:
                     "root_capability_profile",
                     "root_capability_profile_hash",
                     *_operation_workspace_fields(invocation),
+                *({"guidance_binding"} if "guidance_binding" in invocation else ()),
                 }
                 if (
                     set(invocation) != expected_fields
@@ -1594,6 +1597,7 @@ class CodexIdeaSkillAdapter:
                 "root_capability_profile",
                 "root_capability_profile_hash",
                 *_operation_workspace_fields(invocation),
+                *({"guidance_binding"} if "guidance_binding" in invocation else ()),
                 *transport_limits.as_dict(),
             }
             if (
@@ -1908,6 +1912,7 @@ class CodexIdeaSkillAdapter:
             run_ref=run_ref, attempt_ref=attempt_ref, root_session_ref=root_session_ref,
             fence_ref=fence_ref, runtime_binding_hash=runtime_binding_hash,
             job_ref=job_ref, operation_name=operation_name, prompt=prompt,
+            resident=self._root_resident_mcp.enabled,
         )
         if not self._root_resident_mcp.enabled:
             return self._invoke(
@@ -3573,6 +3578,7 @@ def _idea_skill_resources() -> dict[str, str]:
     try:
         return {
             "research-guidance.md": shared_research_guidance(),
+            "human-guidance.md": shared_human_guidance(),
             **{
                 name: resource.read_text(encoding="utf-8")
                 for name, resource in resources

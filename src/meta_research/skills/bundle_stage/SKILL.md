@@ -9,6 +9,8 @@ description: 在已接纳 FormalPlan 内组织并启用 Target，滚动安排材
 
 粒度、风险、正式工作与依赖查[Bundle 契约](references/contract.md)；调用与反馈查[Owner 操作](references/owner-operations.md)。Target 按运行时注入的 target-execution Skill、measurement_contract、result_schema 执行，Bundle 不重建另一套交接协议。
 
+
+正式人类指导按运行时加载的[共享指导合同](../human-guidance.md)读取原文、声明处理并延续约束。
 ## 1. 读取与滚动安排
 
 读取已接纳 FormalPlan、gap Brief、输入索引、权威 frontier 与反馈，选择值得现在投入的工作。局部策略可随结果调整尚未提交的候选和顺序，不要求起步列尽未来路线。研究观察可指导选择，正式 coverage 只用已接纳 TargetCommit。

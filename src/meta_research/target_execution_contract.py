@@ -71,6 +71,7 @@ def target_execution_context(*, authority: object, target_ref: str,
 
 def target_execution_skill_text() -> str:
     path = Path(__file__).with_name("skills") / "target-execution" / "SKILL.md"
-    return (path.read_text(encoding="utf-8") +
+    from meta_research.research_guidance import shared_human_guidance
+    return (shared_human_guidance() + "\n\n" + path.read_text(encoding="utf-8") +
             f"\n\nSkill source: {path.resolve()}\n"
             "Resolve the reference links above relative to this source directory.")

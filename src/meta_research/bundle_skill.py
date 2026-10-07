@@ -1787,10 +1787,11 @@ def _bundle_skill_resources() -> dict[str, str]:
         ),
     )
     try:
-        from .research_guidance import shared_research_guidance
+        from .research_guidance import shared_research_guidance, shared_human_guidance
 
         return {
             "research-guidance.md": shared_research_guidance(),
+            "human-guidance.md": shared_human_guidance(),
             **{name: resource.read_text(encoding="utf-8") for name, resource in resources},
         }
     except (FileNotFoundError, ModuleNotFoundError) as error:

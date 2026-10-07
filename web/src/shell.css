@@ -3834,3 +3834,26 @@ a:focus-visible,
     transition-duration: 0.001ms !important;
   }
 }
+
+.lumen-guidance-compose {
+  display: grid; gap: 8px; padding: 12px; border: 1px solid #9dcfc5;
+  border-radius: 10px; background: #f3fbf8; font-size: 12px;
+}
+.lumen-guidance-compose label { display: grid; gap: 4px; }
+.lumen-guidance-compose textarea, .lumen-guidance-compose select {
+  width: 100%; min-width: 0; box-sizing: border-box; padding: 7px;
+  border: 1px solid #9dcfc5; border-radius: 6px; background: white;
+  font: inherit;
+}
+.lumen-guidance-compose textarea { resize: vertical; }
+.lumen-guidance-compose button {
+  padding: 7px; border: 1px solid #9dcfc5; border-radius: 6px;
+  background: white; color: #167d70; cursor: pointer;
+}
+.lumen-guidance-compose p { margin: 0; line-height: 1.5; }
+.lumen-guidance-compose button:disabled { opacity: 0.55; cursor: default; }
+.lumen-guidance-delivery { margin: 10px 0; overflow-wrap: anywhere; }
+.lumen-guidance-delivery dl { font-size: 11px; }
+.lumen-guidance-delivery dt { font-weight: 600; }
+.lumen-guidance-delivery dd { margin-left: 0; white-space: pre-wrap; }
+.lumen-constraint > p { white-space: pre-wrap; }

@@ -55,7 +55,7 @@ from meta_research.reasoning_contract import (
     validate_reasoning_stage_output,
     validate_scientific_outcome,
 )
-from .research_guidance import shared_research_guidance
+from .research_guidance import shared_research_guidance, shared_human_guidance
 from meta_research.semantic_mcp import (
     ROOT_AGENT_COMMON_OPERATION_IDS,
     ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS,
@@ -1570,6 +1570,7 @@ def _reasoning_skill_resources() -> dict[str, str]:
     try:
         return {
             "research-guidance.md": shared_research_guidance(),
+            "human-guidance.md": shared_human_guidance(),
             **{
                 name: resource.read_text(encoding="utf-8")
                 for name, resource in resources
@@ -1587,6 +1588,7 @@ def _reasoning_skill_instructions() -> str:
         f"<!-- bundled resource: {name} -->\n{resources[name]}"
         for name in (
             "research-guidance.md",
+            "human-guidance.md",
             "SKILL.md",
             "references/contract.md",
             "references/owner-operations.md",

@@ -21,3 +21,8 @@ Quest 的研究时长预算由各 Cycle 累计使用，进入下一轮不重置�
 
 当整理、归类或入库工作量较大（如同批 Target 完成后产物较多、研究资产持续增长），按生产者或明确资产范围委派独立子智能体：在授予的任务权限内读取相关材料、确定归属并完成登记，返回对象／内容引用、整理说明与未决项；权威接纳仍由对应 Owner 承担，不设固定数量或阈值。各根 Session 的 review 由独立子智能体检查并提供自由格式反馈，主 Agent 自主修订；没有具体问题也可以改稿。同根 turn 的自查不构成独立 review。最终提交字段遵循当前阶段输出契约，审阅反馈本身不要求固定表单或 Owner 审阅者身份证明。
 """
+
+
+def shared_human_guidance() -> str:
+    from importlib.resources import files
+    return (files("meta_research.skills") / "human-guidance.md").read_text(encoding="utf-8")
