@@ -41,6 +41,13 @@ ROOT_AGENT_ENVIRONMENT_OPERATION_IDS = (
     "research_graph.environments.reference.reconcile",
 )
 ROOT_AGENT_COMMON_OPERATION_IDS = (
+    "research_memory.assets.page",
+    "research_memory.assets.lifecycle",
+    "research_memory.assets.current",
+    "research_memory.assets.intake",
+    "research_memory.assets.intake.reconcile",
+    "research_memory.assets.retire",
+    "research_memory.assets.retire.reconcile",
     "research_graph.questions.page",
     "research_memory.literature.page",
     "research_memory.content.read",
@@ -61,9 +68,10 @@ ROOT_AGENT_COMMON_OPERATION_IDS = (
 
 
 class SemanticMcpError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, details: dict[str, object] | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.details = details
 
 
 @dataclass(frozen=True)
@@ -453,7 +461,7 @@ class SemanticMcpGateway:
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": _tool_error(error.code),
+                "result": _tool_error(error.code, error.details),
             }
         except Exception:
             return 200, {
@@ -640,10 +648,11 @@ def _jsonrpc_error(
     }
 
 
-def _tool_error(code: str) -> dict[str, object]:
+def _tool_error(code: str, details: dict[str, object] | None = None) -> dict[str, object]:
     return {
         "content": [{"type": "text", "text": code}],
-        "structuredContent": {"status": "capability_unavailable", "code": code},
+        "structuredContent": {"status": "capability_unavailable", "code": code,
+                              **({"details": details} if details is not None else {})},
         "isError": True,
     }
 

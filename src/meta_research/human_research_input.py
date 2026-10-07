@@ -5,6 +5,7 @@ import time
 from sqlalchemy import text
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json, new_ref
 from meta_research.dataset_contract import dataset_asset_binding
+from meta_research.owners.asset_lifecycle import assert_asset_usable
 
 
 def read_research_input(database, input_ref, *, quest_ref=None):
@@ -42,13 +43,22 @@ class HumanResearchInputMixin:
         value={"quest_ref":quest_ref,"question_ref":question_ref,"text":text_content,
                "asset_bindings":[b.as_dict() for b in bindings],"source":"explicit_user_submission"}
         digest=canonical_hash(value)
+        with self._database.read() as c:
+            replay=c.execute(text("SELECT input_ref,content_hash FROM hc_research_inputs WHERE idempotency_key=:key"),{"key":idempotency_key}).first()
+        if replay is not None:
+            if replay.content_hash!=digest:raise OwnerConflict("human_input_idempotency_conflict")
+            return self.query_research_input(replay.input_ref,quest_ref=quest_ref)
+        for binding in bindings:
+            self._research_memory.verify_asset_binding(asset_ref=binding.asset_ref,version_ref=binding.version_ref,content_hash=binding.content_hash,manifest_hash=binding.manifest_hash,receipt=binding.receipt)
+            self._research_graph.verify_asset_quest_scope(binding.version_ref,quest_ref=quest_ref)
         with self._database.fenced_write() as c:
             row=c.execute(text("SELECT input_ref,content_hash FROM hc_research_inputs WHERE idempotency_key=:key"),{"key":idempotency_key}).first()
             if row is not None:
                 if row.content_hash!=digest:raise OwnerConflict("human_input_idempotency_conflict")
                 return self.query_research_input(row.input_ref,quest_ref=quest_ref)
             for binding in bindings:
-                self._research_memory.verify_asset_binding(asset_ref=binding.asset_ref,version_ref=binding.version_ref,content_hash=binding.content_hash,manifest_hash=binding.manifest_hash,receipt=binding.receipt)
+                self._research_memory.verify_asset_receipt(asset_ref=binding.asset_ref,version_ref=binding.version_ref,content_hash=binding.content_hash,manifest_hash=binding.manifest_hash,receipt=binding.receipt)
+                assert_asset_usable(c,binding.version_ref)
                 self._research_graph.verify_asset_quest_scope(binding.version_ref,quest_ref=quest_ref)
             ref=new_ref("human_input");receipt_ref=new_ref("hc_research_input_receipt");now=time.time()
             receipt_hash=canonical_hash({"input_ref":ref,"content_hash":digest,"receipt_ref":receipt_ref,"created_at":now})

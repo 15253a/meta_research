@@ -18,3 +18,4 @@ Current design work: [memory-system map](https://github.com/15253a/meta_research
 Implementation of [spec #169](https://github.com/15253a/meta_research/issues/169)
 starts with [the recovered baseline and verification entrypoints](docs/implementation-baseline.md).
 Frontend behavior tests and typechecks are described in [web/README.md](web/README.md).
+Scientific asset changes, retained retirement, and public verification entrypoints are described in [the asset lifecycle contract](docs/asset-lifecycle.md).

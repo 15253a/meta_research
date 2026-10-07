@@ -365,6 +365,7 @@ class AssetIntakeWebRequest(BaseModel):
     provenance: dict[str, object] | None = None
     asset_ref: str | None = Field(default=None, max_length=128)
     asynchronous: bool = False
+    change: dict[str, object] | None = None
 
     def as_owner_request(self) -> AssetIntakeRequest:
         if self.text is not None and self.content_base64 is not None:
@@ -395,6 +396,7 @@ class AssetIntakeWebRequest(BaseModel):
             provenance=self.provenance,
             asset_ref=self.asset_ref,
             asynchronous=self.asynchronous,
+            change=self.change,
         )
         try:
             request.validate()
@@ -404,6 +406,18 @@ class AssetIntakeWebRequest(BaseModel):
                 detail={"code": error.code},
             ) from error
         return request
+
+
+class AssetRetirementWebRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=0, strict=True)
+    expected_reference_revision: int = Field(ge=0, strict=True)
+    explanation: str = Field(min_length=1, max_length=16000)
+    low_value: bool = Field(strict=True)
+    obsolete: bool = Field(strict=True)
+    incorrect: bool = Field(strict=True)
+    impact_understood: bool = Field(strict=True)
+    has_explanation_value: bool = Field(strict=True)
 
 
 class AssetRoleRequest(BaseModel):
@@ -1076,6 +1090,8 @@ def create_app(
             else 409
         )
         detail: dict[str, object] = {"code": error.code}
+        if error.details is not None:
+            detail["details"] = error.details
         if error.code in {
             "research_memory_asset_intake_not_delivered",
             "deepfetch_not_delivered",
@@ -2530,8 +2546,26 @@ def create_app(
                     "revision": feed_after,
                     "inventory_revision": research_memory_revision,
                     "reference_revision": reference_revision,
+                    "lifecycle": runtime.owners.research_memory.query_asset_lifecycle(item.asset_ref),
                 }
         raise SnapshotConsistencyUnavailable
+
+    @app.get("/api/v1/research-assets/assets/{asset_ref}/lifecycle")
+    def query_research_asset_lifecycle(asset_ref: str) -> dict[str, object]:
+        return runtime.owners.research_memory.query_asset_lifecycle(asset_ref)
+
+    @app.get("/api/v1/research-assets/assets/{asset_ref}/current")
+    def query_current_research_asset(asset_ref: str) -> dict[str, object]:
+        with runtime._database.read_snapshot():
+            lifecycle = runtime.owners.research_memory.query_asset_lifecycle(asset_ref)
+            asset = runtime.owners.research_memory.query_current_asset(asset_ref)
+            return {"lifecycle": lifecycle, "asset": None if asset is None else asset.as_public_dict()}
+
+    @app.post("/api/v1/research-assets/{memory_ref}/retirement", status_code=201)
+    def retire_research_asset(memory_ref: str, request: Request,
+                              retirement: AssetRetirementWebRequest) -> dict[str, object]:
+        return runtime.owners.research_memory.retire_asset_version(memory_ref,
+            **retirement.model_dump(), idempotency_key=_idempotency_key(request))
 
     @app.get("/api/v1/research-assets/{memory_ref}/roles")
     def query_research_asset_role_history(

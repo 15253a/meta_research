@@ -61,6 +61,7 @@ from meta_research.bundle_target_contract import (
 )
 from meta_research.control_contract import signed_owner_preview, validate_control_payload
 from meta_research.database import Database
+from meta_research.owners.asset_lifecycle import assert_asset_usable
 from meta_research.baseline_identity import (
     BASELINE_METHOD_REJECTION_FEEDBACK,
     BaselineIdentityQueries,
@@ -1636,6 +1637,7 @@ class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetO
         quest_ref: str,
         idempotency_key: str,
         verify_content: bool = True,
+        effect_scope=None,
     ) -> AcceptedAssetRole: ...
 
     def query_asset_roles(
@@ -10185,6 +10187,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         quest_ref: str,
         idempotency_key: str,
         verify_content: bool = True,
+        effect_scope=None,
     ) -> AcceptedAssetRole:
         if role not in {"evidence", "quest_source_material"}:
             raise OwnerConflict("asset_role_invalid")
@@ -10249,7 +10252,9 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             manifest_hash=binding.manifest_hash,
             receipt=binding.receipt,
         )
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
+            if effect_scope is not None:
+                effect_scope()
             command = connection.execute(
                 text(
                     "SELECT * FROM rg_asset_role_commands WHERE idempotency_key = "
@@ -10310,6 +10315,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             if version_role_count >= MAX_ASSET_ROLES_PER_VERSION:
                 raise OwnerConflict("asset_version_role_limit_reached")
             role_ref = new_ref("asset_role")
+            assert_asset_usable(connection, binding.version_ref)
             receipt_ref = new_ref("rg_asset_role_receipt")
             bindings = {
                 "version_ref": binding.version_ref,
@@ -13151,7 +13157,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                 self._target_candidate_proof_verifier,
             )
 
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             _acquire_research_graph_writer_lock(connection)
             locked_verified = (
                 self._stage_request_verifier.query_verified_bundle_stage_request(
@@ -15554,7 +15560,7 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
             )
 
         new_head: TargetGraphHead | None = None
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             replay = connection.execute(
                 text(
                     "SELECT * FROM rg_target_graph_appends WHERE proposal_ref = "
@@ -17464,6 +17470,7 @@ def _insert_target_measurement_asset_role(
     binding = role.get("binding")
     if type(binding) is not AcceptedAssetBinding:
         raise OwnerConflict("target_measurement_asset_role_invalid")
+    assert_asset_usable(connection, binding.version_ref)
     connection.execute(
         text(
             "INSERT INTO rg_experiment_asset_roles (role_ref, subject_kind, "
@@ -18069,6 +18076,12 @@ def _insert_target_with_measurement_authority(
         != formal_candidate.candidate.measurement_unit_keys[0]
     ):
         raise OwnerConflict("target_measurement_contract_binding_invalid")
+    for version_ref in _target_direct_accepted_input_asset_refs(target.spec):
+        if connection.execute(
+            text("SELECT 1 FROM rm_asset_versions WHERE version_ref=:ref"),
+            {"ref": version_ref},
+        ).first() is not None:
+            assert_asset_usable(connection, version_ref)
     connection.execute(
         text(
             "INSERT INTO rg_targets (target_ref, graph_ref, target_key, ordinal, "

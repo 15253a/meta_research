@@ -46,9 +46,15 @@ def _quest(runtime, prefix):
 
 
 def _asset(runtime, *, content=b"Observer notes: the pattern was absent.", key="notes", asset_ref=None):
+    change = None
+    if asset_ref is not None:
+        lifecycle = runtime.owners.research_memory.query_asset_lifecycle(asset_ref)
+        change = {"kind": "substantive_change", "expected_revision": lifecycle["revision"],
+                  "predecessor_version_ref": lifecycle["current_version_ref"],
+                  "explanation": "A new collection changes the observed material."}
     result = runtime.owners.research_memory.submit_asset_intake(AssetIntakeRequest(
         source_kind="text", custody_mode="managed", display_name="field-notes.txt",
-        content=content, media_type="text/plain", asset_ref=asset_ref), idempotency_key=key)
+        content=content, media_type="text/plain", asset_ref=asset_ref, change=change), idempotency_key=key)
     assert result.asset is not None
     return result.asset.as_binding()
 
@@ -271,4 +277,3 @@ def test_dataset_mcp_rejects_cross_quest_reference(runtime):
     assert response["result"]["isError"]
     assert "dataset_question_scope_invalid" in str(response)
     assert graph.query_datasets(question_ref=question.question_ref)["total"] == 0
-

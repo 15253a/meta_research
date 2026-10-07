@@ -194,7 +194,8 @@
 .asset-intake select,
 .asset-intake textarea,
 .asset-detail input,
-.asset-detail select {
+.asset-detail select,
+.asset-detail textarea {
   width: 100%;
   min-width: 0;
   padding: 10px 11px;
@@ -205,7 +206,8 @@
   font-size: 12px;
 }
 
-.asset-intake textarea {
+.asset-intake textarea,
+.asset-detail textarea {
   resize: vertical;
   line-height: 1.5;
 }
@@ -480,6 +482,157 @@
   cursor: pointer;
   font-size: 10px;
   font-weight: 800;
+}
+
+.asset-change-fields,
+.asset-impact-fields > fieldset {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #c9ded8;
+  border-radius: 10px;
+}
+
+.asset-change-fields legend,
+.asset-impact-fields legend {
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.asset-change-fields small,
+.asset-impact-fields small {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.asset-evidence-picker,
+.asset-impact-fields,
+.asset-retirement form {
+  display: grid;
+  gap: 10px;
+}
+
+.asset-evidence-picker summary {
+  font-size: 11px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.asset-evidence-picker .asset-check span {
+  overflow-wrap: anywhere;
+}
+
+.asset-change-fields button {
+  padding: 8px 10px;
+  color: #465269;
+  background: #fff;
+  border: 1px solid #d6dce8;
+  border-radius: 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.asset-lifecycle {
+  display: grid;
+  gap: 9px;
+  margin-top: 15px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.asset-lifecycle > small {
+  color: var(--ink-muted);
+}
+
+.asset-lifecycle-state {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  color: #176f63;
+  background: #eef9f6;
+  border: 1px solid #cceae4;
+  border-radius: 10px;
+}
+
+.asset-lifecycle-state[data-state="retired"],
+.asset-lifecycle-state[data-state="superseded"] {
+  color: #775231;
+  background: #fff7eb;
+  border-color: #ebd6b4;
+}
+
+.asset-lifecycle-state code {
+  overflow-wrap: anywhere;
+  font-size: 10px;
+}
+
+.asset-current-pointer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0;
+}
+
+.asset-detail .asset-version-link {
+  min-height: 30px;
+  padding: 4px 6px;
+  color: var(--ultraviolet);
+  text-align: left;
+  overflow-wrap: anywhere;
+  background: transparent;
+  border: 0;
+  font-size: 10px;
+}
+
+.asset-version-link[aria-current="true"] {
+  font-weight: 850;
+}
+
+.asset-lifecycle-history > article {
+  display: grid;
+  gap: 5px;
+  padding-top: 11px;
+  border-top: 1px solid #dce2eb;
+}
+
+.asset-lifecycle-history > article > b {
+  font-size: 10px;
+}
+
+.asset-change-fact {
+  padding: 9px;
+  overflow-wrap: anywhere;
+  background: #fff;
+  border-radius: 8px;
+}
+
+.asset-change-fact p,
+.asset-retirement p,
+.asset-retirement-failure p {
+  margin: 5px 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.asset-detail .asset-retire-button {
+  color: #923e2a;
+  background: #fff0eb;
+  border-color: #e8bcaf;
+}
+
+.asset-retirement-failure {
+  padding: 11px;
+  overflow-wrap: anywhere;
+  color: #923e2a;
+  background: #fff0eb;
+  border: 1px solid #e8bcaf;
+  border-radius: 10px;
 }
 
 .asset-detail details small {

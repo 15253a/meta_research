@@ -34,6 +34,80 @@ export type AssetReceipt = {
   payload_hash: string;
 };
 
+export type AssetEvidenceBinding = {
+  asset_ref: string;
+  version_ref: string;
+  content_hash: string;
+  manifest_hash: string;
+  receipt: AssetReceipt;
+};
+
+export type AssetChangeImpact = {
+  work_ref: string;
+  judgment: "unaffected" | "recheck" | "redo" | "unknown";
+  explanation: string;
+};
+
+export type AssetChangeKind = "initial" | "supplement" | "substantive_change" | "correction" | "retirement";
+
+export type AssetChangeFact = {
+  change_ref: string;
+  kind: AssetChangeKind;
+  version_ref: string;
+  predecessor_version_ref: string | null;
+  explanation: string;
+  error?: string;
+  scope?: string;
+  evidence_bindings?: AssetEvidenceBinding[];
+  impact?: AssetChangeImpact[];
+  no_affected_work_explanation?: string;
+  receipt: AssetReceipt;
+  accepted_at: number;
+};
+
+export type AssetLifecycle = {
+  asset_ref: string;
+  revision: number;
+  current_version_ref: string | null;
+  versions: {
+    version_ref: string;
+    state: "current" | "superseded" | "retired" | "unselected";
+    predecessor_version_ref: string | null;
+    successor_version_refs: string[];
+    changes: AssetChangeFact[];
+  }[];
+  changes: AssetChangeFact[];
+};
+
+type AssetChangeBasis = {
+  predecessor_version_ref: string;
+  expected_revision: number;
+  explanation: string;
+};
+
+export type AssetChangeRequest = AssetChangeBasis & (
+  | { kind: "supplement" | "substantive_change" }
+  | {
+      kind: "correction";
+      error: string;
+      scope: string;
+      evidence_bindings: AssetEvidenceBinding[];
+      impact: AssetChangeImpact[];
+      no_affected_work_explanation?: string;
+    }
+);
+
+export type AssetRetirementRequest = {
+  expected_revision: number;
+  expected_reference_revision: number;
+  explanation: string;
+  low_value: true;
+  obsolete: true;
+  incorrect: true;
+  impact_understood: true;
+  has_explanation_value: false;
+};
+
 export type ResearchAssetItem = {
   asset_ref: string;
   version_ref: string;
@@ -122,6 +196,7 @@ export type ResearchAssetsView = {
 };
 
 export type ResearchAssetDetail = ResearchAssetItem & {
+  lifecycle: AssetLifecycle;
   revision: number;
   inventory_revision: number;
   custodies: ResearchAssetCustody[];
@@ -155,6 +230,7 @@ export type AssetIntakeRequest = {
   source_locator?: string;
   provenance?: Record<string, unknown>;
   asset_ref?: string;
+  change?: AssetChangeRequest;
   asynchronous?: boolean;
 };
 
@@ -2542,7 +2618,10 @@ export type HumanCollaborationProjection = {
 };
 
 export class ProductError extends Error {
-  constructor(public readonly code: string) {
+  constructor(
+    public readonly code: string,
+    public readonly details?: Record<string, unknown>,
+  ) {
     super(code);
   }
 }
@@ -3982,6 +4061,24 @@ export function fetchResearchAsset(
   );
 }
 
+export function fetchAssetLifecycle(assetRef: string, signal?: AbortSignal): Promise<AssetLifecycle> {
+  return readJson(`/api/v1/research-assets/assets/${encodeURIComponent(assetRef)}/lifecycle`, signal);
+}
+
+export function fetchCurrentResearchAsset(assetRef: string, signal?: AbortSignal): Promise<{
+  lifecycle: AssetLifecycle;
+  asset: ResearchAssetItem | null;
+}> {
+  return readJson(`/api/v1/research-assets/assets/${encodeURIComponent(assetRef)}/current`, signal);
+}
+
+export function retireResearchAsset(
+  versionRef: string,
+  judgment: AssetRetirementRequest,
+): Promise<AssetChangeFact> {
+  return writeJson(`/api/v1/research-assets/${encodeURIComponent(versionRef)}/retirement`, "POST", judgment);
+}
+
 function fetchAssetHistory<T>(
   memoryRef: string,
   kind: "roles" | "holds" | "release-assessments",
@@ -4436,13 +4533,17 @@ async function writeJson<T>(
   });
   if (!response.ok) {
     let code = `request_failed:${response.status}`;
+    let details: Record<string, unknown> | undefined;
     try {
-      const payload = (await response.json()) as { detail?: { code?: string } };
+      const payload = (await response.json()) as {
+        detail?: { code?: string; details?: Record<string, unknown> };
+      };
       code = payload.detail?.code ?? code;
+      details = payload.detail?.details;
     } catch {
       // The status remains an actionable fallback when the daemon cannot return JSON.
     }
-    throw new ProductError(code);
+    throw new ProductError(code, details);
   }
   const payload = (await response.json()) as T;
   if (options?.retainPending(payload)) await options.onRetained(payload, pendingWrite);

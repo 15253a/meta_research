@@ -26,6 +26,12 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from meta_research.database import Database
+from meta_research.owners.asset_lifecycle import (
+    AssetLifecycleOwnerMixin,
+    assert_asset_usable,
+    assert_scientific_asset_sources_usable,
+    validate_asset_change,
+)
 from meta_research.owners.research_literature_content import LiteratureContentPageReader, store_body, validate_body
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
@@ -245,6 +251,9 @@ class AssetIntakeRequest:
     provenance: dict[str, object] | None = None
     asset_ref: str | None = None
     asynchronous: bool = False
+    change: dict[str, object] | None = None
+    origin_quest_ref: str | None = None
+    effect_scope_required: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -257,6 +266,9 @@ class AssetIntakeRequest:
             "provenance": self.provenance,
             "asset_ref": self.asset_ref,
             "asynchronous": self.asynchronous,
+            "change": self.change,
+            "origin_quest_ref": self.origin_quest_ref,
+            "effect_scope_required": self.effect_scope_required,
         }
 
     def validate(self) -> None:
@@ -909,6 +921,7 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
         *,
         idempotency_key: str,
         operation_namespace: str | None = None,
+        effect_scope: Callable[[], None] | None = None,
     ) -> AssetIntakeResult: ...
 
     def linked_local_intake_mode(self, source_locator: str) -> str: ...
@@ -930,6 +943,30 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     def query_asset_version(
         self, memory_ref: str
     ) -> AcceptedAssetVersion | None: ...
+
+    def query_asset_lifecycle(self, asset_ref: str) -> dict[str, object]: ...
+
+    def query_current_asset(self, asset_ref: str) -> AcceptedAssetVersion | None: ...
+
+    def query_retirement_by_idempotency_key(
+        self, memory_ref: str, *, idempotency_key: str, **judgment
+    ) -> dict[str, object] | None: ...
+
+    def retire_asset_version(
+        self,
+        memory_ref: str,
+        *,
+        expected_revision: int,
+        expected_reference_revision: int,
+        explanation: str,
+        low_value: bool,
+        obsolete: bool,
+        incorrect: bool,
+        impact_understood: bool,
+        has_explanation_value: bool,
+        idempotency_key: str,
+        effect_scope: Callable[[], None] | None = None,
+    ) -> dict[str, object]: ...
 
     def query_asset_inventory(self) -> tuple[AssetInventoryItem, ...]: ...
 
@@ -2856,6 +2893,7 @@ class SQLiteResearchMemoryReceiptVerifier:
         self.verify_asset_receipt(**values)
         version_ref = values.get("version_ref")
         with self._database.read() as connection:
+            assert_asset_usable(connection, version_ref)
             row = connection.execute(
                 text(
                     "SELECT * FROM rm_asset_versions WHERE version_ref = "
@@ -3137,7 +3175,7 @@ class SQLiteResearchMemoryReceiptVerifier:
         return binding
 
 
-class SQLiteResearchMemory(HumanRequestOwnerMixin):
+class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,
@@ -3435,10 +3473,15 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         *,
         idempotency_key: str,
         operation_namespace: str | None = None,
+        effect_scope: Callable[[], None] | None = None,
     ) -> AssetIntakeResult:
         if not idempotency_key or len(idempotency_key) > 128:
             raise OwnerConflict("asset_intake_idempotency_key_invalid")
         request_document = _asset_request_document(request)
+        if effect_scope is not None:
+            request_document["effect_scope_required"] = True
+        if request_document.get("effect_scope_required") and effect_scope is None:
+            raise OwnerConflict("asset_effect_scope_required")
         request_json = canonical_json(request_document)
         request_hash = canonical_hash(request_document)
         provenance = request_document.get("provenance")
@@ -3564,7 +3607,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     },
                 )
         if sync_claimed:
-            self._process_asset_job(job_ref, already_claimed=True)
+            self._process_asset_job(job_ref, already_claimed=True, effect_scope=effect_scope)
         return self.query_asset_intake(job_ref)
 
     def linked_local_intake_mode(self, source_locator: str) -> str:
@@ -3590,6 +3633,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             row = connection.execute(
                 text(
                     "SELECT job_ref FROM rm_asset_intakes WHERE status = 'queued' "
+                    "AND CASE WHEN json_valid(request_json) THEN COALESCE(json_extract(request_json, '$.effect_scope_required'),0) ELSE 0 END=0 "
                     "AND next_attempt_at <= :now ORDER BY next_attempt_at, "
                     "updated_at, created_at, job_ref LIMIT 1"
                 ),
@@ -3737,7 +3781,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         return True
 
     def _process_asset_job(
-        self, job_ref: str, *, already_claimed: bool = False
+        self, job_ref: str, *, already_claimed: bool = False, effect_scope: Callable[[], None] | None = None
     ) -> None:
         with self._database.write() as connection:
             row = connection.execute(
@@ -3749,6 +3793,12 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             if row is None:
                 raise OwnerConflict("asset_intake_not_found")
             if row.status in {"accepted", "failed"}:
+                return
+            try:
+                requires_scope = decoded_object(row.request_json).get("effect_scope_required")
+            except (TypeError, ValueError):
+                requires_scope = False
+            if requires_scope and effect_scope is None:
                 return
             if already_claimed:
                 if row.status != "processing":
@@ -3782,7 +3832,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             )
             prepared = self._prepare_asset(request_document)
             phase = "accept_prepared_asset"
-            self._accept_prepared_asset(job_ref, request_document, prepared)
+            self._accept_prepared_asset(job_ref, request_document, prepared, effect_scope=effect_scope)
         except OwnerConflict as error:
             if error.code in TRANSIENT_ASSET_INTAKE_CONFLICTS:
                 self._requeue_asset_intake(job_ref, error=error, phase=phase)
@@ -4137,6 +4187,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         job_ref: str,
         request: dict[str, object],
         prepared: _PreparedAsset,
+        *, effect_scope: Callable[[], None] | None = None,
     ) -> None:
         if request.get("custody_mode") == "managed":
             _verify_managed_manifest(self._object_store, prepared.manifest)
@@ -4166,7 +4217,11 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         }
         provenance_json = canonical_json(provenance)
         provenance_hash = canonical_hash(provenance)
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
+            if request.get("effect_scope_required") and effect_scope is None:
+                raise OwnerConflict("asset_effect_scope_required")
+            if effect_scope is not None:
+                effect_scope()
             job = connection.execute(
                 text(
                     "SELECT * FROM rm_asset_intakes WHERE job_ref = :job_ref"
@@ -4294,6 +4349,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     "established_at": now,
                 },
             )
+            self._accept_asset_lifecycle(connection, asset_ref=asset_ref, version_ref=version_ref,
+                change=request.get("change"), origin_quest_ref=request.get("origin_quest_ref"),
+                idempotency_key=job.idempotency_key)
             connection.execute(
                 text(
                     "UPDATE rm_asset_verification_observations SET integrity = "
@@ -4873,8 +4931,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
     def read_asset_content_page(self, memory_ref: str, *, entry_path: str | None = None,
                                 offset: int = 0, limit: int = 8192) -> dict[str, object]:
         """Read an exact bounded page in original custody after receipt verification."""
-        return self._asset_content_pages.read_page(
+        page = self._asset_content_pages.read_page(
             memory_ref, entry_path=entry_path, offset=offset, limit=limit)
+        version = self.query_asset_version(memory_ref)
+        return {**page, "lifecycle": self.query_asset_lifecycle(version.asset_ref)}
 
     def describe_asset_export(self, memory_ref: str) -> AssetExportDescription:
         return self._receipt_verifier.describe_asset_export(memory_ref)
@@ -6113,6 +6173,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
     def verify_asset_binding(self, **values) -> None:
         self._receipt_verifier.verify_asset_binding(**values)
 
+    def assert_asset_usable(self, version_ref: str) -> None:
+        with self._database.read() as connection:
+            assert_asset_usable(connection, version_ref)
+
     @snapshot_cached
     def verify_asset_projection_binding(self, **values) -> None:
         """Verify an exact receipt against the last durable custody observation."""
@@ -6939,7 +7003,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             "execution_receipt_ref": execution_receipt.receipt_ref,
             "execution_receipt_hash": execution_receipt.payload_hash,
         }
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
                     "SELECT * FROM rm_idea_outcome_contents WHERE submission_ref = "
@@ -6950,91 +7014,89 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             if existing is not None:
                 if any(getattr(existing, key) != value for key, value in bindings.items()):
                     raise OwnerConflict("idea_content_acceptance_conflict")
-                _verify_idea_object(self._object_store, existing)
-                _verify_idea_payload(existing)
                 if existing.receipt_hash != _idea_content_receipt_hash(existing):
                     raise OwnerConflict("idea_content_receipt_invalid")
-                return _accepted_idea_content(existing)
-
-            content_ref = new_ref("idea_content")
-            receipt_ref = new_ref("rm_idea_content_receipt")
-            receipt_hash = _receipt_hash(
-                IDEA_CONTENT_RECEIPT_KIND, content_ref, bindings
-            )
-            accepted_at = time.time()
-            connection.execute(
-                text(
-                    "INSERT INTO rm_idea_outcome_contents (content_ref, "
-                    "request_ref, run_ref, attempt_ref, fence_ref, submission_ref, "
-                    "outcome_kind, outcome_json, outcome_hash, review_json, "
-                    "reviewed_draft_json, reviewed_draft_hash, review_hash, "
-                    "payload_json, payload_hash, object_path, "
-                    "execution_receipt_ref, execution_receipt_hash, receipt_ref, "
-                    "receipt_hash, accepted_at) VALUES (:content_ref, :request_ref, "
-                    ":run_ref, :attempt_ref, :fence_ref, :submission_ref, "
-                    ":outcome_kind, :outcome_json, :outcome_hash, :review_json, "
-                    ":reviewed_draft_json, :reviewed_draft_hash, :review_hash, "
-                    ":payload_json, :payload_hash, :object_path, "
-                    ":execution_receipt_ref, :execution_receipt_hash, :receipt_ref, "
-                    ":receipt_hash, :accepted_at)"
-                ),
-                {
-                    **bindings,
-                    "content_ref": content_ref,
-                    "outcome_json": outcome_json,
-                    "reviewed_draft_json": reviewed_draft_json,
-                    "review_json": review_json,
-                    "payload_json": payload_json,
-                    "object_path": object_path,
-                    "receipt_ref": receipt_ref,
-                    "receipt_hash": receipt_hash,
-                    "accepted_at": accepted_at,
-                },
-            )
-            _insert_managed_content_asset(
-                connection,
-                version_ref=content_ref,
-                source_kind="idea_outcome",
-                display_name="Idea outcome content",
-                content_hash=payload_hash,
-                content_json=payload_json,
-                object_path=object_path,
-                provenance={
-                    "source_table": "rm_idea_outcome_contents",
-                    "request_ref": request_ref,
-                    "run_ref": run_ref,
-                    "submission_ref": submission_ref,
-                },
-                acceptance_kind=IDEA_CONTENT_RECEIPT_KIND,
-                receipt_ref=receipt_ref,
-                receipt_hash=receipt_hash,
-                accepted_at=accepted_at,
-            )
-            connection.execute(
-                text(
-                    "UPDATE research_memory_state SET revision = revision + 1, "
-                    "asset_count = (SELECT COUNT(*) FROM rm_assets), "
-                    "asset_version_count = (SELECT COUNT(*) FROM "
-                    "rm_asset_versions), object_count = :object_count, "
-                    "idea_content_count = "
-                    "idea_content_count + 1 WHERE singleton = 'owner'"
-                ),
-                {"object_count": _managed_object_count(connection)},
-            )
-            self._feed.record(
-                connection,
-                "research_memory.idea_outcome_content_accepted",
-                {
-                    "request_ref": request_ref,
-                    "run_ref": run_ref,
-                    "attempt_ref": attempt_ref,
-                    "submission_ref": submission_ref,
-                    "content_ref": content_ref,
-                    "outcome_kind": kind,
-                    "payload_hash": payload_hash,
-                    "receipt_ref": receipt_ref,
-                },
-            )
+            else:
+                assert_scientific_asset_sources_usable(connection, payload)
+                content_ref = new_ref("idea_content")
+                receipt_ref = new_ref("rm_idea_content_receipt")
+                receipt_hash = _receipt_hash(
+                    IDEA_CONTENT_RECEIPT_KIND, content_ref, bindings
+                )
+                accepted_at = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO rm_idea_outcome_contents (content_ref, "
+                        "request_ref, run_ref, attempt_ref, fence_ref, submission_ref, "
+                        "outcome_kind, outcome_json, outcome_hash, review_json, "
+                        "reviewed_draft_json, reviewed_draft_hash, review_hash, "
+                        "payload_json, payload_hash, object_path, "
+                        "execution_receipt_ref, execution_receipt_hash, receipt_ref, "
+                        "receipt_hash, accepted_at) VALUES (:content_ref, :request_ref, "
+                        ":run_ref, :attempt_ref, :fence_ref, :submission_ref, "
+                        ":outcome_kind, :outcome_json, :outcome_hash, :review_json, "
+                        ":reviewed_draft_json, :reviewed_draft_hash, :review_hash, "
+                        ":payload_json, :payload_hash, :object_path, "
+                        ":execution_receipt_ref, :execution_receipt_hash, :receipt_ref, "
+                        ":receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "content_ref": content_ref,
+                        "outcome_json": outcome_json,
+                        "reviewed_draft_json": reviewed_draft_json,
+                        "review_json": review_json,
+                        "payload_json": payload_json,
+                        "object_path": object_path,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": accepted_at,
+                    },
+                )
+                _insert_managed_content_asset(
+                    connection,
+                    version_ref=content_ref,
+                    source_kind="idea_outcome",
+                    display_name="Idea outcome content",
+                    content_hash=payload_hash,
+                    content_json=payload_json,
+                    object_path=object_path,
+                    provenance={
+                        "source_table": "rm_idea_outcome_contents",
+                        "request_ref": request_ref,
+                        "run_ref": run_ref,
+                        "submission_ref": submission_ref,
+                    },
+                    acceptance_kind=IDEA_CONTENT_RECEIPT_KIND,
+                    receipt_ref=receipt_ref,
+                    receipt_hash=receipt_hash,
+                    accepted_at=accepted_at,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE research_memory_state SET revision = revision + 1, "
+                        "asset_count = (SELECT COUNT(*) FROM rm_assets), "
+                        "asset_version_count = (SELECT COUNT(*) FROM "
+                        "rm_asset_versions), object_count = :object_count, "
+                        "idea_content_count = "
+                        "idea_content_count + 1 WHERE singleton = 'owner'"
+                    ),
+                    {"object_count": _managed_object_count(connection)},
+                )
+                self._feed.record(
+                    connection,
+                    "research_memory.idea_outcome_content_accepted",
+                    {
+                        "request_ref": request_ref,
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "submission_ref": submission_ref,
+                        "content_ref": content_ref,
+                        "outcome_kind": kind,
+                        "payload_hash": payload_hash,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
         accepted = self.query_idea_outcome_content(submission_ref)
         if accepted is None:
             raise OwnerConflict("idea_content_missing_after_commit")
@@ -7068,6 +7130,56 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
 
     def verify_idea_content_receipt(self, **values) -> None:
         self._receipt_verifier.verify_idea_content_receipt(**values)
+
+    def _retained_scientific_asset_references(self, connection, version_ref):
+        references = []
+        for table, column, hash_column, receipt_hash in (
+            (
+                "rm_idea_outcome_contents",
+                "payload_json",
+                "payload_hash",
+                _idea_content_receipt_hash,
+            ),
+            (
+                "rm_plan_documents",
+                "plan_document_json",
+                "plan_document_hash",
+                _plan_content_receipt_hash,
+            ),
+            (
+                "rm_reasoning_scientific_candidates",
+                "checkpoint_json",
+                "checkpoint_hash",
+                _reasoning_scientific_candidate_receipt_hash,
+            ),
+            (
+                "rm_reasoning_contents",
+                "payload_json",
+                "payload_hash",
+                _reasoning_content_receipt_hash,
+            ),
+        ):
+            for row in connection.execute(
+                text(f"SELECT * FROM {table} ORDER BY content_ref")
+            ):
+                try:
+                    document = json.loads(getattr(row, column))
+                except (TypeError, ValueError) as error:
+                    raise OwnerConflict("reference_state_uncertain") from error
+                if (
+                    canonical_hash(document) != getattr(row, hash_column)
+                    or receipt_hash(row) != row.receipt_hash
+                ):
+                    raise OwnerConflict("reference_state_uncertain")
+                matched = connection.execute(
+                    text(
+                        f"SELECT 1 FROM {table} t, json_tree(t.{column}) j WHERE t.content_ref=:content AND j.type='text' AND j.value=:version LIMIT 1"
+                    ),
+                    {"content": row.content_ref, "version": version_ref},
+                ).first()
+                if matched is not None:
+                    references.append(f"{table}:{row.content_ref}")
+        return references
 
     def accept_plan_document(
         self,
@@ -7244,7 +7356,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             "execution_receipt_ref": execution_receipt.receipt_ref,
             "execution_receipt_hash": execution_receipt.payload_hash,
         }
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
                     "SELECT * FROM rm_plan_documents WHERE submission_ref = "
@@ -7260,104 +7372,102 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     raise OwnerConflict("plan_content_acceptance_conflict")
                 if existing.receipt_hash != _plan_content_receipt_hash(existing):
                     raise OwnerConflict("plan_content_receipt_invalid")
-                return _accepted_plan_document(
-                    self._object_store, existing, verified_request
+            else:
+                assert_scientific_asset_sources_usable(connection, plan_document)
+                content_ref = new_ref("plan_content")
+                receipt_ref = new_ref("rm_plan_content_receipt")
+                receipt_hash = _receipt_hash(
+                    PLAN_CONTENT_RECEIPT_KIND,
+                    content_ref,
+                    bindings,
                 )
-
-            content_ref = new_ref("plan_content")
-            receipt_ref = new_ref("rm_plan_content_receipt")
-            receipt_hash = _receipt_hash(
-                PLAN_CONTENT_RECEIPT_KIND,
-                content_ref,
-                bindings,
-            )
-            accepted_at = time.time()
-            connection.execute(
-                text(
-                    "INSERT INTO rm_plan_documents (content_ref, request_ref, "
-                    "run_ref, attempt_ref, fence_ref, submission_ref, "
-                    "initialization_id, quest_ref, question_ref, context_pack_ref, "
-                    "question_content_ref, question_content_hash, "
-                    "question_content_receipt_ref, question_content_receipt_hash, "
-                    "question_receipt_ref, question_receipt_hash, "
-                    "idea_outcome_ref, idea_content_ref, idea_content_hash, "
-                    "idea_content_receipt_ref, idea_content_receipt_hash, "
-                    "idea_outcome_receipt_ref, idea_outcome_receipt_hash, "
-                    "idea_stage_commit_ref, idea_stage_commit_receipt_ref, "
-                    "idea_stage_commit_receipt_hash, plan_document_json, "
-                    "plan_document_hash, answer_contract_hash, "
-                    "reviewed_draft_hash, review_hash, "
-                    "payload_hash, object_path, execution_receipt_ref, "
-                    "execution_receipt_hash, receipt_ref, receipt_hash, accepted_at) "
-                    "VALUES (:content_ref, :request_ref, :run_ref, :attempt_ref, "
-                    ":fence_ref, :submission_ref, :initialization_id, :quest_ref, "
-                    ":question_ref, :context_pack_ref, :question_content_ref, "
-                    ":question_content_hash, :question_content_receipt_ref, "
-                    ":question_content_receipt_hash, :question_receipt_ref, "
-                    ":question_receipt_hash, :idea_outcome_ref, :idea_content_ref, "
-                    ":idea_content_hash, :idea_content_receipt_ref, "
-                    ":idea_content_receipt_hash, :idea_outcome_receipt_ref, "
-                    ":idea_outcome_receipt_hash, :idea_stage_commit_ref, "
-                    ":idea_stage_commit_receipt_ref, "
-                    ":idea_stage_commit_receipt_hash, :plan_document_json, "
-                    ":plan_document_hash, :answer_contract_hash, "
-                    ":reviewed_draft_hash, :review_hash, :payload_hash, :object_path, "
-                    ":execution_receipt_ref, :execution_receipt_hash, "
-                    ":receipt_ref, :receipt_hash, :accepted_at)"
-                ),
-                {
-                    **bindings,
-                    "content_ref": content_ref,
-                    "plan_document_json": plan_document_json,
-                    "object_path": object_path,
-                    "receipt_ref": receipt_ref,
-                    "receipt_hash": receipt_hash,
-                    "accepted_at": accepted_at,
-                },
-            )
-            _insert_managed_content_asset(
-                connection,
-                version_ref=content_ref,
-                source_kind="system_artifact",
-                display_name="Accepted PlanDocument",
-                content_hash=payload_hash,
-                content_json=payload_json,
-                object_path=object_path,
-                provenance={
-                    "source_table": "rm_plan_documents",
-                    "request_ref": request_ref,
-                    "run_ref": run_ref,
-                    "submission_ref": submission_ref,
-                },
-                acceptance_kind=PLAN_CONTENT_RECEIPT_KIND,
-                receipt_ref=receipt_ref,
-                receipt_hash=receipt_hash,
-                accepted_at=accepted_at,
-            )
-            connection.execute(
-                text(
-                    "UPDATE research_memory_state SET revision = revision + 1, "
-                    "asset_count = (SELECT COUNT(*) FROM rm_assets), "
-                    "asset_version_count = (SELECT COUNT(*) FROM "
-                    "rm_asset_versions), object_count = :object_count, "
-                    "plan_content_count = plan_content_count + 1 "
-                    "WHERE singleton = 'owner'"
-                ),
-                {"object_count": _managed_object_count(connection)},
-            )
-            self._feed.record(
-                connection,
-                "research_memory.plan_document_accepted",
-                {
-                    "request_ref": request_ref,
-                    "run_ref": run_ref,
-                    "attempt_ref": attempt_ref,
-                    "submission_ref": submission_ref,
-                    "content_ref": content_ref,
-                    "plan_document_hash": plan_document_hash,
-                    "receipt_ref": receipt_ref,
-                },
-            )
+                accepted_at = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO rm_plan_documents (content_ref, request_ref, "
+                        "run_ref, attempt_ref, fence_ref, submission_ref, "
+                        "initialization_id, quest_ref, question_ref, context_pack_ref, "
+                        "question_content_ref, question_content_hash, "
+                        "question_content_receipt_ref, question_content_receipt_hash, "
+                        "question_receipt_ref, question_receipt_hash, "
+                        "idea_outcome_ref, idea_content_ref, idea_content_hash, "
+                        "idea_content_receipt_ref, idea_content_receipt_hash, "
+                        "idea_outcome_receipt_ref, idea_outcome_receipt_hash, "
+                        "idea_stage_commit_ref, idea_stage_commit_receipt_ref, "
+                        "idea_stage_commit_receipt_hash, plan_document_json, "
+                        "plan_document_hash, answer_contract_hash, "
+                        "reviewed_draft_hash, review_hash, "
+                        "payload_hash, object_path, execution_receipt_ref, "
+                        "execution_receipt_hash, receipt_ref, receipt_hash, accepted_at) "
+                        "VALUES (:content_ref, :request_ref, :run_ref, :attempt_ref, "
+                        ":fence_ref, :submission_ref, :initialization_id, :quest_ref, "
+                        ":question_ref, :context_pack_ref, :question_content_ref, "
+                        ":question_content_hash, :question_content_receipt_ref, "
+                        ":question_content_receipt_hash, :question_receipt_ref, "
+                        ":question_receipt_hash, :idea_outcome_ref, :idea_content_ref, "
+                        ":idea_content_hash, :idea_content_receipt_ref, "
+                        ":idea_content_receipt_hash, :idea_outcome_receipt_ref, "
+                        ":idea_outcome_receipt_hash, :idea_stage_commit_ref, "
+                        ":idea_stage_commit_receipt_ref, "
+                        ":idea_stage_commit_receipt_hash, :plan_document_json, "
+                        ":plan_document_hash, :answer_contract_hash, "
+                        ":reviewed_draft_hash, :review_hash, :payload_hash, :object_path, "
+                        ":execution_receipt_ref, :execution_receipt_hash, "
+                        ":receipt_ref, :receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "content_ref": content_ref,
+                        "plan_document_json": plan_document_json,
+                        "object_path": object_path,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": accepted_at,
+                    },
+                )
+                _insert_managed_content_asset(
+                    connection,
+                    version_ref=content_ref,
+                    source_kind="system_artifact",
+                    display_name="Accepted PlanDocument",
+                    content_hash=payload_hash,
+                    content_json=payload_json,
+                    object_path=object_path,
+                    provenance={
+                        "source_table": "rm_plan_documents",
+                        "request_ref": request_ref,
+                        "run_ref": run_ref,
+                        "submission_ref": submission_ref,
+                    },
+                    acceptance_kind=PLAN_CONTENT_RECEIPT_KIND,
+                    receipt_ref=receipt_ref,
+                    receipt_hash=receipt_hash,
+                    accepted_at=accepted_at,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE research_memory_state SET revision = revision + 1, "
+                        "asset_count = (SELECT COUNT(*) FROM rm_assets), "
+                        "asset_version_count = (SELECT COUNT(*) FROM "
+                        "rm_asset_versions), object_count = :object_count, "
+                        "plan_content_count = plan_content_count + 1 "
+                        "WHERE singleton = 'owner'"
+                    ),
+                    {"object_count": _managed_object_count(connection)},
+                )
+                self._feed.record(
+                    connection,
+                    "research_memory.plan_document_accepted",
+                    {
+                        "request_ref": request_ref,
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "submission_ref": submission_ref,
+                        "content_ref": content_ref,
+                        "plan_document_hash": plan_document_hash,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
         accepted = self.query_plan_document(submission_ref)
         if accepted is None:
             raise OwnerConflict("plan_content_missing_after_commit")
@@ -7597,7 +7707,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             "checkpoint_receipt_ref": checkpoint_receipt.receipt_ref,
             "checkpoint_receipt_hash": checkpoint_receipt.payload_hash,
         }
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
                     "SELECT * FROM rm_reasoning_scientific_candidates WHERE "
@@ -7613,126 +7723,112 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     raise OwnerConflict(
                         "reasoning_scientific_candidate_acceptance_conflict"
                     )
-                _verify_reasoning_scientific_candidate_object(
-                    self._object_store, existing
-                )
-                _verify_reasoning_scientific_candidate_payload(
-                    existing,
-                    revision_verifier=(
-                        self._receipt_verifier.verify_question_literature_revision
-                    ),
-                    revision_reader=self.query_question_literature_revision_ref,
-                    reference_reader=self._reference_reader,
-                )
                 if existing.receipt_hash != (
                     _reasoning_scientific_candidate_receipt_hash(existing)
                 ):
                     raise OwnerConflict(
                         "reasoning_scientific_candidate_receipt_invalid"
                     )
-                return _accepted_reasoning_scientific_candidate(
-                    existing,
-                    revision_reader=self.query_question_literature_revision_ref,
-                    reference_reader=self._reference_reader,
+            else:
+                assert_scientific_asset_sources_usable(connection, checkpoint)
+                content_ref = new_ref("reasoning_scientific_candidate")
+                receipt_ref = new_ref("rm_reasoning_scientific_candidate_receipt")
+                receipt_hash = _receipt_hash(
+                    REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+                    content_ref,
+                    bindings,
                 )
-            content_ref = new_ref("reasoning_scientific_candidate")
-            receipt_ref = new_ref("rm_reasoning_scientific_candidate_receipt")
-            receipt_hash = _receipt_hash(
-                REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
-                content_ref,
-                bindings,
-            )
-            accepted_at = time.time()
-            connection.execute(
-                text(
-                    "INSERT INTO rm_reasoning_scientific_candidates "
-                    "(content_ref, request_ref, cycle_ref, foreground_epoch, "
-                    "context_pack_ref, context_pack_json, context_pack_hash, "
-                    "stage_request_receipt_ref, stage_request_receipt_hash, "
-                    "run_ref, attempt_ref, fence_ref, submission_ref, "
-                    "checkpoint_ref, checkpoint_json, checkpoint_hash, "
-                    "scientific_outcome_ref, scientific_outcome_json, "
-                    "outcome_hash, scientific_disposition, "
-                    "autonomous_scope_json, autonomous_scope_hash, "
-                    "evidence_closure_json, evidence_closure_hash, review_json, "
-                    "reviewed_draft_hash, review_hash, object_path, "
-                    "checkpoint_receipt_kind, "
-                    "checkpoint_receipt_ref, checkpoint_receipt_hash, "
-                    "receipt_ref, receipt_hash, accepted_at) VALUES "
-                    "(:content_ref, :request_ref, :cycle_ref, "
-                    ":foreground_epoch, :context_pack_ref, :context_pack_json, "
-                    ":context_pack_hash, :stage_request_receipt_ref, "
-                    ":stage_request_receipt_hash, :run_ref, :attempt_ref, "
-                    ":fence_ref, :submission_ref, :checkpoint_ref, "
-                    ":checkpoint_json, :checkpoint_hash, "
-                    ":scientific_outcome_ref, :scientific_outcome_json, "
-                    ":outcome_hash, :scientific_disposition, "
-                    ":autonomous_scope_json, :autonomous_scope_hash, "
-                    ":evidence_closure_json, :evidence_closure_hash, "
-                    ":review_json, :reviewed_draft_hash, :review_hash, "
-                    ":object_path, "
-                    ":checkpoint_receipt_kind, :checkpoint_receipt_ref, "
-                    ":checkpoint_receipt_hash, :receipt_ref, :receipt_hash, "
-                    ":accepted_at)"
-                ),
-                {
-                    **bindings,
-                    "content_ref": content_ref,
-                    "context_pack_json": context_pack_json,
-                    "checkpoint_json": checkpoint_json,
-                    "scientific_outcome_json": scientific_outcome_json,
-                    "autonomous_scope_json": autonomous_scope_json,
-                    "evidence_closure_json": evidence_closure_json,
-                    "review_json": review_json,
-                    "object_path": object_path,
-                    "receipt_ref": receipt_ref,
-                    "receipt_hash": receipt_hash,
-                    "accepted_at": accepted_at,
-                },
-            )
-            _insert_managed_content_asset(
-                connection,
-                version_ref=content_ref,
-                source_kind="system_artifact",
-                display_name="Accepted Reasoning scientific candidate",
-                content_hash=checkpoint_hash,
-                content_json=checkpoint_json,
-                object_path=object_path,
-                provenance={
-                    "source_table": "rm_reasoning_scientific_candidates",
-                    "request_ref": request_ref,
-                    "run_ref": run_ref,
-                    "checkpoint_ref": checkpoint_ref,
-                },
-                acceptance_kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
-                receipt_ref=receipt_ref,
-                receipt_hash=receipt_hash,
-                accepted_at=accepted_at,
-            )
-            connection.execute(
-                text(
-                    "UPDATE research_memory_state SET revision = revision + 1, "
-                    "asset_count = (SELECT COUNT(*) FROM rm_assets), "
-                    "asset_version_count = (SELECT COUNT(*) FROM "
-                    "rm_asset_versions), object_count = :object_count, "
-                    "reasoning_scientific_candidate_count = "
-                    "reasoning_scientific_candidate_count + 1 WHERE "
-                    "singleton = 'owner'"
-                ),
-                {"object_count": _managed_object_count(connection)},
-            )
-            self._feed.record(
-                connection,
-                "research_memory.reasoning_scientific_candidate_accepted",
-                {
-                    "request_ref": request_ref,
-                    "run_ref": run_ref,
-                    "checkpoint_ref": checkpoint_ref,
-                    "content_ref": content_ref,
-                    "scientific_outcome_ref": scientific_outcome_ref,
-                    "receipt_ref": receipt_ref,
-                },
-            )
+                accepted_at = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO rm_reasoning_scientific_candidates "
+                        "(content_ref, request_ref, cycle_ref, foreground_epoch, "
+                        "context_pack_ref, context_pack_json, context_pack_hash, "
+                        "stage_request_receipt_ref, stage_request_receipt_hash, "
+                        "run_ref, attempt_ref, fence_ref, submission_ref, "
+                        "checkpoint_ref, checkpoint_json, checkpoint_hash, "
+                        "scientific_outcome_ref, scientific_outcome_json, "
+                        "outcome_hash, scientific_disposition, "
+                        "autonomous_scope_json, autonomous_scope_hash, "
+                        "evidence_closure_json, evidence_closure_hash, review_json, "
+                        "reviewed_draft_hash, review_hash, object_path, "
+                        "checkpoint_receipt_kind, "
+                        "checkpoint_receipt_ref, checkpoint_receipt_hash, "
+                        "receipt_ref, receipt_hash, accepted_at) VALUES "
+                        "(:content_ref, :request_ref, :cycle_ref, "
+                        ":foreground_epoch, :context_pack_ref, :context_pack_json, "
+                        ":context_pack_hash, :stage_request_receipt_ref, "
+                        ":stage_request_receipt_hash, :run_ref, :attempt_ref, "
+                        ":fence_ref, :submission_ref, :checkpoint_ref, "
+                        ":checkpoint_json, :checkpoint_hash, "
+                        ":scientific_outcome_ref, :scientific_outcome_json, "
+                        ":outcome_hash, :scientific_disposition, "
+                        ":autonomous_scope_json, :autonomous_scope_hash, "
+                        ":evidence_closure_json, :evidence_closure_hash, "
+                        ":review_json, :reviewed_draft_hash, :review_hash, "
+                        ":object_path, "
+                        ":checkpoint_receipt_kind, :checkpoint_receipt_ref, "
+                        ":checkpoint_receipt_hash, :receipt_ref, :receipt_hash, "
+                        ":accepted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "content_ref": content_ref,
+                        "context_pack_json": context_pack_json,
+                        "checkpoint_json": checkpoint_json,
+                        "scientific_outcome_json": scientific_outcome_json,
+                        "autonomous_scope_json": autonomous_scope_json,
+                        "evidence_closure_json": evidence_closure_json,
+                        "review_json": review_json,
+                        "object_path": object_path,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": accepted_at,
+                    },
+                )
+                _insert_managed_content_asset(
+                    connection,
+                    version_ref=content_ref,
+                    source_kind="system_artifact",
+                    display_name="Accepted Reasoning scientific candidate",
+                    content_hash=checkpoint_hash,
+                    content_json=checkpoint_json,
+                    object_path=object_path,
+                    provenance={
+                        "source_table": "rm_reasoning_scientific_candidates",
+                        "request_ref": request_ref,
+                        "run_ref": run_ref,
+                        "checkpoint_ref": checkpoint_ref,
+                    },
+                    acceptance_kind=REASONING_SCIENTIFIC_CANDIDATE_RECEIPT_KIND,
+                    receipt_ref=receipt_ref,
+                    receipt_hash=receipt_hash,
+                    accepted_at=accepted_at,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE research_memory_state SET revision = revision + 1, "
+                        "asset_count = (SELECT COUNT(*) FROM rm_assets), "
+                        "asset_version_count = (SELECT COUNT(*) FROM "
+                        "rm_asset_versions), object_count = :object_count, "
+                        "reasoning_scientific_candidate_count = "
+                        "reasoning_scientific_candidate_count + 1 WHERE "
+                        "singleton = 'owner'"
+                    ),
+                    {"object_count": _managed_object_count(connection)},
+                )
+                self._feed.record(
+                    connection,
+                    "research_memory.reasoning_scientific_candidate_accepted",
+                    {
+                        "request_ref": request_ref,
+                        "run_ref": run_ref,
+                        "checkpoint_ref": checkpoint_ref,
+                        "content_ref": content_ref,
+                        "scientific_outcome_ref": scientific_outcome_ref,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
         accepted = self.query_reasoning_scientific_candidate(submission_ref)
         if accepted is None:
             raise OwnerConflict(
@@ -8470,7 +8566,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             "execution_receipt_ref": execution_receipt.receipt_ref,
             "execution_receipt_hash": execution_receipt.payload_hash,
         }
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
             existing = connection.execute(
                 text(
                     "SELECT * FROM rm_reasoning_contents WHERE submission_ref = "
@@ -8484,134 +8580,121 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     for key, value in bindings.items()
                 ):
                     raise OwnerConflict("reasoning_content_acceptance_conflict")
-                _verify_reasoning_object(self._object_store, existing)
-                _verify_reasoning_payload(
-                    existing,
-                    revision_verifier=(
-                        self._receipt_verifier.verify_question_literature_revision
-                    ),
-                    revision_reader=self.query_question_literature_revision_ref,
-                    reference_reader=self._reference_reader,
-                )
                 if existing.receipt_hash != _reasoning_content_receipt_hash(
                     existing
                 ):
                     raise OwnerConflict("reasoning_content_receipt_invalid")
-                return _accepted_reasoning_content(
-                    existing,
-                    revision_reader=self.query_question_literature_revision_ref,
-                    reference_reader=self._reference_reader,
+            else:
+                assert_scientific_asset_sources_usable(connection, payload)
+                content_ref = new_ref("reasoning_content")
+                receipt_ref = new_ref("rm_reasoning_content_receipt")
+                receipt_hash = _receipt_hash(
+                    REASONING_CONTENT_RECEIPT_KIND,
+                    content_ref,
+                    bindings,
                 )
-
-            content_ref = new_ref("reasoning_content")
-            receipt_ref = new_ref("rm_reasoning_content_receipt")
-            receipt_hash = _receipt_hash(
-                REASONING_CONTENT_RECEIPT_KIND,
-                content_ref,
-                bindings,
-            )
-            accepted_at = time.time()
-            connection.execute(
-                text(
-                    "INSERT INTO rm_reasoning_contents (content_ref, request_ref, "
-                    "cycle_ref, foreground_epoch, context_pack_ref, "
-                    "context_pack_json, context_pack_hash, "
-                    "stage_request_receipt_ref, stage_request_receipt_hash, "
-                    "run_ref, attempt_ref, fence_ref, submission_ref, "
-                    "outcome_json, payload_json, payload_hash, "
-                    "scientific_outcome_ref, scientific_outcome_json, "
-                    "outcome_hash, scientific_disposition, transition_kind, "
-                    "transition_ref, transition_json, transition_hash, "
-                    "evidence_closure_json, evidence_closure_hash, "
-                    "reviewed_draft_json, reviewed_draft_hash, review_json, "
-                    "review_hash, scientific_candidate_content_ref, "
-                    "scientific_candidate_content_receipt_ref, "
-                    "scientific_candidate_content_receipt_hash, "
-                    "scientific_candidate_domain_receipt_ref, "
-                    "scientific_candidate_domain_receipt_hash, object_path, "
-                    "execution_receipt_kind, "
-                    "execution_receipt_ref, execution_receipt_hash, receipt_ref, "
-                    "receipt_hash, accepted_at) VALUES (:content_ref, "
-                    ":request_ref, :cycle_ref, :foreground_epoch, "
-                    ":context_pack_ref, :context_pack_json, :context_pack_hash, "
-                    ":stage_request_receipt_ref, :stage_request_receipt_hash, "
-                    ":run_ref, :attempt_ref, :fence_ref, :submission_ref, "
-                    ":outcome_json, :payload_json, :payload_hash, "
-                    ":scientific_outcome_ref, :scientific_outcome_json, "
-                    ":outcome_hash, :scientific_disposition, :transition_kind, "
-                    ":transition_ref, :transition_json, :transition_hash, "
-                    ":evidence_closure_json, :evidence_closure_hash, "
-                    ":reviewed_draft_json, :reviewed_draft_hash, :review_json, "
-                    ":review_hash, :scientific_candidate_content_ref, "
-                    ":scientific_candidate_content_receipt_ref, "
-                    ":scientific_candidate_content_receipt_hash, "
-                    ":scientific_candidate_domain_receipt_ref, "
-                    ":scientific_candidate_domain_receipt_hash, :object_path, "
-                    ":execution_receipt_kind, "
-                    ":execution_receipt_ref, :execution_receipt_hash, "
-                    ":receipt_ref, :receipt_hash, :accepted_at)"
-                ),
-                {
-                    **bindings,
-                    "content_ref": content_ref,
-                    "context_pack_json": context_pack_json,
-                    "outcome_json": outcome_json,
-                    "payload_json": payload_json,
-                    "scientific_outcome_json": scientific_outcome_json,
-                    "transition_json": transition_json,
-                    "evidence_closure_json": evidence_closure_json,
-                    "reviewed_draft_json": reviewed_draft_json,
-                    "review_json": review_json,
-                    "object_path": object_path,
-                    "receipt_ref": receipt_ref,
-                    "receipt_hash": receipt_hash,
-                    "accepted_at": accepted_at,
-                },
-            )
-            _insert_managed_content_asset(
-                connection,
-                version_ref=content_ref,
-                source_kind="system_artifact",
-                display_name="Accepted Reasoning content",
-                content_hash=payload_hash,
-                content_json=payload_json,
-                object_path=object_path,
-                provenance={
-                    "source_table": "rm_reasoning_contents",
-                    "request_ref": request_ref,
-                    "run_ref": run_ref,
-                    "submission_ref": submission_ref,
-                },
-                acceptance_kind=REASONING_CONTENT_RECEIPT_KIND,
-                receipt_ref=receipt_ref,
-                receipt_hash=receipt_hash,
-                accepted_at=accepted_at,
-            )
-            connection.execute(
-                text(
-                    "UPDATE research_memory_state SET revision = revision + 1, "
-                    "asset_count = (SELECT COUNT(*) FROM rm_assets), "
-                    "asset_version_count = (SELECT COUNT(*) FROM "
-                    "rm_asset_versions), object_count = :object_count, "
-                    "reasoning_content_count = reasoning_content_count + 1 "
-                    "WHERE singleton = 'owner'"
-                ),
-                {"object_count": _managed_object_count(connection)},
-            )
-            self._feed.record(
-                connection,
-                "research_memory.reasoning_content_accepted",
-                {
-                    "request_ref": request_ref,
-                    "run_ref": run_ref,
-                    "attempt_ref": attempt_ref,
-                    "submission_ref": submission_ref,
-                    "content_ref": content_ref,
-                    "scientific_outcome_ref": scientific_outcome_ref,
-                    "transition_ref": transition_ref,
-                    "receipt_ref": receipt_ref,
-                },
-            )
+                accepted_at = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO rm_reasoning_contents (content_ref, request_ref, "
+                        "cycle_ref, foreground_epoch, context_pack_ref, "
+                        "context_pack_json, context_pack_hash, "
+                        "stage_request_receipt_ref, stage_request_receipt_hash, "
+                        "run_ref, attempt_ref, fence_ref, submission_ref, "
+                        "outcome_json, payload_json, payload_hash, "
+                        "scientific_outcome_ref, scientific_outcome_json, "
+                        "outcome_hash, scientific_disposition, transition_kind, "
+                        "transition_ref, transition_json, transition_hash, "
+                        "evidence_closure_json, evidence_closure_hash, "
+                        "reviewed_draft_json, reviewed_draft_hash, review_json, "
+                        "review_hash, scientific_candidate_content_ref, "
+                        "scientific_candidate_content_receipt_ref, "
+                        "scientific_candidate_content_receipt_hash, "
+                        "scientific_candidate_domain_receipt_ref, "
+                        "scientific_candidate_domain_receipt_hash, object_path, "
+                        "execution_receipt_kind, "
+                        "execution_receipt_ref, execution_receipt_hash, receipt_ref, "
+                        "receipt_hash, accepted_at) VALUES (:content_ref, "
+                        ":request_ref, :cycle_ref, :foreground_epoch, "
+                        ":context_pack_ref, :context_pack_json, :context_pack_hash, "
+                        ":stage_request_receipt_ref, :stage_request_receipt_hash, "
+                        ":run_ref, :attempt_ref, :fence_ref, :submission_ref, "
+                        ":outcome_json, :payload_json, :payload_hash, "
+                        ":scientific_outcome_ref, :scientific_outcome_json, "
+                        ":outcome_hash, :scientific_disposition, :transition_kind, "
+                        ":transition_ref, :transition_json, :transition_hash, "
+                        ":evidence_closure_json, :evidence_closure_hash, "
+                        ":reviewed_draft_json, :reviewed_draft_hash, :review_json, "
+                        ":review_hash, :scientific_candidate_content_ref, "
+                        ":scientific_candidate_content_receipt_ref, "
+                        ":scientific_candidate_content_receipt_hash, "
+                        ":scientific_candidate_domain_receipt_ref, "
+                        ":scientific_candidate_domain_receipt_hash, :object_path, "
+                        ":execution_receipt_kind, "
+                        ":execution_receipt_ref, :execution_receipt_hash, "
+                        ":receipt_ref, :receipt_hash, :accepted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "content_ref": content_ref,
+                        "context_pack_json": context_pack_json,
+                        "outcome_json": outcome_json,
+                        "payload_json": payload_json,
+                        "scientific_outcome_json": scientific_outcome_json,
+                        "transition_json": transition_json,
+                        "evidence_closure_json": evidence_closure_json,
+                        "reviewed_draft_json": reviewed_draft_json,
+                        "review_json": review_json,
+                        "object_path": object_path,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": accepted_at,
+                    },
+                )
+                _insert_managed_content_asset(
+                    connection,
+                    version_ref=content_ref,
+                    source_kind="system_artifact",
+                    display_name="Accepted Reasoning content",
+                    content_hash=payload_hash,
+                    content_json=payload_json,
+                    object_path=object_path,
+                    provenance={
+                        "source_table": "rm_reasoning_contents",
+                        "request_ref": request_ref,
+                        "run_ref": run_ref,
+                        "submission_ref": submission_ref,
+                    },
+                    acceptance_kind=REASONING_CONTENT_RECEIPT_KIND,
+                    receipt_ref=receipt_ref,
+                    receipt_hash=receipt_hash,
+                    accepted_at=accepted_at,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE research_memory_state SET revision = revision + 1, "
+                        "asset_count = (SELECT COUNT(*) FROM rm_assets), "
+                        "asset_version_count = (SELECT COUNT(*) FROM "
+                        "rm_asset_versions), object_count = :object_count, "
+                        "reasoning_content_count = reasoning_content_count + 1 "
+                        "WHERE singleton = 'owner'"
+                    ),
+                    {"object_count": _managed_object_count(connection)},
+                )
+                self._feed.record(
+                    connection,
+                    "research_memory.reasoning_content_accepted",
+                    {
+                        "request_ref": request_ref,
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "submission_ref": submission_ref,
+                        "content_ref": content_ref,
+                        "scientific_outcome_ref": scientific_outcome_ref,
+                        "transition_ref": transition_ref,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
         accepted = self.query_reasoning_content(submission_ref)
         if accepted is None:
             raise OwnerConflict("reasoning_content_missing_after_commit")
@@ -10806,6 +10889,13 @@ def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
         not asset_ref.strip() or len(asset_ref) > 64 or "\x00" in asset_ref
     ):
         raise OwnerConflict("asset_ref_invalid")
+    if request.origin_quest_ref is not None and (
+        not isinstance(request.origin_quest_ref, str) or not request.origin_quest_ref
+        or len(request.origin_quest_ref) > 128
+    ):
+        raise OwnerConflict("asset_origin_quest_invalid")
+    if type(request.effect_scope_required) is not bool:
+        raise OwnerConflict("asset_effect_scope_invalid")
     return {
         "source_kind": request.source_kind,
         "custody_mode": request.custody_mode,
@@ -10820,6 +10910,9 @@ def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
         "provenance": provenance,
         "asset_ref": None if asset_ref is None else asset_ref.strip(),
         "asynchronous": bool(request.asynchronous),
+        **({"change": validate_asset_change(request.change, asset_ref)} if request.change is not None else {}),
+        **({"origin_quest_ref": request.origin_quest_ref} if request.origin_quest_ref is not None else {}),
+        **({"effect_scope_required": True} if request.effect_scope_required else {}),
     }
 
 
@@ -10833,7 +10926,7 @@ def _validated_stored_asset_request(
         document = decoded_object(stored_request_json)
         if (
             canonical_json(document) != stored_request_json
-            or set(document)
+            or set(document) - {"change", "origin_quest_ref", "effect_scope_required"}
             != {
                 "source_kind",
                 "custody_mode",
@@ -10866,6 +10959,9 @@ def _validated_stored_asset_request(
             provenance=document["provenance"],
             asset_ref=document["asset_ref"],
             asynchronous=document["asynchronous"],
+            change=document.get("change"),
+            origin_quest_ref=document.get("origin_quest_ref"),
+            effect_scope_required=document.get("effect_scope_required", False),
         )
         normalized = _asset_request_document(request)
         if normalized != document:

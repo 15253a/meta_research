@@ -33,6 +33,7 @@ from meta_research.target_execution_contract import (
     TargetMetricValue, valid_target_metric_value, validate_target_result_tree,
 )
 from meta_research.database import Database
+from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.research_notes import (
     FINAL_STATEMENT_PATH, research_note_metadata, research_note_metadata_from_path,
 )
@@ -724,6 +725,7 @@ class SQLiteTargetRootCompletionMemoryAuthority:
                         raise OwnerConflict("target_root_manifest_conflict")
                     manifest_ref = str(row.manifest_ref)
                 else:
+                    assert_asset_payload_usable(connection, payload)
                     manifest_ref = new_ref("target_root_manifest")
                     receipt = _receipt(
                         "research_memory",
