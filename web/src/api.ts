@@ -60,6 +60,7 @@ export type AssetChangeFact = {
   scope?: string;
   evidence_bindings?: AssetEvidenceBinding[];
   impact?: AssetChangeImpact[];
+  no_affected_work_explanation?: string;
   receipt: AssetReceipt;
   accepted_at: number;
 };
@@ -92,6 +93,7 @@ export type AssetChangeRequest = AssetChangeBasis & (
       scope: string;
       evidence_bindings: AssetEvidenceBinding[];
       impact: AssetChangeImpact[];
+      no_affected_work_explanation?: string;
     }
 );
 

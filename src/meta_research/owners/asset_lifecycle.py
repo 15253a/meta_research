@@ -37,6 +37,7 @@ def validate_asset_change(change, asset_ref):
         "scope",
         "evidence_bindings",
         "impact",
+        "no_affected_work_explanation",
     }
     if set(change) - allowed or change.get("kind") not in {
         "supplement",
@@ -49,6 +50,7 @@ def validate_asset_change(change, asset_ref):
         "scope",
         "evidence_bindings",
         "impact",
+        "no_affected_work_explanation",
     }:
         raise OwnerConflict("asset_change_correction_fields_invalid")
     if (
@@ -75,6 +77,11 @@ def validate_asset_change(change, asset_ref):
         impact = change.get("impact", [])
         if not isinstance(impact, list) or len(impact) > 256:
             raise OwnerConflict("asset_correction_impact_invalid")
+        if not impact or "no_affected_work_explanation" in change:
+            result["no_affected_work_explanation"] = _description(
+                change.get("no_affected_work_explanation"),
+                "no_affected_work_explanation",
+            )
         result["impact"] = []
         for item in impact:
             if (

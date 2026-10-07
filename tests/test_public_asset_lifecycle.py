@@ -224,6 +224,111 @@ def test_fresh_hold_and_unknown_impact_block_retirement(tmp_path: Path):
         runtime.close()
 
 
+@pytest.mark.parametrize("impact", [None, []], ids=["omitted", "empty"])
+def test_correction_requires_explicit_assessment_when_no_work_is_listed(
+    tmp_path: Path, impact
+):
+    from test_public_research_asset_roles import _runtime, _accepted_quest
+
+    runtime = _runtime(tmp_path / "missing-assessment")
+    try:
+        memory, graph = runtime.owners.research_memory, runtime.owners.research_graph
+        quest = _accepted_quest(runtime)
+        first = intake(memory, b"density: 1000 g\n", "wrong")
+        basis = intake(memory, b"instrument sheet: 1000 mg\n", "basis")
+        role = graph.accept_asset_role(
+            binding=first.as_binding(),
+            role="evidence",
+            quest_ref=quest.quest_ref,
+            idempotency_key="existing-density-use",
+        )
+        change = {
+            "kind": "correction",
+            "predecessor_version_ref": first.version_ref,
+            "expected_revision": 1,
+            "explanation": "Corrects the transcribed unit.",
+            "error": "Milligrams were transcribed as grams.",
+            "scope": "Density observation.",
+            "evidence_bindings": [basis.as_binding().as_dict()],
+        }
+        if impact is not None:
+            change["impact"] = impact
+        with pytest.raises(
+            OwnerConflict, match="asset_change_no_affected_work_explanation_required"
+        ):
+            intake(
+                memory, b"density: 1000 mg\n", "missing-assessment",
+                asset_ref=first.asset_ref, change=change,
+            )
+        assert memory.query_current_asset(first.asset_ref) == first
+        assert len(memory.query_asset_lifecycle(first.asset_ref)["changes"]) == 1
+        assert (
+            graph.accept_asset_role(
+                binding=first.as_binding(), role="evidence", quest_ref=quest.quest_ref,
+                idempotency_key="existing-density-use",
+            ) == role
+        )
+    finally:
+        runtime.close()
+
+
+def test_correction_records_a_checked_no_affected_work_assessment(tmp_path: Path):
+    root = prepare_data_root(tmp_path / "no-affected-work")
+    runtime = build_production_runtime(root)
+    try:
+        memory = runtime.owners.research_memory
+        first = intake(memory, b"draft: 1000 g\n", "wrong")
+        basis = intake(memory, b"instrument sheet: 1000 mg\n", "basis")
+        explanation = "Checked this unused draft and its origin Quest; no accepted analysis uses this observation."
+        change = {
+            "kind": "correction",
+            "predecessor_version_ref": first.version_ref,
+            "expected_revision": 1,
+            "explanation": "Corrects the draft transcription.",
+            "error": "Milligrams were transcribed as grams.",
+            "scope": "Unused density draft.",
+            "evidence_bindings": [basis.as_binding().as_dict()],
+        }
+        for index, value in enumerate((None, "", " \n ", 7)):
+            with pytest.raises(
+                OwnerConflict,
+                match="asset_change_no_affected_work_explanation_required",
+            ):
+                intake(
+                    memory, b"draft: 1000 mg\n", "invalid-" + str(index),
+                    asset_ref=first.asset_ref,
+                    change={**change, "no_affected_work_explanation": value},
+                )
+        change["no_affected_work_explanation"] = "  " + explanation + "  "
+        corrected = intake(
+            memory, b"draft: 1000 mg\n", "correct",
+            asset_ref=first.asset_ref, change=change,
+        )
+        fact = memory.query_asset_lifecycle(first.asset_ref)["changes"][-1]
+        assert fact["impact"] == []
+        assert fact["no_affected_work_explanation"] == explanation
+        assert (
+            intake(memory, b"draft: 1000 mg\n", "correct",
+                   asset_ref=first.asset_ref, change=change) == corrected
+        )
+        assert memory.materialize_asset(first.version_ref).content == b"draft: 1000 g\n"
+        assert memory.query_asset_version(first.version_ref).receipt == first.receipt
+        with pytest.raises(OwnerConflict, match="asset_intake_idempotency_conflict"):
+            intake(
+                memory, b"draft: 1000 mg\n", "correct", asset_ref=first.asset_ref,
+                change={**change, "no_affected_work_explanation": "Different assessment."},
+            )
+    finally:
+        runtime.close()
+    reopened = build_production_runtime(root)
+    try:
+        memory = reopened.owners.research_memory
+        assert memory.query_asset_lifecycle(first.asset_ref)["changes"][-1] == fact
+        assert memory.query_current_asset(first.asset_ref) == corrected
+    finally:
+        reopened.close()
+
+
 def test_correction_keeps_exact_evidence_scope_and_work_judgments(tmp_path: Path):
     runtime = build_production_runtime(prepare_data_root(tmp_path / "correction"))
     try:
@@ -263,6 +368,7 @@ def test_correction_keeps_exact_evidence_scope_and_work_judgments(tmp_path: Path
         assert fact["scope"] == "Density observation only."
         assert fact["evidence_bindings"][0]["version_ref"] == evidence.version_ref
         assert [row["judgment"] for row in fact["impact"]] == ["recheck", "unknown"]
+        assert "no_affected_work_explanation" not in fact
         assert (
             memory.materialize_asset(first.version_ref).content == b"density: 1000 mg\n"
         )

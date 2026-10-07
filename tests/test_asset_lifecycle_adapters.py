@@ -36,8 +36,8 @@ def channel(runtime, question, generation=1):
             {
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments},
+                "method": "tools/list" if name is None else "tools/call",
+                "params": {} if name is None else {"name": name, "arguments": arguments},
             },
         )
         return response["result"]
@@ -261,6 +261,15 @@ def test_http_and_semantic_share_exact_correction_and_retirement_contract(tmp_pa
                 )["structuredContent"]["asset"]
                 is None
             )
+            retired_page = call("research_memory.assets.page")["structuredContent"]
+            retired_item = next(
+                item for item in retired_page["items"]
+                if item["asset"]["asset_ref"] == disposable["asset_ref"]
+            )
+            assert retired_item["asset"]["version_ref"] == disposable["version_ref"]
+            assert retired_item["lifecycle"]["current_version_ref"] is None
+            assert retired_item["lifecycle"]["versions"][0]["state"] == "retired"
+            assert retired_item["lifecycle"]["changes"][-1] == fact
             assert (
                 call(
                     "research_memory.content.read",
@@ -287,6 +296,114 @@ def test_http_and_semantic_share_exact_correction_and_retirement_contract(tmp_pa
                     "research_memory.assets.current", version_ref=first["version_ref"]
                 )["isError"]
                 is True
+            )
+    finally:
+        runtime.close()
+
+
+def test_http_and_semantic_require_and_preserve_a_no_affected_work_assessment(tmp_path):
+    runtime = _runtime(tmp_path / "no-work-assessment")
+    client, headers = _authenticated_client(runtime)
+    try:
+        question = _quest(runtime, "no-work")
+        call = channel(runtime, question)
+        discovered = next(
+            tool for tool in call(None)["tools"]
+            if tool["name"] == "research_memory.assets.intake"
+        )
+        change_schema = discovered["inputSchema"]["properties"]["intake"]["properties"]["change"]
+        assert "no_affected_work_explanation" in change_schema["properties"]
+        assert "Required for correction when impact is omitted or empty" in change_schema["properties"]["no_affected_work_explanation"]["description"]
+
+        def intake(key, literal, **values):
+            result = call(
+                "research_memory.assets.intake", effect_id=key,
+                intake={
+                    "source_kind": "text", "custody_mode": "managed",
+                    "display_name": key + ".txt", "text": literal, **values,
+                },
+            )
+            assert not result["isError"], result
+            assert result["structuredContent"]["status"] == "accepted"
+            return result["structuredContent"]["asset"]
+
+        first = intake("unused-draft", "unused draft: 1000 g\n")
+        basis = intake("calibration", "instrument sheet: 1000 mg\n")
+        change = {
+            "kind": "correction", "predecessor_version_ref": first["version_ref"],
+            "expected_revision": 1, "explanation": "Corrects the unused draft unit.",
+            "error": "Milligrams were transcribed as grams.", "scope": "Unused draft.",
+            "evidence_bindings": [{
+                key: basis[key] for key in (
+                    "asset_ref", "version_ref", "content_hash", "manifest_hash", "receipt"
+                )
+            }],
+            "impact": [],
+        }
+        body = {
+            "source_kind": "text", "custody_mode": "managed",
+            "display_name": "checked-draft.txt", "text": "unused draft: 1000 mg\n",
+            "asset_ref": first["asset_ref"], "change": change,
+        }
+        with client:
+            denied = client.post(
+                "/api/v1/research-assets/intakes", json=body,
+                headers={**headers, "Idempotency-Key": "no-assessment"},
+            )
+            assert denied.status_code == 422, denied.text
+            assert (
+                denied.json()["detail"]["code"]
+                == "asset_change_no_affected_work_explanation_required"
+            )
+            denied = call(
+                "research_memory.assets.intake", effect_id="no-assessment", intake=body
+            )
+            assert denied["isError"]
+            assert (
+                denied["structuredContent"]["code"]
+                == "asset_change_no_affected_work_explanation_required"
+            )
+            assessment = "Checked the Quest inventory and this unused draft; no accepted work uses this observation."
+            change["no_affected_work_explanation"] = assessment
+            accepted = client.post(
+                "/api/v1/research-assets/intakes", json=body,
+                headers={**headers, "Idempotency-Key": "checked-assessment"},
+            )
+            assert accepted.status_code == 201, accepted.text
+            second = accepted.json()["asset"]
+            assert client.post(
+                "/api/v1/research-assets/intakes", json=body,
+                headers={**headers, "Idempotency-Key": "checked-assessment"},
+            ).json()["asset"] == second
+            detail = client.get("/api/v1/research-assets/" + first["version_ref"]).json()
+            fact = detail["lifecycle"]["changes"][-1]
+            assert fact["impact"] == []
+            assert fact["no_affected_work_explanation"] == assessment
+            change = {key: value for key, value in change.items() if key != "impact"}
+            change.update(predecessor_version_ref=second["version_ref"], expected_revision=2)
+            arguments = {
+                "effect_id": "semantic-checked-assessment",
+                "intake": {**body, "text": "unused draft: 1 g\n", "change": change},
+            }
+            third = call("research_memory.assets.intake", **arguments)
+            assert not third["isError"], third
+            assert third["structuredContent"]["status"] == "accepted"
+            assert (
+                call("research_memory.assets.intake", **arguments)["structuredContent"]
+                == third["structuredContent"]
+            )
+            assert (
+                call("research_memory.assets.intake.reconcile", **arguments)["structuredContent"]
+                == {"status": "accepted", "result": third["structuredContent"]}
+            )
+            current = call(
+                "research_memory.assets.current", version_ref=first["version_ref"]
+            )["structuredContent"]
+            assert current["lifecycle"]["changes"][-1]["no_affected_work_explanation"] == assessment
+            assert current["lifecycle"]["changes"][-1]["impact"] == []
+            assert (
+                client.get("/api/v1/research-assets/" + first["version_ref"] + "/content").content
+                == b"unused draft: 1000 g\n"
             )
     finally:
         runtime.close()

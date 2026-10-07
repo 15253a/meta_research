@@ -258,6 +258,10 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
                     "additionalProperties": False,
                 },
             },
+            "no_affected_work_explanation": {
+                **string,
+                "description": "Required for correction when impact is omitted or empty. Explain the checked scope and why no work is affected. If impact is uncertain, list the actual work with judgment unknown instead.",
+            },
         },
         "required": [
             "kind",
@@ -266,6 +270,21 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
             "explanation",
         ],
         "additionalProperties": False,
+        "allOf": [
+            {
+                "if": {"properties": {"kind": {"const": "correction"}}},
+                "then": {
+                    "required": ["error", "scope", "evidence_bindings"],
+                    "anyOf": [
+                        {
+                            "required": ["impact"],
+                            "properties": {"impact": {"minItems": 1}},
+                        },
+                        {"required": ["no_affected_work_explanation"]},
+                    ],
+                },
+            }
+        ],
     }
     retirement = {
         "version_ref": string,
@@ -302,7 +321,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
                     reconciliation_operation_id=None
                     if reconcile
                     else name + ".reconcile",
-                    description="Accept an asset supplement, substantive change, or correction atomically with its exact predecessor, explanation and current selection. Correction requires error, exact evidence bindings, scope, and per-work recheck/redo/unaffected/unknown judgments. Retirement requires confirmed low value, obsolescence and error, understood impact and no explanatory value; fresh references and holds block it. Failure, negative results and goal changes never trigger retirement. All historical bytes are retained. Keep the same effect_id and exact payload when reconciling. A queued intake awaits an authorized caller: retry the same effect and payload with the current root scope; background workers cannot accept it without that scope.",
+                    description="Accept an asset supplement, substantive change, or correction atomically with its exact predecessor, explanation and current selection. Correction requires error, exact evidence bindings, scope, and per-work recheck/redo/unaffected/unknown judgments; if no work is affected, record no_affected_work_explanation with the checked scope and reason. Retirement requires confirmed low value, obsolescence and error, understood impact and no explanatory value; fresh references and holds block it. Failure, negative results and goal changes never trigger retirement. All historical bytes are retained. Keep the same effect_id and exact payload when reconciling. A queued intake awaits an authorized caller: retry the same effect and payload with the current root scope; background workers cannot accept it without that scope.",
                     input_schema={
                         "type": "object",
                         "properties": properties,

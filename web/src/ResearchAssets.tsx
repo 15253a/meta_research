@@ -45,6 +45,7 @@ type ChangeDraft = {
   scope: string;
   evidenceRefs: string[];
   impact: AssetChangeImpact[];
+  noAffectedWorkExplanation: string;
 };
 type CommandReceipt = {
   versionRef: string;
@@ -95,6 +96,7 @@ function emptyChangeDraft(versionRef: string | null): ChangeDraft {
     scope: "",
     evidenceRefs: versionRef ? [versionRef] : [],
     impact: [],
+    noAffectedWorkExplanation: "",
   };
 }
 
@@ -801,6 +803,9 @@ export function ResearchAssetsWorkbench({
         };
         let change: AssetChangeRequest;
         if (changeDraft.kind === "correction") {
+          if (!changeDraft.impact.length && !changeDraft.noAffectedWorkExplanation.trim()) {
+            throw new ProductError("asset_change_no_affected_work_explanation_required");
+          }
           const evidence = changeDraft.evidenceRefs.map((ref) => view.items.find((item) => item.memory_ref === ref));
           if (!changeDraft.error.trim() || !changeDraft.scope.trim()
             || !evidence.length || evidence.some((item) => !item)
@@ -824,6 +829,9 @@ export function ResearchAssetsWorkbench({
               work_ref: item.work_ref.trim(),
               explanation: item.explanation.trim(),
             })),
+            ...(!changeDraft.impact.length ? {
+              no_affected_work_explanation: changeDraft.noAffectedWorkExplanation.trim(),
+            } : {}),
           };
         } else change = { ...basis, kind: changeDraft.kind };
         request.asset_ref = selected.asset_ref;
@@ -915,6 +923,9 @@ export function ResearchAssetsWorkbench({
                 && (!changeDraft.error.trim() || !changeDraft.scope.trim() || !changeDraft.evidenceRefs.length
                   || changeDraft.impact.some((item) => !item.work_ref.trim() || !item.explanation.trim()))
                 ? "请补全错误、更正范围、精确证据和已添加的影响判断。"
+                : createNextVersion && changeDraft.kind === "correction"
+                  && !changeDraft.impact.length && !changeDraft.noAffectedWorkExplanation.trim()
+                  ? "请说明已核查的工作范围，以及没有受影响工作的理由。"
                 : null;
 
   return (
@@ -1461,7 +1472,14 @@ function ChangeFields({ draft, items, busy, onChange }: {
             ))}
           </details>
           <div className="asset-impact-fields">
-            <small>逐项说明受影响工作。无受影响工作时，请在变更说明写明核查范围与理由。</small>
+            <small>逐项说明受影响工作。影响尚未查明时，添加实际工作并选“待核实”。</small>
+            {!draft.impact.length ? (
+              <label>
+                <span>无受影响工作核查说明</span>
+                <textarea aria-label="无受影响工作核查说明" rows={3} value={draft.noAffectedWorkExplanation} onChange={(event) => onChange({ ...draft, noAffectedWorkExplanation: event.target.value })} required />
+                <small>写明已核查的工作范围，以及判断没有受影响工作的理由。</small>
+              </label>
+            ) : null}
             {draft.impact.map((impact, index) => (
               <fieldset key={index}>
                 <legend>受影响工作 {index + 1}</legend>
@@ -1562,6 +1580,7 @@ function AssetLifecyclePanel({ item, lifecycle, busy, failure, onVersion, onReti
                     <p>{change.explanation}</p>
                     {change.error ? <p>错误说明 · {change.error}</p> : null}
                     {change.scope ? <p>更正范围 · {change.scope}</p> : null}
+                    {change.no_affected_work_explanation ? <p>无受影响工作核查 · {change.no_affected_work_explanation}</p> : null}
                     {change.evidence_bindings?.length ? (
                       <details>
                         <summary>精确更正依据</summary>
