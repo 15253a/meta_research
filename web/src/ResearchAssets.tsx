@@ -21,9 +21,14 @@ import {
   pendingAssetIntakeJobRef,
   placeAssetHold,
   ProductError,
+  retireResearchAsset,
   releaseAssetHold,
   submitAssetIntake,
   type AssetIntakeRequest,
+  type AssetChangeImpact,
+  type AssetChangeKind,
+  type AssetChangeRequest,
+  type AssetLifecycle,
   type AssetReceipt,
   type ResearchAssetItem,
   type ResearchAssetsView,
@@ -33,6 +38,14 @@ import { ResearchLibrary } from "./ResearchLibrary";
 import { OutputLanguageControl, useOutputLanguage } from "./OutputLanguage";
 
 type IntakeKind = AssetIntakeRequest["source_kind"];
+type ChangeDraft = {
+  kind: "supplement" | "substantive_change" | "correction";
+  explanation: string;
+  error: string;
+  scope: string;
+  evidenceRefs: string[];
+  impact: AssetChangeImpact[];
+};
 type CommandReceipt = {
   versionRef: string;
   label: string;
@@ -58,6 +71,32 @@ const sourceLabels: Record<IntakeKind, string> = {
   link: "链接",
   system_artifact: "系统产物",
 };
+
+const changeLabels: Record<AssetChangeKind, string> = {
+  initial: "首次保留",
+  supplement: "补充",
+  substantive_change: "实质变更",
+  correction: "更正",
+  retirement: "退役",
+};
+
+const lifecycleLabels = {
+  current: "当前可复用版本",
+  superseded: "已有后继版本",
+  retired: "已退役",
+  unselected: "尚未选为当前版本",
+};
+
+function emptyChangeDraft(versionRef: string | null): ChangeDraft {
+  return {
+    kind: "supplement",
+    explanation: "",
+    error: "",
+    scope: "",
+    evidenceRefs: versionRef ? [versionRef] : [],
+    impact: [],
+  };
+}
 
 export function ResearchAssetsWorkbench({
   initial,
@@ -104,6 +143,14 @@ export function ResearchAssetsWorkbench({
   const [fileReadError, setFileReadError] = useState<string | null>(null);
   const [asynchronous, setAsynchronous] = useState(false);
   const [createNextVersion, setCreateNextVersion] = useState(false);
+  const [changeDraft, setChangeDraft] = useState<ChangeDraft>(() => emptyChangeDraft(selectedRef));
+  const [lifecycleDetail, setLifecycleDetail] = useState<{
+    versionRef: string;
+    lifecycle: AssetLifecycle;
+    referenceRevision: number;
+  } | null>(null);
+  const [lifecycleQueryTick, setLifecycleQueryTick] = useState(0);
+  const [retirementFailure, setRetirementFailure] = useState<ProductError | null>(null);
   const [busy, setBusy] = useState<string | null>(() =>
     pendingAssetIntakeJobRef() ? "intake" : null,
   );
@@ -173,6 +220,7 @@ export function ResearchAssetsWorkbench({
     [selectedRef, view.release_assessments],
   );
   const activeHold = selectedHolds.find((item) => item.active)?.hold_ref ?? null;
+  const lifecycle = lifecycleDetail?.versionRef === selectedRef ? lifecycleDetail.lifecycle : null;
 
   useEffect(() => {
     selectedRefRef.current = selectedRef;
@@ -265,13 +313,9 @@ export function ResearchAssetsWorkbench({
   }, [initial]);
 
   useEffect(() => {
-    if (
-      !selectedRef ||
-      initial.items.some((item) => item.memory_ref === selectedRef)
-    ) {
-      return;
-    }
+    if (!selectedRef) return;
     const controller = new AbortController();
+    setLifecycleDetail(null);
     void fetchResearchAsset(selectedRef, controller.signal)
       .then((detail) => {
         if (controller.signal.aborted) return;
@@ -282,6 +326,11 @@ export function ResearchAssetsWorkbench({
         ) {
           return;
         }
+        setLifecycleDetail({
+          versionRef: selectedRef,
+          lifecycle: detail.lifecycle,
+          referenceRevision: detail.reference_revision,
+        });
         projectionRevisionRef.current = detail.revision;
         setView((current) => ({
           ...current,
@@ -318,7 +367,7 @@ export function ResearchAssetsWorkbench({
     return () => {
       controller.abort();
     };
-  }, [initial.items, initial.revision, selectedRef]);
+  }, [initial.items, initial.revision, lifecycleQueryTick, selectedRef]);
 
   const refresh = useCallback(async (preferredRef?: string) => {
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -376,6 +425,7 @@ export function ResearchAssetsWorkbench({
           : next.items[0]?.memory_ref ?? null;
       setHistoryCursor(emptyHistoryCursor(nextSelected));
       setSelectedRef(nextSelected);
+      setLifecycleQueryTick((current) => current + 1);
       return next;
     }
     throw new ProductError("research_asset_projection_stale");
@@ -545,7 +595,9 @@ export function ResearchAssetsWorkbench({
   }, [intakeWorkerReady]);
 
   useEffect(() => {
-    if (!selectedRef) setCreateNextVersion(false);
+    setCreateNextVersion(false);
+    setChangeDraft(emptyChangeDraft(selectedRef));
+    setRetirementFailure(null);
     setReleaseResult(null);
     setHistoryCursor(emptyHistoryCursor(selectedRef));
   }, [selectedRef]);
@@ -719,7 +771,45 @@ export function ResearchAssetsWorkbench({
         asynchronous: asynchronous && intakeWorkerReady,
         provenance: { submitted_via: "lumen_research_asset_workbench" },
       };
-      if (createNextVersion && selected) request.asset_ref = selected.asset_ref;
+      if (createNextVersion && selected) {
+        if (!lifecycle || lifecycle.current_version_ref !== selected.memory_ref) {
+          throw new ProductError("asset_current_version_required");
+        }
+        const basis = {
+          predecessor_version_ref: selected.memory_ref,
+          expected_revision: lifecycle.revision,
+          explanation: changeDraft.explanation.trim(),
+        };
+        let change: AssetChangeRequest;
+        if (changeDraft.kind === "correction") {
+          const evidence = changeDraft.evidenceRefs.map((ref) => view.items.find((item) => item.memory_ref === ref));
+          if (!changeDraft.error.trim() || !changeDraft.scope.trim()
+            || !evidence.length || evidence.some((item) => !item)
+            || changeDraft.impact.some((item) => !item.work_ref.trim() || !item.explanation.trim())) {
+            throw new ProductError("asset_correction_basis_required");
+          }
+          change = {
+            ...basis,
+            kind: "correction",
+            error: changeDraft.error.trim(),
+            scope: changeDraft.scope.trim(),
+            evidence_bindings: evidence.flatMap((item) => item ? [{
+              asset_ref: item.asset_ref,
+              version_ref: item.memory_ref,
+              content_hash: item.content_hash,
+              manifest_hash: item.manifest_hash,
+              receipt: item.receipt,
+            }] : []),
+            impact: changeDraft.impact.map((item) => ({
+              ...item,
+              work_ref: item.work_ref.trim(),
+              explanation: item.explanation.trim(),
+            })),
+          };
+        } else change = { ...basis, kind: changeDraft.kind };
+        request.asset_ref = selected.asset_ref;
+        request.change = change;
+      }
       if (sourceKind === "text") request.text = textContent;
       else if (sourceKind === "file") {
         if (fileContent === null) throw new ProductError("asset_file_required");
@@ -798,7 +888,15 @@ export function ResearchAssetsWorkbench({
         ? "上次提交仍在恢复中，请等待结果。"
         : sourceKind === "file" && fileContent === null
           ? fileReadError ?? "请先选择一个文件。"
-          : null;
+          : createNextVersion && lifecycle?.current_version_ref !== selectedRef
+            ? "请先读取并选择当前版本，再提交变更。"
+            : createNextVersion && !changeDraft.explanation.trim()
+              ? "请说明这次变更及其影响。"
+              : createNextVersion && changeDraft.kind === "correction"
+                && (!changeDraft.error.trim() || !changeDraft.scope.trim() || !changeDraft.evidenceRefs.length
+                  || changeDraft.impact.some((item) => !item.work_ref.trim() || !item.explanation.trim()))
+                ? "请补全错误、更正范围、精确证据和已添加的影响判断。"
+                : null;
 
   return (
     <dialog
@@ -948,7 +1046,7 @@ export function ResearchAssetsWorkbench({
                   aria-label="作为所选 AssetRef 的下一版本"
                   type="checkbox"
                   checked={createNextVersion}
-                  disabled={busy !== null || !selected}
+                  disabled={busy !== null || !selected || lifecycle?.current_version_ref !== selectedRef}
                   onChange={(event) => setCreateNextVersion(event.target.checked)}
                 />
                 <span>
@@ -957,6 +1055,17 @@ export function ResearchAssetsWorkbench({
                     : "先从盘点中选择一个 AssetRef，或创建全新资产"}
                 </span>
               </label>
+              {selected && lifecycle?.current_version_ref !== selectedRef ? (
+                <small>变更以当前版本为基础。请在版本详情中打开当前版本。</small>
+              ) : null}
+              {createNextVersion ? (
+                <ChangeFields
+                  draft={changeDraft}
+                  items={view.items}
+                  busy={busy !== null}
+                  onChange={setChangeDraft}
+                />
+              ) : null}
               <label className="asset-check">
                 <input
                   type="checkbox"
@@ -1007,6 +1116,7 @@ export function ResearchAssetsWorkbench({
                       type="button"
                       role="listitem"
                       className={item.memory_ref === selectedRef ? "selected" : ""}
+                      disabled={busy !== null}
                       onClick={() => setSelectedRef(item.memory_ref)}
                     >
                       <span className="asset-kind">{item.source_kind}</span>
@@ -1034,6 +1144,39 @@ export function ResearchAssetsWorkbench({
               </div>
               <AssetDetail
                 item={selected}
+                lifecycle={lifecycle}
+                retirementFailure={retirementFailure}
+                onVersion={(versionRef) => setSelectedRef(versionRef)}
+                onRetire={async (explanation) => {
+                  if (!selected || !lifecycle || !lifecycleDetail) return;
+                  const versionRef = selected.memory_ref;
+                  setBusy("retirement");
+                  setError(null);
+                  setRetirementFailure(null);
+                  try {
+                    const result = await retireResearchAsset(versionRef, {
+                      expected_revision: lifecycle.revision,
+                      expected_reference_revision: lifecycleDetail.referenceRevision,
+                      explanation,
+                      low_value: true,
+                      obsolete: true,
+                      incorrect: true,
+                      impact_understood: true,
+                      has_explanation_value: false,
+                    });
+                    setCommandReceipt({ versionRef, label: "版本退役", receipt: result.receipt });
+                    const message = "退役已接纳。所选版本已退出新复用，精确历史与原始内容仍可阅读。";
+                    setNotice(message);
+                    await refreshAfterAcceptedCommand(message, versionRef);
+                  } catch (caught) {
+                    const failure = caught instanceof ProductError ? caught : new ProductError("unknown_error");
+                    setRetirementFailure(failure);
+                    setError(failure.code);
+                    setLifecycleQueryTick((current) => current + 1);
+                  } finally {
+                    setBusy(null);
+                  }
+                }}
                 custodies={selectedCustodies}
                 roles={selectedRoles}
                 referenceRevision={view.reference_revision}
@@ -1249,8 +1392,219 @@ export function ResearchAssetsWorkbench({
   );
 }
 
+function ChangeFields({ draft, items, busy, onChange }: {
+  draft: ChangeDraft;
+  items: ResearchAssetItem[];
+  busy: boolean;
+  onChange: (draft: ChangeDraft) => void;
+}) {
+  return (
+    <fieldset className="asset-change-fields" disabled={busy}>
+      <legend>说明版本变更</legend>
+      <label>
+        <span>变更类型</span>
+        <select aria-label="资产变更类型" value={draft.kind} onChange={(event) => onChange({ ...draft, kind: event.target.value as ChangeDraft["kind"] })}>
+          <option value="supplement">补充</option>
+          <option value="substantive_change">实质变更</option>
+          <option value="correction">更正</option>
+        </select>
+      </label>
+      <label>
+        <span>变更说明与影响</span>
+        <textarea aria-label="资产变更说明" rows={3} value={draft.explanation} onChange={(event) => onChange({ ...draft, explanation: event.target.value })} required />
+      </label>
+      {draft.kind === "correction" ? (
+        <>
+          <label>
+            <span>发现的错误</span>
+            <textarea aria-label="更正错误说明" rows={2} value={draft.error} onChange={(event) => onChange({ ...draft, error: event.target.value })} required />
+          </label>
+          <label>
+            <span>更正范围</span>
+            <textarea aria-label="更正范围" rows={2} value={draft.scope} onChange={(event) => onChange({ ...draft, scope: event.target.value })} required />
+          </label>
+          <details open className="asset-evidence-picker">
+            <summary>更正依据的精确版本</summary>
+            <small>所选版本的内容哈希、manifest 哈希和接纳凭据会随更正提交。</small>
+            {items.map((item) => (
+              <label className="asset-check" key={item.memory_ref}>
+                <input
+                  type="checkbox"
+                  aria-label={`更正依据 ${item.memory_ref}`}
+                  checked={draft.evidenceRefs.includes(item.memory_ref)}
+                  onChange={(event) => onChange({
+                    ...draft,
+                    evidenceRefs: event.target.checked
+                      ? [...draft.evidenceRefs, item.memory_ref]
+                      : draft.evidenceRefs.filter((ref) => ref !== item.memory_ref),
+                  })}
+                />
+                <span>{item.display_name} · v{item.version_number}<small>{item.memory_ref}</small></span>
+              </label>
+            ))}
+          </details>
+          <div className="asset-impact-fields">
+            <small>逐项说明受影响工作。无受影响工作时，请在变更说明写明核查范围与理由。</small>
+            {draft.impact.map((impact, index) => (
+              <fieldset key={index}>
+                <legend>受影响工作 {index + 1}</legend>
+                <label>
+                  <span>工作引用</span>
+                  <input aria-label={`影响工作 ${index + 1}`} value={impact.work_ref} onChange={(event) => onChange({ ...draft, impact: draft.impact.map((row, position) => position === index ? { ...row, work_ref: event.target.value } : row) })} required />
+                </label>
+                <label>
+                  <span>影响判断</span>
+                  <select aria-label={`影响判断 ${index + 1}`} value={impact.judgment} onChange={(event) => onChange({ ...draft, impact: draft.impact.map((row, position) => position === index ? { ...row, judgment: event.target.value as AssetChangeImpact["judgment"] } : row) })}>
+                    <option value="unknown">待核实</option>
+                    <option value="unaffected">不受影响</option>
+                    <option value="recheck">需要复核</option>
+                    <option value="redo">需要重做</option>
+                  </select>
+                </label>
+                <label>
+                  <span>判断理由</span>
+                  <textarea aria-label={`影响理由 ${index + 1}`} rows={2} value={impact.explanation} onChange={(event) => onChange({ ...draft, impact: draft.impact.map((row, position) => position === index ? { ...row, explanation: event.target.value } : row) })} required />
+                </label>
+                <button type="button" onClick={() => onChange({ ...draft, impact: draft.impact.filter((_, position) => position !== index) })}>移除这项工作</button>
+              </fieldset>
+            ))}
+            <button type="button" onClick={() => onChange({ ...draft, impact: [...draft.impact, { work_ref: "", judgment: "unknown", explanation: "" }] })}>添加受影响工作</button>
+          </div>
+        </>
+      ) : null}
+    </fieldset>
+  );
+}
+
+const retirementChecks = [
+  { key: "low_value", label: "已确认这份内容价值低" },
+  { key: "obsolete", label: "已确认这份内容已过时" },
+  { key: "incorrect", label: "已确认这份内容有误" },
+  { key: "impact_understood", label: "已核清对相关工作的影响" },
+  { key: "no_explanation_value", label: "已确认没有需要继续保留的解释价值" },
+] as const;
+
+const impactLabels: Record<AssetChangeImpact["judgment"], string> = {
+  unaffected: "不受影响",
+  recheck: "需要复核",
+  redo: "需要重做",
+  unknown: "待核实",
+};
+
+function AssetLifecyclePanel({ item, lifecycle, busy, failure, onVersion, onRetire }: {
+  item: ResearchAssetItem;
+  lifecycle: AssetLifecycle | null;
+  busy: boolean;
+  failure: ProductError | null;
+  onVersion: (versionRef: string) => void;
+  onRetire: (explanation: string) => Promise<void>;
+}) {
+  const [explanation, setExplanation] = useState("");
+  const [confirmed, setConfirmed] = useState<string[]>([]);
+  const selected = lifecycle?.versions.find((version) => version.version_ref === item.memory_ref);
+  const currentVersionRef = lifecycle?.current_version_ref;
+  const predecessorVersionRef = selected?.predecessor_version_ref;
+  const allConfirmed = retirementChecks.every((check) => confirmed.includes(check.key));
+  const strings = (key: string) => {
+    const value = failure?.details?.[key];
+    return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+  };
+  return (
+    <section className="asset-lifecycle" aria-label="资产当前版本与保留历史">
+      <div className="asset-lifecycle-state" data-state={selected?.state}>
+        <small>所选精确版本</small>
+        <b>{selected ? lifecycleLabels[selected.state] : "正在读取版本状态…"}</b>
+        <code>{item.memory_ref}</code>
+      </div>
+      {lifecycle ? (
+        <>
+          <p className="asset-current-pointer">
+            <span>当前复用入口</span>
+            {currentVersionRef ? (
+              currentVersionRef === item.memory_ref
+                ? <strong>指向所选版本</strong>
+                : <button type="button" disabled={busy} onClick={() => onVersion(currentVersionRef)}>打开当前版本</button>
+            ) : <strong>暂无当前可复用版本</strong>}
+          </p>
+          <small>旧版本与退役版本保留原始内容及变更说明。下载始终读取所选精确版本。</small>
+          {predecessorVersionRef ? (
+            <button type="button" className="asset-version-link" disabled={busy} onClick={() => onVersion(predecessorVersionRef)}>打开前序版本 · {predecessorVersionRef}</button>
+          ) : null}
+          {selected?.successor_version_refs.map((ref) => (
+            <button key={ref} type="button" className="asset-version-link" disabled={busy} onClick={() => onVersion(ref)}>打开后继版本 · {ref}</button>
+          ))}
+          <details className="asset-lifecycle-history" open>
+            <summary>保留历史 · {lifecycle.versions.length} 个版本</summary>
+            {lifecycle.versions.map((version) => (
+              <article key={version.version_ref}>
+                <button type="button" className="asset-version-link" aria-current={version.version_ref === item.memory_ref ? "true" : undefined} disabled={busy} onClick={() => onVersion(version.version_ref)}>{version.version_ref}</button>
+                <b>{lifecycleLabels[version.state]}</b>
+                {version.changes.map((change) => (
+                  <div className="asset-change-fact" key={change.change_ref}>
+                    <strong>{changeLabels[change.kind]}</strong>
+                    <p>{change.explanation}</p>
+                    {change.error ? <p>错误说明 · {change.error}</p> : null}
+                    {change.scope ? <p>更正范围 · {change.scope}</p> : null}
+                    {change.evidence_bindings?.length ? (
+                      <details>
+                        <summary>精确更正依据</summary>
+                        {change.evidence_bindings.map((binding) => (
+                          <dl key={binding.version_ref}>
+                            <div><dt>版本</dt><dd><button type="button" className="asset-version-link" disabled={busy} onClick={() => onVersion(binding.version_ref)}>{binding.version_ref}</button></dd></div>
+                            <div><dt>内容哈希</dt><dd>{binding.content_hash}</dd></div>
+                            <div><dt>manifest</dt><dd>{binding.manifest_hash}</dd></div>
+                            <div><dt>凭据</dt><dd>{binding.receipt.receipt_ref}</dd></div>
+                          </dl>
+                        ))}
+                      </details>
+                    ) : null}
+                    {change.impact?.map((impact) => <p key={impact.work_ref}>{impact.work_ref} · {impactLabels[impact.judgment]} · {impact.explanation}</p>)}
+                    <small>变更凭据 · {change.receipt.receipt_ref}</small>
+                  </div>
+                ))}
+              </article>
+            ))}
+          </details>
+          {selected && selected.state !== "retired" ? (
+            <details className="asset-retirement">
+              <summary>谨慎退役所选版本</summary>
+              <p>确认理由应包含核查范围、实际依据与受影响工作。失败、负结果或目标变化本身不构成退役理由。退役会阻止新复用，历史内容仍保留。</p>
+              <form onSubmit={(event) => { event.preventDefault(); if (!busy && allConfirmed && explanation.trim()) void onRetire(explanation.trim()); }}>
+                <label>
+                  <span>退役理由与核查范围</span>
+                  <textarea aria-label="退役理由与核查范围" rows={3} value={explanation} disabled={busy} onChange={(event) => setExplanation(event.target.value)} required />
+                </label>
+                {retirementChecks.map((check) => (
+                  <label className="asset-check" key={check.key}>
+                    <input type="checkbox" disabled={busy} checked={confirmed.includes(check.key)} onChange={(event) => setConfirmed((current) => event.target.checked ? [...current, check.key] : current.filter((key) => key !== check.key))} />
+                    <span>{check.label}</span>
+                  </label>
+                ))}
+                <button className="asset-retire-button" type="submit" disabled={busy || !allConfirmed || !explanation.trim()}>提交版本退役</button>
+              </form>
+            </details>
+          ) : null}
+          {failure ? (
+            <div className="asset-retirement-failure" role="alert">
+              <b>退役未接纳 · {failure.code}</b>
+              {strings("reasons").map((reason) => <p key={reason}>{reason}</p>)}
+              {strings("active_reference_refs").map((ref) => <p key={ref}>仍在引用 · {ref}</p>)}
+              {strings("active_hold_refs").map((ref) => <p key={ref}>仍有保留要求 · {ref}</p>)}
+              <small>已重新读取版本状态。请核查阻止原因后再提交。</small>
+            </div>
+          ) : null}
+        </>
+      ) : null}
+    </section>
+  );
+}
+
 function AssetDetail({
   item,
+  lifecycle,
+  retirementFailure,
+  onVersion,
+  onRetire,
   custodies,
   roles,
   referenceRevision,
@@ -1270,6 +1624,10 @@ function AssetDetail({
   onAssess,
 }: {
   item: ResearchAssetItem | null;
+  lifecycle: AssetLifecycle | null;
+  retirementFailure: ProductError | null;
+  onVersion: (versionRef: string) => void;
+  onRetire: (explanation: string) => Promise<void>;
   custodies: ResearchAssetsView["custodies"];
   roles: ResearchAssetsView["roles"];
   referenceRevision: number;
@@ -1300,6 +1658,15 @@ function AssetDetail({
         <div><small>MemoryRef · exact, never latest</small><h3>{item.display_name}</h3></div>
         <a href={`/api/v1/research-assets/${item.memory_ref}/content`}>只读下载</a>
       </header>
+      <AssetLifecyclePanel
+        key={item.memory_ref}
+        item={item}
+        lifecycle={lifecycle}
+        busy={busy !== null}
+        failure={retirementFailure}
+        onVersion={onVersion}
+        onRetire={onRetire}
+      />
       <dl>
         <div><dt>MemoryRef</dt><dd>{item.memory_ref}</dd></div>
         <div><dt>AssetRef</dt><dd>{item.asset_ref}</dd></div>
@@ -1360,7 +1727,7 @@ function AssetDetail({
             <option value="evidence">Evidence</option>
           </select>
         </label>
-        <button type="button" onClick={onRoleAccept} disabled={busy !== null || !questRef}>由 RG 接纳角色</button>
+        <button type="button" onClick={onRoleAccept} disabled={busy !== null || !questRef || lifecycle?.versions.find((version) => version.version_ref === item.memory_ref)?.state === "retired"}>由 RG 接纳角色</button>
         <small>{roles.length ? `已有 ${roles.length} 个精确角色 receipt` : "RM 资产事实不会因赋予角色而改变。"}</small>
       </details>
       <details>
