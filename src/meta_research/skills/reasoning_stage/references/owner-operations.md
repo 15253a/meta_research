@@ -7,7 +7,7 @@
 | `advancement_engine.reasoning_stage_run.observe` | 核验当前请求、epoch 和 AE 闭包。 |
 | `research_memory.reasoning_evidence.read` | 读取精确冻结证据与角色，包括已核验 Plan 复用来源。 |
 | `research_graph.reasoning_context.read` | 读取已接纳 Question／Quest／Goal 与领域上下文。 |
-| `research_graph.target_formal_results.read` | 按 target_ref 展开 VariantRun、适用评价和 MetricResult，包括已交接但尚未评价的 Run。 |
+| `research_graph.target_formal_results.read` | 按精确 target_ref 展开 VariantRun、适用评价和 MetricResult，包括已交接但尚未评价的 Run；resource_candidates 提供已接纳 Dataset／Environment 候选、精确 RM binding、当前生产归属和 TargetCommit／manifest 身份，按主 Skill 整理步骤使用。 |
 
 共享六入口及分页 reader 用于发现同 Quest 历史，不把首批目录当作全集。人类输入沿 `human_request.read` 读真实原话及材料，意见、授权、HumanRequest satisfied 与 Quest 完成确认分别核对。
 

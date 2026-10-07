@@ -43,9 +43,11 @@ Bundle 统一保留并筛选 Target 发现的建题线索。跨 Target 合并同
 
 为保留最后一个 Target 后的汇总回合，安排和执行工作时保持 `strategy_complete=false`。全部 Target 已接纳后，读取包括最后结果在内的研究说明、完成候选取舍和独立审阅，再用不新增 Target 的 `StrategyUpdate`（`candidates=[]`、`strategy_complete=true`）提交完整 notes 并封口；科学上的建题推荐写在 notes，不放进用于启用 Target 的 `candidates`。需要继续实施时按现有滚动策略提交实际 Target，保持策略未封口。技术阻塞或语义屏障仍按真实状态交接，不能为凑候选补造工作。
 
-Target 正式接纳后，在同一整理核验环节读取 `dataset_candidates`、`environment_candidates` 和 completion manifest，沿 `artifact_path` 找真实 RM binding 并判断复用价值。Dataset 用 datasets.register／register_version／reference，真实派生用 derive；Environment 用 environments.register 记录含义、真实来源和相同原件 binding，再用 reference 关联当前 Question、原 Target／Run 和用途。六入口按复用目的组织，同一内容可供多个入口引用。
+Target 正式接纳后，在同一整理核验环节从 TargetCommit 上下文取精确 `target_ref`，调用 `research_graph.target_formal_results.read`，读取 `resource_candidates`。核对其 TargetCommit／manifest 身份，再看 `dataset_candidates`、`environment_candidates` 的 `artifact_path`、含义、精确 `asset_binding` 和 `producers`；候选 purpose 表示拟议用途，生产归属以 RG 当前已纠正的 subject 为准，原接纳归属及纠错记录保留依据。implementation 候选沿已核验 Run 的 `input_binding_ref`／implementation revision 关联实际工作。按内容判断复用价值，直接沿用完整原件 binding。Dataset 用 datasets.register／register_version／reference，真实派生用 derive；Environment 用 environments.register 记录含义、真实来源和相同原件 binding，再用 reference 关联当前 Question、原 Target／Run 和用途。六入口按复用目的组织，同一原件可供多种用途引用，交接不要求填满六入口。
 
-先发现或对账已有登记，复用身份和原件；可委派明确范围的整理，根独立查回记录、用途关系及适用的精确内容。最后一个 Target 后 Bundle 若不再运行，由 Reasoning 在其综合交接前承接；暂存和未接纳产物留工作区。已有设备、设施、持久目录、安装或服务按真实来源可直接登记，详见根系统提示的 Environment 语义。
+需要核实实际内容时，对候选 binding 的精确 AssetVersion 调用 `research_memory.content.read`，将 `source_ref`、`version_ref` 都设为 `asset_binding.version_ref`。目录先省略 `entry_path` 并用 `offset=0, limit=1` 读取条目页，再选择所需正文。
+
+先发现或对账已有登记，未知效果用原 `effect_id` reconcile，复用身份和原件；可委派明确范围的整理，根独立查回记录、用途关系及适用的精确内容。完成条件：值得复用且当前可登记的候选已登记并读回；空候选或无保留价值时说明判断，不制造资源记录；未接纳、阻塞和未完成步骤按实际状态说明。最后一个 Target 后 Bundle 若不再运行，由 Reasoning 在其综合交接前承接；暂存和未接纳产物留工作区。已有设备、设施、持久目录、安装或服务按真实来源可直接登记，详见根系统提示的 Environment 语义。
 
 ## 4. 复核与收口
 

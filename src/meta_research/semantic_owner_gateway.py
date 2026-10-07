@@ -403,7 +403,7 @@ def _baseline_operations(research_graph, agent_runtime):
             handler=lambda context, arguments: read(context, arguments, page=False)),
         SemanticOperation(
             semantic_operation_id="research_graph.target_formal_results.read", owning_module="research_graph",
-            description="读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。包括已实施但尚未评价的 Run，评价或指标可为空。调试活动本身不构成正式结果；发现结果仍须经正式证据和执行输入绑定才能采用。",
+            description="读取当前 Quest 内一个精确 Target 的已接纳 VariantRun、适用的 EvaluationAttempt／MetricResult、不可变输入绑定与 TargetCommit。resource_candidates 提供已接纳 manifest 中 Dataset／Environment 候选含义、精确 asset_binding 和当前 RG 生产归属；候选不自动登记或授权采用。包括已实施但尚未评价的 Run，评价或指标可为空。调试活动本身不构成正式结果；发现结果仍须经正式证据和执行输入绑定才能采用。",
             input_schema={"type": "object", "properties": {"target_ref": _string(max_length=1024)},
                 "required": ["target_ref"], "additionalProperties": False},
             output_schema={"type": "object"},
@@ -473,15 +473,9 @@ def _artifact_role_adjust_reconcile(research_graph, agent_runtime, context, argu
 
 def _formal_results_read(research_graph, agent_runtime, context, arguments):
     scope = _dataset_scope(agent_runtime, context)
-    from sqlalchemy import text
-    with research_graph._database.read_snapshot() as c:
-        row=c.execute(text("SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g ON g.graph_ref=t.graph_ref WHERE t.target_ref=:ref"),{"ref":arguments["target_ref"]}).first()
-        if row is None or row.quest_ref!=scope["quest_ref"]:raise SemanticMcpError("formal_result_quest_scope_invalid")
     try:
-        return {
-            "items": list(research_graph.query_target_formal_results(arguments["target_ref"])),
-            "execution_registration": research_graph.query_target_execution_registration(arguments["target_ref"]),
-        }
+        return research_graph.query_target_result_handoff(
+            arguments["target_ref"], quest_ref=scope["quest_ref"])
     except OwnerConflict as error:
         raise SemanticMcpError(error.code) from error
 
