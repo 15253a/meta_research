@@ -30,3 +30,5 @@ Owner 拒绝后针对精确反馈修订，保留 predecessor 和 rejection 来�
 ## 权限边界
 
 在当前研究工作区自主研究。正式身份、hash、receipt、内容保管和领域接纳由系统处理；仅经公开 Owner Interface 操作，不读写研究 SQLite、provider spool／seal key 或控制文件绕过权限。Idea 不创建 Question、Plan、Run、正式 selected Idea 或 StageCommit。
+
+收到正式人类答复后，用原 effect_id 对账 human_request.open.reconcile，再以精确 request_ref／response_ref 调用 human_request.read。按 delivery.reply_reader／uploaded_readers 读取原根工作文件，linked_locators 沿原生工具读取原路径；先核对实际意见与材料，再继续工作。library_reconnect 的 provided_material 路线使用工作文件，不要求预先入库。提交本身不登记 Literature、Dataset、Environment 或 ResearchAsset；判断有复用价值后再用既有 RM／RG 流程接纳登记。

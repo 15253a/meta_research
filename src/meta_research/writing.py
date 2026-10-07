@@ -6,6 +6,7 @@ import inspect
 import time
 from typing import cast
 
+from meta_research.human_reply import ProvidedReply
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime import AgentRuntimeInterface, WritingRun
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
@@ -1305,9 +1306,7 @@ class WritingReportService:
         if _system_operation_retry_response(request, effect_id) is None:
             self._human_collaboration.respond_to_human_request(
                 request_ref,
-                decision="provided",
-                facts={"action": "retry", "effect_id": effect_id},
-                note="",
+                reply=ProvidedReply("", {"action": "retry", "effect_id": effect_id}),
                 idempotency_key=_operation_key(
                     "writing-system-help-response", request_ref, idempotency_key
                 ),

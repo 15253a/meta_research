@@ -931,8 +931,9 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         with self._database.read() as connection:
             rows = connection.execute(
                 text(
-                    "SELECT * FROM hc_human_request_responses WHERE request_ref = "
-                    ":request_ref ORDER BY created_at, response_ref"
+                    "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses AS responses "
+                    "LEFT JOIN hc_reply_deliveries AS deliveries ON deliveries.response_ref = responses.response_ref AND deliveries.state = 'ready' "
+                    "WHERE responses.request_ref = :request_ref ORDER BY responses.created_at, responses.response_ref"
                 ),
                 {"request_ref": request_ref},
             ).all()
@@ -957,8 +958,9 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
         with self._database.read() as connection:
             row = connection.execute(
                 text(
-                    "SELECT * FROM hc_human_request_responses WHERE response_ref = "
-                    ":response_ref AND request_ref = :request_ref"
+                    "SELECT responses.*, deliveries.receipt_json AS delivery_json FROM hc_human_request_responses AS responses "
+                    "LEFT JOIN hc_reply_deliveries AS deliveries ON deliveries.response_ref = responses.response_ref AND deliveries.state = 'ready' "
+                    "WHERE responses.response_ref = :response_ref AND responses.request_ref = :request_ref"
                 ),
                 {"response_ref": response_ref, "request_ref": request_ref},
             ).first()
@@ -3878,6 +3880,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         reply: ProvidedReply | OtherReply | None = None,
         idempotency_key: str,
         _delivery_row=None,
+        _delivery_receipt=None,
     ) -> dict[str, object]:
         if reply is not None:
             decision, facts, note = reply.decision, reply.facts, reply.note
@@ -3889,7 +3892,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
             facts = cast(dict[str, object], json.loads(canonical_json(facts)))
         except (TypeError, ValueError) as error:
             raise OwnerConflict("human_response_facts_invalid") from error
-        if len(canonical_json(facts).encode("utf-8")) > (4 * 1024 * 1024 if _delivery_row is not None else 64 * 1024):
+        if len(canonical_json(facts).encode("utf-8")) > 64 * 1024:
             raise OwnerConflict("human_response_facts_too_large")
         if not isinstance(note, str) or len(note) > 4000:
             raise OwnerConflict("human_response_note_invalid")
@@ -4050,7 +4053,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 if _delivery_row is not None:
                     connection.execute(text("UPDATE hc_reply_deliveries SET state = 'ready', "
                         "receipt_json = :receipt WHERE delivery_ref = :ref AND state = 'pending'"),
-                        {"receipt": canonical_json(facts["workspace_delivery"]), "ref": _delivery_row.delivery_ref})
+                        {"receipt": canonical_json(_delivery_receipt), "ref": _delivery_row.delivery_ref})
         response = self._fact_verifier.verify_human_response(
             request_ref=request_ref, response_ref=response_ref
         )
@@ -4116,7 +4119,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         try:
             destination = self._root_workspaces.destination_for_human_request(
                 request_ref=request_ref, waiter_ref=waiters[0]["waiter_ref"])
-        except SemanticMcpError as error:
+        except (SemanticMcpError, OwnerConflict) as error:
             if materials:
                 raise OwnerConflict("human_response_destination_unbound") from error
             return None
@@ -4200,9 +4203,8 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 "uploaded_readers": [readers[item["relative_path"]] for item in command["materials"] if item["kind"] == "upload"],
                 "linked_locators": linked}
             return self.respond_to_human_request(row.request_ref, decision=command["decision"],
-                facts={**command["facts"], "delivery_ref": row.delivery_ref,
-                       "delivery_manifest_hash": row.manifest_hash, "workspace_delivery": delivery},
-                note=command["note"], idempotency_key=row.idempotency_key, _delivery_row=row)
+                facts=command["facts"], note=command["note"], idempotency_key=row.idempotency_key,
+                _delivery_row=row, _delivery_receipt=delivery)
         except (SemanticMcpError, OwnerConflict) as error:
             with self._database.fenced_write() as connection:
                 connection.execute(text("UPDATE hc_reply_deliveries SET state = 'aborted', failure_code = :code "
@@ -10694,7 +10696,7 @@ def _public_human_response(row) -> dict[str, object]:
             payload_hash=row.receipt_hash,
         ).as_public_dict(),
         "created_at": float(row.created_at),
-        **({"delivery": facts["workspace_delivery"]} if "workspace_delivery" in facts else {}),
+        **({"delivery": decoded_object(row.delivery_json)} if row.delivery_json else {}),
     }
 
 

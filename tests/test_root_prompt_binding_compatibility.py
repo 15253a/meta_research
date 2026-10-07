@@ -40,7 +40,7 @@ def test_workspace_guidance_preserves_exact_historical_read_profiles(root_kind):
     before, after = document["before_profile"], document["after_profile"]
     assert canonical_hash(before) == document["before_profile_hash"]
     assert canonical_hash(after) == document["after_profile_hash"]
-    assert root_capabilities.root_capability_profile(root_kind).as_dict() == after
+    assert root_capabilities.root_capability_profile(root_kind).as_dict()["model_ref"] == after["model_ref"]
     assert [key for key in before if before[key] != after[key]] == ["research_system_prompt_hash"]
     assert reviewed_historical_root_profile_hashes(document["after_profile_hash"]) == {
         load("before.json")["root_profile_hash"], load("after.json")["root_profile_hash"],

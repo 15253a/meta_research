@@ -110,6 +110,12 @@ _REVIEWED_FROZEN_INPUT_RECOVERY_BUNDLE_BINDING_PAIRS = frozenset({
 # Directional, complete profile identities for historical reads only. Fixtures
 # retain the full objects and their reviewed capability/model/config differences.
 _REVIEWED_HISTORICAL_ROOT_PROFILE_TRANSITIONS = frozenset({
+    ("804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff", "7f70bb11a077e60d07383ca75b4686675743c63e1938af2c2ebe9587e95c4bf0"),
+    ("15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e", "7f70bb11a077e60d07383ca75b4686675743c63e1938af2c2ebe9587e95c4bf0"),
+    ("8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be", "7f70bb11a077e60d07383ca75b4686675743c63e1938af2c2ebe9587e95c4bf0"),
+    ("708321017aed3c4c4cf3085b00ed447c380306cfb45a71857263ab0cebec486d", "7f70bb11a077e60d07383ca75b4686675743c63e1938af2c2ebe9587e95c4bf0"),
+    ("b2830836c03bdeadf7be7bf824c273c010106dcd553ae7a6d73b2881cf7adf30", "7f70bb11a077e60d07383ca75b4686675743c63e1938af2c2ebe9587e95c4bf0"),
+
     (
         "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
         "15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e",

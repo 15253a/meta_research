@@ -1,0 +1,80 @@
+{
+  "schema_ref": "meta-research/human-reply-guidance-profile/v1",
+  "before_profile": {
+    "schema_ref": "meta-research/root-capability-profile/v3",
+    "capabilities": [
+      "tool_inventory",
+      "shell",
+      "file_access",
+      "semantic_mcp",
+      "skill",
+      "plugin",
+      "hook",
+      "subagent",
+      "stream",
+      "native_session",
+      "fork",
+      "steer",
+      "interrupt",
+      "resume",
+      "web_search",
+      "web_fetch"
+    ],
+    "enabled_codex_features": [
+      "multi_agent",
+      "plugins",
+      "remote_plugin",
+      "hooks"
+    ],
+    "multi_agent_enabled": true,
+    "web_search_mode": "live",
+    "research_system_prompt_hash": "52da7192d372ccc3f9635915533dafd31d7f7b90aeb71e7357e715d8ab0f8819",
+    "model_ref": "gpt-6.1-sol",
+    "cli_reasoning_preset": "ultra",
+    "effective_reasoning_effort": "max",
+    "collaboration_mode": "ultra"
+  },
+  "before_profile_hash": "b2830836c03bdeadf7be7bf824c273c010106dcd553ae7a6d73b2881cf7adf30",
+  "after_profile": {
+    "schema_ref": "meta-research/root-capability-profile/v3",
+    "capabilities": [
+      "tool_inventory",
+      "shell",
+      "file_access",
+      "semantic_mcp",
+      "skill",
+      "plugin",
+      "hook",
+      "subagent",
+      "stream",
+      "native_session",
+      "fork",
+      "steer",
+      "interrupt",
+      "resume",
+      "web_search",
+      "web_fetch"
+    ],
+    "enabled_codex_features": [
+      "multi_agent",
+      "plugins",
+      "remote_plugin",
+      "hooks"
+    ],
+    "multi_agent_enabled": true,
+    "web_search_mode": "live",
+    "research_system_prompt_hash": "99541557b3d26a55c82fa05ee3ccbafc84cb5532209775979caff06a67a0c80f",
+    "model_ref": "gpt-6.1-sol",
+    "cli_reasoning_preset": "ultra",
+    "effective_reasoning_effort": "max",
+    "collaboration_mode": "ultra"
+  },
+  "after_profile_hash": "7f70bb11a077e60d07383ca75b4686675743c63e1938af2c2ebe9587e95c4bf0",
+  "historical_read_hashes": [
+    "804c83eb1e28ce4ccec59e1a564a701af666eaba7e7ff6740418665da7cf21ff",
+    "15c6735fcb28a8e0a820952f49d37242d2efc345e2bc92236a12e8345b74b62e",
+    "8f043025de4b27d9885426b44848fc4edad721ed0012c0102952c807fc2f14be",
+    "708321017aed3c4c4cf3085b00ed447c380306cfb45a71857263ab0cebec486d",
+    "b2830836c03bdeadf7be7bf824c273c010106dcd553ae7a6d73b2881cf7adf30"
+  ]
+}

@@ -30,6 +30,7 @@ from meta_research.auth import AuthSession
 from meta_research.asset_download import AssetDownloadResponse
 from meta_research.codex_runtime import CODEX_MODEL_REF
 from meta_research.composition import ProductionRuntime
+from meta_research.human_reply import ProvidedReply
 from meta_research.harness import (
     FullConformanceRequest,
     HarnessAdmissionError,
@@ -1513,9 +1514,7 @@ def create_app(
             # Only the original command identity may replay a terminal Retry.
             runtime.owners.human_collaboration.respond_to_human_request(
                 request_ref,
-                decision="provided",
-                facts={"action": "retry"},
-                note="",
+                reply=ProvidedReply("", {"action": "retry"}),
                 idempotency_key=response_key,
             )
             reconciled = runtime.owners.agent_runtime.reconcile_root_human_request(
@@ -1526,9 +1525,7 @@ def create_app(
             raise OwnerConflict("system_operation_retry_unavailable")
         runtime.owners.human_collaboration.respond_to_human_request(
             request_ref,
-            decision="provided",
-            facts={"action": "retry"},
-            note="",
+            reply=ProvidedReply("", {"action": "retry"}),
             idempotency_key=response_key,
         )
         reconciled = runtime.owners.agent_runtime.reconcile_root_human_request(

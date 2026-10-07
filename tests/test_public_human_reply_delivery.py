@@ -73,6 +73,33 @@ def test_explicit_upload_and_linked_directory_deliver_exact_original_root_withou
         runtime.close()
 
 
+@pytest.mark.parametrize("change", ["relative_escape", "duplicate", "invalid_base64", "reserved_facts", "declined_material", "missing_link", "file_limit"])
+def test_rejected_material_command_cannot_publish_or_release(tmp_path, change):
+    runtime = _make(tmp_path / "runtime")
+    try:
+        scope, context, opened = _open(runtime)
+        before = runtime.owners.research_memory.query_snapshot()
+        upload = {"kind": "upload", "relative_path": "original.txt", "media_type": "text/plain", "content_base64": "ZXhhY3Q="}
+        body = {"decision": "provided", "facts": {}, "note": "Read exact observations.", "materials": [upload]}
+        if change == "relative_escape": upload["relative_path"] = "../escaped.txt"
+        if change == "duplicate": body["materials"].append(dict(upload))
+        if change == "invalid_base64": upload["content_base64"] = "not base64!"
+        if change == "reserved_facts": body["facts"] = {"delivery_ref": "foreign-delivery"}
+        if change == "declined_material": body["decision"] = "declined"
+        if change == "missing_link": body["materials"] = [{"kind": "linked_local", "locator": str(tmp_path / "missing"), "description": "Missing host source."}]
+        if change == "file_limit": body["materials"] = [{**upload, "relative_path": f"{index}.txt"} for index in range(100)]
+        with TestClient(create_app(runtime, base_url="http://testserver", control_key="control-key")) as client:
+            response = client.post(f"/api/v1/human-requests/{opened['request_ref']}/responses", headers=_login(client, runtime), json=body)
+            assert response.status_code in (409, 422), response.text
+        request = runtime.owners.human_collaboration.query_human_request(opened["request_ref"])
+        assert request["status"] == "open"
+        assert request["responses"] == []
+        assert request["direct_waiters"][0]["status"] == "blocked"
+        assert runtime.owners.research_memory.query_snapshot() == before
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("boundary", ["before_publication", "after_publication", "after_commit"])
 def test_pending_reply_is_private_and_crash_recovery_resumes_library_material(tmp_path, monkeypatch, boundary):
     from meta_research.human_reply import ProvidedReply, Upload
@@ -121,6 +148,12 @@ def test_pending_reply_is_private_and_crash_recovery_resumes_library_material(tm
     runtime.close()
     runtime = _make(path)
     try:
+        recovered = runtime.owners.human_collaboration.query_human_request(opened["request_ref"])
+        assert recovered["status"] == "satisfied"
+        assert recovered["direct_waiters"][0]["status"] == "consumed"
+        assert len(recovered["responses"]) == 1
+        recovered_reader = recovered["responses"][0]["delivery"]["uploaded_readers"][0]
+        assert _accepted(_call(runtime, _channel(runtime, context), "research_workspace.read", **recovered_reader))["text"] == "Exact lawful fulltext.\n"
         response = runtime.owners.human_collaboration.respond_to_human_request(opened["request_ref"], reply=reply, idempotency_key="crash-submit")
         request = runtime.owners.human_collaboration.query_human_request(opened["request_ref"])
         assert request["status"] == "satisfied"
