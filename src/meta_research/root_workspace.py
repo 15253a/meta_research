@@ -363,7 +363,7 @@ class RootWorkspaces:
                 scanned += len(children) + len(names)
                 if scanned > _MAX_SCAN_FILES:
                     raise SemanticMcpError("workspace_scan_limit_exceeded", {"maximum_entries": _MAX_SCAN_FILES})
-                children[:] = sorted(child for child in children if not child.startswith(".delivery-") and child != ".delivery.json"
+                children[:] = sorted(child for child in children if not child.startswith(".delivery-") and child not in {".delivery.json", ".creation-context"}
                     and not (location.root_kind == "target" and Path(directory) == location.directory and child == "inputs"))
                 for name in sorted(names):
                     path = (Path(directory) / name).relative_to(location.directory).as_posix()

@@ -4618,7 +4618,15 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         expected_draft_hash: str,
         idempotency_key: str,
         expected_draft_revision: int | None = None,
+        *, material_delivery: bool = False,
     ) -> dict[str, object]:
+        with self._database.read() as connection:
+            current = self._require_initialization(connection, initialization_id)
+            current_manifest = decoded_object(current.draft_json).get("material_manifest")
+        if current_manifest is not None and "material_manifest" not in draft:
+            draft = {**draft, "material_manifest": current_manifest}
+        if not material_delivery and draft.get("material_manifest") != current_manifest:
+            raise OwnerConflict("creation_material_manifest_owner_required")
         normalized = _validate_draft(draft)
         draft_schema_ref = _draft_schema_ref(normalized)
         next_hash = canonical_hash(normalized)
@@ -4649,6 +4657,8 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 if row.status in {"confirmed", "completed", "cancelled"}:
                     raise OwnerConflict("quest_draft_is_terminal")
                 _require_draft_cas(row, expected_draft_hash, expected_draft_revision)
+                if not material_delivery and normalized.get("material_manifest") != decoded_object(row.draft_json).get("material_manifest"):
+                    raise OwnerConflict("creation_material_manifest_owner_required")
                 self._validate_resource_envelope_binding(
                     connection, initialization_id, normalized
                 )
@@ -4759,6 +4769,88 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                         },
                     )
         return self.query_quest_creation(initialization_id)
+
+    def _creation_basis_view(self, initialization_id, row, proposal_record):
+        memory = self._research_memory.creation_bases
+        if proposal_record is not None and proposal_record.creation_basis_ref is not None:
+            basis = memory.query(proposal_record.creation_basis_ref, proposal_record.creation_basis_hash)
+        else:
+            basis = memory.prepared(initialization_id, int(row.draft_revision), row.draft_hash)
+        if basis is None:
+            return None
+        return {**basis, "sources": memory.source_views(basis),
+            "freshness": "current" if basis["draft"]["revision"] == int(row.draft_revision) and basis["draft"]["hash"] == row.draft_hash else "stale",
+            "human_reviewed_draft": {"revision": int(row.proposal_basis_revision), "hash": row.proposal_basis_hash} if row.proposal_ref is not None else None}
+
+    def deliver_initialization_materials(self, initialization_id, payload, idempotency_key):
+        from meta_research.initialization_materials import deliver_materials
+        return deliver_materials(self, initialization_id, payload, idempotency_key)
+
+    def prepare_creation_basis(self, initialization_id, revision, draft_hash, draft, job_ref):
+        from meta_research.creation_basis import (
+            InitializationUnderstandingRequest, empty_manifest, empty_understanding,
+        )
+        memory = self._research_memory.creation_bases
+        existing = memory.prepared(initialization_id, revision, draft_hash)
+        if existing is not None:
+            return existing
+        current = self.query_quest_creation(initialization_id)
+        if (current["quest_draft"]["revision"], current["quest_draft"]["hash"]) != (revision, draft_hash):
+            raise OwnerConflict("generation_basis_stale")
+        manifest = draft.get("material_manifest", empty_manifest())
+        if any(not submission["complete"] for submission in manifest["submissions"]):
+            raise OwnerConflict("creation_material_submission_incomplete")
+        with self._database.read() as connection:
+            native_ref = connection.execute(text("SELECT native_session_ref FROM hc_intent_drafting_sessions WHERE initialization_id=:id AND status='open'"), {"id": initialization_id}).scalar_one_or_none()
+        request = InitializationUnderstandingRequest(initialization_id, revision, draft_hash, draft, manifest,
+            job_ref + ":understanding", current["intent_session"]["ref"], native_ref)
+        if manifest["entries"]:
+            understand = getattr(self._proposal_drafter, "understand_initialization", None)
+            if not callable(understand):
+                raise OwnerConflict("creation_understanding_provider_unavailable")
+            result = understand(request)
+            understanding = result.understanding
+            if result.companion_native_session_ref is not None:
+                with self._database.write() as connection:
+                    changed = connection.execute(text("UPDATE hc_intent_drafting_sessions SET native_session_ref=:native WHERE initialization_id=:id AND status='open' AND (native_session_ref IS NULL OR native_session_ref=:native)"),
+                        {"id": initialization_id, "native": result.companion_native_session_ref})
+                    if not changed.rowcount:
+                        raise OwnerConflict("companion_native_session_stale")
+        else:
+            understanding = empty_understanding()
+        return memory.accept_prepared(request, understanding)
+
+    def prepare_deepfetch_creation_basis(self, request):
+        if request.creation_context_kind != "quest_initialization":
+            return request
+        basis = self.prepare_creation_basis(request.initialization_id, request.draft_revision,
+            request.draft_hash, request.draft, request.request_ref)
+        memory = self._research_memory.creation_bases
+        reference = memory.reference(basis)
+        if request.scope.get("creation_basis") == reference:
+            return request
+        if self._agent_runtime.query_deepfetch_run(request.request_ref) is not None:
+            raise OwnerConflict("creation_deepfetch_basis_unbound")
+        scope = {**request.scope, "creation_basis": reference,
+            "existing_work_retrieval": {key: basis["understanding"][key] for key in ("claims_and_conditions", "conflicts", "gaps", "unfinished_questions")}}
+        materials = [*request.accepted_material_bindings, *(source["binding"] for source in basis["sources"] if source["binding"] is not None)]
+        materials = list({item["version_ref"]: item for item in materials}.values())
+        scope_hash = canonical_hash(scope)
+        materials_hash = canonical_hash(materials)
+        from types import SimpleNamespace
+        with self._database.write() as connection:
+            current = self._require_initialization(connection, request.initialization_id)
+            _require_draft_cas(current, request.draft_hash, request.draft_revision)
+            row = connection.execute(text("SELECT * FROM hc_deepfetch_requests WHERE request_ref=:ref"), {"ref": request.request_ref}).first()
+            if row.status != "queued":
+                raise OwnerConflict("deepfetch_request_stale")
+            values = dict(row._mapping)
+            values.update(scope_hash=scope_hash, material_bindings_hash=materials_hash)
+            authorization_hash = _deepfetch_request_receipt_hash(SimpleNamespace(**values))
+            connection.execute(text("UPDATE hc_deepfetch_requests SET scope_json=:scope,scope_hash=:scope_hash,material_bindings_json=:materials,material_bindings_hash=:material_hash,authorization_hash=:authorization WHERE request_ref=:ref AND status='queued'"),
+                {"ref": request.request_ref, "scope": canonical_json(scope), "scope_hash": scope_hash,
+                    "materials": canonical_json(materials), "material_hash": materials_hash, "authorization": authorization_hash})
+        return self.query_deepfetch_request(request.request_ref)
 
     def generate_question_proposal(
         self,
@@ -6213,18 +6305,40 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 )
                 return True
         try:
-            result = self._proposal_drafter.draft(
-                ProposalDraftRequest(
+            frozen_draft = decoded_object(revision.draft_json)
+            basis = self.prepare_creation_basis(str(job.initialization_id), int(job.basis_revision),
+                str(job.basis_hash), frozen_draft, provider_job_ref)
+            with self._database.read() as connection:
+                companion_native_session_ref = connection.execute(text("SELECT native_session_ref FROM hc_intent_drafting_sessions WHERE initialization_id=:id AND status='open'"), {"id": job.initialization_id}).scalar_one_or_none()
+            request = ProposalDraftRequest(
                     initialization_id=job.initialization_id,
                     draft_revision=int(job.basis_revision),
                     draft_hash=job.basis_hash,
-                    draft=decoded_object(revision.draft_json),
+                    draft=frozen_draft,
                     job_ref=provider_job_ref,
                     literature_snapshot=literature_snapshot,
                     companion_native_session_ref=companion_native_session_ref,
                     root_session_ref=self.query_quest_creation(job.initialization_id)["intent_session"]["ref"],
                 )
-            )
+            synthesize = getattr(self._proposal_drafter, "synthesize_first_question", None)
+            if callable(synthesize):
+                from meta_research.creation_basis import FirstQuestionSynthesisRequest
+                workspace = self._creation_workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
+                context = self._research_memory.creation_bases.project(basis, literature_snapshot, workspace)
+                result = synthesize(FirstQuestionSynthesisRequest(request.initialization_id, request.draft_revision,
+                    request.draft_hash, frozen_draft, provider_job_ref, request.root_session_ref,
+                    companion_native_session_ref, basis, context, literature_snapshot))
+                if literature_snapshot is not None:
+                    if result.revision is None:
+                        raise OwnerConflict("creation_literature_revision_required")
+                    basis = self._research_memory.creation_bases.accept_revision(basis,
+                        literature_snapshot["source_snapshot"], result.revision)
+                elif result.revision is not None:
+                    raise OwnerConflict("creation_direct_revision_invalid")
+            else:
+                if frozen_draft.get("material_manifest", {}).get("entries"):
+                    raise OwnerConflict("creation_synthesis_provider_unavailable")
+                result = self._proposal_drafter.draft(request)
             content = _validate_question_content(result.content)
             if result.adapter_kind == "codex_companion_fork" and (
                 not isinstance(result.companion_native_session_ref, str)
@@ -6262,7 +6376,10 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 status=status,
             )
             return True
-        except (TypeError, ValueError, OwnerConflict):
+        except OwnerConflict as error:
+            self._fail_proposal_job(job.generation_ref, claim_attempt, error.code)
+            return True
+        except (TypeError, ValueError):
             self._fail_proposal_job(
                 job.generation_ref,
                 claim_attempt,
@@ -6374,6 +6491,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                             ])["snapshot_hash"]
                         )
                     ),
+                    creation_basis=self._research_memory.creation_bases.reference(basis),
                 )
                 connection.execute(
                     text(
@@ -7978,7 +8096,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
             proposal_record = (
                 connection.execute(
                     text(
-                        "SELECT literature_snapshot_ref FROM hc_question_proposals "
+                        "SELECT literature_snapshot_ref, creation_basis_ref, creation_basis_hash FROM hc_question_proposals "
                         "WHERE proposal_ref = :proposal_ref"
                     ),
                     {"proposal_ref": row.proposal_ref},
@@ -8436,6 +8554,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
             "creation_context": "quest_initialization",
             "route": draft_value.get("route", "direct"),
             "status": status,
+            "creation_basis": self._creation_basis_view(initialization_id, row, proposal_record),
             "quest_draft": {
                 "revision": int(row.draft_revision),
                 "hash": row.draft_hash,
@@ -8497,6 +8616,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     "basis_hash": row.preview_basis_hash,
                     "proposal_ref": row.preview_proposal_ref,
                     "proposal_hash": row.preview_proposal_hash,
+                    "creation_basis": (None if proposal_record is None or proposal_record.creation_basis_ref is None else {"basis_ref": proposal_record.creation_basis_ref, "basis_hash": proposal_record.creation_basis_hash}),
                     "status": (
                         "consumed"
                         if row.confirmed_preview_ref == row.preview_ref
@@ -9027,6 +9147,13 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         self._clear_dispatch_failure(initialization_id, "acquisition_session")
 
         material_bindings = _accepted_material_bindings(draft)
+        with self._database.read() as connection:
+            basis_row = connection.execute(text("SELECT creation_basis_ref,creation_basis_hash FROM hc_question_proposals WHERE proposal_ref=:ref"), {"ref": quest.proposal_ref}).first()
+        creation_basis = None
+        if basis_row is not None and basis_row.creation_basis_ref is not None:
+            creation_basis = self._research_memory.creation_bases.query(basis_row.creation_basis_ref, basis_row.creation_basis_hash)
+            material_bindings = (*material_bindings, *(self._research_memory.query_asset_version(source["binding"]["version_ref"]).as_binding()
+                for source in creation_basis["sources"] if source["binding"] is not None))
         if material_bindings:
             try:
                 roles = self._research_graph.query_asset_roles(
@@ -9148,6 +9275,16 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
             self._clear_dispatch_failure(initialization_id, "question_identity")
             return True
         self._clear_dispatch_failure(initialization_id, "question_identity")
+
+        if creation_basis is not None:
+            try:
+                memory = self._research_memory.creation_bases
+                if memory.for_question(question.question_ref, question.quest_ref) is None:
+                    memory.associate_question(question.as_binding(), creation_basis)
+                    return True
+            except (OwnerConflict, OSError) as error:
+                self._record_dispatch_failure(initialization_id, "question_literature_revision", getattr(error, "code", "creation_basis_unavailable"))
+                return False
 
         # DeepFetch custody and the Question-scoped literature revision are
         # distinct RM facts.  Once RG has accepted the Question identity, bind
@@ -9979,6 +10116,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         basis_hash: str | None = None,
         literature_snapshot_ref: str | None = None,
         literature_snapshot_hash: str | None = None,
+        creation_basis: dict[str, object] | None = None,
     ) -> tuple[str, str]:
         normalized = _validate_question_content(content, require_complete=False)
         schema_ref = schema_ref or (
@@ -9999,6 +10137,10 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         )
         if (literature_snapshot_ref is None) != (literature_snapshot_hash is None):
             raise OwnerConflict("literature_snapshot_binding_invalid")
+        if creation_basis is None and row.proposal_ref is not None:
+            prior = connection.execute(text("SELECT creation_basis_ref,creation_basis_hash FROM hc_question_proposals WHERE proposal_ref=:ref"), {"ref": row.proposal_ref}).first()
+            if prior is not None and prior.creation_basis_ref is not None:
+                creation_basis = {"basis_ref": prior.creation_basis_ref, "basis_hash": prior.creation_basis_hash}
         proposal_binding: dict[str, object] = {
             "schema_ref": schema_ref,
             "basis_revision": basis_revision,
@@ -10013,6 +10155,8 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     "literature_snapshot_hash": literature_snapshot_hash,
                 }
             )
+        if creation_basis is not None:
+            proposal_binding["creation_basis"] = {key: creation_basis[key] for key in ("basis_ref", "basis_hash")}
         proposal_hash = canonical_hash(proposal_binding)
         now = time.time()
         connection.execute(
@@ -10020,12 +10164,12 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 "INSERT INTO hc_question_proposals (proposal_ref, "
                 "initialization_id, revision, basis_revision, basis_hash, "
                 "content_json, proposal_hash, schema_ref, literature_snapshot_ref, "
-                "literature_snapshot_hash, binding_schema_ref, "
+                "literature_snapshot_hash, binding_schema_ref, creation_basis_ref, creation_basis_hash, "
                 "recorded_at) VALUES (:proposal_ref, "
                 ":initialization_id, :revision, :basis_revision, :basis_hash, "
                 ":content_json, :proposal_hash, :schema_ref, "
                 ":literature_snapshot_ref, :literature_snapshot_hash, "
-                ":binding_schema_ref, :now)"
+                ":binding_schema_ref, :creation_basis_ref, :creation_basis_hash, :now)"
             ),
             {
                 "proposal_ref": proposal_ref,
@@ -10039,6 +10183,8 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 "literature_snapshot_ref": literature_snapshot_ref,
                 "literature_snapshot_hash": literature_snapshot_hash,
                 "binding_schema_ref": binding_schema_ref,
+                "creation_basis_ref": None if creation_basis is None else creation_basis["basis_ref"],
+                "creation_basis_hash": None if creation_basis is None else creation_basis["basis_hash"],
                 "now": now,
             },
         )
@@ -10543,7 +10689,7 @@ def _require_initialization_artifact_integrity(
                 "SELECT initialization_id, revision, basis_revision, basis_hash, "
                 "content_json, proposal_hash, schema_ref, "
                 "literature_snapshot_ref, literature_snapshot_hash, "
-                "binding_schema_ref FROM "
+                "binding_schema_ref, creation_basis_ref, creation_basis_hash FROM "
                 "hc_question_proposals WHERE proposal_ref = :proposal_ref"
             ),
             {"proposal_ref": row.proposal_ref},
@@ -10581,6 +10727,8 @@ def _require_initialization_artifact_integrity(
             )
         else:
             raise OwnerConflict(error_code)
+        if proposal_record.creation_basis_ref is not None:
+            proposal_binding["creation_basis"] = {"basis_ref": proposal_record.creation_basis_ref, "basis_hash": proposal_record.creation_basis_hash}
         bound_proposal_hash = canonical_hash(proposal_binding)
         accepted_proposal_hashes = {bound_proposal_hash}
         proposal_basis_schema = connection.execute(
@@ -11258,7 +11406,7 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
         "literature",
         "background_and_initial_direction",
     }
-    if set(draft) == v2_fields:
+    if set(draft) in (v2_fields, v2_fields | {"material_manifest"}):
         normalized: dict[str, object] = {}
         for field in (
             "goal",
@@ -11331,6 +11479,11 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
                 },
             }
         )
+        if "material_manifest" in draft:
+            manifest = draft["material_manifest"]
+            if not isinstance(manifest, dict) or set(manifest) != {"entries", "submissions"} or not isinstance(manifest["entries"], list) or not isinstance(manifest["submissions"], list):
+                raise OwnerConflict("creation_material_manifest_invalid")
+            normalized["material_manifest"] = manifest
         return normalized
 
     expected = {

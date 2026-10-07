@@ -367,6 +367,8 @@ def create_semantic_owner_gateway(
     from meta_research.research_content import research_content_operations
     operations.extend(research_content_operations(research_graph=research_graph,
         research_memory=research_memory, agent_runtime=agent_runtime, human_collaboration=human_collaboration))
+    from meta_research.creation_basis import creation_basis_operations
+    operations.extend(creation_basis_operations(research_memory, agent_runtime, human_collaboration))
     return SemanticMcpGateway(tuple(operations))
 
 

@@ -3217,6 +3217,8 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
         from meta_research.owners.research_asset_content import AssetContentPageReader
         self._asset_content_pages = AssetContentPageReader(object_store, receipt_verifier)
         self._literature_content_pages = LiteratureContentPageReader(self._object_store)
+        from meta_research.creation_basis import CreationBasisMemory
+        self.creation_bases = CreationBasisMemory(self)
         self._recover_asset_intakes()
 
     def bind_asset_intake_recovery_reader(self, reader) -> None:
@@ -6587,6 +6589,11 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 ),
             }
         )
+        with self._database.read() as connection:
+            basis_row = connection.execute(text("SELECT creation_basis_ref,creation_basis_hash FROM hc_question_proposals WHERE proposal_ref=:ref"), {"ref": quest.proposal_ref}).first()
+        if basis_row is not None and basis_row.creation_basis_ref is not None:
+            self.creation_bases.query(basis_row.creation_basis_ref, basis_row.creation_basis_hash)
+            proposal_binding["creation_basis"] = {"basis_ref": basis_row.creation_basis_ref, "basis_hash": basis_row.creation_basis_hash}
         if quest.proposal_hash not in {
             legacy_proposal_hash,
             canonical_hash(proposal_binding),

@@ -2,6 +2,8 @@
 
 ## 输入
 
+首题上下文中的 `creation_basis` 指向正式 Question 关联的已有课题理解。用 `research_memory.stage_context.read` 的 `creation_understanding`、`creation_corrections` 和 `creation_sources` 分页读取。选中原件沿返回的 `research_memory.content.read` 精确版本入口继续读。未选中或未读的原材料保留 `research_memory.creation_basis.read` 入口，hash 变化或文件缺失如实报告。文献修正绑定准确 predecessor 和 snapshot，外部旧成果不能当成本 Quest 新 Run。
+
 `IdeaStageInvocation` 带精确 `stage_request_ref`、验证过的运行绑定、ContextPack ref／hash、`AcceptedQuestionBinding` 与匹配正文，以及 Quest 目标、文献、历史、证据和当前指导的绑定。默认正文给当前交接及相关索引；按需展开完整材料，索引不替代引用正文。身份、hash、schema 和 receipt 在信封中保持一致。
 
 `AcceptedQuestionBinding` 含 Question／Quest／内容引用、内容 hash／schema、RM 内容 receipt 和 RG Question receipt；单独正文须与其精确匹配。Idea 消费科学含义，Question 的 schema 与生命周期由 Owner 管理。

@@ -76,6 +76,13 @@ def empty_understanding() -> dict[str, object]:
     return {**{key: [] for key in UNDERSTANDING_FIELDS}, "coverage": [], "selection": []}
 
 
+def first_creation_instructions():
+    root = Path(__file__).parent / "skills" / "first_creation"
+    paths = ("SKILL.md", "references/source-evidence.md", "references/literature-corrections.md")
+    contents = {name: (root / name).read_text(encoding="utf-8") for name in paths}
+    return {"bundle_hash": canonical_hash(contents), "files": list(paths), "instructions": "\n\n".join(contents.values())}
+
+
 def understanding_schema() -> dict[str, object]:
     citation = {"type": "object", "additionalProperties": False, "properties": {
         "material_key": {"type": "string"}, "offset": {"type": "integer", "minimum": 0},
@@ -236,7 +243,7 @@ class CreationBasisMemory:
                 if hashlib.sha256(content).hexdigest() != entry["sha256"]:
                     raise OwnerConflict("creation_source_changed")
                 accepted = self._owner.submit_asset_intake(AssetIntakeRequest(source_kind="file", custody_mode="managed",
-                    display_name=entry["relative_path"], media_type=mimetypes.guess_type(entry["relative_path"])[0] or "application/octet-stream",
+                    display_name=Path(entry["relative_path"]).name, media_type=mimetypes.guess_type(entry["relative_path"])[0] or "application/octet-stream",
                     content=content, provenance={"kind": "external_existing_work", "origin": entry["origin"],
                         "initialization_id": request.initialization_id, "material_key": entry["material_key"]}, origin_quest_ref=None),
                     idempotency_key="creation-source:" + canonical_hash({"id": request.initialization_id, "key": entry["material_key"]}))
@@ -259,16 +266,19 @@ class CreationBasisMemory:
             known_papers = set()
             for paper in metadata["papers"]:
                 known_papers.update(str(paper.get(key)) for key in ("id", "paper_id", "doi", "url") if paper.get(key))
-            ledger_text = canonical_json(ledger)
+            ledger_body = metadata.get("papers_ledger") or ledger.get("papers_ledger") or {}
+            ledger_papers = ledger_body.get("papers", {}) if isinstance(ledger_body, dict) else {}
             refs = {statement["ref"] for key in UNDERSTANDING_FIELDS for statement in predecessor["understanding"][key]}
             keys = {item["material_key"] for item in predecessor["sources"]}
             for correction in revision["corrections"]:
                 if correction["prior_statement_ref"] not in refs or not set(correction["original_sources"]).issubset(keys):
                     raise ValueError("correction source")
                 for citation in correction["literature_sources"]:
-                    if citation["paper_id"] not in known_papers and citation["paper_id"] not in ledger_text:
+                    paper = ledger_papers.get(citation["paper_id"])
+                    if paper is None:
                         raise ValueError("paper")
-                    if citation["locator"] not in ledger_text:
+                    locators = paper.get("reading", {}).get("evidence_locators", [])
+                    if not any(citation["locator"] == item.get("id") for item in locators):
                         raise ValueError("locator")
             if metadata["completion"] == "honest_empty" and revision["corrections"]:
                 raise ValueError("empty correction")
@@ -318,7 +328,7 @@ class CreationBasisMemory:
         page = self._owner.read_asset_content_page(source["binding"]["version_ref"], offset=offset, limit=limit)
         content = page.get("text")
         if isinstance(content, str):
-            content = content.encode("utf-8")
+            content = base64.b64decode(content) if page.get("encoding") == "base64" else content.encode("utf-8")
         elif "content_base64" in page:
             content = base64.b64decode(page["content_base64"])
         elif "content" in page:
@@ -339,32 +349,36 @@ class CreationBasisMemory:
 
     def project(self, basis, literature, binding):
         payload = {"basis": self.reference(basis), "literature": literature}
-        relative = ".creation-context/" + canonical_hash(payload)
-        root = binding.directory / relative
-        root.mkdir(parents=True, exist_ok=True)
         documents = {"basis.json": canonical_json(basis).encode(), "understanding.json": canonical_json(basis["understanding"]).encode()}
         if literature is not None:
             documents["literature.json"] = canonical_json(literature).encode()
             snapshot_ref = literature["source_snapshot"]["snapshot_ref"]
             metadata = self._owner.read_literature_snapshot_metadata(snapshot_ref)
-            documents["papers.json"] = canonical_json(metadata["papers"]).encode()
-            documents["summary.md"] = self._owner.read_literature_content_page(snapshot_ref, entry_path="summary.md", offset=0, limit=8192)["text"].encode()
+            exact = self._owner.read_literature_snapshot(snapshot_ref)
+            documents["papers.json"] = canonical_json(metadata.get("papers_ledger") or metadata["papers"]).encode()
+            documents["summary.md"] = exact["summary"].encode()
+            for fulltext in exact["fulltexts"]:
+                documents["fulltexts/" + fulltext["content_hash"]] = fulltext["content"].encode()
         for source in basis["sources"]:
             if source["binding"] is None:
                 continue
-            chunks = [self.read_source(basis, source["material_key"], offset)["content"] for offset in range(0, source["bytes"], 65536)]
+            chunks = []
+            offset = 0
+            while offset < source["bytes"]:
+                page = self.read_source(basis, source["material_key"], offset)
+                chunks.append(page["content"])
+                offset += len(page["content"])
+                if not page["content"]:
+                    raise OwnerConflict("creation_source_unavailable")
             documents["sources/" + source["material_key"] + "/" + Path(source["relative_path"]).name] = b"".join(chunks)
         manifest = []
-        for path, content in sorted(documents.items()):
-            target = root / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists() and target.read_bytes() != content:
-                raise OwnerConflict("creation_context_changed")
-            if not target.exists():
-                target.write_bytes(content)
-                target.chmod(0o444)
-            manifest.append({"path": relative + "/" + path, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()})
-        return {"relative_root": relative, "manifest": manifest, "context_hash": canonical_hash(manifest)}
+        destination = self.workspaces.destination_for_initialization(basis["draft"]["initialization_id"], basis["root_session_ref"])
+        items = [(".creation-context/" + path, content) for path, content in sorted(documents.items())]
+        for start in range(0, len(items), 100):
+            receipt = self.workspaces.deliver(destination, delivery_ref="creation-context:" + canonical_hash({"basis": payload, "start": start}), files=tuple(items[start:start + 100]))
+            manifest.extend(receipt["files"])
+        basis_path = next(item["path"] for item in manifest if item["path"].endswith("/.creation-context/basis.json"))
+        return {"relative_root": basis_path.removesuffix("/basis.json"), "manifest": manifest, "context_hash": canonical_hash(manifest)}
 
 
 def creation_basis_operations(memory, runtime, collaboration):
