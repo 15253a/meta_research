@@ -515,7 +515,11 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
     variant_proof = json.loads(root['variant_input_binding_json'])
     evaluation_proof = json.loads(root['evaluation_input_binding_json'])
     handle = json.loads(completion['handle_json'])
-    allowed_inputs = set(variant_proof['input_refs']) | verified_target_input_asset_refs(
+    # Selections in variant_proof may come from this result proposal. Only
+    # frozen Owner sources and implementation bytes authorize new input use.
+    allowed_inputs = set(handle.get('accepted_input_target_commit_refs', [])) | {
+        manifest['implementation_revision_ref'],
+    } | verified_target_input_asset_refs(
         source_owner, target_ref=root['target_ref'],
         proofs=handle.get('accepted_input_asset_proofs', []))
     if any(isinstance(item.get('input_refs'), list)
@@ -622,8 +626,24 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
             names = set(required) if isinstance(required, (list, dict)) else set()
             optional = protocol.get('optional_metrics', [])
             optional_names = {entry['metric_key'] for entry in optional if isinstance(entry, dict) and 'metric_key' in entry}
-            if metrics is not None and (not names <= set(metrics) <= names | optional_names or any(not isinstance(k, str) or not valid_target_metric_value(v) for k, v in metrics.items())):
-                raise OwnerConflict('target_formal_metric_definition_invalid')
+            if metrics is not None:
+                metric_keys = set(metrics)
+                invalid_values = [str(key) for key, value in metrics.items()
+                                  if not isinstance(key, str) or not valid_target_metric_value(value)]
+                if not names <= metric_keys <= names | optional_names or invalid_values:
+                    conflict = OwnerConflict('target_formal_metric_definition_invalid')
+                    conflict.feedback = (
+                        f"Run {item['run_key']!r}, Evaluation {item['attempt_key']!r} has "
+                        f"missing required metric keys {sorted(names - metric_keys)!r}, "
+                        f"unexpected metric keys {sorted(str(key) for key in metric_keys - names - optional_names)!r} "
+                        f"and invalid JSON metric values at {sorted(invalid_values)!r} under "
+                        f"ProtocolVersion {definition['protocol_version_ref']!r}. Correct only "
+                        "that evaluation's metric declaration or add its genuinely missing "
+                        "research evidence; preserve the other valid evaluations, artifacts "
+                        "and actual work, which need no rerun for this declaration error. "
+                        "Finish another normal turn in this Root."
+                    )
+                    raise conflict
             if metrics == {} and not item['reuse_evaluation_attempt']:
                 report_paths = item.get('evaluation_artifact_paths')
                 if report_paths is None:
@@ -634,7 +654,19 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
         eb = None if attempt_ref is None else (evaluation_proof['binding_ref'] if item['ordinal'] == 0 else _ref('evaluation_input', attempt_ref))
         from meta_research.formal_run_bindings import implementation_binding, resolve_local_inputs
         local_inputs = resolve_local_inputs(result, entries, item)
-        input_refs = item['input_refs'] if item['input_refs'] is not None else variant_proof['input_refs']
+        input_selection_recorded = item['input_refs'] is not None
+        legacy_input_selection = False
+        if verify_only and not item['reuse_variant_run']:
+            recorded = connection.execute(text(
+                'SELECT b.inputs_json FROM rg_variant_runs r JOIN rg_experiment_input_bindings b '
+                'ON b.binding_ref=r.input_binding_ref WHERE r.variant_run_ref=:ref'),
+                {'ref': run_ref}).scalar_one_or_none()
+            # Old frozen bindings keep their original receipt and selections.
+            # Only new admissions stop inferring use from available sources.
+            legacy_input_selection = (recorded is not None
+                                      and 'input_selection_recorded' not in json.loads(recorded))
+        input_refs = (item['input_refs'] if item['input_refs'] is not None else
+                      (variant_proof['input_refs'] if legacy_input_selection else []))
         if (not isinstance(input_refs, list) or any(not isinstance(ref, str) for ref in input_refs)
                 or len(set(input_refs)) != len(input_refs)
                 or not item['reuse_variant_run'] and not set(input_refs) <= allowed_inputs):
@@ -658,6 +690,8 @@ def register_root_entities(connection, *, root, authority, manifest, completion,
             'accepted_input_target_commit_refs': handle.get('accepted_input_target_commit_refs', []),
             'run_key': item['run_key'],
         }
+        if not legacy_input_selection:
+            inputs['input_selection_recorded'] = input_selection_recorded
         if item['reuse_variant_run']:
             old = connection.execute(text('SELECT variant_ref,status,input_binding_ref FROM rg_variant_runs WHERE variant_run_ref=:ref'), {'ref': run_ref}).mappings().first()
             if old is None or old['variant_ref'] != item['variant_ref'] or old['status'] != item['run_status']:

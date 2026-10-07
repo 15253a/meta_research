@@ -6,6 +6,31 @@ const target = { target_ref: "target:1", target_key: "trial", target_run_ref: "w
 const commit = (measurement, disposition = "uncertain") => ({ target_ref: "target:1", target_run_ref: "work:1", target_spec_hash: "hash:1", commit_ref: "commit:1", result_disposition: disposition,
   closure: { root_measurement: measurement, research_notes: [{ version_ref: "note:v1" }] } });
 
+test("accepted work without an overall classification retains evaluation, missing metrics and exact sources", () => {
+  const measurement = { execution_status: "executed", evaluation_status: "pending",
+    metrics: { observed_loss: 0.25, validation_accuracy: null },
+    formal_entities: [{ variant_run_ref: "run:1", evaluation_attempt_ref: null }],
+    result_asset: { asset_ref: "observations", version_ref: "observations:v2" } };
+  const unclassified = commit(measurement);
+  delete unclassified.result_disposition;
+  for (const accepted of [unclassified, { ...unclassified, result_disposition: null }]) {
+    const facts = targetResearchFacts(target, accepted);
+    assert.equal(facts.summary, "研究记录已接纳");
+    assert.equal(facts.result, null);
+    assert.equal(facts.facts.find(item => item.label === "接纳").text, "研究记录已接纳");
+    assert.equal(facts.pendingEvaluation, true);
+    assert.equal(facts.technicalFailure, false);
+    assert.equal(facts.facts.find(item => item.label === "评价").text, "执行已记录 · 评价待办");
+    assert.deepEqual(facts.sources.root_measurement, measurement);
+    assert.equal(facts.sources.commit_ref, "commit:1");
+    assert.equal(facts.sources.target_spec_hash, "hash:1");
+    assert.deepEqual(facts.readableAssets, [
+      { versionRef: "observations:v2", label: "读取结果原文" },
+      { versionRef: "note:v1", label: "读取交接说明" },
+    ]);
+  }
+});
+
 test("accepted run-only work keeps its evaluation pending and its negative finding out of technical failure", () => {
   const facts = targetResearchFacts(target, commit({ execution_status: "executed", evaluation_status: "pending", formal_entities: [{ variant_run_ref: "run:1", evaluation_attempt_ref: null }] }, "negative"));
   assert.equal(facts.pendingEvaluation, true);

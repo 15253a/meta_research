@@ -59,7 +59,7 @@ Run 可选字段包括 `variant_ref`、`baseline_forward_contract`、`variant_re
 
 - 省略 `variant_ref` 使用所选 authority 的 Variant；也可提供实际已接纳 Variant 的精确引用，包括其他 Baseline 下的方法。Bundle 建议不锁死真实归属。
 - 新方法以 `baseline_forward_contract` 配合具体 `variant_recipe` 声明：已有 Baseline 用精确 `baseline_ref`；新方法用 `method_key`、`method_version`、稳定 `method_contract`。Owner 经正常接缝解析或登记。同一 Run 的声明不与 `variant_ref`／`variant_run_ref` 并用。
-- `variant_run_ref` 复用已有实施，可在后续 Target 评价；`input_refs` 只能选择已准入当前 Target 的精确引用。复用 Run 保留原实现与输入绑定。
+- `variant_run_ref` 复用已有实施，可在后续 Target 评价；`input_refs` 选择实际采用的已准入精确引用，没有采用时写 `[]`。省略选择仅表示尚未记录采用关系，Owner 仍保留可用冻结输入及其版本。复用 Run 保留原实现与输入绑定。
 - 实际 Variant 与 Bundle 建议不同的评价，默认与 authority 的 ProtocolVersion 配对；显式 `evaluation_ref` 只能指向实际采用的精确 Variant × Protocol 配对。
 
 评价可选 `evaluation_ref`、`evaluation_attempt_ref`、`metric_result_ref`、`artifact_paths`。默认使用所选 authority 的 Evaluation；复用已接纳评价时同时给出 `evaluation_attempt_ref` 与 `metric_result_ref`。每项指标遵循其自身 Protocol，报告和日志归入该评价。

@@ -66,7 +66,6 @@ from meta_research.bundle_target_contract import (
 from meta_research.database import Database
 from meta_research.owners.asset_lifecycle import assert_asset_usable, assert_asset_payload_usable
 from meta_research.read_snapshot_cache import snapshot_cached
-from meta_research.experiment_contract import EXPERIMENT_RESULT_DISPOSITIONS
 from meta_research.feed import DurableFeed
 from meta_research.owners.agent_runtime_harness import (
     AgentRuntimeHarnessInterface,
@@ -4292,7 +4291,7 @@ class SQLiteTargetRunGraphAuthority:
             evaluation_attempt_ref=row.evaluation_attempt_ref,
             metric_result_ref=row.metric_result_ref,
             metric_values=metric_values,
-            result_disposition=payload["result_disposition"],
+            result_disposition=payload.get("result_disposition"),
             checkpoint_artifact_refs=tuple(payload["checkpoint_artifact_refs"]),
             variant_run_input_binding=variant_binding,
             evaluation_attempt_input_binding=evaluation_binding,

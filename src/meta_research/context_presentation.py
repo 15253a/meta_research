@@ -63,16 +63,21 @@ def scientific_handoff(outcome: dict, *, source_ref: str,
 
 
 def evidence_discovery_summary(spec: dict, metric_result: dict | None,
-                               result: dict, disposition: object) -> dict[str, object]:
+                               result: dict) -> dict[str, object]:
     metrics = metric_result.get("metrics", {}) if metric_result is not None else {}
     metrics = metrics if isinstance(metrics, dict) else {}
     inputs = spec.get("semantic_inputs", [])
     purpose = [item.get("goal") for item in inputs if isinstance(item, dict)]
-    result = {**metrics, **(result if isinstance(result, dict) else {})}
-    claim = result.get("claim") or result.get("qualification_verdict") or result.get("baseline_matrix_verdict") or disposition
+    result = result if isinstance(result, dict) else {}
+    if isinstance(result.get("content"), dict):
+        result = result["content"]
+    claim = result.get("claim") or result.get("qualification_verdict") or result.get("baseline_matrix_verdict")
+    result_summary = result.get("summary") or result.get("observations")
     return {"schema_ref": "meta-research/evidence-discovery-summary/v1",
             "summary_only": True, "purpose": bounded_text(purpose, 512),
-            "claim": bounded_text(claim, 512),
+            **({"claim": bounded_text(claim, 512)} if claim is not None else {}),
+            **({"result_summary": bounded_text(result_summary, 512)}
+               if result_summary is not None else {}),
             "support_boundary": bounded_text(result.get("limitations", []), 512),
             "metric_names": [bounded_text(key, 80)["text"] for key in list(metrics)[:12]],
             "metric_count": len(metrics)}

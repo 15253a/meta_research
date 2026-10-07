@@ -444,6 +444,156 @@ def test_finalizer_freezes_once_and_replays_without_reopening_live_workspace(
         runtime.close()
 
 
+def test_complete_result_without_total_classification_reaches_target_commit(
+    tmp_path: Path,
+) -> None:
+    runtime, lifecycle, memory, authority, handle, workspace, evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    result_path = workspace / "outputs" / "metrics.json"
+    document = json.loads(result_path.read_text(encoding="utf-8"))
+    document.pop("result_disposition")
+    document["observations"] = {"measured_effect": "The recorded metrics are the observations."}
+    result_path.write_text(canonical_json(document), encoding="utf-8")
+    finalizer = TargetRunFinalizer(
+        lifecycle=lifecycle,
+        memory=memory,
+        workspace_resolver=runtime.target_run_authorities.agent_runtime,
+        evidence_reader=_EvidenceReader(evidence),
+        measurement_authority=runtime.owners.research_graph,
+        graph_authority=runtime.owners.research_graph,
+    )
+    try:
+        accepted = finalizer.finalize(handle=handle, evidence=evidence)
+        assert accepted.status == "completed"
+        manifest = memory.query(accepted.manifest_ref)
+        assert manifest is not None
+        assert manifest.result_document.as_dict() == document
+        commit = next(item for item in runtime.owners.research_graph.query_target_commits(
+            authority.graph_ref
+        ) if item.commit_ref == accepted.target_commit_ref)
+        from meta_research.target_commit_evidence import target_commit_evidence_document
+        downstream = target_commit_evidence_document(commit)
+        result_entry = next(entry for entry in manifest.entries if entry.role == "result")
+        assert downstream["result_content"]["asset"]["version_ref"] == result_entry.binding.version_ref
+        assert downstream["result_content"]["asset"]["source_bytes_sha256"] == result_entry.content_hash
+        assert json.loads(runtime.owners.research_memory.materialize_asset(
+            result_entry.binding.version_ref
+        ).content) == document
+        assert downstream["metric_result"]["metrics"] == document["metrics"]
+        assert commit.result_disposition is None
+        assert finalizer.finalize(handle=handle, evidence=evidence) == accepted
+    finally:
+        runtime.close()
+
+
+def test_result_uses_owner_schema_without_recopying_it_into_source(
+    tmp_path: Path,
+) -> None:
+    runtime, lifecycle, memory, authority, handle, workspace, evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    result_path = workspace / "outputs" / "metrics.json"
+    document = json.loads(result_path.read_text(encoding="utf-8"))
+    document.pop("schema_ref")
+    document.pop("result_disposition")
+    source_bytes = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+    result_path.write_bytes(source_bytes)
+    finalizer = TargetRunFinalizer(
+        lifecycle=lifecycle,
+        memory=memory,
+        workspace_resolver=runtime.target_run_authorities.agent_runtime,
+        evidence_reader=_EvidenceReader(evidence),
+        measurement_authority=runtime.owners.research_graph,
+        graph_authority=runtime.owners.research_graph,
+    )
+    try:
+        accepted = finalizer.finalize(handle=handle, evidence=evidence)
+        assert accepted.status == "completed"
+        manifest = memory.query(accepted.manifest_ref)
+        assert manifest is not None
+        assert manifest.result_document.as_dict() == document
+        result_entry = next(entry for entry in manifest.entries if entry.role == "result")
+        assert runtime.owners.research_memory.materialize_asset(
+            result_entry.binding.version_ref
+        ).content == source_bytes
+        transition = runtime.owners.research_graph.query_target_frontier_commit_transition(
+            handle.target_ref
+        )
+        assert transition.canonical_terminal.protocol_version_ref == authority.identities.protocol_version_ref
+        assert transition.canonical_terminal.target_run_ref == handle.target_run_ref
+        assert finalizer.finalize(handle=handle, evidence=evidence) == accepted
+    finally:
+        runtime.close()
+
+
+def test_unclassified_result_remains_readable_as_evidence_for_reasoning(
+    tmp_path: Path,
+) -> None:
+    from meta_research.owners.research_memory import AssetIntakeRequest
+    from meta_research.target_commit_evidence import (
+        TARGET_COMMIT_EVIDENCE_MEDIA_TYPE,
+        target_commit_evidence_document,
+        target_commit_evidence_provenance,
+    )
+
+    runtime, lifecycle, memory, authority, handle, workspace, evidence = (
+        _root_finalizer_fixture(tmp_path)
+    )
+    result_path = workspace / "outputs" / "metrics.json"
+    document = json.loads(result_path.read_text(encoding="utf-8"))
+    document.pop("schema_ref")
+    document.pop("result_disposition")
+    document["summary"] = "The evaluation recorded the observations; their scientific scope remains limited."
+    result_path.write_text(canonical_json(document), encoding="utf-8")
+    finalizer = TargetRunFinalizer(
+        lifecycle=lifecycle, memory=memory,
+        workspace_resolver=runtime.target_run_authorities.agent_runtime,
+        evidence_reader=_EvidenceReader(evidence),
+        measurement_authority=runtime.owners.research_graph,
+        graph_authority=runtime.owners.research_graph,
+    )
+    try:
+        accepted = finalizer.finalize(handle=handle, evidence=evidence)
+        assert accepted.status == "completed"
+        graph = runtime.owners.research_graph
+        commit = next(item for item in graph.query_target_commits(authority.graph_ref)
+                      if item.commit_ref == accepted.target_commit_ref)
+        quest_ref = runtime.target_run_authorities.agent_runtime.query_target_workspace_quest_ref(handle)
+        content = canonical_json(target_commit_evidence_document(commit)).encode("utf-8")
+        intake = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text", custody_mode="managed", display_name="target-evidence.json",
+                media_type=TARGET_COMMIT_EVIDENCE_MEDIA_TYPE, content=content,
+                provenance=target_commit_evidence_provenance(commit),
+            ), idempotency_key="unclassified-evidence-intake",
+        )
+        assert intake.status == "accepted" and intake.asset is not None
+        graph.accept_asset_role(
+            binding=intake.asset.as_binding(), role="evidence", quest_ref=quest_ref,
+            idempotency_key="unclassified-evidence-role",
+        )
+        saved = json.loads(runtime.owners.research_memory.materialize_asset(
+            intake.asset.version_ref
+        ).content)
+        assert "result_disposition" not in saved
+        page, catalog = graph.query_plan_evidence_page(quest_ref=quest_ref)
+        assert catalog[0]["target_commit_root_ref"] == commit.commit_ref
+        projection = page["projections"][0]
+        assert "result_disposition" not in projection
+        assert "claim" not in projection["research_summary"]
+        assert projection["research_summary"]["result_summary"]["text"] == document["summary"]
+        leaves = graph.resolve_reasoning_target_evidence_leaves(
+            quest_ref=quest_ref, target_commit_refs=(commit.commit_ref,),
+        )
+        measurement = next(leaf for leaf in leaves if leaf.role == "MetricResult")
+        assert measurement.source_evaluation_attempt_ref == commit.evaluation_attempt_ref
+        assert measurement.target_commit_acceptance_receipt == commit.receipt
+        assert saved["metric_result"]["metrics"] == document["metrics"]
+    finally:
+        runtime.close()
+
+
 def test_recoverable_rg_rejection_is_append_only_and_replays_as_revision_required(
     tmp_path: Path,
 ) -> None:
@@ -677,7 +827,7 @@ def test_invalid_result_candidate_is_rejected_before_rm_and_can_be_revised(
         assert rejected.pending_code == "target_root_result_document_invalid"
         assert rejected.rejection_feedback == (
             "The declared result document is not valid unambiguous UTF-8 JSON for the "
-            "Target result schema. Rewrite outputs/result.json and complete another "
+            "Target result schema. Rewrite outputs/metrics.json and complete another "
             "root turn."
         )
         first_completion = lifecycle.query_completion(handle.target_ref)

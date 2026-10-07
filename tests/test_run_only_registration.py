@@ -131,7 +131,7 @@ def test_reusing_a_run_rejects_changed_inputs_or_another_runs_valid_binding(tmp_
         for item in packet["work_items"]:
             item["reuse_evaluation_attempt"] = False
         if problem == "input_refs":
-            packet["work_items"][0]["input_refs"] = []
+            packet["work_items"][0]["input_refs"] = ["unselected-input"]
         else:
             with runtime._database.write() as connection:
                 connection.execute(text("UPDATE rg_variant_runs SET input_binding_ref='test-swap' WHERE variant_run_ref=:run"),

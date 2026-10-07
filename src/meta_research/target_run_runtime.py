@@ -726,9 +726,13 @@ class TargetRunRuntime:
                     "log": "logs",
                 },
                 "result_document_fields": [
-                    "schema_ref",
                     "metrics",
-                    "result_disposition",
+                ],
+                "system_carried_fields": [
+                    "target_ref", "target_run_ref", "root_session_ref",
+                    "execution_attempt_ref", "execution_fence_ref",
+                    "execution_input_binding_ref", "target_spec_binding",
+                    "frozen_input_manifest_path", "result_schema_ref",
                 ],
                 "root_final_text": "exact text and UTF-8 sha256",
             },
@@ -744,6 +748,8 @@ class TargetRunRuntime:
             "当前工作与证据检查形成可交接结论后，再写 outputs/result.json 作为完成候选；"
             "在途观察写分析或日志，失败、阻塞和未评价保持真实状态，不把在途工作当已完成。"
             "result_schema 是初始表达指导；Protocol 指标集合、身份、来源与数值安全仍按实际合同核验。"
+            "身份、冻结输入和 result_schema_ref 由系统按上述 Owner 权威携带；结果文档可省略 schema_ref。"
+            "用真实指标、分析和局限表达结果，产物用途与实际采用关系仍由根判断并声明。"
             "多个 Run、分离评价或待评价工作读取 Skill 的正式工作交接参考，使用 formal_runs 表达。\n\n"
             "实际训练或评价开始时连续保留完整 stdout 与 stderr，分别写入 logs/train.log 或 logs/eval.log；"
             "使用程序支持的无缓冲或行缓冲模式，如 Python -u 或 PYTHONUNBUFFERED=1。用 tee 镜像时，"

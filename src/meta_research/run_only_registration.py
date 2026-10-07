@@ -59,7 +59,8 @@ def _unassessed_inventory(document):
     return runs if runs and not has_assessment else None
 
 
-def _source_inputs(completion, manifest, target, authority, run, *, source_owner):
+def _source_inputs(completion, manifest, target, authority, run, *, source_owner,
+                   legacy_input_selection=False):
     proofs = projection_plain_value(completion.handle.accepted_input_asset_proofs)
     from meta_research.formal_run_bindings import implementation_binding, resolve_local_inputs
     entries = [entry.as_dict() for entry in manifest.entries]
@@ -73,7 +74,7 @@ def _source_inputs(completion, manifest, target, authority, run, *, source_owner
     ]))
     allowed = set(defaults) | verified_target_input_asset_refs(
         source_owner, target_ref=target.target_ref, proofs=proofs)
-    selected = run.get("input_refs", defaults)
+    selected = run.get("input_refs", defaults if legacy_input_selection else [])
     if isinstance(selected, list) and any(isinstance(ref, str) and ref not in allowed for ref in selected):
         allowed |= verified_target_input_asset_refs(
             source_owner, target_ref=target.target_ref, proofs=[],
@@ -81,7 +82,7 @@ def _source_inputs(completion, manifest, target, authority, run, *, source_owner
     if (not isinstance(selected, list) or any(not isinstance(ref, str) for ref in selected)
             or len(set(selected)) != len(selected) or not set(selected) <= allowed):
         raise OwnerConflict("target_formal_input_reference_invalid")
-    return {
+    inputs = {
         "schema_ref": SCHEMA, "input_refs": list(dict.fromkeys([*selected, *local_inputs])), "run_key": run["run_key"],
         "target_ref": target.target_ref, "target_spec_hash": target.spec_hash,
         "target_run_ref": completion.handle.target_run_ref,
@@ -95,6 +96,9 @@ def _source_inputs(completion, manifest, target, authority, run, *, source_owner
         "accepted_input_asset_proofs": proofs,
         "accepted_input_target_commit_refs": list(completion.handle.accepted_input_target_commit_refs),
     }
+    if not legacy_input_selection:
+        inputs["input_selection_recorded"] = "input_refs" in run
+    return inputs
 
 
 def _check_source_rows(connection, completion, manifest, target, authority):
@@ -147,7 +151,9 @@ def _verify_original_binding_source(owner, proof, run_ref):
         selected = [run for run in runs if run["run_key"] == proof.inputs.get("run_key")]
         if (len(selected) != 1 or selected[0].get("variant_run_ref")
                 or _ref("variant_run", completion.completion_ref, selected[0]["run_key"]) != run_ref
-                or proof.inputs != _source_inputs(completion, manifest, target, authority, selected[0], source_owner=owner)):
+                or proof.inputs != _source_inputs(
+                    completion, manifest, target, authority, selected[0], source_owner=owner,
+                    legacy_input_selection="input_selection_recorded" not in proof.inputs)):
             raise OwnerConflict("target_unassessed_execution_integrity_invalid")
 
 
@@ -266,8 +272,16 @@ def _persist_runs(connection, *, completion, manifest, target, authority, runs, 
                 raise OwnerConflict("target_formal_reused_run_input_conflict")
             bound_inputs = original.inputs
         else:
-            inputs = _source_inputs(completion, manifest, target, authority, run, source_owner=source_owner)
             binding_ref = _ref("variant_input", run_ref)
+            recorded = connection.execute(text(
+                "SELECT inputs_json FROM rg_experiment_input_bindings WHERE binding_ref=:ref"),
+                {"ref": binding_ref}).scalar_one_or_none() if verify_only else None
+            # Reading historical executions must reproduce their exact input
+            # receipt, including the original selection semantics.
+            legacy_input_selection = (recorded is not None
+                                      and "input_selection_recorded" not in json.loads(recorded))
+            inputs = _source_inputs(completion, manifest, target, authority, run,
+                source_owner=source_owner, legacy_input_selection=legacy_input_selection)
             _ensure_input(ensure, binding_ref, "variant_run", run_ref, inputs, at)
             ensure("rg_variant_runs", "variant_run_ref", {
                 "variant_run_ref": run_ref, "variant_ref": variant_ref, "input_binding_ref": binding_ref,

@@ -523,7 +523,7 @@ class AcceptedTargetGenericMeasurement:
     evaluation_attempt_ref: str
     metric_result_ref: str
     metric_values: tuple[TargetMetricValue, ...]
-    result_disposition: str
+    result_disposition: str | None
     checkpoint_artifact_refs: tuple[str, ...]
     variant_run_input_binding: ExecutionInputBindingProof
     evaluation_attempt_input_binding: ExecutionInputBindingProof

@@ -1759,7 +1759,8 @@ class BundleStageWorker:
             "evaluation_attempt_ref": commit.evaluation_attempt_ref,
             "target_spec_hash": commit.target_spec_hash,
             "closure_hash": commit.closure_hash,
-            "result_disposition": commit.result_disposition,
+            **({"result_disposition": commit.result_disposition}
+               if commit.result_disposition is not None else {}),
             "protocol": commit.closure["protocol"],
             "metric_result": target_commit_metric_result(commit),
             "receipt": commit.receipt.as_public_dict(),
@@ -2097,7 +2098,8 @@ class BundleStageWorker:
                     "target_spec_hash": commit.target_spec_hash,
                     "closure_hash": commit.closure_hash,
                     "closure": commit.closure,
-                    "result_disposition": commit.result_disposition,
+                    **({"result_disposition": commit.result_disposition}
+                       if commit.result_disposition is not None else {}),
                     "receipt": commit.receipt.as_public_dict(),
                 }
                 for commit in commits
@@ -2111,7 +2113,8 @@ class BundleStageWorker:
                 {
                     "target_commit_ref": commit.commit_ref,
                     "target_ref": commit.target_ref,
-                    "result_disposition": commit.result_disposition,
+                    **({"result_disposition": commit.result_disposition}
+                       if commit.result_disposition is not None else {}),
                     "metric_result": target_commit_metric_result(commit),
                     "receipt": commit.receipt.as_public_dict(),
                     "evidence_ref": evidence["evidence_ref"],

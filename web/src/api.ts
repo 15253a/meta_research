@@ -1109,11 +1109,11 @@ export type BundleTargetCommitProjection = {
   commit_ref: string;
   target_ref: string;
   target_run_ref: string;
-  evaluation_attempt_ref: string;
+  evaluation_attempt_ref: string | null;
   target_spec_hash: string;
   closure_hash: string;
   closure: Record<string, unknown>;
-  result_disposition: string;
+  result_disposition?: string | null;
   receipt?: IdeaReceipt | null;
   [key: string]: unknown;
 };
@@ -1301,7 +1301,7 @@ export type BundleStageProjection = {
   baseline_pool: Array<{
     target_commit_ref: string;
     target_ref: string;
-    result_disposition: string;
+    result_disposition?: string | null;
     metric_result?: Record<string, unknown>;
     receipt?: IdeaReceipt | null;
     [key: string]: unknown;
