@@ -242,6 +242,51 @@ def test_workspace_path_capture_preserves_one_submission_and_rejects_unsafe_byte
         runtime.close()
 
 
+def test_literature_revision_updates_source_coverage_without_changing_the_prepared_basis(tmp_path):
+    class ExpandedReadingAdapter(ExistingWorkAdapter):
+        def synthesize_first_question(self, request):
+            result = super().synthesize_first_question(request)
+            binding = self.workspaces.bind_initialization(request.initialization_id, request.root_session_ref)
+            basis = json.loads((binding.directory / request.context["relative_root"] / "basis.json").read_text())
+            source = next(item for item in basis["sources"] if item["relative_path"] == "project/raw.log")
+            content = self.workspaces.read_initialization(request.initialization_id, request.root_session_ref,
+                workspace_ref=source["workspace_ref"], path=source["path"], expected_sha256=source["sha256"])["content"]
+            coverage = {"material_key": source["material_key"], "kind": "read", "read_ranges": [{
+                "material_key": source["material_key"], "offset": 0, "length": len(content),
+                "chunk_sha256": hashlib.sha256(content).hexdigest(), "location": "raw.log line 1"}], "unread_description": ""}
+            result.revision["understanding"]["coverage"] = [
+                coverage if item["material_key"] == source["material_key"] else item
+                for item in result.revision["understanding"]["coverage"]]
+            return result
+
+    provider = PreparedBasisReadingDeepFetch()
+    runtime = build_production_runtime(prepare_data_root(tmp_path / "data"), proposal_drafter=ExpandedReadingAdapter(),
+        host_compute_probe=DeterministicProbe(), deepfetch_provider=provider, acquisition_provider=RecordingAcquisitionProvider())
+    provider.runtime = runtime
+    client, headers = _authenticate(runtime)
+    try:
+        ready = _ready(runtime, client, headers, "deepfetch")
+        memory = runtime.owners.research_memory.creation_bases
+        revised = memory.query(ready["creation_basis"]["basis_ref"], ready["creation_basis"]["basis_hash"])
+        prepared = memory.query(revised["predecessor"]["basis_ref"], revised["predecessor"]["basis_hash"])
+        before = {source["material_key"]: source for source in prepared["sources"]}
+        coverage = {item["material_key"]: item for item in revised["understanding"]["coverage"]}
+        for source in revised["sources"]:
+            assert source["coverage"] == coverage[source["material_key"]]
+            assert {key: value for key, value in source.items() if key != "coverage"} == {
+                key: value for key, value in before[source["material_key"]].items() if key != "coverage"}
+        raw = next(source for source in revised["sources"] if source["relative_path"] == "project/raw.log")
+        assert raw["coverage"]["kind"] == "read"
+        assert before[raw["material_key"]]["coverage"]["kind"] == "unread"
+        assert revised["basis_hash"] != prepared["basis_hash"]
+        assert memory.query(prepared["basis_ref"], prepared["basis_hash"]) == prepared
+        projected_raw = next(source for source in memory.source_views(revised) if source["material_key"] == raw["material_key"])
+        assert projected_raw["coverage"] == coverage[raw["material_key"]]
+    finally:
+        client.close()
+        runtime.close()
+
+
 def test_draft_change_keeps_generation_basis_distinct_from_explicit_human_review(tmp_path):
     runtime = build_production_runtime(prepare_data_root(tmp_path / "data"), proposal_drafter=ExistingWorkAdapter(), host_compute_probe=DeterministicProbe())
     client, headers = _authenticate(runtime)

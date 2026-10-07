@@ -283,9 +283,11 @@ class CreationBasisMemory:
             raise
         except Exception as error:
             raise OwnerConflict("creation_revision_invalid") from error
+        coverage = {item["material_key"]: item for item in revision["understanding"]["coverage"]}
         body = {key: value for key, value in predecessor.items() if key not in {"basis_ref", "basis_hash"}}
         body.update(kind="literature_revised", predecessor=self.reference(predecessor),
             literature_snapshot=snapshot, understanding=revision["understanding"], corrections=revision["corrections"],
+            sources=[{**source, "coverage": coverage[source["material_key"]]} for source in predecessor["sources"]],
             search_assessment={"assessment": revision["search_assessment"], "completion": metadata["completion"], "limitations": metadata["limitations"]})
         return self._accept(body)
 
