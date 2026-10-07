@@ -11903,6 +11903,7 @@ def _validate_generation_basis(draft: dict[str, object]) -> None:
     if (
         literature["mode"] == "provided_only"
         and not literature["accepted_material_bindings"]
+        and not normalized.get("material_manifest", {}).get("entries")
     ):
         raise OwnerConflict("accepted_material_binding_required")
 

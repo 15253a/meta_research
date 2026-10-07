@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 from pathlib import Path
 
@@ -45,7 +46,12 @@ def deliver_materials(owner, initialization_id, payload, idempotency_key):
                 if len(files) > 10000:
                     raise OwnerConflict("creation_material_count_exceeded")
     else:
-        files = [(item["relative_path"], base64.b64decode(item["content_base64"], validate=True)) for item in payload["files"]]
+        try:
+            files = [(item["relative_path"], base64.b64decode(item["content_base64"], validate=True)) for item in payload["files"]]
+        except (binascii.Error, ValueError) as error:
+            raise OwnerConflict("creation_material_content_invalid") from error
+    if sum(len(content) for _, content in files) > 64 * 1024 * 1024:
+        raise OwnerConflict("creation_material_size_exceeded")
     if not files:
         raise OwnerConflict("creation_material_delivery_empty")
     batch_records = []

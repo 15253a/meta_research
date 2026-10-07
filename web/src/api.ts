@@ -273,6 +273,29 @@ export type QuestDraft = {
     accepted_material_bindings: Array<Record<string, unknown>>;
   };
   background_and_initial_direction: string;
+  material_manifest?: CreationMaterialManifest;
+};
+
+export type CreationMaterialManifest = {
+  entries: Array<{ material_key: string; relative_path: string; sha256: string; bytes: number }>;
+  submissions: Array<{ submission_ref: string; complete: boolean }>;
+};
+
+export type CreationResearchBasis = {
+  basis_ref: string;
+  basis_hash: string;
+  kind: "prepared" | "literature_revised";
+  freshness: "current" | "stale";
+  human_reviewed_draft: { revision: number; hash: string } | null;
+  understanding: Record<"material_composition" | "work_already_done" | "claims_and_conditions" | "conflicts" | "gaps" | "unfinished_questions", Array<{
+    ref: string; text: string; kind: "reported_work" | "agent_inference"; conditions: string[];
+    sources: Array<{ material_key: string; location: string; offset: number; length: number }>;
+  }>>;
+  sources: Array<{ material_key: string; relative_path: string; selection_reason: string | null;
+    coverage: { kind: "read" | "partial" | "unread"; unread_description: string } }>;
+  corrections: Array<{ prior_statement_ref: string; disposition: string; explanation: string;
+    original_sources: string[]; literature_sources: Array<{ paper_id: string; locator: string }> }>;
+  search_assessment: { assessment: string; completion: string; limitations: string[] } | null;
 };
 
 export type LegacyQuestDraft = {
@@ -486,6 +509,7 @@ export type QuestCapability =
 
 export type QuestCreationView = {
   initialization_id: string;
+  creation_basis?: CreationResearchBasis | null;
   creation_context: "quest_initialization";
   route: "direct" | "deepfetch";
   status:
@@ -4345,6 +4369,31 @@ export function acceptAssetRole(
 
 export function createQuest(): Promise<QuestCreationView> {
   return writeJson("/api/v1/quest-initializations", "POST", {});
+}
+
+export function deliverCreationMaterials(
+  creation: QuestCreationView,
+  submission: { submission_ref: string; folder: boolean; files: Array<{ relative_path: string; content_base64: string }> },
+): Promise<QuestCreationView> {
+  return writeJson(`/api/v1/quest-initializations/${creation.initialization_id}/material-deliveries`, "POST", {
+    expected_draft_revision: creation.quest_draft.revision,
+    expected_draft_hash: creation.quest_draft.hash,
+    ...submission,
+    complete: true,
+  });
+}
+
+export function captureCreationMaterialPath(
+  creation: QuestCreationView,
+  submissionRef: string,
+  locator: string,
+): Promise<QuestCreationView> {
+  return writeJson(`/api/v1/quest-initializations/${creation.initialization_id}/material-paths`, "POST", {
+    expected_draft_revision: creation.quest_draft.revision,
+    expected_draft_hash: creation.quest_draft.hash,
+    submission_ref: submissionRef,
+    locator,
+  });
 }
 
 export function reviseQuestDraft(

@@ -216,7 +216,7 @@ class CreationMaterialDeliveryRequest(BaseModel):
     submission_ref: str = Field(min_length=1, max_length=128)
     folder: bool = False
     complete: bool = True
-    files: list[CreationMaterialFileRequest] = Field(min_length=1, max_length=100)
+    files: list[CreationMaterialFileRequest] = Field(min_length=1, max_length=10000)
 
 
 class CreationMaterialPathRequest(BaseModel):
