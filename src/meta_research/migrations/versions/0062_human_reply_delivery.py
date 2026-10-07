@@ -1,5 +1,3 @@
-"""Keep exact reply commands private until working files are readable."""
-
 import sqlalchemy as sa
 from alembic import op
 
