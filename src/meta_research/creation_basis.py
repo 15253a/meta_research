@@ -263,9 +263,6 @@ class CreationBasisMemory:
                 raise ValueError("selection changed")
             metadata = self._owner.read_literature_snapshot_metadata(snapshot["snapshot_ref"])
             ledger = self._owner.read_literature_proposal_evidence(snapshot["snapshot_ref"])
-            known_papers = set()
-            for paper in metadata["papers"]:
-                known_papers.update(str(paper.get(key)) for key in ("id", "paper_id", "doi", "url") if paper.get(key))
             ledger_body = metadata.get("papers_ledger") or ledger.get("papers_ledger") or {}
             ledger_papers = ledger_body.get("papers", {}) if isinstance(ledger_body, dict) else {}
             refs = {statement["ref"] for key in UNDERSTANDING_FIELDS for statement in predecessor["understanding"][key]}
@@ -413,7 +410,9 @@ def creation_basis_operations(memory, runtime, collaboration):
                 return {**page, "basis_ref": basis["basis_ref"], "basis_hash": basis["basis_hash"]}
             value = {"understanding": basis["understanding"], "sources": memory.creation_bases.source_views(basis),
                 "corrections": basis["corrections"], "search_assessment": basis["search_assessment"],
-                "literature_snapshot": basis["literature_snapshot"]}
+                "literature_snapshot": basis["literature_snapshot"], "predecessor": basis["predecessor"],
+                "prepared_understanding": (None if basis["predecessor"] is None else memory.creation_bases.query(
+                    basis["predecessor"]["basis_ref"], basis["predecessor"]["basis_hash"])["understanding"])}
             return {**context_read_page(value, path=[], offset=arguments.get("offset", 0), limit=min(arguments.get("limit", 8192), 16384)),
                 "basis_ref": basis["basis_ref"], "basis_hash": basis["basis_hash"]}
         except (OwnerConflict, KeyError) as error:

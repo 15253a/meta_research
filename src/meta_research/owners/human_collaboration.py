@@ -4784,7 +4784,11 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
 
     def deliver_initialization_materials(self, initialization_id, payload, idempotency_key):
         from meta_research.initialization_materials import deliver_materials
-        return deliver_materials(self, initialization_id, payload, idempotency_key)
+        from meta_research.semantic_mcp import SemanticMcpError
+        try:
+            return deliver_materials(self, initialization_id, payload, idempotency_key)
+        except SemanticMcpError as error:
+            raise OwnerConflict(error.code) from error
 
     def prepare_creation_basis(self, initialization_id, revision, draft_hash, draft, job_ref):
         from meta_research.creation_basis import (
