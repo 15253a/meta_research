@@ -258,11 +258,13 @@ export type ScopedAssetIntakePointer = {
 };
 
 export type LiteratureMode = "oa_then_institution" | "oa_only" | "provided_only";
+export type ResearchStyle = "focus" | "balanced" | "open";
 
 export type QuestDraft = {
   goal: string;
   completion_criteria: string;
   time_budget: "7d" | "30d" | "90d" | "open";
+  research_style: ResearchStyle;
   route: "direct" | "deepfetch";
   resource_envelope_ref: string | null;
   resource_envelope_hash: string | null;
@@ -2626,15 +2628,15 @@ export class ProductError extends Error {
   }
 }
 
-export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string };
+export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string; research_style?: ResearchStyle };
 
 export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSignal): Promise<QuestRuntimeConditions> {
   return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);
 }
 
-export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string): Promise<QuestRuntimeConditions> {
+export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle): Promise<QuestRuntimeConditions> {
   return writeJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, "PUT", {
-    text, expected_revision: expectedRevision,
+    text, expected_revision: expectedRevision, research_style: researchStyle,
   });
 }
 

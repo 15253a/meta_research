@@ -11258,7 +11258,8 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
         "literature",
         "background_and_initial_direction",
     }
-    if set(draft) == v2_fields:
+    if set(draft) in (v2_fields, v2_fields | {'research_style'}):
+        from meta_research.research_style import validate_research_style
         normalized: dict[str, object] = {}
         for field in (
             "goal",
@@ -11320,6 +11321,7 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
         normalized.update(
             {
                 "time_budget": time_budget,
+                'research_style': validate_research_style(draft.get('research_style', 'balanced')),
                 "route": route,
                 "resource_envelope_ref": envelope_ref,
                 "resource_envelope_hash": envelope_hash,
@@ -11374,6 +11376,7 @@ def _blank_v2_draft() -> dict[str, object]:
         "goal": "",
         "completion_criteria": "",
         "time_budget": "open",
+        'research_style': 'balanced',
         "route": "direct",
         "resource_envelope_ref": None,
         "resource_envelope_hash": None,
