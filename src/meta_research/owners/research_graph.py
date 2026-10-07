@@ -1387,6 +1387,10 @@ class TargetCandidateOwnerProofVerifier(Protocol):
     ) -> None: ...
 
 class ResearchGraphInterface(ResearchEnvironmentOwnerInterface, ResearchDatasetOwnerInterface, HumanRequestOwnerInterface, Protocol):
+    def query_target_result_handoff(
+        self, target_ref: str, *, quest_ref: str
+    ) -> dict[str, object]: ...
+
     def query_baseline(self, baseline_ref: str) -> dict[str, object] | None: ...
 
     def query_baselines(self, *, query: str = "", method_contract_hash: str | None = None,
@@ -7134,6 +7138,129 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
         committed_runs = {item['variant_run_ref'] for item in committed}
         unassessed = query_unassessed_runs(self, target_ref)
         return (*committed, *(item for item in unassessed if item['variant_run_ref'] not in committed_runs))
+
+    def _target_resource_candidates(
+        self, target_ref: str, *, facts: tuple[dict[str, object], ...]
+    ) -> dict[str, object]:
+        """Read candidate meaning from the accepted, receipt-verified completion.
+
+        Candidate purpose is a proposal for reuse. Exact RM bindings and the
+        current RG production attribution remain independent Owner facts.
+        """
+        with self._database.read_snapshot():
+            result: dict[str, object] = {
+                "status": "not_found", "target_ref": target_ref,
+                "target_run_ref": None, "target_commit_ref": None,
+                "manifest_ref": None, "manifest_receipt": None,
+                "dataset_candidates": [], "environment_candidates": [],
+            }
+            transition = self._query_target_root_commit_transition(target_ref)
+            if transition is None:
+                return result
+            reader = self._target_root_manifest_reader
+            manifest = None if reader is None else reader.query(
+                transition.canonical_terminal.asset_manifest_ref)
+            if (manifest is None or manifest.target_ref != target_ref
+                    or manifest.target_run_ref != transition.target_run_ref
+                    or receipt_proof(manifest.receipt, subject_ref=manifest.manifest_ref)
+                    != transition.canonical_terminal.rm_asset_receipt):
+                raise OwnerConflict("target_input_dependency_manifest_invalid")
+            document = manifest.result_document.as_dict()
+            entries = {entry.declared_relative_path: entry for entry in manifest.entries}
+            subjects = {(kind, fact[key]) for fact in facts
+                        for kind, key in (("variant_run", "variant_run_ref"),
+                                          ("evaluation_attempt", "evaluation_attempt_ref"))
+                        if fact.get(key) is not None}
+            result.update(status="accepted", target_run_ref=transition.target_run_ref,
+                target_commit_ref=transition.target_commit_ref,
+                manifest_ref=manifest.manifest_ref,
+                manifest_receipt=manifest.receipt.as_public_dict())
+            with self._database.read() as connection:
+                for field in ("dataset_candidates", "environment_candidates"):
+                    candidates = []
+                    for declaration in document.get(field, []):
+                        entry = entries.get(declaration["artifact_path"])
+                        if entry is None:
+                            raise OwnerConflict("target_formal_entity_integrity_invalid")
+                        rows = connection.execute(text(
+                            "SELECT r.*, (SELECT a.from_subject_kind FROM "
+                            "rg_experiment_asset_role_adjustments a WHERE a.role_ref=r.role_ref "
+                            "ORDER BY a.accepted_at,a.rowid LIMIT 1) AS _adjusted_from_kind, "
+                            "(SELECT a.from_subject_ref FROM rg_experiment_asset_role_adjustments a "
+                            "WHERE a.role_ref=r.role_ref ORDER BY a.accepted_at,a.rowid LIMIT 1) "
+                            "AS _adjusted_from_ref FROM rg_experiment_asset_roles r "
+                            "WHERE r.version_ref=:version ORDER BY r.role,r.ordinal,r.role_ref"),
+                            {"version": entry.binding.version_ref}).all()
+                        producers = []
+                        for row in rows:
+                            original = (row._adjusted_from_kind or row.subject_kind,
+                                        row._adjusted_from_ref or row.subject_ref)
+                            if original not in subjects:
+                                continue
+                            role = _accepted_experiment_asset_role_tolerant(connection, row)
+                            if role.binding != entry.binding:
+                                raise OwnerConflict("target_formal_entity_integrity_invalid")
+                            adjustments = connection.execute(text(
+                                "SELECT * FROM rg_experiment_asset_role_adjustments "
+                                "WHERE role_ref=:ref ORDER BY accepted_at,rowid"),
+                                {"ref": role.role_ref}).mappings().all()
+                            _verify_resource_candidate_adjustments(
+                                row, adjustments, original_subject=original)
+                            producers.append({"role_ref": role.role_ref, "role": role.role,
+                                "subject_kind": row.subject_kind, "subject_ref": row.subject_ref,
+                                "receipt": role.receipt.as_public_dict(),
+                                "accepted_subject_kind": original[0], "accepted_subject_ref": original[1],
+                                "attribution_adjustments": [self._artifact_role_adjustment_record(item)
+                                                            for item in adjustments]})
+                        if entry.role == "implementation":
+                            from meta_research.formal_run_bindings import implementation_binding
+                            declarations = {run["run_key"]: run for run in document.get("formal_runs", [])
+                                            if run.get("run_key")}
+                            selected_runs = set()
+                            for fact in facts:
+                                run = fact["variant_run"]
+                                source = run["inputs"]
+                                declared = declarations.get(fact["run_key"], {})
+                                paths = declared.get("implementation_paths")
+                                if (run["variant_run_ref"] in selected_runs
+                                        or declared.get("variant_run_ref")
+                                        or source.get("manifest_ref") != manifest.manifest_ref
+                                        or (paths is not None and entry.declared_relative_path not in paths)):
+                                    continue
+                                revision, tree_hash = implementation_binding(
+                                    [item.as_dict() for item in manifest.entries], paths)
+                                if (source.get("implementation_revision_ref") != revision
+                                        or source.get("implementation_tree_hash") != tree_hash):
+                                    raise OwnerConflict("target_formal_entity_integrity_invalid")
+                                selected_runs.add(run["variant_run_ref"])
+                                producers.append({"subject_kind": "variant_run",
+                                    "subject_ref": run["variant_run_ref"], "role": "implementation_snapshot",
+                                    "input_binding_ref": run["input_binding_ref"],
+                                    "implementation_revision_ref": revision})
+                        if not producers:
+                            raise OwnerConflict("target_resource_candidate_producer_missing")
+                        candidates.append({**declaration, "asset_binding": entry.binding.as_dict(),
+                                           "producers": producers})
+                    result[field] = candidates
+            return result
+
+    def query_target_result_handoff(
+        self, target_ref: str, *, quest_ref: str
+    ) -> dict[str, object]:
+        """Read formal facts and their candidate handoff at one Owner snapshot."""
+        with self._database.read_snapshot():
+            with self._database.read() as connection:
+                target_quest = connection.execute(text(
+                    "SELECT g.quest_ref FROM rg_targets t JOIN rg_target_graphs g "
+                    "ON g.graph_ref=t.graph_ref WHERE t.target_ref=:ref"),
+                    {"ref": target_ref}).scalar_one_or_none()
+            if target_quest is None or target_quest != quest_ref:
+                raise OwnerConflict("formal_result_quest_scope_invalid")
+            facts = self.query_target_formal_results(target_ref)
+            candidates = self._target_resource_candidates(target_ref, facts=facts)
+            return {"items": list(facts),
+                    "execution_registration": self.query_target_execution_registration(target_ref),
+                    "resource_candidates": candidates}
 
     def query_formal_result_by_ref(
         self, ref: str, *, quest_ref: str
@@ -17513,6 +17640,31 @@ def _role_adjustment_original_subject(connection, role_ref):
     if adjusted is None:
         return None
     return str(adjusted[0]), str(adjusted[1])
+
+
+def _verify_resource_candidate_adjustments(row, adjustments, *, original_subject):
+    """Authenticate the correction chain before publishing current attribution."""
+    subject = original_subject
+    for adjustment in adjustments:
+        payload = {"role_ref": adjustment["role_ref"],
+                   "to_subject_kind": adjustment["to_subject_kind"],
+                   "to_subject_ref": adjustment["to_subject_ref"],
+                   "reason": adjustment["reason"]}
+        receipt_bindings = {**payload,
+            "from_subject_kind": adjustment["from_subject_kind"],
+            "from_subject_ref": adjustment["from_subject_ref"],
+            "payload_hash": adjustment["payload_hash"]}
+        if (adjustment["role_ref"] != row.role_ref
+                or adjustment["payload_hash"] != canonical_hash(payload)
+                or adjustment["receipt_hash"] != _receipt_hash(
+                    "experiment_artifact_role_adjustment", adjustment["adjustment_ref"], receipt_bindings)
+                or not adjustment["receipt_ref"]
+                or (adjustment["from_subject_kind"], adjustment["from_subject_ref"]) != subject
+                or adjustment["to_subject_kind"] not in {"variant_run", "evaluation_attempt"}):
+            raise OwnerConflict("target_resource_candidate_adjustment_invalid")
+        subject = (adjustment["to_subject_kind"], adjustment["to_subject_ref"])
+    if subject != (row.subject_kind, row.subject_ref):
+        raise OwnerConflict("target_resource_candidate_adjustment_invalid")
 
 
 def _accepted_experiment_asset_role_tolerant(connection, row):

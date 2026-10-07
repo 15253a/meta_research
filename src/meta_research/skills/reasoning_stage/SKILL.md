@@ -25,13 +25,13 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 ## 2. 交接前整理已接纳 Target 资源
 
-在同一整理核验环节读取已接纳 Target 的 `dataset_candidates`、`environment_candidates` 和精确 completion manifest，沿 `artifact_path` 找真实 RM binding，判断独立复用价值。交接前用 datasets.register／register_version／reference 登记数据版本与用途，真实派生用 derive；用 environments.register／reference 登记环境含义、真实来源、原件 binding、当前 Question 及原 Target／Run 的用途关系。Target 已正式接纳即满足这些原件的发布前提，primary／draft 阶段可做，不等本次 ScientificOutcome 接纳。现有设备、设施、持久目录、安装或服务可按真实来源直接登记，无须补造 Target。
+在同一整理核验环节从已接纳 TargetCommit 上下文取精确 `target_ref`，调用 `research_graph.target_formal_results.read`，读取 `resource_candidates`，核对 TargetCommit／manifest 身份。查看 `dataset_candidates`、`environment_candidates` 的 `artifact_path`、含义、完整 `asset_binding` 和 `producers`，判断独立复用价值；purpose 是候选用途，生产归属使用 RG 当前已纠正的 subject，原接纳归属及纠错记录保留依据。implementation 候选通过已核验 Run 的 `input_binding_ref`／implementation revision 关联实际工作。交接前沿用原件 binding，以 datasets.register／register_version／reference 登记数据版本与用途，真实派生用 derive；以 environments.register／reference 登记环境含义、真实来源、原件 binding、当前 Question 及原 Target／Run 的用途关系。同一原件可有多种用途，交接不要求填满六入口。Target 已正式接纳即满足这些原件的发布前提，生成草稿的 primary 回合即可做，不等本次 ScientificOutcome 接纳。现有设备、设施、持久目录、安装或服务可按真实来源直接登记，无须补造 Target。
 
-本轮 Target 闭包从 context pack 的 `accepted_target_commit_closures` 读取；`predecessor_closure` 用于 `prior_accepted_bindings` 中的前序交接。需要原件及登记凭据时，对精确 AssetVersion 调用 `research_memory.content.read`，将 `source_ref`、`version_ref` 都设为该版本引用。目录先省略 `entry_path` 并用 `offset=0, limit=1` 读取条目页，返回的完整 `asset_binding`（含 RM receipt）可原样用于版本登记，无须读取大文件。`formal_results` 提供实施与归属线索；其中未附 receipt 时沿上述原件入口取得凭据，再判断是否存在实际阻塞。
+本轮 TargetCommit 身份从 context pack 的 `accepted_target_commit_closures` 读取，其中的闭包概要不代替候选正文；`predecessor_closure` 用于 `prior_accepted_bindings` 中的前序交接。需要核实实际内容时，对候选 binding 的精确 AssetVersion 调用 `research_memory.content.read`，将 `source_ref`、`version_ref` 都设为该版本引用。目录先省略 `entry_path` 并用 `offset=0, limit=1` 读取条目页，再选择所需正文。候选完整 `asset_binding`（含 RM receipt）可原样用于登记，无须读取大文件取得凭据。
 
 最后一个 Target 后 Bundle 若不再运行，由 Reasoning 承接。先发现或对账既有登记，再复用身份和原件；未知效果沿同一 `effect_id` reconcile。可委派明确资源范围的子智能体登记，根在交接前独立查回资源记录与用途关系；有数字材料时核实精确版本及原件，有真实数据派生时核实派生关系。无保留价值时说明判断；外部条件阻塞时记录未完成步骤和继续条件；暂存、未接纳材料仍在工作区。
 
-完成条件：值得保留且当前可登记的候选已登记并读回；其余有真实取舍或具体阻塞说明，不把空 Dataset 身份当作已有版本，也不把登记当作新实验结果。
+完成条件：值得保留且当前可登记的候选已登记并读回；空候选或无保留价值时说明判断，不制造资源记录；其余有真实取舍或具体阻塞说明，不把空 Dataset 身份当作已有版本，也不把登记当作新实验结果。
 
 ## 3. 判断后继与相关问题
 

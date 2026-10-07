@@ -14,7 +14,7 @@ AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan�
 2. 提出科学候选和真实依赖，由 RG 接纳身份和 spec；重读其内容绑定及 current frontier。
 3. 仅对未启动、ready 且获授权的 Target 发起 admission／dispatch。claim 验证 spec、输入、资源、授权和 Harness，并确保至多一个 current 根。
 4. 已执行工作沿原 TargetRun 观察、wake 或 reconcile；wake 只带重新读事实的信号，不携带研究结果作为权威依据。
-5. Target 形成稳定交接后，由 AR／RM／RG 核验、保存并接纳真实 Run、产物和适用评价；Bundle 读回 TargetCommit 后更新覆盖。
+5. Target 形成稳定交接后，由 AR／RM／RG 核验、保存并接纳真实 Run、产物和适用评价；Bundle 读回 TargetCommit 后更新覆盖，并用其 `target_ref` 调用 `research_graph.target_formal_results.read` 获取 `resource_candidates`，按[主 Skill 的整理步骤](../SKILL.md)筛选、登记及查回可复用资源。
 6. 独立审阅最终策略及交接，提交真实 BundleReport 候选，由 AE 验证阶段收口。
 
 根与系统的执行分工不要求 Agent 重建 receipts、固定内部调用签名或 daemon 私有流程。仅凭 Session 完成、退出码、日志标签和页面进度不能认定正式科学结果。
