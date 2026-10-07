@@ -26,6 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from meta_research.database import Database
+from meta_research.owners.asset_lifecycle import AssetLifecycleOwnerMixin, assert_asset_usable, validate_asset_change
 from meta_research.owners.research_literature_content import LiteratureContentPageReader, store_body, validate_body
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
@@ -245,6 +246,7 @@ class AssetIntakeRequest:
     provenance: dict[str, object] | None = None
     asset_ref: str | None = None
     asynchronous: bool = False
+    change: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -257,6 +259,7 @@ class AssetIntakeRequest:
             "provenance": self.provenance,
             "asset_ref": self.asset_ref,
             "asynchronous": self.asynchronous,
+            "change": self.change,
         }
 
     def validate(self) -> None:
@@ -909,6 +912,7 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
         *,
         idempotency_key: str,
         operation_namespace: str | None = None,
+        effect_scope: Callable[[], None] | None = None,
     ) -> AssetIntakeResult: ...
 
     def linked_local_intake_mode(self, source_locator: str) -> str: ...
@@ -3137,7 +3141,7 @@ class SQLiteResearchMemoryReceiptVerifier:
         return binding
 
 
-class SQLiteResearchMemory(HumanRequestOwnerMixin):
+class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,
@@ -3435,6 +3439,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         *,
         idempotency_key: str,
         operation_namespace: str | None = None,
+        effect_scope: Callable[[], None] | None = None,
     ) -> AssetIntakeResult:
         if not idempotency_key or len(idempotency_key) > 128:
             raise OwnerConflict("asset_intake_idempotency_key_invalid")
@@ -3564,7 +3569,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     },
                 )
         if sync_claimed:
-            self._process_asset_job(job_ref, already_claimed=True)
+            self._process_asset_job(job_ref, already_claimed=True, effect_scope=effect_scope)
         return self.query_asset_intake(job_ref)
 
     def linked_local_intake_mode(self, source_locator: str) -> str:
@@ -3737,7 +3742,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         return True
 
     def _process_asset_job(
-        self, job_ref: str, *, already_claimed: bool = False
+        self, job_ref: str, *, already_claimed: bool = False, effect_scope: Callable[[], None] | None = None
     ) -> None:
         with self._database.write() as connection:
             row = connection.execute(
@@ -3782,7 +3787,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             )
             prepared = self._prepare_asset(request_document)
             phase = "accept_prepared_asset"
-            self._accept_prepared_asset(job_ref, request_document, prepared)
+            self._accept_prepared_asset(job_ref, request_document, prepared, effect_scope=effect_scope)
         except OwnerConflict as error:
             if error.code in TRANSIENT_ASSET_INTAKE_CONFLICTS:
                 self._requeue_asset_intake(job_ref, error=error, phase=phase)
@@ -4137,6 +4142,7 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         job_ref: str,
         request: dict[str, object],
         prepared: _PreparedAsset,
+        *, effect_scope: Callable[[], None] | None = None,
     ) -> None:
         if request.get("custody_mode") == "managed":
             _verify_managed_manifest(self._object_store, prepared.manifest)
@@ -4166,7 +4172,9 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         }
         provenance_json = canonical_json(provenance)
         provenance_hash = canonical_hash(provenance)
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
+            if effect_scope is not None:
+                effect_scope()
             job = connection.execute(
                 text(
                     "SELECT * FROM rm_asset_intakes WHERE job_ref = :job_ref"
@@ -4294,6 +4302,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     "established_at": now,
                 },
             )
+            self._accept_asset_lifecycle(connection, asset_ref=asset_ref, version_ref=version_ref,
+                change=request.get("change"), idempotency_key=job.idempotency_key)
             connection.execute(
                 text(
                     "UPDATE rm_asset_verification_observations SET integrity = "
@@ -6112,6 +6122,10 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
 
     def verify_asset_binding(self, **values) -> None:
         self._receipt_verifier.verify_asset_binding(**values)
+
+    def assert_asset_usable(self, version_ref: str) -> None:
+        with self._database.read() as connection:
+            assert_asset_usable(connection, version_ref)
 
     @snapshot_cached
     def verify_asset_projection_binding(self, **values) -> None:
@@ -10820,6 +10834,7 @@ def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:
         "provenance": provenance,
         "asset_ref": None if asset_ref is None else asset_ref.strip(),
         "asynchronous": bool(request.asynchronous),
+        **({"change": validate_asset_change(request.change, asset_ref)} if request.change is not None else {}),
     }
 
 
@@ -10845,6 +10860,7 @@ def _validated_stored_asset_request(
                 "asset_ref",
                 "asynchronous",
             }
+            and set(document) != {"source_kind", "custody_mode", "display_name", "media_type", "content_base64", "source_locator", "provenance", "asset_ref", "asynchronous", "change"}
         ):
             raise ValueError("durable asset request binding mismatch")
         encoded = document["content_base64"]
@@ -10866,6 +10882,7 @@ def _validated_stored_asset_request(
             provenance=document["provenance"],
             asset_ref=document["asset_ref"],
             asynchronous=document["asynchronous"],
+            change=document.get("change"),
         )
         normalized = _asset_request_document(request)
         if normalized != document:

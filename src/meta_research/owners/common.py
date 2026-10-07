@@ -970,9 +970,10 @@ class RunCompletionReceiptVerifier(Protocol):
 class OwnerConflict(RuntimeError):
     """An idempotent Owner command was replayed with different semantics."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, details: dict[str, object] | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.details = details
 
 
 def canonical_json(value: object) -> str:
