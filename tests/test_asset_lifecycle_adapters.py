@@ -332,3 +332,37 @@ def test_semantic_asset_discovery_uses_one_filtered_page(tmp_path):
         assert refs == [asset["asset_ref"] for asset in reversed(assets)]
     finally:
         runtime.close()
+
+
+def test_current_full_conformance_accepts_the_expanded_asset_operation_catalog(
+    tmp_path,
+):
+    from test_harness_full_conformance import _runtime, _full_request
+    from meta_research.harness import FULL_CONFORMANCE_V2
+
+    runtime, _, _ = _runtime(tmp_path / "asset-catalog-conformance")
+    try:
+        admitted = runtime.harnesses.start_full_conformance(_full_request())
+        assert admitted.contract_ref == FULL_CONFORMANCE_V2
+        required = {
+            binding["semantic_operation_id"]
+            for binding in admitted.runs[0].mcp_binding.operation_bindings
+        }
+        assert {
+            "research_memory.assets.page",
+            "research_memory.assets.lifecycle",
+            "research_memory.assets.current",
+            "research_memory.assets.intake",
+            "research_memory.assets.intake.reconcile",
+            "research_memory.assets.retire",
+            "research_memory.assets.retire.reconcile",
+        } <= required
+        for _ in range(4):
+            if runtime.harnesses.query_status()["status"] == "ready":
+                break
+            assert runtime.harnesses.advance_full_conformance(
+                mcp_base_url="http://127.0.0.1:8765"
+            )
+        assert runtime.harnesses.query_status()["status"] == "ready"
+    finally:
+        runtime.close()

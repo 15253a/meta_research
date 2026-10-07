@@ -8,6 +8,8 @@ Correction also records `error`, `scope`, exact accepted `evidence_bindings`, an
 
 Retirement requires an explanation, explicit confirmation of low value, obsolescence, and error, understood impact, and no remaining explanatory value. The writer checks fresh research references, pending accepted input custody, holds, and the expected asset and reference revisions. An eligibility assessment is an observation, never a retirement permit. Failure, negative findings, and changed goals do not trigger retirement.
 
+Accepted Idea, Plan, and Reasoning content retain exact asset sources in their scientific documents. An intake origin permits Quest access without inventing a scientific role. When an agent chooses that material as a new scientific basis, the final content writer checks usability under the same fence as retirement. Retirement verifies the retained document metadata and its existing acceptance receipt. Historical resolution and replay keep the original source identity when current changes.
+
 Accepted retirement removes the selected version from current and rejects new uses. It retains managed objects, shared directory entries, linked originals, and historical explanations. This implementation does not reclaim bytes. A retained exact version remains readable with its retirement notice. A same-key replay returns the original fact; a changed payload conflicts.
 
 ## Public operations
@@ -31,6 +33,6 @@ A semantic intake durably records that it requires an effect scope in its canoni
 
 Migration `0060_asset_lifecycle` leaves previous content and receipts unchanged. Legacy versions remain `unselected` with revision zero. No latest version becomes current by inference. The first explicit change selects its stated predecessor and creates an accepted current selection. Owner-bound formal content remains protected by its existing owner.
 
-The public owner probes are in `tests/test_public_asset_lifecycle.py`. HTTP and actual semantic dispatch share the contract in `tests/test_asset_lifecycle_adapters.py`. `tests/test_asset_lifecycle_protection.py` verifies Target production, pending inputs, completion protection, human responses, and shared directory entries with real owner fixtures. Backend tests run on Linux because the runtime requires `fcntl`. Workspace handoff notes provide the isolated Linux runner. Frontend checks use `npm test`, `npm run typecheck`, and `npm run build` from `web`.
+The public owner probes are in `tests/test_public_asset_lifecycle.py`. HTTP and actual semantic dispatch share the contract in `tests/test_asset_lifecycle_adapters.py`. That suite also checks readiness with the expanded current operation catalog. `tests/test_asset_lifecycle_protection.py` verifies origin-only Plan and Reasoning sources, Target production, pending inputs, completion protection, human responses, and shared directory entries with real owner fixtures. Backend tests run on Linux because the runtime requires `fcntl`. Workspace handoff notes provide the isolated Linux runner. Frontend checks use `npm test`, `npm run typecheck`, and `npm run build` from `web`.
 
 The local engineering checks use temporary content and independent data roots. They do not establish long-term scientific benefit or mutate deployed research assets.

@@ -13,6 +13,201 @@ from test_root_formal_entities import _accept
 from test_target_root_finalizer import _root_finalizer_fixture
 
 
+@pytest.mark.parametrize("timing", ["accepted_before", "retired_before"])
+def test_plan_acceptance_retains_origin_only_exact_basis_and_rejects_retired_basis(
+    tmp_path, timing, monkeypatch
+):
+    from test_plan_asset_target_input import _runtime
+    import test_public_bundle_stage as fixtures
+    import meta_research.owners.research_memory as memory_module
+
+    runtime, plan, bundle = _runtime(tmp_path / timing)
+    try:
+        quest = fixtures._confirm_direct_quest(runtime)
+        assets, graph = runtime.owners.research_memory, runtime.owners.research_graph
+        basis = intake(
+            assets,
+            b"exact scientific Plan observation\n",
+            "plan-basis",
+            origin_quest_ref=quest["quest_ref"],
+        )
+        assert graph.query_asset_roles(version_refs=(basis.version_ref,)) == ()
+        plan.source_ref = bundle.source_ref = basis.version_ref
+        accept = assets.accept_plan_document
+        calls = []
+        read_payload = memory_module._read_verified_plan_payload
+
+        def read_outside_writer(*args):
+            assert not runtime._database._write_lock._is_owned()
+            return read_payload(*args)
+
+        def record_acceptance(**values):
+            calls.append(values)
+            return accept(**values)
+
+        monkeypatch.setattr(assets, "accept_plan_document", record_acceptance)
+        monkeypatch.setattr(
+            memory_module, "_read_verified_plan_payload", read_outside_writer
+        )
+        fixtures._finish_idea_stage(runtime)
+        if timing == "retired_before":
+            retire(assets, graph, basis, "retire-plan-basis")
+            with pytest.raises(OwnerConflict, match="asset_version_retired"):
+                fixtures._finish_plan_stage(runtime)
+            current = runtime.plan_stage.query_current()
+            assert current["stage_commit"] is None
+            assert graph.query_snapshot().facts["formal_plan_count"] == 0
+            submission_ref = current["run"]["submission_ref"]
+            assert assets.query_plan_document(submission_ref) is None
+        else:
+            fixtures._finish_plan_stage(runtime)
+            submission_ref = runtime.plan_stage.query_current()["run"]["submission_ref"]
+            document = assets.query_plan_document(submission_ref)
+            with pytest.raises(OwnerConflict) as blocked:
+                retire(assets, graph, basis, "retire-plan-basis")
+            assert (
+                f"rm_plan_documents:{document.content_ref}"
+                in blocked.value.details["active_reference_refs"]
+            )
+            newer = intake(
+                assets,
+                b"later scientific observation\n",
+                "later-plan-basis",
+                asset_ref=basis.asset_ref,
+                change={
+                    "kind": "supplement",
+                    "expected_revision": 1,
+                    "predecessor_version_ref": basis.version_ref,
+                    "explanation": "Keep the original observation and add the later measurement.",
+                },
+            )
+            assert (
+                assets.query_current_asset(basis.asset_ref).version_ref
+                == newer.version_ref
+            )
+            assert assets.query_plan_document(submission_ref) == document
+            assert accept(**calls[-1]) == document
+            assert runtime.plan_stage.process_once() is False
+            from sqlalchemy import text
+
+            with runtime._database.write() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE rm_plan_documents SET plan_document_json=:document WHERE content_ref=:ref"
+                    ),
+                    {"document": canonical_json({}), "ref": document.content_ref},
+                )
+            with pytest.raises(OwnerConflict, match="reference_state_uncertain"):
+                retire(assets, graph, basis, "retire-with-missing-plan-origin")
+        assert (
+            assets.materialize_asset(basis.version_ref).content
+            == b"exact scientific Plan observation\n"
+        )
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("timing", ["accepted_before", "retired_before"])
+def test_reasoning_scientific_acceptance_retains_origin_only_exact_basis(
+    tmp_path, timing, monkeypatch
+):
+    from test_reasoning_summary_decision_flow import (
+        runtime_at,
+        seed_checkpoint,
+        SummarySkill,
+    )
+    import meta_research.owners.research_memory as memory_module
+
+    class SourceSkill(SummarySkill):
+        source_ref = None
+
+        def decide_after_deepfetch(self, *args):
+            decision = super().decide_after_deepfetch(*args)
+            decision["final_output"]["scientific_outcome"]["evidence"].append(
+                {"kind": "AssetVersion", "ref": self.source_ref, "finding": "context"}
+            )
+            return decision
+
+    skill = SourceSkill("create")
+    runtime = runtime_at(tmp_path / timing, skill)
+    try:
+        request, checkpoint = seed_checkpoint(runtime)
+        assets, graph = runtime.owners.research_memory, runtime.owners.research_graph
+        basis = intake(
+            assets,
+            b"exact Reasoning observation\n",
+            "reasoning-basis",
+            origin_quest_ref=request.accepted_question.quest_ref,
+        )
+        assert graph.query_asset_roles(version_refs=(basis.version_ref,)) == ()
+        skill.source_ref = basis.version_ref
+        accept, calls = assets.accept_reasoning_scientific_candidate, []
+
+        def record_acceptance(**values):
+            calls.append(values)
+            return accept(**values)
+
+        verify_object = memory_module._verify_reasoning_scientific_candidate_object
+
+        def verify_outside_writer(*args):
+            assert not runtime._database._write_lock._is_owned()
+            return verify_object(*args)
+
+        monkeypatch.setattr(
+            assets, "accept_reasoning_scientific_candidate", record_acceptance
+        )
+        monkeypatch.setattr(
+            memory_module,
+            "_verify_reasoning_scientific_candidate_object",
+            verify_outside_writer,
+        )
+        for _ in range(15):
+            runtime.autonomous_creation.process_once()
+            view = runtime.autonomous_creation.query(checkpoint.checkpoint_ref)
+            if view and view["deepfetch"]["status"] == "queued":
+                runtime.deepfetch.process_once()
+            if view and view["status"] == "awaiting_reasoning_decision":
+                break
+        if timing == "retired_before":
+            retire(assets, graph, basis, "retire-reasoning-basis")
+            with pytest.raises(OwnerConflict, match="asset_version_retired"):
+                for _ in range(10):
+                    runtime.reasoning_stage.process_once()
+            assert (
+                assets.query_reasoning_scientific_candidate_by_checkpoint_ref(
+                    checkpoint.checkpoint_ref
+                )
+                is None
+            )
+        else:
+            for _ in range(10):
+                runtime.reasoning_stage.process_once()
+                candidate = assets.query_reasoning_scientific_candidate_by_checkpoint_ref(
+                    checkpoint.checkpoint_ref
+                )
+                if candidate is not None:
+                    break
+            assert candidate is not None
+            assert {
+                "kind": "AssetVersion",
+                "ref": basis.version_ref,
+                "finding": "context",
+            } in candidate.scientific_outcome["evidence"]
+            assert accept(**calls[-1]) == candidate
+            with pytest.raises(OwnerConflict) as blocked:
+                retire(assets, graph, basis, "retire-reasoning-basis")
+            assert (
+                f"rm_reasoning_scientific_candidates:{candidate.content_ref}"
+                in blocked.value.details["active_reference_refs"]
+            )
+        assert (
+            assets.materialize_asset(basis.version_ref).content
+            == b"exact Reasoning observation\n"
+        )
+    finally:
+        runtime.close()
+
+
 def test_two_actual_productions_keep_retirement_blocked_after_role_correction(tmp_path):
     (
         runtime,

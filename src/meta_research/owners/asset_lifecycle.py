@@ -124,6 +124,26 @@ def assert_asset_payload_usable(connection, value):
             assert_asset_payload_usable(connection, item)
 
 
+def assert_scientific_asset_sources_usable(connection, document):
+    pending = [document]
+    sources = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+        elif isinstance(value, str):
+            sources.add(value)
+    for source in sorted(sources):
+        exists = connection.execute(
+            text("SELECT 1 FROM rm_asset_versions WHERE version_ref=:ref"),
+            {"ref": source},
+        ).first()
+        if exists is not None:
+            assert_asset_usable(connection, source)
+
+
 def retained_asset_references(connection, version_ref):
     references = []
     target_rows = (
@@ -610,6 +630,9 @@ class AssetLifecycleOwnerMixin:
                         [
                             *references,
                             *retained_asset_references(connection, memory_ref),
+                            *self._retained_scientific_asset_references(
+                                connection, memory_ref
+                            ),
                         ]
                     )
                 )

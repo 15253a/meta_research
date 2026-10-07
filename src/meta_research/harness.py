@@ -3272,7 +3272,8 @@ class HarnessRuntime:
             or not idempotency_key
             or len(idempotency_key) > 128
             or not request.required_operation_ids
-            or len(request.required_operation_ids) > 64
+            or len(request.required_operation_ids)
+            > max(64, len(FULL_CONFORMANCE_OPERATION_IDS))
             or not operations_valid
             or len(request.required_operation_ids)
             != len(set(request.required_operation_ids))
