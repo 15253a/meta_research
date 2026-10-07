@@ -719,6 +719,9 @@ class SQLiteHumanCollaborationLadder:
                 native_session_ref=row.native_session_ref,
                 job_ref=provider_job_ref,
                 root_runtime_scope=root_runtime_scope,
+                creation_context_kind="companion_conversation",
+                creation_context_ref=str(row.scope_ref),
+                root_session_ref=str(row.session_ref),
             )
             result = self._drafting_provider.reply(request)
             reply = _text(
@@ -1184,6 +1187,18 @@ class SQLiteHumanCollaborationLadder:
                 boundary=boundary,
                 checkpoint_ref=checkpoint_ref,
             )
+
+    def query_companion_session(self, session_ref: str) -> dict[str, object] | None:
+        with self._database.read() as connection:
+            scope_ref = connection.execute(text(
+                "SELECT scope_ref FROM hc_companion_sessions WHERE session_ref = :session_ref"),
+                {"session_ref": session_ref}).scalar_one_or_none()
+        if scope_ref is None:
+            return None
+        session = self.query_companion(str(scope_ref))
+        if session["session_ref"] != session_ref:
+            raise OwnerConflict("companion_session_invalid")
+        return session
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
         scope_ref = _scope_ref(scope_ref, "companion_scope_required")

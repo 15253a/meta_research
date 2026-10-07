@@ -128,6 +128,14 @@ class RootWorkspaces:
                 return WorkspaceLocation(session.workspace_ref, kind, session.root_session_ref,
                     session.work_ref, session.directory, quest_ref=quest_ref, request_ref=run_ref,
                     initialization_id=session.initialization_id)
+        if kind == "companion":
+            facts = self._hc.query_companion_work_context(managed["root_session_ref"])
+            if facts is not None:
+                session = self.bind_companion_session(facts["scope_ref"], managed["root_session_ref"]).location
+                if session.quest_ref != quest_ref:
+                    raise OwnerConflict("workspace_lineage_invalid")
+                return WorkspaceLocation(session.workspace_ref, kind, session.root_session_ref,
+                    session.work_ref, session.directory, quest_ref=quest_ref, request_ref=run_ref)
         if kind == "deepfetch":
             run = self._ar.query_deepfetch_run_by_ref(run_ref)
             if self._deepfetch_locator is None:
@@ -222,6 +230,29 @@ class RootWorkspaces:
             context_generation, require_open=False).location, "human_collaboration", context_ref, root_session_ref,
             "manual_question_creation")
 
+    def bind_companion_session(self, scope_ref: str, root_session_ref: str) -> WorkspaceBinding:
+        return self._companion_session_binding(scope_ref, root_session_ref, require_open=True)
+
+    def _companion_session_binding(self, scope_ref: str, root_session_ref: str,
+                                   *, require_open: bool) -> WorkspaceBinding:
+        if (not isinstance(scope_ref, str) or not scope_ref
+            or not isinstance(root_session_ref, str) or not root_session_ref):
+            raise SemanticMcpError("workspace_companion_scope_invalid")
+        try:
+            facts = self._hc.query_companion_work_context(root_session_ref)
+        except OwnerConflict as error:
+            raise SemanticMcpError(error.code) from error
+        if (facts is None or facts["session_ref"] != root_session_ref
+            or facts["scope_ref"] != scope_ref or require_open and facts["status"] != "open"):
+            raise SemanticMcpError("workspace_companion_scope_invalid")
+        identity = {"companion_session_ref": root_session_ref}
+        location = WorkspaceLocation("workspace:" + canonical_hash(identity), "companion",
+            root_session_ref, root_session_ref, self._bases["companion"] / canonical_hash(identity),
+            quest_ref=facts["quest_ref"], request_ref=scope_ref)
+        self._ensure_directory(location.directory)
+        return WorkspaceBinding(location, canonical_hash({"owner": "human_collaboration",
+            **identity, "scope_ref": scope_ref}))
+
     def bind_acquisition_session(self, session_ref: str) -> WorkspaceBinding:
         session = self._ar.query_acquisition_session(session_ref=session_ref)
         if session is None:
@@ -255,7 +286,7 @@ class RootWorkspaces:
             location = candidates[0]
         else:
             location = self._runtime_location(caller["task_ref"])
-        original_task_ref = (location.request_ref if location.root_kind == "acquisition" and location.request_ref
+        original_task_ref = (location.request_ref if location.root_kind in {"acquisition", "companion"} and location.request_ref
                              else location.work_ref)
         if (location.root_session_ref != caller.get("root_session_ref")
             or original_task_ref != caller.get("task_ref")):
@@ -314,6 +345,10 @@ class RootWorkspaces:
         return self._discover((self._manual_creation_binding(context_ref, root_session_ref,
             context_generation, require_open=False).location,), **arguments)
 
+    def discover_companion_session(self, scope_ref: str, root_session_ref: str, **arguments):
+        return self._discover((self._companion_session_binding(scope_ref, root_session_ref,
+            require_open=False).location,), **arguments)
+
     def _discover(self, locations, *, prefix="", offset=0, limit=50):
         if prefix:
             _relative_parts(prefix.rstrip("/"))
@@ -364,6 +399,10 @@ class RootWorkspaces:
                              context_generation: int, **arguments):
         return self._read((self._manual_creation_binding(context_ref, root_session_ref,
             context_generation, require_open=False).location,), **arguments)
+
+    def read_companion_session(self, scope_ref: str, root_session_ref: str, **arguments):
+        return self._read((self._companion_session_binding(scope_ref, root_session_ref,
+            require_open=False).location,), **arguments)
 
     def _read(self, locations, *, workspace_ref, path, expected_sha256=None, offset=0, max_bytes=65536):
         if type(offset) is not int or offset < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= 65536:

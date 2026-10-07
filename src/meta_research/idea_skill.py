@@ -1059,6 +1059,10 @@ class CodexIdeaSkillAdapter:
                 if request.creation_context_kind == "manual_question_creation"
                 else "workspace_initialization_scope_invalid")
         try:
+            if request.creation_context_kind == "companion_conversation":
+                if request.creation_context_ref != request.initialization_id:
+                    raise IdeaSkillUnavailable("workspace_companion_scope_invalid")
+                return self._workspaces.bind_companion_session(request.creation_context_ref, root_ref)
             if request.creation_context_kind == "manual_question_creation":
                 binding = self._workspaces.bind_manual_creation(request.creation_context_ref,
                     root_ref, request.context_generation)
