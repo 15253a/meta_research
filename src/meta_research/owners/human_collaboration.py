@@ -4780,7 +4780,9 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
             return None
         return {**basis, "sources": memory.source_views(basis),
             "freshness": "current" if basis["draft"]["revision"] == int(row.draft_revision) and basis["draft"]["hash"] == row.draft_hash else "stale",
-            "human_reviewed_draft": {"revision": int(row.proposal_basis_revision), "hash": row.proposal_basis_hash} if row.proposal_ref is not None else None}
+            "human_reviewed_draft": {"revision": int(row.proposal_basis_revision), "hash": row.proposal_basis_hash}
+                if row.proposal_ref is not None and (int(row.proposal_basis_revision), row.proposal_basis_hash)
+                    != (basis["draft"]["revision"], basis["draft"]["hash"]) else None}
 
     def deliver_initialization_materials(self, initialization_id, payload, idempotency_key):
         from meta_research.initialization_materials import deliver_materials

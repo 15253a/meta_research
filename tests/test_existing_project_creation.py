@@ -248,6 +248,7 @@ def test_draft_change_keeps_generation_basis_distinct_from_explicit_human_review
     try:
         ready = _ready(runtime, client, headers, "direct")
         generated = ready["creation_basis"]
+        assert generated["human_reviewed_draft"] is None
         changed = {**ready["quest_draft"]["value"], "goal": "Narrow the follow-up to cold conditions"}
         del changed["material_manifest"]
         response = client.put(f"/api/v1/quest-initializations/{ready['initialization_id']}/draft", headers=_write_headers(headers, "change-goal"), json={
