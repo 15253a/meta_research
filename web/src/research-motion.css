@@ -1,0 +1,6 @@
+.research-motion-control { display:inline-flex; align-items:center; justify-content:center; gap:6px; flex-shrink:0; min-height:36px; padding:6px 10px; border:1px solid #dfe3ee; border-radius:9px; color:#55627a; background:#fff; font-size:12px; cursor:pointer; }
+.research-motion-control[aria-pressed=true] { background:#f0eeff; border-color:#cbc5ef; color:#625fe7; }
+html[data-research-motion=still] *, html[data-research-motion=still] *::before, html[data-research-motion=still] *::after { animation-play-state:paused !important; transition:none !important; scroll-behavior:auto !important; }
+[data-motion-active=false] .meta-trace, [data-motion-active=false] .meta-trace *, [data-motion-active=false] .spectrum-chart * { animation-play-state:paused !important; }
+@media(prefers-reduced-motion:reduce) { *, *::before, *::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; } }
+@media(max-width:600px) { .research-motion-control { font-size:13px; width:36px; min-width:36px; padding:6px; } .research-motion-control > span:last-child { display:none; } }

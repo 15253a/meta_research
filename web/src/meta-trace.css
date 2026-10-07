@@ -1,0 +1,10 @@
+.meta-trace{display:inline-flex;align-items:center;justify-content:center;flex:none;vertical-align:middle;pointer-events:none;line-height:1;color:#76649a}
+.meta-trace svg{display:block;width:100%;height:100%;overflow:visible}
+.meta-trace-signature{width:34px;height:34px}
+.meta-trace-brief{width:20px;height:20px}
+.meta-trace-spectrum{width:24px;height:24px;color:var(--stage-color)}
+.meta-trace-timeline{width:18px;height:18px;color:#76649a}
+.meta-trace-assistant{width:34px;height:34px;animation:none!important}
+.meta-trace-brief[data-motion-active=true],.meta-trace-spectrum[data-motion-active=true]{animation:meta-trace-breathe 2.4s ease-in-out infinite}
+@keyframes meta-trace-breathe{0%,100%{opacity:.9}50%{opacity:.42}}
+@media(prefers-reduced-motion:reduce){.meta-trace{animation:none!important;transition:none!important}}

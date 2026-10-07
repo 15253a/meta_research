@@ -487,6 +487,7 @@ async function openTimeline(page: Page, { runningBundle = false, secondTargetFir
   });
   await page.goto("http://timeline.test/?workspace=1", { waitUntil: "domcontentloaded" });
   const timeline = page.getByRole("region", { name: "研究时间线", exact: true });
+  await timeline.scrollIntoViewIfNeeded();
   return { timeline, errors, snapshot, overview, catalog, recorder, reads, runtime };
 }
 
@@ -562,6 +563,7 @@ test("saved summary time separates an old Target sentence from its completed liv
     status: "completed", is_executing: false,
   });
   await page.reload({ waitUntil: "domcontentloaded" });
+  await timeline.scrollIntoViewIfNeeded();
   const target = cycleNode(timeline).locator('.research-timeline-target[data-target-ref="target-143-a"]');
   await expect(target.locator(".research-timeline-target-state")).toHaveText("已完成");
   await expect(target.locator(".timeline-summary-text")).toHaveText(oldSentence);
@@ -576,6 +578,7 @@ test("saved summary time separates old Reasoning prose and preserves missing-tim
   const oldSentence = "本轮尚无可供综合核对的研究结果或实验依据。";
   updateSummary(recorder, key, { summary: oldSentence, updated_at: SOURCE_TIME });
   await page.reload({ waitUntil: "domcontentloaded" });
+  await timeline.scrollIntoViewIfNeeded();
   const reasoning = summaryNode(timeline, key);
   await expect(reasoning.locator(".timeline-summary-text")).toHaveText(oldSentence);
   await expect(reasoning.locator(".timeline-summary-saved-at")).toHaveText(/^总结保存于 2026\/09\/09 \d{2}:\d{2}$/);
@@ -859,6 +862,7 @@ test("the Quest timeline remains available after the foreground ends and on a fr
   await expect(timeline.locator(".research-timeline-question")).toHaveCount(3);
   await expect(timeline.locator('.research-timeline-cycle[data-current="true"]')).toHaveCount(0);
   await page.reload({ waitUntil: "domcontentloaded" });
+  await timeline.scrollIntoViewIfNeeded();
   await expect(timeline).toBeVisible();
   await expect(timeline.locator(".research-timeline-question")).toHaveCount(3);
   await expandHistory(timeline);
