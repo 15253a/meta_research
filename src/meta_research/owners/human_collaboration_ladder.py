@@ -7,6 +7,7 @@ from typing import Callable, Protocol, cast
 
 from sqlalchemy import text
 
+from meta_research.human_guidance import GUIDANCE_DOCUMENT_MAX_BYTES
 from meta_research.control_contract import validate_control_payload
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
@@ -1462,6 +1463,42 @@ class SQLiteHumanCollaborationLadder:
             "created_at": float(row.created_at),
         }
 
+    def submit_human_guidance(
+        self, *, quest_ref: str, original_text: str, strength: int = 3,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        _idempotency_key(idempotency_key)
+        guidance = _formal_guidance({"text": original_text}, strength)
+        scope_ref = "quest:" + _scope_ref(quest_ref, "guidance_quest_required")
+        command_hash = canonical_hash({"scope_ref": scope_ref, "guidance": guidance})
+        with self._database.fenced_write() as connection:
+            replay = _collaboration_command(
+                connection, idempotency_key, "guidance_submit", command_hash,
+            )
+            if replay is not None:
+                constraint_ref = replay
+            else:
+                if connection.execute(text(
+                    "SELECT quest_ref FROM rg_quests WHERE quest_ref=:quest_ref"
+                ), {"quest_ref": quest_ref}).first() is None:
+                    raise OwnerConflict("guidance_quest_not_found")
+                constraint_ref = _create_formal_guidance(
+                    connection, scope_ref=scope_ref, guidance=guidance,
+                    strength=strength, source_proposal_ref=None,
+                    idempotency_key=idempotency_key,
+                )
+                _record_collaboration_command(
+                    connection, idempotency_key, "guidance_submit", command_hash, constraint_ref,
+                )
+                connection.execute(text(
+                    "UPDATE human_collaboration_state SET revision=revision+1, "
+                    "soft_constraint_count=soft_constraint_count+1 WHERE singleton='owner'"
+                ))
+                self._feed.record(connection, "human_collaboration.guidance_submitted", {
+                    "constraint_ref": constraint_ref, "quest_ref": quest_ref,
+                })
+        return self._query_soft_constraint(constraint_ref)
+
     def convert_agent_proposal_to_soft_constraint(
         self,
         proposal_ref: str,
@@ -1469,7 +1506,9 @@ class SQLiteHumanCollaborationLadder:
         expected_scope_ref: str,
         expected_proposal_hash: str,
         idempotency_key: str,
+        strength: int = 3,
     ) -> dict[str, object]:
+        _guidance_strength(strength)
         proposal_ref = _text(proposal_ref, "agent_proposal_stale", 64)
         expected_scope_ref = _scope_ref(
             expected_scope_ref, "agent_proposal_stale"
@@ -1484,6 +1523,7 @@ class SQLiteHumanCollaborationLadder:
                 "proposal_ref": proposal_ref,
                 "expected_scope_ref": expected_scope_ref,
                 "expected_proposal_hash": expected_proposal_hash,
+                **({} if strength == 3 else {"strength": strength}),
             }
         )
         with self._database.write() as connection:
@@ -1500,42 +1540,10 @@ class SQLiteHumanCollaborationLadder:
                     expected_scope_ref=expected_scope_ref,
                     expected_proposal_hash=expected_proposal_hash,
                 )
-                text_value = guidance.get("text")
-                if not isinstance(text_value, str) or not text_value.strip():
-                    raise OwnerConflict("soft_constraint_text_required")
-                _reject_secret_content(guidance)
-                constraint_ref = new_ref("soft_constraint")
-                receipt_ref = new_ref("hc_receipt")
-                guidance_hash = canonical_hash(guidance)
-                revision = 1
-                receipt_hash = _guidance_receipt_hash(
-                    constraint_ref,
-                    expected_scope_ref,
-                    revision,
-                    guidance_hash,
-                )
-                now = time.time()
-                connection.execute(
-                    text(
-                        "INSERT INTO hc_soft_constraints (constraint_ref, "
-                        "scope_ref, source_proposal_ref, revision, guidance_json, "
-                        "guidance_hash, status, receipt_ref, receipt_hash, "
-                        "idempotency_key, created_at, updated_at) VALUES "
-                        "(:constraint_ref, :scope_ref, :proposal_ref, 1, "
-                        ":guidance_json, :guidance_hash, 'active', :receipt_ref, "
-                        ":receipt_hash, :idempotency_key, :now, :now)"
-                    ),
-                    {
-                        "constraint_ref": constraint_ref,
-                        "scope_ref": expected_scope_ref,
-                        "proposal_ref": proposal_ref,
-                        "guidance_json": canonical_json(guidance),
-                        "guidance_hash": guidance_hash,
-                        "receipt_ref": receipt_ref,
-                        "receipt_hash": receipt_hash,
-                        "idempotency_key": idempotency_key,
-                        "now": now,
-                    },
+                constraint_ref = _create_formal_guidance(
+                    connection, scope_ref=expected_scope_ref, guidance=guidance,
+                    strength=strength, source_proposal_ref=proposal_ref,
+                    idempotency_key=idempotency_key,
                 )
                 _mark_proposal_converted(connection, row)
                 _record_collaboration_command(
@@ -3635,3 +3643,41 @@ def _document(value: object, code: str) -> dict[str, object]:
 def _reject_secret_content(value: object) -> None:
     if contains_secret(value):
         raise OwnerConflict("human_collaboration_secret_forbidden")
+
+
+def _guidance_strength(strength: int) -> None:
+    if type(strength) is not int or not 1 <= strength <= 5:
+        raise OwnerConflict("guidance_strength_invalid")
+
+
+def _formal_guidance(guidance: dict[str, object], strength: int) -> dict[str, object]:
+    _guidance_strength(strength)
+    original = guidance.get("text")
+    if not isinstance(original, str) or not original.strip():
+        raise OwnerConflict("soft_constraint_text_required")
+    document = {**guidance, "strength": strength}
+    if len(canonical_json(document).encode("utf-8")) > GUIDANCE_DOCUMENT_MAX_BYTES:
+        raise OwnerConflict("guidance_document_too_large")
+    _reject_secret_content(document)
+    return document
+
+
+def _create_formal_guidance(
+    connection, *, scope_ref, guidance, strength, source_proposal_ref, idempotency_key,
+):
+    document = _formal_guidance(guidance, strength)
+    constraint_ref = new_ref("soft_constraint")
+    receipt_ref = new_ref("hc_receipt")
+    guidance_hash = canonical_hash(document)
+    connection.execute(text(
+        "INSERT INTO hc_soft_constraints (constraint_ref,scope_ref,source_proposal_ref,"
+        "revision,guidance_json,guidance_hash,status,receipt_ref,receipt_hash,"
+        "idempotency_key,created_at,updated_at) VALUES (:constraint_ref,:scope_ref,"
+        ":source_proposal_ref,1,:guidance_json,:guidance_hash,'active',:receipt_ref,"
+        ":receipt_hash,:idempotency_key,:now,:now)"
+    ), {"constraint_ref": constraint_ref, "scope_ref": scope_ref,
+        "source_proposal_ref": source_proposal_ref, "guidance_json": canonical_json(document),
+        "guidance_hash": guidance_hash, "receipt_ref": receipt_ref,
+        "receipt_hash": _guidance_receipt_hash(constraint_ref, scope_ref, 1, guidance_hash),
+        "idempotency_key": idempotency_key, "now": time.time()})
+    return constraint_ref
