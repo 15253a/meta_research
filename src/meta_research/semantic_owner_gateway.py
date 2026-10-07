@@ -1988,6 +1988,7 @@ def _root_human_request_resolution(
         "disposition": disposition["decision"],
         "reason_code": reason["code"],
         "accepted_evidence_refs": evidence_refs,
+        **({"delivery": selected["delivery"]} if "delivery" in selected else {}),
     }
 
 
@@ -2838,6 +2839,24 @@ def _root_human_request_open_input_schema() -> dict[str, object]:
     )
 
 
+def _workspace_reply_schema() -> dict[str, object]:
+    reader = _closed_object({"workspace_ref": _string(max_length=256),
+        "path": _string(max_length=1024), "expected_sha256": _string(max_length=64)},
+        required=("workspace_ref", "path", "expected_sha256"))
+    properties = {name: _string(max_length=256) for name in (
+        "delivery_ref", "manifest_hash", "human_request_ref", "response_ref", "workspace_ref",
+        "root_kind", "root_session_ref", "work_ref", "status", "schema_ref")}
+    properties.update({name: {"type": ["string", "null"], "maxLength": 256} for name in (
+        "quest_ref", "cycle_ref", "request_ref", "stage_request_ref", "target_ref", "initialization_id")})
+    properties.update({"context_generation": {"type": "integer", "minimum": 1},
+        "reply_reader": reader, "uploaded_readers": {"type": "array", "maxItems": 99, "items": reader},
+        "linked_locators": {"type": "array", "maxItems": 100, "items": _closed_object({
+            "kind": _string(enum=("linked_local",)), "locator": _string(max_length=16000),
+            "description": _string(max_length=4000), "observed_kind": _string(enum=("file", "directory"))},
+            required=("kind", "locator", "description", "observed_kind"))}})
+    return _closed_object(properties, required=tuple(name for name in properties if name != "context_generation"))
+
+
 def _root_human_request_output_schema() -> dict[str, object]:
     operation_binding = _closed_object(
         {
@@ -2936,6 +2955,7 @@ def _root_human_request_output_schema() -> dict[str, object]:
                         "type": "array",
                         "items": _string(max_length=512),
                     },
+                    "delivery": _workspace_reply_schema(),
                 },
                 required=(
                     "response_ref",

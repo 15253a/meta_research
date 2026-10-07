@@ -525,6 +525,9 @@ def _valid_schema_contract(schema: object) -> bool:
     if not isinstance(schema, dict):
         return False
     schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        return bool(schema_type) and all(isinstance(member, str)
+            and _valid_schema_contract({**schema, "type": member}) for member in schema_type)
     if schema_type not in {
         "object",
         "array",
@@ -579,6 +582,8 @@ def _matches_schema(value: object, schema: dict[str, object]) -> bool:
     if isinstance(enum, list) and value not in enum:
         return False
     schema_type = schema["type"]
+    if isinstance(schema_type, list):
+        return any(_matches_schema(value, {**schema, "type": member}) for member in schema_type)
     if schema_type == "object":
         if not isinstance(value, dict):
             return False

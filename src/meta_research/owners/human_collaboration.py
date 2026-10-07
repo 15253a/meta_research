@@ -4195,6 +4195,8 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                 "delivery_ref": row.delivery_ref, "manifest_hash": row.manifest_hash,
                 "human_request_ref": row.request_ref, "response_ref": row.response_ref,
                 **destination.location.source(), "reply_reader": readers["reply.json"],
+                "stage_request_ref": (destination.location.request_ref
+                    if destination.location.root_kind in {"idea", "plan", "bundle", "reasoning", "target"} else None),
                 "uploaded_readers": [readers[item["relative_path"]] for item in command["materials"] if item["kind"] == "upload"],
                 "linked_locators": linked}
             return self.respond_to_human_request(row.request_ref, decision=command["decision"],
