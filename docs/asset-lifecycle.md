@@ -27,6 +27,8 @@ The retirement body contains `expected_revision`, `expected_reference_revision`,
 
 Root agents discover `research_memory.assets.page`, `.lifecycle`, and `.current`. They use `.intake` and `.retire` with their corresponding `.reconcile` operation. Every operation verifies the current Quest and runtime fence. Intake records the accepting Quest as an immutable origin fact. That access fact does not manufacture a scientific use. Exact content uses the existing `research_memory.content.read` tool.
 
+Each `.page` item's asset metadata includes `lifecycle_state` (`current`, `superseded`, `retired`, or `unselected`), derived for that exact version from the accompanying verified lifecycle.
+
 A semantic intake durably records that it requires an effect scope in its canonical request. After a transient storage failure, it remains queued until an authorized caller retries the same effect ID and payload with its current runtime scope. Background workers skip these jobs. The final fenced acceptance checks that scope and the original asset revision and predecessor again. Reconciliation reports the queued state; it does not grant acceptance permission.
 
 ## Migration and verification

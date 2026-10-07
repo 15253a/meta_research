@@ -56,8 +56,19 @@ def asset_lifecycle_operations(graph, memory, agent_runtime):
                     )
                     scope(context, version_ref)
                     asset = memory.query_asset_version(version_ref)
+                    lifecycle_state = next(
+                        version["state"]
+                        for version in lifecycle["versions"]
+                        if version["version_ref"] == version_ref
+                    )
                     items.append(
-                        {"asset": asset.as_public_dict(), "lifecycle": lifecycle}
+                        {
+                            "asset": {
+                                **asset.as_public_dict(),
+                                "lifecycle_state": lifecycle_state,
+                            },
+                            "lifecycle": lifecycle,
+                        }
                     )
                 return {
                     "items": items,

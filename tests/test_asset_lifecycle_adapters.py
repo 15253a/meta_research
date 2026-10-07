@@ -267,6 +267,7 @@ def test_http_and_semantic_share_exact_correction_and_retirement_contract(tmp_pa
                 if item["asset"]["asset_ref"] == disposable["asset_ref"]
             )
             assert retired_item["asset"]["version_ref"] == disposable["version_ref"]
+            assert retired_item["asset"]["lifecycle_state"] == "retired"
             assert retired_item["lifecycle"]["current_version_ref"] is None
             assert retired_item["lifecycle"]["versions"][0]["state"] == "retired"
             assert retired_item["lifecycle"]["changes"][-1] == fact
@@ -442,6 +443,7 @@ def test_semantic_asset_discovery_uses_one_filtered_page(tmp_path):
                 "research_memory.assets.page", query="match", offset=offset, limit=1
             )["structuredContent"]
             assert len(result["items"]) == 1
+            assert result["items"][0]["asset"]["lifecycle_state"] == "current"
             refs.append(result["items"][0]["asset"]["asset_ref"])
             if result["next_offset"] is None:
                 break
@@ -449,6 +451,55 @@ def test_semantic_asset_discovery_uses_one_filtered_page(tmp_path):
         assert refs == [asset["asset_ref"] for asset in reversed(assets)]
     finally:
         runtime.close()
+
+
+def test_legacy_asset_page_labels_unselected_without_inferring_current(tmp_path):
+    import sqlite3
+    from meta_research.owners.research_memory import AssetIntakeRequest
+
+    path = tmp_path / "legacy-page"
+    runtime = _runtime(path)
+    question = _quest(runtime, "legacy-page")
+    asset = runtime.owners.research_memory.submit_asset_intake(
+        AssetIntakeRequest(
+            source_kind="text", custody_mode="managed",
+            display_name="legacy-page.txt", content=b"legacy exact\n",
+        ),
+        idempotency_key="legacy-page",
+    ).asset
+    assert asset is not None
+    runtime.owners.research_graph.accept_asset_role(
+        binding=asset.as_binding(), role="evidence", quest_ref=question.quest_ref,
+        idempotency_key="legacy-page-role",
+    )
+    database = runtime.data_root.database
+    runtime.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE rm_asset_changes")
+        connection.execute("DROP TABLE rm_asset_version_lifecycle")
+        connection.execute("DROP TABLE rm_asset_lifecycle")
+        connection.execute(
+            "UPDATE alembic_version SET version_num='0059_research_environments'"
+        )
+    migrated = _runtime(path)
+    try:
+        call = channel(migrated, question, generation=2)
+        item = call("research_memory.assets.page", query="legacy-page")[
+            "structuredContent"
+        ]["items"][0]
+        assert item["asset"]["version_ref"] == asset.version_ref
+        assert item["asset"]["receipt"] == asset.as_public_dict()["receipt"]
+        assert item["asset"]["lifecycle_state"] == "unselected"
+        assert item["lifecycle"]["current_version_ref"] is None
+        assert item["lifecycle"]["versions"][0]["state"] == "unselected"
+        assert (
+            call(
+                "research_memory.content.read", source_ref=asset.version_ref,
+                version_ref=asset.version_ref,
+            )["structuredContent"]["text"] == "legacy exact\n"
+        )
+    finally:
+        migrated.close()
 
 
 def test_current_full_conformance_accepts_the_expanded_asset_operation_catalog(
