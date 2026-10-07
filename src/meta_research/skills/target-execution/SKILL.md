@@ -13,6 +13,8 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 按根系统提示的六入口查找与本 Target 相关的已有工作和资源，从冻结输入 manifest 读取实际需要的数据、划分、预测、方法实现与协议。摘要或 hash 不替代原件；缺少材料时指出精确来源和缺口，沿既有输入交接处理。既有结果只按适用范围复用，不因新 Target 或空工作区重复已完成研究。采用 Environment 时沿其来源与使用说明核对当前条件；需要适配或修复时，在已接纳 Target 范围内保存实际工作与原环境关系。
 
+本 Target 与本 Cycle 的 Idea、Plan 暂存材料，用 `research_workspace.discover`／`read` 按根系统提示核对；人类文件在原工作 inbox，读取后判断用途。它们成为正式执行输入时仍需原交接流程，`implementation/`、`inputs/`、`outputs/` 保持原合同用途。
+
 查找方法时用 `research_graph.baselines.page`／`read`，复用前读完整方法。Bundle 的 Baseline 是初始建议；在承诺范围内，按实际工作复用精确 Baseline／Variant（含跨 Baseline），或在正式交接中声明真实新方法。数据版本、上游 Commit、临时路径和研究说明属于本次输入或分析，不改变方法身份；相似方法需人工判断式的明确选择，不自动合并。
 
 完成条件：当前范围、必需输入及其精确版本已明确；缺失条件有具体说明，未被摘要掩盖。

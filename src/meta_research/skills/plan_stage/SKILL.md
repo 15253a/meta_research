@@ -13,6 +13,8 @@ description: 根据当前研究重心、构想与历史证据选择本轮投入�
 
 先读上轮综合、notes、已完成工作和相关证据。默认缺上轮摘要时，用 `research_memory.stage_context.read` 的 `source=question_history` 找已接纳结果，再用 `source=scientific_outcome`、`source_ref=outcome_ref` 读正文；缺摘要不代表没有历史。
 
+本 Cycle 的 Idea 暂存材料与本工作人类交付文件，用 `research_workspace.discover`／`read` 按根系统提示发现并读取；核对真实内容后判断其用途，正式证据仍需原接纳路径。
+
 明确本轮继续、复用及补充什么。复用 Idea 不继承旧 Plan 的 coverage、gap 或 Brief 状态；仍适用的工作保留精确来源，重做需说明新条件、疑点或预期增量。新 Cycle 或空 TargetGraph 本身不要求重跑。
 
 完成条件：本轮投入依据与历史关系清楚，关键采用材料已读到精确原文。

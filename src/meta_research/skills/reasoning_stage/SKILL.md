@@ -13,6 +13,8 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 先读本轮结果、上轮及相关问题历史，再按需分页、展开精确原文。保持 request、Question、Quest、Goal、epoch 和来源绑定。Idea／Plan／Bundle 的 Completed、Skipped、Exhausted、NoViableCandidate 是路线状态，本身不证明科学主张。
 
+本 Cycle 阶段与 Target 的暂存说明及本工作人类交付文件，用 `research_workspace.discover`／`read` 按根系统提示核对；它们可解释过程和未决项，科学结论的正式来源仍须核验接纳链。
+
 比较历史结果时，将实验结论对应到实际产生它的 Cycle／ScientificOutcome，区分结果产生轮次与后来转述它的轮次。“上一轮”仅指当前 Cycle 的直接前序；较早试点写明来源轮次，尚未核实轮次时称“既有试点”，保留架构、数据和协议差异。独立审阅据这项对应关系核对比较措辞。
 
 从冻结闭包、Plan 已验证来源绑定或同 Quest 可核验历史引用精确 kind／ref。LiteratureRecord、MetricResult、WorkProduct、日志、分析、checkpoint、人类输入、ScientificOutcome、AssetVersion 等按真实内容支持、反对或限定判断；材料类型和数量不决定科学采用资格。仍须核对 Owner、版本、Quest 权限和接纳链，不能用相近对象 ID 代替真实来源。纯理论综合可无外部引文，明确推导、适用范围和不确定性。
