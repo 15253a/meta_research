@@ -932,6 +932,12 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         schema: dict[str, object],
         native_session_ref: str | None,
     ) -> tuple[dict[str, object], str | None, str]:
+        prompt, guidance_binding = self._prepare_stage_guidance(
+            run_ref=request.run_ref, attempt_ref=request.attempt_ref,
+            root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
+            runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
+            job_ref=request.job_ref, operation_name=operation_name, prompt=prompt,
+        )
         authority = self._full_conformance_authority
         base_url = self._resident_mcp_base_url
         if authority is None or base_url is None:
@@ -969,6 +975,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                         request.runtime_binding.as_dict()
                     ),
                     operation_ids=operation_ids,
+                    **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
                 )
             except HarnessAdmissionError as error:
                 raise ReasoningSkillUnavailable(error.code) from error
@@ -976,6 +983,8 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
 
         try:
             _validate_reasoning_resident_channel(channel, operation_ids)
+            if getattr(channel.binding, "guidance_binding", None) != guidance_binding:
+                raise ReasoningSkillUnavailable("guidance_snapshot_unbound")
             endpoint = urlsplit(channel.binding.endpoint_ref)
             if (
                 endpoint.scheme
@@ -990,6 +999,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 )
             scope_binding_hash = canonical_hash(
                 {
+                    **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
                     "catalog_hash": channel.binding.catalog_hash,
                     "operation_bindings": list(
                         channel.binding.operation_bindings
@@ -1012,6 +1022,7 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 semantic_mcp_protected_environment=human_request_enabled,
                 authorized_operation_ids=operation_ids,
                 run_ref=request.run_ref,
+                **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
                 workspace_binding=self._workspace_binding(run_ref=request.run_ref,
                     attempt_ref=request.attempt_ref, root_session_ref=request.root_session_ref,
                     fence_ref=request.fence_ref, runtime_binding_hash=canonical_hash(request.runtime_binding.as_dict())),

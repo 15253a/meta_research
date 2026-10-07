@@ -324,6 +324,8 @@ def create_semantic_owner_gateway(
     ]
     if human_collaboration is not None:
         from meta_research.human_research_context import human_research_context_operation
+        from meta_research.human_guidance_operations import human_guidance_operations
+        operations.extend(human_guidance_operations(human_collaboration))
         operations.append(human_research_context_operation(
             agent_runtime=agent_runtime, human_collaboration=human_collaboration))
     from meta_research.question_relations import (
