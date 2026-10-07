@@ -208,6 +208,7 @@ class CodexCompanionAdapter(
                 schema=schema,
                 native_session_ref=request.companion_native_session_ref,
                 job_ref=request.job_ref,
+                workspace_binding=self._initialization_workspace(request),
             )
             if root_session_ref is None:
                 raise DraftingUnavailable("companion_native_session_missing")
@@ -290,6 +291,8 @@ class CodexCompanionAdapter(
                     schema=_reply_schema(include_agent_proposal=companion),
                     native_session_ref=request.native_session_ref,
                     job_ref=request.job_ref,
+                    workspace_binding=(self._initialization_workspace(request)
+                        if getattr(request, "root_runtime_scope", None) is None else None),
                     root_runtime_scope=getattr(
                         request, "root_runtime_scope", None
                     ),

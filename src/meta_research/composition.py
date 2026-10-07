@@ -946,7 +946,7 @@ def build_production_runtime(
             for kind, provider in workspace_providers.items()},
         deepfetch_locator=getattr(deepfetch_provider, "research_workspace_path", None),
     )
-    for provider in (*workspace_providers.values(), proposal_drafter):
+    for provider in (*workspace_providers.values(), proposal_drafter, deepfetch_provider):
         bind_workspaces = getattr(provider, "bind_workspaces", None)
         if callable(bind_workspaces):
             bind_workspaces(root_workspaces)

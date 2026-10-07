@@ -6212,6 +6212,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     job_ref=provider_job_ref,
                     literature_snapshot=literature_snapshot,
                     companion_native_session_ref=companion_native_session_ref,
+                    root_session_ref=self.query_quest_creation(job.initialization_id)["intent_session"]["ref"],
                 )
             )
             content = _validate_question_content(result.content)
@@ -6706,6 +6707,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
                     message=turn.user_content,
                     native_session_ref=native_session_ref,
                     job_ref=provider_job_ref,
+                    root_session_ref=turn.session_ref,
                 )
             )
             if not isinstance(result.reply, str):

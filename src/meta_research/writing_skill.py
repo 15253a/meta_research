@@ -215,7 +215,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
     _reconciliation_operation_names = ("writing-primary", "writing-review")
 
     def _sandbox_arguments(
-        self, sandbox_read_root: Path | None
+        self, sandbox_read_root: Path | None, *, working_directory: Path | None = None
     ) -> tuple[str, ...]:
         if sandbox_read_root is None:
             raise WritingSkillUnavailable("writing_source_read_root_missing")
@@ -224,7 +224,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
             staging_root = (self._workspace / "writing-inputs").resolve(
                 strict=True
             )
-            agent_workspace = self._agent_workspace.resolve(strict=True)
+            agent_workspace = (working_directory or self._agent_workspace).resolve(strict=True)
         except OSError as error:
             raise WritingSkillUnavailable(
                 "writing_source_read_root_invalid"

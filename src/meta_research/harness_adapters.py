@@ -46,6 +46,7 @@ from meta_research.root_capabilities import (
 from meta_research.quest_drafting import (
     _CancellableProcessRunner,
     _ProcessStopped,
+    provider_working_directory,
 )
 from meta_research.target_run_runtime_contract import (
     TARGET_COMPLETION_BINDING_SCHEMA,
@@ -1298,7 +1299,8 @@ class HarnessSupervisorTransport:
             provider_argv_path,
             json.dumps(argv, ensure_ascii=False, separators=(",", ":")),
         )
-        request = self._supervisor_request(directory, invocation_hash, family, timeout)
+        working_directory = provider_working_directory(argv, environment)
+        request = self._supervisor_request(directory, invocation_hash, family, timeout, working_directory)
         bridge_argv = cast(list[str], request["argv"])
         terminal_replay = _terminal_replay_only or receipt_path.exists()
         try:
@@ -1406,11 +1408,13 @@ class HarnessSupervisorTransport:
 
     @staticmethod
     def _supervisor_request(
-        directory: Path, invocation_hash: str, family: str, timeout: float | None
+        directory: Path, invocation_hash: str, family: str, timeout: float | None,
+        working_directory: Path | None = None,
     ) -> dict[str, object]:
         return {
             "schema_ref": SUPERVISOR_REQUEST_SCHEMA_V2,
             "invocation_hash": invocation_hash,
+            **({"working_directory": str(working_directory)} if working_directory is not None else {}),
             "argv": [
                 sys.executable, "-m", "meta_research.harness_cli_bridge",
                 "--family", family,
@@ -1492,7 +1496,8 @@ class HarnessSupervisorTransport:
                     continue
                 self._verify_terminal_request(
                     directory / "supervisor-request.json",
-                    self._supervisor_request(directory, invocation_hash, family, timeout),
+                    self._supervisor_request(directory, invocation_hash, family, timeout,
+                        provider_working_directory(argv, environment)),
                 )
                 if (directory / "provider-argv.json").read_text(encoding="utf-8") != json.dumps(
                     argv, ensure_ascii=False, separators=(",", ":")
@@ -1553,7 +1558,8 @@ class HarnessSupervisorTransport:
                 if invocation_hash != directory.name:
                     continue
                 self._verify_terminal_request(directory / "supervisor-request.json",
-                    self._supervisor_request(directory, invocation_hash, family, request.get("timeout_seconds")))
+                    self._supervisor_request(directory, invocation_hash, family, request.get("timeout_seconds"),
+                        Path(request["working_directory"]) if "working_directory" in request else None))
                 receipt, envelope = read_verified_exit_receipt(
                     receipt_path, key=self._transport_key, invocation_hash=invocation_hash,
                     prompt_path=prompt_path, schema_path=directory / "output-schema.json",

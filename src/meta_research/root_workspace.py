@@ -117,6 +117,13 @@ class RootWorkspaces:
             if request.accepted_question.quest_ref != quest_ref:
                 raise OwnerConflict("workspace_lineage_invalid")
             request_ref, cycle_ref = request.request_ref, request.cycle_ref
+        if kind == "acquisition":
+            acquisition = self._ar.query_acquisition_session(session_ref=managed["root_session_ref"])
+            if acquisition is not None:
+                session = self.bind_acquisition_session(acquisition.session_ref).location
+                return WorkspaceLocation(session.workspace_ref, kind, session.root_session_ref,
+                    session.work_ref, session.directory, quest_ref=quest_ref, request_ref=run_ref,
+                    initialization_id=session.initialization_id)
         if kind == "deepfetch":
             run = self._ar.query_deepfetch_run_by_ref(run_ref)
             if self._deepfetch_locator is None:
@@ -131,7 +138,7 @@ class RootWorkspaces:
             kind, managed["root_session_ref"], run_ref, directory,
             quest_ref, cycle_ref, request_ref)
 
-    def _target_location(self, target_ref: str) -> WorkspaceLocation:
+    def _target_locations(self, target_ref: str, *, history: bool = False) -> tuple[WorkspaceLocation, ...]:
         launch = self._ar.query_admitted_target_launch(target_ref)
         if launch is None:
             raise OwnerConflict("workspace_target_launch_missing")
@@ -142,12 +149,19 @@ class RootWorkspaces:
             or bundle.cycle_ref != request.cycle_ref
             or request.accepted_question.quest_ref != launch.quest_ref):
             raise OwnerConflict("workspace_lineage_invalid")
-        workspace, directory = self._target.read_target_workspace_location(launch.target_run_ref)
-        if workspace.target_ref != target_ref or workspace.target_run_ref != launch.target_run_ref:
-            raise OwnerConflict("workspace_lineage_invalid")
-        return WorkspaceLocation(workspace.workspace_ref, "target", workspace.root_session_ref,
-            workspace.target_run_ref, directory, launch.quest_ref, bundle.cycle_ref,
-            launch.stage_request_ref, target_ref)
+        facts = (self._target.read_target_workspace_locations(launch.target_run_ref) if history
+                 else (self._target.read_target_workspace_location(launch.target_run_ref),))
+        locations = []
+        for workspace, directory in facts:
+            if workspace.target_ref != target_ref or workspace.target_run_ref != launch.target_run_ref:
+                raise OwnerConflict("workspace_lineage_invalid")
+            locations.append(WorkspaceLocation(workspace.workspace_ref, "target", workspace.root_session_ref,
+                workspace.target_run_ref, directory, launch.quest_ref, bundle.cycle_ref,
+                launch.stage_request_ref, target_ref))
+        return tuple(locations)
+
+    def _target_location(self, target_ref: str) -> WorkspaceLocation:
+        return self._target_locations(target_ref)[0]
 
     def bind_initialization(self, initialization_id: str, root_session_ref: str) -> WorkspaceBinding:
         creation = self._hc.query_quest_creation(initialization_id)
@@ -167,6 +181,18 @@ class RootWorkspaces:
         return WorkspaceDestination(self.bind_initialization(initialization_id, root_session_ref).location,
             "human_collaboration", initialization_id, root_session_ref)
 
+    def bind_acquisition_session(self, session_ref: str) -> WorkspaceBinding:
+        session = self._ar.query_acquisition_session(session_ref=session_ref)
+        if session is None:
+            raise SemanticMcpError("workspace_acquisition_session_missing")
+        location = WorkspaceLocation("workspace:" + canonical_hash({"acquisition_session_ref": session.session_ref}),
+            "acquisition", session.session_ref, session.session_ref,
+            self._bases["acquisition"] / canonical_hash({"acquisition_session_ref": session.session_ref}),
+            initialization_id=session.initialization_id)
+        self._ensure_directory(location.directory)
+        return WorkspaceBinding(location, canonical_hash({"owner": "agent_runtime",
+            "acquisition_session_ref": session.session_ref}))
+
     def destination_for_human_request(self, *, request_ref: str, waiter_ref: str) -> WorkspaceDestination:
         request = self._hc.query_human_request(request_ref)
         if request is None:
@@ -179,9 +205,19 @@ class RootWorkspaces:
         if not isinstance(caller, dict) or waiter_ref != "root_run:" + str(caller.get("task_ref")):
             raise SemanticMcpError("workspace_destination_unbound")
         target_ref = request.get("target_assertion", {}).get("root", {}).get("target_ref")
-        location = (self._target_location(target_ref) if target_ref
-                    else self._runtime_location(caller["task_ref"]))
-        if location.root_session_ref != caller.get("root_session_ref"):
+        if target_ref:
+            candidates = [source for source in self._target_locations(target_ref, history=True)
+                          if source.work_ref == caller.get("task_ref")
+                          and source.root_session_ref == caller.get("root_session_ref")]
+            if len(candidates) != 1:
+                raise SemanticMcpError("workspace_destination_unbound")
+            location = candidates[0]
+        else:
+            location = self._runtime_location(caller["task_ref"])
+        original_task_ref = (location.request_ref if location.root_kind == "acquisition" and location.request_ref
+                             else location.work_ref)
+        if (location.root_session_ref != caller.get("root_session_ref")
+            or original_task_ref != caller.get("task_ref")):
             raise SemanticMcpError("workspace_destination_unbound")
         return WorkspaceDestination(location, request["issuer"], request_ref, waiter_ref)
 
@@ -190,6 +226,9 @@ class RootWorkspaces:
         if current.cycle_ref is None:
             return (current,)
         locations = {current.workspace_ref: current}
+        if current.root_kind == "target":
+            for source in self._target_locations(current.target_ref, history=True):
+                locations[source.workspace_ref] = source
         rank = 2 if current.root_kind == "target" else _STAGES.index(current.root_kind)
         for request in self._ae.query_cycle_stage_requests(current.cycle_ref):
             if _STAGES.index(request.stage) >= rank:
@@ -211,14 +250,15 @@ class RootWorkspaces:
                     if self._ar.query_admitted_target_launch(target.target_ref) is None:
                         continue
                     try:
-                        source = self._target_location(target.target_ref)
+                        sources = self._target_locations(target.target_ref, history=True)
                     except OwnerConflict as error:
                         if error.code == "target_run_workspace_unavailable":
                             continue
                         raise
-                    if source.cycle_ref != current.cycle_ref or source.quest_ref != current.quest_ref:
-                        raise SemanticMcpError("workspace_lineage_invalid")
-                    locations[source.workspace_ref] = source
+                    for source in sources:
+                        if source.cycle_ref != current.cycle_ref or source.quest_ref != current.quest_ref:
+                            raise SemanticMcpError("workspace_lineage_invalid")
+                        locations[source.workspace_ref] = source
         return tuple(locations[key] for key in sorted(locations))
 
     def discover(self, context: SemanticCallContext, *, prefix: str = "", offset: int = 0,

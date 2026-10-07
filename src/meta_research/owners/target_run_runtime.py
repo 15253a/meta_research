@@ -468,6 +468,8 @@ class ResearchGraphTargetReader(Protocol):
 class AgentRuntimeTargetVerifier(Protocol):
     def query_target_frontier_entry(self, target_ref: str) -> object | None: ...
 
+    def query_target_root_handle_history(self, target_ref: str) -> object | None: ...
+
     def verify_target_recovery_preflight_reuse(
         self,
         *,
@@ -4589,6 +4591,98 @@ class SQLiteTargetRunAgentAuthority:
             allow_pending_continuity=False,
         )
 
+    def query_target_workspace_history(
+        self, target_run_ref: str
+    ) -> tuple[TargetRunWorkspace, ...]:
+        current = self.query_target_workspace(target_run_ref)
+        if current is None:
+            return ()
+        with self._database.read() as connection:
+            workspace_rows = connection.execute(
+                text("SELECT * FROM ar_target_run_workspaces WHERE target_run_ref = :run_ref"),
+                {"run_ref": target_run_ref},
+            ).all()
+            recovery_rows = connection.execute(
+                text("SELECT * FROM ar_target_root_provider_recoveries WHERE target_ref = :target_ref"),
+                {"target_ref": current.target_ref},
+            ).all()
+            continuity_rows = connection.execute(
+                text("SELECT * FROM ar_target_root_workspace_continuities WHERE target_ref = :target_ref"),
+                {"target_ref": current.target_ref},
+            ).all()
+            handle_rows = connection.execute(
+                text("SELECT * FROM ar_target_root_handle_history WHERE target_ref = :target_ref ORDER BY ordinal"),
+                {"target_ref": current.target_ref},
+            ).all()
+        stored = tuple(self._stored_target_workspace(row, require_current=False) for row in workspace_rows)
+        workspaces = {workspace.workspace_ref: workspace for workspace in stored}
+        if len(workspaces) != len(stored) or workspaces.get(current.workspace_ref) != current:
+            raise OwnerConflict("target_root_workspace_continuity_integrity_invalid")
+        issued_recoveries = {}
+        if len(stored) > 1:
+            issued = self._execution_verifier.query_target_root_handle_history(current.target_ref)
+            if issued is None:
+                raise OwnerConflict("target_root_handle_history_authority_unavailable")
+            ordered = sorted(stored, key=lambda workspace: workspace.ordinal)
+            if (issued.target_ref != current.target_ref
+                or len(issued.handle_history) != len(ordered)
+                or len(issued.recoveries) != len(ordered) - 1
+                or any((workspace.ordinal, workspace.target_ref, workspace.target_run_ref,
+                        workspace.root_session_ref, workspace.target_attempt_ref, workspace.target_fence_ref)
+                    != (ordinal, handle.target_ref, handle.target_run_ref, handle.root_session_ref,
+                        handle.execution_attempt_ref, handle.execution_fence_ref)
+                    for ordinal, (workspace, handle) in enumerate(zip(ordered, issued.handle_history), 1))):
+                raise OwnerConflict("target_root_handle_history_integrity_invalid")
+            issued_recoveries = {recovery.transition_ref: recovery for recovery in issued.recoveries}
+            if len(issued_recoveries) != len(issued.recoveries):
+                raise OwnerConflict("target_root_handle_history_integrity_invalid")
+        history = [current]
+        successor = current
+        while True:
+            recoveries = [row for row in recovery_rows
+                          if row.new_execution_attempt_ref == successor.target_attempt_ref]
+            continuities = [row for row in continuity_rows
+                            if row.successor_workspace_ref == successor.workspace_ref]
+            if not recoveries:
+                if continuities or successor.ordinal != 1:
+                    raise OwnerConflict("target_root_workspace_continuity_integrity_invalid")
+                break
+            if len(recoveries) != 1 or len(continuities) != 1:
+                raise OwnerConflict("target_root_workspace_continuity_integrity_invalid")
+            recovery = recoveries[0]
+            predecessor = workspaces.get(recovery.retired_workspace_ref)
+            handles = [row for row in handle_rows if row.execution_attempt_ref in {
+                recovery.old_execution_attempt_ref, recovery.new_execution_attempt_ref}]
+            if predecessor is None or len(handles) != 2:
+                raise OwnerConflict("target_root_workspace_continuity_integrity_invalid")
+            issued_recovery = issued_recoveries.get(recovery.transition_ref)
+            if (issued_recovery is None
+                or issued_recovery.ordinal != recovery.ordinal
+                or (issued_recovery.old_handle.target_run_ref, issued_recovery.old_handle.root_session_ref,
+                    issued_recovery.old_handle.execution_attempt_ref, issued_recovery.old_handle.execution_fence_ref)
+                != (predecessor.target_run_ref, predecessor.root_session_ref,
+                    predecessor.target_attempt_ref, predecessor.target_fence_ref)
+                or (issued_recovery.replacement_handle.target_run_ref, issued_recovery.replacement_handle.root_session_ref,
+                    issued_recovery.replacement_handle.execution_attempt_ref, issued_recovery.replacement_handle.execution_fence_ref)
+                != (successor.target_run_ref, successor.root_session_ref,
+                    successor.target_attempt_ref, successor.target_fence_ref)):
+                raise OwnerConflict("target_root_handle_history_integrity_invalid")
+            self._verify_target_workspace_recovery_link(
+                recovery=recovery, predecessor=predecessor, successor=successor,
+                handle_rows=handles, allow_retired_successor=successor != current,
+            )
+            self._verify_target_workspace_continuity_row(
+                continuity=continuities[0], recovery=recovery,
+                predecessor=predecessor, successor=successor,
+            )
+            history.append(predecessor)
+            successor = predecessor
+        if {workspace.workspace_ref for workspace in history} != set(workspaces):
+            raise OwnerConflict("target_root_workspace_continuity_integrity_invalid")
+        if self.query_target_workspace(target_run_ref) != current:
+            raise OwnerConflict("target_run_workspace_unavailable")
+        return tuple(reversed(history))
+
     def _query_target_workspace_record(
         self,
         target_run_ref: str,
@@ -4777,6 +4871,7 @@ class SQLiteTargetRunAgentAuthority:
         predecessor: TargetRunWorkspace,
         successor: TargetRunWorkspace,
         handle_rows: object,
+        allow_retired_successor: bool = False,
     ) -> None:
         handles_by_attempt = {
             str(item.execution_attempt_ref): item for item in handle_rows
@@ -4785,7 +4880,7 @@ class SQLiteTargetRunAgentAuthority:
         new_handle = handles_by_attempt.get(str(recovery.new_execution_attempt_ref))
         if (
             predecessor.status != "retired"
-            or successor.status != "active"
+            or successor.status not in ({"active", "retired"} if allow_retired_successor else {"active"})
             or recovery.target_ref != successor.target_ref
             or recovery.retired_workspace_ref != predecessor.workspace_ref
             or recovery.old_execution_attempt_ref
@@ -6110,6 +6205,15 @@ class SQLiteTargetRunAgentAuthority:
         if workspace is None or self._workspace_root is None:
             raise OwnerConflict("target_run_workspace_unavailable")
         return workspace, self._workspace_root / canonical_hash({"workspace_ref": workspace.workspace_ref})
+
+    def read_target_workspace_locations(
+        self, target_run_ref: str
+    ) -> tuple[tuple[TargetRunWorkspace, Path], ...]:
+        history = self.query_target_workspace_history(target_run_ref)
+        if not history or self._workspace_root is None:
+            raise OwnerConflict("target_run_workspace_unavailable")
+        return tuple((workspace, self._workspace_root / canonical_hash({"workspace_ref": workspace.workspace_ref}))
+                     for workspace in history)
 
     def resolve_target_workspace(
         self,

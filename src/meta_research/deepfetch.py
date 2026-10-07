@@ -1127,6 +1127,12 @@ class CodexDeepFetchAdapter:
     def _provider_execution_key(cls, job_ref: str) -> str:
         return canonical_hash({"job_ref": cls._root_provider_job_ref(job_ref)})
 
+    def research_workspace_path(self, job_ref: str, runtime_binding_hash: str) -> Path:
+        return self._agent_workspace_path(job_ref, runtime_binding_hash)
+
+    def bind_workspaces(self, workspaces) -> None:
+        self._root_resident_mcp.bind_workspaces(workspaces)
+
     def _agent_workspace_path(
         self, job_ref: str, runtime_binding_hash: str
     ) -> Path:
