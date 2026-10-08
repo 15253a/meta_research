@@ -231,17 +231,25 @@ class ServerFiles:
 
     def discover(self, selection, *, actor, path="", cursor=None, limit=50):
         absolute = self._referenced_path(selection, path)
-        current = self.inspect(absolute)
-        if current["kind"] == "file":
-            return {"server": self.server, "path": path, "entries": [{"path": path, **current}],
-                    "next_cursor": None, "unexpanded": False}
-        page = self.browse(actor=actor, path=absolute, cursor=cursor, limit=limit)
-        page["path"] = path
-        page["entries"] = [{**entry, "path": (path + "/" if path else "") + entry["name"]} for entry in page["entries"]]
-        return page
+        with self._open_reference(selection, path) as (_, observed):
+            current = self.inspect(absolute)
+            if current["observation"] != observed:
+                raise OwnerConflict("material_source_changed")
+            if current["kind"] == "file":
+                result = {"server": self.server, "path": path, "entries": [{"path": path, **current}],
+                          "next_cursor": None, "unexpanded": False}
+            else:
+                result = self.browse(actor=actor, path=absolute, cursor=cursor, limit=limit)
+                result["path"] = path
+                result["entries"] = [{**entry, "path": (path + "/" if path else "") + entry["name"]} for entry in result["entries"]]
+            if self.inspect(absolute)["observation"] != observed:
+                if result["next_cursor"]:
+                    self.cancel(actor=actor, cursor=result["next_cursor"])
+                raise OwnerConflict("material_source_changed")
+        return result
 
     def read(self, selection, *, path: str, observation_ref: str, offset=0, max_bytes=65536):
-        if type(offset) is not int or offset < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
+        if type(offset) is not int or not 0 <= offset <= 2**63 - 1 or type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
             raise OwnerConflict("material_range_invalid")
         absolute = self._referenced_path(selection, path)
         with self._open_reference(selection, path) as (descriptor, before):

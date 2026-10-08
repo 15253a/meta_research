@@ -24,7 +24,7 @@ from meta_research.control_contract import (
     validate_control_payload,
 )
 from meta_research.database import Database
-from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload
+from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload, ServerReference
 from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
@@ -4068,6 +4068,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     connection.execute(text("UPDATE hc_reply_deliveries SET state = 'ready', "
                         "receipt_json = :receipt WHERE delivery_ref = :ref AND state = 'pending'"),
                         {"receipt": canonical_json(_delivery_receipt), "ref": _delivery_row.delivery_ref})
+                    connection.execute(text("UPDATE hc_work_material_submissions SET state='ready' "
+                        "WHERE idempotency_key=:key AND anchor_kind='request' AND state='pending'"), {"key": idempotency_key})
         response = self._fact_verifier.verify_human_response(
             request_ref=request_ref, response_ref=response_ref
         )
@@ -4084,7 +4086,12 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
         names = set()
         total = 0
         for material in materials:
-            if isinstance(material, Upload):
+            if isinstance(material, ServerReference):
+                if not isinstance(material.selection, dict) or material.selection.get("absolute_path") in names:
+                    raise OwnerConflict("material_selection_invalid")
+                names.add(material.selection.get("absolute_path"))
+                normalized.append({"kind": "server_reference", "selection": material.selection})
+            elif isinstance(material, Upload):
                 from meta_research.root_workspace import _relative_parts
                 _relative_parts(material.relative_path)
                 if (len(material.relative_path) > 900 or material.relative_path in names
@@ -4141,10 +4148,16 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             raise OwnerConflict("human_request_material_response_invalid")
         linked = [{**item, **_probe_linked_reply(item["locator"])}
                   for item in normalized if item["kind"] == "linked_local"]
+        selections = [item["selection"] for item in normalized if item["kind"] == "server_reference"]
+        for selection in selections:
+            self._root_workspaces.server_files.validate_selection(selection)
         delivery_ref = "human_reply:" + canonical_hash({"request_ref": request_ref, "idempotency_key": idempotency_key})
         binding = {**destination.location.source(), "owner": destination.owner,
                    "human_request_ref": request_ref, "waiter_ref": destination.waiter_ref}
         manifest_hash = canonical_hash({"command_hash": command_hash, "destination": binding})
+        material_command = ({"receiver": {"kind": "request", "request_ref": request_ref,
+            "request_revision": current["revision"], "issuer": current["issuer"], "waiter_ref": destination.waiter_ref,
+            "roots": [destination.location.source()]}, "selections": selections, "description": reply.note} if selections else None)
         with self._database.fenced_write() as connection:
             existing = connection.execute(text("SELECT * FROM hc_reply_deliveries WHERE idempotency_key = :key"),
                                           {"key": idempotency_key}).first()
@@ -4154,12 +4167,15 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                     raise OwnerConflict("idempotency_conflict")
                 verify_human_request_response_target(connection, request_ref=request_ref,
                     issuer=current["issuer"], request_id=current["request_id"], revision=current["revision"])
+                if material_command is not None:
+                    self._insert_material_submission(connection, command=material_command, key=idempotency_key,
+                        anchor_kind="request", anchor_ref=request_ref, state="pending", validate_receiver=False)
                 connection.execute(text("INSERT INTO hc_reply_deliveries (delivery_ref, response_ref, request_ref, "
                     "idempotency_key, command_hash, command_json, destination_json, manifest_hash, state, created_at) "
                     "VALUES (:ref, :response, :request, :key, :hash, :command, :destination, :manifest, 'pending', :now)"),
                     {"ref": delivery_ref, "response": new_ref("human_response"), "request": request_ref,
                      "key": idempotency_key, "hash": command_hash,
-                     "command": canonical_json({"reply": command, "linked_probes": linked}),
+                     "command": canonical_json({"reply": command, "linked_probes": linked, "material_command": material_command}),
                      "destination": canonical_json(binding), "manifest": manifest_hash, "now": time.time()})
             elif existing.command_hash != command_hash:
                 raise OwnerConflict("idempotency_conflict")
@@ -4193,15 +4209,39 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 if any(saved[name] != probe[name] for name in ("device", "inode", "observed_kind")):
                     raise OwnerConflict("human_response_linked_path_changed")
                 linked.append({name: saved[name] for name in ("kind", "locator", "description", "observed_kind")})
+            material_command = spool.get("material_command")
+            material_readers = []
+            selections = [item["selection"] for item in command["materials"] if item["kind"] == "server_reference"]
+            if bool(selections) != (material_command is not None):
+                raise OwnerConflict("human_response_spool_invalid")
+            if material_command is not None:
+                if (material_command["selections"] != selections or material_command["description"] != command["note"]
+                    or material_command["receiver"].get("kind") != "request"
+                    or material_command["receiver"].get("request_ref") != row.request_ref
+                    or material_command["receiver"].get("waiter_ref") != destination.waiter_ref
+                    or material_command["receiver"].get("roots") != [destination.location.source()]):
+                    raise OwnerConflict("human_response_spool_invalid")
+                for selection in material_command["selections"]:
+                    self._root_workspaces.server_files.validate_selection(selection)
+                with self._database.read() as connection:
+                    saved_submission = self._material_replay(connection, row.idempotency_key, material_command)
+                    if saved_submission is None or saved_submission.state != "pending" or saved_submission.anchor_ref != row.request_ref:
+                        raise OwnerConflict("human_response_spool_invalid")
+                    material_readers = [{"reference_ref": item.reference_ref} for item in connection.execute(text(
+                        "SELECT r.reference_ref FROM hc_work_material_references r JOIN hc_work_material_submissions s USING(submission_ref) "
+                        "WHERE s.idempotency_key=:key ORDER BY r.ordinal"), {"key": row.idempotency_key}).all()]
             envelope = {"schema_ref": "meta-research/human-reply-envelope/v1",
                 "human_request_ref": row.request_ref, "response_ref": row.response_ref,
                 "decision": command["decision"], "note": command["note"], "facts": command["facts"],
                 "linked_locators": linked, "uploads": [{key: item[key] for key in ("relative_path", "media_type", "sha256")}
-                    for item in command["materials"] if item["kind"] == "upload"]}
+                    for item in command["materials"] if item["kind"] == "upload"],
+                **({"work_materials": material_readers} if material_command is not None else {})}
             files = (("reply.json", canonical_json(envelope).encode("utf-8")), *(
                 (item["relative_path"], base64.b64decode(item["content_base64"], validate=True))
                 for item in command["materials"] if item["kind"] == "upload"))
             published = self._root_workspaces.deliver(destination, delivery_ref=row.delivery_ref, files=files)
+            for selection in selections:
+                self._root_workspaces.server_files.validate_selection(selection)
             for saved in spool["linked_probes"]:
                 probe = _probe_linked_reply(saved["locator"])
                 if any(saved[name] != probe[name] for name in ("device", "inode", "observed_kind")):
@@ -4215,7 +4255,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 "stage_request_ref": (destination.location.request_ref
                     if destination.location.root_kind in {"idea", "plan", "bundle", "reasoning", "target"} else None),
                 "uploaded_readers": [readers[item["relative_path"]] for item in command["materials"] if item["kind"] == "upload"],
-                "linked_locators": linked}
+                "linked_locators": linked,
+                **({"work_materials": material_readers, "receiving_identity": material_command["receiver"]} if material_command is not None else {})}
             return self.respond_to_human_request(row.request_ref, decision=command["decision"],
                 facts=command["facts"], note=command["note"], idempotency_key=row.idempotency_key,
                 _delivery_row=row, _delivery_receipt=delivery)
@@ -4223,6 +4264,8 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             with self._database.fenced_write() as connection:
                 connection.execute(text("UPDATE hc_reply_deliveries SET state = 'aborted', failure_code = :code "
                     "WHERE delivery_ref = :ref AND state = 'pending'"), {"ref": row.delivery_ref, "code": error.code})
+                connection.execute(text("UPDATE hc_work_material_submissions SET state='aborted' WHERE idempotency_key=:key "
+                    "AND anchor_kind='request' AND state='pending'"), {"key": row.idempotency_key})
             raise OwnerConflict(error.code) from error
 
     def recover_response_deliveries(self) -> None:

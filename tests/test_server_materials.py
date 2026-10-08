@@ -59,6 +59,8 @@ def test_reference_range_reads_large_original_and_rejects_drift_escape_and_symli
     small = next(entry for entry in page["entries"] if entry["name"] == "small.txt")
     read = files.read(selection, path="small.txt", observation_ref=small["observation"]["observation_ref"], offset=8, max_bytes=5)
     assert (read["text"], read["bytes"], read["eof"]) == ("small", 5, False)
+    with pytest.raises(OwnerConflict, match="material_range_invalid"):
+        files.read(selection, path="small.txt", observation_ref=small["observation"]["observation_ref"], offset=2**63)
     (original / "small.txt").write_text("Changed.")
     with pytest.raises(OwnerConflict, match="material_source_changed"):
         files.read(selection, path="small.txt", observation_ref=small["observation"]["observation_ref"])
@@ -68,3 +70,24 @@ def test_reference_range_reads_large_original_and_rejects_drift_escape_and_symli
     with pytest.raises(OwnerConflict, match="material_unsafe"):
         files.inspect(str(original / "escape"))
     files.close()
+
+
+def test_discovery_rejects_original_root_replaced_during_real_metadata_access(tmp_path, monkeypatch):
+    files = ServerFiles()
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "old.txt").write_text("Old source.")
+    selected = files.inspect(str(root))
+    browse = files.browse
+    def replace_after_browse(**arguments):
+        result = browse(**arguments)
+        root.rename(tmp_path / "moved-original")
+        root.mkdir()
+        (root / "new.txt").write_text("Different source.")
+        return result
+    monkeypatch.setattr(files, "browse", replace_after_browse)
+    try:
+        with pytest.raises(OwnerConflict, match="material_source_changed"):
+            files.discover(selected, actor="test")
+    finally:
+        files.close()

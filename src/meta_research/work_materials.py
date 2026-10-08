@@ -55,6 +55,23 @@ def material_reference(database, reference_ref):
             "reader": {"reference_ref": row.reference_ref}}
 
 
+def material_submission(database, submission_ref):
+    with database.read() as connection:
+        row = connection.execute(text("SELECT * FROM hc_work_material_submissions WHERE submission_ref=:ref"), {"ref": submission_ref}).first()
+        if row is None or row.state != "ready":
+            raise OwnerConflict("material_reference_not_found")
+        references = connection.execute(text("SELECT reference_ref FROM hc_work_material_references WHERE submission_ref=:ref ORDER BY ordinal"), {"ref": submission_ref}).all()
+    return {"submission_ref": submission_ref, "receiver": json.loads(row.receiver_json),
+            "references": [material_reference(database, item.reference_ref) for item in references],
+            "description": json.loads(row.command_json)["description"], "state": "saved", "created_at": row.created_at}
+
+
+def material_submissions_for(database, anchor_kind, anchor_ref):
+    with database.read() as connection:
+        rows = connection.execute(text("SELECT submission_ref FROM hc_work_material_submissions WHERE anchor_kind=:kind AND anchor_ref=:anchor AND state='ready' ORDER BY created_at,submission_ref"), {"kind": anchor_kind, "anchor": anchor_ref}).all()
+    return [material_submission(database, row.submission_ref) for row in rows]
+
+
 class WorkMaterialsMixin:
     def material_receiver(self, kind, anchor_ref):
         if kind == "creation":
@@ -146,19 +163,10 @@ class WorkMaterialsMixin:
         return self.query_material_submission(ref)
 
     def query_material_submission(self, submission_ref):
-        with self._database.read() as connection:
-            row = connection.execute(text("SELECT * FROM hc_work_material_submissions WHERE submission_ref=:ref"), {"ref": submission_ref}).first()
-            if row is None or row.state != "ready":
-                raise OwnerConflict("material_reference_not_found")
-            references = connection.execute(text("SELECT reference_ref FROM hc_work_material_references WHERE submission_ref=:ref ORDER BY ordinal"), {"ref": submission_ref}).all()
-        return {"submission_ref": submission_ref, "receiver": json.loads(row.receiver_json),
-                "references": [material_reference(self._database, item.reference_ref) for item in references],
-                "description": json.loads(row.command_json)["description"], "state": "saved", "created_at": row.created_at}
+        return material_submission(self._database, submission_ref)
 
     def query_work_materials(self, anchor_kind, anchor_ref):
-        with self._database.read() as connection:
-            rows = connection.execute(text("SELECT submission_ref FROM hc_work_material_submissions WHERE anchor_kind=:kind AND anchor_ref=:anchor AND state='ready' ORDER BY created_at,submission_ref"), {"kind": anchor_kind, "anchor": anchor_ref}).all()
-        return [self.query_material_submission(row.submission_ref) for row in rows]
+        return material_submissions_for(self._database, anchor_kind, anchor_ref)
 
     def query_work_material(self, reference_ref):
         return material_reference(self._database, reference_ref)
@@ -199,6 +207,7 @@ class WorkMaterialsMixin:
         except OwnerConflict as error:
             self._record_material_access(reference_ref, actor, path, {"operation": "discover", "error": error.code, "availability": error.code, "path": path})
             raise
+        self._record_material_access(reference_ref, actor, path, {"operation": "discover", "availability": "available", "path": path})
         return {"reference_ref": reference_ref, **result, "read_state": reference["read_state"]}
 
     def read_work_material(self, *, reference_ref, path, observation_ref, offset=0, max_bytes=65536, context=None, actor="browser"):
@@ -227,8 +236,11 @@ class WorkMaterialsMixin:
         return self.discover_work_materials(**arguments)
 
     def read_creation_material(self, *, initialization_id=None, context_ref=None, **arguments):
-        self.discover_creation_materials(initialization_id=initialization_id, context_ref=context_ref,
-            reference_ref=arguments["reference_ref"], limit=1)
+        kind, anchor = ("creation", initialization_id) if initialization_id is not None else ("manual", context_ref)
+        self.material_receiver(kind, anchor)
+        allowed = {ref["reference_ref"] for item in self.query_work_materials(kind, anchor) for ref in item["references"]}
+        if arguments["reference_ref"] not in allowed:
+            raise OwnerConflict("material_not_visible")
         return self.read_work_material(**arguments)
 
 

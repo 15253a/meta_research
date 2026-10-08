@@ -23,13 +23,14 @@ def read_research_input(database, input_ref, *, quest_ref=None):
             or row.receipt_hash!=canonical_hash({"input_ref":row.input_ref,"content_hash":row.content_hash,
                 "receipt_ref":row.receipt_ref,"created_at":row.created_at})):
             raise OwnerConflict("human_input_receipt_invalid")
-        return {"input_ref":row.input_ref,**value,"content_hash":row.content_hash,"created_at":row.created_at,
+        from meta_research.work_materials import material_submissions_for
+        return {"input_ref":row.input_ref,**value,"work_materials": material_submissions_for(database, "input", row.input_ref), "content_hash":row.content_hash,"created_at":row.created_at,
                 "receipt":{"issuer":"human_collaboration","kind":"research_input","receipt_ref":row.receipt_ref,
                            "subject_ref":row.input_ref,"payload_hash":row.receipt_hash}}
 
 
 class HumanResearchInputMixin:
-    def submit_research_input(self, *, quest_ref, text_content, question_ref=None, asset_bindings=(), idempotency_key):
+    def submit_research_input(self, *, quest_ref, text_content, question_ref=None, asset_bindings=(), work_materials=None, idempotency_key):
         if not isinstance(text_content,str) or not text_content.strip() or len(text_content)>65536:
             raise OwnerConflict("human_input_text_invalid")
         if not isinstance(idempotency_key,str) or not 1<=len(idempotency_key)<=128:
@@ -42,12 +43,20 @@ class HumanResearchInputMixin:
         bindings=[dataset_asset_binding(b) for b in asset_bindings]
         value={"quest_ref":quest_ref,"question_ref":question_ref,"text":text_content,
                "asset_bindings":[b.as_dict() for b in bindings],"source":"explicit_user_submission"}
+        if work_materials is not None:
+            from meta_research.work_materials import MaterialSubmission
+            submission = MaterialSubmission.parse(work_materials)
+            if submission.receiver.get("kind") != "current" or submission.receiver.get("quest_ref") != quest_ref or question_ref is not None and submission.receiver.get("question_ref") != question_ref:
+                raise OwnerConflict("material_receiver_invalid")
+            value["material_command"] = work_materials
         digest=canonical_hash(value)
         with self._database.read() as c:
             replay=c.execute(text("SELECT input_ref,content_hash FROM hc_research_inputs WHERE idempotency_key=:key"),{"key":idempotency_key}).first()
         if replay is not None:
             if replay.content_hash!=digest:raise OwnerConflict("human_input_idempotency_conflict")
             return self.query_research_input(replay.input_ref,quest_ref=quest_ref)
+        if work_materials is not None:
+            self._prepare_material_submission(work_materials)
         for binding in bindings:
             self._research_memory.verify_asset_binding(asset_ref=binding.asset_ref,version_ref=binding.version_ref,content_hash=binding.content_hash,manifest_hash=binding.manifest_hash,receipt=binding.receipt)
             self._research_graph.verify_asset_quest_scope(binding.version_ref,quest_ref=quest_ref)
@@ -61,6 +70,9 @@ class HumanResearchInputMixin:
                 assert_asset_usable(c,binding.version_ref)
                 self._research_graph.verify_asset_quest_scope(binding.version_ref,quest_ref=quest_ref)
             ref=new_ref("human_input");receipt_ref=new_ref("hc_research_input_receipt");now=time.time()
+            if work_materials is not None:
+                self._insert_material_submission(c, command=work_materials, key=idempotency_key,
+                    anchor_kind="input", anchor_ref=ref)
             receipt_hash=canonical_hash({"input_ref":ref,"content_hash":digest,"receipt_ref":receipt_ref,"created_at":now})
             c.execute(text("INSERT INTO hc_research_inputs (input_ref,quest_ref,question_ref,payload_json,content_hash,idempotency_key,receipt_ref,receipt_hash,created_at) VALUES (:ref,:quest,:question,:payload,:hash,:key,:receipt,:receipt_hash,:now)"),
                 {"ref":ref,"quest":quest_ref,"question":question_ref,"payload":canonical_json(value),"hash":digest,

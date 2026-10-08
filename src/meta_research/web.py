@@ -535,15 +535,21 @@ class HumanReplyLinkedRequest(BaseModel):
     description: str = Field(min_length=1, max_length=4000)
 
 
+class HumanReplyServerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["server_reference"]
+    selection: ServerSelectionRequest
+
+
 class HumanRequestResponseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: Literal["provided", "declined", "deferred"]
     facts: dict[str, object] = Field(default_factory=dict)
     note: str = Field(default="", max_length=4000)
-    materials: list[HumanReplyUploadRequest | HumanReplyLinkedRequest] = Field(default_factory=list, max_length=100)
+    materials: list[HumanReplyUploadRequest | HumanReplyLinkedRequest | HumanReplyServerRequest] = Field(default_factory=list, max_length=100)
 
     def as_reply(self):
-        from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload
+        from meta_research.human_reply import LinkedLocal, OtherReply, ProvidedReply, Upload, ServerReference
         from meta_research.root_workspace import _relative_parts
         from meta_research.semantic_mcp import SemanticMcpError
         if self.decision != "provided":
@@ -557,7 +563,9 @@ class HumanRequestResponseRequest(BaseModel):
             raise OwnerConflict("human_response_material_too_large")
         materials = []
         for item in self.materials:
-            if isinstance(item, HumanReplyLinkedRequest):
+            if isinstance(item, HumanReplyServerRequest):
+                materials.append(ServerReference(item.selection.model_dump()))
+            elif isinstance(item, HumanReplyLinkedRequest):
                 materials.append(LinkedLocal(item.locator, item.description))
             else:
                 try:
@@ -582,6 +590,7 @@ class HumanGuidanceSubmissionRequest(BaseModel):
     scope_ref: str = Field(min_length=1, max_length=128)
     text: str = Field(min_length=1, max_length=65536)
     strength: int = Field(default=3, ge=1, le=5, strict=True)
+    work_materials: WorkMaterialSubmissionRequest | None = None
 
 
 class GuidanceProposalConversionRequest(BaseModel):
@@ -803,6 +812,7 @@ class ResearchInputRequest(BaseModel):
     question_ref: str | None = Field(default=None,min_length=1,max_length=128)
     text: str = Field(min_length=1,max_length=65536)
     asset_bindings: list[dict[str,object]] = Field(default_factory=list,max_length=256)
+    work_materials: WorkMaterialSubmissionRequest | None = None
 
 
 class OutputLanguagePreference(BaseModel):
@@ -1646,6 +1656,7 @@ def create_app(
         return runtime.owners.human_collaboration.submit_human_guidance(
             quest_ref=scope.removeprefix("quest:"), original_text=submission.text,
             strength=submission.strength, idempotency_key=_idempotency_key(request),
+            work_materials=submission.work_materials.model_dump() if submission.work_materials is not None else None,
         )
 
     @app.post("/api/v1/human-collaboration/agent-proposals", status_code=201)
@@ -1903,6 +1914,14 @@ def create_app(
     @app.get("/api/v1/work-materials/receiver")
     def current_material_receiver(quest_ref: str, question_ref: str | None = None):
         return runtime.owners.human_collaboration.current_material_receiver(quest_ref, question_ref)
+
+    @app.get("/api/v1/quest-initializations/{initialization_id}/material-receiver")
+    def creation_material_receiver(initialization_id: str):
+        return runtime.owners.human_collaboration.material_receiver("creation", initialization_id)
+
+    @app.get("/api/v1/manual-question-creations/{context_ref}/material-receiver")
+    def manual_material_receiver(context_ref: str):
+        return runtime.owners.human_collaboration.material_receiver("manual", context_ref)
 
     @app.get("/api/v1/work-materials/{reference_ref}")
     def query_work_material(reference_ref: str):
@@ -2303,12 +2322,20 @@ def create_app(
     @app.post("/api/v1/research-inputs",status_code=201)
     def submit_research_input(request: Request, research_input: ResearchInputRequest) -> dict[str, object]:
         payload = research_input.model_dump()
-        if set(payload)-{"quest_ref","question_ref","text","asset_bindings"}:
+        if set(payload)-{"quest_ref","question_ref","text","asset_bindings","work_materials"}:
             raise OwnerConflict("human_input_invalid")
         return runtime.owners.human_collaboration.submit_research_input(
             quest_ref=payload.get("quest_ref"),question_ref=payload.get("question_ref"),
             text_content=payload.get("text"),asset_bindings=payload.get("asset_bindings",[]),
+            work_materials=payload.get("work_materials"),
             idempotency_key=_idempotency_key(request))
+
+    @app.get("/api/v1/research-inputs/{input_ref}")
+    def query_research_input(input_ref: str, quest_ref: str):
+        value = runtime.owners.human_collaboration.query_research_input(input_ref, quest_ref=quest_ref)
+        if value is None:
+            raise OwnerConflict("human_input_not_found")
+        return value
 
     @app.get("/api/v1/research-formal")
     def read_research_formal(quest_ref: str,ref: str) -> dict[str,object]:
