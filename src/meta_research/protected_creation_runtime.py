@@ -181,17 +181,21 @@ class ProtectedCreationRuntime:
         self.work_directory = self.jail_root / "workspace"
         self._control = self.jail_root.parent / ("." + self.jail_root.name + "-control")
         self._guard = threading.Lock()
+        self._state = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
         self._receipt: Path | None = None
         self._stop_before_launch = False
+        self._starting = False
+        self._has_run = False
         self._entry_command = "/bin/codex"
 
     def run(self, call: NativeCreationCall) -> subprocess.CompletedProcess[str]:
         self._check_call(call)
-        if not self._guard.acquire(blocking=False):
-            raise ProtectedCreationError("protected_creation_active")
+        with self._state:
+            if not self._guard.acquire(blocking=False):
+                raise ProtectedCreationError("protected_creation_active")
+            self._starting = True
         try:
-            self._stop_before_launch = False
             self._check_platform()
             _directory(self._control, 0o700)
             _owned_directory(self._control, 0, private=True)
@@ -199,22 +203,28 @@ class ProtectedCreationRuntime:
                 self._check_previous_seal()
                 if self._process is not None and self._process.poll() is None:
                     raise ProtectedCreationError("protected_creation_unknown_outcome")
+                with self._state:
+                    if self._stop_before_launch:
+                        return self._cancelled_call(call)
                 self._prepare_runtime()
                 arguments, environment, outputs, prompt = self._prepare_call(call)
                 launch = self._control / ("launch-" + secrets.token_hex(12) + ".json")
                 receipt = launch.with_suffix(".receipt.json")
                 _write_private(launch, json.dumps({"jail": str(self.jail_root),
                     "argv": arguments, "environment": environment, "receipt": str(receipt)}).encode())
-                self._receipt = receipt
-                _replace_private(self._control / "active.json", json.dumps({"receipt": receipt.name}).encode(), 0o600)
-                self._process = subprocess.Popen(
-                    [sys.executable, "-I", "-S", "-c", _HELPER, str(launch)],
-                    env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-                    cwd="/", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                    close_fds=True, start_new_session=True)
-                if self._stop_before_launch:
-                    self._process.send_signal(signal.SIGTERM)
+                with self._state:
+                    if self._stop_before_launch:
+                        return self._cancelled_call(call)
+                    self._receipt = receipt
+                    self._process = None
+                    _replace_private(self._control / "active.json", json.dumps({"receipt": receipt.name}).encode(), 0o600)
+                    self._process = subprocess.Popen(
+                        [sys.executable, "-I", "-S", "-c", _HELPER, str(launch)],
+                        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                        cwd="/", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                        close_fds=True, start_new_session=True)
+                    self._starting = False
                 try:
                     stdout, stderr = self._process.communicate(prompt, timeout=call.timeout_seconds)
                 except subprocess.TimeoutExpired as error:
@@ -233,27 +243,45 @@ class ProtectedCreationRuntime:
                     self._publish_output(source, destination)
                 return subprocess.CompletedProcess(call.argv, int(outcome["returncode"]), stdout, stderr)
         finally:
-            self._guard.release()
+            with self._state:
+                self._starting = False
+                self._stop_before_launch = False
+                self._has_run = True
+                self._guard.release()
+
+    def _cancelled_call(self, call: NativeCreationCall) -> subprocess.CompletedProcess[str]:
+        receipt = self._control / ("cancel-" + secrets.token_hex(12) + ".receipt.json")
+        _write_private(receipt, json.dumps({"status": "stopped", "returncode": -signal.SIGTERM,
+            "descendants_ended": True}).encode())
+        _replace_private(self._control / "active.json", json.dumps({"receipt": receipt.name}).encode(), 0o600)
+        self._receipt = receipt
+        self._process = None
+        return subprocess.CompletedProcess(call.argv, -signal.SIGTERM, "", "")
 
     def request_stop(self) -> dict[str, object]:
-        self._stop_before_launch = True
-        process = self._process
-        if process is None:
-            try:
-                previous = self._check_previous_seal()
-            except ProtectedCreationError:
+        with self._state:
+            if self._starting:
+                self._stop_before_launch = True
                 return {"status": "unknown_outcome", "descendants_ended": False}
-            return {"status": previous["status"] if previous else "not_running", "descendants_ended": True}
-        if process.poll() is None:
-            try:
-                process.send_signal(signal.SIGTERM)
-                process.wait(timeout=_STOP_SECONDS)
-            except (OSError, subprocess.TimeoutExpired):
+            process = self._process
+            if process is None:
+                try:
+                    previous = self._check_previous_seal()
+                except ProtectedCreationError:
+                    return {"status": "unknown_outcome", "descendants_ended": False}
+                if previous is None and not self._has_run:
+                    self._stop_before_launch = True
+                return {"status": previous["status"] if previous else "not_running", "descendants_ended": True}
+            if process.poll() is None:
+                try:
+                    process.send_signal(signal.SIGTERM)
+                    process.wait(timeout=_STOP_SECONDS)
+                except (OSError, subprocess.TimeoutExpired):
+                    return {"status": "unknown_outcome", "descendants_ended": False}
+            outcome = self._read_receipt()
+            if not outcome.get("descendants_ended"):
                 return {"status": "unknown_outcome", "descendants_ended": False}
-        outcome = self._read_receipt()
-        if not outcome.get("descendants_ended"):
-            return {"status": "unknown_outcome", "descendants_ended": False}
-        return {"status": outcome["status"], "descendants_ended": True}
+            return {"status": outcome["status"], "descendants_ended": True}
 
     def _read_receipt(self) -> dict[str, object]:
         if self._receipt is None:

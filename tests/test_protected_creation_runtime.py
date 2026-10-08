@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -312,6 +313,69 @@ os._exit(0)
     with pytest.raises(ProcessLookupError):
         os.kill(int(marker.read_text()), 0)
     assert runtime.request_stop()["descendants_ended"] is True
+
+
+def test_prelaunch_stop_prevents_first_native_and_preserves_reuse(runtime, tmp_path):
+    isolated = ProtectedCreationRuntime(tmp_path / "isolated", Path("/bin/bash"), runtime.credentials_home)
+    destination = tmp_path / "retained.txt"
+    destination.write_text("retained", encoding="utf-8")
+    assert isolated.request_stop() == {"status": "not_running", "descendants_ended": True}
+    completed = isolated.run(_call("raise AssertionError('must not launch')", outputs=(destination,), timeout=None))
+    assert (completed.returncode, completed.stdout, completed.stderr) == (-signal.SIGTERM, "", "")
+    assert not isolated.jail_root.exists()
+    assert destination.read_text() == "retained"
+    reconstructed = ProtectedCreationRuntime(isolated.jail_root, isolated.executable, isolated.credentials_home)
+    assert reconstructed.request_stop() == {"status": "stopped", "descendants_ended": True}
+    assert isolated.request_stop() == {"status": "stopped", "descendants_ended": True}
+    assert isolated.run(_call("print('reused after cancellation')", timeout=None)).stdout == "reused after cancellation\n"
+
+
+@pytest.mark.parametrize("previous_completed", (False, True))
+def test_stop_during_staging_does_not_report_prior_seal(runtime, tmp_path, monkeypatch, previous_completed):
+    isolated = ProtectedCreationRuntime(tmp_path / "isolated", Path("/bin/bash"), runtime.credentials_home)
+    if previous_completed:
+        assert isolated.run(_call("print('previous completed')", timeout=None)).returncode == 0
+    destination = tmp_path / "retained.txt"
+    destination.write_text("retained", encoding="utf-8")
+    entered = threading.Event()
+    release = threading.Event()
+    result = []
+    failures = []
+    prepare = isolated._prepare_runtime
+
+    def staged():
+        prepare()
+        entered.set()
+        assert release.wait(15)
+
+    def execute():
+        try:
+            result.append(isolated.run(_call('''
+from pathlib import Path
+Path("/workspace/must-not-launch").write_text("launched")
+''', outputs=(destination,), timeout=None)))
+        except BaseException as error:
+            failures.append(error)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(isolated, "_prepare_runtime", staged)
+        worker = threading.Thread(target=execute)
+        worker.start()
+        try:
+            assert entered.wait(15)
+            assert isolated.request_stop() == {"status": "unknown_outcome", "descendants_ended": False}
+        finally:
+            release.set()
+            worker.join(timeout=15)
+    assert not worker.is_alive()
+    assert not failures
+    assert (result[0].returncode, result[0].stdout, result[0].stderr) == (-signal.SIGTERM, "", "")
+    assert not (isolated.work_directory / "must-not-launch").exists()
+    assert destination.read_text() == "retained"
+    assert isolated.request_stop() == {"status": "stopped", "descendants_ended": True}
+    reconstructed = ProtectedCreationRuntime(isolated.jail_root, isolated.executable, isolated.credentials_home)
+    assert reconstructed.request_stop() == {"status": "stopped", "descendants_ended": True}
+    assert isolated.run(_call("print('reused after staging stop')", timeout=None)).stdout == "reused after staging stop\n"
 
 
 def test_stop_reaps_child_that_escaped_original_group(runtime):
