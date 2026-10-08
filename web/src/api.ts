@@ -2352,6 +2352,16 @@ export type HumanRequestResponseBody = {
   };
 };
 
+export type HumanRequestHandoff = {
+  schema_ref: "meta-research/human-request-handoff/v1";
+  request_ref: string;
+  revision: number;
+  is_current: boolean;
+  status: HumanRequestItem["status"];
+  title: string;
+  sections: Array<{ key: string; title: string; paragraphs: string[] }>;
+};
+
 export type HumanRequestRetryResult = HumanRequestItem & {
   retry:
     | { status: "processing" | "succeeded" }
@@ -3321,6 +3331,30 @@ export function sendCompanionMessage(
     message,
     ...(viewContext ? { view_context: viewContext } : {}),
   });
+}
+
+export function readHumanRequestHandoff(
+  requestRef: string,
+  revision: number,
+  signal?: AbortSignal,
+): Promise<HumanRequestHandoff> {
+  return readJson(
+    `/api/v1/human-requests/${encodeURIComponent(requestRef)}/handoff?revision=${revision}`,
+    signal,
+  );
+}
+
+export async function downloadHumanRequestHandoff(
+  requestRef: string,
+  revision: number,
+  format: "md" | "html" | "pdf",
+): Promise<Blob> {
+  const response = await fetch(
+    `/api/v1/human-requests/${encodeURIComponent(requestRef)}/handoff.${format}?revision=${revision}`,
+    { credentials: "same-origin" },
+  );
+  if (!response.ok) throw new ProductError(`request_failed:${response.status}`);
+  return response.blob();
 }
 
 export async function respondToHumanRequest(

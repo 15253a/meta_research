@@ -2519,7 +2519,9 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         assert runtime.owners.agent_runtime.query_target_launch_ack(
             target["target_ref"]
         ) is None
-        assert runtime.bundle_stage.transient_error == "bundle_root_waiting"
+        assert runtime.owners.agent_runtime.query_human_request(
+            request["request_ref"]
+        )["status"] == "open"
 
         invalid_response = (
             runtime.owners.human_collaboration.respond_to_human_request(
@@ -2535,8 +2537,6 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         assert runtime.owners.agent_runtime.query_target_launch_ack(
             target["target_ref"]
         ) is None
-        assert runtime.bundle_stage.transient_error == "bundle_root_waiting"
-
         authorization = _grant_request_capability(runtime, request)
         assert authorization["scope_ref"] == f"human_request:{request['request_ref']}"
         for _step in range(12):
@@ -2698,7 +2698,7 @@ def test_high_risk_frontier_emits_root_scoped_human_request_command(
         requirement_scope = requirement["scope"]
         assert isinstance(requirement_scope, dict)
         condition = arguments["condition"]
-        assert condition == {
+        assert {key: value for key, value in condition.items() if key != "help_context"} == {
             "schema_ref": "meta-research/root-agent-human-request-target/v1",
             "root": {
                 "run_kind": "bundle_stage",

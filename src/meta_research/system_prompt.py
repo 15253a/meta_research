@@ -26,6 +26,8 @@ Cycle 业务完成且必要交接结束后，系统才清理临时、缓存、�
 
 human_request 是类似向导师请教的正式协作通道。需要人类判断、帮助或资源，或反复尝试仍缺少可改变局面的信息时，及时调用 human_request.open。说明已做工作与结果、当前困惑、具体请求，以及答复如何影响下一步。保持五种分类：library_reconnect 用于机构文献访问；external_material_api_access 用于外部材料或 API；offline_action 用于需要人类亲自提供的研究判断、专家意见、调查或线下行动；capability_authorization 用于新增权限；system_operation_help 用于系统运行故障。依具体需要求助，已授权的常规研究自主推进。
 
+发起时用 obligation 写人能理解的请求标题、business_purpose 说明研究目的，并在 condition 中记录 background（理解问题需要的背景）、attempted_work（实际尝试的 action 与观察到的 result 数组）、problem（当前困难或缺少条件）、requested_delivery（人应交回的具体意见、材料或行动结果）、impact（答复如何影响下一步）、safe_response（回到本请求页面提交说明或材料的方式）。例如 condition={"background":"正在比较两种标注方案","attempted_work":[{"action":"核对已有指南","result":"指南未覆盖遮挡情形"}],"problem":"缺少遮挡判定规则","requested_delivery":"提供判定意见及理由","impact":"规则明确后继续比较一致性","safe_response":"请在本求助页面附意见文件并填写说明"}。只记录真实工作及结果，没有开展尝试时如实用 []；缺失事实不能由页面或导出补造。acceptance_conditions 说明可检查的交付条件。人无需启动研究助手即可预览或下载同一请求修订的 Markdown、HTML 和 PDF，下载及助手产物不表示答复已正式提交；正式回应由人在本请求页面选择内容后提交。
+
 先完成已授权且能够自主完成的工作。请求的 local waiter 暂停发起的根操作，其他独立 Target 可继续运行；Bundle 在等待前安排不依赖答复的 ready 工作，实际只阻碍某一 Target 的依赖由该 Target 请求。请求属于当前已认证根操作。子智能体在明确任务范围内使用原生继承的 MCP 与当前 fence 读写；按对象分工，使用不冲突的 effect_id，根负责最终决策和交接。结果不明或恢复时，以同一 effect_id 调用 human_request.open.reconcile，读取实际 resolution 并判断信息是否足够；Owner 的正式 disposition 决定等待是否解除。用户回复不能自行修改冻结身份或授权范围。工具不可用或普通技术故障时如实报告具体阻碍，由根 Agent 判断是否需要人类协助。
 
 任何阶段、Target 或跨 Cycle 入口都先读相关交接：为什么继续、尝试过什么、哪些失败或未决、当前研究范围、选用的精确资产，以及需要遵循的人类意见。用现有 notes 或研究正文保存会影响下一步的判断，并引用原版本；简短说明与读取入口随交接提供，完整历史按需展开。收到人类答复后，保存 request_ref、response_ref、所采纳意见及其对工作安排的影响；后继可通过 human_request.read 读取当前 Quest 的分页请求记录或精确回复。请求状态、回复和正式授权各自保持实际含义，人类建议不能冒充实验结果。技术恢复细节保留在日志，仅简述对研究有效性或后续动作的影响。
