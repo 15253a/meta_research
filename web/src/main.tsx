@@ -12,6 +12,7 @@ import {
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { StatusHome } from "./StatusHome";
+import { HostResources } from "./HostResources";
 import { OutputLanguageProvider, OutputLanguageControl } from "./OutputLanguage";
 import { observedActiveTarget } from "./activeTargetStatus";
 import { observedTargetRetry, targetResearchFacts } from "./targetResearchFacts";
@@ -5354,6 +5355,7 @@ function DetailedApp() {
           </div>
           <RuntimeConditions questRef={overviewQuestRef(snapshot)} questionRef={runtimeConditionsQuestionRef(snapshot)} disabled={humanRequestSurfaceOpen || detailsScopeChanged} />
           <ResearchMotionControl />
+          <HostResources disabled={humanRequestSurfaceOpen} />
           <ForegroundResearchControlShortcut
             control={snapshot?.research_control}
             commands={snapshot?.human_collaboration?.commands.items}
