@@ -27,6 +27,7 @@ let noFiles = false;
 let holdNextTrainPage = false;
 let heldTrainPage = null;
 let executionStatus = 'admitted';
+let temporarilyUnavailable = false;
 const catalog = target => ({
   schema_ref: 'meta-research/experiment-log-list/v1', target_ref: target.target_ref, target_run_ref: target.target_run_ref,
   target_status: target === first ? executionStatus : 'running',
@@ -58,7 +59,10 @@ const server = createServer(async (req, res) => {
     assert.ok(target);
     assert.equal(url.searchParams.get('target_run_ref'), target.target_run_ref);
     const listed = catalog(target);
-    if (!match[2]) return send(listed);
+    if (!match[2]) return send(temporarilyUnavailable && target === first ? {
+      ...listed, status: 'unavailable', target_status: null, workspace_ref: null,
+      logs: [], default_log_ref: null, reason: { code: 'experiment_log_workspace_unavailable' },
+    } : listed);
     const file = listed.logs.find(item => item.log_ref === match[2]);
     assert.ok(file, 'only a discovered file is read');
     if (url.searchParams.has('stream_ref') && url.searchParams.get('stream_ref') !== file.stream_ref) {
@@ -160,10 +164,26 @@ try {
   assert.equal(await trainLog.innerText(), beforeResponse);
   assert.equal(await trainLog.evaluate(node => node.scrollTop), beforeResponsePosition);
   checks.push('an already-started append response cannot replace or scroll a reader who entered history before it arrived');
+  temporarilyUnavailable = true;
+  await expect(trainPane.locator('.experiment-log-states')).toContainText('正在重连', { timeout: 7000 });
+  await expect(trainLog).toHaveCount(1);
+  assert.equal(await trainLog.innerText(), beforeResponse);
+  assert.equal(await trainLog.evaluate(node => node.scrollTop), beforeResponsePosition);
+  temporarilyUnavailable = false;
+  texts.set('run-a:train', texts.get('run-a:train') + 'RECOVERED_AFTER_UNAVAILABLE_NULL_STATUS\n');
+  await expect(trainPane.locator('.experiment-log-states')).toContainText('日志读取正常', { timeout: 7000 });
+  assert.equal(await trainLog.innerText(), beforeResponse);
+  assert.equal(await trainLog.evaluate(node => node.scrollTop), beforeResponsePosition);
+  await trainPane.getByRole('button', { name: /继续跟随/ }).click();
+  await expect(trainLog).toContainText('RECOVERED_AFTER_UNAVAILABLE_NULL_STATUS', { timeout: 7000 });
+  await trainLog.evaluate(node => { node.scrollTop -= 300; node.dispatchEvent(new Event('scroll')); });
+  await expect(trainPane).toContainText('正在阅读已加载内容');
+  const recoveredHistory = await trainLog.innerText();
+  checks.push('an unavailable same-run catalog with null execution status preserves history and scroll, then reconnects and resumes explicitly');
   executionStatus = 'executed';
   await expect(trainPane.locator('.experiment-log-states')).toContainText('执行状态：已结束', { timeout: 7000 });
   await expect(trainPane.locator('.experiment-log-states')).not.toContainText('执行中');
-  await expect(trainLog).toHaveText(beforeResponse);
+  await expect(trainLog).toHaveText(recoveredHistory);
   checks.push('the public execution status distinguishes admission, running and finished logs even when the graph Target still says running');
   if (artifacts) { await mkdir(artifacts, { recursive: true }); await logs.screenshot({ path: resolve(artifacts, 'parallel-logs-desktop.png') }); }
   await page.setViewportSize({ width: 390, height: 844 });

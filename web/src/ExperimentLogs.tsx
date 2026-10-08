@@ -299,7 +299,7 @@ export function ExperimentLogs({ target, blockedByHumanRequest, activityPaused, 
   const file = currentCatalog?.logs.find(log => log.log_ref === selectedRef) ?? null;
   const sourceBytes = file?.source_bytes ?? current?.sourceBytes ?? 0;
   const unreadBytes = current ? Math.max(0, sourceBytes - current.nextOffset - current.pendingUtf8Bytes) : 0;
-  const executionStatus = currentCatalog?.target_status;
+  const executionStatus = currentCatalog?.target_status ?? undefined;
   const taskLabel = targetStatus(target, executionStatus);
   const connectionLabel = paused ? "已暂停读取" : connection === "connected" ? currentCatalog?.status === "empty" ? "正在等待匹配的日志文件" : "日志读取正常"
     : connection === "error" ? "正在重连" : "正在连接日志";
