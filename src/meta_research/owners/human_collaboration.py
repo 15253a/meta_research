@@ -9183,10 +9183,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
     def query_current_manual_question_creation(
         self, *, quest_ref: str, parent_question_ref: str
     ) -> dict[str, object] | None:
-        return self._manual_creation.query_current(
+        view = self._manual_creation.query_current(
             quest_ref=quest_ref,
             parent_question_ref=parent_question_ref,
         )
+        return None if view is None else {**view, "work_materials": self.query_work_materials("manual", view["context_ref"])}
 
     def query_collaboration_scope(self) -> str:
         """Resolve the durable active Quest independently of an unfinished form."""

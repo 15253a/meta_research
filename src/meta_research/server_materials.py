@@ -1,4 +1,3 @@
-"""Read-only, bounded access to originals on the Meta process host."""
 from __future__ import annotations
 
 import base64

@@ -25,7 +25,7 @@ def test_current_guidance_and_input_save_exact_receivers_atomically_and_replay_a
                 guide = {"scope_ref": "quest:" + self.quest, "text": "  Keep original text.\n", "strength": 4, "work_materials": command}
                 denied = client.post("/api/v1/human-collaboration/guidance", json={**guide, "work_materials": stale}, headers={**headers, "Idempotency-Key": "stale-guide"})
                 assert denied.status_code == 409, denied.text
-                assert self.runtime.owners.human_collaboration.query_work_materials("guidance", "stale-guide") == []
+                assert self.runtime.owners.human_collaboration.query_collaboration_projection(("quest:" + self.quest,))["soft_constraints"] == []
                 accepted = client.post("/api/v1/human-collaboration/guidance", json=guide, headers={**headers, "Idempotency-Key": "current-guide"})
                 assert accepted.status_code == 201, accepted.text
                 assert accepted.json()["guidance"] == {"text": guide["text"], "strength": 4}
@@ -269,6 +269,9 @@ def test_manual_context_receives_before_seed_without_material_intake(tmp_path):
             readback = client.get(f"/api/v1/manual-question-creations/{context}").json()
             assert readback["seed"] is None
             assert readback["work_materials"][0]["receiver"] == {"kind": "manual", "context_ref": context, "quest_ref": quest, "parent_question_ref": question, "generation": view["generation"]}
+            reopened = client.get("/api/v1/manual-question-creations/current", params={"quest_ref": quest, "parent_question_ref": question})
+            assert reopened.status_code == 200, reopened.text
+            assert reopened.json()["work_materials"] == readback["work_materials"]
             reference = result.json()["references"][0]
             value = runtime.owners.human_collaboration.read_creation_material(context_ref=context, reference_ref=reference["reference_ref"], path="", observation_ref=reference["source"]["observation"]["observation_ref"])
             assert value["text"] == "Manual prior notes."

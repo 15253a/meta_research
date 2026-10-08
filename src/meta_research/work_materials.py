@@ -1,4 +1,3 @@
-"""HC reception receipts and reads of lightweight server originals."""
 from __future__ import annotations
 
 from dataclasses import dataclass
