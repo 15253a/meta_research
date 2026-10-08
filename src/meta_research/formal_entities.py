@@ -136,48 +136,70 @@ def explicit_run_only(document):
     return all(attempt is None or attempt.get('status') == 'failed' for _, attempt in work)
 
 
+def _work_inventory_conflict(path, requirement):
+    error = OwnerConflict('target_formal_work_inventory_invalid')
+    error.feedback = (path + ' ' + requirement + '. Correct that formal work declaration '
+        'and finish another normal turn in the same Root. Preserve the existing research, '
+        'trained checkpoints, metrics and retained artifacts; a declaration correction '
+        'does not require repeating the research. The rejected completion remains unchanged.')
+    return error
+
+
 def _declared_work(result_document):
     declared = result_document.get('formal_runs')
     if declared is None:
         declared = [{'run_key': 'primary', 'evaluations': [
             {'attempt_key': 'primary', 'metrics': result_document['metrics']}]}]
     if not isinstance(declared, list) or not declared or len(declared) > 100:
-        raise OwnerConflict('target_formal_work_inventory_invalid')
+        raise _work_inventory_conflict('$.formal_runs', 'must be a nonempty list of at most 100 actual Runs')
     measured, failed, unassessed, keys = [], [], [], set()
-    for run in declared:
+    for run_ordinal, run in enumerate(declared):
+        run_path = '$.formal_runs[' + str(run_ordinal) + ']'
         if not isinstance(run, dict):
-            raise OwnerConflict('target_formal_work_inventory_invalid')
+            raise _work_inventory_conflict(run_path, 'must be an object describing this actual Run')
         state = run.get('status', 'executed')
+        if not isinstance(state, str) or state not in {'executed', 'failed', 'blocked', 'cancelled', 'not_executed'}:
+            raise _work_inventory_conflict(run_path + '.status',
+                'must be executed, failed, blocked, cancelled or not_executed according to the actual work')
         if state in {'blocked', 'cancelled', 'not_executed'}:
             continue
         key = run.get('run_key')
-        if (state not in {'executed', 'failed'} or not isinstance(key, str)
-                or not key or len(key) > 128 or key in keys):
-            raise OwnerConflict('target_formal_work_inventory_invalid')
+        if not isinstance(key, str) or not key or len(key) > 128 or key in keys:
+            raise _work_inventory_conflict(run_path + '.run_key',
+                'must be a nonempty string of at most 128 characters, unique among the actual Runs')
         keys.add(key)
         implementation_revision_ref = run.get('implementation_revision_ref')
         if implementation_revision_ref is not None and (
                 not isinstance(implementation_revision_ref, str)
                 or not implementation_revision_ref or len(implementation_revision_ref) > 1024):
-            raise OwnerConflict('target_formal_work_inventory_invalid')
+            raise _work_inventory_conflict(run_path + '.implementation_revision_ref',
+                'must be omitted or a nonempty exact revision string of at most 1024 characters')
         _checkpoint_paths(run.get('checkpoint_paths'))
         _artifact_paths(run.get('artifact_paths'))
         evaluations = run.get('evaluations', [])
         if not isinstance(evaluations, list) or len(evaluations) > 100:
-            raise OwnerConflict('target_formal_work_inventory_invalid')
+            raise _work_inventory_conflict(
+                run_path + '.evaluations',
+                'must be a list of at most 100 actual evaluations; use [] for a Run not yet assessed')
         attempt_keys = set()
-        for attempt in evaluations:
+        for attempt_ordinal, attempt in enumerate(evaluations):
+            attempt_path = run_path + '.evaluations[' + str(attempt_ordinal) + ']'
             if not isinstance(attempt, dict):
-                raise OwnerConflict('target_formal_work_inventory_invalid')
+                raise _work_inventory_conflict(attempt_path, 'must be an object describing this actual evaluation')
             status = attempt.get('status', 'executed')
+            if not isinstance(status, str) or status not in {'executed', 'failed', 'blocked', 'cancelled', 'not_executed'}:
+                raise _work_inventory_conflict(attempt_path + '.status',
+                    'must be executed, failed, blocked, cancelled or not_executed according to the actual assessment')
             if status in {'blocked', 'cancelled', 'not_executed'}:
                 continue
             key, metrics = attempt.get('attempt_key'), attempt.get('metrics')
-            if (status not in {'executed', 'failed'} or not isinstance(key, str)
-                    or not key or len(key) > 128 or key in attempt_keys
-                    or (status == 'executed' and not isinstance(metrics, dict))
+            if not isinstance(key, str) or not key or len(key) > 128 or key in attempt_keys:
+                raise _work_inventory_conflict(attempt_path + '.attempt_key',
+                    'must be a nonempty string of at most 128 characters, unique within this Run')
+            if ((status == 'executed' and not isinstance(metrics, dict))
                     or (status == 'failed' and metrics is not None and not isinstance(metrics, dict))):
-                raise OwnerConflict('target_formal_work_inventory_invalid')
+                raise _work_inventory_conflict(attempt_path + '.metrics',
+                    'must be an object for an executed assessment; a failed assessment may omit it')
             if status == 'failed' and (attempt.get('evaluation_attempt_ref') or attempt.get('metric_result_ref')):
                 raise OwnerConflict('target_formal_reused_evaluation_invalid')
             attempt_keys.add(key)
