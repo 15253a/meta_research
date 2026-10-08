@@ -494,7 +494,7 @@ export function ParallelExecutionLogs({ targets, blocked, paused }: {
     <div className="parallel-execution-log-grid">
       {available.map(target => <TargetLogFiles key={`${target.target_ref}:${target.target_run_ref}`} target={target} blocked={blocked} paused={paused} onDiscovery={onDiscovery} />)}
     </div>
-    {!available.length ? <p className="parallel-log-read-status">当前没有实际执行。</p> : null}
+    {!available.length ? <p className="parallel-log-read-status">当前没有实验执行日志；其他工作输出可在研究会话中查看。</p> : null}
     {available.length > 0 && !hasFiles ? <p className="parallel-log-read-status" role="status">{confirmed
       ? "尚未发现当前执行日志；准备工作和其他命令输出可从任务执行记录查看。"
       : "正在查找当前执行日志…"}</p> : null}

@@ -199,7 +199,7 @@ try {
   checks.push('an execution without discovered log files has a readable empty state without reserving log panes');
   for (const target of targets) target.target_run_ref = null;
   await page.goto(base + '/?workspace=1', { waitUntil: 'domcontentloaded' });
-  await expect(logs).toContainText('当前没有实际执行');
+  await expect(logs).toContainText('当前没有实验执行日志；其他工作输出可在研究会话中查看。');
   await expect(logs.getByRole('log')).toHaveCount(0);
   checks.push('no actual TargetRun is distinct from an execution without discovered files');
   assert.deepEqual(writes, []); assert.deepEqual(errors, []);
