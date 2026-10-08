@@ -29,6 +29,8 @@
 
 示例指标需替换为实际 Protocol 的精确 key 和真实值。数据获取或整理时，Baseline／Variant 表达来源特点和方法；Run 保存实际获得的材料，评价检查完整性、来源、适用性或具体科学标准。Protocol 未声明指标时，已实施评价可用 `metrics: {}`，将真实报告归入其 `artifact_paths`；MetricResult 保留空指标和精确结果文档来源。空对象本身不证明实施：尚未评价用 `evaluations: []`；已声明 required metrics 仍须满足真实取值或合同允许的缺测。
 
+`formal_runs` 是非空 Run 对象列表；`evaluations` 是评价对象列表。`run_key` 在这些实际 Run 中唯一，`attempt_key` 在各自 Run 内唯一，均为非空且不超过 128 字符的字符串。收到 `target_formal_work_inventory_invalid` 时，按 Owner 给出的 JSON 路径修正相应列表、键、状态、指标对象或实现版本声明，保留原有工作和产物，在同一 Root 正常结束下一轮。即使顶层 `metrics: {}`，也按具体字段反馈修正，不为格式修订复制评价指标或重新训练；被拒版本保持可读。
+
 状态为 `executed | failed | blocked | cancelled | not_executed`。`failed` 仅用于已实施且失败的工作，保留日志和产物；失败 EvaluationAttempt 不产生 MetricResult，可省略 `metrics`、用 `{}` 或保留部分观察但不称其为完成测量。其余未实施状态按事实填写。已执行 Run 可以没有评价或带被阻塞的评价，不补造结果。
 
 显式设置每个真实生产者的 `artifact_paths` 为实际产生的精确文件或目录，没有则为 `[]`；Run 的保留状态用 `checkpoint_paths`。即使只有一个生产者也声明实际归属。目录和字节相同都不证明生产事实。诊断日志可以留在 Target 交接，不据其名称补造实施或评价。

@@ -689,10 +689,28 @@ def test_current_reasoning_epoch_does_not_return_a_stale_request(
         runtime.close()
 
 
+class _SystemMetadataReasoningSkill(_DeterministicReasoningSkill):
+    def generate_draft(self, request: ReasoningSkillRequest) -> ReasoningSkillDraft:
+        draft = super().generate_draft(request)
+        outcome = draft.draft["scientific_outcome"]
+        for field in (
+            "target_commit_refs", "changed_axis_fact_refs",
+            "held_fixed_fact_refs", "provenance_refs",
+        ):
+            outcome["causal_interpretation"].pop(field)
+        outcome["research_synthesis"]["current_question"].pop(
+            "prior_accepted_outcome_refs"
+        )
+        return draft
+
+
+@pytest.mark.parametrize("system_metadata", [False, True])
 def test_reasoning_affirmed_next_cycle_keeps_owner_acceptance_layers_distinct(
-    tmp_path: Path,
+    tmp_path: Path, system_metadata: bool,
 ) -> None:
-    reasoning_skill = _DeterministicReasoningSkill()
+    reasoning_skill = (
+        _SystemMetadataReasoningSkill() if system_metadata else _DeterministicReasoningSkill()
+    )
     data_path = tmp_path / "reasoning-owner-chain"
     runtime = _reasoning_runtime(
         data_path,

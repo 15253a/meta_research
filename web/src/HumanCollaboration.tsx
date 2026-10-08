@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { useReplyStream } from "./chatReplyStream";
+import { MetaTrace } from "./MetaTrace";
 import {
   acknowledgeAssetIntake,
   authorizeHumanCommand,
@@ -463,7 +464,7 @@ export function QuestCompanion({
       tabIndex={0}
     >
       <header className="lumen-companion-head">
-        <span className="lumen-orb" aria-hidden="true" />
+        <span className="lumen-orb" aria-hidden="true"><MetaTrace variant="assistant" /></span>
         <div>
           <b>研究助手</b>
           <small>{questionContext

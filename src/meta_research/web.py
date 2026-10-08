@@ -196,6 +196,7 @@ class QuestDraftV2Request(BaseModel):
     goal: str = Field(max_length=4000)
     completion_criteria: str = Field(max_length=4000)
     time_budget: Literal["7d", "30d", "90d", "open"] = "open"
+    research_style: Literal['focus', 'balanced', 'open'] = 'balanced'
     route: Literal["direct", "deepfetch"] = "direct"
     resource_envelope_ref: str | None = Field(default=None, max_length=64)
     resource_envelope_hash: str | None = Field(default=None, max_length=64)
@@ -749,6 +750,7 @@ class RuntimeConditionsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=24000)
     expected_revision: str = Field(min_length=64, max_length=64)
+    research_style: Literal['focus', 'balanced', 'open'] | None = None
 
 
 def create_app(

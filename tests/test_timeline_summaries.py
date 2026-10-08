@@ -152,6 +152,25 @@ def test_failure_keeps_previous_sentence_and_retries_with_recovered_session(reco
     assert service.query('quest-1')['nodes'][0]['summary'] == '两个外部队列可用。'
 
 
+def test_saved_tentative_finding_keeps_its_kind_and_sources_when_refresh_fails(tmp_path):
+    store = TimelineSummaryStore(tmp_path / 'summary-kinds.sqlite3')
+    store.sync('quest-1', [node('初步发现改善，等待独立数据复核。')], 100)
+    job = store.claim(100, 'zh')
+    basis = job['nodes'][0]
+    store.publish(job, [{'node_key': basis['node_key'], 'source_hash': basis['source_hash'],
+        'summary': '初步发现改善，等待独立数据复核。', 'summary_kind': 'tentative_finding',
+        'source_refs': ['accepted-plan-1']}], 'recorder-1', 101)
+    store.sync('quest-1', [node('已增加新的数据，尚待分析。')], 500)
+    refresh = store.claim(500, 'zh')
+    store.fail(refresh, 'timeline_summary_output_invalid', 501)
+    result = TimelineSummaryStore(store.path).query('quest-1')['nodes'][0]
+    assert {key: result[key] for key in ('summary', 'summary_kind', 'status', 'sources')} == {
+        'summary': '初步发现改善，等待独立数据复核。', 'summary_kind': 'tentative_finding',
+        'status': 'failed', 'sources': [{'ref': 'accepted-plan-1', 'label': 'Plan'}],
+    }
+    assert result['source_hash'] != result['summarized_source_hash']
+
+
 def test_pending_durable_job_after_restart_is_not_launched_twice(recorder):
     service, store, reader, provider, now = recorder
     service._observe('quest-1', now[0])

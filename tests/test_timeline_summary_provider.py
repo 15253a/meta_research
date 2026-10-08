@@ -7,8 +7,9 @@ import subprocess
 
 import pytest
 
-from meta_research.quest_drafting import DraftingUnavailable
+from meta_research.quest_drafting import CODEX_DRAFTING_LOCKED_VERSION, DraftingUnavailable
 from meta_research.timeline_summary_provider import CodexTimelineSummaryAdapter, _output_schema
+from meta_research.timeline_summaries import TimelineSummaryStore
 
 
 def nodes():
@@ -34,9 +35,9 @@ def nodes():
 def output():
     return {"next_scan_seconds": 900, "summaries": [
         {"node_key": "question:question-1", "source_hash": "a" * 64,
-         "summary": "研究脑电分类效果能否跨被试泛化，并明确验证范围。", "source_refs": ["question-1"]},
+         "summary": "研究脑电分类效果能否跨被试泛化，并明确验证范围。", "summary_kind": "process", "source_refs": ["question-1"]},
         {"node_key": "target:target-1", "source_hash": "b" * 64,
-         "summary": "核查按被试划分的数据是否重叠，现有证据尚不能判定泛化有效。", "source_refs": ["progress-1"]},
+         "summary": "核查按被试划分的数据是否重叠，现有证据尚不能判定泛化有效。", "summary_kind": "process", "source_refs": ["progress-1"]},
     ]}
 
 
@@ -49,7 +50,7 @@ class RecorderRunner:
 
     def run_command(self, argv, timeout):
         self.version_calls += 1
-        return subprocess.CompletedProcess(argv, 0, stdout="codex-cli 0.156.1\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=f"codex-cli {CODEX_DRAFTING_LOCKED_VERSION}\n", stderr="")
 
     def __call__(self, argv, prompt, timeout):
         self.calls.append((argv, prompt))
@@ -86,7 +87,7 @@ def test_summary_uses_complete_basis_skill_schema_and_inherited_tool_isolation(t
     assert "--ephemeral" not in argv
     assert 'mcp_servers={}' in argv and 'web_search="disabled"' in argv
     assert "shell_tool" in argv and "unified_exec" in argv
-    assert argv[argv.index("--model") + 1] == "gpt-6-sol"
+    assert argv[argv.index("--model") + 1] == "gpt-6.1-sol"
     assert 'model_reasoning_effort="max"' in argv
     schema = runner.schemas[0]
     assert schema["additionalProperties"] is False
@@ -94,6 +95,10 @@ def test_summary_uses_complete_basis_skill_schema_and_inherited_tool_isolation(t
     assert schema["properties"]["next_scan_seconds"] == {"type": "integer", "minimum": 300, "maximum": 7200}
     assert schema["properties"]["summaries"]["minItems"] == 2
     assert schema["properties"]["summaries"]["items"]["properties"]["summary"]["maxLength"] == 180
+    assert schema["properties"]["summaries"]["items"]["properties"]["summary_kind"]["enum"] == [
+        "process", "tentative_finding", "accepted_conclusion", "insufficient_evidence",
+    ]
+    assert "summary_kind" in prompt and "工程接纳" in prompt
 
 
 def test_summary_resumes_only_the_native_session_supplied_by_service(tmp_path):
@@ -104,6 +109,75 @@ def test_summary_resumes_only_the_native_session_supplied_by_service(tmp_path):
     assert resumed == session and second == output()["summaries"]
     assert interval == 900
     assert runner.calls[1][0][-3:] == ["resume", session, "-"]
+
+
+def test_tentative_finding_retains_its_source_binding_and_is_not_a_conclusion(tmp_path):
+    value = output()
+    value["summaries"][1]["summary_kind"] = "tentative_finding"
+    value["summaries"][1]["summary"] = "初步发现分类准确率提高，仍等待独立被试复核。"
+    actual, _, _ = summarize(adapter(tmp_path, RecorderRunner(value)))
+    assert actual[1] == value["summaries"][1]
+
+
+def test_public_progress_cannot_be_labelled_as_an_accepted_conclusion(tmp_path):
+    value = output()
+    value["summaries"][1]["summary_kind"] = "accepted_conclusion"
+    with pytest.raises(DraftingUnavailable, match="timeline_summary_output_invalid"):
+        summarize(adapter(tmp_path, RecorderRunner(value)))
+
+
+@pytest.mark.parametrize("language, sentence", [
+    ("zh", "该阶段尚无可读的工作或判断记录，无法确认具体进展。"),
+    ("en", "No readable work or judgment records are available for this stage, so its progress is unknown."),
+])
+def test_stage_without_records_persists_unknown_progress_instead_of_model_execution_guess(tmp_path, language, sentence):
+    basis = nodes()
+    basis[1].update(node_key="stage:cycle-1:reasoning", kind="stage", stage="reasoning", target_ref=None,
+        content={"ordinal": 1, "artifacts": [], "current": None, "gaps": []},
+        sources=[{"ref": "cycle-1", "label": "Cycle identity"}])
+    value = output()
+    value["summaries"][1].update(node_key="stage:cycle-1:reasoning", summary_kind="insufficient_evidence",
+        summary="该阶段尚未启动，需待实验实施阶段完成后方可开展。", source_refs=["cycle-1"])
+    rows, native, interval = summarize(adapter(tmp_path, RecorderRunner(value)), nodes=basis, output_language=language)
+    store = TimelineSummaryStore(tmp_path / "public-readback.sqlite3")
+    store.sync("quest-1", basis, 100)
+    store.publish(store.claim(100, language), rows, native, 101, interval)
+    observed = store.query("quest-1")["nodes"]
+    assert {key: observed[1][key] for key in ("summary", "summary_kind", "summarized_source_hash", "sources")} == {
+        "summary": sentence, "summary_kind": "insufficient_evidence", "summarized_source_hash": "b" * 64,
+        "sources": [{"ref": "cycle-1", "label": "Cycle identity"}],
+    }
+    assert observed[0]["summary"] == value["summaries"][0]["summary"]
+
+
+@pytest.mark.parametrize("kind", ["stage", "cycle"])
+def test_accepted_reasoning_judgment_keeps_its_exact_scientific_source(tmp_path, kind):
+    judgment = {"stage": "reasoning", "status": "accepted",
+        "content": {"claim": "当前数据未能支持跨被试泛化，仍缺外部队列。"},
+        "source": {"content_ref": "scientific-content-1", "outcome_ref": "scientific-outcome-1"}}
+    basis = nodes()
+    key = "stage:cycle-1:reasoning" if kind == "stage" else "cycle:cycle-1"
+    basis[1].update(node_key=key, kind=kind, stage="reasoning" if kind == "stage" else None, target_ref=None,
+        content={"artifacts": [judgment]} if kind == "stage" else {"stages": {"reasoning": {"artifacts": [judgment]}}},
+        sources=[{"ref": "scientific-content-1", "label": "Accepted Reasoning"}, {"ref": "progress-1"}])
+    value = output()
+    value["summaries"][1].update(node_key=key, summary_kind="accepted_conclusion",
+        summary="当前数据未能支持跨被试泛化，仍缺外部队列。", source_refs=["scientific-content-1"])
+    provider = adapter(tmp_path, RecorderRunner(value))
+    assert summarize(provider, nodes=basis)[0][1] == value["summaries"][1]
+    value["summaries"][1]["source_refs"] = ["progress-1"]
+    with pytest.raises(DraftingUnavailable, match="timeline_summary_output_invalid"):
+        summarize(adapter(tmp_path / 'unbound', RecorderRunner(value)), nodes=basis)
+
+
+def test_legacy_saved_summary_has_a_process_label_without_regeneration(tmp_path):
+    value = output()
+    for row in value["summaries"]:
+        row.pop("summary_kind")
+    provider = adapter(tmp_path, RecorderRunner(value))
+    summarize(provider)
+    recovered = adapter(tmp_path, NoRecoveryInvocation()).recover_summaries(recovery_job())
+    assert recovered[0] == output()["summaries"]
 
 
 def test_completed_job_replay_after_adapter_restart_does_not_call_provider(tmp_path):
