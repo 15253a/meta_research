@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import subprocess
 import threading
 from types import SimpleNamespace
 
@@ -81,3 +82,14 @@ def test_protected_unknown_outcome_preserves_exact_slots_and_has_no_host_fallbac
     assert runner.cancel_job("unknown-job")["descendants_ended"] is False
     assert runner.cancel_job("another-job")["descendants_ended"] is False
     assert "third-party Python scientific packages" in runner.runtime_conditions
+
+
+def test_protected_prelaunch_cancel_keeps_named_stopped_outcome(tmp_path):
+    work = SimpleNamespace(operation=SimpleNamespace(operation_ref="cancelled-job"),
+        run=lambda call: subprocess.CompletedProcess(call.argv, -15, "", ""),
+        request_stop=lambda: {"status": "unknown_outcome", "descendants_ended": False})
+    runner = ProtectedCreationRunner(work)
+    assert runner.cancel_job("cancelled-job")["descendants_ended"] is False
+    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_stopped"):
+        runner.run_job("cancelled-job", ["/bin/codex", "--output-schema", str(tmp_path / "schema.json"),
+            "--output-last-message", str(tmp_path / "result.json")], "", None)

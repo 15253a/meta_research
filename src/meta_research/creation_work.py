@@ -3,11 +3,12 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
+import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import stat
 
-from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.protected_creation_runtime import ProtectedCreationRuntime
 from meta_research.work_material_contract import CREATION_MATERIAL_OPERATION_IDS
 
@@ -51,6 +52,8 @@ class ProtectedCreation:
         self.relative_directory = "operations/" + canonical_hash({"operation_ref": operation_ref})
         self._token = None
         self._terminal = False
+        self._executed = False
+        self.sealed_identity = None
         self.execution_binding = {"operation_ref": operation_ref, "fence_ref": self.operation.fence_ref,
             "binding_hash": self.operation.binding_hash, "work_ref": self.work_ref,
             "work_directory": "/workspace/" + self.relative_directory,
@@ -79,7 +82,9 @@ class ProtectedCreation:
     def run(self, call):
         if self._terminal:
             raise OwnerConflict("creation_work_closed")
-        return self.runtime.run(call)
+        completed = self.runtime.run(call)
+        self._executed = True
+        return completed
 
     def request_stop(self):
         return self.runtime.request_stop()
@@ -121,8 +126,9 @@ class ProtectedCreation:
 
     @contextmanager
     def read_file(self, path):
-        parts = PurePosixPath(path).parts
-        if not parts or path.startswith("/") or any(part in {".", ".."} for part in parts):
+        from meta_research.server_materials import relative_parts
+        parts = relative_parts(path)
+        if not parts:
             raise OwnerConflict("creation_work_path_invalid")
         with owned_directory(self.work_directory) as root:
             opened = []
@@ -148,12 +154,103 @@ class ProtectedCreation:
             if (details.st_dev, details.st_ino) != (receipt["device"], receipt["inode"]):
                 raise OwnerConflict("creation_work_changed")
 
+    def retain_source(self, source):
+        from sqlalchemy import text
+        from meta_research.creation_inputs import require_identity
+        from meta_research.server_materials import observation
+
+        if self.sealed_identity is None or not self._terminal:
+            raise OwnerConflict("creation_work_not_sealed")
+        require_identity(self.owner._hc, self.sealed_identity)
+        key = "creation_custody:" + canonical_hash({"operation": self.operation.operation_ref,
+            "identity": self.sealed_identity.digest, "source": source})
+        database = self.owner._hc._database
+        with database.read() as connection:
+            row = connection.execute(text("SELECT receipt_json FROM root_creation_custody WHERE custody_ref=:ref"),
+                                     {"ref": key}).first()
+        if row is not None:
+            receipt = json.loads(row.receipt_json)
+            with self.owner.server_files._open(receipt["locator"]) as (descriptor, details):
+                if details["kind"] != "file" or int(details["size"]) != receipt["bytes"]:
+                    raise OwnerConflict("creation_custody_changed")
+                with os.fdopen(os.dup(descriptor), "rb") as stream:
+                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                if digest != receipt["sha256"]:
+                    raise OwnerConflict("creation_custody_changed")
+            return receipt
+
+        @contextmanager
+        def selected_file():
+            if source["kind"] == "work_file":
+                if source["work_ref"] != self.work_ref:
+                    raise OwnerConflict("creation_work_unbound")
+                if source["trial_ref"] is not None:
+                    with database.read() as connection:
+                        trial = connection.execute(text("SELECT receipt_json FROM hc_creation_material_copies "
+                            "WHERE effect_key=:ref AND operation_ref=:operation AND fence_ref=:fence AND state='ready'"),
+                            {"ref": source["trial_ref"], "operation": self.operation.operation_ref,
+                             "fence": self.operation.fence_ref}).first()
+                    if trial is None or json.loads(trial.receipt_json)["work_file"] != source:
+                        raise OwnerConflict("creation_trial_unbound")
+                with self.read_file(source["path"]) as (descriptor, details):
+                    yield descriptor, observation(details), None
+            else:
+                reference = next((item for item in self.operation.inputs.references
+                                  if item["reference_ref"] == source["reference_ref"]), None)
+                if reference is None:
+                    raise OwnerConflict("material_not_visible")
+                with self.owner.server_files._open_reference(reference["source"], source["path"]) as (descriptor, details):
+                    if details["kind"] != "file" or details["observation_ref"] != source["observation_ref"]:
+                        raise OwnerConflict("material_source_changed")
+                    locator = reference["source"]["absolute_path"].rstrip("/")
+                    if source["path"]:
+                        locator += "/" + source["path"]
+                    yield descriptor, details, locator
+
+        destination = self.owner._bases["companion"] / ".creation-custody"
+        self.owner._ensure_directory(destination)
+        name = key.split(":", 1)[1]
+        with selected_file() as (descriptor, before, original_locator), owned_directory(destination) as directory:
+            digest = hashlib.sha256()
+            count = 0
+            output = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o400, dir_fd=directory)
+            try:
+                with os.fdopen(output, "wb") as stream:
+                    while True:
+                        chunk = os.pread(descriptor, 1024 * 1024, count)
+                        if not chunk:
+                            break
+                        stream.write(chunk)
+                        digest.update(chunk)
+                        count += len(chunk)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    if os.fstat(stream.fileno()).st_nlink != 1:
+                        raise OwnerConflict("creation_work_unsafe")
+                if observation(os.fstat(descriptor)) != before or count != int(before["size"]):
+                    raise OwnerConflict("creation_source_changed")
+                receipt = {"custody_ref": key, "source": source, "locator": str(destination / name),
+                    "original_locator": original_locator, "sha256": digest.hexdigest(), "bytes": count}
+                require_identity(self.owner._hc, self.sealed_identity)
+                with database.fenced_write() as connection:
+                    connection.execute(text("INSERT INTO root_creation_custody(custody_ref,operation_ref,source_json,receipt_json) "
+                        "VALUES(:ref,:operation,:source,:receipt)"), {"ref": key, "operation": self.operation.operation_ref,
+                        "source": canonical_json(source), "receipt": canonical_json(receipt)})
+                return receipt
+            except BaseException:
+                os.unlink(name, dir_fd=directory)
+                raise
+
     def seal(self):
         try:
+            if not self._executed:
+                raise OwnerConflict("protected_creation_unknown_outcome")
             outcome = self.runtime.request_stop()
             if not outcome["descendants_ended"] or outcome["status"] not in {"completed", "stopped"}:
                 raise OwnerConflict("protected_creation_unknown_outcome")
             identity = self.operation.seal()
+            self.sealed_identity = identity
             self._terminal = True
             return identity
         finally:
@@ -186,6 +283,7 @@ class ProtectedCreationRunner:
         self.work = work
         self.read_only_inputs = tuple(read_only_inputs)
         self.environment = dict(environment or {})
+        self._stop_requested = False
 
     def run_job(self, job_ref, argv, prompt, timeout_seconds, environment=None):
         from meta_research.idea_skill import IdeaSkillUnavailable
@@ -201,13 +299,17 @@ class ProtectedCreationRunner:
                 raise IdeaSkillUnavailable("creation_native_handoff_invalid")
             slots[option] = Path(argv[index + 1])
         try:
-            return self.work.run(NativeCreationCall(tuple(argv), prompt, timeout_seconds,
+            completed = self.work.run(NativeCreationCall(tuple(argv), prompt, timeout_seconds,
                 {**self.environment, **(environment or {})},
                 (*self.read_only_inputs, slots["--output-schema"]), (slots["--output-last-message"],)))
+            if self._stop_requested and completed.returncode != 0:
+                raise IdeaSkillUnavailable("codex_cli_stopped")
+            return completed
         except ProtectedCreationError as error:
             raise IdeaSkillUnavailable(error.code) from error
 
     def cancel_job(self, job_ref):
         if job_ref != self.work.operation.operation_ref:
             return {"status": "not_running", "descendants_ended": False}
+        self._stop_requested = True
         return self.work.request_stop()

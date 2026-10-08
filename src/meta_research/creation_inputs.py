@@ -101,6 +101,11 @@ class CreationInputIdentity:
     material_set_hash: str
     consumed: tuple[ReadWitness, ...]
 
+    @classmethod
+    def from_dict(cls, value):
+        return cls(CreationAnchor(**value["anchor"]), value["material_set_hash"],
+                   tuple(ReadWitness(**item) for item in value["consumed"]))
+
     def as_dict(self):
         return {"anchor": self.anchor.as_dict(), "material_set_hash": self.material_set_hash,
                 "consumed": [item.as_dict() for item in self.consumed]}
@@ -238,6 +243,7 @@ class CreationMaterialOperation:
     def seal(self):
         identity = self.identity()
         with self.human._database.fenced_write() as connection:
+            require_anchor(self.human, self.inputs.anchor, require_open=True)
             require_identity(self.human, identity)
             changed = connection.execute(text("UPDATE hc_creation_material_operations SET state='sealed',"
                 "identity_json=:identity WHERE operation_ref=:ref AND fence_ref=:fence AND state='active'"),

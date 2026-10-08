@@ -34,12 +34,15 @@ class InitializationUnderstandingRequest:
     creation_context_kind: str = "quest_initialization"
     creation_context_ref: str | None = None
     context_generation: int | None = None
+    inputs: object | None = None
 
 
 @dataclass(frozen=True)
 class InitializationUnderstandingResult:
     understanding: dict[str, object]
     companion_native_session_ref: str | None = None
+    input_identity: object | None = None
+    work: object | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,8 @@ class FirstQuestionSynthesisResult:
     companion_native_session_ref: str | None
     proposal_fork_native_session_ref: str | None
     revision: dict[str, object] | None = None
+    input_identity: object | None = None
+    work: object | None = None
 
 
 def empty_manifest() -> dict[str, object]:
@@ -83,7 +88,7 @@ def first_creation_instructions():
     return {"bundle_hash": canonical_hash(contents), "files": list(paths), "instructions": "\n\n".join(contents.values())}
 
 
-def understanding_schema() -> dict[str, object]:
+def understanding_schema(*, references=False) -> dict[str, object]:
     citation = {"type": "object", "additionalProperties": False, "properties": {
         "material_key": {"type": "string"}, "offset": {"type": "integer", "minimum": 0},
         "length": {"type": "integer", "minimum": 1, "maximum": 65536},
@@ -104,6 +109,25 @@ def understanding_schema() -> dict[str, object]:
     selection = {"type": "object", "additionalProperties": False, "properties": {
         "material_key": {"type": "string"}, "reason": {"type": "string", "minLength": 1}},
         "required": ["material_key", "reason"]}
+    if references:
+        citation = {"type": "object", "additionalProperties": False,
+            "properties": {"witness_ref": {"type": "string", "minLength": 1},
+                           "location": {"type": "string", "minLength": 1}},
+            "required": ["witness_ref", "location"]}
+        statement["properties"]["sources"]["items"] = citation
+        coverage["properties"]["read_ranges"]["items"] = citation
+        original = {"type": "object", "additionalProperties": False, "properties": {
+            "kind": {"const": "original_file"}, "reference_ref": {"type": "string", "minLength": 1},
+            "path": {"type": "string"}, "observation_ref": {"type": "string", "minLength": 1}},
+            "required": ["kind", "reference_ref", "path", "observation_ref"]}
+        work = {"type": "object", "additionalProperties": False, "properties": {
+            "kind": {"const": "work_file"}, "work_ref": {"type": "string", "minLength": 1},
+            "path": {"type": "string", "minLength": 1}, "trial_ref": {"type": ["string", "null"]}},
+            "required": ["kind", "work_ref", "path", "trial_ref"]}
+        selection = {"type": "object", "additionalProperties": False, "properties": {
+            "source": {"oneOf": [original, work]},
+            "custody": {"type": "string", "enum": ["managed", "linked_local"]},
+            "reason": {"type": "string", "minLength": 1}}, "required": ["source", "custody", "reason"]}
     return {"type": "object", "additionalProperties": False, "properties": {
         **{key: {"type": "array", "items": statement} for key in UNDERSTANDING_FIELDS},
         "coverage": {"type": "array", "items": coverage},
@@ -111,9 +135,9 @@ def understanding_schema() -> dict[str, object]:
         "required": [*UNDERSTANDING_FIELDS, "coverage", "selection"]}
 
 
-def revision_schema() -> dict[str, object]:
+def revision_schema(*, references=False) -> dict[str, object]:
     return {"type": "object", "additionalProperties": False, "properties": {
-        "understanding": understanding_schema(),
+        "understanding": understanding_schema(references=references),
         "corrections": {"type": "array", "items": {"type": "object", "additionalProperties": False,
             "properties": {"prior_statement_ref": {"type": "string"},
                 "disposition": {"type": "string", "enum": ["confirmed", "qualified", "contradicted", "unresolved"]},
@@ -187,6 +211,70 @@ def validate_understanding(value, manifest, read_witness) -> dict[str, object]:
     return value
 
 
+def validate_reference_understanding(value, inputs, identity, server_files):
+    from jsonschema import Draft202012Validator
+    try:
+        Draft202012Validator(understanding_schema(references=True)).validate(value)
+        references = {item["reference_ref"]: item for item in inputs.references}
+        witnesses = {item.witness_ref: item for item in identity.consumed}
+        coverage = {item["material_key"]: item for item in value["coverage"]}
+        if len(coverage) != len(value["coverage"]) or set(coverage) != set(references):
+            raise ValueError("coverage")
+
+        def witness(citation):
+            item = witnesses[citation["witness_ref"]]
+            if item.reference_ref not in references:
+                raise ValueError("witness source")
+            return item
+
+        for key, item in coverage.items():
+            ranges = [witness(citation) for citation in item["read_ranges"]]
+            if any(part.reference_ref != key for part in ranges):
+                raise ValueError("coverage source")
+            if item["kind"] == "unread" and ranges or item["kind"] != "unread" and not ranges:
+                raise ValueError("coverage")
+            if item["kind"] != "read" and not item["unread_description"].strip():
+                raise ValueError("unread")
+            if item["kind"] == "read":
+                if references[key]["source"]["kind"] != "file" or any(part.path for part in ranges):
+                    raise ValueError("directory incomplete")
+                with server_files._open_reference(references[key]["source"], "") as (_, details):
+                    size = int(details["size"])
+                ordered = sorted(set((part.offset, part.offset + part.length) for part in ranges))
+                cursor = 0
+                for start, end in ordered:
+                    if start > cursor:
+                        raise ValueError("incomplete read")
+                    cursor = max(cursor, end)
+                if cursor != size:
+                    raise ValueError("incomplete read")
+        statement_refs = set()
+        for field in UNDERSTANDING_FIELDS:
+            for statement in value[field]:
+                if statement["ref"] in statement_refs:
+                    raise ValueError("duplicate statement")
+                statement_refs.add(statement["ref"])
+                if field not in {"material_composition", "gaps", "unfinished_questions"} and not statement["sources"]:
+                    raise ValueError("unsupported content")
+                for citation in statement["sources"]:
+                    if coverage[witness(citation).reference_ref]["kind"] == "unread":
+                        raise ValueError("unread claim")
+        selected = set()
+        for item in value["selection"]:
+            source = item["source"]
+            key = canonical_hash(source)
+            if key in selected:
+                raise ValueError("duplicate selection")
+            selected.add(key)
+            if source["kind"] == "original_file" and source["reference_ref"] not in references:
+                raise ValueError("selection source")
+    except (OwnerConflict, SemanticMcpError):
+        raise
+    except Exception as error:
+        raise OwnerConflict("creation_understanding_invalid") from error
+    return value
+
+
 class CreationBasisMemory:
     def __init__(self, owner):
         self._owner = owner
@@ -203,11 +291,31 @@ class CreationBasisMemory:
             raise OwnerConflict("creation_basis_hash_invalid")
         return {**body, "basis_ref": basis_ref, "basis_hash": row.basis_hash}
 
-    def prepared(self, initialization_id, draft_revision, draft_hash):
+    def prepared(self, initialization_id, draft_revision, draft_hash, inputs=None):
         with self._database.read() as connection:
-            ref = connection.execute(text("SELECT basis_ref FROM rm_creation_bases WHERE initialization_id=:id AND draft_revision=:rev AND draft_hash=:hash AND kind='prepared'"),
-                {"id": initialization_id, "rev": draft_revision, "hash": draft_hash}).scalar_one_or_none()
-        return None if ref is None else self.query(ref)
+            rows = connection.execute(text("SELECT basis_ref FROM rm_creation_bases WHERE initialization_id=:id "
+                "AND draft_revision=:rev AND draft_hash=:hash AND kind='prepared' "
+                "AND ((:inputs=0 AND input_identity_hash IS NULL) OR (:inputs=1 AND input_identity_hash IS NOT NULL))"),
+                {"id": initialization_id, "rev": draft_revision, "hash": draft_hash, "inputs": int(inputs is not None)}).all()
+        for row in rows:
+            basis = self.query(row.basis_ref)
+            if inputs is None:
+                return basis
+            if basis["input_identity"]["anchor"] != inputs.anchor.as_dict() or basis["input_identity"]["material_set_hash"] != inputs.set_hash:
+                continue
+            try:
+                self.require_current(basis)
+            except OwnerConflict as error:
+                if error.code == "creation_input_stale":
+                    continue
+                raise
+            return basis
+        return None
+
+    def require_current(self, basis):
+        from meta_research.creation_inputs import CreationInputIdentity, require_identity
+        if basis.get("input_identity") is not None:
+            return require_identity(self.workspaces._hc, CreationInputIdentity.from_dict(basis["input_identity"]))
 
     def _accept(self, body):
         from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
@@ -216,9 +324,11 @@ class CreationBasisMemory:
         ref = "creation_basis_" + digest[:32]
         with self._database.fenced_write() as connection:
             assert_asset_payload_usable(connection, body["sources"])
-            connection.execute(text("INSERT INTO rm_creation_bases (basis_ref,basis_hash,initialization_id,draft_revision,draft_hash,kind,body_json) VALUES (:ref,:hash,:id,:revision,:draft_hash,:kind,:body) ON CONFLICT(basis_ref) DO NOTHING"),
+            self.require_current(body)
+            connection.execute(text("INSERT INTO rm_creation_bases (basis_ref,basis_hash,initialization_id,draft_revision,draft_hash,kind,body_json,input_identity_hash) VALUES (:ref,:hash,:id,:revision,:draft_hash,:kind,:body,:identity) ON CONFLICT(basis_ref) DO NOTHING"),
                 {"ref": ref, "hash": digest, "id": body["draft"]["initialization_id"], "revision": body["draft"]["revision"],
-                    "draft_hash": body["draft"]["hash"], "kind": body["kind"], "body": canonical_json(body)})
+                    "draft_hash": body["draft"]["hash"], "kind": body["kind"], "body": canonical_json(body),
+                    "identity": (None if body.get("input_identity") is None else canonical_hash(body["input_identity"]))})
         return self.query(ref, digest)
 
     def read_workspace(self, body, entry, offset=0, limit=65536):
@@ -256,12 +366,79 @@ class CreationBasisMemory:
             body["sources"].append(source)
         return self._accept(body)
 
-    def accept_revision(self, predecessor, snapshot, revision):
+    def accept_reference_prepared(self, request, result):
+        from meta_research.owners.research_memory import AssetIntakeRequest
+        inputs, identity, work = request.inputs, result.input_identity, result.work
+        if (inputs is None or identity is None or work is None or work.sealed_identity != identity
+            or work.operation.inputs != inputs or work.operation.operation_ref != request.job_ref
+            or identity.anchor != inputs.anchor or identity.material_set_hash != inputs.set_hash):
+            raise OwnerConflict("creation_input_identity_invalid")
+        validate_reference_understanding(result.understanding, inputs, identity, self.workspaces.server_files)
+        coverage = {item["material_key"]: item for item in result.understanding["coverage"]}
+        body = {"schema_ref": "meta-research/creation-research-basis/v2", "kind": "prepared",
+            "draft": {"initialization_id": request.initialization_id, "revision": request.draft_revision, "hash": request.draft_hash},
+            "root_session_ref": request.root_session_ref, "manifest": empty_manifest(),
+            "manifest_hash": canonical_hash(empty_manifest()), "material_references": inputs.as_dict(),
+            "input_identity": identity.as_dict(), "understanding": result.understanding,
+            "sources": [], "predecessor": None, "literature_snapshot": None, "corrections": [], "search_assessment": None}
+        self.require_current(body)
+        for entry in inputs.references:
+            body["sources"].append({"material_key": entry["reference_ref"], "relative_path": entry["source"]["absolute_path"],
+                "reference": entry, "source": {"kind": "material_reference", "reference_ref": entry["reference_ref"]},
+                "coverage": coverage[entry["reference_ref"]], "selection_reason": None, "binding": None,
+                "custody": None, "intake_state": None})
+        for selected in result.understanding["selection"]:
+            source = selected["source"]
+            retained = work.retain_source(source)
+            locator = (retained["original_locator"] if selected["custody"] == "linked_local"
+                       and source["kind"] == "original_file" else retained["locator"])
+            source_key = "selected_file_" + canonical_hash(selected)
+            relative_path = source["path"] or Path(locator).name
+            provenance = {"kind": "external_existing_work" if source["kind"] == "original_file" else "creation_work_result",
+                "creation_anchor": inputs.anchor.as_dict(), "operation_ref": work.operation.operation_ref,
+                "source": source, "input_identity_hash": identity.digest, "custody_ref": retained["custody_ref"]}
+            accepted = self._owner.submit_asset_intake(AssetIntakeRequest(source_kind="local_path", custody_mode=selected["custody"],
+                display_name=Path(relative_path).name, media_type=mimetypes.guess_type(relative_path)[0] or "application/octet-stream",
+                source_locator=locator, provenance=provenance, origin_quest_ref=None, asynchronous=True),
+                idempotency_key="creation-selected:" + canonical_hash({"custody": retained["custody_ref"], "selection": selected}),
+                effect_scope=lambda: self.require_current(body))
+            if accepted.status == "queued":
+                self._owner._process_asset_job(accepted.job_ref, effect_scope=lambda: self.require_current(body))
+                accepted = self._owner.query_asset_intake(accepted.job_ref)
+            if accepted.status != "accepted" or accepted.asset is None:
+                raise OwnerConflict("creation_source_not_accepted")
+            if accepted.asset.content_hash != retained["sha256"]:
+                raise OwnerConflict("creation_source_changed")
+            body["sources"].append({"material_key": source_key, "relative_path": relative_path, "source": source,
+                "bytes": retained["bytes"], "sha256": retained["sha256"], "custody": selected["custody"],
+                "custody_ref": retained["custody_ref"], "selection_reason": selected["reason"], "intake_state": "accepted",
+                "binding": accepted.asset.as_binding().as_dict(),
+                "coverage": (coverage[source["reference_ref"]] if source["kind"] == "original_file" else {
+                    "kind": "partial", "read_ranges": [], "unread_description": "Result of the sealed native operation; input witnesses describe the original entrance."})})
+        return self._accept(body)
+
+    def accept_revision(self, predecessor, snapshot, revision, result=None):
         from jsonschema import Draft202012Validator
+        from meta_research.creation_inputs import CreationInputIdentity, MaterialSet
+        references = predecessor.get("input_identity") is not None
+        identity = None
         try:
-            Draft202012Validator(revision_schema()).validate(revision)
-            validate_understanding(revision["understanding"], predecessor["manifest"],
-                lambda entry, offset, length: self.read_source(predecessor, entry["material_key"], offset, length)["content"])
+            self.require_current(predecessor)
+            Draft202012Validator(revision_schema(references=references)).validate(revision)
+            if references:
+                identity = CreationInputIdentity.from_dict(predecessor["input_identity"])
+                if result is not None and result.input_identity is not None:
+                    current = result.input_identity
+                    if (result.work is None or result.work.sealed_identity != current or current.anchor != identity.anchor
+                        or current.material_set_hash != identity.material_set_hash):
+                        raise ValueError("revision identity")
+                    consumed = {item.witness_ref: item for item in (*identity.consumed, *current.consumed)}
+                    identity = CreationInputIdentity(identity.anchor, identity.material_set_hash, tuple(consumed.values()))
+                inputs = MaterialSet(identity.anchor, tuple(predecessor["material_references"]["references"]))
+                validate_reference_understanding(revision["understanding"], inputs, identity, self.workspaces.server_files)
+            else:
+                validate_understanding(revision["understanding"], predecessor["manifest"],
+                    lambda entry, offset, length: self.read_source(predecessor, entry["material_key"], offset, length)["content"])
             if revision["understanding"]["selection"] != predecessor["understanding"]["selection"]:
                 raise ValueError("selection changed")
             metadata = self._owner.read_literature_snapshot_metadata(snapshot["snapshot_ref"])
@@ -290,8 +467,10 @@ class CreationBasisMemory:
         body = {key: value for key, value in predecessor.items() if key not in {"basis_ref", "basis_hash"}}
         body.update(kind="literature_revised", predecessor=self.reference(predecessor),
             literature_snapshot=snapshot, understanding=revision["understanding"], corrections=revision["corrections"],
-            sources=[{**source, "coverage": coverage[source["material_key"]]} for source in predecessor["sources"]],
+            sources=[{**source, "coverage": coverage.get(source["material_key"], source["coverage"])} for source in predecessor["sources"]],
             search_assessment={"assessment": revision["search_assessment"], "completion": metadata["completion"], "limitations": metadata["limitations"]})
+        if identity is not None:
+            body["input_identity"] = identity.as_dict()
         return self._accept(body)
 
     @staticmethod
@@ -326,6 +505,16 @@ class CreationBasisMemory:
         if source is None:
             raise OwnerConflict("creation_source_unbound")
         if source["binding"] is None:
+            if basis.get("input_identity") is not None:
+                from meta_research.creation_inputs import material_bytes
+                self.require_current(basis)
+                reference = source["reference"]
+                with self.workspaces.server_files._open_reference(reference["source"], "") as (_, details):
+                    if details["kind"] != "file":
+                        raise OwnerConflict("creation_source_file_required")
+                page = self.workspaces.server_files.read(reference["source"], path="",
+                    observation_ref=details["observation_ref"], offset=offset, max_bytes=limit)
+                return {**page, "content": material_bytes(page)}
             return self.read_workspace(basis, source, offset, limit)
         page = self._owner.read_asset_content_page(source["binding"]["version_ref"], offset=offset, limit=limit)
         content = page.get("text")
@@ -346,38 +535,52 @@ class CreationBasisMemory:
             reader = ({"operation": "research_memory.content.read", "source_ref": binding["version_ref"], "version_ref": binding["version_ref"]}
                 if binding is not None else {"operation": "research_memory.creation_basis.read", "basis_ref": basis["basis_ref"],
                     "expected_basis_hash": basis["basis_hash"], "view": "source", "material_key": source["material_key"]})
-            views.append({**source, "reader": reader})
+            view = {**source, "reader": reader}
+            if basis.get("input_identity") is not None:
+                view["coverage"] = {**source["coverage"], "read_ranges": [
+                    self.citation_view(basis, item) for item in source["coverage"]["read_ranges"]]}
+            views.append(view)
         return views
 
+    @staticmethod
+    def citation_view(basis, citation):
+        item = next(item for item in basis["input_identity"]["consumed"] if item["witness_ref"] == citation["witness_ref"])
+        return {**item, "material_key": item["reference_ref"], "location": citation["location"]}
+
+    def understanding_view(self, basis):
+        if basis.get("input_identity") is None:
+            return basis["understanding"]
+        return {**basis["understanding"], **{field: [{**statement, "sources": [
+            self.citation_view(basis, citation) for citation in statement["sources"]]}
+            for statement in basis["understanding"][field]] for field in UNDERSTANDING_FIELDS}}
+
     def project(self, basis, literature, binding):
+        self.require_current(basis)
         payload = {"basis": self.reference(basis), "literature": literature}
-        documents = {"basis.json": canonical_json(basis).encode(), "understanding.json": canonical_json(basis["understanding"]).encode()}
+        documents = {"basis.json": canonical_json({**self.reference(basis), "input_identity": basis.get("input_identity"),
+            "reader": {"operation": "research_memory.creation_basis.read", "basis_ref": basis["basis_ref"],
+                "expected_basis_hash": basis["basis_hash"], "view": "understanding"}}).encode(),
+            "understanding.json": canonical_json(basis["understanding"]).encode(),
+            "sources.json": canonical_json(self.source_views(basis)).encode()}
         if literature is not None:
             documents["literature.json"] = canonical_json(literature).encode()
             snapshot_ref = literature["source_snapshot"]["snapshot_ref"]
             metadata = self._owner.read_literature_snapshot_metadata(snapshot_ref)
-            exact = self._owner.read_literature_snapshot(snapshot_ref)
             documents["papers.json"] = canonical_json(metadata.get("papers_ledger") or metadata["papers"]).encode()
-            documents["summary.md"] = exact["summary"].encode()
-            for fulltext in exact["fulltexts"]:
-                documents["fulltexts/" + fulltext["content_hash"]] = fulltext["content"].encode()
-        for source in basis["sources"]:
-            if source["binding"] is None:
-                continue
-            chunks = []
-            offset = 0
-            while offset < source["bytes"]:
-                page = self.read_source(basis, source["material_key"], offset)
-                chunks.append(page["content"])
-                offset += len(page["content"])
-                if not page["content"]:
-                    raise OwnerConflict("creation_source_unavailable")
-            documents["sources/" + source["material_key"] + "/" + Path(source["relative_path"]).name] = b"".join(chunks)
+            documents["literature-reader.json"] = canonical_json({"operation": "research_memory.content.read",
+                "source_ref": snapshot_ref, "version_ref": snapshot_ref}).encode()
         manifest = []
-        destination = self.workspaces.destination_for_initialization(basis["draft"]["initialization_id"], basis["root_session_ref"])
+        if binding.location.context_generation is not None:
+            destination = self.workspaces.destination_for_manual_creation(binding.location.request_ref,
+                binding.location.root_session_ref, binding.location.context_generation)
+        else:
+            destination = self.workspaces.destination_for_initialization(basis["draft"]["initialization_id"], basis["root_session_ref"])
+        if destination.location.workspace_ref != binding.location.workspace_ref:
+            raise OwnerConflict("creation_context_workspace_invalid")
         items = [(".creation-context/" + path, content) for path, content in sorted(documents.items())]
         for start in range(0, len(items), 100):
-            receipt = self.workspaces.deliver(destination, delivery_ref="creation-context:" + canonical_hash({"basis": payload, "start": start}), files=tuple(items[start:start + 100]))
+            receipt = self.workspaces.deliver(destination, delivery_ref="creation-context:" + canonical_hash({
+                "basis": payload, "workspace": binding.seal(), "start": start}), files=tuple(items[start:start + 100]))
             manifest.extend(receipt["files"])
         basis_path = next(item["path"] for item in manifest if item["path"].endswith("/.creation-context/basis.json"))
         return {"relative_root": basis_path.removesuffix("/basis.json"), "manifest": manifest, "context_hash": canonical_hash(manifest)}
@@ -386,24 +589,37 @@ class CreationBasisMemory:
 def creation_basis_operations(memory, runtime, collaboration):
     def read(context, arguments):
         try:
-            scope = runtime.verify_root_agent_runtime_scope(root_kind=context.root_kind, run_ref=context.run_ref,
-                attempt_ref=context.attempt_ref, root_session_ref=context.root_session_ref,
-                fence_ref=context.fence_ref, runtime_binding_hash=context.capability_binding_hash)
             basis = memory.creation_bases.query(arguments["basis_ref"], arguments["expected_basis_hash"])
-            if scope.get("quest_ref"):
+            exact_request_basis = None
+            if context.phase == "creation_materials":
+                operation = collaboration._creation_material_operation(context)
+                operation.authorize(context)
+                identity = basis.get("input_identity")
+                if (identity is None or identity["anchor"] != operation.inputs.anchor.as_dict()
+                    or identity["material_set_hash"] != operation.inputs.set_hash):
+                    raise OwnerConflict("creation_basis_unbound")
+                memory.creation_bases.require_current(basis)
+                scope = {}
+                exact_request_basis = memory.creation_bases.reference(basis)
+            else:
+                scope = runtime.verify_root_agent_runtime_scope(root_kind=context.root_kind, run_ref=context.run_ref,
+                    attempt_ref=context.attempt_ref, root_session_ref=context.root_session_ref,
+                    fence_ref=context.fence_ref, runtime_binding_hash=context.capability_binding_hash)
+                if context.root_kind == "deepfetch":
+                    run = runtime.query_deepfetch_run_by_ref(context.run_ref)
+                    request = collaboration.query_deepfetch_request(run.request_ref)
+                    exact_request_basis = request.scope.get("creation_basis")
+            if exact_request_basis is not None:
+                if exact_request_basis != memory.creation_bases.reference(basis):
+                    raise OwnerConflict("creation_basis_unbound")
+            elif scope.get("quest_ref"):
                 with memory._database.read() as connection:
                     visible = connection.execute(text("SELECT 1 FROM rm_question_creation_bases WHERE quest_ref=:quest AND basis_ref=:basis"),
                         {"quest": scope["quest_ref"], "basis": basis["basis_ref"]}).first()
                 if visible is None:
                     raise OwnerConflict("creation_basis_unbound")
             else:
-                if context.root_kind != "deepfetch":
-                    raise OwnerConflict("creation_basis_unbound")
-                run = runtime.query_deepfetch_run_by_ref(context.run_ref)
-                request = collaboration.query_deepfetch_request(run.request_ref)
-                expected = request.scope.get("creation_basis")
-                if expected != memory.creation_bases.reference(basis):
-                    raise OwnerConflict("creation_basis_unbound")
+                raise OwnerConflict("creation_basis_unbound")
             if arguments["view"] == "source":
                 page = memory.creation_bases.read_source(basis, arguments["material_key"], arguments.get("offset", 0), arguments.get("limit", 8192))
                 content = page.pop("content")
@@ -413,7 +629,7 @@ def creation_basis_operations(memory, runtime, collaboration):
                     except UnicodeDecodeError:
                         page["content_base64"] = base64.b64encode(content).decode()
                 return {**page, "basis_ref": basis["basis_ref"], "basis_hash": basis["basis_hash"]}
-            value = {"understanding": basis["understanding"], "sources": memory.creation_bases.source_views(basis),
+            value = {"understanding": memory.creation_bases.understanding_view(basis), "sources": memory.creation_bases.source_views(basis),
                 "corrections": basis["corrections"], "search_assessment": basis["search_assessment"],
                 "literature_snapshot": basis["literature_snapshot"], "predecessor": basis["predecessor"],
                 "prepared_understanding": (None if basis["predecessor"] is None else memory.creation_bases.query(
