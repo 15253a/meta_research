@@ -7,10 +7,14 @@ from mcp.server.fastmcp import FastMCP
 from mcp import types
 
 
+def current_failure_stage():
+    failure_file = os.environ.get("EXTERNAL_MCP_FAILURE_FILE")
+    return Path(failure_file).read_text().strip() if failure_file else ""
+
+
 if os.environ.get("EXTERNAL_MCP_DELAY"):
     time.sleep(float(os.environ["EXTERNAL_MCP_DELAY"]))
-failure_file = os.environ.get("EXTERNAL_MCP_FAILURE_FILE")
-if failure_file and Path(failure_file).read_text().strip() == "initialize":
+if current_failure_stage() == "initialize":
     time.sleep(30)
 
 server = FastMCP("harmless-lab", instructions="Use temperatures as observations, not accepted conclusions.",
@@ -19,8 +23,7 @@ server = FastMCP("harmless-lab", instructions="Use temperatures as observations,
 
 @server.tool(description="Read the fixture temperature in Celsius.")
 def read_temperature(sensor: str) -> dict[str, object]:
-    failure_file = os.environ.get("EXTERNAL_MCP_FAILURE_FILE")
-    if failure_file and Path(failure_file).read_text().strip() == "tools/call":
+    if current_failure_stage() == "tools/call":
         raise RuntimeError("The fixture sensor is offline; no measurement was made.")
     ledger = Path(os.environ["EXTERNAL_MCP_LEDGER"])
     with ledger.open("a") as stream:
@@ -41,8 +44,7 @@ list_tools_handler = server._mcp_server.request_handlers[types.ListToolsRequest]
 async def audited_list_tools(request):
     if request is None:
         return await list_tools_handler(request)
-    failure_file = os.environ.get("EXTERNAL_MCP_FAILURE_FILE")
-    if failure_file and Path(failure_file).read_text().strip() == "tools/list":
+    if current_failure_stage() == "tools/list":
         raise RuntimeError("The fixture catalog is unavailable.")
     audit_path = os.environ.get("EXTERNAL_MCP_AUDIT")
     if audit_path:
