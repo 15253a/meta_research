@@ -63,6 +63,39 @@ class ReadWitness:
 
 
 @dataclass(frozen=True)
+class OriginalFile:
+    reference_ref: str
+    path: str
+    observation_ref: str
+
+    def as_dict(self):
+        return {"kind": "original_file", "reference_ref": self.reference_ref,
+                "path": self.path, "observation_ref": self.observation_ref}
+
+
+@dataclass(frozen=True)
+class WorkFile:
+    work_ref: str
+    path: str
+    trial_ref: str | None = None
+
+    def as_dict(self):
+        return {"kind": "work_file", "work_ref": self.work_ref,
+                "path": self.path, "trial_ref": self.trial_ref}
+
+
+@dataclass(frozen=True)
+class Selection:
+    source: OriginalFile | WorkFile
+    custody: Literal["managed", "linked_local"]
+    reason: str
+
+    def as_dict(self):
+        return {"source": self.source.as_dict(), "custody": self.custody,
+                "reason": self.reason}
+
+
+@dataclass(frozen=True)
 class CreationInputIdentity:
     anchor: CreationAnchor
     material_set_hash: str

@@ -79,6 +79,40 @@ class RootWorkspaces:
         self._deepfetch_locator = deepfetch_locator
         from meta_research.server_materials import ServerFiles
         self.server_files = ServerFiles()
+        self._creation_runtime_configuration = None
+        self._creation_gateway = None
+        self._creation_endpoint = None
+        self._creation_channels = {}
+
+    def creation_channel_is_current(self, token):
+        operation = self._creation_channels.get(hashlib.sha256(token.encode()).hexdigest())
+        if operation is None:
+            return False
+        context = SemanticCallContext(operation.operation_ref, operation.operation_ref,
+            operation.binding.location.root_session_ref, operation.fence_ref,
+            operation.binding_hash, "companion", "creation_materials", "")
+        try:
+            operation.authorize(context)
+            return True
+        except OwnerConflict:
+            return False
+
+    def configure_creation_runtime(self, *, executable, credentials_home):
+        self._creation_runtime_configuration = (Path(executable).absolute(), Path(credentials_home).absolute())
+
+    def bind_creation_gateway(self, gateway):
+        self._creation_gateway = gateway
+
+    def configure_creation_endpoint(self, base_url):
+        from urllib.parse import urlsplit
+        parsed = urlsplit(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+            raise OwnerConflict("creation_material_endpoint_invalid")
+        self._creation_endpoint = base_url.rstrip("/")
+
+    def protected_creation(self, binding, inputs, *, operation_ref):
+        from meta_research.creation_work import ProtectedCreation
+        return ProtectedCreation(self, binding, inputs, operation_ref)
 
     def bind_runtime(self, context: SemanticCallContext) -> WorkspaceBinding:
         try:

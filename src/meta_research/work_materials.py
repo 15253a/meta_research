@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import hashlib
+import os
+from pathlib import Path
 import time
 from sqlalchemy import text
 
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json, new_ref
 from meta_research.semantic_mcp import SemanticMcpError, SemanticOperation
-from meta_research.work_material_contract import WORK_MATERIAL_OPERATION_IDS
+from meta_research.work_material_contract import WORK_MATERIAL_OPERATION_IDS, CREATION_MATERIAL_OPERATION_IDS
 
 
 @dataclass(frozen=True)
@@ -278,13 +281,93 @@ class WorkMaterialsMixin:
             raise OwnerConflict("material_not_visible")
         return self.read_work_material(**arguments)
 
+    def copy_creation_material(self, *, context, effect_id, reference_ref, path, observation_ref, max_bytes=1048576):
+        from meta_research.creation_inputs import material_bytes
+        operation = self._creation_material_operation(context)
+        operation.authorize(context, reference_ref)
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 8 * 1024**2:
+            raise OwnerConflict("creation_copy_limit_invalid")
+        request = {"reference_ref": reference_ref, "path": path,
+                   "observation_ref": observation_ref, "max_bytes": max_bytes}
+        key, request_hash = context.effect_key(effect_id), canonical_hash(request)
+        with self._database.fenced_write() as connection:
+            row = connection.execute(text("SELECT * FROM hc_creation_material_copies WHERE effect_key=:key"), {"key": key}).first()
+            if row is not None:
+                if row.request_hash != request_hash:
+                    raise OwnerConflict("creation_copy_identity_conflict")
+                return self.reconcile_creation_copy(context=context, effect_id=effect_id)
+            connection.execute(text("INSERT INTO hc_creation_material_copies "
+                "(effect_key,operation_ref,fence_ref,request_hash,state) VALUES (:key,:operation,:fence,:hash,'pending')"),
+                {"key": key, "operation": operation.operation_ref, "fence": operation.fence_ref, "hash": request_hash})
+        try:
+            reference = self.query_work_material(reference_ref)
+            with self._root_workspaces.server_files._open_reference(reference["source"], path) as (_, observed):
+                if observed["kind"] != "file" or observed["observation_ref"] != observation_ref:
+                    raise OwnerConflict("material_source_changed")
+                if int(observed["size"]) > max_bytes:
+                    raise OwnerConflict("creation_copy_too_large")
+            suffix = Path(path or reference["source"]["absolute_path"]).suffix
+            if len(suffix) > 24 or not all(character.isalnum() or character == "." for character in suffix):
+                suffix = ""
+            digest, witnesses, offset = hashlib.sha256(), [], 0
+            with operation.work.new_copy(key, suffix) as (stream, name):
+                while True:
+                    page = self.read_work_material(context=context, reference_ref=reference_ref,
+                        path=path, observation_ref=observation_ref, offset=offset, max_bytes=min(65536, max_bytes - offset + 1))
+                    content = material_bytes(page)
+                    offset += len(content)
+                    if offset > max_bytes:
+                        raise OwnerConflict("creation_copy_too_large")
+                    stream.write(content)
+                    digest.update(content)
+                    witnesses.append(page["read_witness"])
+                    if page["eof"]:
+                        break
+                    if not content:
+                        raise OwnerConflict("material_source_changed")
+                details = os.fstat(stream.fileno())
+                receipt = {"state": "ready", "effect_key": key,
+                    "work_file": {"kind": "work_file", "work_ref": operation.work.work_ref, "path": name, "trial_ref": key},
+                    "working_path": "/workspace/" + operation.work.relative_directory + "/" + name,
+                    "source": {"kind": "original_file", "reference_ref": reference_ref, "path": path, "observation_ref": observation_ref},
+                    "bytes": offset, "sha256": digest.hexdigest(), "read_witnesses": witnesses,
+                    "device": details.st_dev, "inode": details.st_ino}
+            operation.authorize(context, reference_ref)
+            with self._database.fenced_write() as connection:
+                connection.execute(text("UPDATE hc_creation_material_copies SET state='ready',receipt_json=:receipt WHERE effect_key=:key AND state='pending'"),
+                    {"key": key, "receipt": canonical_json(receipt)})
+            return receipt
+        except BaseException:
+            with self._database.fenced_write() as connection:
+                connection.execute(text("UPDATE hc_creation_material_copies SET state='failed' WHERE effect_key=:key AND state='pending'"), {"key": key})
+            raise
+
+    def reconcile_creation_copy(self, *, context, effect_id):
+        operation = self._creation_material_operation(context)
+        key = context.effect_key(effect_id)
+        with self._database.read() as connection:
+            row = connection.execute(text("SELECT * FROM hc_creation_material_copies WHERE effect_key=:key"), {"key": key}).first()
+        if row is None:
+            return {"state": "absent"}
+        if row.operation_ref != operation.operation_ref or row.fence_ref != operation.fence_ref:
+            raise OwnerConflict("creation_material_scope_invalid")
+        if row.state != "ready":
+            return {"state": row.state}
+        receipt = json.loads(row.receipt_json)
+        operation.work.copy_receipt_available(receipt)
+        return receipt
+
 
 def material_operations(human):
     def call(context, arguments):
         try:
             if context.operation_id == WORK_MATERIAL_OPERATION_IDS[0]:
                 return human.discover_work_materials(context=context, **arguments)
-            return human.read_work_material(context=context, **arguments)
+            if context.operation_id == WORK_MATERIAL_OPERATION_IDS[1]:
+                return human.read_work_material(context=context, **arguments)
+            if context.operation_id == CREATION_MATERIAL_OPERATION_IDS[2]:
+                return human.copy_creation_material(context=context, **arguments)
+            return human.reconcile_creation_copy(context=context, **arguments)
         except OwnerConflict as error:
             raise SemanticMcpError(error.code) from error
     properties = {"reference_ref": {"type": "string", "maxLength": 96}, "path": {"type": "string", "maxLength": 4096}}
@@ -293,4 +376,11 @@ def material_operations(human):
         {"type": "object", "properties": {**properties, "cursor": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": False}, {"type": "object"}),
         SemanticOperation(WORK_MATERIAL_OPERATION_IDS[1], "human_collaboration",
         "Read at most 65536 requested bytes from a saved server material reference with its discovered observation_ref. Recheck original source identity and current root visibility. Returns UTF-8 or base64, exact byte interval and EOF; records successful ranges and failures without claiming comprehension. Changed originals require fresh discovery. No RM binding is required.", call,
-        {"type": "object", "properties": {**properties, "observation_ref": {"type": "string", "minLength": 1}, "offset": {"type": "integer", "minimum": 0}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536}}, "required": ["reference_ref", "path", "observation_ref"], "additionalProperties": False}, {"type": "object"}))
+        {"type": "object", "properties": {**properties, "observation_ref": {"type": "string", "minLength": 1}, "offset": {"type": "integer", "minimum": 0}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536}}, "required": ["reference_ref", "path", "observation_ref"], "additionalProperties": False}, {"type": "object"}),
+        SemanticOperation(CREATION_MATERIAL_OPERATION_IDS[2], "human_collaboration",
+        "Copy only one explicitly requested observed original file into this creation operation's isolated work. Reads bounded original ranges and returns their witnesses plus an independent editable WorkFile. Default 1MiB, maximum8MiB per requested copy; no directory recursion. Retry the same effect_id unchanged or reconcile it; an edited copy is never overwritten by replay.", call,
+        {"type": "object", "properties": {**properties, "observation_ref": {"type": "string", "minLength": 1}, "effect_id": {"type": "string", "minLength": 1, "maxLength": 128}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608}},
+         "required": ["reference_ref", "path", "observation_ref", "effect_id"], "additionalProperties": False}, {"type": "object"}, "effect", CREATION_MATERIAL_OPERATION_IDS[3]),
+        SemanticOperation(CREATION_MATERIAL_OPERATION_IDS[3], "human_collaboration",
+        "Read this creation operation's exact copy receipt. Pending or failed copies remain explicit; no implicit retry or replacement of edited work.", call,
+        {"type": "object", "properties": {"effect_id": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["effect_id"], "additionalProperties": False}, {"type": "object"}, "reconcile"))
