@@ -77,6 +77,8 @@ class RootWorkspaces:
         self._target = target_run_agent
         self._bases = {kind: path.absolute() for kind, path in bases.items()}
         self._deepfetch_locator = deepfetch_locator
+        from meta_research.server_materials import ServerFiles
+        self.server_files = ServerFiles()
 
     def bind_runtime(self, context: SemanticCallContext) -> WorkspaceBinding:
         try:

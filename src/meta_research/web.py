@@ -1819,6 +1819,19 @@ def create_app(
                 raise OwnerConflict("telemetry_provider_unavailable") from error
         return recorded
 
+    @app.get("/api/v1/server-materials/browse")
+    def browse_server_materials(request: Request, path: str = "/", cursor: str | None = None, limit: int = 50):
+        return runtime.root_workspaces.server_files.browse(
+            actor=request.state.session_token, path=path, cursor=cursor, limit=limit)
+
+    @app.get("/api/v1/server-materials/inspect")
+    def inspect_server_material(request: Request, path: str, description: str = ""):
+        return runtime.root_workspaces.server_files.inspect(path, description=description)
+
+    @app.delete("/api/v1/server-materials/cursors/{cursor}")
+    def cancel_server_material_cursor(request: Request, cursor: str):
+        return runtime.root_workspaces.server_files.cancel(actor=request.state.session_token, cursor=cursor)
+
     @app.post("/api/v1/quest-initializations", status_code=201)
     async def create_quest_initialization(
         request: Request,
