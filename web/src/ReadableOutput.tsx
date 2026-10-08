@@ -184,16 +184,19 @@ function pauseIfReadingHistory(event: UIEvent<HTMLElement>, props: ReadableOutpu
 
 export function StageReadableOutput(props: ReadableOutputProps & {
   scrollRef?: RefObject<HTMLDivElement | null>;
+  visibleCount?: number;
+  onVisibleCountChange?: (count: number) => void;
 }) {
   const parsed = useParsedOutput(props);
   const localRef = useRef<HTMLDivElement>(null);
   const scrollRef = props.scrollRef ?? localRef;
-  const [visibleCount, setVisibleCount] = useState(80);
+  const [localVisibleCount, setLocalVisibleCount] = useState(80);
+  const visibleCount = props.visibleCount ?? localVisibleCount;
   const groups = useMemo(() => groupStageEntries(parsed.entries), [parsed.entries]);
   const hiddenCount = groups.slice(0, Math.max(0, groups.length - visibleCount))
     .reduce((count, group) => count + (group.kind === "message" ? 1 : group.entries.length), 0);
   useEffect(() => {
-    setVisibleCount(80);
+    setLocalVisibleCount(80);
   }, [props.streamKey]);
   useEffect(() => {
     if (props.followLive && scrollRef.current) {
@@ -204,8 +207,10 @@ export function StageReadableOutput(props: ReadableOutputProps & {
     <div className="ro-stage-scroll" ref={scrollRef} tabIndex={0}
       aria-label="主智能体输出，可滚动阅读" onScroll={event => pauseIfReadingHistory(event, props)}>
       {hiddenCount ? <button type="button" className="ro-load-earlier" onClick={() => {
+        const count = visibleCount + 80;
+        if (props.onVisibleCountChange) props.onVisibleCountChange(count);
+        else setLocalVisibleCount(count);
         props.onPauseFollow?.();
-        setVisibleCount(count => count + 80);
       }}>显示更早的输出 · 还有 {hiddenCount} 条</button> : null}
       {groups.slice(-visibleCount).map(group => group.kind === "message"
         ? <FeedEntry key={group.id} entry={group.entry} />
