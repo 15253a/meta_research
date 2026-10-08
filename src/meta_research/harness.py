@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, GuidanceOperationIdentity, TargetGuidanceOperation, GUIDANCE_OPERATION_IDS, guidance_prompt)
+
 import hashlib
 import ipaddress
 import logging
@@ -379,6 +381,7 @@ class _ResidentMcpScope:
     root_kind: RootAgentKind
     phase: str
     subject_policy: Literal["operation_tree", "review_tree"]
+    guidance_binding: FrozenGuidanceBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -523,6 +526,7 @@ class HarnessRuntime:
         )
         self._admissions: dict[str, tuple[str, HarnessAdmission]] = {}
         self._admissions_by_request: dict[str, HarnessAdmission] = {}
+        self._human_guidance_authority = None
         self._resident_scope_verifier: ResidentMcpScopeVerifier | None = None
         self._target_workspace_resolver: TargetWorkspaceResolver | None = None
         self._operation_canceller = operation_canceller
@@ -766,6 +770,9 @@ class HarnessRuntime:
             raise HarnessAdmissionError("mcp_scope_verifier_already_bound")
         self._resident_scope_verifier = verifier
 
+    def bind_human_guidance_authority(self, authority) -> None:
+        self._human_guidance_authority = authority
+
     def issue_resident_mcp_channel(
         self,
         *,
@@ -778,6 +785,7 @@ class HarnessRuntime:
         root_kind: RootAgentKind,
         phase: str,
         subject_policy: Literal["operation_tree", "review_tree"],
+        guidance_binding: FrozenGuidanceBinding | None = None,
     ) -> ResidentMcpChannel:
         """Issue a scoped channel for one already-admitted operation scope.
 
@@ -810,11 +818,12 @@ class HarnessRuntime:
             or (
                 subject_policy == "review_tree"
                 and set(operation_ids).intersection(
-                    ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+                    (*ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS, *GUIDANCE_OPERATION_IDS)
                 )
             )
         ):
             raise HarnessAdmissionError("mcp_channel_scope_invalid")
+        reconciling_scope = False
         try:
             verifier.verify_root_agent_runtime_scope(
                 root_kind=root_kind,
@@ -836,6 +845,7 @@ class HarnessRuntime:
                 code = getattr(error, "code", "mcp_channel_scope_invalid")
                 raise HarnessAdmissionError(str(code)) from error
             try:
+                reconciling_scope = True
                 reconcile_verifier(
                     root_kind=root_kind,
                     run_ref=run_ref,
@@ -851,6 +861,16 @@ class HarnessRuntime:
                     "mcp_channel_scope_invalid",
                 )
                 raise HarnessAdmissionError(str(code)) from reconcile_error
+        if guidance_binding is not None:
+            if self._human_guidance_authority is None:
+                raise HarnessAdmissionError("guidance_authority_unavailable")
+            try:
+                self._human_guidance_authority.verify_frozen_guidance_binding(guidance_binding)
+                verifier.verify_guidance_read_scope(GuidanceRuntimeScope(
+                    root_kind, run_ref, attempt_ref, root_session_ref, fence_ref,
+                    capability_binding_hash), guidance_binding, reconcile=reconciling_scope)
+            except Exception as error:
+                raise HarnessAdmissionError(str(getattr(error, "code", "guidance_snapshot_unbound"))) from error
         try:
             connection, binding = self._gateway.issue_channel(
                 run_ref=run_ref,
@@ -861,6 +881,7 @@ class HarnessRuntime:
                 operation_ids=operation_ids,
                 root_kind=root_kind,
                 phase=phase,
+                **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
             )
         except SemanticMcpError as error:
             raise HarnessAdmissionError(error.code) from error
@@ -874,6 +895,7 @@ class HarnessRuntime:
                 operation_ids=operation_ids,
                 root_kind=root_kind,
                 phase=phase,
+                guidance_binding=guidance_binding,
                 subject_policy=subject_policy,
             )
         )
@@ -2058,6 +2080,17 @@ class HarnessRuntime:
         operation_ref = provider_operation_ref(
             admission.run.run_ref, "harness_turn", generation
         )
+        guidance_binding = None
+        if isinstance(request, TargetHarnessRequest) and self._human_guidance_authority is not None:
+            try:
+                cut = self._human_guidance_authority.freeze_operation_guidance(TargetGuidanceOperation(
+                    GuidanceRuntimeScope("target", admission.run.run_ref, admission.run.attempt_ref,
+                        admission.run.root_session_ref, admission.run.fence_ref,
+                        admission.run.capability_binding_hash), operation_ref, generation, resume))
+            except Exception as error:
+                raise HarnessAdmissionError(str(getattr(error, "code", "guidance_preparation_failed"))) from error
+            guidance_binding = cut.binding
+            prompt += guidance_prompt(cut)
         workspace_ref, working_directory = self._target_workspace_for(
             admission, request
         )
@@ -2077,6 +2110,7 @@ class HarnessRuntime:
             generation=generation,
             resume=resume,
             workspace_ref=workspace_ref,
+            guidance_binding=guidance_binding,
         )
         invocation_hash = canonical_hash(invocation_material)
         self._start_operation(
@@ -2099,6 +2133,7 @@ class HarnessRuntime:
             workspace_ref=workspace_ref,
             working_directory=working_directory,
             human_request_continuation=human_request_continuation,
+            guidance_binding=guidance_binding,
         )
 
     def reconcile_probe_turn(
@@ -2161,6 +2196,15 @@ class HarnessRuntime:
         if resume and admission.run.native_session_ref is None:
             raise HarnessAdmissionError("native_session_resume_unavailable")
         operation_ref = operation.operation_ref
+        guidance_binding = None
+        if isinstance(request, TargetHarnessRequest) and self._human_guidance_authority is not None:
+            try:
+                cut = self._human_guidance_authority.recover_operation_guidance(
+                    GuidanceOperationIdentity("target", admission.run.run_ref, operation_ref))
+            except Exception as error:
+                raise HarnessAdmissionError(str(getattr(error, "code", "guidance_snapshot_missing"))) from error
+            guidance_binding = cut.binding
+            prompt += guidance_prompt(cut)
         workspace_ref, working_directory = self._target_workspace_for(
             admission, request
         )
@@ -2174,6 +2218,7 @@ class HarnessRuntime:
                 generation=generation,
                 resume=resume,
                 workspace_ref=workspace_ref,
+                guidance_binding=guidance_binding,
             )
         )
         terminal_replay_only = False
@@ -2211,6 +2256,7 @@ class HarnessRuntime:
                 admission, request, prompt=frozen_prompt, mcp_base_url=mcp_base_url,
                 operation_ref=operation_ref, generation=generation, resume=resume,
                 workspace_ref=workspace_ref,
+                guidance_binding=guidance_binding,
             ))
             if frozen_hash != operation.invocation_hash:
                 raise HarnessAdmissionError("harness_operation_conflict")
@@ -2232,6 +2278,7 @@ class HarnessRuntime:
             working_directory=working_directory,
             human_request_continuation=human_request_continuation,
             terminal_replay_only=terminal_replay_only,
+            guidance_binding=guidance_binding,
         )
 
     @staticmethod
@@ -2245,6 +2292,7 @@ class HarnessRuntime:
         workspace_ref: str | None,
         working_directory: Path | None,
         entry_path: Literal["initial", "resume", "recovery"],
+        operation_channel: ResidentMcpChannel | None = None,
     ) -> HarnessInvocation:
         return HarnessInvocation(
             harness_family=request.harness_family,
@@ -2257,7 +2305,7 @@ class HarnessRuntime:
             model_ref=request.model_ref,
             prompt=prompt,
             mcp_url=mcp_base_url.rstrip("/") + admission.run.mcp_binding.endpoint_ref,
-            mcp_token=admission.connection.token,
+            mcp_token=admission.connection.token if operation_channel is None else operation_channel.connection.token,
             native_session_ref=admission.run.native_session_ref,
             target_workspace_ref=workspace_ref,
             working_directory=None if working_directory is None else str(working_directory),
@@ -2287,6 +2335,7 @@ class HarnessRuntime:
         working_directory: Path | None = None,
         human_request_continuation: bool = False,
         terminal_replay_only: bool = False,
+        guidance_binding: FrozenGuidanceBinding | None = None,
     ) -> HarnessProbeRun:
         adapter = self._adapters[request.harness_family]
         entry_path = (
@@ -2339,15 +2388,30 @@ class HarnessRuntime:
                     error.code,
                     next_retry_at=(None if retry is None else retry.next_retry_at),
                 ) from error
+        operation_channel = None
         try:
-            invoke = getattr(adapter, "invoke_terminal", None) if terminal_replay_only else adapter.invoke
-            if not callable(invoke):
-                raise HarnessAdapterUnavailable("provider_io_unavailable", durable_outcome="unknown")
-            result = invoke(self._provider_invocation(
-                admission, request, prompt=prompt, mcp_base_url=mcp_base_url,
-                operation_ref=operation_ref, workspace_ref=workspace_ref,
-                working_directory=working_directory, entry_path=entry_path,
-            ))
+            if guidance_binding is not None:
+                operation_channel = self.issue_resident_mcp_channel(
+                    run_ref=admission.run.run_ref, attempt_ref=admission.run.attempt_ref,
+                    root_session_ref=admission.run.root_session_ref, fence_ref=admission.run.fence_ref,
+                    capability_binding_hash=admission.run.capability_binding_hash,
+                    operation_ids=request.required_operation_ids, root_kind="target",
+                    phase=admission.run.mcp_binding.phase, subject_policy="operation_tree",
+                    guidance_binding=guidance_binding,
+                )
+            try:
+                invoke = getattr(adapter, "invoke_terminal", None) if terminal_replay_only else adapter.invoke
+                if not callable(invoke):
+                    raise HarnessAdapterUnavailable("provider_io_unavailable", durable_outcome="unknown")
+                result = invoke(self._provider_invocation(
+                    admission, request, prompt=prompt, mcp_base_url=mcp_base_url,
+                    operation_ref=operation_ref, workspace_ref=workspace_ref,
+                    working_directory=working_directory, entry_path=entry_path,
+                    operation_channel=operation_channel,
+                ))
+            finally:
+                if operation_channel is not None:
+                    self.revoke_resident_mcp_channel(operation_channel)
         except HarnessAdapterUnavailable as error:
             parked = (
                 self._checkpoint_target_root_human_request_session(
@@ -3937,6 +4001,7 @@ def _turn_invocation_material(
     generation: int,
     resume: bool,
     workspace_ref: str | None,
+    guidance_binding: FrozenGuidanceBinding | None = None,
 ) -> dict[str, object]:
     material: dict[str, object] = {
         "schema_ref": "meta-research/harness-invocation/v1",
@@ -3957,6 +4022,7 @@ def _turn_invocation_material(
         ),
         "capability_binding_hash": admission.run.capability_binding_hash,
         "target_workspace_ref": workspace_ref,
+        **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
     }
     if isinstance(request, (ConformanceHarnessRequest, TargetHarnessRequest)):
         material["provider_operation_timeout_seconds"] = (
@@ -4002,6 +4068,8 @@ def _resident_reconcile_dispatch_allowed(message: object) -> bool:
         in {
             ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS[1],
             ROOT_AGENT_ACQUISITION_OPERATION_IDS[1],
+            "human_guidance.read.reconcile",
+            "human_guidance.feedback.reconcile",
         }
     )
 

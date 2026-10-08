@@ -1001,6 +1001,11 @@ def build_production_runtime(
         root_operation_diagnostic_recorder=root_operation_diagnostics,
     )
     harnesses.bind_resident_mcp_scope_verifier(owners.agent_runtime)
+    harnesses.bind_human_guidance_authority(owners.human_collaboration)
+    for provider in (idea_skill_provider, plan_skill_provider, bundle_skill_provider, reasoning_skill_provider):
+        bind_guidance = getattr(provider, "bind_human_guidance_authority", None)
+        if callable(bind_guidance):
+            bind_guidance(owners.human_collaboration)
     harnesses.bind_target_workspace_resolver(target_run_agent)
     if startup_harness_diagnostics:
         harnesses.run_startup_diagnostics()

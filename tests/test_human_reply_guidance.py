@@ -28,6 +28,10 @@ def test_reply_prompt_preserves_exact_historical_read_profiles(kind):
     before, after = document["before_profile"], document["after_profile"]
     assert canonical_hash(before) == document["before_profile_hash"]
     assert canonical_hash(after) == document["after_profile_hash"]
-    assert root_capability_profile(kind).as_dict() == after
+    current = root_capability_profile(kind)
+    assert {key: value for key, value in current.as_dict().items() if key != "research_system_prompt_hash"} == {
+        key: value for key, value in after.items() if key != "research_system_prompt_hash"
+    }
+    assert document["after_profile_hash"] in reviewed_historical_root_profile_hashes(current.digest)
     assert [key for key in before if before[key] != after[key]] == ["research_system_prompt_hash"]
     assert reviewed_historical_root_profile_hashes(document["after_profile_hash"]) == frozenset(document["historical_read_hashes"])

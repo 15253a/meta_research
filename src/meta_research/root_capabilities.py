@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from meta_research.human_guidance import GUIDANCE_OPERATION_IDS
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF, CODEX_REASONING_EFFORT, CODEX_ROOT_REASONING_PRESET,
     CODEX_COLLABORATION_MODE,
@@ -101,9 +102,10 @@ ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
     "deepfetch": (),
     "acquisition": (),
     "companion": (),
-    "idea": ("research_memory.research_notes.read", "research_memory.stage_context.read"),
-    "plan": ("research_memory.research_notes.read", "research_memory.stage_context.read", "research_graph.plan_evidence.page", "research_memory.plan_evidence.read"),
+    "idea": (*GUIDANCE_OPERATION_IDS, "research_memory.research_notes.read", "research_memory.stage_context.read"),
+    "plan": (*GUIDANCE_OPERATION_IDS, "research_memory.research_notes.read", "research_memory.stage_context.read", "research_graph.plan_evidence.page", "research_memory.plan_evidence.read"),
     "bundle": (
+        *GUIDANCE_OPERATION_IDS,
         "research_memory.research_notes.read",
         "research_memory.stage_context.read",
         "advancement_engine.bundle_stage_run.observe",
@@ -119,9 +121,10 @@ ROOT_ROLE_OPERATION_DELTAS: dict[RootAgentKind, tuple[str, ...]] = {
         "agent_runtime.target_frontier.read",
         "agent_runtime.bundle_inbox.read",
     ),
-    "target": ("research_memory.research_notes.read", "agent_runtime.target_run.observe",
+    "target": (*GUIDANCE_OPERATION_IDS, "research_memory.research_notes.read", "agent_runtime.target_run.observe",
                "agent_runtime.target_run.progress"),
     "reasoning": (
+        *GUIDANCE_OPERATION_IDS,
         "research_graph.question_relations.record",
         "research_graph.question_relations.record.reconcile",
         "research_memory.research_notes.read",

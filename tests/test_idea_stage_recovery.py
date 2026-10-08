@@ -29,6 +29,7 @@ from meta_research.quest_drafting import (
 )
 from meta_research.web import create_app
 from meta_research.semantic_mcp import ROOT_AGENT_HUMAN_REQUEST_OPERATION_IDS
+from test_bundle_skill_adapter import _fake_codex
 from test_harness_full_conformance import (
     _FullConformanceAdapter,
     _full_request,
@@ -844,6 +845,7 @@ def test_real_idea_nonzero_after_human_request_resumes_same_session(
     runner = _NonzeroHumanRequestIdeaRunner()
     adapter = CodexIdeaSkillAdapter(
         data_root.run / "idea-human-request-provider",
+        executable=str(_fake_codex(tmp_path / "idea-human-request-codex")),
         process_runner=runner,
     )
     runtime = build_production_runtime(

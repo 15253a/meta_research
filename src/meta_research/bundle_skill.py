@@ -1026,6 +1026,11 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         native_session_ref: str | None,
         job_ref: str | None,
     ) -> tuple[dict[str, object], str | None, str]:
+        prompt, guidance_binding = self._prepare_stage_guidance(
+            run_ref=run_ref, attempt_ref=attempt_ref, root_session_ref=root_session_ref,
+            fence_ref=fence_ref, runtime_binding_hash=canonical_hash(runtime_binding.as_dict()),
+            job_ref=job_ref, operation_name=operation_name, prompt=prompt,
+        )
         authority = self._full_conformance_authority
         base_url = self._resident_mcp_base_url
         if authority is None or base_url is None:
@@ -1084,12 +1089,14 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                         runtime_binding.as_dict()
                     ),
                     operation_ids=operation_ids,
+                    **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
                 )
             except HarnessAdmissionError as error:
                 raise BundleSkillUnavailable(error.code) from error
             self._resident_mcp_channels[channel_key] = channel
         if (
-            channel.connection.grant_ref
+            getattr(channel.binding, "guidance_binding", None) != guidance_binding
+            or channel.connection.grant_ref
             != channel.binding.connection_grant_ref
             or channel.binding.catalog_hash
             != conformance.semantic_mcp_catalog_hash
@@ -1104,6 +1111,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             raise BundleSkillUnavailable("bundle_semantic_mcp_endpoint_invalid")
         scope_binding_hash = canonical_hash(
             {
+                **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
                 "catalog_hash": channel.binding.catalog_hash,
                 "operation_bindings": list(channel.binding.operation_bindings),
             }
@@ -1121,6 +1129,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 semantic_mcp_protected_environment=True,
                 authorized_operation_ids=operation_ids,
                 run_ref=run_ref,
+                **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
                 workspace_binding=self._workspace_binding(run_ref=run_ref, attempt_ref=attempt_ref,
                     root_session_ref=root_session_ref, fence_ref=fence_ref,
                     runtime_binding_hash=canonical_hash(runtime_binding.as_dict())),
@@ -1778,10 +1787,11 @@ def _bundle_skill_resources() -> dict[str, str]:
         ),
     )
     try:
-        from .research_guidance import shared_research_guidance
+        from .research_guidance import shared_research_guidance, shared_human_guidance
 
         return {
             "research-guidance.md": shared_research_guidance(),
+            "human-guidance.md": shared_human_guidance(),
             **{name: resource.read_text(encoding="utf-8") for name, resource in resources},
         }
     except (FileNotFoundError, ModuleNotFoundError) as error:

@@ -534,6 +534,22 @@ class AgentProposalRequest(BaseModel):
     proposal: dict[str, object]
 
 
+class HumanGuidanceSubmissionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_ref: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=65536)
+    strength: int = Field(default=3, ge=1, le=5, strict=True)
+
+
+class GuidanceProposalConversionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_scope_ref: str = Field(min_length=1, max_length=128)
+    expected_proposal_hash: str = Field(min_length=64, max_length=64)
+    strength: int = Field(default=3, ge=1, le=5, strict=True)
+
+
 class AgentProposalConversionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1578,6 +1594,18 @@ def create_app(
             raise OwnerConflict("human_request_not_found")
         return agent_retry_result(reconciled)
 
+    @app.post("/api/v1/human-collaboration/guidance", status_code=201)
+    def submit_human_guidance(
+        request: Request, submission: HumanGuidanceSubmissionRequest,
+    ) -> dict[str, object]:
+        scope = submission.scope_ref
+        if not scope.startswith("quest:") or len(scope) <= len("quest:"):
+            raise OwnerConflict("guidance_quest_required")
+        return runtime.owners.human_collaboration.submit_human_guidance(
+            quest_ref=scope.removeprefix("quest:"), original_text=submission.text,
+            strength=submission.strength, idempotency_key=_idempotency_key(request),
+        )
+
     @app.post("/api/v1/human-collaboration/agent-proposals", status_code=201)
     def record_agent_proposal(
         request: Request, proposal: AgentProposalRequest
@@ -1599,7 +1627,7 @@ def create_app(
     def convert_agent_proposal_to_soft_constraint(
         proposal_ref: str,
         request: Request,
-        conversion: AgentProposalConversionRequest,
+        conversion: GuidanceProposalConversionRequest,
     ) -> dict[str, object]:
         require_current_collaboration_scope(
             conversion.expected_scope_ref,
@@ -1610,6 +1638,7 @@ def create_app(
             expected_scope_ref=conversion.expected_scope_ref,
             expected_proposal_hash=conversion.expected_proposal_hash,
             idempotency_key=_idempotency_key(request),
+            strength=conversion.strength,
         )
 
     @app.post(

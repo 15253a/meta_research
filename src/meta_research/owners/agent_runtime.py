@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.owners.guidance_runtime import GuidanceRuntimeMixin
+
 import hashlib
 import json
 import math
@@ -2418,7 +2420,7 @@ class TargetRootCompletionReader(Protocol):
     def query_handle_history(self, target_ref: str) -> object | None: ...
 
 
-class SQLiteAgentRuntime(HumanRequestOwnerMixin):
+class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     """Agent Runtime owns durable host-capability observations and their integrity."""
 
     def admit_target_launch(

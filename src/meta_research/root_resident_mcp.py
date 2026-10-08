@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from meta_research.human_guidance import FrozenGuidanceBinding
 from meta_research.owners.common import canonical_hash
 from meta_research.root_capabilities import RootAgentKind, root_operation_catalog
 from meta_research.semantic_mcp import ROOT_AGENT_COMMON_OPERATION_IDS, SemanticCallContext, SemanticMcpError
@@ -51,6 +52,7 @@ class _ResidentMcpBinding(Protocol):
     operation_bindings: tuple[dict[str, object], ...]
     root_kind: RootAgentKind | None
     phase: str
+    guidance_binding: FrozenGuidanceBinding | None
 
 
 class _ResidentMcpChannel(Protocol):
@@ -79,6 +81,7 @@ class RootResidentMcpAuthority(Protocol):
         fence_ref: str,
         capability_binding_hash: str,
         operation_ids: tuple[str, ...],
+        guidance_binding: FrozenGuidanceBinding | None = None,
     ) -> _ResidentMcpChannel: ...
 
     def revoke_resident_mcp_channel(
@@ -206,6 +209,7 @@ class RootResidentMcpChannels:
         capability_binding_hash: str,
         phase: str,
         job_ref: str | None,
+        guidance_binding: FrozenGuidanceBinding | None = None,
     ) -> tuple[RootResidentMcpChannelKey, RootResidentMcpAccess]:
         authority = self._authority
         base_url = self._base_url
@@ -221,6 +225,7 @@ class RootResidentMcpChannels:
                 "capability_binding_hash": capability_binding_hash,
                 "root_kind": self._root_kind,
                 "phase": phase,
+                **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
             }
         )
         key = (job_ref or run_ref, phase, exact_scope_hash)
@@ -238,6 +243,7 @@ class RootResidentMcpChannels:
                         fence_ref=fence_ref,
                         capability_binding_hash=capability_binding_hash,
                         operation_ids=self._operation_ids,
+                        **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
                     )
                 except Exception as error:
                     raise RootResidentMcpError(
@@ -266,6 +272,7 @@ class RootResidentMcpChannels:
                     or observed_operation_ids != self._operation_ids
                     or channel.binding.root_kind != self._root_kind
                     or channel.binding.phase != phase
+                    or getattr(channel.binding, "guidance_binding", None) != guidance_binding
                     or endpoint.scheme
                     or endpoint.netloc
                     or endpoint.query
@@ -283,6 +290,7 @@ class RootResidentMcpChannels:
                         "root_kind": channel.binding.root_kind,
                         "phase": channel.binding.phase,
                         "subject_policy": "operation_tree",
+                        **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
                     }
                 )
                 return key, RootResidentMcpAccess(
@@ -292,7 +300,7 @@ class RootResidentMcpChannels:
                     operation_ids=self._operation_ids,
                     workspace_binding=(None if self._workspaces is None else self._workspaces.bind_runtime(
                         SemanticCallContext(run_ref, attempt_ref, root_session_ref, fence_ref,
-                            capability_binding_hash, self._root_kind, phase, "research_workspace.read"))),
+                            capability_binding_hash, self._root_kind, phase, "research_workspace.read", guidance_binding))),
                 )
             except SemanticMcpError as error:
                 self.release(key)

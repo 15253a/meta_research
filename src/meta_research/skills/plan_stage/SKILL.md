@@ -9,6 +9,8 @@ description: 根据当前研究重心、构想与历史证据选择本轮投入�
 
 字段语义见[Plan 契约](references/contract.md)；发现、精确引用与反馈处理见[Owner 操作](references/owner-operations.md)。
 
+
+正式人类指导按运行时加载的[共享指导合同](../human-guidance.md)读取原文、声明处理并延续约束。
 ## 1. 读取当前认识
 
 先读上轮综合、notes、已完成工作和相关证据。默认缺上轮摘要时，用 `research_memory.stage_context.read` 的 `source=question_history` 找已接纳结果，再用 `source=scientific_outcome`、`source_ref=outcome_ref` 读正文；缺摘要不代表没有历史。

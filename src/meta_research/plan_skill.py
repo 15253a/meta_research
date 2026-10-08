@@ -25,7 +25,7 @@ from meta_research.idea_skill import (
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
-from meta_research.research_guidance import shared_research_guidance
+from meta_research.research_guidance import shared_research_guidance, shared_human_guidance
 from meta_research.plan_contract import (
     MAX_PLAN_EXPERIMENT_BRIEFS,
     MAX_PLAN_OBLIGATIONS,
@@ -655,6 +655,7 @@ def _plan_skill_resources() -> dict[str, str]:
     try:
         return {
             "research-guidance.md": shared_research_guidance(),
+            "human-guidance.md": shared_human_guidance(),
             **{
                 name: resource.read_text(encoding="utf-8")
                 for name, resource in resources

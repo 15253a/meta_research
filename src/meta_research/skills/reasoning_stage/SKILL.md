@@ -9,6 +9,8 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 输出和来源见[语义契约](references/contract.md)；权限与接纳见[Owner 操作](references/owner-operations.md)。遵循根系统提示的六入口、预算、人类输入和语言偏好，委派时传递范围及直接输出语言。输入已有正文无需为固定顺序重复读取。
 
+
+正式人类指导按运行时加载的[共享指导合同](../human-guidance.md)读取原文、声明处理并延续约束。
 ## 1. 综合真实来源
 
 先读本轮结果、上轮及相关问题历史，再按需分页、展开精确原文。保持 request、Question、Quest、Goal、epoch 和来源绑定。Idea／Plan／Bundle 的 Completed、Skipped、Exhausted、NoViableCandidate 是路线状态，本身不证明科学主张。

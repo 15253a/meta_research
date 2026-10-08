@@ -2218,7 +2218,35 @@ export type CompanionMessage = {
   view_context?: CompanionViewContext | null;
 };
 
+export type GuidanceStrength = 1 | 2 | 3 | 4 | 5;
+
+export type GuidanceTreatment = {
+  understanding: string;
+  changes: string;
+  continuing_work: string;
+  reasons: string;
+  disposition: "applied" | "considered" | "deferred" | "goal_alignment_pending";
+  declared_by_root: boolean;
+  goal_update_pending: boolean;
+  receipt: { receipt_ref: string; payload_hash: string; issuer: string; kind: string };
+};
+
+export type GuidanceDelivery = {
+  delivery_ref: string;
+  root_kind: "idea" | "plan" | "bundle" | "target" | "reasoning";
+  run_ref: string;
+  operation_ref: string;
+  prepared_at: number;
+  received_at: number | null;
+  read_at: number | null;
+  needs_treatment: boolean;
+  treatment: GuidanceTreatment | null;
+};
+
 export type CompanionSoftConstraint = {
+  strength?: GuidanceStrength;
+  deliveries?: GuidanceDelivery[];
+
   constraint_ref?: string;
   scope_ref?: string | null;
   source_proposal_ref?: string | null;
@@ -3642,8 +3670,21 @@ export function authorizeHumanCommand(
   );
 }
 
+export function submitHumanGuidance(
+  scopeRef: string,
+  text: string,
+  strength: GuidanceStrength = 3,
+): Promise<CompanionSoftConstraint> {
+  return writeJson("/api/v1/human-collaboration/guidance", "POST", {
+    scope_ref: scopeRef,
+    text,
+    strength,
+  });
+}
+
 export function convertAgentProposalToSoftConstraint(
   proposal: CompanionAgentProposal,
+  strength: GuidanceStrength = 3,
 ): Promise<{
   proposal: CompanionAgentProposal;
   soft_constraint: CompanionSoftConstraint;
@@ -3657,6 +3698,7 @@ export function convertAgentProposalToSoftConstraint(
     {
       expected_scope_ref: proposal.scope_ref,
       expected_proposal_hash: proposal.proposal_hash,
+      ...(strength === 3 ? {} : { strength }),
     },
   );
 }
@@ -5583,6 +5625,10 @@ export function followProjection(
     "human_collaboration.companion_reply_recorded",
     "human_collaboration.companion_reply_failed",
     "human_collaboration.soft_constraint_recorded",
+    "human_collaboration.guidance_submitted",
+    "human_collaboration.guidance_prepared",
+    "human_collaboration.guidance_read",
+    "human_collaboration.guidance_treated",
     "human_collaboration.soft_constraint_withdrawn",
     "human_collaboration.agent_proposal_recorded",
     "human_collaboration.command_draft_created",

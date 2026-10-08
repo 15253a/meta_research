@@ -5,7 +5,7 @@ import {
   type Response,
   type Route,
 } from "@playwright/test";
-import { DeterministicProduct } from "./support/deterministic-product";
+import { DeterministicProduct, openAuthenticatedProduct } from "./support/deterministic-product";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -662,7 +662,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
   expect(explicitWrites).toEqual([]);
   await expect(companion).toContainText("DF-09 只有一篇全文等待图书馆访问");
   await expect(companion).toContainText("YOU · CONVERSATION");
-  await expect(companion).toContainText("SOFT CONSTRAINT · ACTIVE");
+  await expect(companion).toContainText("人类指导 · 生效中");
   await expect(companion).toContainText("建议复核证据边界");
   await expect(companion).toContainText("接受建议最多形成草案，不直接改变研究");
   await expect(companion).toContainText("建议建立精确归档授权草案");
@@ -703,7 +703,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
     },
   });
 
-  await companion.getByRole("button", { name: "明确接受为软约束" }).click();
+  await companion.getByRole("button", { name: "明确接受为指导" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/agent-proposals/proposal-1/soft-constraint",
     body: {
@@ -714,7 +714,7 @@ test("the persistent Quest Companion sends ordinary conversation without command
   await expect(companion.locator(".lumen-constraint").filter({ hasText: "首轮只使用公开文献" }))
     .toContainText("source · proposal-1");
   await companion.locator(".lumen-constraint").filter({ hasText: "优先使用可公开复核的材料" })
-    .getByRole("button", { name: "撤回软约束" }).click();
+    .getByRole("button", { name: "撤回指导" }).click();
   await expect.poll(() => explicitWrites.at(-1)).toEqual({
     path: "/api/v1/human-collaboration/soft-constraints/constraint-1/withdrawals",
     body: { expected_revision: 1 },
@@ -2316,7 +2316,6 @@ test("human request Draft streams before its snapshot and keeps request conversa
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("这个事项请分段解释");
 });
 
-
 for (const selection of ["files", "folder", "library"] as const) {
   test(`explicit browser ${selection} deliver original relative paths without RM intake`, async ({ page }) => {
     await installHumanCollaborationSnapshot(page);
@@ -2450,4 +2449,118 @@ test("sealed upload reply survives lost ACK and reload with visible edits", asyn
       content_base64: Buffer.from("Exact original bytes.").toString("base64") }] });
   expect(commits).toBe(1);
   expect(intakes).toEqual([]);
+});
+
+async function createGuidanceQuestThroughWeb(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "创建 Quest" }).click();
+  const dialog = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" });
+  await expect(dialog).toBeVisible();
+  const goal = dialog.getByRole("textbox", { name: "目标", exact: true });
+  await goal.fill("判断低照度显微图像去噪能否保留稀有形态");
+  await dialog.getByRole("textbox", { name: "边界", exact: true }).fill(
+    "形成带反例、证据边界和可执行 gap 的比较结论",
+  );
+  await goal.blur();
+  await expect(dialog.getByText("草案已自动保存", { exact: true })).toBeVisible();
+
+  const computeCard = dialog.getByLabel("本机计算卡");
+  await computeCard.getByRole("button", { name: "检测本机计算卡" }).click();
+  await expect(
+    dialog.getByText(
+      "capability_unavailable · deterministic_probe_unavailable",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await computeCard.getByRole("button", { name: "重新检测", exact: true }).click();
+  const device = computeCard.getByRole("button", {
+    name: /Deterministic GPU.*GPU-deterministic-1/,
+  });
+  await expect(device).toBeVisible();
+  await device.click();
+  await expect(
+    dialog.getByText("已绑定 1 张实际检测设备。", { exact: false }),
+  ).toBeVisible();
+
+  await dialog.getByRole("button", { name: "生成第一个问题" }).click();
+  await expect(dialog.getByLabel("首问题标题")).toHaveValue(
+    "低照度显微图像中的稀有形态保真",
+    { timeout: 15_000 },
+  );
+  await expect(
+    dialog.getByText("当前 Impact Preview 已绑定，可以确认", { exact: true }),
+  ).toBeVisible();
+
+  const confirmation = dialog.getByRole("button", {
+    name: "确认创建 Quest 与第一个问题",
+  });
+  await expect(confirmation).toBeEnabled();
+  await confirmation.click();
+  await expect.poll(async () => {
+    try {
+      const snapshot = await (await page.request.get(product!.baseUrl + "/api/v1/snapshot")).json();
+      return snapshot.question_tree.status === "ready"
+        && snapshot.question_tree.items.length > 0
+        && snapshot.research_control.foreground
+        ? "completed"
+        : "pending";
+    } catch {
+      return "snapshot_unavailable";
+    }
+  }, { timeout: 30_000 }).toBe("completed");
+  if (await dialog.isVisible()) {
+    await dialog.getByRole("button", { name: "关闭创建 Quest 窗口" }).click();
+  }
+  await page.getByRole("button", { name: "Quest 总览", exact: true }).click();
+  await expect(page.getByTestId("current-cycle-overview")).toBeVisible();
+}
+
+test("human guidance saves exact original text and all strengths in the real product", async ({ page }) => {
+  test.setTimeout(120_000);
+  product = await DeterministicProduct.start({ stagePipeline: "plan-gap" });
+  await openAuthenticatedProduct(page, product);
+  await createGuidanceQuestThroughWeb(page);
+  await product.waitForPlanProviderPhase("plan-primary", 30_000);
+  const form = page.getByRole("form", { name: "提交人类指导" });
+  await expect(form).toBeVisible();
+  await expect(form.getByRole("combobox", { name: "指导力度", exact: true })).toHaveValue("3");
+  const text = "  保留各设备的独立核验。\n再比较稀有形态。  ";
+  await form.getByRole("textbox", { name: "指导原文" }).fill(text);
+  const saved = page.waitForResponse((response) => response.url().endsWith("/human-collaboration/guidance") && response.request().method() === "POST");
+  await form.getByRole("button", { name: "保存指导" }).click();
+  const response = await saved;
+  expect(response.status()).toBe(201);
+  const first = await response.json();
+  expect(first.guidance).toEqual({ text, strength: 3 });
+  const scopeRef = first.scope_ref;
+  for (const strength of [1, 2, 3, 4, 5]) {
+    await form.getByRole("combobox", { name: "指导力度", exact: true }).selectOption(String(strength));
+    const original = "力度 " + strength + " 的原文";
+    await form.getByRole("textbox", { name: "指导原文" }).fill(original);
+    const save = page.waitForResponse((reply) => reply.url().endsWith("/human-collaboration/guidance") && reply.request().method() === "POST");
+    await form.getByRole("button", { name: "保存指导" }).click();
+    const reply = await save;
+    expect(reply.status()).toBe(201);
+    expect((await reply.json()).guidance).toEqual({ text: original, strength });
+  }
+  const omitted = await page.request.post(product.baseUrl + "/api/v1/human-collaboration/guidance", {
+    headers: { Origin: product.baseUrl, "Idempotency-Key": "browser-guidance-default" },
+    data: { scope_ref: scopeRef, text: "省略力度仍默认优先考虑。" },
+  });
+  expect(omitted.status()).toBe(201);
+  expect((await omitted.json()).guidance.strength).toBe(3);
+  for (const strength of [true, 0, 6, "3", 3.5, null]) {
+    const malformed = await page.request.post(product.baseUrl + "/api/v1/human-collaboration/guidance", {
+      headers: { Origin: product.baseUrl, "Idempotency-Key": "browser-malformed-" + String(strength) },
+      data: { scope_ref: scopeRef, text: "invalid", strength },
+    });
+    expect(malformed.status()).toBe(422);
+  }
+  await page.reload();
+  const cards = page.locator(".lumen-constraint");
+  await expect(cards).toHaveCount(7);
+  await expect(cards.filter({ hasText: "稀有形态" }).first()).toContainText(text.trim());
+  await expect(cards.filter({ hasText: "力度 5 的原文" })).toContainText("目标更新待对齐");
+  await expect(cards.filter({ hasText: "力度 5 的原文" })).toContainText("等待下一研究操作读取");
+  const snapshot = await (await page.request.get(product.baseUrl + "/api/v1/snapshot")).json();
+  expect(snapshot.human_collaboration.companion.soft_constraints[0].deliveries).toEqual([]);
 });

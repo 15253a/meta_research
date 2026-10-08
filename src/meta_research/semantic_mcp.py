@@ -6,6 +6,7 @@ import secrets
 from dataclasses import dataclass
 from typing import Callable, Literal
 
+from meta_research.human_guidance import FrozenGuidanceBinding
 from meta_research import __version__
 from meta_research.owners.common import canonical_hash, new_ref
 from meta_research.root_capabilities import ROOT_AGENT_KINDS, RootAgentKind
@@ -86,6 +87,7 @@ class SemanticCallContext:
     root_kind: RootAgentKind | None
     phase: str
     operation_id: str
+    guidance_binding: FrozenGuidanceBinding | None = None
 
     def effect_key(self, effect_id: str) -> str:
         if not effect_id or len(effect_id) > 128:
@@ -217,6 +219,7 @@ class ResidentMcpBinding:
     deployment_profile: str = "local_resident_streamable_http"
     transport: str = "streamable_http"
     protocol_version: str = MCP_PROTOCOL_VERSION
+    guidance_binding: FrozenGuidanceBinding | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -232,6 +235,7 @@ class ResidentMcpBinding:
             "connection_grant_ref": self.connection_grant_ref,
             "root_kind": self.root_kind,
             "phase": self.phase,
+            **({} if self.guidance_binding is None else {"guidance_binding": self.guidance_binding.as_dict()}),
         }
 
 
@@ -246,6 +250,7 @@ class _ChannelGrant:
     operation_ids: tuple[str, ...]
     root_kind: RootAgentKind | None
     phase: str
+    guidance_binding: FrozenGuidanceBinding | None = None
 
 
 class SemanticMcpGateway:
@@ -322,6 +327,7 @@ class SemanticMcpGateway:
         operation_ids: tuple[str, ...],
         root_kind: RootAgentKind | None,
         phase: str,
+        guidance_binding: FrozenGuidanceBinding | None = None,
     ) -> tuple[McpConnection, ResidentMcpBinding]:
         if (
             not run_ref
@@ -350,6 +356,7 @@ class SemanticMcpGateway:
             operation_ids=operation_ids,
             root_kind=root_kind,
             phase=phase,
+            guidance_binding=guidance_binding,
         )
         self._grants[_token_hash(token)] = grant
         bindings = tuple(self._operations[item].binding() for item in operation_ids)
@@ -365,6 +372,7 @@ class SemanticMcpGateway:
                 operation_bindings=bindings,
                 root_kind=root_kind,
                 phase=phase,
+                guidance_binding=guidance_binding,
             ),
         )
 
@@ -457,6 +465,7 @@ class SemanticMcpGateway:
                 root_kind=grant.root_kind,
                 phase=grant.phase,
                 operation_id=operation_id,
+                guidance_binding=grant.guidance_binding,
             )
             result = operation.handler(context, arguments)
         except SemanticMcpError as error:

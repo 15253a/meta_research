@@ -30,6 +30,9 @@ import {
   reviseHumanCommand,
   sendCompanionMessage,
   withdrawSoftConstraint,
+  submitHumanGuidance,
+  type GuidanceStrength,
+  type GuidanceDelivery,
   type CompanionAgentProposal,
   type CompanionMessage,
   type CompanionSoftConstraint,
@@ -554,6 +557,7 @@ export function QuestCompanion({
             <PendingCompanionReply message={message} onChanged={onChanged} />
           </article>
         ))}
+        {ready && scopeRef ? <HumanGuidanceComposer key={scopeRef} scopeRef={scopeRef} onChanged={onChanged} /> : null}
         {ready ? softConstraints.map((constraint, index) => (
           <SoftConstraintCard
             key={constraint.constraint_ref ?? `constraint-${index}`}
@@ -609,7 +613,7 @@ export function QuestCompanion({
             disabled={!canSend || sending}
             rows={1}
             placeholder={canSend
-              ? "问为什么，或提出一个软约束……"
+              ? "询问研究情况，或讨论建议……"
               : ready
                 ? "创建 Quest 后开始对话"
                 : "研究助手尚未启用"}
@@ -1767,6 +1771,97 @@ function HumanCommandCard({
   );
 }
 
+const guidanceStrengthLabels: Record<GuidanceStrength, string> = {
+  1: "供参考", 2: "有所倾向", 3: "优先考虑", 4: "强烈要求", 5: "按我设定",
+};
+
+function GuidanceStrengthSelect({ value, onChange, disabled, label = "指导力度" }: {
+  value: GuidanceStrength; onChange: (value: GuidanceStrength) => void;
+  disabled: boolean; label?: string;
+}) {
+  return (
+    <label>{label}
+      <select aria-label={label} value={value} disabled={disabled}
+        onChange={(event) => onChange(Number(event.target.value) as GuidanceStrength)}>
+        {([1, 2, 3, 4, 5] as const).map((strength) => (
+          <option key={strength} value={strength}>{strength} · {guidanceStrengthLabels[strength]}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function HumanGuidanceComposer({ scopeRef, onChanged }: {
+  scopeRef: string; onChanged: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [strength, setStrength] = useState<GuidanceStrength>(3);
+  const [pending, setPending] = useState(false);
+  const pendingRef = useRef(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (pendingRef.current || !text.trim()) return;
+    pendingRef.current = true;
+    setPending(true);
+    setMessage(null);
+    try {
+      await submitHumanGuidance(scopeRef, text, strength);
+      setText("");
+      setMessage("指导已保存。下一研究操作将读取这份原文。");
+      onChanged();
+    } catch (caught) {
+      setMessage("保存失败 · " + reasonCode(caught));
+    } finally {
+      pendingRef.current = false;
+      setPending(false);
+    }
+  };
+  return (
+    <form className="lumen-guidance-compose" aria-label="提交人类指导"
+      onSubmit={(event) => void submit(event)}>
+      <b>人类指导</b>
+      <label>指导原文
+        <textarea aria-label="指导原文" rows={3} value={text} disabled={pending}
+          onChange={(event) => setText(event.target.value)}
+          placeholder="写下希望研究工作遵循的具体指导……" />
+      </label>
+      <GuidanceStrengthSelect value={strength} onChange={setStrength} disabled={pending} />
+      {strength === 5 ? <p>目标更新待对齐。当前研究继续，目标变化由目标演化流程处理。</p> : null}
+      <button type="submit" disabled={pending || !text.trim()}>保存指导</button>
+      {message ? <p role="status">{message}</p> : null}
+    </form>
+  );
+}
+
+function GuidanceDeliveryCard({ delivery }: { delivery: GuidanceDelivery }) {
+  const treatment = delivery.treatment;
+  return (
+    <li className="lumen-guidance-delivery">
+      <b>{delivery.root_kind.toUpperCase()} · {treatment
+        ? "Agent 已声明处理"
+        : delivery.read_at ? "已完整读取"
+        : delivery.received_at ? "已确认收到" : "已准备送达"}</b>
+      <p>已准备送达{delivery.received_at ? " · 已确认收到" : ""}
+        {delivery.read_at ? " · 已完整读取" : ""}</p>
+      {!delivery.needs_treatment ? <p>本工作继续履行既有指导。</p> : null}
+      {treatment ? (
+        <dl>
+          <dt>理解</dt><dd>{treatment.understanding}</dd>
+          <dt>调整</dt><dd>{treatment.changes}</dd>
+          <dt>继续工作</dt><dd>{treatment.continuing_work}</dd>
+          <dt>理由</dt><dd>{treatment.reasons}</dd>
+        </dl>
+      ) : null}
+      {treatment?.goal_update_pending ? <p>目标更新待对齐</p> : null}
+      <details><summary>操作与回执</summary>
+        <p>工作 · {delivery.run_ref}</p><p>操作 · {delivery.operation_ref}</p>
+        {treatment ? <p>回执 · {treatment.receipt.receipt_ref}</p> : null}
+      </details>
+    </li>
+  );
+}
+
 function SoftConstraintCard({
   constraint,
   onChanged,
@@ -1790,14 +1885,18 @@ function SoftConstraintCard({
   };
   return (
     <article className={`lumen-constraint ${constraint.status}`}>
-      <small>SOFT CONSTRAINT · {constraint.status.toUpperCase()}</small>
+      <small>人类指导 · {constraint.status === "active" ? "生效中" : "已撤回"}</small>
       <p>{constraint.text ?? constraint.content ?? documentText(constraint.guidance, "text")}</p>
-      <span>可撤回的指导，不是执行授权</span>
+      <span>力度 {constraint.strength ?? 3} · {guidanceStrengthLabels[constraint.strength ?? 3]}</span>
+      {constraint.strength === 5 ? <p>目标更新待对齐</p> : null}
+      {constraint.deliveries?.length ? (
+        <ul>{constraint.deliveries.map((delivery) => <GuidanceDeliveryCard key={delivery.delivery_ref} delivery={delivery} />)}</ul>
+      ) : <p>等待下一研究操作读取。</p>}
       {constraint.source_proposal_ref ? (
         <code className="lumen-source-proposal">source · {constraint.source_proposal_ref}</code>
       ) : null}
       {constraint.status === "active" && constraint.constraint_ref && constraint.revision !== undefined ? (
-        <button type="button" disabled={pending} onClick={() => void withdraw()}>撤回软约束</button>
+        <button type="button" disabled={pending} onClick={() => void withdraw()}>撤回指导</button>
       ) : null}
       {error ? <em role="status">撤回失败 · {error}</em> : null}
     </article>
@@ -1817,13 +1916,14 @@ function AgentProposalCard({
   const proposalKind = proposal.kind
     ?? documentText(proposal.proposal, "proposal_kind", "kind");
   const proposedGuidance = documentText(proposal.proposal, "text");
+  const [strength, setStrength] = useState<GuidanceStrength>(3);
   const proposedCommand = commandDraftFromProposal(proposal.proposal);
   const acceptGuidance = async () => {
     if (!proposal.scope_ref || !proposal.proposal_ref || !proposal.proposal_hash || !proposedGuidance) return;
     setPending(true);
     setError(null);
     try {
-      await convertAgentProposalToSoftConstraint(proposal);
+      await convertAgentProposalToSoftConstraint(proposal, strength);
       setConvertedTo("soft_constraint");
       onChanged();
     } catch (caught) {
@@ -1854,7 +1954,7 @@ function AgentProposalCard({
       {proposal.impact_preview ? <ImpactPreview preview={proposal.impact_preview} /> : null}
       {convertedTo ? (
         <span role="status">
-          已原子转换为 {convertedTo === "command_draft" ? "Command Draft" : "Soft Constraint"}；原 Proposal 不可重复转换。
+          已原子转换为 {convertedTo === "command_draft" ? "Command Draft" : "人类指导"}；原 Proposal 不可重复转换。
         </span>
       ) : null}
       {!convertedTo && proposal.status === "proposed" && proposalKind === "command_draft" && proposal.scope_ref && proposal.proposal_ref && proposal.proposal_hash && proposedCommand ? (
@@ -1863,9 +1963,10 @@ function AgentProposalCard({
         </button>
       ) : null}
       {!convertedTo && proposal.status === "proposed" && proposalKind !== "command_draft" && proposal.scope_ref && proposal.proposal_ref && proposal.proposal_hash && proposedGuidance ? (
-        <button type="button" disabled={pending} onClick={() => void acceptGuidance()}>
-          明确接受为软约束
-        </button>
+        <>
+          <GuidanceStrengthSelect label="建议转指导的力度" value={strength} onChange={setStrength} disabled={pending} />
+          <button type="button" disabled={pending} onClick={() => void acceptGuidance()}>明确接受为指导</button>
+        </>
       ) : null}
       {proposal.status === "proposed" && !proposal.proposal_hash ? (
         <em role="status">当前 Proposal 缺少 exact hash，已停止转换。</em>

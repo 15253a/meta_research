@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.owners.human_guidance import HumanGuidanceMixin
+
 import json
 import base64
 import hashlib
@@ -1743,7 +1745,7 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
 from meta_research.human_research_input import HumanResearchInputMixin
 
 
-class SQLiteHumanCollaboration(HumanResearchInputMixin):
+class SQLiteHumanCollaboration(HumanResearchInputMixin, HumanGuidanceMixin):
     def __init__(
         self,
         database: Database,
@@ -2121,6 +2123,9 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         self, scope_refs: tuple[str, ...]
     ) -> dict[str, list[dict[str, object]]]:
         projection = self._collaboration_ladder.query_projection(scope_refs)
+        for guide in projection["soft_constraints"]:
+            guide["deliveries"] = self.query_guidance_deliveries(guide["constraint_ref"])
+            guide["strength"] = guide["guidance"].get("strength", 3)
         authorizations: list[dict[str, object]] = []
         for authorization in projection["authorizations"]:
             if (
@@ -2378,12 +2383,14 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin):
         expected_scope_ref: str,
         expected_proposal_hash: str,
         idempotency_key: str,
+        strength: int = 3,
     ) -> dict[str, object]:
         return self._collaboration_ladder.convert_agent_proposal_to_soft_constraint(
             proposal_ref,
             expected_scope_ref=expected_scope_ref,
             expected_proposal_hash=expected_proposal_hash,
             idempotency_key=idempotency_key,
+            strength=strength,
         )
 
     def convert_agent_proposal_to_command_draft(
