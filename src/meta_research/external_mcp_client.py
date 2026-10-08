@@ -14,8 +14,9 @@ from mcp.client.streamable_http import streamable_http_client
 
 
 class ExternalMcpClientError(Exception):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, stage: str = "initialize") -> None:
         self.code = code
+        self.stage = stage
         super().__init__(code)
 
 
@@ -31,12 +32,13 @@ class ExternalMcpClient:
         return self._run(connection, (name, arguments))
 
     def _run(self, connection: dict[str, Any], call: tuple[str, dict[str, Any]] | None) -> dict[str, Any]:
+        progress = {"stage": "initialize"}
         try:
-            return asyncio.run(self._request(connection, call))
+            return asyncio.run(self._request(connection, call, progress))
         except (TimeoutError, asyncio.TimeoutError) as error:
-            raise ExternalMcpClientError("timeout") from error
-        except ExternalMcpClientError:
-            raise
+            raise ExternalMcpClientError("timeout", stage=progress["stage"]) from error
+        except ExternalMcpClientError as error:
+            raise ExternalMcpClientError(error.code, stage=progress["stage"]) from error
         except Exception as error:
             leaves = _exception_leaves(error)
             code = "unreachable"
@@ -51,9 +53,9 @@ class ExternalMcpClient:
                 code = "process_start_failed"
             elif any(type(item).__name__ in {"ValidationError", "McpError"} for item in leaves):
                 code = "invalid_protocol"
-            raise ExternalMcpClientError(code) from error
+            raise ExternalMcpClientError(code, stage=progress["stage"]) from error
 
-    async def _request(self, connection: dict[str, Any], call: tuple[str, dict[str, Any]] | None) -> dict[str, Any]:
+    async def _request(self, connection: dict[str, Any], call: tuple[str, dict[str, Any]] | None, progress: dict[str, str]) -> dict[str, Any]:
         async with asyncio.timeout(self.timeout_seconds):
             async with AsyncExitStack() as stack:
                 if connection["transport"] == "stdio":
@@ -75,6 +77,7 @@ class ExternalMcpClient:
                 ))
                 initialized = await session.initialize()
                 if call is not None:
+                    progress["stage"] = "tools/call"
                     result = (await session.send_request(types.ClientRequest(types.CallToolRequest(
                         params=types.CallToolRequestParams(name=call[0], arguments=call[1]),
                     )), types.CallToolResult)).model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -83,6 +86,7 @@ class ExternalMcpClient:
                 tools: list[dict[str, Any]] = []
                 cursor = None
                 seen: set[str] = set()
+                progress["stage"] = "tools/list"
                 for _page in range(32):
                     page = await session.list_tools(cursor=cursor)
                     tools.extend(tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in page.tools)
