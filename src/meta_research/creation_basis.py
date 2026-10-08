@@ -210,9 +210,12 @@ class CreationBasisMemory:
         return None if ref is None else self.query(ref)
 
     def _accept(self, body):
+        from meta_research.owners.asset_lifecycle import assert_asset_payload_usable
+
         digest = canonical_hash(body)
         ref = "creation_basis_" + digest[:32]
-        with self._database.write() as connection:
+        with self._database.fenced_write() as connection:
+            assert_asset_payload_usable(connection, body["sources"])
             connection.execute(text("INSERT INTO rm_creation_bases (basis_ref,basis_hash,initialization_id,draft_revision,draft_hash,kind,body_json) VALUES (:ref,:hash,:id,:revision,:draft_hash,:kind,:body) ON CONFLICT(basis_ref) DO NOTHING"),
                 {"ref": ref, "hash": digest, "id": body["draft"]["initialization_id"], "revision": body["draft"]["revision"],
                     "draft_hash": body["draft"]["hash"], "kind": body["kind"], "body": canonical_json(body)})

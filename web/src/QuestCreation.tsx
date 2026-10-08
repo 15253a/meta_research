@@ -1,3 +1,4 @@
+import { useWorkMaterialDraft, WorkMaterialFields, WorkMaterialReferences } from "./WorkMaterialForm";
 import {
   useCallback,
   useEffect,
@@ -9,8 +10,6 @@ import {
 } from "react";
 import {
   cancelQuest,
-  captureCreationMaterialPath,
-  deliverCreationMaterials,
   type CreationResearchBasis,
   confirmQuest,
   createQuest,
@@ -42,8 +41,6 @@ type PendingIntentMessage = {
   knownTurnRefs: string[];
 };
 
-const QUEST_MATERIAL_LIMIT = 10000;
-const QUEST_MATERIAL_MAX_BYTES = 64 * 1024 * 1024;
 const BOUNDARY_COMPLETION_MAX_LENGTH = 4_000;
 const BOUNDARY_EXCLUSIONS_MAX_LENGTH = 8_000;
 const BOUNDARY_SEGMENT_SEPARATOR = "\n\n范围与排除：";
@@ -52,7 +49,6 @@ const BOUNDARY_RAW_INPUT_MAX_LENGTH =
 const BOUNDARY_CANONICAL_INPUT_MAX_LENGTH =
   BOUNDARY_RAW_INPUT_MAX_LENGTH +
   BOUNDARY_SEGMENT_SEPARATOR.length;
-const questMaterialCommitFlights = new Map<string, Promise<void>>();
 
 const blankDraft: QuestDraft = {
   goal: "",
@@ -143,13 +139,6 @@ type Operation =
 type InFlightOperations = Record<Operation, boolean>;
 type ProductFailure = { code: string; message: string };
 type WriteConflict = "draft" | "proposal";
-type MaterialUploadStatus = "reading" | "delivering" | "failed";
-type MaterialUpload = {
-  key: string;
-  name: string;
-  status: MaterialUploadStatus;
-  reason?: string;
-};
 type QuestAcceptedMaterialBinding =
   QuestDraft["literature"]["accepted_material_bindings"][number];
 
@@ -227,12 +216,6 @@ export function QuestCreationWorkbench({
   const proposalActionRef = useRef<HTMLButtonElement>(null);
   const conflictRecoveryRef = useRef<HTMLButtonElement>(null);
   const firstRequiredRef = useRef<HTMLTextAreaElement>(null);
-  const materialFilesInputRef = useRef<HTMLInputElement>(null);
-  const materialFolderInputRef = useRef<HTMLInputElement>(null);
-  const materialUploadQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const materialUploadsRef = useRef<MaterialUpload[]>([]);
-  const materialRetriesRef = useRef(new Map<string, () => Promise<void>>());
-  const materialDeliveryBasisRef = useRef(new Map<string, QuestCreationView>());
   const mountedRef = useRef(true);
   const openingPromiseRef = useRef<Promise<QuestCreationView> | null>(null);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -262,6 +245,8 @@ export function QuestCreationWorkbench({
     normalizedCurrent,
   );
   const creationRef = useRef<NormalizedQuestCreationView | null>(normalizedCurrent);
+  const materialAnchor = creation?.initialization_id ?? "unopened";
+  const referenceDraft = useWorkMaterialDraft(`creation:${materialAnchor}`, `/api/v1/quest-initializations/${encodeURIComponent(materialAnchor)}/material-receiver`);
   const [draft, setDraft] = useState<QuestDraft>(
     normalizedCurrent?.quest_draft.value ?? cloneDraft(blankDraft),
   );
@@ -290,31 +275,6 @@ export function QuestCreationWorkbench({
   const [pendingIntent, setPendingIntent] = useState<PendingIntentMessage | null>(null);
   const intentSendingRef = useRef(false);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [materialAssets, setMaterialAssets] = useState(researchAssets);
-  const [materialDirectory, setMaterialDirectory] = useState("");
-  const [materialUploads, setMaterialUploads] = useState<MaterialUpload[]>([]);
-
-  const replaceMaterialUploads = (
-    update: (current: MaterialUpload[]) => MaterialUpload[],
-  ) => {
-    if (!mountedRef.current) return;
-    const next = update(materialUploadsRef.current);
-    materialUploadsRef.current = next;
-    setMaterialUploads(next);
-  };
-
-  useEffect(() => {
-    materialFolderInputRef.current?.setAttribute("webkitdirectory", "");
-  }, []);
-
-  useEffect(() => {
-    setMaterialAssets((current) => {
-      const byRef = new Map(current.map((item) => [item.memory_ref, item]));
-      for (const item of researchAssets) byRef.set(item.memory_ref, item);
-      return [...byRef.values()];
-    });
-  }, [researchAssets]);
-
   const applyView = useCallback((
     received: QuestCreationView,
     options: ApplyViewOptions = {},
@@ -935,106 +895,6 @@ export function QuestCreationWorkbench({
     updateDraft(boundaryDraft(draftRef.current, value));
   };
 
-  const removeAcceptedMaterial = (versionRef: string) => {
-    const bindings = draftRef.current.literature.accepted_material_bindings;
-    const nextBindings = bindings.filter(
-      (binding) => binding.version_ref !== versionRef,
-    );
-    updateDraft({
-      ...draftRef.current,
-      literature: {
-        ...draftRef.current.literature,
-        accepted_material_bindings: nextBindings,
-      },
-    });
-  };
-
-  const updateMaterialUpload = (
-    key: string,
-    patch: Partial<Omit<MaterialUpload, "key">>,
-  ) => {
-    if (!mountedRef.current) return;
-    replaceMaterialUploads((currentUploads) => currentUploads.map((upload) =>
-      upload.key === key ? { ...upload, ...patch } : upload
-    ));
-  };
-
-  const deliverMaterialSelection = async (
-    key: string,
-    operation: (basis: QuestCreationView) => Promise<QuestCreationView>,
-  ) => {
-    try {
-      updateMaterialUpload(key, { status: "delivering", reason: undefined });
-      await enqueueQuestMaterialCommit(creationRef.current!.initialization_id, async () => {
-        const saved = await persistDraft();
-        if (!saved) throw new ProductError("quest_draft_stale");
-        let received: QuestCreationView | null = null;
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          const basis = materialDeliveryBasisRef.current.get(key) ?? await fetchQuestCreation(saved.initialization_id);
-          materialDeliveryBasisRef.current.set(key, basis);
-          try { received = await operation(basis); break; }
-          catch (caught) {
-            if (!(caught instanceof ProductError) || caught.code !== "quest_draft_stale") throw caught;
-            materialDeliveryBasisRef.current.delete(key);
-          }
-        }
-        if (!received) throw new ProductError("quest_draft_stale");
-        applyView(received, { syncDraft: true, adoptDirtyDraftBasis: true, notify: false });
-      });
-      materialRetriesRef.current.delete(key);
-      materialDeliveryBasisRef.current.delete(key);
-      replaceMaterialUploads((uploads) => uploads.filter((item) => item.key !== key));
-      onChanged();
-    } catch (caught) {
-      const code = caught instanceof ProductError ? caught.code : "unknown_error";
-      updateMaterialUpload(key, { status: "failed", reason: materialUploadFailureCopy(code) });
-    }
-  };
-
-  const useMaterialDirectory = () => {
-    if (!creationRef.current || !materialDirectory.trim()) return;
-    const directory = materialDirectory.trim();
-    const key = crypto.randomUUID();
-    replaceMaterialUploads((uploads) => [...uploads, { key, name: directory, status: "delivering" }]);
-    setMaterialDirectory("");
-    const retry = () => deliverMaterialSelection(key, (basis) => captureCreationMaterialPath(basis, key, directory));
-    materialRetriesRef.current.set(key, retry);
-    materialUploadQueueRef.current = materialUploadQueueRef.current.then(retry);
-  };
-
-  const selectMaterialFiles = (selected: FileList | null, selectionMode: "files" | "folder") => {
-    if (!creationRef.current || !selected?.length) return;
-    const files = [...selected];
-    const totalBytes = files.reduce((total, file) => total + file.size, 0);
-    const remaining = remainingQuestMaterialSlots(draftRef.current, materialUploadsRef.current);
-    if (files.length > remaining || totalBytes > QUEST_MATERIAL_MAX_BYTES) {
-      setError(files.length > remaining ? questMaterialLimitFailure(remaining) : {
-        code: "asset_content_too_large", message: "本次材料合计超过 64 MiB，请缩小文件夹或分次提供。",
-      });
-      return;
-    }
-    const key = crypto.randomUUID();
-    const relativePath = (file: File) => file.webkitRelativePath || file.name;
-    const name = selectionMode === "folder" ? relativePath(files[0]).split("/")[0] : `${files.length} 个文件`;
-    replaceMaterialUploads((uploads) => [...uploads, { key, name, status: "reading" }]);
-    let submission: Parameters<typeof deliverCreationMaterials>[1] | null = null;
-    const retry = async () => {
-      try {
-        if (!submission) {
-          const filesToDeliver = [];
-          for (const file of files) filesToDeliver.push({ relative_path: relativePath(file), content_base64: arrayBufferToBase64(await file.arrayBuffer()) });
-          submission = { submission_ref: key, folder: selectionMode === "folder", files: filesToDeliver };
-        }
-        const sealed = submission;
-        await deliverMaterialSelection(key, (basis) => deliverCreationMaterials(basis, sealed));
-      } catch (caught) {
-        updateMaterialUpload(key, { status: "failed", reason: materialUploadFailureCopy(caught instanceof ProductError ? caught.code : "unknown_error") });
-      }
-    };
-    materialRetriesRef.current.set(key, retry);
-    materialUploadQueueRef.current = materialUploadQueueRef.current.then(retry);
-  };
-
   const updateProposal = (key: keyof QuestionContent, value: string) => {
     const currentProposal = proposalRef.current;
     if (!currentProposal) return;
@@ -1402,7 +1262,7 @@ export function QuestCreationWorkbench({
   const acquisitionActionLocked = terminal || inFlight.acquisition || inFlight.generating ||
     proposalGenerationActive || inFlight.reviewing || terminalMutationActive;
   const proposalActionLocked = terminal || inFlight.compute || inFlight.acquisition || inFlight.generating ||
-    proposalGenerationActive || inFlight.reviewing || terminalMutationActive || materialUploads.some((item) => item.status !== "failed");
+    proposalGenerationActive || inFlight.reviewing || terminalMutationActive || referenceDraft.busy;
   const anyOperationActive = Object.values(inFlight).some(Boolean);
   const draftComplete = draftIsComplete(draft);
   const proposalComplete = questionIsComplete(proposal);
@@ -1787,113 +1647,14 @@ export function QuestCreationWorkbench({
                   <small>先提供资料，再阅读和选择</small>
                 </div>
                 <div className="quest-material-card">
-                  <div className="quest-material-directory">
-                    <label className="quest-field">
-                      <span>运行 Meta Research 的主机目录</span>
-                      <input
-                        type="text"
-                        inputMode="text"
-                        autoComplete="off"
-                        spellCheck={false}
-                        aria-label="研究材料目录"
-                        value={materialDirectory}
-                        disabled={!creation || draftInteractionLocked}
-                        placeholder="/absolute/path/to/research-materials"
-                        onChange={(event) => setMaterialDirectory(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key !== "Enter") return;
-                          event.preventDefault();
-                          useMaterialDirectory();
-                        }}
-                      />
-                    </label>
-                    <button
-                      className="quest-material-button"
-                      type="button"
-                      disabled={
-                        !creation ||
-                        draftInteractionLocked ||
-                        !materialDirectory.trim()
-                      }
-                      onClick={useMaterialDirectory}
-                    >
-                      使用此目录
-                    </button>
-                  </div>
-                  <p className="quest-material-footnote">
-                    请输入服务所在机器可访问的绝对目录。系统捕获资料到本次创建工作区，阅读后选择需要长期保留的原件。
-                  </p>
-                  <div className="quest-material-actions">
-                    <button className="quest-material-button" type="button" disabled={!creation || draftInteractionLocked}
-                      onClick={() => materialFolderInputRef.current?.click()}>提供文件夹</button>
-                    <button className="quest-material-button" type="button" disabled={!creation || draftInteractionLocked}
-                      onClick={() => materialFilesInputRef.current?.click()}>提供文件</button>
-                  </div>
-                  <input
-                    ref={materialFolderInputRef}
-                    hidden
-                    type="file"
-                    multiple
-                    tabIndex={-1}
-                    aria-label="上传研究材料文件夹"
-                    onChange={(event) => {
-                      selectMaterialFiles(event.target.files, "folder");
-                      event.target.value = "";
-                    }}
-                  />
-                  <input
-                    ref={materialFilesInputRef}
-                    hidden
-                    type="file"
-                    multiple
-                    tabIndex={-1}
-                    aria-label="上传研究材料文件"
-                    onChange={(event) => {
-                      selectMaterialFiles(event.target.files, "files");
-                      event.target.value = "";
-                    }}
-                  />
-                  {materialUploads.length || draft.material_manifest?.entries.length || draft.literature.accepted_material_bindings.length ? (
-                    <div className="quest-material-statuses" aria-live="polite">
-                      {draft.literature.accepted_material_bindings.map((binding) => {
-                        const versionRef = String(binding.version_ref ?? "");
-                        const asset = materialAssets.find((item) => item.version_ref === versionRef);
-                        return (
-                          <div className="quest-material-status accepted" key={versionRef}>
-                            <span aria-hidden="true">✓</span>
-                            <b>{asset?.display_name ?? versionRef}</b>
-                            <small>已加入本次 Quest</small>
-                            {!draftInteractionLocked ? (
-                              <button type="button" onClick={() => removeAcceptedMaterial(versionRef)}>
-                                移除
-                              </button>
-                            ) : null}
-                          </div>
-                        );
-                      })}
-                      {draft.material_manifest?.entries.map((entry) => (
-                        <div className="quest-material-status accepted" key={entry.material_key}>
-                          <span aria-hidden="true">✓</span><b>{entry.relative_path}</b>
-                          <small>{creation?.creation_basis?.sources.find((source) => source.material_key === entry.material_key)?.selection_reason ? "原件已保留" : "已交付到创建工作区"}</small>
-                        </div>
-                      ))}
-                      {materialUploads.map((upload) => (
-                        <div className={`quest-material-status ${upload.status}`} key={upload.key}>
-                          <span aria-hidden="true">{upload.status === "failed" ? "!" : "…"}</span>
-                          <b>{upload.name}</b>
-                          <small>{upload.reason ?? materialUploadStatusCopy(upload.status)}</small>
-                          {upload.status === "failed" ? <button type="button" onClick={() => void materialRetriesRef.current.get(upload.key)?.()}>重试交付</button> : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="quest-material-empty">可以提供已有课题资料，也可以直接从目标开始。</p>
-                  )}
-                  {draft.literature.mode === "provided_only" ? (
-                    <p className="quest-material-footnote">
-                      资料交付完成后，系统先阅读已有工作，再生成第一问。
-                    </p>
-                  ) : null}
+                  <p>保存服务器原路径及说明到本次创建草稿。提交不读取内容；材料解释由后续创建工作处理。</p>
+                  <WorkMaterialFields draft={referenceDraft} disabled={!creation || draftInteractionLocked}
+                    onRetried={() => { onChanged(); }} />
+                  <button type="button" disabled={!creation || draftInteractionLocked || referenceDraft.busy || !!referenceDraft.pending || !referenceDraft.selection || !referenceDraft.receiver}
+                    onClick={() => { const command = referenceDraft.materialCommand(); if (command) void referenceDraft.submit(`/api/v1/quest-initializations/${encodeURIComponent(materialAnchor)}/material-references`, command).then(result => { if (result) onChanged(); }); }}>保存材料引用到创建草稿</button>
+                  <WorkMaterialReferences receipts={creation?.work_materials ?? []} />
+                  {draft.material_manifest?.entries.map(entry => <p key={entry.material_key}>既有创建材料 · {entry.relative_path}</p>)}
+                  {draft.literature.accepted_material_bindings.map(binding => <p key={String(binding.version_ref)}>既有原件版本 · {String(binding.version_ref)}</p>)}
                 </div>
               </section>
 
@@ -3255,37 +3016,6 @@ function boundaryDraft(draft: QuestDraft, boundary: string): QuestDraft {
   };
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
-  }
-  return btoa(binary);
-}
-
-function enqueueQuestMaterialCommit(
-  initializationId: string,
-  operation: () => Promise<void>,
-): Promise<void> {
-  const prior = questMaterialCommitFlights.get(initializationId) ?? Promise.resolve();
-  const current = prior.catch(() => undefined).then(operation);
-  questMaterialCommitFlights.set(initializationId, current);
-  void current.then(
-    () => {
-      if (questMaterialCommitFlights.get(initializationId) === current) {
-        questMaterialCommitFlights.delete(initializationId);
-      }
-    },
-    () => {
-      if (questMaterialCommitFlights.get(initializationId) === current) {
-        questMaterialCommitFlights.delete(initializationId);
-      }
-    },
-  );
-  return current;
-}
-
 function CreationUnderstanding({ basis }: { basis: CreationResearchBasis }) {
   const labels: Record<keyof CreationResearchBasis["understanding"], string> = {
     material_composition: "资料构成", work_already_done: "已完成工作", claims_and_conditions: "已有结论与条件",
@@ -3323,45 +3053,6 @@ function CreationUnderstanding({ basis }: { basis: CreationResearchBasis }) {
       {basis.search_assessment?.limitations.length ? <ul>{basis.search_assessment.limitations.map((limit) => <li key={limit}>{limit}</li>)}</ul> : null}
     </div> : null}
   </section>;
-}
-
-function materialUploadStatusCopy(status: MaterialUploadStatus): string {
-  return {
-    reading: "正在读取",
-    delivering: "正在交付到创建工作区",
-    failed: "未加入",
-  }[status];
-}
-
-function remainingQuestMaterialSlots(
-  draft: QuestDraft,
-  uploads: MaterialUpload[],
-): number {
-  const bound = draft.material_manifest?.entries.length ?? 0;
-  const pending = uploads.filter((upload) => upload.status !== "failed").length;
-  return Math.max(0, QUEST_MATERIAL_LIMIT - bound - pending);
-}
-
-function questMaterialLimitFailure(remaining: number): ProductFailure {
-  return {
-    code: "quest_material_limit_exceeded",
-    message: `每个 Quest 最多可加入 ${QUEST_MATERIAL_LIMIT} 个材料；` +
-      `当前剩余 ${remaining} 个。本次选择未读取、未上传。`,
-  };
-}
-
-function materialUploadFailureCopy(code: string): string {
-  return {
-    asset_content_too_large: "文件超过 64 MiB；未上传",
-    asset_source_locator_absolute_required: "请输入运行服务的机器上的绝对目录",
-    asset_source_unavailable: "目录不存在、不可访问，或不是目录",
-    asset_source_symlink_unsupported: "目录中包含不支持的符号链接",
-    asset_source_entry_unsupported: "目录中包含不支持的文件或路径名称",
-    asset_source_too_large: "目录超过 10,000 项或 64 MiB，未加入",
-    asset_source_changed_during_intake: "读取期间目录发生变化，请重试",
-    quest_material_binding_closed: "材料已接纳，但 Quest 已确认，未加入本次依据",
-    quest_material_binding_pending: "材料已接纳；自动加入待重试",
-  }[code] ?? `材料处理未完成（${code}）；其他步骤不受影响`;
 }
 
 function messageFor(code: string): string {

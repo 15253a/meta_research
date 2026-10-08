@@ -6,11 +6,14 @@ import {
   type Route,
 } from "@playwright/test";
 import { DeterministicProduct, openAuthenticatedProduct } from "./support/deterministic-product";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readSelectedServerMaterial } from "./support/server-material-selection.js";
 
 type JsonRecord = Record<string, unknown>;
+const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const serverFile = resolve(sourceRoot, "README.md");
+const serverDirectory = resolve(sourceRoot, "src/meta_research/skills/deepfetch_v4/references");
 
 let product: DeterministicProduct | null = null;
 
@@ -1202,24 +1205,20 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
     "/api/v1/research-assets/research_asset_version-guidance-41/content",
   );
   await expect(dialog.getByLabel("自然语言回应")).toBeVisible();
-  await expect(dialog.getByLabel("回应文件", { exact: true })).toBeVisible();
-  await expect(dialog.getByLabel("绝对本地文件或目录路径")).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "选择服务器文件或目录", exact: true })).toBeVisible();
+  await expect(dialog.locator("input[type=file]")).toHaveCount(0);
   await expect(dialog.getByRole("button", { name: "提交", exact: true })).toHaveCount(1);
   await expect(dialog).toContainText("REQUEST-ONLY transcript marker");
   await dialog.getByLabel("自然语言回应").fill("批准已返回；按原始结果处理。");
-  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({
-    name: "approval.pdf",
-    mimeType: "application/pdf",
-    buffer: Buffer.from("approved"),
-  });
-  await expect(dialog.getByLabel("绝对本地文件或目录路径")).toBeEnabled();
+  const approvalSource = await readSelectedServerMaterial(page, dialog, serverFile);
+  await expect(dialog.getByRole("button", { name: "选择服务器文件或目录", exact: true })).toBeEnabled();
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
   expect(assetIntakes).toHaveLength(0);
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/research_memory%3AHR-41%3Ar1/responses",
     body: {
       decision: "provided", facts: {}, note: "批准已返回；按原始结果处理。",
-      materials: [{kind: "upload", relative_path: "approval.pdf", media_type: "application/pdf", content_base64: "YXBwcm92ZWQ="}],
+      materials: [{ kind: "server_reference", selection: approvalSource }],
     },
   });
   await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
@@ -1234,8 +1233,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
   await expect(dialog.getByLabel("就线下操作事项发消息")).toBeVisible();
   await expect(dialog.getByRole("link", { name: "下载参考材料 ↓" })).toHaveCount(0);
   await dialog.getByLabel("自然语言回应").fill("校准完成，原始目录如下。");
-  await dialog.getByLabel("绝对本地文件或目录路径").fill("/data/research/raw-calibration");
-  await expect(dialog.getByLabel("回应文件", { exact: true })).toBeEnabled();
+  const calibrationSource = await readSelectedServerMaterial(page, dialog, serverDirectory);
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
   await expect.poll(() => posts.at(-1)).toEqual({
     path: "/api/v1/human-requests/research_graph%3AHR-52%3Ar1/responses",
@@ -1243,7 +1241,7 @@ test("the HumanRequest surface keeps five raw Agent requests and their shortest 
       decision: "provided",
       facts: {},
       note: "校准完成，原始目录如下。",
-      materials: [{kind: "linked_local", locator: "/data/research/raw-calibration", description: "校准完成，原始目录如下。"}],
+      materials: [{ kind: "server_reference", selection: calibrationSource }],
     },
   });
   expect(assetIntakes).toHaveLength(0);
@@ -1712,11 +1710,7 @@ test("an orphaned material delivery is discarded when its request revision is no
     waitUntil: "domcontentloaded",
   });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({
-    name: "approval.pdf",
-    mimeType: "application/pdf",
-    buffer: Buffer.from("approved"),
-  });
+  await readSelectedServerMaterial(page, dialog, serverFile);
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
   await expect.poll(() => externalAttempt).toBe(1);
   const humanRequests = (snapshot.human_collaboration as JsonRecord).human_requests as JsonRecord;
@@ -2316,55 +2310,32 @@ test("human request Draft streams before its snapshot and keeps request conversa
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("这个事项请分段解释");
 });
 
-for (const selection of ["files", "folder", "library"] as const) {
-  test(`explicit browser ${selection} deliver original relative paths without RM intake`, async ({ page }) => {
+for (const kind of ["file", "directory", "library"] as const) {
+  test(`explicit server ${kind} delivers an original reference without RM intake`, async ({ page }) => {
     await installHumanCollaborationSnapshot(page);
     const posts: JsonRecord[] = [];
     const intakes: JsonRecord[] = [];
-    await page.route("**/api/v1/research-assets/intakes", async (route) => {
+    await page.route("**/api/v1/research-assets/intakes", async route => {
       intakes.push(route.request().postDataJSON() as JsonRecord);
       await route.abort();
     });
-    await page.route("**/api/v1/human-requests/*/responses", async (route) => {
+    await page.route("**/api/v1/human-requests/*/responses", async route => {
       posts.push(route.request().postDataJSON() as JsonRecord);
       await fulfillJson(route, { response_ref: "delivered-response", delivery: { root_session_ref: "original-root" } });
     });
-    await page.goto(`${product!.baseUrl}/?panel=${selection === "library" ? "human-request" : "external-request"}`, { waitUntil: "domcontentloaded" });
+    await page.goto(`${product!.baseUrl}/?panel=${kind === "library" ? "human-request" : "external-request"}`, { waitUntil: "domcontentloaded" });
     const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
-    if (selection === "library") {
+    if (kind === "library") {
       await dialog.getByRole("button", { name: "手动上传该文献" }).click();
       await dialog.getByPlaceholder("例如：先暂停这篇；或者改为向作者索取全文。").fill("Read these exact observations.");
     } else await dialog.getByLabel("自然语言回应").fill("Read these exact observations.");
-    if (selection !== "folder") {
-      await dialog.getByLabel("回应文件", { exact: true }).setInputFiles([
-        { name: "observations.csv", mimeType: "text/csv", buffer: Buffer.from("x,y\n1,7\n") },
-        { name: "method.txt", mimeType: "text/plain", buffer: Buffer.from("Wait 15 minutes.") },
-      ]);
-    } else {
-      const directory = await mkdtemp(join(tmpdir(), "reply-folder-"));
-      const folder = join(directory, "observations");
-      await mkdir(join(folder, "nested"), { recursive: true });
-      await writeFile(join(folder, "run.csv"), "x,y\n1,7\n");
-      await writeFile(join(folder, "nested/method.txt"), "Wait 15 minutes.");
-      await dialog.getByLabel("回应文件夹").setInputFiles(folder);
-    }
-    await dialog.getByLabel("绝对本地文件或目录路径").fill("/data/original-observations");
-    await dialog.getByRole("button", { name: selection === "library" ? "提交全文来源回应" : "提交", exact: true }).click();
+    const source = await readSelectedServerMaterial(page, dialog, kind === "directory" ? serverDirectory : serverFile, "Original metadata description.");
+    expect(posts).toEqual([]);
+    await expect(dialog.locator("input[type=file]")).toHaveCount(0);
+    await dialog.getByRole("button", { name: kind === "library" ? "提交全文来源回应" : "提交", exact: true }).click();
     await expect.poll(() => posts.length).toBe(1);
-    const materials = posts[0].materials as JsonRecord[];
-    const uploaded = materials.filter((item) => item.kind === "upload").map((item) => ({
-      path: item.relative_path, text: Buffer.from(String(item.content_base64), "base64").toString(),
-    })).sort((a, b) => String(a.path).localeCompare(String(b.path)));
-    expect(uploaded).toEqual(selection !== "folder" ? [
-      { path: "method.txt", text: "Wait 15 minutes." },
-      { path: "observations.csv", text: "x,y\n1,7\n" },
-    ] : [
-      { path: "observations/nested/method.txt", text: "Wait 15 minutes." },
-      { path: "observations/run.csv", text: "x,y\n1,7\n" },
-    ]);
-    expect(materials.at(-1)).toEqual({ kind: "linked_local", locator: "/data/original-observations",
-      description: "Read these exact observations." });
-    expect(posts[0].facts).toEqual(selection === "library" ? { route: "provided_material", acquisition_paper_id: "paper-ACQ-17" } : {});
+    expect(posts[0].materials).toEqual([{ kind: "server_reference", selection: source }]);
+    expect(posts[0].facts).toEqual(kind === "library" ? { route: "provided_material", acquisition_paper_id: "paper-ACQ-17" } : {});
     expect(intakes).toEqual([]);
     await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
   });
@@ -2393,15 +2364,42 @@ test("legacy material recovery requires reselection and never replays intake", a
   await expect(dialog).toContainText("human_response_material_reselection_required");
   expect(replies).toHaveLength(0);
   expect(intakes).toHaveLength(0);
-  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({ name: "fresh.txt", mimeType: "text/plain", buffer: Buffer.from("Fresh exact original.") });
+  const freshSource = await readSelectedServerMaterial(page, dialog, serverFile);
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
   await expect.poll(() => replies.length).toBe(1);
-  expect(replies[0].materials).toEqual([{kind: "upload", relative_path: "fresh.txt", media_type: "text/plain", content_base64: "RnJlc2ggZXhhY3Qgb3JpZ2luYWwu"}]);
+  expect(replies[0].materials).toEqual([{ kind: "server_reference", selection: freshSource }]);
   expect(intakes).toHaveLength(0);
   await expect.poll(() => page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_asset_intake_operation"))).toBeNull();
 });
 
-test("sealed upload reply survives lost ACK and reload with visible edits", async ({ page }) => {
+test("a rejected stale server reference clears recovery so a new source uses a new key", async ({ page }) => {
+  await installHumanCollaborationSnapshot(page);
+  const attempts: Array<{ key: string; body: JsonRecord }> = [];
+  await page.route("**/api/v1/human-requests/*/responses", async route => {
+    attempts.push({ key: route.request().headers()["idempotency-key"], body: route.request().postDataJSON() as JsonRecord });
+    if (attempts.length === 1) {
+      await route.fulfill({ status: 409, json: { detail: { code: "material_source_changed" } } });
+      return;
+    }
+    await fulfillJson(route, { response_ref: "corrected-original-reference" });
+  });
+  await page.goto(`${product!.baseUrl}/?panel=external-request`, { waitUntil: "domcontentloaded" });
+  const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
+  await dialog.getByLabel("自然语言回应").fill("Keep this response while correcting its source.");
+  await readSelectedServerMaterial(page, dialog, serverFile, "Rejected original file.");
+  await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await expect(dialog).toContainText("material_source_changed");
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"))).toBeNull();
+  await expect(dialog.getByRole("button", { name: "选择服务器文件或目录", exact: true })).toBeEnabled();
+  const corrected = await readSelectedServerMaterial(page, dialog, serverDirectory, "Corrected original directory.");
+  await dialog.getByRole("button", { name: "提交", exact: true }).click();
+  await expect.poll(() => attempts.length).toBe(2);
+  expect(attempts[1].key).not.toBe(attempts[0].key);
+  expect(attempts[1].body).toEqual({ decision: "provided", facts: {}, note: "Keep this response while correcting its source.", materials: [{ kind: "server_reference", selection: corrected }] });
+  await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
+});
+
+test("sealed server reference survives lost ACK and reload with controls locked", async ({ page }) => {
   const snapshot = await installHumanCollaborationSnapshot(page);
   await keepProjectionRoutesAcrossPages(page, snapshot);
   const context = page.context();
@@ -2427,9 +2425,7 @@ test("sealed upload reply survives lost ACK and reload with visible edits", asyn
   await page.goto(`${product!.baseUrl}/?panel=external-request`, { waitUntil: "domcontentloaded" });
   const dialog = page.getByRole("dialog", { name: "需要你处理的事项" });
   await dialog.getByLabel("自然语言回应").fill("Original sealed reply.");
-  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({
-    name: "exact.txt", mimeType: "text/plain", buffer: Buffer.from("Exact original bytes."),
-  });
+  const exactSource = await readSelectedServerMaterial(page, dialog, serverFile, "Exact original source.");
   await dialog.getByRole("button", { name: "提交", exact: true }).click();
   await expect.poll(() => attempts.length).toBe(1);
   const pending = await page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"));
@@ -2437,22 +2433,20 @@ test("sealed upload reply survives lost ACK and reload with visible edits", asyn
   expect(pending).not.toContain("Exact original bytes.");
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect.poll(() => attempts.length).toBe(2);
-  await dialog.getByLabel("自然语言回应").fill("Visible edited reply.");
-  await dialog.getByLabel("回应文件", { exact: true }).setInputFiles({
-    name: "changed.txt", mimeType: "text/plain", buffer: Buffer.from("Changed visible bytes."),
-  });
+  await expect(dialog.getByRole("button", { name: "选择服务器文件或目录", exact: true })).toBeDisabled();
+  await expect(dialog).toContainText("Original sealed reply.");
+  await expect(dialog).toContainText(exactSource.absolute_path);
   releaseReplay!();
   await expect.poll(() => page.evaluate(() => sessionStorage.getItem("meta_research_pending_human_request_response"))).toBeNull();
   expect(attempts[1]).toEqual(attempts[0]);
   expect(attempts[1].body).toEqual({ decision: "provided", facts: {}, note: "Original sealed reply.",
-    materials: [{ kind: "upload", relative_path: "exact.txt", media_type: "text/plain",
-      content_base64: Buffer.from("Exact original bytes.").toString("base64") }] });
+    materials: [{ kind: "server_reference", selection: exactSource }] });
   expect(commits).toBe(1);
   expect(intakes).toEqual([]);
 });
 
 async function createGuidanceQuestThroughWeb(page: Page): Promise<void> {
-  await page.getByRole("button", { name: "创建 Quest" }).click();
+  await page.getByRole("button", { name: "创建研究任务" }).click();
   const dialog = page.getByRole("dialog", { name: "创建 Quest，并决定第一个研究问题" });
   await expect(dialog).toBeVisible();
   const goal = dialog.getByRole("textbox", { name: "目标", exact: true });

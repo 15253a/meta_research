@@ -3,6 +3,13 @@ export type RootOperation = {
   operation_ref: string; label: string; phase: string | null; status: RootSessionStatus;
   created_at: number | null; updated_at: number | null;
 };
+export type DelegatedChild = {
+  session_ref: string; native_session_ref: string | null;
+  parent_native_session_ref: string; parent_session_ref: string; operation_ref: string;
+  provider: "codex" | "claude";
+  status: "starting" | "running" | "completed" | "failed" | "cancelled" | "unknown";
+  updated_at: number; label: string;
+};
 export type RootSession = {
   session_ref: string; root_session_ref: string; kind: "stage" | "target" | "deepfetch" | "acquisition";
   title: string; stage: string | null; related_stages: string[]; scope_label: string;
@@ -13,6 +20,7 @@ export type RootSession = {
   owner_session_ref: string | null; status: RootSessionStatus; is_executing: boolean; is_current: boolean | null;
   run_ref: string | null; target_ref: string | null; cycle_ref: string | null; question_ref: string | null;
   created_at: number | null; updated_at: number | null; operations: RootOperation[];
+  children?: DelegatedChild[];
 };
 export type RootSessions = {
   schema_ref: "meta-research/root-sessions/v1"; quest_ref: string; observed_at: number;

@@ -1,0 +1,43 @@
+.server-material-picker { min-width: 0; }
+.server-material-picker__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.server-material-picker__candidate { display: grid; gap: 6px; margin-top: 10px; padding: 12px; border: 1px solid var(--border-color, #c8d0d8); border-radius: 8px; }
+.server-material-picker__candidate p { margin: 0; white-space: pre-wrap; }
+.server-material-picker code, .server-material-dialog code { overflow-wrap: anywhere; white-space: pre-wrap; }
+.server-material-picker__error { color: var(--danger-color, #a32929); overflow-wrap: anywhere; }
+.work-material-fields, .work-material-references { min-width: 0; }
+.work-material-fields pre, .work-material-references pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.work-material-receiver { min-width: 0; margin: 8px 0; }
+.server-material-dialog { box-sizing: border-box; width: min(760px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 20px; border: 1px solid #bdc8d2; border-radius: 12px; background: var(--surface-color, #fff); color: var(--text-color, #19232f); overflow: auto; }
+.server-material-dialog::backdrop { background: rgb(18 31 47 / 45%); }
+.server-material-dialog button, .server-material-picker button { min-height: 36px; padding: 6px 12px; cursor: pointer; }
+.server-material-dialog button:disabled, .server-material-picker button:disabled { cursor: default; opacity: .6; }
+.server-material-dialog :focus-visible, .server-material-picker :focus-visible { outline: 2px solid #286fc4; outline-offset: 3px; }
+.server-material-dialog__heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.server-material-dialog__heading h3 { margin: 0; }
+.server-material-dialog__server { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; padding: 10px; border-radius: 6px; background: #f1f4f7; }
+.server-material-dialog__server div { min-width: 0; }
+.server-material-dialog__server dt { font-size: 12px; color: #506171; }
+.server-material-dialog__server dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.server-material-dialog__identity { grid-column: 1 / -1; font-size: 12px; }
+.server-material-dialog__path, .server-material-dialog__description { display: grid; gap: 8px; margin: 12px 0; }
+.server-material-dialog input:not([type=radio]), .server-material-dialog textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 8px; border: 1px solid #aebcca; border-radius: 5px; font: inherit; }
+.server-material-dialog textarea { resize: vertical; }
+.server-material-dialog__status p { margin: 8px 0; }
+.server-material-dialog__listing { border: 1px solid #c8d0d8; border-radius: 6px; padding: 10px; }
+.server-material-dialog__listing-heading { display: grid; gap: 4px; }
+.server-material-dialog__listing ul { padding: 0; margin: 8px 0; list-style: none; max-height: 300px; overflow-y: auto; }
+.server-material-dialog__listing li { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 9px 6px; border-bottom: 1px solid #e0e6ec; }
+.server-material-dialog__listing li.is-selected { background: #edf5ff; }
+.server-material-dialog__listing li > label { display: flex; align-items: flex-start; gap: 8px; flex: 1; min-width: 0; cursor: pointer; }
+.server-material-dialog__listing li > label > span { display: grid; gap: 3px; min-width: 0; }
+.server-material-dialog__listing strong { overflow-wrap: anywhere; }
+.server-material-dialog__listing small, .server-material-dialog__listing code { font-size: 12px; }
+.server-material-dialog__listing > small { display: block; margin-top: 8px; }
+.server-material-dialog__chosen { display: grid; gap: 5px; }
+.server-material-dialog__footer { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+@media (max-width: 520px) {
+  .server-material-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); padding: 12px; }
+  .server-material-dialog__server { grid-template-columns: 1fr; }
+  .server-material-dialog__footer button { flex: 1; }
+  .server-material-dialog__listing ul { max-height: 240px; }
+}
