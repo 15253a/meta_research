@@ -1465,12 +1465,13 @@ class SQLiteHumanCollaborationLadder:
 
     def submit_human_guidance(
         self, *, quest_ref: str, original_text: str, strength: int = 3,
-        idempotency_key: str,
+        idempotency_key: str, work_materials=None, material_committer=None,
     ) -> dict[str, object]:
         _idempotency_key(idempotency_key)
         guidance = _formal_guidance({"text": original_text}, strength)
         scope_ref = "quest:" + _scope_ref(quest_ref, "guidance_quest_required")
-        command_hash = canonical_hash({"scope_ref": scope_ref, "guidance": guidance})
+        command_hash = canonical_hash({"scope_ref": scope_ref, "guidance": guidance,
+            **({"work_materials": work_materials} if work_materials is not None else {})})
         with self._database.fenced_write() as connection:
             replay = _collaboration_command(
                 connection, idempotency_key, "guidance_submit", command_hash,
@@ -1497,6 +1498,8 @@ class SQLiteHumanCollaborationLadder:
                 self._feed.record(connection, "human_collaboration.guidance_submitted", {
                     "constraint_ref": constraint_ref, "quest_ref": quest_ref,
                 })
+            if material_committer is not None:
+                material_committer(connection, constraint_ref)
         return self._query_soft_constraint(constraint_ref)
 
     def convert_agent_proposal_to_soft_constraint(
@@ -1768,6 +1771,7 @@ class SQLiteHumanCollaborationLadder:
             )
         ):
             raise OwnerConflict("soft_constraint_invalid")
+        from meta_research.work_materials import material_submissions_for
         return {
             "constraint_ref": row.constraint_ref,
             "scope_ref": row.scope_ref,
@@ -1786,6 +1790,7 @@ class SQLiteHumanCollaborationLadder:
             ).as_public_dict(),
             "created_at": float(row.created_at),
             "updated_at": float(row.updated_at),
+            "work_materials": material_submissions_for(self._database, "guidance", constraint_ref),
         }
 
     def create_command_draft(
