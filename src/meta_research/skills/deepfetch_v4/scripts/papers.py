@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 
+try:
+    from .ledger_contract import ContractError, parse_extensions, parse_provenance, equivalent_version, academic_url
+except ImportError:
+    from ledger_contract import ContractError, parse_extensions, parse_provenance, equivalent_version, academic_url
+
+
 LEDGER_SCHEMA = "deepfetch.papers.v4"
 READER_JOB_SCHEMA = "deepfetch.reader.job.v4"
 READER_PATCH_SCHEMA = "deepfetch.reader.patch.v4"
@@ -358,7 +364,7 @@ INTAKE_FLAT_KEYS = {
     "institutions", "year", "venue", "publisher", "abstract", "cited_by_count",
     "citation_count_observed_at", "source_urls", "summary", "pre_understanding_summary",
     "evidence_level", "basis", "why_included", "uncertainty",
-    "identity", "metadata", "pre_understanding",
+    "identity", "metadata", "pre_understanding", "provenance",
     # Radar-only OpenAlex fields are accepted by the deterministic adapter and
     # deliberately omitted from the public ledger.
     "publication_date", "type", "is_retracted", "relevance", "matched_queries",
@@ -409,7 +415,20 @@ def normalized_intake(raw: Any) -> Dict[str, Any]:
     )
     if (cited_by_count is None) != (citation_count_observed_at is None):
         raise PapersError("cited_by_count and citation_count_observed_at must be supplied together")
+    raw_provenance = raw.get("provenance")
+    if raw_provenance is not None:
+        try:
+            parse_provenance(raw_provenance)
+            raw_arxiv = pick("arxiv_id", identity)
+            if raw_arxiv:
+                observed_revision = re.search(r"v([1-9]\d*)(?:\.pdf)?$", str(raw_arxiv))
+                if observed_revision and int(observed_revision.group(1)) != raw_provenance["version"]["arxiv_version"]:
+                    raise ContractError("intake arXiv revision conflicts with version")
+        except ContractError as error:
+            raise PapersError(str(error)) from error
     return {
+        "provenance": copy.deepcopy(raw_provenance),
+        "raw_arxiv_id": pick("arxiv_id", identity),
         "paper_id": nullable_string(pick("paper_id", identity), "paper_id"),
         "title": title,
         "doi": normalize_doi(pick("doi", identity)),
@@ -439,47 +458,62 @@ def normalized_intake(raw: Any) -> Dict[str, Any]:
 
 
 def generated_paper_id(item: Dict[str, Any]) -> str:
-    if item["doi"]:
-        return "doi:%s" % item["doi"]
+    provenance = item["provenance"]
+    if provenance is None:
+        raise PapersError("new paper needs verified original-paper version provenance")
     if item["arxiv_id"]:
-        return "arxiv:%s" % item["arxiv_id"]
-    if item["openalex_id"]:
-        return "openalex:%s" % item["openalex_id"]
-    digest = hashlib.sha256(title_key(item["title"]).encode("utf-8")).hexdigest()[:20]
-    return "title:%s" % digest
+        base = "arxiv:" + item["arxiv_id"]
+    elif item["doi"]:
+        base = "doi:" + item["doi"]
+    elif item["openalex_id"]:
+        base = "openalex:" + item["openalex_id"]
+    else:
+        base = "academic:" + hashlib.sha256(provenance["version"]["canonical_url"].encode()).hexdigest()[:20]
+    version = provenance["version"]
+    suffix = hashlib.sha256(json_bytes({key: version[key] for key in ("kind", "arxiv_version", "canonical_url")})).hexdigest()[:12]
+    if version["kind"] == "unknown":
+        suffix += uuid.uuid4().hex[:8]
+    return base + "@" + suffix
 
 
 def find_existing_id(ledger: Dict[str, Any], item: Dict[str, Any]) -> Optional[str]:
     matches = set()
-    if item["paper_id"] is not None:
-        if item["paper_id"] not in ledger["papers"]:
+    selected = item["paper_id"]
+    if selected is not None:
+        if selected not in ledger["papers"]:
             raise PapersError("paper_id may select an existing record but cannot create one")
-        matches.add(item["paper_id"])
+        matches.add(selected)
     for paper_id, paper in ledger["papers"].items():
         identity = paper["identity"]
-        if item["doi"] and identity["doi"] == item["doi"]:
-            matches.add(paper_id)
-        if item["arxiv_id"] and identity["arxiv_id"] == item["arxiv_id"]:
-            matches.add(paper_id)
-        if item["openalex_id"] and identity["openalex_id"] == item["openalex_id"]:
-            matches.add(paper_id)
-        if title_key(identity["title"]) == title_key(item["title"]):
-            matches.add(paper_id)
+        shared = any(item[field] and identity[field] == item[field] for field in ("doi", "arxiv_id", "openalex_id"))
+        if item["provenance"] is not None and "provenance" in paper:
+            if shared and equivalent_version(paper["provenance"], item["provenance"], identities=(identity, item)):
+                matches.add(paper_id)
+            elif not any(item[field] for field in ("doi", "arxiv_id", "openalex_id")) and equivalent_version(paper["provenance"], item["provenance"]):
+                matches.add(paper_id)
     if len(matches) > 1:
         raise PapersError("paper identifiers resolve to multiple existing records")
     if not matches:
         return None
     paper_id = next(iter(matches))
-    existing = ledger["papers"][paper_id]["identity"]
-    if title_key(existing["title"]) != title_key(item["title"]):
-        raise PapersError("title conflicts with the selected existing paper")
-    for field, label in (("doi", "DOI"), ("arxiv_id", "arXiv ID"), ("openalex_id", "OpenAlex ID")):
+    paper = ledger["papers"][paper_id]
+    existing = paper["identity"]
+    for field in ("doi", "arxiv_id", "openalex_id"):
         if item[field] and existing[field] and item[field] != existing[field]:
-            raise PapersError("%s conflicts with the selected existing paper" % label)
+            raise PapersError(field + " conflicts with selected paper")
+    if item["provenance"] is not None and "provenance" in paper:
+        if not equivalent_version(paper["provenance"], item["provenance"], identities=(existing, item)) and paper["provenance"]["version"] != item["provenance"]["version"]:
+            raise PapersError("version conflicts with selected paper")
     return paper_id
 
 
 def merge_intake(paper: Dict[str, Any], item: Dict[str, Any]) -> None:
+    if item["provenance"] is not None:
+        if "provenance" not in paper:
+            paper["provenance"] = copy.deepcopy(item["provenance"])
+        else:
+            for field in ("discovery_refs", "related_paper_ids"):
+                paper["provenance"][field] = merge_unique(paper["provenance"][field], item["provenance"][field])
     identity = paper["identity"]
     metadata = paper["metadata"]
     pre = paper["pre_understanding"]
@@ -758,6 +792,7 @@ def command_init(args: argparse.Namespace) -> None:
         "papers": {},
         "missing_fulltexts": [],
         "limitations": [],
+        "discovery": {"receipts": [], "unresolved_leads": []},
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     with ledger_lock(out_dir):
@@ -840,8 +875,34 @@ def command_upsert(args: argparse.Namespace) -> None:
                 changed.append(paper_id)
         ledger["limitations"] = merge_unique(ledger["limitations"], limitations)
         refresh_missing(ledger)
+        try:
+            parse_extensions(ledger, historical_read=True)
+        except ContractError as error:
+            raise PapersError(str(error)) from error
         atomic_write_json(out_dir / "papers.json", ledger)
     output({"upserted": changed, "paper_count": len(ledger["paper_order"])})
+
+
+def command_discovery(args: argparse.Namespace) -> None:
+    payload = read_json(Path(args.input))
+    exact_object(payload, ("receipts", "unresolved_leads"), "discovery input")
+    out_dir = Path(args.out_dir).resolve()
+    with ledger_lock(out_dir):
+        ledger = load_ledger(out_dir)
+        discovery = ledger.setdefault("discovery", {"receipts": [], "unresolved_leads": []})
+        for field in ("receipts", "unresolved_leads"):
+            if not isinstance(payload[field], list):
+                raise PapersError(field + " must be an array")
+            discovery[field] = merge_unique(discovery[field], payload[field])
+        try:
+            parse_extensions(ledger)
+        except ContractError as error:
+            raise PapersError(str(error)) from error
+        for receipt in payload["receipts"]:
+            if receipt["limitation"]:
+                ledger["limitations"] = merge_unique(ledger["limitations"], [receipt["limitation"]])
+        atomic_write_json(out_dir / "papers.json", ledger)
+    output({"receipt_count": len(discovery["receipts"]), "lead_count": len(discovery["unresolved_leads"])})
 
 
 def command_register_fulltext(args: argparse.Namespace) -> None:
@@ -1293,7 +1354,12 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
         except (PapersError, KeyError, TypeError, ValueError, OSError) as exc:
             errors.append("%s: %s" % (prefix, exc))
 
-    check(lambda: exact_object(ledger, TOP_KEYS, "papers.json"), "schema")
+    top_keys = (*TOP_KEYS, "discovery") if "discovery" in ledger else TOP_KEYS
+    check(lambda: exact_object(ledger, top_keys, "papers.json"), "schema")
+    try:
+        parse_extensions(ledger, historical_read=True)
+    except ContractError as error:
+        errors.append("discovery: " + str(error))
     if ledger.get("schema_version") != LEDGER_SCHEMA:
         errors.append("schema: schema_version must be %s" % LEDGER_SCHEMA)
 
@@ -1381,7 +1447,8 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
 
     for paper_id, paper in papers.items():
         prefix = "paper %s" % paper_id
-        check(lambda paper=paper: exact_object(paper, PAPER_KEYS, "paper"), prefix)
+        paper_keys = (*PAPER_KEYS, "provenance") if "discovery" in ledger else PAPER_KEYS
+        check(lambda paper=paper: exact_object(paper, paper_keys, "paper"), prefix)
         if not isinstance(paper, dict) or any(key not in paper for key in PAPER_KEYS):
             continue
         identity = paper["identity"]
@@ -1406,16 +1473,21 @@ def validate_public_ledger(out_dir: Path, ledger: Dict[str, Any], state: Dict[st
                 ):
                     if identity[field] != canonical:
                         errors.append("%s: identity.%s is not canonical" % (prefix, field))
-                if paper_id.startswith("doi:"):
-                    if canonical_doi is None or paper_id != "doi:%s" % canonical_doi:
+                stable_id = paper_id.split("@", 1)[0] if "discovery" in ledger else paper_id
+                if stable_id.startswith("doi:"):
+                    if canonical_doi is None or stable_id != "doi:%s" % canonical_doi:
                         errors.append("%s: DOI paper_id disagrees with identity.doi" % prefix)
-                elif paper_id.startswith("arxiv:"):
-                    if canonical_arxiv is None or paper_id != "arxiv:%s" % canonical_arxiv:
+                elif stable_id.startswith("arxiv:"):
+                    if canonical_arxiv is None or stable_id != "arxiv:%s" % canonical_arxiv:
                         errors.append("%s: arXiv paper_id disagrees with identity.arxiv_id" % prefix)
-                elif paper_id.startswith("openalex:"):
-                    if canonical_openalex is None or paper_id != "openalex:%s" % canonical_openalex:
+                elif stable_id.startswith("openalex:"):
+                    if canonical_openalex is None or stable_id != "openalex:%s" % canonical_openalex:
                         errors.append("%s: OpenAlex paper_id disagrees with identity.openalex_id" % prefix)
-                elif paper_id.startswith("title:"):
+                elif stable_id.startswith("academic:") and "discovery" in ledger:
+                    expected = "academic:" + hashlib.sha256(paper["provenance"]["version"]["canonical_url"].encode()).hexdigest()[:20]
+                    if stable_id != expected:
+                        errors.append("%s: academic paper_id disagrees with original URL" % prefix)
+                elif stable_id.startswith("title:"):
                     expected = "title:%s" % hashlib.sha256(title_key(identity["title"]).encode("utf-8")).hexdigest()[:20]
                     if paper_id != expected:
                         errors.append("%s: title fingerprint paper_id disagrees with title" % prefix)
@@ -1628,6 +1700,11 @@ def build_parser() -> argparse.ArgumentParser:
     upsert.add_argument("--out-dir", required=True)
     upsert.add_argument("--input", required=True, help="JSON file or - for stdin")
     upsert.set_defaults(function=command_upsert)
+
+    discovery = commands.add_parser("record-discovery")
+    discovery.add_argument("--out-dir", required=True)
+    discovery.add_argument("--input", required=True)
+    discovery.set_defaults(function=command_discovery)
 
     register = commands.add_parser("register-fulltext")
     register.add_argument("--out-dir", required=True)

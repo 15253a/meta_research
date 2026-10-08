@@ -25,7 +25,8 @@
   "paper_order": [],
   "papers": {},
   "missing_fulltexts": [],
-  "limitations": []
+  "limitations": [],
+  "discovery": {"receipts": [], "unresolved_leads": []}
 }
 ```
 
@@ -33,11 +34,21 @@
 
 ## 论文身份与元数据
 
-每个 `papers[paper_id]` 恰含 `identity`、`metadata`、`pre_understanding`、`fulltext_path`、`reading`。
+每个新 `papers[paper_id]` 恰含 `identity`、`metadata`、`pre_understanding`、`fulltext_path`、`reading`、`provenance`。已接纳历史快照保持原形可读。
 
-创建时用最强已核实标识形成稳定 `paper_id`：依次优先 DOI、arXiv、OpenAlex、确定性标题指纹。后来取得更强标识也保留原 ID；合并需明确身份依据。DOI 不带 URL 前缀，OpenAlex token 为 `W...`，标题保持已核实原文。OpenAlex 记录不是必要条件。
+工具按已核实 arXiv、DOI、OpenAlex 或原学术地址生成 paper_id，并附确认版本指纹。identity.arxiv_id 保存 base，provenance.version.arxiv_version 保存修订号。标题不形成论文身份，也不触发合并。只有共享稳定身份且同一确认版本才合并；未知版本保持保守独立。后来取得更强标识仍保留原 ID。DOI 不带 URL 前缀，OpenAlex token 为 `W...`，标题保持已核实原文。OpenAlex 记录不是必要条件。
 
-`metadata` 只保存书目事实。`authors`、`institutions` 为名称数组；`citation_count_observed_at` 与 `cited_by_count` 配对，使用 RFC 3339 时间，缺时间的计数视为未知。`source_urls` 是元数据位置，不证明已取得全文。
+`metadata` 只保存书目事实。`authors`、`institutions` 为名称数组；`citation_count_observed_at` 与 `cited_by_count` 配对，使用 RFC 3339 时间，缺时间的计数视为未知。`source_urls` 仅为原学术元数据位置，不证明已取得全文。公众号与搜索地址存入发现回执。全文 URL 始终取 provenance.version.canonical_url，source_urls 顺序不改变原论文身份。
+
+## 发现与确认版本
+
+精确扩展由 `scripts/ledger_contract.py` 校验。`discovery` 恰含 `receipts` 和 `unresolved_leads` 数组。[搜狗参考](sogou.md)定义回执字段和证据级别。
+
+每篇 `provenance` 恰含 `discovery_refs`、`version`、`related_paper_ids`。引用数组只引用本账本已有回执及论文。`version` 恰含 `kind`、`arxiv_version`、`canonical_url`、`verified_at`、`verification_urls`。kind 为 `preprint | published | unknown`。arXiv 修订为正整数或 null，与 canonical_url 中修订一致。canonical_url 为核实的原论文地址，verification_urls 至少含一个实际核验的学术地址，verified_at 为核验时的 RFC 3339 时间。不要用登记时间冒充核验时间。
+
+跨渠道同一版本合并后保留全部 discovery_refs。arXiv v1 与 v2、预印本与正式发表版独立登记，已确认关系写入 related_paper_ids。未知 DOI、OpenAlex 和修订号为 null。只有已核实原论文才进入 papers。
+
+未解决线索恰含 `lead_ref`、`discovery_refs`、`kind`、`title`、`url`、`limitation`。kind 为 `article | project | possible_paper`。未知 title/url 为 null，limitation 描述未核实或不可访问之处。线索不取得论文 Reader 状态。
 
 ## 预理解
 

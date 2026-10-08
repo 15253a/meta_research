@@ -210,12 +210,14 @@ class RootResidentMcpChannels:
         phase: str,
         job_ref: str | None,
         guidance_binding: FrozenGuidanceBinding | None = None,
+        excluded_operation_ids: tuple[str, ...] = (),
     ) -> tuple[RootResidentMcpChannelKey, RootResidentMcpAccess]:
         authority = self._authority
         base_url = self._base_url
         if authority is None or base_url is None:
             raise RootResidentMcpError("semantic_mcp_unavailable")
-        binding = self._require_operation_binding()
+        operation_ids = tuple(value for value in self._operation_ids if value not in excluded_operation_ids)
+        binding = self._require_operation_binding(operation_ids)
         exact_scope_hash = canonical_hash(
             {
                 "run_ref": run_ref,
@@ -225,6 +227,7 @@ class RootResidentMcpChannels:
                 "capability_binding_hash": capability_binding_hash,
                 "root_kind": self._root_kind,
                 "phase": phase,
+                "operation_ids": list(operation_ids),
                 **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
             }
         )
@@ -242,7 +245,7 @@ class RootResidentMcpChannels:
                         root_session_ref=root_session_ref,
                         fence_ref=fence_ref,
                         capability_binding_hash=capability_binding_hash,
-                        operation_ids=self._operation_ids,
+                        operation_ids=operation_ids,
                         **({} if guidance_binding is None else {"guidance_binding": guidance_binding}),
                     )
                 except Exception as error:
@@ -269,7 +272,7 @@ class RootResidentMcpChannels:
                     != binding.semantic_mcp_catalog_hash
                     or canonical_hash(list(channel.binding.operation_bindings))
                     != binding.semantic_mcp_operation_bindings_hash
-                    or observed_operation_ids != self._operation_ids
+                    or observed_operation_ids != operation_ids
                     or channel.binding.root_kind != self._root_kind
                     or channel.binding.phase != phase
                     or getattr(channel.binding, "guidance_binding", None) != guidance_binding
@@ -297,7 +300,7 @@ class RootResidentMcpChannels:
                     url=base_url + endpoint.path,
                     token=channel.connection.token,
                     scope_binding_hash=scope_binding_hash,
-                    operation_ids=self._operation_ids,
+                    operation_ids=operation_ids,
                     workspace_binding=(None if self._workspaces is None else self._workspaces.bind_runtime(
                         SemanticCallContext(run_ref, attempt_ref, root_session_ref, fence_ref,
                             capability_binding_hash, self._root_kind, phase, "research_workspace.read", guidance_binding))),
@@ -429,14 +432,15 @@ class RootResidentMcpChannels:
                     str(getattr(error, "code", "semantic_mcp_revoke_failed"))
                 ) from error
 
-    def _require_operation_binding(self) -> _OperationBinding:
+    def _require_operation_binding(self, operation_ids: tuple[str, ...] | None = None) -> _OperationBinding:
+        operation_ids = self._operation_ids if operation_ids is None else operation_ids
         authority = self._authority
         if authority is None:
             raise RootResidentMcpError("semantic_mcp_unavailable")
         try:
             binding = authority.require_operation_binding(
                 harness_family="codex",
-                required_operation_ids=self._operation_ids,
+                required_operation_ids=operation_ids,
                 required_capabilities=("semantic_mcp",),
             )
         except Exception as error:
@@ -447,7 +451,7 @@ class RootResidentMcpChannels:
             binding.contract_ref != _OPERATION_BINDING_CONTRACT
             or binding.required_families != ("codex",)
             or binding.required_capabilities != ("semantic_mcp",)
-            or binding.required_operation_ids != self._operation_ids
+            or binding.required_operation_ids != operation_ids
         ):
             raise RootResidentMcpError("semantic_mcp_operation_binding_invalid")
         return binding

@@ -6082,11 +6082,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         self._authorization_verifier = human_response_verifier
         self._research_material_resolver: ResearchMaterialResolver | None = None
         self._writing_citation_verifier: WritingCitationDecisionVerifier | None = None
+        from meta_research.sogou_discovery import SogouDiscovery
         self._acquisition_private_root = (
             acquisition_private_root
             if acquisition_private_root is not None
             else Path(".meta-research-acquisition")
         )
+        self.sogou_discovery = SogouDiscovery(self._acquisition_private_root / "discovery-receipts")
         self._configure_human_request_owner(
             database, feed, AR_OWNER, human_response_verifier
         )

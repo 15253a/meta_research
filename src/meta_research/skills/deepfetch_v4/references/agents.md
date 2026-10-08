@@ -46,3 +46,7 @@ Reader 输入必须包括研究任务、论文记录、单篇全文绝对路径�
 - `reader_failed`、`timeout`、`invalid_output`：保留有效全文，发布空的 `failed` 阅读；值得重试时重试同文，否则该名额以失败结束。
 - `file_invalid`、`paper_mismatch`：由合并工具隔离文件、清空公开路径并恢复 `not_read`；可修正并重试同文，名额仍已占用。
 - Reader 确实失联且达到运行时超时条件时，主智能体可用原 assignment 数据提交 `timeout` 失败 patch；尚在运行或等待时继续观察，不用主观等待时长伪造超时或阅读结论。
+
+## 发现来源与 Reader 身份
+
+按 [微信搜狗](sogou.md)保留真实查询和访问回执。公众号已打开正文是发现线索，不是原论文独立阅读。Acquisition targets 使用 ledger 返回的精确版本 paper_id、原学术 source_urls 和实际 arXiv 修订地址。Reader job 的 paper.provenance.version 是本次待读的确认版本，核对身份及原件 hash，再提交既有 patch。不同修订各占一个既有 Reader 名额，同一版本跨来源合并后只占一个。
