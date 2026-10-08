@@ -1,3 +1,5 @@
+import { ServerMaterialPicker } from "./ServerMaterialPicker";
+import type { ServerMaterialSelection } from "./workMaterialApi";
 import {
   Fragment,
   useCallback,
@@ -37,7 +39,7 @@ import "./research-assets.css";
 import { ResearchLibrary } from "./ResearchLibrary";
 import { OutputLanguageControl, useOutputLanguage } from "./OutputLanguage";
 
-type IntakeKind = AssetIntakeRequest["source_kind"];
+type IntakeKind = Exclude<AssetIntakeRequest["source_kind"], "file">;
 type ChangeDraft = {
   kind: "supplement" | "substantive_change" | "correction";
   explanation: string;
@@ -61,13 +63,11 @@ type HistoryCursor = {
   holdsMore: boolean;
   assessmentsMore: boolean;
 };
-const MAX_ASSET_BYTES = 64 * 1024 * 1024;
 
 const sourceLabels: Record<IntakeKind, string> = {
   text: "文本",
-  file: "文件上传",
-  directory: "本地目录",
-  local_path: "本地路径",
+  directory: "服务器目录",
+  local_path: "服务器文件路径",
   repository: "代码仓库",
   link: "链接",
   system_artifact: "系统产物",
@@ -122,8 +122,6 @@ export function ResearchAssetsWorkbench({
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const intakeControllerRef = useRef<AbortController | null>(null);
-  const fileReaderRef = useRef<FileReader | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const projectionRevisionRef = useRef(initial.revision);
   const inventoryRevisionRef = useRef(initial.inventory_revision);
   const referenceRevisionRef = useRef(initial.reference_revision);
@@ -133,6 +131,7 @@ export function ResearchAssetsWorkbench({
   const [view, setView] = useState(initial);
   const [selectedRef, setSelectedRef] = useState(initial.items[0]?.memory_ref ?? null);
   const [sourceKind, setSourceKind] = useState<IntakeKind>("text");
+  const [serverSelection, setServerSelection] = useState<ServerMaterialSelection | null>(null);
   const [custodyMode, setCustodyMode] = useState<"managed" | "linked_local">(
     "managed",
   );
@@ -140,9 +139,6 @@ export function ResearchAssetsWorkbench({
   const [mediaType, setMediaType] = useState("text/markdown; charset=utf-8");
   const [textContent, setTextContent] = useState("");
   const [sourceLocator, setSourceLocator] = useState("");
-  const [fileContent, setFileContent] = useState<string | null>(null);
-  const [readingFile, setReadingFile] = useState<string | null>(null);
-  const [fileReadError, setFileReadError] = useState<string | null>(null);
   const [asynchronous, setAsynchronous] = useState(false);
   const [createNextVersion, setCreateNextVersion] = useState(false);
   const [changeDraft, setChangeDraft] = useState<ChangeDraft>(() => emptyChangeDraft(selectedRef));
@@ -590,9 +586,6 @@ export function ResearchAssetsWorkbench({
       focusFrame = requestAnimationFrame(focusWhenVisible);
     });
     return () => {
-      const reader = fileReaderRef.current;
-      fileReaderRef.current = null;
-      reader?.abort();
       active = false;
       cancelAnimationFrame(frame);
       if (focusFrame !== null) cancelAnimationFrame(focusFrame);
@@ -600,15 +593,7 @@ export function ResearchAssetsWorkbench({
   }, []);
 
   useEffect(() => {
-    if (["text", "file", "link"].includes(sourceKind)) setCustodyMode("managed");
-    if (sourceKind !== "file") {
-      const reader = fileReaderRef.current;
-      fileReaderRef.current = null;
-      reader?.abort();
-      setFileContent(null);
-      setReadingFile(null);
-      setFileReadError(null);
-    }
+    if (["text", "link"].includes(sourceKind)) setCustodyMode("managed");
   }, [sourceKind]);
 
   useEffect(() => {
@@ -624,9 +609,6 @@ export function ResearchAssetsWorkbench({
   }, [selectedRef]);
 
   const close = () => {
-    const reader = fileReaderRef.current;
-    fileReaderRef.current = null;
-    reader?.abort();
     intakeControllerRef.current?.abort();
     intakeControllerRef.current = null;
     const dialog = dialogRef.current;
@@ -775,8 +757,7 @@ export function ResearchAssetsWorkbench({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy || pendingJobRef || readingFile
-      || (sourceKind === "file" && fileContent === null)) return;
+    if (busy || pendingJobRef) return;
     const controller = new AbortController();
     intakeControllerRef.current?.abort();
     intakeControllerRef.current = controller;
@@ -792,6 +773,10 @@ export function ResearchAssetsWorkbench({
         asynchronous: asynchronous && intakeWorkerReady,
         provenance: { submitted_via: "lumen_research_asset_workbench" },
       };
+      if (serverSelection && sourceLocator === serverSelection.absolute_path
+          && sourceKind === (serverSelection.kind === "directory" ? "directory" : "local_path")) {
+        request.provenance!.server_material_selection = serverSelection;
+      }
       if (createNextVersion && selected) {
         if (!lifecycle || !canChangeSelected) {
           throw new ProductError("asset_current_version_required");
@@ -838,10 +823,7 @@ export function ResearchAssetsWorkbench({
         request.change = change;
       }
       if (sourceKind === "text") request.text = textContent;
-      else if (sourceKind === "file") {
-        if (fileContent === null) throw new ProductError("asset_file_required");
-        request.content_base64 = fileContent;
-      } else request.source_locator = sourceLocator;
+      else request.source_locator = sourceLocator;
 
       let result = await submitAssetIntake(request);
       if (controller.signal.aborted) return;
@@ -861,61 +843,11 @@ export function ResearchAssetsWorkbench({
     }
   };
 
-  const removeFile = () => {
-    const reader = fileReaderRef.current;
-    fileReaderRef.current = null;
-    reader?.abort();
-    setFileContent(null);
-    setReadingFile(null);
-    setFileReadError(null);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-      fileInputRef.current.focus();
-    }
-  };
-
-  const chooseFile = (file: File | undefined) => {
-    const previous = fileReaderRef.current;
-    fileReaderRef.current = null;
-    previous?.abort();
-    setFileContent(null);
-    setReadingFile(null);
-    setFileReadError(null);
-    setError(null);
-    if (!file) return;
-    if (file.size > MAX_ASSET_BYTES) {
-      setFileReadError("文件超过 64 MiB，请选择更小的文件。");
-      return;
-    }
-    setDisplayName(file.name);
-    setMediaType(file.type || "application/octet-stream");
-    const reader = new FileReader();
-    fileReaderRef.current = reader;
-    setReadingFile(file.name);
-    reader.onload = () => {
-      if (fileReaderRef.current !== reader) return;
-      setFileContent(arrayBufferToBase64(reader.result as ArrayBuffer));
-      setReadingFile(null);
-      fileReaderRef.current = null;
-    };
-    reader.onerror = () => {
-      if (fileReaderRef.current !== reader) return;
-      setFileReadError("无法读取文件，请重新选择后再试。");
-      setReadingFile(null);
-      fileReaderRef.current = null;
-    };
-    reader.readAsArrayBuffer(file);
-  };
-
-  const intakeBlocker = readingFile
-    ? `正在读取 ${readingFile}，读取完成后才能提交。`
-    : busy !== null
+  const intakeBlocker = busy !== null
       ? "正在处理当前操作，请稍候。"
       : pendingJobRef !== null
         ? "上次提交仍在恢复中，请等待结果。"
-        : sourceKind === "file" && fileContent === null
-          ? fileReadError ?? "请先选择一个文件。"
-          : createNextVersion && !canChangeSelected
+        : createNextVersion && !canChangeSelected
             ? changeBasisHint ?? "所选版本目前不能作为变更基础。"
             : createNextVersion && !changeDraft.explanation.trim()
               ? "请说明这次变更及其影响。"
@@ -991,6 +923,16 @@ export function ResearchAssetsWorkbench({
                   ))}
                 </select>
               </label>
+              <ServerMaterialPicker value={serverSelection} disabled={busy !== null} onSelect={selection => {
+                setServerSelection(selection);
+                if (selection) {
+                  setSourceKind(selection.kind === "directory" ? "directory" : "local_path");
+                  setCustodyMode("linked_local"); setSourceLocator(selection.absolute_path);
+                  setDisplayName(selection.absolute_path.split("/").at(-1) || selection.absolute_path);
+                  setMediaType(selection.kind === "directory" ? "application/x-directory" : "application/octet-stream");
+                }
+              }} />
+              <p>服务器候选仅提供来源位置。点击“提交 Asset Intake”才会正式接纳资产。</p>
               <label>
                 <span>显示名称</span>
                 <input
@@ -1023,32 +965,9 @@ export function ResearchAssetsWorkbench({
                     required
                   />
                 </label>
-              ) : sourceKind === "file" ? (
-                <label>
-                  <span>本地文件</span>
-                  <input
-                    ref={fileInputRef}
-                    aria-label="Research Asset 本地文件"
-                    aria-describedby="asset-file-feedback"
-                    type="file"
-                    disabled={busy !== null}
-                    onChange={(event) => chooseFile(event.target.files?.[0])}
-                    required
-                  />
-                  <small id="asset-file-feedback" role="status">
-                    {fileReadError ?? (readingFile
-                      ? `正在读取 ${readingFile}…`
-                      : fileContent !== null ? "文件已就绪，可以提交。" : "支持最大 64 MiB 的文件。")}
-                  </small>
-                  {readingFile || fileContent !== null || fileReadError ? (
-                    <button type="button" disabled={busy !== null} onClick={removeFile}>
-                      {readingFile ? "取消读取" : "移除文件"}
-                    </button>
-                  ) : null}
-                </label>
               ) : (
                 <label>
-                  <span>{sourceKind === "link" ? "精确链接" : "本机绝对路径"}</span>
+                  <span>{sourceKind === "link" ? "精确链接" : "服务器绝对路径"}</span>
                   <input
                     aria-label="Research Asset 来源位置"
                     type={sourceKind === "link" ? "url" : "text"}
@@ -1064,7 +983,7 @@ export function ResearchAssetsWorkbench({
                 <select
                   aria-label="Research Asset 保管模式"
                   value={custodyMode}
-                  disabled={busy !== null || ["text", "file", "link"].includes(sourceKind)}
+                  disabled={busy !== null || ["text", "link"].includes(sourceKind)}
                   onChange={(event) => setCustodyMode(event.target.value as typeof custodyMode)}
                 >
                   <option value="managed">managed · 完整校验后接纳</option>
@@ -1804,15 +1723,6 @@ function ReceiptCard({ label, receipt }: { label: string; receipt: AssetReceipt 
       </dl>
     </article>
   );
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
-  }
-  return btoa(binary);
 }
 
 function mergeResearchAssetPages(

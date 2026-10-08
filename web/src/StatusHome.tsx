@@ -5,6 +5,7 @@ import { canObserveActiveTarget, observedActiveTarget, TARGET_OBSERVATION_INTERV
 import "./status-home.css";
 import { ResearchMotionControl } from "./ResearchMotion";
 import { MetaTrace } from "./MetaTrace";
+import { HostResources } from "./HostResources";
 
 type Health = { status: string; checks: { name: string; status: string; reason?: { code: string } }[] };
 export type RuntimeStatus = {
@@ -151,6 +152,7 @@ export function StatusHome() {
       <a href="/" aria-label="Meta Research 首页"><span className="lumen-logo" aria-hidden="true"><MetaTrace variant="signature" /></span><span><b>Meta Research</b><small>LUMEN WORKSPACE</small></span></a>
       <nav aria-label="工作台导航"><a className="is-active" href="/" aria-current="page">工作台</a><a href="/?workspace=1">研究现场</a><a href="/?workspace=1&companion=1">研究助手 <span>↗</span></a></nav>
       <ResearchMotionControl />
+      <HostResources />
     </header>
     <main id="main-content">
       <div className="status-home-intro"><div><p className="home-eyebrow">从一个问题，到新的发现</p><h2>研究工作台<span> / Workspace</span></h2></div><p className="home-intro-note">思路、验证、证据与判断。<br />在同一条研究脉络里，继续探索。</p></div>

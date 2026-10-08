@@ -564,12 +564,12 @@ test("root activity preserves source and Cycle scope, reports empty output hones
   expect(f.nonGetRequests).toEqual([]); expect(f.errors).toEqual([]);
 });
 
-test("active Bundle selects its exact root and keeps later calls continuous without mixing Target or previous Cycle output", async ({ page }) => {
+test("active Bundle follows its executing Target while explicit stage output keeps later calls continuous", async ({ page }) => {
   const f = await openCurrentCycle(page, true), activity = page.locator("#research-activity");
   const current = page.getByRole("region", { name: "研究光谱" }).locator('.spectrum-stage[data-stage="bundle"]');
   await expect(page.locator('.spectrum-stage[data-stage="bundle"]')).toHaveAttribute("aria-current", "step");
   await expect(current.locator(".stage-root-count")).toHaveText("3 个根 session");
-  await expect(activity).toContainText("当前轮 Bundle 已形成初始实验安排。");
+  await expect(activity).toContainText("T1 独立根会话正在检验关键假设 A。");
   await current.locator(`button[data-session-ref="${f.bundle.session_ref}"]`).click();
   const timeline = activity.getByRole("region", { name: "Bundle 会话", exact: true });
   await expect(timeline).toHaveAttribute("data-session-ref", f.bundle.session_ref);
