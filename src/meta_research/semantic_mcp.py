@@ -54,6 +54,7 @@ ROOT_AGENT_COMMON_OPERATION_IDS = (
     "research_graph.questions.page",
     "research_memory.literature.page",
     "research_memory.content.read",
+    "research_memory.creation_basis.read",
     "human_request.read",
     "research_graph.baselines.page",
     "research_graph.baselines.read",

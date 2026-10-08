@@ -54,6 +54,9 @@ class FirstQuestionDeepFetchWorker:
             if request is None:
                 return False
             try:
+                prepare = getattr(self._request_authority, "prepare_deepfetch_creation_basis", None)
+                if callable(prepare):
+                    request = prepare(request)
                 run = self._agent_runtime.execute_deepfetch(request, self._provider)
                 snapshot = self._research_memory.accept_literature_snapshot(request, run)
                 self._request_authority.record_deepfetch_succeeded(

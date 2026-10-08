@@ -728,9 +728,12 @@ def _validate_literature_reference(value, question_ref):
 
 
 def _validate_context_pack_v4(pack, *, cycle_ref, accepted_question_binding):
-    if set(pack)!=_IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page"}:
+    if set(pack) not in (_IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page"}, _IDEA_CONTEXT_PACK_V2_FIELDS|{"evidence_page", "creation_basis"}):
         raise IdeaContractError("idea_context_pack_invalid")
-    legacy={k:v for k,v in pack.items() if k!="evidence_page"}
+    creation=pack.get("creation_basis")
+    if creation is not None and (not isinstance(creation,dict) or set(creation)!={"basis_ref","basis_hash","kind"} or not isinstance(creation["basis_ref"],str) or not _is_hash(creation["basis_hash"]) or creation["kind"] not in {"prepared","literature_revised"}):
+        raise IdeaContractError("idea_context_pack_invalid")
+    legacy={k:v for k,v in pack.items() if k not in {"evidence_page", "creation_basis"}}
     legacy.update(schema_ref=IDEA_CONTEXT_PACK_SCHEMA_V2_REF,literature_binding=None,prior_accepted_bindings=[])
     refs=validate_idea_context_pack(legacy,cycle_ref=cycle_ref,accepted_question_binding=accepted_question_binding)
     page=pack["evidence_page"]

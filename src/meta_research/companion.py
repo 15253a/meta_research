@@ -38,6 +38,11 @@ from meta_research.quest_drafting import (
     _validated_question,
 )
 from meta_research.root_capabilities import RootCapabilityProfile, root_capability_profile
+from meta_research.creation_basis import (
+    InitializationUnderstandingRequest, InitializationUnderstandingResult,
+    FirstQuestionSynthesisRequest, FirstQuestionSynthesisResult,
+    first_creation_instructions, understanding_schema, revision_schema,
+)
 
 
 class CodexCompanionAdapter(
@@ -55,7 +60,7 @@ class CodexCompanionAdapter(
     """
 
     _root_agent_kind = "companion"
-    _reconciliation_operation_names = ("companion-turn", "proposal-fork")
+    _reconciliation_operation_names = ("companion-turn", "proposal-fork", "initialization-understanding", "first-question-synthesis")
 
     def __init__(
         self,
@@ -90,8 +95,10 @@ class CodexCompanionAdapter(
         return True
 
     def _transport_contract_failure_code(self, operation_name: str) -> str:
-        if operation_name == "proposal-fork":
+        if operation_name in {"proposal-fork", "first-question-synthesis"}:
             return "companion_proposal_fork_result_invalid"
+        if operation_name == "initialization-understanding":
+            return "companion_initialization_understanding_invalid"
         if operation_name == "companion-turn":
             return "companion_turn_result_invalid"
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
@@ -154,6 +161,64 @@ class CodexCompanionAdapter(
         ):
             return ""
         return read_chat_reply(directory / "stdout.jsonl")
+
+    def understand_initialization(self, request: InitializationUnderstandingRequest) -> InitializationUnderstandingResult:
+        instructions = first_creation_instructions()
+        prompt = (
+            "You are the persistent creation Companion. Read the captured existing project using native filesystem tools in your bound cwd. "
+            "Return only the understanding schema. You have no resident Owner MCP in this creation call. Never pretend to call one. "
+            "Prove observed source bytes through exact range witnesses and preserve unread entrances.\n"
+            + _canonical_json({"instruction_bundle": instructions, "draft_binding": {"initialization_id": request.initialization_id,
+                "revision": request.draft_revision, "hash": request.draft_hash}, "draft": request.draft, "material_manifest": request.manifest})
+        )
+        try:
+            raw, native_ref, _stdout = self._invoke(operation_name="initialization-understanding", prompt=prompt,
+                schema=understanding_schema(), native_session_ref=request.companion_native_session_ref,
+                job_ref=request.job_ref, workspace_binding=self._creation_workspace(request))
+            if native_ref is None:
+                raise DraftingUnavailable("companion_native_session_missing")
+            return InitializationUnderstandingResult(raw, native_ref)
+        except IdeaSkillUnavailable as error:
+            raise DraftingUnavailable(error.code) from error
+
+    def synthesize_first_question(self, request: FirstQuestionSynthesisRequest) -> FirstQuestionSynthesisResult:
+        instructions = first_creation_instructions()
+        child_schema = {"type": "object", "additionalProperties": False, "properties": {
+            "content": _proposal_schema(), "revision": revision_schema() if request.literature_snapshot is not None else {"type": "null"}},
+            "required": ["content", "revision"]}
+        schema = {"type": "object", "additionalProperties": False, "properties": {
+            "proposal_fork_native_session_ref": {"type": "string", "minLength": 1},
+            "result": child_schema}, "required": ["proposal_fork_native_session_ref", "result"]}
+        child_prompt = (
+            "Read this exact context cache with native filesystem tools. Verify the manifest hashes before relying on it. "
+            "Read full originals that matter and exact literature evidence. Preserve the prepared basis and source selection. "
+            "Return the six proposal fields and the route-specific revision. A direct route returns revision=null. "
+            "A DeepFetch route returns a complete literature revision with explicit corrections or an honest unchanged/empty assessment. "
+            "No Owner writes, receipts, human confirmation, or invented Quest Run.\n"
+            + _canonical_json({"instruction_bundle": instructions, "draft": request.draft,
+                "prepared_basis": {key: request.basis[key] for key in ("basis_ref", "basis_hash", "kind")},
+                "sealed_context": request.context, "output_schema": child_schema})
+        )
+        prompt = (
+            "You are the persistent Companion. Call spawn_agent exactly once with fork_context=true for a fresh short-lived first Question drafter. "
+            "Its short message points to BEGIN_FIRST_QUESTION_TASK through END_FIRST_QUESTION_TASK in inherited context. "
+            "Save the actual child identifier returned by spawn, wait for its final result, validate it against the schema, "
+            "and return {proposal_fork_native_session_ref,result}. Do not reuse an old proposal child. "
+            "Keep the current parent session. The child owns content only.\nBEGIN_FIRST_QUESTION_TASK\n"
+            + child_prompt + "\nEND_FIRST_QUESTION_TASK"
+        )
+        try:
+            raw, native_ref, _stdout = self._invoke(operation_name="first-question-synthesis", prompt=prompt, schema=schema,
+                native_session_ref=request.companion_native_session_ref, job_ref=request.job_ref,
+                workspace_binding=self._creation_workspace(request))
+            from jsonschema import Draft202012Validator
+            Draft202012Validator(schema).validate(raw)
+            if native_ref is None or raw["proposal_fork_native_session_ref"] == native_ref:
+                raise DraftingUnavailable("companion_proposal_fork_invalid")
+            return FirstQuestionSynthesisResult(_validated_question(raw["result"]["content"]), "codex_companion_fork",
+                native_ref, raw["proposal_fork_native_session_ref"], raw["result"]["revision"])
+        except IdeaSkillUnavailable as error:
+            raise DraftingUnavailable(error.code) from error
 
     def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
         child_prompt = (

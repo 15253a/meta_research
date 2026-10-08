@@ -900,6 +900,8 @@ class IdeaStageWorker:
             "accepted_question_binding":current.question.as_binding().as_dict(),
             "accepted_evidence_refs":list(refs),"evidence_reference_revision":page["total_count"],
             "evidence_page":page,"literature_binding":literature_reference(literature),
+            "creation_basis": (lambda basis: None if basis is None else self._research_memory.creation_bases.reference(basis))(
+                self._research_memory.creation_bases.for_question(current.question.question_ref, current.question.quest_ref)),
             "prior_accepted_bindings":[],"active_guidance_bindings":guidance}
 
 

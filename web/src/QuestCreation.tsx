@@ -8,29 +8,26 @@ import {
   type KeyboardEvent,
 } from "react";
 import {
-  acknowledgeScopedAssetIntake,
   cancelQuest,
+  captureCreationMaterialPath,
+  deliverCreationMaterials,
+  type CreationResearchBasis,
   confirmQuest,
   createQuest,
-  fetchAssetIntake,
   fetchQuestCreation,
   generateQuestionProposal,
-  hydrateScopedAssetIntakeRecovery,
   observeHostCompute,
   prepareAcquisitionSession,
   ProductError,
   reviseQuestDraft,
   saveQuestionProposal,
   sendIntentMessage,
-  submitScopedAssetIntake,
   type IntentSessionTurn,
   type DeepFetchActivityEvent,
   type LegacyQuestDraft,
   type QuestionContent,
   type QuestReceiptState,
-  type AssetIntakeResult,
   type ResearchAssetItem,
-  type ScopedAssetIntakeContext,
   type QuestCreationView,
   type QuestDraft,
 } from "./api";
@@ -45,9 +42,8 @@ type PendingIntentMessage = {
   knownTurnRefs: string[];
 };
 
-const QUEST_MATERIAL_LIMIT = 100;
+const QUEST_MATERIAL_LIMIT = 10000;
 const QUEST_MATERIAL_MAX_BYTES = 64 * 1024 * 1024;
-const QUEST_MATERIAL_POLL_TIMEOUT_MS = 30 * 60 * 1_000;
 const BOUNDARY_COMPLETION_MAX_LENGTH = 4_000;
 const BOUNDARY_EXCLUSIONS_MAX_LENGTH = 8_000;
 const BOUNDARY_SEGMENT_SEPARATOR = "\n\n范围与排除：";
@@ -56,8 +52,6 @@ const BOUNDARY_RAW_INPUT_MAX_LENGTH =
 const BOUNDARY_CANONICAL_INPUT_MAX_LENGTH =
   BOUNDARY_RAW_INPUT_MAX_LENGTH +
   BOUNDARY_SEGMENT_SEPARATOR.length;
-const questMaterialIntakeFlights = new Map<string, Promise<AssetIntakeResult>>();
-const questMaterialBindingFlights = new Map<string, Promise<QuestCreationView>>();
 const questMaterialCommitFlights = new Map<string, Promise<void>>();
 
 const blankDraft: QuestDraft = {
@@ -149,7 +143,7 @@ type Operation =
 type InFlightOperations = Record<Operation, boolean>;
 type ProductFailure = { code: string; message: string };
 type WriteConflict = "draft" | "proposal";
-type MaterialUploadStatus = "reading" | "accepting" | "binding" | "failed";
+type MaterialUploadStatus = "reading" | "delivering" | "failed";
 type MaterialUpload = {
   key: string;
   name: string;
@@ -237,7 +231,8 @@ export function QuestCreationWorkbench({
   const materialFolderInputRef = useRef<HTMLInputElement>(null);
   const materialUploadQueueRef = useRef<Promise<void>>(Promise.resolve());
   const materialUploadsRef = useRef<MaterialUpload[]>([]);
-  const recoveredMaterialJobsRef = useRef(new Set<string>());
+  const materialRetriesRef = useRef(new Map<string, () => Promise<void>>());
+  const materialDeliveryBasisRef = useRef(new Map<string, QuestCreationView>());
   const mountedRef = useRef(true);
   const openingPromiseRef = useRef<Promise<QuestCreationView> | null>(null);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -964,290 +959,81 @@ export function QuestCreationWorkbench({
     ));
   };
 
-  const settleMaterialUpload = async (
+  const deliverMaterialSelection = async (
     key: string,
-    initializationId: string,
-    initial: Awaited<ReturnType<typeof fetchAssetIntake>>,
+    operation: (basis: QuestCreationView) => Promise<QuestCreationView>,
   ) => {
-    const context = questMaterialIntakeContext(initializationId);
-    const jobRef = initial.job_ref;
-    let terminalStatus: "accepted" | "failed" | null = null;
     try {
-      const result = await awaitQuestMaterialIntake(initial);
-      terminalStatus = result.status === "accepted" || result.status === "failed"
-        ? result.status
-        : null;
-      if (result.status === "failed") {
-        throw new ProductError(result.failure?.code ?? "asset_intake_failed");
-      }
-      if (result.status !== "accepted" || !result.asset) {
-        throw new ProductError("asset_intake_status_invalid");
-      }
-
-      const asset = result.asset;
-      updateMaterialUpload(key, { status: "binding" });
-      if (mountedRef.current) {
-        setMaterialAssets((currentAssets) => {
-          const byRef = new Map(currentAssets.map((item) => [item.memory_ref, item]));
-          byRef.set(asset.memory_ref, asset);
-          return [...byRef.values()];
-        });
-        // Save the user's current text before the independent material CAS.
-        // Later edits never wait for this optional bind: whichever CAS loses
-        // retries from the newer basis, and Draft stale recovery only merges
-        // an exact accepted-material addition into the user's local fields.
-        await persistDraft();
-      }
-      await enqueueQuestMaterialCommit(initializationId, async () => {
-        let bound = normalizeQuestCreationView(
-          await bindAcceptedQuestMaterial(initializationId, asset),
-        );
-        if (mountedRef.current) {
-          let merged = false;
-          for (let attempt = 0; attempt < 5; attempt += 1) {
-            const acceptedBinding = bound.quest_draft.value.literature
-              .accepted_material_bindings.find(
-                (candidate) => candidate.version_ref === asset.version_ref,
-              );
-            if (acceptedBinding) {
-              const applied = applyView(bound, {
-                syncDraft: true,
-                syncProposal: !proposalDirtyRef.current,
-                adoptDirtyDraftBasis: true,
-                acceptedMaterialAdditions: [acceptedBinding],
-                notify: false,
-              });
-              merged = (applied || creationRef.current?.initialization_id === initializationId) &&
-                draftRef.current.literature.accepted_material_bindings.some(
-                  (candidate) => candidate.version_ref === asset.version_ref,
-                );
-              if (merged) break;
-            }
-            bound = normalizeQuestCreationView(
-              await fetchQuestCreation(initializationId),
-            );
+      updateMaterialUpload(key, { status: "delivering", reason: undefined });
+      await enqueueQuestMaterialCommit(creationRef.current!.initialization_id, async () => {
+        const saved = await persistDraft();
+        if (!saved) throw new ProductError("quest_draft_stale");
+        let received: QuestCreationView | null = null;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const basis = materialDeliveryBasisRef.current.get(key) ?? await fetchQuestCreation(saved.initialization_id);
+          materialDeliveryBasisRef.current.set(key, basis);
+          try { received = await operation(basis); break; }
+          catch (caught) {
+            if (!(caught instanceof ProductError) || caught.code !== "quest_draft_stale") throw caught;
+            materialDeliveryBasisRef.current.delete(key);
           }
-          if (!merged) throw new ProductError("quest_material_binding_pending");
         }
-        // Only a verified Owner bind that has also reached the current local
-        // merge may retire its durable intake pointer. Keeping this inside the
-        // per-initialization commit queue prevents a later AssetVersion from
-        // acknowledging ahead of an earlier held CAS response.
-        acknowledgeScopedAssetIntake(context, result.job_ref);
+        if (!received) throw new ProductError("quest_draft_stale");
+        applyView(received, { syncDraft: true, adoptDirtyDraftBasis: true, notify: false });
       });
-      if (mountedRef.current) {
-        replaceMaterialUploads((currentUploads) => currentUploads.filter(
-          (upload) => upload.key !== key,
-        ));
-        onChanged();
-      }
+      materialRetriesRef.current.delete(key);
+      materialDeliveryBasisRef.current.delete(key);
+      replaceMaterialUploads((uploads) => uploads.filter((item) => item.key !== key));
+      onChanged();
     } catch (caught) {
       const code = caught instanceof ProductError ? caught.code : "unknown_error";
-      // Keep an accepted intake pointer until the exact AssetVersion has been
-      // durably bound. A reload can then resume the independent Quest write.
-      // Failed intakes and already-closed Quests have no remaining bind work.
-      if (terminalStatus === "failed" || code === "quest_material_binding_closed") {
-        acknowledgeScopedAssetIntake(context, jobRef);
-      }
-      updateMaterialUpload(key, {
-        status: "failed",
-        reason: materialUploadFailureCopy(code),
-      });
-    }
-  };
-
-  const runMaterialUpload = async (
-    key: string,
-    file: File,
-    selectionMode: "files" | "folder",
-    initializationId: string,
-  ) => {
-    try {
-      if (file.size > QUEST_MATERIAL_MAX_BYTES) {
-        throw new ProductError("asset_content_too_large");
-      }
-      const contentBase64 = arrayBufferToBase64(await file.arrayBuffer());
-      updateMaterialUpload(key, { status: "accepting" });
-      const result = await submitScopedAssetIntake(
-        questMaterialIntakeContext(initializationId),
-        {
-          source_kind: "file",
-          custody_mode: "managed",
-          display_name: file.name,
-          media_type: file.type || "application/octet-stream",
-          content_base64: contentBase64,
-          asynchronous: true,
-          provenance: {
-            submitted_via: "quest_creation",
-            initialization_id: initializationId,
-            selection_mode: selectionMode,
-            relative_path: (file as File & { webkitRelativePath?: string })
-              .webkitRelativePath || null,
-          },
-        },
-      );
-      // The selection queue ends at the durable POST ACK. This settlement
-      // owns its own failure handling and may poll independently, so one slow
-      // accepted-material job cannot prevent the next file from being read
-      // and assigned its own durable operation/job pointer.
-      void settleMaterialUpload(key, initializationId, result);
-    } catch (caught) {
-      const code = caught instanceof ProductError ? caught.code : "unknown_error";
-      updateMaterialUpload(key, {
-        status: "failed",
-        reason: materialUploadFailureCopy(code),
-      });
-    }
-  };
-
-  const runMaterialDirectory = async (
-    key: string,
-    directory: string,
-    initializationId: string,
-  ) => {
-    try {
-      updateMaterialUpload(key, { status: "accepting" });
-      const result = await submitScopedAssetIntake(
-        questMaterialIntakeContext(initializationId),
-        {
-          source_kind: "directory",
-          custody_mode: "linked_local",
-          display_name: materialDirectoryName(directory),
-          media_type: "application/x-directory",
-          source_locator: directory,
-          asynchronous: true,
-          provenance: {
-            submitted_via: "quest_creation",
-            initialization_id: initializationId,
-            selection_mode: "directory_path",
-          },
-        },
-      );
-      void settleMaterialUpload(key, initializationId, result);
-    } catch (caught) {
-      const code = caught instanceof ProductError ? caught.code : "unknown_error";
-      updateMaterialUpload(key, {
-        status: "failed",
-        reason: materialUploadFailureCopy(code),
-      });
+      updateMaterialUpload(key, { status: "failed", reason: materialUploadFailureCopy(code) });
     }
   };
 
   const useMaterialDirectory = () => {
-    const initializationId = creationRef.current?.initialization_id;
+    if (!creationRef.current || !materialDirectory.trim()) return;
     const directory = materialDirectory.trim();
-    if (!initializationId || !directory) return;
-    if (materialUploadsRef.current.some(
-      (upload) => upload.name === directory && upload.status !== "failed",
-    )) {
-      setMaterialDirectory("");
-      return;
-    }
-    const remaining = remainingQuestMaterialSlots(
-      draftRef.current,
-      materialUploadsRef.current,
-    );
-    if (remaining < 1) {
-      errorFocusRef.current = "alert";
-      setError(questMaterialLimitFailure(remaining));
-      return;
-    }
-    const key = `directory-${Date.now()}-${crypto.randomUUID()}`;
-    replaceMaterialUploads((currentUploads) => [
-      ...currentUploads,
-      {
-        key,
-        name: directory,
-        status: "accepting",
-      },
-    ]);
+    const key = crypto.randomUUID();
+    replaceMaterialUploads((uploads) => [...uploads, { key, name: directory, status: "delivering" }]);
     setMaterialDirectory("");
-    materialUploadQueueRef.current = materialUploadQueueRef.current.then(
-      () => runMaterialDirectory(key, directory, initializationId),
-    );
+    const retry = () => deliverMaterialSelection(key, (basis) => captureCreationMaterialPath(basis, key, directory));
+    materialRetriesRef.current.set(key, retry);
+    materialUploadQueueRef.current = materialUploadQueueRef.current.then(retry);
   };
 
-  const selectMaterialFiles = (
-    selected: FileList | null,
-    selectionMode: "files" | "folder",
-  ) => {
-    const initializationId = creationRef.current?.initialization_id;
-    if (!selected || !selected.length || !initializationId) return;
+  const selectMaterialFiles = (selected: FileList | null, selectionMode: "files" | "folder") => {
+    if (!creationRef.current || !selected?.length) return;
     const files = [...selected];
-    const remaining = remainingQuestMaterialSlots(
-      draftRef.current,
-      materialUploadsRef.current,
-    );
-    if (files.length > remaining) {
-      errorFocusRef.current = "alert";
-      setError(questMaterialLimitFailure(remaining));
+    const totalBytes = files.reduce((total, file) => total + file.size, 0);
+    const remaining = remainingQuestMaterialSlots(draftRef.current, materialUploadsRef.current);
+    if (files.length > remaining || totalBytes > QUEST_MATERIAL_MAX_BYTES) {
+      setError(files.length > remaining ? questMaterialLimitFailure(remaining) : {
+        code: "asset_content_too_large", message: "本次材料合计超过 64 MiB，请缩小文件夹或分次提供。",
+      });
       return;
     }
-    const uploads = files.map((file, index) => ({
-      key: `${Date.now()}-${index}-${crypto.randomUUID()}`,
-      name: file.name,
-      status: "reading" as const,
-    }));
-    replaceMaterialUploads((currentUploads) => [...currentUploads, ...uploads]);
-    files.forEach((file, index) => {
-      const upload = uploads[index];
-      materialUploadQueueRef.current = materialUploadQueueRef.current.then(
-        () => runMaterialUpload(upload.key, file, selectionMode, initializationId),
-      );
-    });
-  };
-
-  useEffect(() => {
-    const initializationId = creation?.initialization_id;
-    if (!initializationId) return;
-    let active = true;
-    void hydrateScopedAssetIntakeRecovery(
-      questMaterialIntakeContext(initializationId),
-    ).then((pointers) => {
-      if (!active || !mountedRef.current) return;
-      for (const pointer of pointers) {
-        if (recoveredMaterialJobsRef.current.has(pointer.job_ref)) continue;
-        recoveredMaterialJobsRef.current.add(pointer.job_ref);
-        const key = `recovery:${pointer.job_ref}`;
-        replaceMaterialUploads((currentUploads) => [
-          ...currentUploads.filter((upload) => upload.key !== key),
-          {
-            key,
-            name: pointer.display_name,
-            status: "accepting",
-          },
-        ]);
-        materialUploadQueueRef.current = materialUploadQueueRef.current.then(
-          async () => {
-            try {
-              const result = await fetchAssetIntake(pointer.job_ref);
-              // A synthetic recovery ref may replay the exact POST here, so
-              // the queue waits through that durable ACK. Polling and binding
-              // then settle independently and cannot serialize later jobs.
-              void settleMaterialUpload(key, initializationId, result);
-            } catch (caught) {
-              const code = caught instanceof ProductError
-                ? caught.code
-                : "unknown_error";
-              updateMaterialUpload(key, {
-                status: "failed",
-                reason: materialUploadFailureCopy(code),
-              });
-            }
-          },
-        );
+    const key = crypto.randomUUID();
+    const relativePath = (file: File) => file.webkitRelativePath || file.name;
+    const name = selectionMode === "folder" ? relativePath(files[0]).split("/")[0] : `${files.length} 个文件`;
+    replaceMaterialUploads((uploads) => [...uploads, { key, name, status: "reading" }]);
+    let submission: Parameters<typeof deliverCreationMaterials>[1] | null = null;
+    const retry = async () => {
+      try {
+        if (!submission) {
+          const filesToDeliver = [];
+          for (const file of files) filesToDeliver.push({ relative_path: relativePath(file), content_base64: arrayBufferToBase64(await file.arrayBuffer()) });
+          submission = { submission_ref: key, folder: selectionMode === "folder", files: filesToDeliver };
+        }
+        const sealed = submission;
+        await deliverMaterialSelection(key, (basis) => deliverCreationMaterials(basis, sealed));
+      } catch (caught) {
+        updateMaterialUpload(key, { status: "failed", reason: materialUploadFailureCopy(caught instanceof ProductError ? caught.code : "unknown_error") });
       }
-    }).catch((caught) => {
-      if (active && mountedRef.current) showError(caught);
-    });
-    return () => {
-      active = false;
     };
-    // The exact initialization identity owns this recovery scan. Any queued
-    // settlement continues after unmount; a scan still hydrating is resumed by
-    // the next instance instead of retaining a stale component closure.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [creation?.initialization_id]);
+    materialRetriesRef.current.set(key, retry);
+    materialUploadQueueRef.current = materialUploadQueueRef.current.then(retry);
+  };
 
   const updateProposal = (key: keyof QuestionContent, value: string) => {
     const currentProposal = proposalRef.current;
@@ -1616,7 +1402,7 @@ export function QuestCreationWorkbench({
   const acquisitionActionLocked = terminal || inFlight.acquisition || inFlight.generating ||
     proposalGenerationActive || inFlight.reviewing || terminalMutationActive;
   const proposalActionLocked = terminal || inFlight.compute || inFlight.acquisition || inFlight.generating ||
-    proposalGenerationActive || inFlight.reviewing || terminalMutationActive;
+    proposalGenerationActive || inFlight.reviewing || terminalMutationActive || materialUploads.some((item) => item.status !== "failed");
   const anyOperationActive = Object.values(inFlight).some(Boolean);
   const draftComplete = draftIsComplete(draft);
   const proposalComplete = questionIsComplete(proposal);
@@ -1901,7 +1687,7 @@ export function QuestCreationWorkbench({
                       <option value="oa_only">只搜索开放获取资源</option>
                       <option
                         value="provided_only"
-                        disabled={draft.literature.accepted_material_bindings.length === 0}
+                        disabled={!draft.literature.accepted_material_bindings.length && !draft.material_manifest?.entries.length}
                       >
                         只使用我提供的材料
                       </option>
@@ -1988,8 +1774,8 @@ export function QuestCreationWorkbench({
                   {draft.literature.mode === "provided_only" ? (
                     <small className="quest-library-boundary">
                       {draft.literature.accepted_material_bindings.length
-                        ? `已绑定 ${draft.literature.accepted_material_bindings.length} 个 RM Accepted AssetVersion。`
-                        : "请在下方选择至少一个已由 Research Memory 接纳的精确版本。"}
+                        ? `已保留 ${draft.literature.accepted_material_bindings.length} 个原件版本。`
+                        : "请在下方提供已有资料；系统阅读后选择需要保留的原件。"}
                     </small>
                   ) : null}
                 </div>
@@ -1998,7 +1784,7 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="materials" aria-labelledby="quest-materials-title">
                 <div className="quest-section-heading">
                   <b id="quest-materials-title">研究材料 <em>可选</em></b>
-                  <small>输入目录路径，材料留在原处</small>
+                  <small>先提供资料，再阅读和选择</small>
                 </div>
                 <div className="quest-material-card">
                   <div className="quest-material-directory">
@@ -2035,8 +1821,14 @@ export function QuestCreationWorkbench({
                     </button>
                   </div>
                   <p className="quest-material-footnote">
-                    请输入运行 Meta Research 服务的机器可访问的绝对目录。系统只建立本地关联，不上传或复制文件。
+                    请输入服务所在机器可访问的绝对目录。系统捕获资料到本次创建工作区，阅读后选择需要长期保留的原件。
                   </p>
+                  <div className="quest-material-actions">
+                    <button className="quest-material-button" type="button" disabled={!creation || draftInteractionLocked}
+                      onClick={() => materialFolderInputRef.current?.click()}>提供文件夹</button>
+                    <button className="quest-material-button" type="button" disabled={!creation || draftInteractionLocked}
+                      onClick={() => materialFilesInputRef.current?.click()}>提供文件</button>
+                  </div>
                   <input
                     ref={materialFolderInputRef}
                     hidden
@@ -2061,7 +1853,7 @@ export function QuestCreationWorkbench({
                       event.target.value = "";
                     }}
                   />
-                  {materialUploads.length || draft.literature.accepted_material_bindings.length ? (
+                  {materialUploads.length || draft.material_manifest?.entries.length || draft.literature.accepted_material_bindings.length ? (
                     <div className="quest-material-statuses" aria-live="polite">
                       {draft.literature.accepted_material_bindings.map((binding) => {
                         const versionRef = String(binding.version_ref ?? "");
@@ -2079,20 +1871,27 @@ export function QuestCreationWorkbench({
                           </div>
                         );
                       })}
+                      {draft.material_manifest?.entries.map((entry) => (
+                        <div className="quest-material-status accepted" key={entry.material_key}>
+                          <span aria-hidden="true">✓</span><b>{entry.relative_path}</b>
+                          <small>{creation?.creation_basis?.sources.find((source) => source.material_key === entry.material_key)?.selection_reason ? "原件已保留" : "已交付到创建工作区"}</small>
+                        </div>
+                      ))}
                       {materialUploads.map((upload) => (
                         <div className={`quest-material-status ${upload.status}`} key={upload.key}>
                           <span aria-hidden="true">{upload.status === "failed" ? "!" : "…"}</span>
                           <b>{upload.name}</b>
                           <small>{upload.reason ?? materialUploadStatusCopy(upload.status)}</small>
+                          {upload.status === "failed" ? <button type="button" onClick={() => void materialRetriesRef.current.get(upload.key)?.()}>重试交付</button> : null}
                         </div>
                       ))}
                     </div>
                   ) : (
-                    <p className="quest-material-empty">尚未设置材料目录。这里为空不会阻塞 Direct 创建。</p>
+                    <p className="quest-material-empty">可以提供已有课题资料，也可以直接从目标开始。</p>
                   )}
                   {draft.literature.mode === "provided_only" ? (
                     <p className="quest-material-footnote">
-                      目录正式加入后，“只使用我提供的材料”才会继续生成第一问。
+                      资料交付完成后，系统先阅读已有工作，再生成第一问。
                     </p>
                   ) : null}
                 </div>
@@ -2201,6 +2000,7 @@ export function QuestCreationWorkbench({
                 </div>
               </section>
 
+              {creation?.creation_basis ? <CreationUnderstanding basis={creation.creation_basis} /> : null}
               <section className="quest-journey-section" data-journey-section="question-proposal" aria-labelledby="quest-proposal-title">
                 <div className="quest-section-heading">
                   <b id="quest-proposal-title">系统起草的第一个研究问题</b>
@@ -2755,6 +2555,7 @@ function mergeServerManagedDraft(
   }
   return {
     ...cloneDraft(local),
+    material_manifest: server.material_manifest,
     resource_envelope_ref: server.resource_envelope_ref,
     resource_envelope_hash: server.resource_envelope_hash,
     literature: {
@@ -3415,12 +3216,6 @@ function formatMemory(memoryTotalMib: number): string {
   return `${Number.isInteger(gib) ? gib.toFixed(0) : gib.toFixed(1)} GiB`;
 }
 
-function questMaterialIntakeContext(
-  initializationId: string,
-): ScopedAssetIntakeContext {
-  return { kind: "quest_creation", ref: initializationId };
-}
-
 function boundaryText(draft: QuestDraft): string {
   const completion = draft.completion_criteria;
   const exclusions = draft.literature.scope_exclusions;
@@ -3469,84 +3264,6 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-function materialDirectoryName(directory: string): string {
-  const normalized = directory.trim().replace(/[\\/]+$/, "");
-  const leaf = normalized.split(/[\\/]/).at(-1)?.trim();
-  return leaf || "research-materials";
-}
-
-function researchAssetBinding(asset: ResearchAssetItem): Record<string, unknown> {
-  return {
-    asset_ref: asset.asset_ref,
-    version_ref: asset.version_ref,
-    content_hash: asset.content_hash,
-    manifest_hash: asset.manifest_hash,
-    receipt: { ...asset.receipt },
-  };
-}
-
-function awaitQuestMaterialIntake(
-  initial: AssetIntakeResult,
-): Promise<AssetIntakeResult> {
-  const existing = questMaterialIntakeFlights.get(initial.job_ref);
-  if (existing) return existing;
-  const aliases = new Set([initial.job_ref]);
-  let flight!: Promise<AssetIntakeResult>;
-  flight = (async () => {
-    const deadline = Date.now() + QUEST_MATERIAL_POLL_TIMEOUT_MS;
-    let result = initial;
-    let retryCount = 0;
-    while (["queued", "processing"].includes(result.status)) {
-      if (Date.now() >= deadline) {
-        throw new ProductError("quest_material_intake_poll_timeout");
-      }
-      await delay(Math.min(4_000, 250 * 2 ** Math.min(retryCount, 4)));
-      try {
-        result = await fetchAssetIntake(result.job_ref);
-        retryCount = 0;
-        if (!aliases.has(result.job_ref)) {
-          aliases.add(result.job_ref);
-          questMaterialIntakeFlights.set(result.job_ref, flight);
-        }
-      } catch (caught) {
-        retryCount += 1;
-        if (
-          retryCount >= 5 ||
-          caught instanceof ProductError &&
-            /^request_failed:(401|403|4\d\d)$/.test(caught.code)
-        ) throw caught;
-      }
-    }
-    return result;
-  })().finally(() => {
-    for (const alias of aliases) {
-      if (questMaterialIntakeFlights.get(alias) === flight) {
-        questMaterialIntakeFlights.delete(alias);
-      }
-    }
-  });
-  questMaterialIntakeFlights.set(initial.job_ref, flight);
-  return flight;
-}
-
-async function bindAcceptedQuestMaterial(
-  initializationId: string,
-  asset: ResearchAssetItem,
-): Promise<QuestCreationView> {
-  const bindingKey = `${initializationId}:${asset.version_ref}`;
-  const existing = questMaterialBindingFlights.get(bindingKey);
-  if (existing) return existing;
-  let flight!: Promise<QuestCreationView>;
-  flight = bindAcceptedQuestMaterialOnce(initializationId, asset)
-    .finally(() => {
-      if (questMaterialBindingFlights.get(bindingKey) === flight) {
-        questMaterialBindingFlights.delete(bindingKey);
-      }
-    });
-  questMaterialBindingFlights.set(bindingKey, flight);
-  return flight;
-}
-
 function enqueueQuestMaterialCommit(
   initializationId: string,
   operation: () => Promise<void>,
@@ -3569,40 +3286,49 @@ function enqueueQuestMaterialCommit(
   return current;
 }
 
-async function bindAcceptedQuestMaterialOnce(
-  initializationId: string,
-  asset: ResearchAssetItem,
-): Promise<QuestCreationView> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const latest = normalizeQuestCreationView(
-      await fetchQuestCreation(initializationId),
-    );
-    if (latest.quest_draft.value.literature.accepted_material_bindings.some(
-      (binding) => binding.version_ref === asset.version_ref,
-    )) return latest;
-    if (creationIsLocked(latest)) {
-      throw new ProductError("quest_material_binding_closed");
-    }
-    const nextDraft = cloneDraft(latest.quest_draft.value);
-    nextDraft.literature.accepted_material_bindings.push(
-      researchAssetBinding(asset),
-    );
-    try {
-      return await reviseQuestDraft(latest, nextDraft, draftBasisOf(latest));
-    } catch (caught) {
-      if (!(caught instanceof ProductError) || caught.code !== "quest_draft_stale") {
-        throw caught;
-      }
-    }
-  }
-  throw new ProductError("quest_material_binding_pending");
+function CreationUnderstanding({ basis }: { basis: CreationResearchBasis }) {
+  const labels: Record<keyof CreationResearchBasis["understanding"], string> = {
+    material_composition: "资料构成", work_already_done: "已完成工作", claims_and_conditions: "已有结论与条件",
+    conflicts: "冲突", gaps: "证据缺口", unfinished_questions: "尚未解决的问题",
+  };
+  const sources = new Map(basis.sources.map((source) => [source.material_key, source.relative_path]));
+  return <section className="quest-journey-section quest-understanding" aria-labelledby="quest-understanding-title">
+    <div className="quest-section-heading">
+      <b id="quest-understanding-title">已有课题的理解</b>
+      <small>{basis.kind === "literature_revised" ? "结合文献修正后" : "根据已有资料"}</small>
+    </div>
+    {basis.freshness === "stale" ? <p role="status">创建依据已经变化。下面保留生成时的理解；重新生成会重新阅读当前资料。</p> : null}
+    {(Object.keys(labels) as Array<keyof typeof labels>).map((field) => <div key={field}>
+      <h3>{labels[field]}</h3>
+      {basis.understanding[field].length ? <ul>{basis.understanding[field].map((statement) => <li key={statement.ref}>
+        <p>{statement.text}</p>
+        {statement.conditions.length ? <small>条件：{statement.conditions.join("；")}</small> : null}
+        <small>{statement.kind === "agent_inference" ? "系统推断" : "资料报告"}
+          {statement.sources.map((citation) => ` · ${sources.get(citation.material_key) ?? citation.material_key} ${citation.location}`).join("")}</small>
+      </li>)}</ul> : <p>当前资料未形成这一项结论。</p>}
+    </div>)}
+    <details open><summary>阅读覆盖与原件选择</summary><ul>{basis.sources.map((source) => <li key={source.material_key}>
+      <b>{source.relative_path}</b> · {{ read: "已读", partial: "部分已读", unread: "未读" }[source.coverage.kind]}
+      {source.coverage.unread_description ? <p>{source.coverage.unread_description}</p> : null}
+      <p>{source.selection_reason ? `原件已保留：${source.selection_reason}` : "资料保留在本次工作区，后续可继续读取。"}</p>
+    </li>)}</ul></details>
+    {basis.kind === "literature_revised" ? <div>
+      <h3>文献带来的修正</h3>
+      {basis.corrections.length ? <ul>{basis.corrections.map((correction, index) => <li key={`${correction.prior_statement_ref}-${index}`}>
+        <p>{correction.explanation}</p>
+        <small>原资料：{correction.original_sources.map((key) => sources.get(key) ?? key).join("、")}</small>
+        <small>文献：{correction.literature_sources.map((citation) => `${citation.paper_id} · ${citation.locator}`).join("；")}</small>
+      </li>)}</ul> : <p>本次文献结果未支持新增修正。</p>}
+      <p>{basis.search_assessment?.assessment}</p>
+      {basis.search_assessment?.limitations.length ? <ul>{basis.search_assessment.limitations.map((limit) => <li key={limit}>{limit}</li>)}</ul> : null}
+    </div> : null}
+  </section>;
 }
 
 function materialUploadStatusCopy(status: MaterialUploadStatus): string {
   return {
     reading: "正在读取",
-    accepting: "后台处理中；你可以继续填写",
-    binding: "已接纳，正在加入当前草案",
+    delivering: "正在交付到创建工作区",
     failed: "未加入",
   }[status];
 }
@@ -3611,7 +3337,7 @@ function remainingQuestMaterialSlots(
   draft: QuestDraft,
   uploads: MaterialUpload[],
 ): number {
-  const bound = draft.literature.accepted_material_bindings.length;
+  const bound = draft.material_manifest?.entries.length ?? 0;
   const pending = uploads.filter((upload) => upload.status !== "failed").length;
   return Math.max(0, QUEST_MATERIAL_LIMIT - bound - pending);
 }

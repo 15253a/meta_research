@@ -2615,6 +2615,13 @@ class CodexDeepFetchAdapter:
     ) -> str:
         skill_entrypoint = self._skill_root / "SKILL.md"
         route_contract = ""
+        creation_contract = ""
+        if request.scope.get("creation_basis") is not None:
+            creation_contract = (
+                "Before Radar read scope.creation_basis through research_memory.creation_basis.read with its exact basis_ref and expected_basis_hash. "
+                "Read relevant originals and use claim conditions, conflicts, gaps, and unfinished questions to guide search, acquisition, and independent Readers. "
+                "This initialization has no Quest. Keep imported results external. New evidence may qualify or contradict the old understanding.\n"
+            )
         if request.scope.get("literature_mode") == "oa_only":
             route_contract = (
                 "本请求的 oa_only 是用户明确选择的主路线；跳过 "
@@ -2647,6 +2654,7 @@ class CodexDeepFetchAdapter:
             f"draft_hash={request.draft_hash}\n"
             f"scope={canonical_json(request.scope)}\n"
             f"{route_contract}"
+            f"{creation_contract}"
             "accepted_material_bindings="
             f"{canonical_json(list(request.accepted_material_bindings))}"
         )
@@ -3435,6 +3443,7 @@ def _deepfetch_skill_root() -> Path:
         root / "references" / "openalex.md",
         root / "references" / "papers-json.md",
         root / "references" / "summary.md",
+        root / "references" / "creation-basis.md",
         root / "scripts" / "papers.py",
         root / "scripts" / "openalex.py",
     )

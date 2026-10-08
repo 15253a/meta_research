@@ -201,6 +201,9 @@ class _DeepFetchRequestAuthorityRouter:
         self._human_collaboration = human_collaboration
         self._advancement_engine = advancement_engine
 
+    def prepare_deepfetch_creation_basis(self, request):
+        return self._human_collaboration.prepare_deepfetch_creation_basis(request)
+
     def query_next_deepfetch_request(
         self, excluded_request_refs: tuple[str, ...] = ()
     ) -> DeepFetchRunRequest | None:
@@ -952,6 +955,8 @@ def build_production_runtime(
         bind_workspaces = getattr(provider, "bind_workspaces", None)
         if callable(bind_workspaces):
             bind_workspaces(root_workspaces)
+    human_collaboration._creation_workspaces = root_workspaces
+    research_memory.creation_bases.workspaces = root_workspaces
     semantic_gateway = create_semantic_owner_gateway(
         root_workspaces=root_workspaces,
         research_graph=owners.research_graph,

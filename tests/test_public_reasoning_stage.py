@@ -489,12 +489,14 @@ def _confirm_deepfetch_quest(runtime) -> dict[str, object]:
         preview_hash=str(previewed["confirmation_preview"]["hash"]),
         idempotency_key="reasoning-deepfetch-confirm",
     )
-    for _step in range(8):
+    for _step in range(16):
         completed = human.query_quest_creation(initialization_id)
         if completed["status"] == "completed":
             return completed
         assert human.reconcile_once()
-    raise AssertionError("DeepFetch Quest did not complete")
+    completed = human.query_quest_creation(initialization_id)
+    assert completed["status"] == "completed", "DeepFetch Quest did not complete"
+    return completed
 
 
 def _tick_reasoning(runtime) -> dict[str, object]:

@@ -206,7 +206,10 @@ def _confirm_direct_quest(runtime) -> dict[str, object]:
         preview_hash=previewed["confirmation_preview"]["hash"],
         idempotency_key="idea-confirm",
     )
-    for _step in range(5):
+    for _step in range(16):
+        current = human.query_quest_creation(opened["initialization_id"])
+        if current["status"] == "completed":
+            break
         if not human.reconcile_once():
             break
     completed = human.query_quest_creation(opened["initialization_id"])

@@ -1863,3 +1863,8 @@
     animation-iteration-count: 1 !important;
   }
 }
+.quest-material-actions { display: flex; gap: 0.5rem; margin: 0.75rem 0; }
+.quest-understanding h3 { font-size: 0.9rem; margin: 1rem 0 0.5rem; }
+.quest-understanding p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.4rem 0; }
+.quest-understanding small { display: block; color: var(--muted, #737b89); overflow-wrap: anywhere; }
+.quest-understanding details { margin-top: 1rem; }

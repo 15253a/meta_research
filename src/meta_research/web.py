@@ -205,6 +205,31 @@ class QuestDraftV2Request(BaseModel):
         default_factory=LiteratureConfigurationRequest
     )
     background_and_initial_direction: str = Field(default="", max_length=12000)
+    material_manifest: dict[str, object] | None = None
+
+
+class CreationMaterialFileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    relative_path: str = Field(min_length=1, max_length=4096)
+    content_base64: str
+
+
+class CreationMaterialDeliveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_draft_revision: int = Field(ge=1)
+    expected_draft_hash: str = Field(min_length=64, max_length=64)
+    submission_ref: str = Field(min_length=1, max_length=128)
+    folder: bool = False
+    complete: bool = True
+    files: list[CreationMaterialFileRequest] = Field(min_length=1, max_length=10000)
+
+
+class CreationMaterialPathRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_draft_revision: int = Field(ge=1)
+    expected_draft_hash: str = Field(min_length=64, max_length=64)
+    submission_ref: str = Field(min_length=1, max_length=128)
+    locator: str = Field(min_length=1, max_length=4096)
 
 
 class ReviseQuestDraftV2Request(BaseModel):
@@ -1815,7 +1840,7 @@ def create_app(
         request: Request,
         draft: ReviseQuestDraftV2Request,
     ) -> dict[str, object]:
-        owner_draft = draft.draft.model_dump()
+        owner_draft = draft.draft.model_dump(exclude={"material_manifest"})
         idempotency_key = _idempotency_key(request)
         return await _await_bounded_asset_io(
             lambda: runtime.owners.human_collaboration.revise_quest_draft(
@@ -1828,6 +1853,18 @@ def create_app(
             slots=asset_io_slots,
             timeout_code="quest_material_io_timeout",
         )
+
+    @app.post("/api/v1/quest-initializations/{initialization_id}/material-deliveries")
+    async def deliver_creation_materials(initialization_id: str, request: Request, delivery: CreationMaterialDeliveryRequest):
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.deliver_initialization_materials(initialization_id, delivery.model_dump(), _idempotency_key(request)),
+            slots=asset_io_slots, timeout_code="quest_material_io_timeout")
+
+    @app.post("/api/v1/quest-initializations/{initialization_id}/material-paths")
+    async def deliver_creation_path(initialization_id: str, request: Request, delivery: CreationMaterialPathRequest):
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.deliver_initialization_materials(initialization_id, delivery.model_dump(), _idempotency_key(request)),
+            slots=asset_io_slots, timeout_code="quest_material_io_timeout")
 
     @app.post(
         "/api/v1/quest-initializations/{initialization_id}/proposal",

@@ -72,6 +72,15 @@ def read_stage_context(advancement_engine, agent_runtime, research_graph, resear
                 raise SemanticMcpError('research_note_predecessor_unbound')
         if source=='context_pack':
             value=pack
+        elif source in {'creation_understanding','creation_corrections','creation_sources'}:
+            binding=pack.get('creation_basis')
+            if not isinstance(binding,dict):
+                raise SemanticMcpError('stage_creation_basis_unbound')
+            basis=research_memory.creation_bases.for_question(question.question_ref,question.quest_ref)
+            if basis is None or research_memory.creation_bases.reference(basis)!=binding:
+                raise SemanticMcpError('stage_creation_basis_unbound')
+            source_ref=basis['basis_ref']
+            value=(basis['understanding'] if source=='creation_understanding' else basis['corrections'] if source=='creation_corrections' else research_memory.creation_bases.source_views(basis))
         elif source=='question':
             source_ref=question.content_ref
             value=research_memory.read_question_content(question.content_ref,question.content_hash)
@@ -139,7 +148,7 @@ def stage_context_operations(*, advancement_engine, agent_runtime, research_grap
         description='Read exact frozen stage inputs or accepted history within the authenticated current Question/Quest. JSON path is not a filesystem path. Return <=16384 UTF-8 text bytes with exact source hash, next_offset and complete; history index_offset pages 12 outcomes/Questions or 32 evidence references.',
         input_schema={'type':'object','properties':{
             'context_pack_ref':{'type':'string','minLength':1,'maxLength':256},
-            'source':{'type':'string','enum':['context_pack','question','literature_records','scientific_outcome','predecessor_closure','question_history','question_index','evidence_index']},
+            'source':{'type':'string','enum':['context_pack','question','literature_records','creation_understanding','creation_corrections','creation_sources','scientific_outcome','predecessor_closure','question_history','question_index','evidence_index']},
             'source_ref':{'type':'string','maxLength':256},
             'path':{'type':'array','maxItems':16,'items':{'type':'string','maxLength':256}},
             'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':16384},
