@@ -1,3 +1,6 @@
+import { ServerMaterialPicker } from "./ServerMaterialPicker";
+import { useWorkMaterialDraft, WorkMaterialFields, WorkMaterialReferences, HumanRequestMaterialReferences } from "./WorkMaterialForm";
+import { currentMaterialReceiverPath, type ServerMaterialSelection } from "./workMaterialApi";
 import {
   useEffect,
   useMemo,
@@ -20,6 +23,7 @@ import {
   executeHumanCommand,
   hydratePendingHumanRequestRecovery,
   pendingHumanRequestResponse,
+  pendingHumanRequestResponsePreview,
   hasLegacyHumanRequestMaterial,
   previewHumanCommand,
   ProductError,
@@ -1794,6 +1798,7 @@ function GuidanceStrengthSelect({ value, onChange, disabled, label = "指导力�
 function HumanGuidanceComposer({ scopeRef, onChanged }: {
   scopeRef: string; onChanged: () => void;
 }) {
+  const materials = useWorkMaterialDraft(`guidance:${scopeRef}`, currentMaterialReceiverPath(scopeRef.replace(/^quest:/, "")));
   const [text, setText] = useState("");
   const [strength, setStrength] = useState<GuidanceStrength>(3);
   const [pending, setPending] = useState(false);
@@ -1806,7 +1811,10 @@ function HumanGuidanceComposer({ scopeRef, onChanged }: {
     setPending(true);
     setMessage(null);
     try {
-      await submitHumanGuidance(scopeRef, text, strength);
+      if (materials.selection) {
+        const result = await materials.submit("/api/v1/human-collaboration/guidance", { scope_ref: scopeRef, text, strength, work_materials: materials.materialCommand() });
+        if (!result) return;
+      } else await submitHumanGuidance(scopeRef, text, strength);
       setText("");
       setMessage("指导已保存。下一研究操作将读取这份原文。");
       onChanged();
@@ -1828,7 +1836,8 @@ function HumanGuidanceComposer({ scopeRef, onChanged }: {
       </label>
       <GuidanceStrengthSelect value={strength} onChange={setStrength} disabled={pending} />
       {strength === 5 ? <p>目标更新待对齐。当前研究继续，目标变化由目标演化流程处理。</p> : null}
-      <button type="submit" disabled={pending || !text.trim()}>保存指导</button>
+      <WorkMaterialFields draft={materials} disabled={pending} onRetried={() => { setText(""); setMessage("指导及材料引用已保存。材料尚未表示已理解。"); onChanged(); }} />
+      <button type="submit" disabled={pending || materials.busy || !!materials.pending || (!!materials.selection && !materials.receiver) || !text.trim()}>保存指导</button>
       {message ? <p role="status">{message}</p> : null}
     </form>
   );
@@ -1887,6 +1896,7 @@ function SoftConstraintCard({
     <article className={`lumen-constraint ${constraint.status}`}>
       <small>人类指导 · {constraint.status === "active" ? "生效中" : "已撤回"}</small>
       <p>{constraint.text ?? constraint.content ?? documentText(constraint.guidance, "text")}</p>
+      <WorkMaterialReferences receipts={constraint.work_materials ?? []} />
       <span>力度 {constraint.strength ?? 3} · {guidanceStrengthLabels[constraint.strength ?? 3]}</span>
       {constraint.strength === 5 ? <p>目标更新待对齐</p> : null}
       {constraint.deliveries?.length ? (
@@ -2736,80 +2746,17 @@ type SubmitResponse = (
 ) => Promise<void>;
 
 type HumanRequestMaterial = {
-  files: File[];
-  localPath: string;
+  selection: ServerMaterialSelection | null;
 };
 
-const MAX_HUMAN_REPLY_BYTES = 64 * 1024 * 1024;
-
-async function humanReplyMaterials(material: HumanRequestMaterial, note: string): Promise<HumanReplyMaterial[]> {
-  if (material.files.length > 99 || material.files.reduce((sum, file) => sum + file.size, 0) > MAX_HUMAN_REPLY_BYTES) {
-    throw new ProductError("human_response_material_too_large");
-  }
-  const names = new Set<string>();
-  for (const file of material.files) {
-    const path = file.webkitRelativePath || file.name;
-    if (path.length > 900 || names.has(path) || path.split("/")[0] === "reply.json"
-        || path.includes("\\") || path.includes(":")
-        || path.split("/").some((part) => !part || part === "." || part === ".."
-          || part === ".delivery.json" || part.startsWith(".delivery-"))) {
-      throw new ProductError("human_response_upload_path_invalid");
-    }
-    names.add(path);
-  }
-  const materials: HumanReplyMaterial[] = [];
-  for (const file of material.files) {
-    materials.push({ kind: "upload", relative_path: file.webkitRelativePath || file.name,
-      media_type: file.type || "application/octet-stream",
-      content_base64: arrayBufferToBase64(await file.arrayBuffer()) });
-  }
-  if (material.localPath.trim()) {
-    materials.push({ kind: "linked_local", locator: material.localPath,
-      description: note || "Materials supplied for this exact HumanRequest." });
-  }
-  return materials;
+async function humanReplyMaterials(material: HumanRequestMaterial): Promise<HumanReplyMaterial[]> {
+  return material.selection ? [{ kind: "server_reference", selection: material.selection }] : [];
 }
 
-function MaterialPicker({ files, setFiles, localPath, setLocalPath, disabled }: {
-  files: File[]; setFiles: (value: File[]) => void;
-  localPath: string; setLocalPath: (value: string) => void; disabled: boolean;
+function MaterialPicker({ selection, setSelection, disabled }: {
+  selection: ServerMaterialSelection | null; setSelection: (value: ServerMaterialSelection | null) => void; disabled: boolean;
 }) {
-  const [selectionError, setSelectionError] = useState("");
-  return <>
-    <label className="hc-file-picker full">
-      浏览器文件 · 可多选
-      <input type="file" multiple aria-label="回应文件" disabled={disabled}
-        onChange={(event) => { setFiles(Array.from(event.target.files ?? [])); setSelectionError(""); }} />
-    </label>
-    <label className="hc-file-picker full">
-      浏览器文件夹
-      <input type="file" multiple aria-label="回应文件夹" disabled={disabled}
-        ref={(element) => { element?.setAttribute("webkitdirectory", ""); }}
-        onChange={(event) => {
-          const selected = Array.from(event.target.files ?? []);
-          setFiles(selected);
-          setSelectionError(selected.length ? "" : "文件夹没有可上传文件。请重新选择，或提供服务器可读的绝对路径。");
-        }} />
-    </label>
-    <small>{files.length ? `待送达 · ${files.map((file) => file.webkitRelativePath || file.name).join("、")}` : "尚未选择文件"}</small>
-    {files.length ? <button type="button" disabled={disabled} onClick={() => setFiles([])}>移除回应文件</button> : null}
-    {selectionError ? <p role="alert">{selectionError}</p> : null}
-    <label className="full">
-      服务器可读的绝对文件或目录路径 · 可选
-      <input aria-label="绝对本地文件或目录路径" value={localPath} disabled={disabled}
-        onChange={(event) => setLocalPath(event.target.value)} placeholder="例如 /data/research/result" />
-    </label>
-    <p>浏览器文件及文件夹上传到请求原根的工作区，保留相对目录。路径原件留在服务器原位置，说明填写在回应中。最多 99 个文件、总计 64 MiB；大型目录可使用原路径。</p>
-  </>;
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
-  }
-  return btoa(binary);
+  return <ServerMaterialPicker value={selection} onSelect={setSelection} disabled={disabled} />;
 }
 
 function RequestForm({ request, commands, authorizations, onChanged }: {
@@ -2819,6 +2766,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
   onChanged: () => void;
 }) {
   const [note, setNote] = useState("");
+  const [sealedResponse, setSealedResponse] = useState<HumanRequestResponseBody | null>(null);
   const [pending, setPending] = useState(false);
   const [recorded, setRecorded] = useState(false);
   const [retryStatus, setRetryStatus] = useState<"processing" | "succeeded" | null>(null);
@@ -2828,6 +2776,13 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
   const evaluationDecision = typeof request.evaluation?.decision === "string"
     ? request.evaluation.decision
     : null;
+
+  useEffect(() => {
+    let active = true;
+    void pendingHumanRequestResponsePreview(request.request_ref).then(value => { if (active) setSealedResponse(value); })
+      .catch(caught => { if (active) setError(reasonCode(caught)); });
+    return () => { active = false; };
+  }, [request.request_ref]);
 
   useEffect(() => {
     setNote("");
@@ -2874,11 +2829,12 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           throw new ProductError("human_request_response_recovery_conflict");
         }
         await deliverPendingHumanRequestResponse(request.request_ref);
+        setSealedResponse(null);
         markResponseRecorded();
         return;
       }
       if (material) {
-        const materials = await humanReplyMaterials(material, note);
+        const materials = await humanReplyMaterials(material);
         if (materials.length) response.materials = materials;
       }
       if (decision === "provided" && hasLegacyHumanRequestMaterial(request.request_ref)
@@ -2886,8 +2842,10 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         throw new ProductError("human_response_material_reselection_required");
       }
       await respondToHumanRequest(request.request_ref, response);
+      setSealedResponse(null);
       markResponseRecorded();
     } catch (caught) {
+      void pendingHumanRequestResponsePreview(request.request_ref).then(setSealedResponse).catch(() => undefined);
       const code = reasonCode(caught);
       setError(humanRequestScopeStale(code)
         ? "任务已更新，这次回应未提交。正在刷新当前待办，请在更新后重新选择。"
@@ -2925,6 +2883,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         <b>这件事已处理{request.status !== "satisfied" && retryStatus !== "succeeded"
           ? ` · ${requestStatusLabel(request.status)}` : ""}</b><br />
         处理记录可在详情中查看；如果出现后续待办，可在那里补充。
+        <HumanRequestMaterialReferences responses={request.responses ?? []} />
       </div>
     );
   }
@@ -2951,7 +2910,8 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         <span aria-hidden="true">✓</span>
         <div>
           <h3>回应已提交</h3>
-          <p>回应已交回。上传材料通过原根工作台读取，路径原件保留在原位置；提交本身不自动入库。只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
+          <HumanRequestMaterialReferences responses={request.responses ?? []} />
+          <p>回应及原始来源引用已提交到请求原根。材料保留在原服务器路径，原根可按需读取；提交本身不自动入库。只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
         </div>
       </section>
     );
@@ -2959,9 +2919,16 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
 
   return (
     <>
+      {sealedResponse && <section className="server-material-picker__candidate" role="status">
+        <b>原求助回应有待重试的封存提交</b><code>{request.request_ref}</code>
+        <p>{sealedResponse.note}</p>
+        {sealedResponse.materials?.filter(item => item.kind === "server_reference").map((item, index) => item.kind === "server_reference" && <div key={index}><code>{item.selection.absolute_path}</code><p>{item.selection.description}</p><span>{item.selection.server.hostname} · {item.selection.server.platform} · {item.selection.server.permission_context}</span></div>)}
+        <button type="button" disabled={pending} onClick={() => void submit()}>重试封存回应</button>
+        <p>重试使用原回应、原材料及原请求身份。</p>
+      </section>}
       {hasLegacyHumanRequestMaterial(request.request_ref) ? <p role="status">检测到旧版材料恢复记录。原入库回执保留；请重新选择文件或原路径后提交，旧记录不会自动重放。</p> : null}
       {request.kind === "library_reconnect" ? (
-        <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending} />
+        <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending || !!sealedResponse} />
       ) : null}
       {request.kind === "external_material_api_access" ? (
         <NaturalLanguageMaterialForm
@@ -2969,7 +2936,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           note={note}
           setNote={setNote}
           submit={submit}
-          disabled={pending}
+          disabled={pending || !!sealedResponse}
         />
       ) : null}
       {request.kind === "offline_action" ? (
@@ -2978,7 +2945,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           note={note}
           setNote={setNote}
           submit={submit}
-          disabled={pending}
+          disabled={pending || !!sealedResponse}
         />
       ) : null}
       {request.kind === "capability_authorization" ? (
@@ -2989,7 +2956,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           note={note}
           setNote={setNote}
           submit={submit}
-          disabled={pending}
+          disabled={pending || !!sealedResponse}
           onChanged={onChanged}
         />
       ) : null}
@@ -3006,7 +2973,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           <button
             className="hc-submit"
             type="button"
-            disabled={pending}
+            disabled={pending || !!sealedResponse}
             onClick={() => void retry()}
           >重试</button>
         )
@@ -3064,8 +3031,7 @@ function LibraryForm({
   disabled: boolean;
 }) {
   const [mode, setMode] = useState<"none" | "oa" | "material">("none");
-  const [localPath, setLocalPath] = useState("");
-  const [materialFiles, setMaterialFiles] = useState<File[]>([]);
+  const [selection, setSelection] = useState<ServerMaterialSelection | null>(null);
   const acquisitionPaperId = typeof request.target_assertion?.acquisition_paper_id === "string"
     ? request.target_assertion.acquisition_paper_id
     : null;
@@ -3083,7 +3049,7 @@ function LibraryForm({
           <i>OA 替代</i><b>跳过，之后只用 OA</b><small>选择更窄的获取路线；无需申请额外权限。</small>
         </button>
         <button type="button" disabled={disabled} onClick={() => setMode("material")}>
-          <i>提供全文</i><b>手动上传该文献</b><small>提交文件或本地路径，等待系统核对。</small>
+          <i>提供全文</i><b>提供服务器文献来源</b><small>保存服务器原路径及说明，等待原根核对。</small>
         </button>
       </section>
       {mode === "oa" ? (
@@ -3098,14 +3064,13 @@ function LibraryForm({
       ) : null}
       {mode === "material" ? (
         <section className="hc-choice-panel">
-          <MaterialPicker files={materialFiles} setFiles={setMaterialFiles} localPath={localPath} setLocalPath={setLocalPath} disabled={disabled} />
-          <p>提交表示全文已送达请求原根工作台。原根按收到的 reader 读取材料；本次提交不自动入库。</p>
+          <MaterialPicker selection={selection} setSelection={setSelection} disabled={disabled} />
+          <p>提交仅将原始来源引用交给请求原根。材料留在原服务器路径，原根可按需读取；本次提交不自动入库。</p>
           <button type="button" disabled={disabled} onClick={() => void submit(
             { route: "provided_material", ...(acquisitionPaperId ? { acquisition_paper_id: acquisitionPaperId } : {}) },
             "provided",
             {
-              files: materialFiles,
-              localPath,
+              selection,
             },
           )}>提交全文来源回应</button>
         </section>
@@ -3142,8 +3107,7 @@ function NaturalLanguageMaterialForm({
   submit: SubmitResponse;
   disabled: boolean;
 }) {
-  const [localPath, setLocalPath] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
+  const [selection, setSelection] = useState<ServerMaterialSelection | null>(null);
   const condition = isRecord(request.target_assertion?.condition)
     ? request.target_assertion.condition
     : {};
@@ -3175,16 +3139,15 @@ function NaturalLanguageMaterialForm({
               placeholder="写下结果、拒绝、限制或建议的替代路线。"
             />
           </label>
-          <MaterialPicker files={files} setFiles={setFiles} localPath={localPath} setLocalPath={setLocalPath} disabled={disabled} />
+          <MaterialPicker selection={selection} setSelection={setSelection} disabled={disabled} />
         </div>
-        <p className="hc-asset-boundary">提交表示回应和材料已送达请求原根工作台；提交本身不自动入库。负责当前请求的 Agent 会解释其含义。</p>
+        <p className="hc-asset-boundary">提交将回应和原始来源引用交给请求原根。材料留在原服务器路径，可由原根按需读取；提交本身不自动入库。</p>
       </section>
       <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit(
         {},
         "provided",
         {
-          files,
-          localPath,
+          selection,
         },
       )}>提交</button>
     </>

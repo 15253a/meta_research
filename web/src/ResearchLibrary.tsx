@@ -1,3 +1,5 @@
+import { useWorkMaterialDraft, WorkMaterialFields, ResearchInputMaterialReferences } from "./WorkMaterialForm";
+import { currentMaterialReceiverPath } from "./workMaterialApi";
 import { useEffect, useRef, useState } from "react";
 import {
   fetchResearchContent, fetchResearchLibrary, submitResearchInput,
@@ -47,6 +49,7 @@ export function ResearchLibrary({ questRef, questionRef }: { questRef: string | 
   const bodyRequest = useRef<AbortController | null>(null);
   const [guidance, setGuidance] = useState("");
   const [questionScope, setQuestionScope] = useState(false);
+  const materials = useWorkMaterialDraft(`input:${questRef}:${questionScope ? questionRef : "quest"}`, currentMaterialReceiverPath(questRef ?? "", questionScope ? questionRef : null));
   const [inputBusy, setInputBusy] = useState(false);
   const [inputSaved, setInputSaved] = useState(false);
   const [inputError, setInputError] = useState<string | null>(null);
@@ -114,7 +117,10 @@ export function ResearchLibrary({ questRef, questionRef }: { questRef: string | 
     if (!questRef || !guidance.trim()) return;
     setInputBusy(true); setInputError(null); setInputSaved(false);
     try {
-      await submitResearchInput(questRef, questionScope ? questionRef : null, guidance.trim());
+      if (materials.selection) {
+        const result = await materials.submit("/api/v1/research-inputs", { quest_ref: questRef, question_ref: questionScope ? questionRef : null, text: guidance.trim(), asset_bindings: [], work_materials: materials.materialCommand() });
+        if (!result) return;
+      } else await submitResearchInput(questRef, questionScope ? questionRef : null, guidance.trim());
       setGuidance(""); setInputSaved(true); setRevision(value => value + 1);
     } catch (caught) { setInputError(String(caught instanceof Error ? caught.message : caught)); }
     finally { setInputBusy(false); }
@@ -138,7 +144,8 @@ export function ResearchLibrary({ questRef, questionRef }: { questRef: string | 
         <p>{t("保存你的意见、背景或材料说明，供研究代理查找和采用。一般聊天不会自动存入这里。", "Save your guidance, background, or material notes for research agents to find and use. Ordinary chat is not saved here automatically.")}</p>
         <label>{t("研究指导", "Research guidance")}<textarea rows={3} value={guidance} onChange={event => { setGuidance(event.target.value); setInputSaved(false); }} required /></label>
         {questionRef ? <label className="library-scope"><input type="checkbox" checked={questionScope} onChange={event => setQuestionScope(event.target.checked)} />{t("仅适用于当前问题", "Applies only to the current question")}</label> : null}
-        <button disabled={inputBusy || !guidance.trim()}>{inputBusy ? t("正在保存…", "Saving…") : t("保存指导", "Save guidance")}</button>
+        <WorkMaterialFields draft={materials} disabled={inputBusy} onRetried={() => { setGuidance(""); setInputSaved(true); setRevision(value => value + 1); }} />
+        <button disabled={inputBusy || materials.busy || !!materials.pending || (!!materials.selection && !materials.receiver) || !guidance.trim()}>{inputBusy ? t("正在保存…", "Saving…") : t("保存指导", "Save guidance")}</button>
         {inputSaved ? <p role="status">{t("已保存，后续研究可以发现这条指导。", "Saved. Future research can discover this guidance.")}</p> : null}
         {inputError ? <div role="alert">{t("未能保存。请重试。", "Could not save. Please retry.")}<details><summary>{t("技术详情", "Technical details")}</summary><code>{inputError}</code></details></div> : null}
       </form> : null}
@@ -153,7 +160,9 @@ export function ResearchLibrary({ questRef, questionRef }: { questRef: string | 
             const reader = item.reader;
             const judgments = Array.isArray(item.judgments) ? item.judgments as ResearchLibraryItem[] : [];
             return <article className="library-card" key={text(item.ref) || text(item.question_ref) || text(item.record_ref) || String(index)}>
-              <h4>{name}</h4>{text(item.summary) ? <p>{text(item.summary)}</p> : null}
+              <h4>{name}</h4>
+              {entry === "human" && (text(item.input_ref) || (text(item.ref).startsWith("research_input:") ? text(item.ref) : "")) ? <ResearchInputMaterialReferences inputRef={text(item.input_ref) || text(item.ref)} questRef={questRef} /> : null}
+              {text(item.summary) ? <p>{text(item.summary)}</p> : null}
               {entry === "environments" ? <>
                 {isEnvironmentReference ? <>
                   <p><b>{t("研究问题：", "Question: ")}</b>{text(item.question_ref)}</p>
