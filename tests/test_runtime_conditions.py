@@ -83,6 +83,26 @@ def test_selected_four_gpus_budget_literature_and_target_directory(root):
     assert "GPU-one-3" in rendered
 
 
+@pytest.mark.parametrize('style,description', [
+    ('focus', '聚焦攻关'), ('balanced', '均衡探索'), ('open', '开放探索'),
+])
+def test_research_style_round_trip_preserves_persistent_conditions(root, style, description):
+    initial = read_runtime_conditions(root, 'quest-one')
+    assert initial['research_style'] == 'balanced'
+    saved = save_runtime_conditions(root, 'quest-one', text=initial['text'],
+        research_style=style, expected_revision=initial['revision'])
+    assert read_runtime_conditions(root, 'quest-one') == saved
+    assert saved['research_style'] == style
+    assert saved['text'] == initial['text']
+    rendered = render_runtime_conditions(root, run_ref='run-one')
+    assert description in rendered and 'GPU-one-3' in rendered and '30d' in rendered
+    assert '不取消或覆盖人的持续条件' in rendered
+    # A text-only edit from an existing client keeps the selected style.
+    updated = save_runtime_conditions(root, 'quest-one', text='仅 CPU，预算七天。',
+        expected_revision=saved['revision'])
+    assert updated['research_style'] == style
+
+
 def test_edits_persist_refresh_and_leave_other_quest_and_database_unchanged(root):
     database = root / "meta-research.sqlite3"
     before = database.read_bytes()

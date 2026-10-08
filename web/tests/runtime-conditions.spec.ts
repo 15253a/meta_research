@@ -18,13 +18,16 @@ const suffix = "\n另请保留这条手写约束。";
 const structuredText = (data: unknown = initialConditions) => prefix + JSON.stringify(data, null, 2) + suffix;
 const savedJson = (text: string) => JSON.parse(text.slice(prefix.length, -suffix.length));
 
-async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间预算：30 天") {
+async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间预算：30 天", researchStyle?: string) {
   const snapshot = JSON.parse(await readFile(new URL("./snapshot-before.json", import.meta.url), "utf8"));
   snapshot.human_collaboration.human_requests.items = [];
   const questRef: string = snapshot.research_space.current_quest.quest_ref;
+  const configs: Record<string, { quest_ref: string; text: string; revision: string; research_style?: string }> = {
+    [questRef]: { quest_ref: questRef, text, revision: "r1", research_style: researchStyle },
+  };
   const state = {
     snapshot, questRef, reads: [] as string[], writes: [] as { questRef: string; text: string; expected_revision: string }[],
-    configs: { [questRef]: { quest_ref: questRef, text, revision: "r1" } },
+    configs,
     catalogFailure: false, catalogQuest: questRef, catalogReads: 0,
     failure: 0, delayedQuest: "", release: null as (() => void) | null,
   };
@@ -50,7 +53,8 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
       state.writes.push({ questRef: selected, ...body });
       if (state.failure) return json({ detail: { code: state.failure === 409 ? "runtime_conditions_stale" : "temporarily_unavailable" } }, state.failure);
       expect(body.expected_revision).toBe(state.configs[selected].revision);
-      const next = { quest_ref: selected, text: body.text, revision: `r${state.writes.length + 1}` };
+      const next = { quest_ref: selected, text: body.text, revision: `r${state.writes.length + 1}`,
+        research_style: body.research_style ?? state.configs[selected].research_style };
       state.configs[selected] = next;
       return json(next);
     }
@@ -98,6 +102,26 @@ test("opening reads the current configuration and cancelling never writes", asyn
   await opener.click();
   await expect(editor(page)).toHaveValue(state.configs[state.questRef].text);
   expect(state.reads).toHaveLength(2);
+});
+
+test("research style defaults to balanced and a saved choice preserves handwritten conditions", async ({ page }) => {
+  const conditions = "只使用我提供的数据。\n未经我同意不要改变持续保留条件。";
+  const state = await workspace(page, conditions);
+  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  const style = dialog(page).getByRole("combobox", { name: "研究风格", exact: true });
+  await expect(style).toHaveValue("balanced");
+  await expect(style.locator("option")).toHaveText(["聚焦攻关", "均衡探索", "开放探索"]);
+  await expect(dialog(page).getByText("当前研究风格：均衡探索", { exact: true })).toBeVisible();
+  await style.selectOption("open");
+  await expect(editor(page)).toHaveValue(conditions);
+  await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
+  await expect(dialog(page).getByRole("status")).toHaveText("已保存，将用于后续新调用。");
+  await expect(dialog(page).getByText("当前研究风格：开放探索", { exact: true })).toBeVisible();
+  expect(state.configs[state.questRef]).toMatchObject({ text: conditions, research_style: "open" });
+  await dialog(page).getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("button", { name: "运行条件", exact: true }).click();
+  await expect(dialog(page).getByRole("combobox", { name: "研究风格", exact: true })).toHaveValue("open");
+  await expect(editor(page)).toHaveValue(conditions);
 });
 
 test("saving uses the displayed revision and keeps the server receipt for the next edit", async ({ page }) => {
@@ -157,7 +181,7 @@ test("Quest changes close the editor and a late old response cannot replace the 
   await editor(page).fill("下一项研究的新条件");
   await dialog(page).getByRole("button", { name: "保存运行条件" }).click();
   await expect(dialog(page).getByRole("status")).toContainText("已保存");
-  expect(state.writes).toEqual([{ questRef: nextQuest, text: "下一项研究的新条件", expected_revision: "r-next" }]);
+  expect(state.writes).toEqual([{ questRef: nextQuest, text: "下一项研究的新条件", expected_revision: "r-next", research_style: "balanced" }]);
 });
 
 test("the control stays available without a foreground and fits desktop and mobile", async ({ page }) => {
