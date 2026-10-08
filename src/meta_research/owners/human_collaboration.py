@@ -8325,6 +8325,25 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 {"request_ref": request_ref, "reason_code": failure_code},
             )
 
+    def _quest_creation_materials(self, draft, proposal_ref):
+        material_bindings = _accepted_material_bindings(draft)
+        with self._database.read() as connection:
+            basis_row = connection.execute(
+                text("SELECT creation_basis_ref,creation_basis_hash FROM hc_question_proposals WHERE proposal_ref=:ref"),
+                {"ref": proposal_ref},
+            ).first()
+        creation_basis = None
+        if basis_row is not None and basis_row.creation_basis_ref is not None:
+            creation_basis = self._research_memory.creation_bases.query(
+                basis_row.creation_basis_ref, basis_row.creation_basis_hash
+            )
+            material_bindings = (
+                *material_bindings,
+                *(self._research_memory.query_asset_version(source["binding"]["version_ref"]).as_binding()
+                  for source in creation_basis["sources"] if source["binding"] is not None),
+            )
+        return material_bindings, creation_basis
+
     def query_quest_creation(self, initialization_id: str) -> dict[str, object]:
         with self._database.read() as connection:
             row = self._require_initialization(connection, initialization_id)
@@ -8523,7 +8542,9 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 )
             except OwnerConflict as error:
                 broad_authorization_failure = error
-        material_bindings = _accepted_material_bindings(current_draft_value)
+        material_bindings, _ = self._quest_creation_materials(
+            current_draft_value, row.confirmed_proposal_ref or row.proposal_ref
+        )
         material_roles = ()
         material_failure: OwnerConflict | None = None
         material_complete = not material_bindings
@@ -9423,14 +9444,7 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             return True
         self._clear_dispatch_failure(initialization_id, "acquisition_session")
 
-        material_bindings = _accepted_material_bindings(draft)
-        with self._database.read() as connection:
-            basis_row = connection.execute(text("SELECT creation_basis_ref,creation_basis_hash FROM hc_question_proposals WHERE proposal_ref=:ref"), {"ref": quest.proposal_ref}).first()
-        creation_basis = None
-        if basis_row is not None and basis_row.creation_basis_ref is not None:
-            creation_basis = self._research_memory.creation_bases.query(basis_row.creation_basis_ref, basis_row.creation_basis_hash)
-            material_bindings = (*material_bindings, *(self._research_memory.query_asset_version(source["binding"]["version_ref"]).as_binding()
-                for source in creation_basis["sources"] if source["binding"] is not None))
+        material_bindings, creation_basis = self._quest_creation_materials(draft, quest.proposal_ref)
         if material_bindings:
             try:
                 roles = self._research_graph.query_asset_roles(

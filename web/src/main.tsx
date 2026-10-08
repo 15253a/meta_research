@@ -12,6 +12,7 @@ import {
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { StatusHome } from "./StatusHome";
+import { HostResources } from "./HostResources";
 import { OutputLanguageProvider, OutputLanguageControl } from "./OutputLanguage";
 import { observedActiveTarget } from "./activeTargetStatus";
 import { observedTargetRetry, targetResearchFacts } from "./targetResearchFacts";
@@ -4127,7 +4128,7 @@ function WorkspaceMain({
           <BoundedDetails key={displayedTarget.target_ref} className="research-target-details" summary="查看输入、产物与交接">{() => <TargetResearchFactsView facts={displayedTargetFacts} label={displayedTarget.target_key} />}</BoundedDetails>
         </section> : null}
       </> : null}
-      {(liveContext.foreground || rootConversations.selectedRef) && !hidden ? <RootConversations model={rootConversations} connected={connected} polling={Boolean(runtimeStatus.status && !runtimeStatus.error)} targetRetry={targetRetry} /> : null}
+      {(liveContext.foreground || rootConversations.selected || rootConversations.selectedRef) && !hidden ? <RootConversations model={rootConversations} connected={connected} polling={Boolean(runtimeStatus.status && !runtimeStatus.error)} targetRetry={targetRetry} /> : null}
       <details className="research-existing-details"><summary>研究材料与阶段详情</summary>
       {showingLiveOverview && snapshot ? <p role="status">以下保留上次读取的阶段详情；当前轮次的详细结果仍在加载。</p> : null}
       <div className="lumen-lower">
@@ -5224,6 +5225,7 @@ function DetailedApp() {
           </div>
           <RuntimeConditions questRef={overviewQuestRef(snapshot)} questionRef={runtimeConditionsQuestionRef(snapshot)} disabled={humanRequestSurfaceOpen || detailsScopeChanged} />
           <ResearchMotionControl />
+          <HostResources disabled={humanRequestSurfaceOpen} />
           <ForegroundResearchControlShortcut
             control={snapshot?.research_control}
             commands={snapshot?.human_collaboration?.commands.items}

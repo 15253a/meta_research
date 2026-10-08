@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from meta_research.runtime_resources import (
+    HostResourceProbe, RuntimeResourceReader, SystemHostResourceProbe,
+)
+
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -287,6 +291,7 @@ class ProductionRuntime:
     _resident_mcp_providers: tuple[object, ...] = ()
     _stop_requested: bool = False
     timeline_summaries: object | None = None
+    resources: RuntimeResourceReader | None = None
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         for provider in self._resident_mcp_providers:
@@ -522,6 +527,7 @@ def build_production_runtime(
     proposal_drafter: ProposalDrafter | None = None,
     intent_drafting_provider: IntentDraftingProvider | None = None,
     host_compute_probe: HostComputeProbe | None = None,
+    host_resource_probe: HostResourceProbe | None = None,
     idea_skill_provider: IdeaSkillProvider | None = None,
     plan_skill_provider: PlanSkillProvider | None = None,
     bundle_skill_provider: BundleSkillProvider | None = None,
@@ -1207,6 +1213,7 @@ def build_production_runtime(
         ),
         _provider_lifecycles=tuple(provider_lifecycles),
         _resident_mcp_providers=tuple(resident_mcp_providers),
+        resources=RuntimeResourceReader(host_resource_probe or SystemHostResourceProbe(), host_compute_probe),
     )
     runtime.reconcile_telemetry_authorization()
     from meta_research.timeline_summaries import create_timeline_summary_service

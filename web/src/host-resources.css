@@ -1,0 +1,23 @@
+.host-resource-trigger { border:1px solid #d9dbe8; border-radius:9px; padding:8px 10px; background:#fff; color:#565476; font:inherit; font-size:12px; cursor:pointer; white-space:nowrap; }
+.host-resource-panel { position:fixed; z-index:80; top:92px; right:24px; width:min(560px,calc(100vw - 32px)); max-height:calc(100dvh - 115px); overflow:auto; box-sizing:border-box; padding:24px; border:1px solid #d9dbe8; border-radius:16px; background:#fff; color:#252b38; box-shadow:0 14px 60px #252b382b; font-size:14px; }
+.host-resource-panel header,.host-resource-refresh { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.host-resource-panel h2 { margin:0; font-size:18px; }
+.host-resource-panel button { padding:6px 9px; border:1px solid #d9dbe8; border-radius:7px; background:#f6f7fb; color:#565476; font:inherit; cursor:pointer; }
+.host-resource-panel button:disabled { opacity:.5; cursor:wait; }
+.host-resource-scope,.host-resource-time { color:#6b7183; line-height:1.65; font-size:12px; }
+.host-resource-host { margin-bottom:4px; overflow-wrap:anywhere; font-weight:600; }
+.host-resource-warning { background:#fff4e5; color:#885828; padding:10px; border-radius:8px; line-height:1.6; }
+.host-resource-metrics { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:16px; }
+.host-resource-metrics article { background:#f6f7fb; padding:14px; border-radius:10px; min-width:0; }
+.host-resource-metrics h3 { margin:0 0 10px; font-size:13px; }
+.host-resource-metrics b { display:block; font-size:19px; }
+.host-resource-metrics small,.host-resource-metrics span { display:block; margin-top:8px; color:#72788a; font-size:11px; overflow-wrap:anywhere; }
+.host-gpu-heading { font-size:14px; margin-top:24px; }
+.host-gpu-heading small { font-weight:400; color:#72788a; }
+.host-gpu-list { margin:0; padding:0; list-style:none; }
+.host-gpu-list li { padding:14px 0; border-top:1px solid #e6e7ee; }
+.host-gpu-list code { display:block; margin-top:5px; font-size:11px; color:#72788a; overflow-wrap:anywhere; }
+.host-gpu-list dl { display:flex; flex-wrap:wrap; gap:16px 32px; margin:12px 0 0; }
+.host-gpu-list dt { font-size:11px; color:#72788a; }
+.host-gpu-list dd { margin:5px 0 0; font-size:16px; }
+@media(max-width:650px) { .host-resource-panel { top:80px; right:16px; padding:18px; max-height:calc(100dvh - 96px); } .host-resource-metrics { grid-template-columns:1fr; } .status-home-header { flex-wrap:wrap; padding-bottom:12px; padding-top:12px; } }

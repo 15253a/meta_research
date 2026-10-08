@@ -33,14 +33,14 @@ function header(sourceUpdatedAt: number | null | undefined, createdAt = reschedu
   let slot = 0;
   const sandbox = {
     React, Date, Number,
-    useState: (initial: unknown) => [slot++ === 0 ? page : initial, () => {}],
+    useState: (initial: unknown) => [slot++ === 1 ? page : typeof initial === "function" ? initial() : initial, () => {}],
     useRef: (initial: unknown) => ({ current: initial }), useEffect: () => {},
     StageReadableOutput: () => null, ExecutionElapsed: () => null,
-    RootOperationOutput: null as unknown as (props: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; onOutput: () => void }) => React.ReactElement<{ children: React.ReactNode[] }>,
+    RootOperationOutput: null as unknown as (props: { questRef: string; sessionRef: string; operation: RootOperation; ordinal: number; active: boolean; onOutput: () => void; readingCache: Map<string, unknown> }) => React.ReactElement<{ children: React.ReactNode[] }>,
   };
   runInNewContext(javascript, sandbox, { filename: sourcePath });
   const operation: RootOperation = { operation_ref: "operation", label: "Bundle", phase: null, status: "completed", created_at: createdAt, updated_at: createdAt };
-  const article = sandbox.RootOperationOutput({ questRef: "quest", sessionRef: "session", operation, ordinal: 5, active: true, onOutput: () => {} });
+  const article = sandbox.RootOperationOutput({ questRef: "quest", sessionRef: "session", operation, ordinal: 5, active: true, onOutput: () => {}, readingCache: new Map() });
   return renderToStaticMarkup(article.props.children[0]);
 }
 

@@ -904,6 +904,13 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+
+    @app.get("/api/v1/runtime/resources")
+    def runtime_resources() -> dict[str, object]:
+        if runtime.resources is None:
+            raise HTTPException(status_code=503, detail="host_resource_probe_unavailable")
+        return runtime.resources.query()
+
     web_root = Path(str(files("meta_research") / "web_dist")).resolve()
     expected_host = urlsplit(base_url).netloc
     base_url_host = urlsplit(base_url).hostname
