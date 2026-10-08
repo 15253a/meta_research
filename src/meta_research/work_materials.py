@@ -72,6 +72,25 @@ def material_submissions_for(database, anchor_kind, anchor_ref):
 
 
 class WorkMaterialsMixin:
+    def creation_material_snapshot(self, anchor):
+        from meta_research.creation_inputs import material_snapshot
+        return material_snapshot(self, anchor)
+
+    def begin_creation_material_operation(self, inputs, binding, operation_ref):
+        from meta_research.creation_inputs import CreationMaterialOperation
+        operation = CreationMaterialOperation(self, inputs, binding, operation_ref)
+        if not hasattr(self, "_creation_material_operations"):
+            self._creation_material_operations = {}
+        self._creation_material_operations[operation_ref] = operation
+        return operation
+
+    def _creation_material_operation(self, context):
+        operation = getattr(self, "_creation_material_operations", {}).get(context.run_ref)
+        if operation is None:
+            raise OwnerConflict("creation_material_scope_invalid")
+        operation.authorize(context)
+        return operation
+
     def material_receiver(self, kind, anchor_ref):
         if kind == "creation":
             view = self.query_quest_creation(anchor_ref)
@@ -173,6 +192,9 @@ class WorkMaterialsMixin:
     def _authorize_material(self, reference, context):
         if context is None:
             return
+        if context.phase == "creation_materials":
+            self._creation_material_operation(context).authorize(context, reference["reference_ref"])
+            return
         visible = {location.workspace_ref for location in self._root_workspaces._visible(context)}
         receiver = reference["receiver"]
         if not visible.intersection(root["workspace_ref"] for root in receiver.get("roots", [])):
@@ -188,6 +210,12 @@ class WorkMaterialsMixin:
         if reference_ref is None:
             if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
                 raise OwnerConflict("material_page_invalid")
+            if context is not None and context.phase == "creation_materials":
+                operation = self._creation_material_operation(context)
+                refs = operation.inputs.references[offset:offset + limit]
+                return {"references": [operation.reference_view(item["reference_ref"]) for item in refs],
+                        "next_offset": offset + limit if len(operation.inputs.references) > offset + limit else None,
+                        "material_set_hash": operation.inputs.set_hash}
             visible = None if context is None else [location.workspace_ref for location in self._root_workspaces._visible(context)]
             with self._database.read() as connection:
                 query = "SELECT r.reference_ref FROM hc_work_material_references r JOIN hc_work_material_submissions s USING(submission_ref) WHERE s.state='ready'"
@@ -200,6 +228,8 @@ class WorkMaterialsMixin:
                     "next_offset": offset + limit if len(rows) > limit else None}
         reference = self.query_work_material(reference_ref)
         self._authorize_material(reference, context)
+        if context is not None and context.phase == "creation_materials":
+            reference = self._creation_material_operation(context).reference_view(reference_ref)
         actor = context.run_ref if context is not None else actor
         try:
             result = self._root_workspaces.server_files.discover(reference["source"], actor=actor + ":" + reference_ref, path=path, cursor=cursor, limit=limit)
@@ -218,10 +248,16 @@ class WorkMaterialsMixin:
         except OwnerConflict as error:
             self._record_material_access(reference_ref, actor, path, {"operation": "read", "error": error.code, "availability": error.code, "path": path})
             raise
+        witness = None
+        if context is not None and context.phase == "creation_materials":
+            operation = self._creation_material_operation(context)
+            witness = operation.witness(reference_ref, path, value)
         self._record_material_access(reference_ref, actor, path, {"operation": "read", "path": path,
             "observation_ref": value["observation"]["observation_ref"], "offset": offset, "bytes": value["bytes"],
-            "eof": value["eof"], "availability": "available"})
-        return {"reference_ref": reference_ref, **value}
+            "eof": value["eof"], "availability": "available",
+            **({"witness": witness.as_dict(), "fence_ref": operation.fence_ref} if witness else {})})
+        return {"reference_ref": reference_ref, **value,
+                **({"read_witness": witness.as_dict()} if witness else {})}
 
     def discover_creation_materials(self, *, initialization_id=None, context_ref=None, **arguments):
         kind, anchor = ("creation", initialization_id) if initialization_id is not None else ("manual", context_ref)
