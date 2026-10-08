@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.external_mcp import ExternalMcpAccess
+
 import json
 import hashlib
 import logging
@@ -166,6 +168,7 @@ class HarnessInvocation:
     root_kind: RootAgentKind | None = None
     entry_path: RootCapabilityEntryPath = "initial"
     authorized_operation_ids: tuple[str, ...] = ()
+    external_mcp_access: ExternalMcpAccess | None = None
 
 
 @dataclass(frozen=True)
@@ -187,6 +190,7 @@ def _harness_evidence_scope_ref(invocation: HarnessInvocation) -> str:
             "native_session_ref": invocation.native_session_ref,
             "target_workspace_ref": invocation.target_workspace_ref,
             "prompt_hash": canonical_hash(invocation.prompt),
+            **({} if invocation.external_mcp_access is None else {"external_mcp": invocation.external_mcp_access.binding()}),
         }
     )
 
@@ -365,6 +369,7 @@ class _NativeCliHarnessAdapter:
 
     def _environment(self, invocation: HarnessInvocation) -> dict[str, str]:
         return {
+            **({} if invocation.external_mcp_access is None else invocation.external_mcp_access.environment()),
             _MCP_TOKEN_ENV: invocation.mcp_token,
             _HARNESS_FAMILY_ENV: self.family,
             _HARNESS_WORKSPACE_ENV: (
@@ -1036,6 +1041,7 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
                 "mcp_servers.meta_research."
                 'default_tools_approval_mode="approve"'
             ),
+            *(invocation.external_mcp_access.codex_arguments() if invocation.external_mcp_access is not None else ()),
         ]
         if invocation.native_session_ref is None:
             argv.append("-")
@@ -1061,6 +1067,11 @@ class ClaudeHarnessAdapter(_NativeCliHarnessAdapter):
                 }
             }
         }
+        if invocation.external_mcp_access is not None:
+            config["mcpServers"]["meta_research_external"] = {
+                "type": "http", "url": invocation.external_mcp_access.url,
+                "headers": {"Authorization": "Bearer ${META_RESEARCH_EXTERNAL_MCP_TOKEN}"},
+            }
         config_directory = self._workspace / "mcp-configs"
         config_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         config_path = config_directory / (
@@ -1070,6 +1081,8 @@ class ClaudeHarnessAdapter(_NativeCliHarnessAdapter):
                     "attempt_ref": invocation.attempt_ref,
                     "fence_ref": invocation.fence_ref,
                     "mcp_url": invocation.mcp_url,
+                    **({} if invocation.external_mcp_access is None else {"operation_ref": invocation.provider_operation_ref,
+                        "external_mcp": invocation.external_mcp_access.binding(), "external_mcp_url": invocation.external_mcp_access.url}),
                 }
             )
             + ".json"
@@ -1100,6 +1113,7 @@ class ClaudeHarnessAdapter(_NativeCliHarnessAdapter):
             (
                 "Bash,Read,Write,Edit,Agent,WebSearch,WebFetch,Skill,"
                 "mcp__meta_research__*"
+                + (",mcp__meta_research_external__*" if invocation.external_mcp_access is not None else "")
             ),
         ]
         if invocation.native_session_ref is not None:

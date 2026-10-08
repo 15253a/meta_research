@@ -62,6 +62,20 @@ def test_allowed_discovery_call_and_denied_guessed_call(tmp_path):
     assert (tmp_path / "calls.jsonl").read_text().splitlines() == ['{"name": "read_temperature", "sensor": "A"}']
 
 
+def test_call_uses_frozen_catalog_without_sdk_rediscovery(tmp_path):
+    runtime = ExternalMcpRuntime(tmp_path)
+    runtime.configure_endpoint("http://127.0.0.1:9999")
+    draft = service(tmp_path)
+    draft["connection"]["environment"].update(EXTERNAL_MCP_AUDIT=str(tmp_path / "audit.jsonl"), EXTERNAL_MCP_PAGINATE="1")
+    runtime.save_config(services=parse_services([draft]), expected_revision=runtime.read_config().revision)
+    snapshot = runtime.operation_snapshot(operation_identity="paginated", root_kind="idea", task_prompt="read")
+    assert len(json.loads(snapshot.services[0].catalog_json)) == 2
+    with runtime.channel(snapshot) as access:
+        called = runtime.dispatch_http(access.token, request("tools/call", name=exposed_tool_name("lab", "read_temperature"), arguments={"sensor": "frozen"}))[1]
+        assert called["result"].get("structuredContent") == {"sensor": "frozen", "temperature": 23.75}, called
+    assert (tmp_path / "audit.jsonl").read_text().splitlines() == ['"tools/list"', '"tools/list"']
+
+
 def test_persistence_freezes_config_and_checks_signed_snapshot(tmp_path):
     runtime = configured(tmp_path, research_instructions="First instruction")
     current = runtime.read_config()

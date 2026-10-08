@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
+from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, ExternalMcpRuntime, compose_external_mcp_prompt
+from meta_research.external_mcp_client import ExternalMcpClientError
+
 import base64
 import hashlib
 import hmac
 import json
+import secrets
 import logging
 import os
 import re
@@ -761,6 +766,10 @@ class CodexDeepFetchAdapter:
             RootOperationDiagnosticRecorder | None
         ) = None
         self._root_resident_mcp = RootResidentMcpChannels("deepfetch")
+        self._external_mcp: ExternalMcpRuntime | None = None
+
+    def bind_external_mcp(self, runtime: ExternalMcpRuntime) -> None:
+        self._external_mcp = runtime
 
     def bind_resident_mcp_authority(
         self, authority: RootResidentMcpAuthority
@@ -1988,6 +1997,11 @@ class CodexDeepFetchAdapter:
                     "root_capability_profile",
                     "root_capability_profile_hash",
                 }
+                if "external_mcp" in invocation:
+                    expected_invocation_keys.add("external_mcp")
+                    if self._external_mcp is None:
+                        raise ValueError("external_mcp_runtime_missing")
+                    self._external_mcp.restore_snapshot(invocation["external_mcp"], root_kind="deepfetch")
                 if "mcp_url" in invocation or "mcp_scope_binding_hash" in invocation:
                     expected_invocation_keys |= {"mcp_url", "mcp_scope_binding_hash"}
                     self._verify_existing_mcp_invocation(
@@ -2805,183 +2819,216 @@ class CodexDeepFetchAdapter:
         timeout_seconds: float | None,
         access: RootResidentMcpAccess | None,
     ) -> tuple[dict[str, object], str, dict[str, object], tuple[dict[str, object], ...]]:
-        schema = output_schema or _deepfetch_output_schema()
-        if request.job_ref is not None and callable(
-            getattr(self._runner, "run_durable_job", None)
-        ):
-            return self._invoke_durable(
-                request,
-                prompt,
-                output_schema=schema,
-                timeout_seconds=timeout_seconds,
-                access=access,
-            )
-        root_job_ref = request.job_ref or f"{request.run_ref}:direct"
-        agent_workspace = self._agent_workspace_for(
-            root_job_ref,
-            canonical_hash(request.runtime_binding.as_dict()),
-        )
-        prompt = compose_runtime_prompt(
-            prompt, render_runtime_conditions(
-                self._workspace, run_ref=request.run_ref,
-                initialization_id=request.initialization_id,
-            ),
-        )
-        with tempfile.TemporaryDirectory(
-            prefix="deepfetch-", dir=self._workspace
-        ) as raw_directory:
-            directory = Path(raw_directory)
-            schema_path = directory / "output-schema.json"
-            result_path = directory / "last-message.json"
-            schema_path.write_text(
-                canonical_json(schema), encoding="utf-8"
-            )
-            capability_profile = root_capability_profile("deepfetch")
-            entry_path: RootCapabilityEntryPath = (
-                "resume"
-                if request.native_session_ref is not None
-                else "initial"
-            )
-            pre_turn_diagnostics = self._root_capability_diagnostics(
-                entry_path=entry_path
-            )
-            argv = [
-                self._executable,
-                "exec",
-                "--skip-git-repo-check",
-                "--strict-config",
-                *(
-                    (
-                        "--config",
-                        "mcp_servers={}",
-                        "--config",
-                        f'mcp_servers.meta_research.url="{access.url}"',
-                        "--config",
-                        "mcp_servers.meta_research.bearer_token_env_var="
-                        '"META_RESEARCH_MCP_TOKEN"',
-                        "--config",
-                        "mcp_servers.meta_research.required=true",
-                        "--config",
-                        "mcp_servers.meta_research."
-                        'default_tools_approval_mode="approve"',
-                    )
-                    if access is not None
-                    else ()
-                ),
-                "--config",
-                'approval_policy="never"',
-                "--config",
-                CODEX_ROOT_REASONING_PRESET_CONFIG,
-                *(
-                    (
-                        "--config",
-                        'shell_environment_policy.inherit="none"',
-                    )
-                    if access is not None
-                    else ()
-                ),
-                *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
-                "--sandbox",
-                self._sandbox_mode,
-                "--model",
-                self._model_ref,
-                "--cd",
-                str(agent_workspace),
-                "--json",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(result_path),
-            ]
-            if request.native_session_ref is None:
-                argv.append("-")
-            else:
-                argv.extend(["resume", request.native_session_ref, "-"])
-            try:
-                environment = (
-                    semantic_mcp_environment(access.token)
-                    if access is not None
-                    else None
+        with ExitStack() as external_channels:
+            external_mcp_access = None
+            if self._external_mcp is not None:
+                identity = canonical_json({"workspace": str(self._workspace.resolve()), "job_ref": request.job_ref,
+                    "runtime_binding_hash": canonical_hash(request.runtime_binding.as_dict()),
+                    "call_ref": None if request.job_ref is not None else secrets.token_hex(16)})
+                binding = None
+                legacy = False
+                if request.job_ref is not None:
+                    directory = self._provider_operation_root(request.job_ref, canonical_hash(request.runtime_binding.as_dict()))
+                    invocation_path = directory / "deepfetch-initial/invocation.json"
+                    if invocation_path.exists():
+                        try:
+                            _, key = ensure_transport_key(self._workspace)
+                            invocation = read_transport_envelope(invocation_path, key)
+                            binding = invocation.get("external_mcp")
+                            legacy = binding is None
+                        except (OSError, ValueError, ProviderSupervisorError) as error:
+                            raise DeepFetchUnavailable("deepfetch_provider_spool_invalid") from error
+                try:
+                    snapshot = self._external_mcp.operation_snapshot(operation_identity=identity,
+                        root_kind="deepfetch", task_prompt=prompt, binding=binding, legacy_empty=legacy)
+                    if not legacy:
+                        prompt = compose_external_mcp_prompt(prompt, snapshot)
+                        external_mcp_access = external_channels.enter_context(self._external_mcp.channel(
+                            snapshot, resident_token=None if access is None else access.token))
+                except (ExternalMcpError, ExternalMcpClientError) as error:
+                    raise DeepFetchUnavailable(error.code) from error
+            schema = output_schema or _deepfetch_output_schema()
+            if request.job_ref is not None and callable(
+                getattr(self._runner, "run_durable_job", None)
+            ):
+                return self._invoke_durable(
+                    request,
+                    prompt,
+                    output_schema=schema,
+                    timeout_seconds=timeout_seconds,
+                    access=access,
+                    external_mcp_access=external_mcp_access,
                 )
-                run_job = getattr(self._runner, "run_job", None)
-                if request.job_ref is not None and callable(run_job):
-                    completed = (
-                        run_job(
-                            request.job_ref,
-                            argv,
-                            prompt,
-                            timeout_seconds,
-                            environment,
-                        )
-                        if environment is not None
-                        else run_job(
-                            request.job_ref, argv, prompt, timeout_seconds
-                        )
-                    )
-                else:
-                    completed = (
-                        self._runner(
-                            argv, prompt, timeout_seconds, environment
-                        )
-                        if environment is not None
-                        else self._runner(argv, prompt, timeout_seconds)
-                    )
-            except _ProcessStopped as error:
-                raise DeepFetchUnavailable("deepfetch_provider_stopped") from error
-            except FileNotFoundError as error:
-                raise DeepFetchUnavailable("codex_cli_unavailable") from error
-            except subprocess.TimeoutExpired as error:
-                raise DeepFetchUnavailable("codex_deepfetch_timeout") from error
-            except DraftingUnavailable as error:
-                if error.code == "codex_output_too_large":
-                    raise DeepFetchUnavailable(
-                        "codex_deepfetch_output_too_large"
-                    ) from error
-                raise
-            except OSError as error:
-                raise DeepFetchUnavailable("codex_deepfetch_io_unavailable") from error
-            if completed.returncode != 0:
-                raise DeepFetchUnavailable("codex_deepfetch_failed")
-            if _text_exceeds_limit(
-                completed.stdout, DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
-            ) or _text_exceeds_limit(
-                completed.stderr, DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
-            ):
-                raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
-            try:
-                if result_path.stat().st_size > PROVIDER_RESULT_MAX_BYTES:
-                    raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
-                decoded = json.loads(result_path.read_text(encoding="utf-8"))
-            except DeepFetchUnavailable:
-                raise
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise DeepFetchUnavailable("codex_deepfetch_output_invalid") from error
-            if not isinstance(decoded, dict):
-                raise DeepFetchUnavailable("codex_deepfetch_output_invalid")
-            observed_native_session_ref = _thread_id(completed.stdout)
-            if observed_native_session_ref is None:
-                raise DeepFetchUnavailable("codex_deepfetch_session_ref_missing")
-            if (
-                request.native_session_ref is not None
-                and request.native_session_ref != observed_native_session_ref
-            ):
-                raise DeepFetchUnavailable("deepfetch_native_session_changed")
-            self._record_root_operation_diagnostics(
-                source_ref=(
-                    f"{root_job_ref}:native-session:"
-                    f"{observed_native_session_ref}:prompt:{canonical_hash(prompt)}"
+            root_job_ref = request.job_ref or f"{request.run_ref}:direct"
+            agent_workspace = self._agent_workspace_for(
+                root_job_ref,
+                canonical_hash(request.runtime_binding.as_dict()),
+            )
+            prompt = compose_runtime_prompt(
+                prompt, render_runtime_conditions(
+                    self._workspace, run_ref=request.run_ref,
+                    initialization_id=request.initialization_id,
                 ),
-                phase="direct",
-                pre_turn=pre_turn_diagnostics,
-                stdout=completed.stdout,
             )
-            web_evidence = _verified_turn_evidence(completed.stdout)
-            return (
-                _with_host_finalized_at(decoded, datetime.now(timezone.utc).isoformat()),
-                observed_native_session_ref,
-                web_evidence,
-                _native_acquisition_effects(completed.stdout),
-            )
+            with tempfile.TemporaryDirectory(
+                prefix="deepfetch-", dir=self._workspace
+            ) as raw_directory:
+                directory = Path(raw_directory)
+                schema_path = directory / "output-schema.json"
+                result_path = directory / "last-message.json"
+                schema_path.write_text(
+                    canonical_json(schema), encoding="utf-8"
+                )
+                capability_profile = root_capability_profile("deepfetch")
+                entry_path: RootCapabilityEntryPath = (
+                    "resume"
+                    if request.native_session_ref is not None
+                    else "initial"
+                )
+                pre_turn_diagnostics = self._root_capability_diagnostics(
+                    entry_path=entry_path
+                )
+                argv = [
+                    self._executable,
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--strict-config",
+                    *(("--config", "mcp_servers={}") if access is None and self._external_mcp is not None else ()),
+                    *(
+                        (
+                            "--config",
+                            "mcp_servers={}",
+                            "--config",
+                            f'mcp_servers.meta_research.url="{access.url}"',
+                            "--config",
+                            "mcp_servers.meta_research.bearer_token_env_var="
+                            '"META_RESEARCH_MCP_TOKEN"',
+                            "--config",
+                            "mcp_servers.meta_research.required=true",
+                            "--config",
+                            "mcp_servers.meta_research."
+                            'default_tools_approval_mode="approve"',
+                        )
+                        if access is not None
+                        else ()
+                    ),
+                    *(external_mcp_access.codex_arguments() if external_mcp_access is not None else ()),
+                    "--config",
+                    'approval_policy="never"',
+                    "--config",
+                    CODEX_ROOT_REASONING_PRESET_CONFIG,
+                    *(
+                        (
+                            "--config",
+                            'shell_environment_policy.inherit="none"',
+                        )
+                        if access is not None or external_mcp_access is not None
+                        else ()
+                    ),
+                    *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
+                    "--sandbox",
+                    self._sandbox_mode,
+                    "--model",
+                    self._model_ref,
+                    "--cd",
+                    str(agent_workspace),
+                    "--json",
+                    "--output-schema",
+                    str(schema_path),
+                    "--output-last-message",
+                    str(result_path),
+                ]
+                if request.native_session_ref is None:
+                    argv.append("-")
+                else:
+                    argv.extend(["resume", request.native_session_ref, "-"])
+                try:
+                    environment = (
+                        semantic_mcp_environment(access.token)
+                        if access is not None
+                        else None
+                    )
+                    if external_mcp_access is not None:
+                        environment = {**(environment or {}), **external_mcp_access.environment()}
+                    run_job = getattr(self._runner, "run_job", None)
+                    if request.job_ref is not None and callable(run_job):
+                        completed = (
+                            run_job(
+                                request.job_ref,
+                                argv,
+                                prompt,
+                                timeout_seconds,
+                                environment,
+                            )
+                            if environment is not None
+                            else run_job(
+                                request.job_ref, argv, prompt, timeout_seconds
+                            )
+                        )
+                    else:
+                        completed = (
+                            self._runner(
+                                argv, prompt, timeout_seconds, environment
+                            )
+                            if environment is not None
+                            else self._runner(argv, prompt, timeout_seconds)
+                        )
+                except _ProcessStopped as error:
+                    raise DeepFetchUnavailable("deepfetch_provider_stopped") from error
+                except FileNotFoundError as error:
+                    raise DeepFetchUnavailable("codex_cli_unavailable") from error
+                except subprocess.TimeoutExpired as error:
+                    raise DeepFetchUnavailable("codex_deepfetch_timeout") from error
+                except DraftingUnavailable as error:
+                    if error.code == "codex_output_too_large":
+                        raise DeepFetchUnavailable(
+                            "codex_deepfetch_output_too_large"
+                        ) from error
+                    raise
+                except OSError as error:
+                    raise DeepFetchUnavailable("codex_deepfetch_io_unavailable") from error
+                if completed.returncode != 0:
+                    raise DeepFetchUnavailable("codex_deepfetch_failed")
+                if _text_exceeds_limit(
+                    completed.stdout, DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
+                ) or _text_exceeds_limit(
+                    completed.stderr, DEEPFETCH_PROVIDER_STREAM_MAX_BYTES
+                ):
+                    raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
+                try:
+                    if result_path.stat().st_size > PROVIDER_RESULT_MAX_BYTES:
+                        raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
+                    decoded = json.loads(result_path.read_text(encoding="utf-8"))
+                except DeepFetchUnavailable:
+                    raise
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise DeepFetchUnavailable("codex_deepfetch_output_invalid") from error
+                if not isinstance(decoded, dict):
+                    raise DeepFetchUnavailable("codex_deepfetch_output_invalid")
+                observed_native_session_ref = _thread_id(completed.stdout)
+                if observed_native_session_ref is None:
+                    raise DeepFetchUnavailable("codex_deepfetch_session_ref_missing")
+                if (
+                    request.native_session_ref is not None
+                    and request.native_session_ref != observed_native_session_ref
+                ):
+                    raise DeepFetchUnavailable("deepfetch_native_session_changed")
+                self._record_root_operation_diagnostics(
+                    source_ref=(
+                        f"{root_job_ref}:native-session:"
+                        f"{observed_native_session_ref}:prompt:{canonical_hash(prompt)}"
+                    ),
+                    phase="direct",
+                    pre_turn=pre_turn_diagnostics,
+                    stdout=completed.stdout,
+                )
+                web_evidence = _verified_turn_evidence(completed.stdout)
+                return (
+                    _with_host_finalized_at(decoded, datetime.now(timezone.utc).isoformat()),
+                    observed_native_session_ref,
+                    web_evidence,
+                    _native_acquisition_effects(completed.stdout),
+                )
 
     def _invoke_durable(
         self,
@@ -2991,6 +3038,7 @@ class CodexDeepFetchAdapter:
         output_schema: dict[str, object],
         timeout_seconds: float | None,
         access: RootResidentMcpAccess | None = None,
+        external_mcp_access: ExternalMcpAccess | None = None,
     ) -> tuple[dict[str, object], str, dict[str, object], tuple[dict[str, object], ...]]:
         """Reconcile one logical provider operation across daemon Attempts."""
 
@@ -3022,6 +3070,7 @@ class CodexDeepFetchAdapter:
                 native_session_ref=native_session_ref,
                 transport_key=transport_key,
                 access=access,
+                external_mcp_access=external_mcp_access,
             )
             trace_parts.append(outcome[2])
             if outcome[0] == "completed":
@@ -3065,6 +3114,7 @@ class CodexDeepFetchAdapter:
         native_session_ref: str | None,
         transport_key: bytes,
         access: RootResidentMcpAccess | None = None,
+        external_mcp_access: ExternalMcpAccess | None = None,
     ) -> tuple[str, dict[str, object] | None, str, str | None]:
         directory.mkdir(parents=True, exist_ok=True)
         invocation_path = directory / "invocation.json"
@@ -3109,6 +3159,7 @@ class CodexDeepFetchAdapter:
             "model_ref": self._model_ref,
             "root_capability_profile": capability_profile.as_dict(),
             "root_capability_profile_hash": capability_profile.digest,
+            **({} if external_mcp_access is None else {"external_mcp": external_mcp_access.binding()}),
         }
         if access is not None:
             invocation.update(
@@ -3169,6 +3220,7 @@ class CodexDeepFetchAdapter:
                 "schema_path": schema_path,
                 "result_path": result_path,
                 "native_session_ref": native_session_ref,
+                "external_mcp_access": external_mcp_access,
             }
             argv = (
                 self._durable_argv(**durable_argv_kwargs, mcp_url=access.url)
@@ -3208,10 +3260,13 @@ class CodexDeepFetchAdapter:
                     directory / "pid.json",
                     supervisor_request_path,
                 )
-                if access is not None:
+                environment = semantic_mcp_environment(access.token) if access is not None else {}
+                if external_mcp_access is not None:
+                    environment.update(external_mcp_access.environment())
+                if environment:
                     durable_arguments = (
                         *durable_arguments,
-                        semantic_mcp_environment(access.token),
+                        environment,
                     )
                 if isinstance(self._runner, _CancellableProcessRunner):
                     durable_job(
@@ -3265,6 +3320,7 @@ class CodexDeepFetchAdapter:
         result_path: Path,
         native_session_ref: str | None,
         mcp_url: str | None = None,
+        external_mcp_access: ExternalMcpAccess | None = None,
     ) -> list[str]:
         agent_workspace = self._agent_workspace_for(
             job_ref, runtime_binding_hash
@@ -3275,6 +3331,7 @@ class CodexDeepFetchAdapter:
             "exec",
             "--skip-git-repo-check",
             "--strict-config",
+            *(("--config", "mcp_servers={}") if mcp_url is None and self._external_mcp is not None else ()),
             *(
                 (
                     "--config",
@@ -3293,6 +3350,7 @@ class CodexDeepFetchAdapter:
                 if mcp_url is not None
                 else ()
             ),
+            *(external_mcp_access.codex_arguments() if external_mcp_access is not None else ()),
             "--config",
             'approval_policy="never"',
             "--config",
@@ -3302,7 +3360,7 @@ class CodexDeepFetchAdapter:
                     "--config",
                     'shell_environment_policy.inherit="none"',
                 )
-                if mcp_url is not None
+                if mcp_url is not None or external_mcp_access is not None
                 else ()
             ),
             *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),

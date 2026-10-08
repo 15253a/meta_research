@@ -507,6 +507,7 @@ class ProductionRuntime:
             self.request_stop()
         finally:
             try:
+                self.external_mcp.close()
                 self.runtime_protection.close()
             finally:
                 self._database.close()
@@ -1171,8 +1172,16 @@ def build_production_runtime(
             provider is lifecycle for lifecycle in provider_lifecycles
         ):
             provider_lifecycles.append(provider)
+    external_mcp = ExternalMcpRuntime(data_root.root)
+    external_mcp.bind_scope_authority(harnesses)
+    for provider in (intent_drafting_provider, idea_skill_provider, plan_skill_provider,
+        bundle_skill_provider, reasoning_skill_provider, deepfetch_provider, acquisition_provider, writing_skill_provider):
+        bind_external = getattr(provider, "bind_external_mcp", None)
+        if callable(bind_external):
+            bind_external(external_mcp)
+    harnesses.bind_external_mcp(external_mcp)
     runtime = ProductionRuntime(
-        external_mcp=ExternalMcpRuntime(data_root.root),
+        external_mcp=external_mcp,
         data_root=data_root,
         owners=owners,
         authentication=Authentication(database),

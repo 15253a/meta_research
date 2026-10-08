@@ -7,7 +7,7 @@ import json
 import os
 from typing import Any
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -70,7 +70,9 @@ class ExternalMcpClient:
                 ))
                 initialized = await session.initialize()
                 if call is not None:
-                    result = (await session.call_tool(call[0], call[1])).model_dump(mode="json", by_alias=True, exclude_none=True)
+                    result = (await session.send_request(types.ClientRequest(types.CallToolRequest(
+                        params=types.CallToolRequestParams(name=call[0], arguments=call[1]),
+                    )), types.CallToolResult)).model_dump(mode="json", by_alias=True, exclude_none=True)
                     self._bounded(result)
                     return result
                 tools: list[dict[str, Any]] = []

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
+from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, ExternalMcpOperationSnapshot, ExternalMcpRuntime, compose_external_mcp_prompt
+from meta_research.external_mcp_client import ExternalMcpClientError
+
 from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, GuidanceOperationIdentity, TargetGuidanceOperation, GUIDANCE_OPERATION_IDS, guidance_prompt)
 
 import hashlib
@@ -527,6 +531,7 @@ class HarnessRuntime:
         self._admissions: dict[str, tuple[str, HarnessAdmission]] = {}
         self._admissions_by_request: dict[str, HarnessAdmission] = {}
         self._human_guidance_authority = None
+        self._external_mcp: ExternalMcpRuntime | None = None
         self._resident_scope_verifier: ResidentMcpScopeVerifier | None = None
         self._target_workspace_resolver: TargetWorkspaceResolver | None = None
         self._operation_canceller = operation_canceller
@@ -769,6 +774,9 @@ class HarnessRuntime:
         ):
             raise HarnessAdmissionError("mcp_scope_verifier_already_bound")
         self._resident_scope_verifier = verifier
+
+    def bind_external_mcp(self, runtime: ExternalMcpRuntime) -> None:
+        self._external_mcp = runtime
 
     def bind_human_guidance_authority(self, authority) -> None:
         self._human_guidance_authority = authority
@@ -2101,6 +2109,14 @@ class HarnessRuntime:
                 working_directory, run_ref=admission.run.run_ref,
                 target_ref=request.target_ref,
             ))
+        external_snapshot = None
+        if isinstance(request, TargetHarnessRequest) and self._external_mcp is not None:
+            try:
+                external_snapshot = self._external_mcp.operation_snapshot(operation_identity=operation_ref,
+                    root_kind="target", task_prompt=prompt)
+                prompt = compose_external_mcp_prompt(prompt, external_snapshot)
+            except (ExternalMcpError, ExternalMcpClientError) as error:
+                raise HarnessAdmissionError(error.code) from error
         invocation_material = _turn_invocation_material(
             admission,
             request,
@@ -2111,6 +2127,7 @@ class HarnessRuntime:
             resume=resume,
             workspace_ref=workspace_ref,
             guidance_binding=guidance_binding,
+            external_mcp_binding=None if external_snapshot is None else external_snapshot.binding(),
         )
         invocation_hash = canonical_hash(invocation_material)
         self._start_operation(
@@ -2134,6 +2151,7 @@ class HarnessRuntime:
             working_directory=working_directory,
             human_request_continuation=human_request_continuation,
             guidance_binding=guidance_binding,
+            external_mcp_snapshot=external_snapshot,
         )
 
     def reconcile_probe_turn(
@@ -2208,6 +2226,14 @@ class HarnessRuntime:
         workspace_ref, working_directory = self._target_workspace_for(
             admission, request
         )
+        external_snapshot = None
+        if isinstance(request, TargetHarnessRequest) and self._external_mcp is not None:
+            try:
+                external_snapshot = self._external_mcp.operation_snapshot(operation_identity=operation_ref,
+                    root_kind="target", task_prompt=prompt, recovery=True)
+                prompt = compose_external_mcp_prompt(external_snapshot.task_prompt, external_snapshot)
+            except (ExternalMcpError, ExternalMcpClientError) as error:
+                raise HarnessAdmissionError(error.code) from error
         invocation_hash = canonical_hash(
             _turn_invocation_material(
                 admission,
@@ -2219,6 +2245,7 @@ class HarnessRuntime:
                 resume=resume,
                 workspace_ref=workspace_ref,
                 guidance_binding=guidance_binding,
+                external_mcp_binding=None if external_snapshot is None else external_snapshot.binding(),
             )
         )
         terminal_replay_only = False
@@ -2257,6 +2284,7 @@ class HarnessRuntime:
                 operation_ref=operation_ref, generation=generation, resume=resume,
                 workspace_ref=workspace_ref,
                 guidance_binding=guidance_binding,
+                external_mcp_binding=None if external_snapshot is None else external_snapshot.binding(),
             ))
             if frozen_hash != operation.invocation_hash:
                 raise HarnessAdmissionError("harness_operation_conflict")
@@ -2279,6 +2307,7 @@ class HarnessRuntime:
             human_request_continuation=human_request_continuation,
             terminal_replay_only=terminal_replay_only,
             guidance_binding=guidance_binding,
+            external_mcp_snapshot=external_snapshot,
         )
 
     @staticmethod
@@ -2293,6 +2322,7 @@ class HarnessRuntime:
         working_directory: Path | None,
         entry_path: Literal["initial", "resume", "recovery"],
         operation_channel: ResidentMcpChannel | None = None,
+        external_mcp_access: ExternalMcpAccess | None = None,
     ) -> HarnessInvocation:
         return HarnessInvocation(
             harness_family=request.harness_family,
@@ -2317,6 +2347,7 @@ class HarnessRuntime:
             root_kind="target" if isinstance(request, TargetHarnessRequest) else None,
             entry_path=entry_path,
             authorized_operation_ids=request.required_operation_ids,
+            external_mcp_access=external_mcp_access,
         )
 
     def _invoke_provider_turn(
@@ -2336,6 +2367,7 @@ class HarnessRuntime:
         human_request_continuation: bool = False,
         terminal_replay_only: bool = False,
         guidance_binding: FrozenGuidanceBinding | None = None,
+        external_mcp_snapshot: ExternalMcpOperationSnapshot | None = None,
     ) -> HarnessProbeRun:
         adapter = self._adapters[request.harness_family]
         entry_path = (
@@ -2400,15 +2432,21 @@ class HarnessRuntime:
                     guidance_binding=guidance_binding,
                 )
             try:
-                invoke = getattr(adapter, "invoke_terminal", None) if terminal_replay_only else adapter.invoke
-                if not callable(invoke):
-                    raise HarnessAdapterUnavailable("provider_io_unavailable", durable_outcome="unknown")
-                result = invoke(self._provider_invocation(
-                    admission, request, prompt=prompt, mcp_base_url=mcp_base_url,
-                    operation_ref=operation_ref, workspace_ref=workspace_ref,
-                    working_directory=working_directory, entry_path=entry_path,
-                    operation_channel=operation_channel,
-                ))
+                with ExitStack() as external_channels:
+                    external_mcp_access = None
+                    if external_mcp_snapshot is not None:
+                        external_mcp_access = external_channels.enter_context(self._external_mcp.channel(
+                            external_mcp_snapshot, resident_token=admission.connection.token if operation_channel is None else operation_channel.connection.token))
+                    invoke = getattr(adapter, "invoke_terminal", None) if terminal_replay_only else adapter.invoke
+                    if not callable(invoke):
+                        raise HarnessAdapterUnavailable("provider_io_unavailable", durable_outcome="unknown")
+                    result = invoke(self._provider_invocation(
+                        admission, request, prompt=prompt, mcp_base_url=mcp_base_url,
+                        operation_ref=operation_ref, workspace_ref=workspace_ref,
+                        working_directory=working_directory, entry_path=entry_path,
+                        operation_channel=operation_channel,
+                        external_mcp_access=external_mcp_access,
+                    ))
             finally:
                 if operation_channel is not None:
                     self.revoke_resident_mcp_channel(operation_channel)
@@ -3255,6 +3293,23 @@ class HarnessRuntime:
         _ = mcp_session_id
         return status, payload, response_session_id
 
+    def external_mcp_scope_is_current(self, token: str) -> bool:
+        token_hash = _token_hash(token)
+        resident_scope = self._resident_channel_scopes.get(token_hash)
+        try:
+            if resident_scope is None:
+                return self._owner.channel_is_current(token_hash)
+            if self._resident_scope_verifier is None:
+                return False
+            self._resident_scope_verifier.verify_root_agent_runtime_scope(
+                root_kind=resident_scope.root_kind, run_ref=resident_scope.run_ref,
+                attempt_ref=resident_scope.attempt_ref, root_session_ref=resident_scope.root_session_ref,
+                fence_ref=resident_scope.fence_ref, runtime_binding_hash=resident_scope.capability_binding_hash,
+            )
+            return True
+        except Exception:
+            return False
+
     def _full_conformance_request_ref(
         self, token: str, family: HarnessFamily
     ) -> str:
@@ -4002,6 +4057,7 @@ def _turn_invocation_material(
     resume: bool,
     workspace_ref: str | None,
     guidance_binding: FrozenGuidanceBinding | None = None,
+    external_mcp_binding: dict[str, str] | None = None,
 ) -> dict[str, object]:
     material: dict[str, object] = {
         "schema_ref": "meta-research/harness-invocation/v1",
@@ -4022,6 +4078,7 @@ def _turn_invocation_material(
         ),
         "capability_binding_hash": admission.run.capability_binding_hash,
         "target_workspace_ref": workspace_ref,
+        **({} if external_mcp_binding is None else {"external_mcp": external_mcp_binding}),
         **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
     }
     if isinstance(request, (ConformanceHarnessRequest, TargetHarnessRequest)):

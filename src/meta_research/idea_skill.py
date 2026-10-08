@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
+from meta_research.external_mcp import ExternalMcpAccess, ExternalMcpError, ExternalMcpRuntime, compose_external_mcp_prompt
+from meta_research.external_mcp_client import ExternalMcpClientError
+
 from meta_research.human_guidance import (FrozenGuidanceBinding, GuidanceRuntimeScope, StageGuidanceOperation, GUIDANCE_ROOT_KINDS, guidance_prompt)
 
 from meta_research.context_presentation import stage_context_view
@@ -10,6 +14,7 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import logging
 import math
 import os
@@ -1015,6 +1020,7 @@ class CodexIdeaSkillAdapter:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
         self._human_guidance_authority = None
+        self._external_mcp: ExternalMcpRuntime | None = None
         self._workspaces: RootWorkspaces | None = None
         self._agent_workspace = self._workspace / "research-workspace"
         self._agent_workspace.mkdir(parents=True, exist_ok=True)
@@ -1041,6 +1047,18 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable("workspace_service_conflict")
         self._workspaces = workspaces
         self._root_resident_mcp.bind_workspaces(workspaces)
+
+    def bind_external_mcp(self, runtime: ExternalMcpRuntime) -> None:
+        self._external_mcp = runtime
+
+    def _verify_external_snapshot(self, invocation: dict[str, object]) -> None:
+        if "external_mcp" in invocation:
+            if self._external_mcp is None:
+                raise IdeaSkillUnavailable("external_mcp_runtime_missing")
+            try:
+                self._external_mcp.restore_snapshot(invocation["external_mcp"], root_kind=self._root_agent_kind)
+            except ExternalMcpError as error:
+                raise IdeaSkillUnavailable(error.code) from error
 
     def _workspace_binding(self, *, run_ref, attempt_ref, root_session_ref,
                            fence_ref, runtime_binding_hash) -> WorkspaceBinding | None:
@@ -1309,6 +1327,7 @@ class CodexIdeaSkillAdapter:
                         )
                     continue
                 invocation = read_transport_envelope(invocation_path, key)
+                self._verify_external_snapshot(invocation)
                 transport_limits = _operation_transport_limits(invocation)
                 expected_fields = {
                     "schema_ref",
@@ -1326,6 +1345,7 @@ class CodexIdeaSkillAdapter:
                     "root_capability_profile_hash",
                     *_operation_workspace_fields(invocation),
                 *({"guidance_binding"} if "guidance_binding" in invocation else ()),
+                *({"external_mcp"} if "external_mcp" in invocation else ()),
                 }
                 if (
                     set(invocation) != expected_fields
@@ -1582,6 +1602,7 @@ class CodexIdeaSkillAdapter:
             )
             if not isinstance(invocation, dict):
                 raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+            self._verify_external_snapshot(invocation)
             transport_limits = _operation_transport_limits(invocation)
             expected_fields = {
                 "schema_ref",
@@ -1598,6 +1619,7 @@ class CodexIdeaSkillAdapter:
                 "root_capability_profile_hash",
                 *_operation_workspace_fields(invocation),
                 *({"guidance_binding"} if "guidance_binding" in invocation else ()),
+                *({"external_mcp"} if "external_mcp" in invocation else ()),
                 *transport_limits.as_dict(),
             }
             if (
@@ -2089,89 +2111,114 @@ class CodexIdeaSkillAdapter:
             schema,
             transport_limits=transport_limits,
         )
-        if job_ref is not None:
-            operation_root = self._workspace / "provider-operations"
-            directory = (
-                operation_root
-                / canonical_hash({"job_ref": job_ref})
-                / operation_name
-            )
-            result = self._invoke_durable(
-                directory=directory,
-                operation_name=operation_name,
-                job_ref=job_ref,
-                prompt=prompt,
-                schema=schema,
-                native_session_ref=native_session_ref,
-                mcp_url=mcp_url,
-                mcp_token=mcp_token,
-                mcp_scope_binding_hash=mcp_scope_binding_hash,
-                semantic_mcp_protected_environment=(
-                    semantic_mcp_protected_environment
-                ),
-                authorized_operation_ids=authorized_operation_ids,
-                sandbox_read_root=sandbox_read_root,
-                transport_limits=transport_limits,
-                workspace_binding=workspace_binding,
-                run_ref=run_ref,
-                guidance_binding=guidance_binding,
-            )
-        else:
-            prompt = compose_runtime_prompt(
-                prompt, render_runtime_conditions(self._workspace, run_ref=run_ref)
-            )
-            _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
-            pre_turn_diagnostics = self._root_capability_diagnostics(
-                entry_path=entry_path,
-                authorized_operation_ids=authorized_operation_ids,
-                semantic_mcp_available=False,
-            )
-            with tempfile.TemporaryDirectory(
-                prefix="idea-provider-", dir=self._workspace
-            ) as raw_directory:
-                invoked = self._invoke_once(
-                    directory=Path(raw_directory),
+        with ExitStack() as external_channels:
+            external_mcp_access = None
+            if self._external_mcp is not None:
+                directory = self._workspace / "provider-operations" / canonical_hash({"job_ref": job_ref}) / operation_name
+                binding = None
+                legacy = False
+                if job_ref is not None and (directory / "invocation.json").exists():
+                    try:
+                        sealed = json.loads((directory / "invocation.json").read_text(encoding="utf-8"))
+                        binding = sealed["payload"].get("external_mcp")
+                        legacy = binding is None
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
+                identity = canonical_json({"workspace": str(self._workspace.resolve()), "job_ref": job_ref,
+                    "operation_name": operation_name, "call_ref": None if job_ref is not None else secrets.token_hex(16)})
+                try:
+                    snapshot = self._external_mcp.operation_snapshot(operation_identity=identity,
+                        root_kind=self._root_agent_kind, task_prompt=prompt, binding=binding, legacy_empty=legacy)
+                    if not legacy:
+                        prompt = compose_external_mcp_prompt(prompt, snapshot)
+                        external_mcp_access = external_channels.enter_context(self._external_mcp.channel(snapshot, resident_token=mcp_token))
+                except (ExternalMcpError, ExternalMcpClientError) as error:
+                    raise IdeaSkillUnavailable(error.code) from error
+            if job_ref is not None:
+                operation_root = self._workspace / "provider-operations"
+                directory = (
+                    operation_root
+                    / canonical_hash({"job_ref": job_ref})
+                    / operation_name
+                )
+                result = self._invoke_durable(
+                    directory=directory,
+                    operation_name=operation_name,
+                    job_ref=job_ref,
                     prompt=prompt,
                     schema=schema,
                     native_session_ref=native_session_ref,
-                    job_ref=None,
-                    stdout_path=None,
-                    invocation_hash=None,
                     mcp_url=mcp_url,
                     mcp_token=mcp_token,
                     mcp_scope_binding_hash=mcp_scope_binding_hash,
                     semantic_mcp_protected_environment=(
                         semantic_mcp_protected_environment
                     ),
+                    authorized_operation_ids=authorized_operation_ids,
                     sandbox_read_root=sandbox_read_root,
                     transport_limits=transport_limits,
                     workspace_binding=workspace_binding,
+                    run_ref=run_ref,
+                    guidance_binding=guidance_binding,
+                    external_mcp_access=external_mcp_access,
                 )
-                result = (*invoked, pre_turn_diagnostics)
-        self._record_root_operation_diagnostics(
-            source_ref=(
-                job_ref
-                if job_ref is not None
-                else (
-                    f"native-session:{result[1]}:prompt:"
-                    + canonical_hash(prompt)
+            else:
+                prompt = compose_runtime_prompt(
+                    prompt, render_runtime_conditions(self._workspace, run_ref=run_ref)
                 )
-            ),
-            phase=operation_name,
-            pre_turn=result[3],
-            stdout=result[2],
-            semantic_mcp_available=mcp_url is not None,
-        )
-        try:
-            unwrapped = _unwrap_codex_root_output(result[0], raw_schema)
-            decoded = _decode_codex_provider_output(unwrapped, raw_schema)
-        except IdeaSkillUnavailable as error:
-            if error.code != "codex_json_object_transport_invalid":
-                raise
-            # Make the stage's existing top-level shape check fail so its
-            # stage-specific sealed terminal contract remains authoritative.
-            decoded = {_CODEX_TRANSPORT_DECODE_FAILURE_KEY: error.code}
-        return decoded, result[1], result[2]
+                _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
+                pre_turn_diagnostics = self._root_capability_diagnostics(
+                    entry_path=entry_path,
+                    authorized_operation_ids=authorized_operation_ids,
+                    semantic_mcp_available=False,
+                )
+                with tempfile.TemporaryDirectory(
+                    prefix="idea-provider-", dir=self._workspace
+                ) as raw_directory:
+                    invoked = self._invoke_once(
+                        directory=Path(raw_directory),
+                        prompt=prompt,
+                        schema=schema,
+                        native_session_ref=native_session_ref,
+                        job_ref=None,
+                        stdout_path=None,
+                        invocation_hash=None,
+                        mcp_url=mcp_url,
+                        mcp_token=mcp_token,
+                        mcp_scope_binding_hash=mcp_scope_binding_hash,
+                        semantic_mcp_protected_environment=(
+                            semantic_mcp_protected_environment
+                        ),
+                        sandbox_read_root=sandbox_read_root,
+                        transport_limits=transport_limits,
+                        workspace_binding=workspace_binding,
+                        external_mcp_access=external_mcp_access,
+                    )
+                    result = (*invoked, pre_turn_diagnostics)
+            self._record_root_operation_diagnostics(
+                source_ref=(
+                    job_ref
+                    if job_ref is not None
+                    else (
+                        f"native-session:{result[1]}:prompt:"
+                        + canonical_hash(prompt)
+                    )
+                ),
+                phase=operation_name,
+                pre_turn=result[3],
+                stdout=result[2],
+                semantic_mcp_available=mcp_url is not None,
+            )
+            try:
+                unwrapped = _unwrap_codex_root_output(result[0], raw_schema)
+                decoded = _decode_codex_provider_output(unwrapped, raw_schema)
+            except IdeaSkillUnavailable as error:
+                if error.code != "codex_json_object_transport_invalid":
+                    raise
+                # Make the stage's existing top-level shape check fail so its
+                # stage-specific sealed terminal contract remains authoritative.
+                decoded = {_CODEX_TRANSPORT_DECODE_FAILURE_KEY: error.code}
+            return decoded, result[1], result[2]
 
     def _invoke_durable(
         self,
@@ -2192,6 +2239,7 @@ class CodexIdeaSkillAdapter:
         run_ref: str | None = None,
         workspace_binding: WorkspaceBinding | None = None,
         guidance_binding: FrozenGuidanceBinding | None = None,
+        external_mcp_access: ExternalMcpAccess | None = None,
     ) -> tuple[dict[str, object], str | None, str, dict[str, object]]:
         directory.mkdir(parents=True, exist_ok=True)
         invocation_path = directory / "invocation.json"
@@ -2236,6 +2284,7 @@ class CodexIdeaSkillAdapter:
             "root_capability_profile_hash": capability_profile.digest,
             "mcp_url": mcp_url,
             "mcp_scope_binding_hash": mcp_scope_binding_hash,
+            **({} if external_mcp_access is None else {"external_mcp": external_mcp_access.binding()}),
             **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
             **transport_limits.as_dict(),
         }
@@ -2330,6 +2379,7 @@ class CodexIdeaSkillAdapter:
                 sandbox_read_root=sandbox_read_root,
                 transport_limits=transport_limits,
                 workspace_binding=workspace_binding,
+                external_mcp_access=external_mcp_access,
             )
         except IdeaSkillUnavailable as error:
             if error.code in _SEALED_TRANSPORT_CONTRACT_FAILURES:
@@ -2371,6 +2421,7 @@ class CodexIdeaSkillAdapter:
         semantic_mcp_protected_environment: bool = False,
         sandbox_read_root: Path | None = None,
         workspace_binding: WorkspaceBinding | None = None,
+        external_mcp_access: ExternalMcpAccess | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         working_directory = workspace_binding.directory if workspace_binding else self._agent_workspace.resolve()
         mcp_values = (mcp_url, mcp_token, mcp_scope_binding_hash)
@@ -2407,6 +2458,7 @@ class CodexIdeaSkillAdapter:
             "--strict-config",
             "--config",
             "mcp_servers={}",
+            *(external_mcp_access.codex_arguments() if external_mcp_access is not None else ()),
             *(
                 (
                     "--config",
@@ -2437,6 +2489,7 @@ class CodexIdeaSkillAdapter:
                     "shell_environment_policy.inherit=\"none\"",
                 )
                 if semantic_mcp_protected_environment
+                or external_mcp_access is not None
                 or self._shell_environment_inherit == "none"
                 else ()
             ),
@@ -2472,6 +2525,8 @@ class CodexIdeaSkillAdapter:
             )
             if workspace_binding is not None:
                 environment = {**(environment or {}), "META_RESEARCH_PROVIDER_CWD": str(working_directory)}
+            if external_mcp_access is not None:
+                environment = {**(environment or {}), **external_mcp_access.environment()}
             if job_ref is None:
                 completed = (
                     self._runner(

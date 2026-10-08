@@ -211,6 +211,10 @@ class ExternalMcpRuntime:
     def bind_scope_authority(self, authority: object) -> None:
         self._scope_authority = authority
 
+    def close(self) -> None:
+        with self._lock:
+            self._grants.clear()
+
     def read_config(self) -> ExternalMcpConfiguration:
         with self._lock:
             path = self._root / "config.json"
@@ -290,6 +294,18 @@ class ExternalMcpRuntime:
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise ExternalMcpError("external_mcp_snapshot_invalid") from error
 
+    def restore_snapshot(self, binding: dict[str, str], *, root_kind: RootAgentKind) -> ExternalMcpOperationSnapshot:
+        if not isinstance(binding, dict) or set(binding) != {"operation_key", "snapshot_hash"} or any(
+            not isinstance(value, str) or re.fullmatch(r"[a-f0-9]{64}", value) is None for value in binding.values()):
+            raise ExternalMcpError("external_mcp_snapshot_invalid")
+        path = self._operations / (binding["operation_key"] + ".json")
+        if not path.exists():
+            raise ExternalMcpError("external_mcp_snapshot_missing")
+        snapshot = self._read_snapshot(path)
+        if snapshot.binding() != binding or snapshot.root_kind != root_kind:
+            raise ExternalMcpError("external_mcp_snapshot_conflict")
+        return snapshot
+
     def _write(self, path: Path, value: object, *, exclusive: bool) -> None:
         temporary = path.with_name("." + path.name + "." + secrets.token_hex(12))
         try:
@@ -332,8 +348,7 @@ class ExternalMcpRuntime:
                 return True
             if self._scope_authority is None:
                 return False
-            return self._scope_authority.dispatch_mcp_http(resident_token,
-                {"jsonrpc": "2.0", "id": "external-scope", "method": "ping"}, mcp_session_id=None)[0] == 200
+            return self._scope_authority.external_mcp_scope_is_current(resident_token)
         tools = {exposed_tool_name(frozen.service.service_id, tool["name"]): (frozen, tool)
             for frozen in snapshot.services for tool in json.loads(frozen.catalog_json)}
         token = secrets.token_urlsafe(32)
@@ -351,7 +366,7 @@ class ExternalMcpRuntime:
         try:
             yield access
         except Exception as error:
-            if getattr(error, "durable_outcome", None) not in {"pending", "unknown"}:
+            if getattr(error, "durable_outcome", None) not in {"pending", "unknown"} and getattr(error, "code", None) != "codex_operation_reconciliation_pending":
                 self.release(access)
             raise
         else:
@@ -392,6 +407,11 @@ class ExternalMcpRuntime:
                 return failure(-32602, "external_mcp_arguments_invalid")
             try:
                 result = self._client.call(json.loads(frozen.service.connection_json), tool["name"], arguments)
+                if not result.get("isError", False) and "outputSchema" in tool:
+                    try:
+                        Draft202012Validator(tool["outputSchema"]).validate(result.get("structuredContent"))
+                    except ValidationError:
+                        return failure(-32000, "external_mcp_result_invalid")
             except ExternalMcpClientError as error:
                 return failure(-32000, error.code)
         else:
