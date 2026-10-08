@@ -470,8 +470,11 @@ def generated_paper_id(item: Dict[str, Any]) -> str:
     else:
         base = "academic:" + hashlib.sha256(provenance["version"]["canonical_url"].encode()).hexdigest()[:20]
     version = provenance["version"]
-    suffix = hashlib.sha256(json_bytes({key: version[key] for key in ("kind", "arxiv_version", "canonical_url")})).hexdigest()[:12]
-    if version["kind"] == "unknown":
+    fingerprint = {key: version[key] for key in ("kind", "arxiv_version", "canonical_url")}
+    if "stable_identity" in provenance:
+        fingerprint["stable_identity"] = provenance["stable_identity"]
+    suffix = hashlib.sha256(json_bytes(fingerprint)).hexdigest()[:12]
+    if version["kind"] == "unknown" or not any(item[field] for field in ("doi", "arxiv_id", "openalex_id")) and "stable_identity" not in provenance:
         suffix += uuid.uuid4().hex[:8]
     return base + "@" + suffix
 
@@ -482,14 +485,13 @@ def find_existing_id(ledger: Dict[str, Any], item: Dict[str, Any]) -> Optional[s
     if selected is not None:
         if selected not in ledger["papers"]:
             raise PapersError("paper_id may select an existing record but cannot create one")
+        if "discovery" in ledger and item["provenance"] is None:
+            raise PapersError("selected paper update needs verified original-paper version provenance")
         matches.add(selected)
     for paper_id, paper in ledger["papers"].items():
         identity = paper["identity"]
-        shared = any(item[field] and identity[field] == item[field] for field in ("doi", "arxiv_id", "openalex_id"))
         if item["provenance"] is not None and "provenance" in paper:
-            if shared and equivalent_version(paper["provenance"], item["provenance"], identities=(identity, item)):
-                matches.add(paper_id)
-            elif not any(item[field] for field in ("doi", "arxiv_id", "openalex_id")) and equivalent_version(paper["provenance"], item["provenance"]):
+            if equivalent_version(paper["provenance"], item["provenance"], identities=(identity, item)):
                 matches.add(paper_id)
     if len(matches) > 1:
         raise PapersError("paper identifiers resolve to multiple existing records")
@@ -502,6 +504,9 @@ def find_existing_id(ledger: Dict[str, Any], item: Dict[str, Any]) -> Optional[s
         if item[field] and existing[field] and item[field] != existing[field]:
             raise PapersError(field + " conflicts with selected paper")
     if item["provenance"] is not None and "provenance" in paper:
+        stable_a, stable_b = paper["provenance"].get("stable_identity"), item["provenance"].get("stable_identity")
+        if stable_a and stable_b and stable_a != stable_b:
+            raise PapersError("stable identity conflicts with selected paper")
         if not equivalent_version(paper["provenance"], item["provenance"], identities=(existing, item)) and paper["provenance"]["version"] != item["provenance"]["version"]:
             raise PapersError("version conflicts with selected paper")
     return paper_id
@@ -512,6 +517,8 @@ def merge_intake(paper: Dict[str, Any], item: Dict[str, Any]) -> None:
         if "provenance" not in paper:
             paper["provenance"] = copy.deepcopy(item["provenance"])
         else:
+            if "stable_identity" in item["provenance"]:
+                paper["provenance"]["stable_identity"] = copy.deepcopy(item["provenance"]["stable_identity"])
             for field in ("discovery_refs", "related_paper_ids"):
                 paper["provenance"][field] = merge_unique(paper["provenance"][field], item["provenance"][field])
     identity = paper["identity"]

@@ -30,10 +30,10 @@ class Transport:
         return HttpObservation(url, final or url, redirects, status, body)
 
 
-def service(tmp_path, tail):
+def service(tmp_path, tail, *, scope="run:attempt"):
     transport = Transport([(200, CARD, None, ()), *tail])
     discovery = SogouDiscovery(tmp_path / "host", session_factory=lambda: transport)
-    result = discovery.search("run:attempt", "uncertainty calibration")
+    result = discovery.search(scope, "uncertainty calibration")
     return discovery, transport, result
 
 
@@ -235,7 +235,7 @@ def test_forged_receipts_and_commentary_originals_fail(tmp_path):
     assert upsert(tmp_path, intake(version(1), arxiv_id="2401.01234v2")) == 2
     discovery, _, search = service(tmp_path, [])
     ledger = papers.load_ledger(tmp_path)
-    ledger["discovery"]["receipts"] = [search["receipt"]]
+    ledger["discovery"]["receipts"] = discovery.receipts("run:attempt")
     with pytest.raises(ContractError, match="host observation"):
         verify_host_receipts(ledger, [])
     verify_host_receipts(ledger, discovery.receipts("run:attempt"))
@@ -255,12 +255,14 @@ def test_snapshot_consumers_preserve_discovery_and_distinct_version_records(tmp_
     assert records == [{"ref": "paper:" + first, "evidence_basis": "title_lead", "evidence_basis_ref": "paper:" + first}, {"ref": "paper:" + second, "evidence_basis": "title_lead", "evidence_basis_ref": "paper:" + second}]
 
 
-@pytest.mark.parametrize("forged", [False, True])
-def test_provider_import_retains_host_receipt_and_original_url(tmp_path, forged):
+@pytest.mark.parametrize("mutation", [None, "changed_query", "no_discovery", "no_query", "no_card", "no_open"])
+def test_provider_import_retains_host_receipt_and_original_url(tmp_path, mutation):
     from meta_research.deepfetch import CodexDeepFetchAdapter, DeepFetchUnavailable
     from test_deepfetch_adapter import SequencedPrototypeRunner, PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL, RecordingAcquisitionClient, _bind_acquisition, _execute
-    discovery, _, search = service(tmp_path, [])
-    observations = discovery.receipts("run:attempt")
+    scope = "deepfetch_run_1:deepfetch_attempt_1"
+    discovery, _, search = service(tmp_path, [(200, BODY, "https://mp.weixin.qq.com/s?actual=1", ())], scope=scope)
+    discovery.open(scope, search["candidates"][0]["candidate_ref"])
+    observations = discovery.receipts(scope)
 
     class ProvenanceRunner(SequencedPrototypeRunner):
         def __call__(self, argv, prompt, timeout):
@@ -269,20 +271,27 @@ def test_provider_import_retains_host_receipt_and_original_url(tmp_path, forged)
                 root = Path(next(line.removeprefix("public_output_root=") for line in prompt.splitlines() if line.startswith("public_output_root=")))
                 ledger = json.loads((root / "papers.json").read_text())
                 ledger["discovery"] = {"receipts": copy.deepcopy(observations), "unresolved_leads": []}
-                if forged:
+                if mutation == "changed_query":
                     ledger["discovery"]["receipts"][0]["query"] = "fabricated query"
+                elif mutation in {"no_query", "no_card", "no_open"}:
+                    omitted = {"no_query": 0, "no_card": 1, "no_open": 2}[mutation]
+                    del ledger["discovery"]["receipts"][omitted]
                 paper = ledger["papers"]["doi:10.1000/example"]
                 paper["provenance"] = version(kind="published", url="https://doi.org/10.1000/example")
-                paper["provenance"]["discovery_refs"] = [search["candidates"][0]["receipt"]["receipt_ref"]]
+                paper["provenance"]["discovery_refs"] = []
+                if mutation == "no_discovery":
+                    del ledger["discovery"]
+                    del paper["provenance"]
                 paper["metadata"]["source_urls"] = ["https://openalex.org/W123", "https://example.org/paper"]
                 (root / "papers.json").write_text(json.dumps(ledger), encoding="utf-8")
             return result
 
     runner = ProvenanceRunner([PROTOTYPE_ACQUIRE, PROTOTYPE_FINAL])
     adapter = _bind_acquisition(CodexDeepFetchAdapter(tmp_path / "provider", model_ref="gpt-test", process_runner=runner), RecordingAcquisitionClient(tmp_path / "acquisition"))
-    adapter.bind_sogou_discovery(SimpleNamespace(receipts=lambda scope: observations))
-    if forged:
-        with pytest.raises(DeepFetchUnavailable, match="deepfetch_discovery_provenance_invalid"):
+    adapter.bind_sogou_discovery(discovery)
+    if mutation:
+        expected_error = "deepfetch_papers_v4_validator_failed" if mutation in {"no_query", "no_card"} else "deepfetch_discovery_provenance_invalid"
+        with pytest.raises(DeepFetchUnavailable, match=expected_error):
             _execute(adapter)
     else:
         result = _execute(adapter)
@@ -366,3 +375,79 @@ def test_provider_paths_grant_reachable_discovery_or_deny_provided_only(tmp_path
     result = adapter._invoke(request, "web_evidence_gate=v1", phase="turn-0")
     assert result[0] == {"status": "web_evidence_ready"}
     assert outcomes == (["results"] if mode == "oa_only" else ["discovery_not_granted"])
+
+
+def test_selected_revision_update_requires_provenance_and_preserves_ledger(tmp_path):
+    initialize(tmp_path)
+    assert upsert(tmp_path, intake()) == 0
+    first = papers.load_ledger(tmp_path)["paper_order"][0]
+    before = (tmp_path / "papers.json").read_bytes()
+    assert upsert(tmp_path, {"paper_id": first, "arxiv_id": "2401.01234v2", "title": "Different revision"}) == 2
+    assert (tmp_path / "papers.json").read_bytes() == before
+    assert upsert(tmp_path, intake(version(2), paper_id=first, arxiv_id="2401.01234v2")) == 2
+    assert (tmp_path / "papers.json").read_bytes() == before
+    assert upsert(tmp_path, intake(version(), paper_id=first, arxiv_id="2401.01234v1", abstract="Verified same revision metadata")) == 0
+    ledger = papers.load_ledger(tmp_path)
+    assert ledger["paper_order"] == [first]
+    assert ledger["papers"][first]["metadata"]["abstract"] == "Verified same revision metadata"
+    assert ledger["papers"][first]["provenance"]["version"]["arxiv_version"] == 1
+
+
+def test_publisher_identity_merges_sources_but_url_title_and_other_versions_do_not(tmp_path):
+    initialize(tmp_path)
+    canonical = "https://papers.nips.cc/paper/7181-attention-is-all-you-need"
+    provenance = version(kind="published", url=canonical)
+    provenance["stable_identity"] = {"namespace": "publisher:papers.nips.cc", "identifier": "7181"}
+    discovery, _, search = service(tmp_path, [])
+    sogou = search["candidates"][0]["receipt"]
+    web = copy.deepcopy(sogou)
+    web.update(receipt_ref="native:publisher", channel="native_web", parent_receipt_ref=None, evidence_kind="academic_source")
+    web["observation"]["requested_url"] = canonical
+    ledger = papers.load_ledger(tmp_path)
+    ledger["discovery"]["receipts"] = [search["receipt"], sogou, web]
+    papers.atomic_write_json(tmp_path / "papers.json", ledger)
+    a, b = copy.deepcopy(provenance), copy.deepcopy(provenance)
+    a["discovery_refs"] = [sogou["receipt_ref"]]
+    b["discovery_refs"] = ["native:publisher"]
+    assert upsert(tmp_path, [intake(a, arxiv_id=None, source_urls=[canonical]), intake(b, arxiv_id=None, source_urls=[canonical], abstract="Verified publisher abstract")]) == 0
+    ledger = papers.load_ledger(tmp_path)
+    first = ledger["paper_order"][0]
+    assert ledger["paper_order"] == [first]
+    assert ledger["papers"][first]["provenance"]["discovery_refs"] == [sogou["receipt_ref"], "native:publisher"]
+    assert canonical_paper_url(ledger["papers"][first]) == canonical
+    other_identity = copy.deepcopy(provenance)
+    other_identity["stable_identity"]["identifier"] = "7182"
+    other_version = copy.deepcopy(provenance)
+    other_version["version"].update(kind="preprint", arxiv_version=1, canonical_url="https://arxiv.org/abs/1706.03762v1")
+    other_version["version"]["verification_urls"] = [other_version["version"]["canonical_url"], canonical]
+    url_only = version(kind="published", url=canonical)
+    assert upsert(tmp_path, [intake(other_identity, arxiv_id=None, source_urls=[canonical]), intake(other_version, arxiv_id=None, source_urls=[other_version["version"]["canonical_url"]]), intake(url_only, arxiv_id=None, source_urls=[canonical]), intake(url_only, arxiv_id=None, source_urls=[canonical])]) == 0
+    ledger = papers.load_ledger(tmp_path)
+    assert len(ledger["paper_order"]) == 5
+    assert len(set(ledger["paper_order"])) == 5
+    from meta_research.owners.research_memory import _proposal_ledger_evidence, _validated_v4_ledger
+    assert _validated_v4_ledger(ledger, expected_count=5) == 5
+    assert _proposal_ledger_evidence(ledger)["papers"][first]["provenance"]["stable_identity"] == {"namespace": "publisher:papers.nips.cc", "identifier": "7181"}
+    before = (tmp_path / "papers.json").read_bytes()
+    assert upsert(tmp_path, intake(other_identity, paper_id=first, arxiv_id=None, source_urls=[canonical])) == 2
+    assert (tmp_path / "papers.json").read_bytes() == before
+    invalid = copy.deepcopy(provenance)
+    invalid["stable_identity"]["namespace"] = "publisher:unverified.example"
+    assert upsert(tmp_path, intake(invalid, arxiv_id=None, source_urls=[canonical])) == 2
+    assert (tmp_path / "papers.json").read_bytes() == before
+    invalid = copy.deepcopy(provenance)
+    invalid["stable_identity"]["identifier"] = canonical
+    assert upsert(tmp_path, intake(invalid, arxiv_id=None, source_urls=[canonical])) == 2
+    assert (tmp_path / "papers.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("omitted", [0, 1, 2])
+def test_every_host_observation_must_survive_even_without_paper_refs(tmp_path, omitted):
+    discovery, _, search = service(tmp_path, [(200, BODY, "https://mp.weixin.qq.com/s?actual=1", ())])
+    discovery.open("run:attempt", search["candidates"][0]["candidate_ref"])
+    observations = discovery.receipts("run:attempt")
+    ledger = {"discovery": {"receipts": copy.deepcopy(observations)}}
+    verify_host_receipts(ledger, observations)
+    del ledger["discovery"]["receipts"][omitted]
+    with pytest.raises(ContractError, match="complete matching host observations"):
+        verify_host_receipts(ledger, observations)

@@ -94,10 +94,24 @@ def parse_version(value):
 
 
 def parse_provenance(value):
-    exact(value, PROVENANCE_KEYS, "provenance")
+    exact(value, PROVENANCE_KEYS | ({"stable_identity"} if isinstance(value, dict) and "stable_identity" in value else set()), "provenance")
+    if "stable_identity" in value:
+        identity = exact(value["stable_identity"], {"namespace", "identifier"}, "stable_identity")
+        namespace = text(identity["namespace"], "stable_identity.namespace")
+        identifier = text(identity["identifier"], "stable_identity.identifier")
+        if not re.fullmatch(r"(?:publisher|repository):[a-z0-9][a-z0-9.-]*|pubmed", namespace):
+            raise ContractError("stable_identity namespace invalid")
+        if "://" in identifier or any(char.isspace() for char in identifier):
+            raise ContractError("stable_identity needs an official identifier, not a URL or title")
+        if namespace == "pubmed" and not re.fullmatch(r"[1-9]\d*", identifier):
+            raise ContractError("stable_identity PubMed identifier invalid")
     strings(value["discovery_refs"], "discovery_refs")
     strings(value["related_paper_ids"], "related_paper_ids")
     parse_version(value["version"])
+    if "stable_identity" in value:
+        authority = namespace.split(":", 1)[1] if ":" in namespace else "pubmed.ncbi.nlm.nih.gov"
+        if not any(urlsplit(source).hostname == authority for source in value["version"]["verification_urls"]):
+            raise ContractError("stable_identity needs its official authority in verification_urls")
     return value
 
 
@@ -202,20 +216,33 @@ def equivalent_version(left, right, *, identities=None):
     a, b = left["version"], right["version"]
     if a["kind"] == "unknown" or b["kind"] == "unknown" or a["kind"] != b["kind"]:
         return False
+    shared = identities is not None and any(
+        identities[0].get(field) and identities[0].get(field) == identities[1].get(field)
+        for field in ("doi", "arxiv_id", "openalex_id")
+    )
+    stable_a, stable_b = left.get("stable_identity"), right.get("stable_identity")
+    if stable_a and stable_b and stable_a != stable_b:
+        return False
+    if not (shared or stable_a and stable_a == stable_b):
+        return False
     if a["kind"] == "preprint":
-        shared_arxiv = identities is not None and identities[0].get("arxiv_id") and identities[0].get("arxiv_id") == identities[1].get("arxiv_id")
-        return a["arxiv_version"] is not None and a["arxiv_version"] == b["arxiv_version"] and bool(shared_arxiv or a["canonical_url"] == b["canonical_url"])
+        return a["arxiv_version"] is not None and a["arxiv_version"] == b["arxiv_version"] and (
+            identities is not None and identities[0].get("arxiv_id") and identities[0].get("arxiv_id") == identities[1].get("arxiv_id")
+            or a["canonical_url"] == b["canonical_url"]
+        )
     shared_doi = identities is not None and identities[0].get("doi") and identities[0].get("doi") == identities[1].get("doi")
-    if shared_doi:
-        return True
-    return a["canonical_url"] == b["canonical_url"]
+    return bool(shared_doi or a["canonical_url"] == b["canonical_url"])
 
 
 def verify_host_receipts(ledger, observations):
     host = {r["receipt_ref"]: r for r in observations}
-    for receipt in ledger.get("discovery", {}).get("receipts", []):
-        if receipt["channel"] == "sogou_wechat" and host.get(receipt["receipt_ref"]) != receipt:
-            raise ContractError("Sogou receipt is not a matching host observation")
+    submitted = {
+        receipt["receipt_ref"]: receipt
+        for receipt in ledger.get("discovery", {}).get("receipts", [])
+        if receipt["channel"] == "sogou_wechat"
+    }
+    if submitted != host:
+        raise ContractError("Sogou receipts are not the complete matching host observations")
 
 
 def canonical_paper_url(paper):
