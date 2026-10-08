@@ -184,6 +184,7 @@ def retained_asset_references(connection, version_ref):
         )
         references.extend(f"{table}:{ref}" for ref in rows)
     structured = (
+        ("rm_creation_bases", "basis_ref", "body_json"),
         ("rm_target_generic_result_manifests", "manifest_ref", "payload_json"),
         ("rm_asset_changes", "change_ref", "payload_json"),
         ("rm_target_root_completion_manifests", "manifest_ref", "entries_json"),

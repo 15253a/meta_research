@@ -8,6 +8,8 @@ Correction also records `error`, `scope`, exact accepted `evidence_bindings`, an
 
 Retirement requires an explanation, explicit confirmation of low value, obsolescence, and error, understood impact, and no remaining explanatory value. The writer checks fresh research references, pending accepted input custody, holds, and the expected asset and reference revisions. An eligibility assessment is an observation, never a retirement permit. Failure, negative findings, and changed goals do not trigger retirement.
 
+Saved creation bases retain their selected exact asset bindings before human confirmation, on both direct and DeepFetch routes. A blocked retirement identifies them as `rm_creation_bases:<basis_ref>`. Saving a new basis rechecks selected source usability under the same SQLite writer fence as retirement; a version retired before a new basis is saved cannot become its new source. This protects the persisted reference, without making the preceding content intake and basis acceptance one transaction. Historical bases and exact source bytes remain readable.
+
 Accepted Idea, Plan, and Reasoning content retain exact asset sources in their scientific documents. An intake origin permits Quest access without inventing a scientific role. When an agent chooses that material as a new scientific basis, the final content writer checks usability under the same fence as retirement. Retirement verifies the retained document metadata and its existing acceptance receipt. Historical resolution and replay keep the original source identity when current changes.
 
 Accepted retirement removes the selected version from current and rejects new uses. It retains managed objects, shared directory entries, linked originals, and historical explanations. This implementation does not reclaim bytes. A retained exact version remains readable with its retirement notice. A same-key replay returns the original fact; a changed payload conflicts.
@@ -24,6 +26,8 @@ Accepted retirement removes the selected version from current and rejects new us
 | Retirement | `POST /api/v1/research-assets/{version_ref}/retirement` |
 
 The retirement body contains `expected_revision`, `expected_reference_revision`, `explanation`, `low_value`, `obsolete`, `incorrect`, `impact_understood`, and `has_explanation_value`. A blocked response exposes reason codes and the actual reference and hold identities.
+
+`GET /api/v1/quest-initializations/{initialization_id}` reports source-material dispatch for both draft bindings and the confirmed proposal's creation basis. If source custody is temporarily unavailable, the creation remains readable with a `quest_source_material` failure receipt and recovery step; later steps remain `not_attempted`. Restoring custody allows the existing reconciliation retry to continue with the same basis and exact source identities.
 
 Root agents discover `research_memory.assets.page`, `.lifecycle`, and `.current`. They use `.intake` and `.retire` with their corresponding `.reconcile` operation. Every operation verifies the current Quest and runtime fence. Intake records the accepting Quest as an immutable origin fact. That access fact does not manufacture a scientific use. Exact content uses the existing `research_memory.content.read` tool.
 
