@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { fetchQuestRuntimeConditions, fetchQuestRuntimeDevices, ProductError, saveQuestRuntimeConditions, type QuestRuntimeConditions } from "./api";
+import { fetchQuestRuntimeConditions, fetchQuestRuntimeDevices, ProductError, saveQuestRuntimeConditions, type QuestRuntimeConditions, type ResearchStyle } from "./api";
+import { RESEARCH_STYLES, researchStyleLabel } from "./researchStyle";
 import {
   isConditionsObject, mergeRuntimeConditionDevices, parseRuntimeConditions, replaceRuntimeConditionsJson,
   runtimeConditionDeviceIds, runtimeConditionDevices, updateRuntimeConditionDevices,
@@ -36,6 +37,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
   const alive = useRef(false);
   const [basis, setBasis] = useState<QuestRuntimeConditions | null>(null);
   const [text, setText] = useState("");
+  const [researchStyle, setResearchStyle] = useState<ResearchStyle>("balanced");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -102,6 +104,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
       }
       setBasis(value);
       setText(value.text);
+      setResearchStyle(value.research_style ?? "balanced");
       rememberDevices(value.text);
       setAdvanced(parseRuntimeConditions(value.text).kind !== "structured");
     }).catch(() => {
@@ -141,13 +144,14 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
     setSaved(false);
     setError(null);
     try {
-      const value = await saveQuestRuntimeConditions(questRef, text, basis.revision);
+      const value = await saveQuestRuntimeConditions(questRef, text, basis.revision, researchStyle);
       if (!alive.current) return;
       if (value.quest_ref !== questRef || typeof value.text !== "string" || typeof value.revision !== "string") {
         throw new Error("runtime_conditions_identity_invalid");
       }
       setBasis(value);
       setText(value.text);
+      setResearchStyle(value.research_style ?? "balanced");
       rememberDevices(value.text);
       setSaved(true);
     } catch (caught) {
@@ -167,6 +171,15 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
       <p id="runtime-conditions-help">保存后用于后续新调用，不改变正在进行的调用或已保存的研究成果。</p>
       {loading ? <p role="status">正在读取运行条件…</p> : null}
       <div className="runtime-conditions-fields">
+        <label><span>研究风格</span><select aria-label="研究风格" aria-describedby="runtime-research-style-help"
+          value={researchStyle} disabled={loading || !basis || saving}
+          onChange={event => { setResearchStyle(event.currentTarget.value as ResearchStyle); setSaved(false); }}>
+          {RESEARCH_STYLES.map(style => <option key={style.value} value={style.value}>{style.label}</option>)}
+        </select></label>
+        {basis ? <p>当前研究风格：{researchStyleLabel(basis.research_style ?? "balanced")}</p> : null}
+        <p id="runtime-research-style-help" className="runtime-conditions-exclusions">
+          {RESEARCH_STYLES.find(style => style.value === researchStyle)?.description} 这是持续研究倾向，仍须遵循你明确保留的条件。
+        </p>
         <label><span>时间预算</span><select aria-label="时间预算" value={typeof data.time_budget === "string" ? data.time_budget : ""}
           disabled={controlsDisabled || !stringField(data.time_budget)}
           onChange={event => editFields({ ...data, time_budget: event.currentTarget.value })}>
@@ -217,7 +230,7 @@ function RuntimeConditionsDialog({ questRef, questionRef, onClose }: { questRef:
       {saved ? <p role="status" className="runtime-conditions-saved">已保存，将用于后续新调用。</p> : null}
       <footer><button type="button" onClick={onClose}>{saved || saving ? "关闭" : "取消"}</button>
         {!basis && !loading ? <button type="button" onClick={() => setAttempt(value => value + 1)}>重新读取</button> : null}
-        <button type="submit" className="runtime-conditions-save" disabled={!basis || loading || saving || conflict || !text.trim() || text.length > MAX_CONDITIONS_LENGTH || text === basis.text}>
+        <button type="submit" className="runtime-conditions-save" disabled={!basis || loading || saving || conflict || !text.trim() || text.length > MAX_CONDITIONS_LENGTH || (text === basis.text && researchStyle === (basis.research_style ?? "balanced"))}>
           {saving ? "正在保存…" : "保存运行条件"}</button></footer>
     </form>
   </dialog>;

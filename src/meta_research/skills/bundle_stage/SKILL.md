@@ -58,3 +58,5 @@ Target 正式接纳后，在同一整理核验环节从 TargetCommit 上下文�
 重大候选与终态交接按研究需要委派原生独立子智能体审阅，根核对完整结果及必要原文并自主修订；最终交接的独立审阅不能用同根自查替代，不要求固定反馈数量或审查表单。
 
 全部完成 cells 有 current accepted TargetCommit 覆盖时为 `realized`；需改变冻结语义时说明 `replan_required` 与剩余义务；真实阻塞、在途工作和未知效果保持实际状态。完成条件是本轮承诺已核对、结果与未决项已交接，Owner 接纳链可验证；执行结束、保存、TargetCommit 和科学结论分别成立。
+
+收到正式人类答复后，用原 effect_id 对账 human_request.open.reconcile，再以精确 request_ref／response_ref 调用 human_request.read。按 delivery.reply_reader／uploaded_readers 读取原根工作文件，linked_locators 沿原生工具读取原路径；先核对实际意见与材料，再继续工作。library_reconnect 的 provided_material 路线使用工作文件，不要求预先入库。提交本身不登记 Literature、Dataset、Environment 或 ResearchAsset；判断有复用价值后再用既有 RM／RG 流程接纳登记。

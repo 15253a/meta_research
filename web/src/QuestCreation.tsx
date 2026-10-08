@@ -34,6 +34,7 @@ import {
   type QuestCreationView,
   type QuestDraft,
 } from "./api";
+import { RESEARCH_STYLES } from "./researchStyle";
 import "./quest-creation.css";
 import { ProposalOutput } from "./ProposalOutput";
 import { useReplyStream } from "./chatReplyStream";
@@ -63,6 +64,7 @@ const blankDraft: QuestDraft = {
   goal: "",
   completion_criteria: "",
   time_budget: "30d",
+  research_style: "balanced",
   route: "direct",
   resource_envelope_ref: null,
   resource_envelope_hash: null,
@@ -1787,6 +1789,18 @@ export function QuestCreationWorkbench({
                 </div>
                 <div className="quest-config-card">
                   <div className="quest-config-grid">
+                    <label className="quest-field quest-research-style">
+                      <span>研究风格</span>
+                      <select aria-label="研究风格" aria-describedby="quest-research-style-help"
+                        value={draft.research_style} disabled={!creation || draftInteractionLocked}
+                        onChange={event => updateDraft({ ...draft, research_style: event.currentTarget.value as QuestDraft["research_style"] })}
+                        onBlur={() => void persistDraft()}>
+                        {RESEARCH_STYLES.map(style => <option key={style.value} value={style.value}>{style.label}</option>)}
+                      </select>
+                      <small id="quest-research-style-help">
+                        {RESEARCH_STYLES.find(style => style.value === draft.research_style)?.description} 这是持续研究倾向，仍须遵循你明确保留的条件。
+                      </small>
+                    </label>
                     <label className="quest-field">
                       <span>时间预算</span>
                       <select
@@ -2660,6 +2674,7 @@ function technicalList(values: string[]): string {
 function cloneDraft(value: QuestDraft): QuestDraft {
   return {
     ...value,
+    research_style: value.research_style ?? "balanced",
     literature: {
       ...value.literature,
       accepted_material_bindings: value.literature.accepted_material_bindings.map(
@@ -2674,7 +2689,7 @@ function normalizeQuestCreationView(
 ): NormalizedQuestCreationView {
   const value = view.quest_draft.value;
   if (isQuestDraftV2(value)) {
-    return view as NormalizedQuestCreationView;
+    return { ...view, quest_draft: { ...view.quest_draft, value: cloneDraft(value) } };
   }
   return {
     ...view,
@@ -2711,6 +2726,7 @@ function legacyDraftForWorkbench(value: LegacyQuestDraft): QuestDraft {
     goal: value.goal,
     completion_criteria: value.completion_criteria,
     time_budget: "open",
+    research_style: "balanced",
     route: "direct",
     resource_envelope_ref: null,
     resource_envelope_hash: null,

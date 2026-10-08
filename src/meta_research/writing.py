@@ -6,6 +6,7 @@ import inspect
 import time
 from typing import cast
 
+from meta_research.human_reply import ProvidedReply
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime import AgentRuntimeInterface, WritingRun
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
@@ -1212,18 +1213,19 @@ class WritingReportService:
 
         if run.status != "active":
             raise OwnerConflict("writing_operation_not_retryable")
+        obligation, business_purpose, condition = self._writing_system_help_context(
+            run, failure_code=failure_code
+        )
         target = _writing_system_help_target(
             run,
             failure_code=failure_code,
         )
+        target["condition"] = condition
         waiter_ref = "writing_retry:" + str(target["effect_id"])
         return self._agent_runtime.open_human_request(
             request_kind="system_operation_help",
-            obligation=failure_code,
-            business_purpose=(
-                "Retry only this failed Writing operation and preserve "
-                "its existing run lineage."
-            ),
+            obligation=obligation,
+            business_purpose=business_purpose,
             target_assertion=target,
             acceptance_conditions=(
                 "The existing Writing resume action succeeds for this exact failed attempt.",
@@ -1237,6 +1239,42 @@ class WritingReportService:
             },
             quest_ref=run.quest_ref,
             idempotency_key=idempotency_key,
+        )
+
+    def _writing_system_help_context(
+        self, run: WritingRun, *, failure_code: str
+    ) -> tuple[str, str, dict[str, object]]:
+        command = self._human_collaboration.query_command(run.intent_id)
+        intent = cast(dict[str, object], self._writing_payload(command)["intent"])
+        title = cast(str, intent["title"])
+        purpose = cast(str, intent["purpose"])
+        phase = "生成初稿" if run.checkpoint is None else "复核初稿"
+        retained = (
+            "尚未保存初稿。"
+            if run.checkpoint is None
+            else f"已保存的初稿仍保留（{run.checkpoint.checkpoint_ref}）。"
+        )
+        return (
+            f"请重试报告“{title}”的{phase}操作。",
+            purpose,
+            {
+                "background": (
+                    f"报告：{title}。面向：{intent['audience']}。"
+                    f"目的：{purpose}。写作要求：{intent['instructions']}"
+                ),
+                "attempted_work": [
+                    {
+                        "action": f"为报告“{title}”执行{phase}。",
+                        "result": f"本次操作失败，记录的失败代码：{failure_code}；{retained}",
+                    }
+                ],
+                "problem": f"{phase}未完成，记录的失败代码：{failure_code}；具体原因未记录。",
+                "requested_delivery": (
+                    f"请确认当前请求后点击“重试”，恢复报告“{title}”的{phase}操作。"
+                ),
+                "impact": f"成功重试后才能继续报告“{title}”的写作流程。",
+                "safe_response": "请在本求助页面点击“重试”；无需填写答复表单或上传材料。",
+            },
         )
 
     def retry_system_operation_help(
@@ -1305,9 +1343,7 @@ class WritingReportService:
         if _system_operation_retry_response(request, effect_id) is None:
             self._human_collaboration.respond_to_human_request(
                 request_ref,
-                decision="provided",
-                facts={"action": "retry", "effect_id": effect_id},
-                note="",
+                reply=ProvidedReply("", {"action": "retry", "effect_id": effect_id}),
                 idempotency_key=_operation_key(
                     "writing-system-help-response", request_ref, idempotency_key
                 ),
@@ -1486,16 +1522,20 @@ class WritingReportService:
             or failed_run.runtime_binding_hash != target["runtime_binding_hash"]
         ):
             raise OwnerConflict("system_operation_retry_binding_invalid")
+        obligation, _business_purpose, condition = self._writing_system_help_context(
+            failed_run, failure_code=failure_code
+        )
         next_target = {
             **target,
             "attempt_ref": failed_run.attempt_ref,
             "fence_ref": failed_run.fence_ref,
             "failure_code": failure_code,
+            "condition": condition,
         }
         return self._agent_runtime.revise_human_request(
             cast(str, request["request_ref"]),
             expected_revision=cast(int, request["revision"]),
-            obligation=failure_code,
+            obligation=obligation,
             target_assertion=next_target,
             acceptance_conditions=tuple(
                 cast(list[str], request["acceptance_conditions"])

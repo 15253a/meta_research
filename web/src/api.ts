@@ -258,11 +258,13 @@ export type ScopedAssetIntakePointer = {
 };
 
 export type LiteratureMode = "oa_then_institution" | "oa_only" | "provided_only";
+export type ResearchStyle = "focus" | "balanced" | "open";
 
 export type QuestDraft = {
   goal: string;
   completion_criteria: string;
   time_budget: "7d" | "30d" | "90d" | "open";
+  research_style: ResearchStyle;
   route: "direct" | "deepfetch";
   resource_envelope_ref: string | null;
   resource_envelope_hash: string | null;
@@ -2369,13 +2371,34 @@ export type HumanRequestItem = {
   successor_request_ref?: string | null;
 };
 
+export type HumanReplyMaterial =
+  | { kind: "upload"; relative_path: string; media_type: string; content_base64: string }
+  | { kind: "linked_local"; locator: string; description: string };
+
+type SealedRecoveryPayload = {
+  algorithm: "AES-GCM";
+  key_ref: string;
+  iv_base64: string;
+  ciphertext_ref: string;
+  body_hash: string;
+  binding_hash: string;
+};
+
 export type HumanRequestResponseBody = {
   decision: "provided" | "declined" | "deferred";
   facts: Record<string, unknown>;
   note: string;
-  linked_local_material?: {
-    source_locator: string;
-  };
+  materials?: HumanReplyMaterial[];
+};
+
+export type HumanRequestHandoff = {
+  schema_ref: "meta-research/human-request-handoff/v1";
+  request_ref: string;
+  revision: number;
+  is_current: boolean;
+  status: HumanRequestItem["status"];
+  title: string;
+  sections: Array<{ key: string; title: string; paragraphs: string[] }>;
 };
 
 export type HumanRequestRetryResult = HumanRequestItem & {
@@ -2388,57 +2411,12 @@ export type PendingHumanRequestResponse = {
   schema: "meta-research/human-request-response/v1";
   request_ref: string;
   response_path: string;
-  sealed_response: PendingHumanRequestAssetResponse["sealed_response"];
+  sealed_response: SealedRecoveryPayload;
   response_idempotency_key: string;
   response_write_slot: string;
 };
 
-export type PendingHumanRequestAssetResponse = {
-  schema: "meta-research/human-request-asset-response/v1";
-  request_ref: string;
-  asset_job_ref: string;
-  asset_intake_write_slot: string;
-  fact_prefix: "material" | "result";
-  accepted_asset: AcceptedHumanRequestAssetBinding;
-  response_path: string;
-  sealed_response: {
-    algorithm: "AES-GCM";
-    key_ref: string;
-    iv_base64: string;
-    ciphertext_ref: string;
-    body_hash: string;
-    binding_hash: string;
-  };
-  response_idempotency_key: string;
-  response_write_slot: string;
-};
 
-export type AcceptedHumanRequestAssetBinding = {
-  asset_ref: string;
-  version_ref: string;
-  memory_ref: string;
-  content_hash: string;
-  manifest_hash: string;
-  receipt: AssetReceipt;
-};
-
-type PendingAcceptedHumanRequestAsset = {
-  schema: "meta-research/human-request-accepted-asset/v1";
-  request_ref: string;
-  asset_job_ref: string;
-  asset_intake_write_slot: string;
-  fact_prefix: "material" | "result";
-  accepted_asset: AcceptedHumanRequestAssetBinding;
-};
-
-type PendingHumanRequestAssetIntakeOperation = {
-  schema: "meta-research/human-request-asset-intake/v1";
-  request_ref: string;
-  intake_path: "/api/v1/research-assets/intakes";
-  asset_idempotency_key: string;
-  asset_write_slot: string;
-  sealed_operation: PendingHumanRequestAssetResponse["sealed_response"];
-};
 
 type PendingScopedAssetIntakeOperation = {
   schema: "meta-research/scoped-asset-intake/v1";
@@ -2448,7 +2426,7 @@ type PendingScopedAssetIntakeOperation = {
   asset_idempotency_key: string;
   asset_write_slot: string;
   display_name: string;
-  sealed_operation: PendingHumanRequestAssetResponse["sealed_response"];
+  sealed_operation: SealedRecoveryPayload;
 };
 
 type PendingScopedAssetIntakeJob = {
@@ -2463,12 +2441,6 @@ type PendingScopedAssetIntakeJob = {
 type PendingScopedAssetIntakeRecovery =
   | PendingScopedAssetIntakeOperation
   | PendingScopedAssetIntakeJob;
-
-type HumanRequestAssetIntakeOperationBody = {
-  intake: AssetIntakeRequest;
-  response: HumanRequestResponseBody;
-  fact_prefix: "material" | "result";
-};
 
 export type HumanCapabilityCommandDraft = {
   command_kind: "capability_authorization";
@@ -2654,15 +2626,15 @@ export class ProductError extends Error {
   }
 }
 
-export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string };
+export type QuestRuntimeConditions = { quest_ref: string; text: string; revision: string; research_style?: ResearchStyle };
 
 export function fetchQuestRuntimeConditions(questRef: string, signal?: AbortSignal): Promise<QuestRuntimeConditions> {
   return readJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, signal);
 }
 
-export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string): Promise<QuestRuntimeConditions> {
+export function saveQuestRuntimeConditions(questRef: string, text: string, expectedRevision: string, researchStyle?: ResearchStyle): Promise<QuestRuntimeConditions> {
   return writeJson(`/api/v1/quests/${encodeURIComponent(questRef)}/runtime-conditions`, "PUT", {
-    text, expected_revision: expectedRevision,
+    text, expected_revision: expectedRevision, research_style: researchStyle,
   });
 }
 
@@ -3349,6 +3321,30 @@ export function sendCompanionMessage(
   });
 }
 
+export function readHumanRequestHandoff(
+  requestRef: string,
+  revision: number,
+  signal?: AbortSignal,
+): Promise<HumanRequestHandoff> {
+  return readJson(
+    `/api/v1/human-requests/${encodeURIComponent(requestRef)}/handoff?revision=${revision}`,
+    signal,
+  );
+}
+
+export async function downloadHumanRequestHandoff(
+  requestRef: string,
+  revision: number,
+  format: "md" | "html" | "pdf",
+): Promise<Blob> {
+  const response = await fetch(
+    `/api/v1/human-requests/${encodeURIComponent(requestRef)}/handoff.${format}?revision=${revision}`,
+    { credentials: "same-origin" },
+  );
+  if (!response.ok) throw new ProductError(`request_failed:${response.status}`);
+  return response.blob();
+}
+
 export async function respondToHumanRequest(
   requestRef: string,
   response: HumanRequestResponseBody,
@@ -3380,6 +3376,11 @@ async function stageHumanRequestResponse(
   await hydratePendingHumanRequestRecovery();
   const responsePath = humanRequestResponsePath(requestRef);
   const responseBody = JSON.parse(JSON.stringify(response)) as HumanRequestResponseBody;
+  const materials = responseBody.materials ?? [];
+  if (materials.length > 100 || materials.filter((item) => item.kind === "upload").length > 99
+      || materials.reduce((sum, item) => sum + (item.kind === "upload" ? item.content_base64.length : 0), 0) > 89_478_488) {
+    throw new ProductError("human_response_material_too_large");
+  }
   const bodyJson = JSON.stringify(responseBody);
   const bodyHash = await sha256Hex(bodyJson);
   const existing = readPendingHumanRequestResponse(requestRef);
@@ -3391,11 +3392,7 @@ async function stageHumanRequestResponse(
     }
     return existing;
   }
-  if (readPendingHumanRequestAssetResponse(requestRef)
-      || readPendingHumanRequestAssetIntakeOperation(requestRef)
-      || readPendingAcceptedHumanRequestAsset(requestRef)) {
-    throw new ProductError("human_request_response_recovery_conflict");
-  }
+
   const pendingWrite = await reserveIdempotencyKey("POST", responsePath, bodyJson);
   const bindingJson = JSON.stringify({
     schema: "meta-research/human-request-response/v1",
@@ -3488,6 +3485,10 @@ async function deliverPendingHumanRequestResponseOnce(
       delivery.sealed_response,
     );
     responseWrite.value?.clear();
+    for (const kind of ["asset-response", "asset-intake", "accepted-asset"] as const) {
+      const legacy = recoveryManifestValue(kind, delivery.request_ref);
+      if (legacy) await deleteHumanRequestRecoveryRecord(kind, delivery.request_ref, legacy);
+    }
     return result;
   } catch (error) {
     if (isCorrectableHumanResponseRejection(error)
@@ -3498,172 +3499,12 @@ async function deliverPendingHumanRequestResponseOnce(
   }
 }
 
-async function stageHumanRequestAssetResponse(
-  requestRef: string,
-  assetJobRef: string,
-  assetIntakeWriteSlot: string,
-  factPrefix: "material" | "result",
-  acceptedAsset: AcceptedHumanRequestAssetBinding,
-  response: HumanRequestResponseBody,
-): Promise<PendingHumanRequestAssetResponse> {
+
+
+
+
+export async function reconcileHumanRequestResponses(): Promise<boolean> {
   await hydratePendingHumanRequestRecovery();
-  const responsePath = humanRequestResponsePath(requestRef);
-  const acceptedAssetBinding = {
-    asset_ref: acceptedAsset.asset_ref,
-    version_ref: acceptedAsset.version_ref,
-    memory_ref: acceptedAsset.memory_ref,
-    content_hash: acceptedAsset.content_hash,
-    manifest_hash: acceptedAsset.manifest_hash,
-    receipt: { ...acceptedAsset.receipt },
-  };
-  const responseBody = JSON.parse(JSON.stringify(response)) as HumanRequestResponseBody;
-  const responseBodyJson = JSON.stringify(responseBody);
-  const responseBodyHash = await sha256Hex(responseBodyJson);
-  const existing = readPendingHumanRequestAssetResponse(requestRef);
-  if (existing) {
-    if (existing.request_ref !== requestRef
-        || existing.asset_job_ref !== assetJobRef
-        || existing.asset_intake_write_slot !== assetIntakeWriteSlot
-        || existing.fact_prefix !== factPrefix
-        || existing.response_path !== responsePath
-        || existing.sealed_response.body_hash !== responseBodyHash
-        || JSON.stringify(existing.accepted_asset) !== JSON.stringify(acceptedAssetBinding)) {
-      throw new ProductError("human_request_asset_response_recovery_conflict");
-    }
-    return existing;
-  }
-  const pendingWrite = await reserveIdempotencyKey("POST", responsePath, responseBodyJson);
-  const bindingJson = JSON.stringify({
-    schema: "meta-research/human-request-asset-response/v1",
-    request_ref: requestRef,
-    asset_job_ref: assetJobRef,
-    asset_intake_write_slot: assetIntakeWriteSlot,
-    fact_prefix: factPrefix,
-    accepted_asset: acceptedAssetBinding,
-    response_path: responsePath,
-    response_idempotency_key: pendingWrite.key,
-    response_write_slot: pendingWrite.slot,
-  });
-  let preparedResponse: PreparedHumanRequestRecoveryPayload;
-  try {
-    preparedResponse = await sealHumanRequestResponse(
-      responseBodyJson,
-      responseBodyHash,
-      bindingJson,
-    );
-  } catch (error) {
-    pendingWrite.clear();
-    throw error;
-  }
-  const delivery: PendingHumanRequestAssetResponse = {
-    schema: "meta-research/human-request-asset-response/v1",
-    request_ref: requestRef,
-    asset_job_ref: assetJobRef,
-    asset_intake_write_slot: assetIntakeWriteSlot,
-    fact_prefix: factPrefix,
-    accepted_asset: acceptedAssetBinding,
-    response_path: responsePath,
-    sealed_response: preparedResponse.sealed,
-    response_idempotency_key: pendingWrite.key,
-    response_write_slot: pendingWrite.slot,
-  };
-  const serialized = JSON.stringify(delivery);
-  try {
-    await storeHumanRequestRecoveryRecord(
-      "asset-response",
-      requestRef,
-      serialized,
-      preparedResponse,
-    );
-  } catch (error) {
-    pendingWrite.clear();
-    throw error;
-  }
-  return delivery;
-}
-
-export function pendingHumanRequestAssetResponse(
-  requestRef?: string,
-): PendingHumanRequestAssetResponse | null {
-  return readPendingHumanRequestAssetResponse(requestRef);
-}
-
-export function pendingHumanRequestAssetIntakeRequestRef(
-  requestRef?: string,
-): string | null {
-  return readPendingHumanRequestAssetIntakeOperation(requestRef)?.request_ref ?? null;
-}
-
-export function pendingAcceptedHumanRequestAssetRequestRef(
-  requestRef?: string,
-): string | null {
-  return readPendingAcceptedHumanRequestAsset(requestRef)?.request_ref ?? null;
-}
-
-export async function stagePendingAcceptedHumanRequestAssetResponse(
-  requestRef: string,
-  response: HumanRequestResponseBody,
-): Promise<PendingHumanRequestAssetResponse> {
-  return runHumanRequestRecoverySingleFlight(
-    `accepted-asset-stage:${requestRef}`,
-    requestRef,
-    () => stagePendingAcceptedHumanRequestAssetResponseOnce(requestRef, response),
-  );
-}
-
-async function stagePendingAcceptedHumanRequestAssetResponseOnce(
-  requestRef: string,
-  response: HumanRequestResponseBody,
-): Promise<PendingHumanRequestAssetResponse> {
-  await hydratePendingHumanRequestRecovery();
-  const accepted = readPendingAcceptedHumanRequestAsset(requestRef);
-  if (!accepted || accepted.request_ref !== requestRef) {
-    throw new ProductError("human_request_accepted_asset_recovery_conflict");
-  }
-  const exactResponse: HumanRequestResponseBody = {
-    ...response,
-    facts: {
-      ...response.facts,
-      [`${accepted.fact_prefix}_source_ref`]: accepted.accepted_asset.memory_ref,
-      [`${accepted.fact_prefix}_version_ref`]: accepted.accepted_asset.version_ref,
-      [`${accepted.fact_prefix}_content_hash`]: accepted.accepted_asset.content_hash,
-      [`${accepted.fact_prefix}_manifest_hash`]: accepted.accepted_asset.manifest_hash,
-      [`${accepted.fact_prefix}_acceptance_receipt_ref`]:
-        accepted.accepted_asset.receipt.receipt_ref,
-    },
-  };
-  const delivery = await stageHumanRequestAssetResponse(
-    accepted.request_ref,
-    accepted.asset_job_ref,
-    accepted.asset_intake_write_slot,
-    accepted.fact_prefix,
-    accepted.accepted_asset,
-    exactResponse,
-  );
-  await deleteHumanRequestRecoveryRecord(
-    "accepted-asset",
-    accepted.request_ref,
-    JSON.stringify(accepted),
-  );
-  return delivery;
-}
-
-export async function resumePendingHumanRequestAssetIntake(
-  requestRef: string,
-): Promise<AssetIntakeResult> {
-  await hydratePendingHumanRequestRecovery();
-  const operation = readPendingHumanRequestAssetIntakeOperation(requestRef);
-  if (!operation || operation.request_ref !== requestRef) {
-    throw new ProductError("human_request_asset_intake_recovery_conflict");
-  }
-  return executeHumanRequestAssetIntakeOperationOnce(operation);
-}
-
-export async function reconcileOrphanedHumanRequestAssetRecovery(
-  currentRequestRefs: string[],
-): Promise<boolean> {
-  await hydratePendingHumanRequestRecovery();
-  const current = new Set(currentRequestRefs);
   let changed = false;
   for (const response of readPendingHumanRequestResponses()) {
     try {
@@ -3674,219 +3515,18 @@ export async function reconcileOrphanedHumanRequestAssetRecovery(
       else throw error;
     }
   }
-
-  for (const delivery of readPendingHumanRequestAssetResponses()) {
-    try {
-      await deliverPendingHumanRequestAssetResponse(delivery.request_ref);
-      changed = true;
-    } catch (error) {
-      if (!readPendingHumanRequestAssetResponse(delivery.request_ref)) changed = true;
-      else throw error;
-    }
-  }
-
-  for (const operation of readPendingHumanRequestAssetIntakeOperations()) {
-    try {
-      const result = await executeHumanRequestAssetIntakeOperation(operation);
-      if (result.status === "accepted" && result.asset) {
-        await deliverPendingHumanRequestAssetResponse(operation.request_ref);
-      }
-      changed = true;
-    } catch (error) {
-      if (!readPendingHumanRequestAssetIntakeOperation(operation.request_ref)
-          && !readPendingHumanRequestAssetResponse(operation.request_ref)) changed = true;
-      else throw error;
-    }
-  }
-
-  for (const accepted of readPendingAcceptedHumanRequestAssets()) {
-    if (current.has(accepted.request_ref)) continue;
-    clearPendingWriteSlot(accepted.asset_intake_write_slot);
-    removePendingAssetIntakeMarker(accepted.asset_job_ref);
-    await deleteHumanRequestRecoveryRecord(
-      "accepted-asset",
-      accepted.request_ref,
-      JSON.stringify(accepted),
-    );
-    changed = true;
-  }
-  return changed;
+  return changed || hasLegacyHumanRequestMaterial();
 }
 
-async function stageHumanRequestAssetIntakeOperation(
-  requestRef: string,
-  pendingWrite: PendingWrite,
-  body: HumanRequestAssetIntakeOperationBody,
-): Promise<PendingHumanRequestAssetIntakeOperation> {
-  const bindingJson = JSON.stringify({
-    schema: "meta-research/human-request-asset-intake/v1",
-    request_ref: requestRef,
-    intake_path: "/api/v1/research-assets/intakes",
-    asset_idempotency_key: pendingWrite.key,
-    asset_write_slot: pendingWrite.slot,
-  });
-  const bodyJson = JSON.stringify(body);
-  const preparedOperation = await sealHumanRequestResponse(
-    bodyJson,
-    await sha256Hex(bodyJson),
-    bindingJson,
-  );
-  const operation: PendingHumanRequestAssetIntakeOperation = {
-    schema: "meta-research/human-request-asset-intake/v1",
-    request_ref: requestRef,
-    intake_path: "/api/v1/research-assets/intakes",
-    asset_idempotency_key: pendingWrite.key,
-    asset_write_slot: pendingWrite.slot,
-    sealed_operation: preparedOperation.sealed,
-  };
-  const serialized = JSON.stringify(operation);
-  await storeHumanRequestRecoveryRecord(
-    "asset-intake",
-    requestRef,
-    serialized,
-    preparedOperation,
-  );
-  return operation;
+export function hasLegacyHumanRequestMaterial(requestRef?: string): boolean {
+  return ["asset-response", "asset-intake", "accepted-asset"].some((kind) =>
+    requestRef ? recoveryManifestValue(kind as HumanRequestRecoveryManifestKind, requestRef) !== null
+      : recoveryManifestValues(kind as HumanRequestRecoveryManifestKind).length > 0);
 }
 
-async function executeHumanRequestAssetIntakeOperation(
-  operation: PendingHumanRequestAssetIntakeOperation,
-): Promise<AssetIntakeResult> {
-  return runHumanRequestRecoverySingleFlight(
-    `asset-intake:${operation.sealed_operation.key_ref}`,
-    operation.request_ref,
-    () => executeHumanRequestAssetIntakeOperationOnce(operation),
-  );
-}
 
-async function executeHumanRequestAssetIntakeOperationOnce(
-  operation: PendingHumanRequestAssetIntakeOperation,
-): Promise<AssetIntakeResult> {
-  const body = await unsealHumanRequestAssetIntakeOperation(operation);
-  const result = await writeJson<AssetIntakeResult>(
-    operation.intake_path,
-    "POST",
-    body.intake,
-    {
-      retainPending: () => true,
-      onReserved: (pendingWrite) => {
-        if (pendingWrite.key !== operation.asset_idempotency_key
-            || pendingWrite.slot !== operation.asset_write_slot) {
-          throw new ProductError("human_request_asset_intake_idempotency_mismatch");
-        }
-      },
-      onRetained: async (result, pendingWrite) => {
-        writeSessionValue(
-          pendingAssetIntakeSlot,
-          JSON.stringify({ job_ref: result.job_ref, write_slot: pendingWrite.slot }),
-        );
-        if (result.status !== "accepted" || !result.asset) return;
-        const exactResponse: HumanRequestResponseBody = {
-          ...body.response,
-          facts: {
-            ...body.response.facts,
-            [`${body.fact_prefix}_source_ref`]: result.asset.memory_ref,
-            [`${body.fact_prefix}_version_ref`]: result.asset.version_ref,
-            [`${body.fact_prefix}_content_hash`]: result.asset.content_hash,
-            [`${body.fact_prefix}_manifest_hash`]: result.asset.manifest_hash,
-            [`${body.fact_prefix}_acceptance_receipt_ref`]: result.asset.receipt.receipt_ref,
-          },
-        };
-        await stageHumanRequestAssetResponse(
-          operation.request_ref,
-          result.job_ref,
-          pendingWrite.slot,
-          body.fact_prefix,
-          result.asset,
-          exactResponse,
-        );
-      },
-    },
-  );
-  if (result.status === "accepted" && result.asset) {
-    removePendingAssetIntakeMarker(result.job_ref);
-  }
-  await clearPendingHumanRequestAssetIntakeOperation(operation);
-  return result;
-}
 
-export function deliverPendingHumanRequestAssetResponse(
-  requestRef: string,
-): Promise<Record<string, unknown>> {
-  return runHumanRequestRecoverySingleFlight(
-    `asset-response:${requestRef}`,
-    requestRef,
-    () => deliverPendingHumanRequestAssetResponseOnce(requestRef),
-  );
-}
 
-async function deliverPendingHumanRequestAssetResponseOnce(
-  requestRef: string,
-): Promise<Record<string, unknown>> {
-  await hydratePendingHumanRequestRecovery();
-  const delivery = readPendingHumanRequestAssetResponse(requestRef);
-  if (!delivery) {
-    throw new ProductError("human_request_asset_response_recovery_missing");
-  }
-  if (delivery.request_ref !== requestRef
-      || delivery.response_path !== humanRequestResponsePath(requestRef)) {
-    throw new ProductError("human_request_asset_response_recovery_conflict");
-  }
-  await clearMatchingHumanRequestAssetIntakeOperation(
-    delivery.request_ref,
-    delivery.asset_intake_write_slot,
-  );
-  removePendingAssetIntakeMarker(delivery.asset_job_ref);
-  await removeMatchingPendingAcceptedHumanRequestAsset(delivery.request_ref);
-  const response = await unsealHumanRequestResponse(delivery);
-  const responseWrite: { value: PendingWrite | null } = { value: null };
-  let result: Record<string, unknown>;
-  try {
-    result = await writeJson<Record<string, unknown>>(
-      delivery.response_path,
-      "POST",
-      response,
-      {
-        retainPending: () => true,
-        onRetained: () => undefined,
-        onReserved: (pendingWrite) => {
-          if (pendingWrite.key !== delivery.response_idempotency_key
-              || pendingWrite.slot !== delivery.response_write_slot) {
-            throw new ProductError("human_request_asset_response_idempotency_mismatch");
-          }
-          responseWrite.value = pendingWrite;
-        },
-      },
-    );
-  } catch (error) {
-    if (isCorrectableHumanResponseRejection(error)) {
-      try {
-        await persistPendingAcceptedHumanRequestAsset(delivery);
-      } catch {
-        // The rejected response is always destroyed even if the non-sensitive
-        // accepted-asset fallback cannot be persisted.
-      }
-      await discardPendingHumanRequestAssetResponse(delivery);
-    } else if (isPermanentHumanResponseRejection(error)) {
-      await discardPendingHumanRequestAssetResponse(delivery);
-    }
-    throw error;
-  }
-
-  // Clearing the asset write first is safe because the accepted facts and receipt
-  // remain sealed in the delivery record. Removing the delivery record before the
-  // response key means a crash can only leave a harmless key, never force a replay
-  // under a new identity.
-  clearPendingWriteSlot(delivery.asset_intake_write_slot);
-  await deleteHumanRequestRecoveryRecord(
-    "asset-response",
-    delivery.request_ref,
-    JSON.stringify(delivery),
-    delivery.sealed_response,
-  );
-  responseWrite.value?.clear();
-  return result;
-}
 
 function isCorrectableHumanResponseRejection(error: unknown): boolean {
   return error instanceof ProductError && (
@@ -3894,6 +3534,15 @@ function isCorrectableHumanResponseRejection(error: unknown): boolean {
     || error.code === "human_response_facts_invalid"
     || error.code === "human_response_facts_too_large"
     || error.code === "human_response_note_invalid"
+    || error.code === "human_request_material_response_invalid"
+    || error.code === "human_response_reserved_facts"
+    || error.code === "human_response_destination_unbound"
+    || error.code === "human_response_upload_invalid"
+    || error.code === "human_response_upload_path_invalid"
+    || error.code === "human_response_material_too_large"
+    || error.code === "human_response_linked_path_invalid"
+    || error.code === "human_response_linked_path_unreadable"
+    || error.code === "human_response_linked_path_changed"
   );
 }
 
@@ -3904,20 +3553,6 @@ function isPermanentHumanResponseRejection(error: unknown): boolean {
     || error.code === "root_agent_human_request_scope_stale"
     || error.code === "root_human_request_scope_stale"
     || error.code === "idempotency_conflict"
-  );
-}
-
-async function discardPendingHumanRequestAssetResponse(
-  delivery: PendingHumanRequestAssetResponse,
-): Promise<void> {
-  clearPendingWriteSlot(delivery.asset_intake_write_slot);
-  clearPendingWriteSlot(delivery.response_write_slot);
-  removePendingAssetIntakeMarker(delivery.asset_job_ref);
-  await deleteHumanRequestRecoveryRecord(
-    "asset-response",
-    delivery.request_ref,
-    JSON.stringify(delivery),
-    delivery.sealed_response,
   );
 }
 
@@ -4256,59 +3891,6 @@ export function acknowledgeScopedAssetIntake(
   void acknowledgeScopedAssetIntakeOnce(context, matched).catch(() => undefined);
 }
 
-export async function submitHumanRequestAssetIntake(
-  requestRef: string,
-  intake: AssetIntakeRequest,
-  response: HumanRequestResponseBody,
-  factPrefix: "material" | "result",
-): Promise<AssetIntakeResult> {
-  return runHumanRequestRecoverySingleFlight(
-    `asset-intake-submit:${requestRef}`,
-    requestRef,
-    () => submitHumanRequestAssetIntakeOnce(
-      requestRef,
-      intake,
-      response,
-      factPrefix,
-    ),
-  );
-}
-
-async function submitHumanRequestAssetIntakeOnce(
-  requestRef: string,
-  intake: AssetIntakeRequest,
-  response: HumanRequestResponseBody,
-  factPrefix: "material" | "result",
-): Promise<AssetIntakeResult> {
-  await hydratePendingHumanRequestRecovery();
-  const existing = readPendingHumanRequestAssetIntakeOperation(requestRef);
-  if (existing) {
-    throw new ProductError("human_request_asset_intake_recovery_conflict");
-  }
-  const operationBody: HumanRequestAssetIntakeOperationBody = {
-    intake: JSON.parse(JSON.stringify(intake)) as AssetIntakeRequest,
-    response: JSON.parse(JSON.stringify(response)) as HumanRequestResponseBody,
-    fact_prefix: factPrefix,
-  };
-  const intakePath = "/api/v1/research-assets/intakes" as const;
-  const pendingWrite = await reserveIdempotencyKey(
-    "POST",
-    intakePath,
-    JSON.stringify(operationBody.intake),
-  );
-  let operation: PendingHumanRequestAssetIntakeOperation;
-  try {
-    operation = await stageHumanRequestAssetIntakeOperation(
-      requestRef,
-      pendingWrite,
-      operationBody,
-    );
-  } catch (error) {
-    pendingWrite.clear();
-    throw error;
-  }
-  return executeHumanRequestAssetIntakeOperationOnce(operation);
-}
 
 export async function fetchAssetIntake(
   jobRef: string,
@@ -5156,120 +4738,9 @@ function readPendingHumanRequestResponses(): PendingHumanRequestResponse[] {
   });
 }
 
-function parsePendingHumanRequestAssetResponse(
-  value: string | null,
-): PendingHumanRequestAssetResponse | null {
-  if (!value) return null;
-  try {
-    const parsed = JSON.parse(value) as Partial<PendingHumanRequestAssetResponse>;
-    const acceptedAsset = parsed.accepted_asset as
-      | Partial<PendingHumanRequestAssetResponse["accepted_asset"]>
-      | undefined;
-    const receipt = acceptedAsset?.receipt as Partial<AssetReceipt> | undefined;
-    const sealedResponse = parsed.sealed_response as
-      | Partial<PendingHumanRequestAssetResponse["sealed_response"]>
-      | undefined;
-    const valid = parsed.schema === "meta-research/human-request-asset-response/v1"
-      && typeof parsed.request_ref === "string"
-      && typeof parsed.asset_job_ref === "string"
-      && typeof parsed.asset_intake_write_slot === "string"
-      && (parsed.fact_prefix === "material" || parsed.fact_prefix === "result")
-      && typeof parsed.response_path === "string"
-      && typeof parsed.response_idempotency_key === "string"
-      && typeof parsed.response_write_slot === "string"
-      && typeof acceptedAsset?.asset_ref === "string"
-      && typeof acceptedAsset.version_ref === "string"
-      && typeof acceptedAsset.memory_ref === "string"
-      && typeof acceptedAsset.content_hash === "string"
-      && typeof acceptedAsset.manifest_hash === "string"
-      && typeof receipt?.issuer === "string"
-      && typeof receipt.kind === "string"
-      && typeof receipt.receipt_ref === "string"
-      && typeof receipt.subject_ref === "string"
-      && typeof receipt.payload_hash === "string"
-      && sealedResponse?.algorithm === "AES-GCM"
-      && typeof sealedResponse.key_ref === "string"
-      && typeof sealedResponse.iv_base64 === "string"
-      && typeof sealedResponse.ciphertext_ref === "string"
-      && typeof sealedResponse.body_hash === "string"
-      && typeof sealedResponse.binding_hash === "string";
-    if (!valid) {
-      throw new ProductError("human_request_asset_response_recovery_invalid");
-    }
-    return parsed as PendingHumanRequestAssetResponse;
-  } catch (error) {
-    if (error instanceof ProductError) throw error;
-    throw new ProductError("human_request_asset_response_recovery_invalid");
-  }
-}
 
-function readPendingHumanRequestAssetResponse(
-  requestRef?: string,
-): PendingHumanRequestAssetResponse | null {
-  return parsePendingHumanRequestAssetResponse(
-    recoveryManifestValue("asset-response", requestRef),
-  );
-}
 
-function readPendingHumanRequestAssetResponses(): PendingHumanRequestAssetResponse[] {
-  return recoveryManifestValues("asset-response").map((serialized) => {
-    const response = parsePendingHumanRequestAssetResponse(serialized);
-    if (!response) {
-      throw new ProductError("human_request_asset_response_recovery_invalid");
-    }
-    return response;
-  });
-}
 
-function parsePendingHumanRequestAssetIntakeOperation(
-  value: string | null,
-):
-  PendingHumanRequestAssetIntakeOperation | null {
-  if (!value) return null;
-  try {
-    const parsed = JSON.parse(value) as Partial<PendingHumanRequestAssetIntakeOperation>;
-    const sealed = parsed.sealed_operation as
-      | Partial<PendingHumanRequestAssetResponse["sealed_response"]>
-      | undefined;
-    const valid = parsed.schema === "meta-research/human-request-asset-intake/v1"
-      && typeof parsed.request_ref === "string"
-      && parsed.intake_path === "/api/v1/research-assets/intakes"
-      && typeof parsed.asset_idempotency_key === "string"
-      && typeof parsed.asset_write_slot === "string"
-      && sealed?.algorithm === "AES-GCM"
-      && typeof sealed.key_ref === "string"
-      && typeof sealed.iv_base64 === "string"
-      && typeof sealed.ciphertext_ref === "string"
-      && typeof sealed.body_hash === "string"
-      && typeof sealed.binding_hash === "string";
-    if (!valid) {
-      throw new ProductError("human_request_asset_intake_recovery_invalid");
-    }
-    return parsed as PendingHumanRequestAssetIntakeOperation;
-  } catch (error) {
-    if (error instanceof ProductError) throw error;
-    throw new ProductError("human_request_asset_intake_recovery_invalid");
-  }
-}
-
-function readPendingHumanRequestAssetIntakeOperation(
-  requestRef?: string,
-): PendingHumanRequestAssetIntakeOperation | null {
-  return parsePendingHumanRequestAssetIntakeOperation(
-    recoveryManifestValue("asset-intake", requestRef),
-  );
-}
-
-function readPendingHumanRequestAssetIntakeOperations():
-  PendingHumanRequestAssetIntakeOperation[] {
-  return recoveryManifestValues("asset-intake").map((serialized) => {
-    const operation = parsePendingHumanRequestAssetIntakeOperation(serialized);
-    if (!operation) {
-      throw new ProductError("human_request_asset_intake_recovery_invalid");
-    }
-    return operation;
-  });
-}
 
 function parsePendingScopedAssetIntakeOperation(
   value: string | null,
@@ -5279,7 +4750,7 @@ function parsePendingScopedAssetIntakeOperation(
     const parsed = JSON.parse(value) as Partial<PendingScopedAssetIntakeOperation>;
     const context = parsed.context as Partial<ScopedAssetIntakeContext> | undefined;
     const sealed = parsed.sealed_operation as
-      | Partial<PendingHumanRequestAssetResponse["sealed_response"]>
+      | Partial<SealedRecoveryPayload>
       | undefined;
     const valid = parsed.schema === "meta-research/scoped-asset-intake/v1"
       && typeof parsed.operation_ref === "string"
@@ -5386,109 +4857,9 @@ function readPendingScopedAssetIntakeRecovery(
   return null;
 }
 
-function parsePendingAcceptedHumanRequestAsset(
-  value: string | null,
-): PendingAcceptedHumanRequestAsset | null {
-  if (!value) return null;
-  try {
-    const parsed = JSON.parse(value) as Partial<PendingAcceptedHumanRequestAsset>;
-    const asset = parsed.accepted_asset as Partial<AcceptedHumanRequestAssetBinding> | undefined;
-    const receipt = asset?.receipt as Partial<AssetReceipt> | undefined;
-    const valid = parsed.schema === "meta-research/human-request-accepted-asset/v1"
-      && typeof parsed.request_ref === "string"
-      && typeof parsed.asset_job_ref === "string"
-      && typeof parsed.asset_intake_write_slot === "string"
-      && (parsed.fact_prefix === "material" || parsed.fact_prefix === "result")
-      && typeof asset?.asset_ref === "string"
-      && typeof asset.version_ref === "string"
-      && typeof asset.memory_ref === "string"
-      && typeof asset.content_hash === "string"
-      && typeof asset.manifest_hash === "string"
-      && typeof receipt?.issuer === "string"
-      && typeof receipt.kind === "string"
-      && typeof receipt.receipt_ref === "string"
-      && typeof receipt.subject_ref === "string"
-      && typeof receipt.payload_hash === "string";
-    if (!valid) throw new ProductError("human_request_accepted_asset_recovery_invalid");
-    return parsed as PendingAcceptedHumanRequestAsset;
-  } catch (error) {
-    if (error instanceof ProductError) throw error;
-    throw new ProductError("human_request_accepted_asset_recovery_invalid");
-  }
-}
 
-function readPendingAcceptedHumanRequestAsset(
-  requestRef?: string,
-): PendingAcceptedHumanRequestAsset | null {
-  return parsePendingAcceptedHumanRequestAsset(
-    recoveryManifestValue("accepted-asset", requestRef),
-  );
-}
 
-function readPendingAcceptedHumanRequestAssets(): PendingAcceptedHumanRequestAsset[] {
-  return recoveryManifestValues("accepted-asset").map((serialized) => {
-    const accepted = parsePendingAcceptedHumanRequestAsset(serialized);
-    if (!accepted) {
-      throw new ProductError("human_request_accepted_asset_recovery_invalid");
-    }
-    return accepted;
-  });
-}
 
-async function persistPendingAcceptedHumanRequestAsset(
-  delivery: PendingHumanRequestAssetResponse,
-): Promise<void> {
-  const accepted: PendingAcceptedHumanRequestAsset = {
-    schema: "meta-research/human-request-accepted-asset/v1",
-    request_ref: delivery.request_ref,
-    asset_job_ref: delivery.asset_job_ref,
-    asset_intake_write_slot: delivery.asset_intake_write_slot,
-    fact_prefix: delivery.fact_prefix,
-    accepted_asset: delivery.accepted_asset,
-  };
-  const serialized = JSON.stringify(accepted);
-  await storeHumanRequestRecoveryRecord(
-    "accepted-asset",
-    accepted.request_ref,
-    serialized,
-  );
-}
-
-async function removeMatchingPendingAcceptedHumanRequestAsset(
-  requestRef: string,
-): Promise<void> {
-  const accepted = readPendingAcceptedHumanRequestAsset(requestRef);
-  if (accepted?.request_ref === requestRef) {
-    await deleteHumanRequestRecoveryRecord(
-      "accepted-asset",
-      accepted.request_ref,
-      JSON.stringify(accepted),
-    );
-  }
-}
-
-async function clearPendingHumanRequestAssetIntakeOperation(
-  operation: PendingHumanRequestAssetIntakeOperation,
-): Promise<void> {
-  const current = readPendingHumanRequestAssetIntakeOperation(operation.request_ref);
-  if (!current || current.sealed_operation.key_ref !== operation.sealed_operation.key_ref) return;
-  await deleteHumanRequestRecoveryRecord(
-    "asset-intake",
-    operation.request_ref,
-    JSON.stringify(operation),
-    operation.sealed_operation,
-  );
-}
-
-async function clearMatchingHumanRequestAssetIntakeOperation(
-  requestRef: string,
-  assetWriteSlot: string,
-): Promise<void> {
-  const operation = readPendingHumanRequestAssetIntakeOperation(requestRef);
-  if (!operation || operation.request_ref !== requestRef
-      || operation.asset_write_slot !== assetWriteSlot) return;
-  await clearPendingHumanRequestAssetIntakeOperation(operation);
-}
 
 const humanRequestRecoveryDatabase = "meta_research_human_request_recovery";
 const humanRequestRecoveryKeyStore = "sealed_response_keys";
@@ -5496,7 +4867,7 @@ const humanRequestRecoveryCiphertextStore = "sealed_payloads";
 const humanRequestRecoveryManifestStore = "recovery_manifests";
 
 type PreparedHumanRequestRecoveryPayload = {
-  sealed: PendingHumanRequestAssetResponse["sealed_response"];
+  sealed: SealedRecoveryPayload;
   key: CryptoKey;
   ciphertext: ArrayBuffer;
 };
@@ -5537,17 +4908,8 @@ async function sealHumanRequestResponse(
   };
 }
 
-async function unsealHumanRequestResponse(
-  delivery: PendingHumanRequestAssetResponse,
-): Promise<HumanRequestResponseBody> {
-  return unsealHumanRequestResponseBody(
-    delivery.sealed_response,
-    humanRequestResponseBindingJson(delivery),
-  );
-}
-
 async function unsealHumanRequestResponseBody(
-  sealedResponse: PendingHumanRequestAssetResponse["sealed_response"],
+  sealedResponse: SealedRecoveryPayload,
   bindingJson: string,
 ): Promise<HumanRequestResponseBody> {
   const bodyJson = await unsealRecoveryPayload(sealedResponse, bindingJson);
@@ -5564,37 +4926,6 @@ async function unsealHumanRequestResponseBody(
     return parsed as HumanRequestResponseBody;
   } catch {
     throw new ProductError("human_request_asset_response_body_invalid");
-  }
-}
-
-async function unsealHumanRequestAssetIntakeOperation(
-  operation: PendingHumanRequestAssetIntakeOperation,
-): Promise<HumanRequestAssetIntakeOperationBody> {
-  const bindingJson = JSON.stringify({
-    schema: operation.schema,
-    request_ref: operation.request_ref,
-    intake_path: operation.intake_path,
-    asset_idempotency_key: operation.asset_idempotency_key,
-    asset_write_slot: operation.asset_write_slot,
-  });
-  const bodyJson = await unsealRecoveryPayload(operation.sealed_operation, bindingJson);
-  try {
-    const parsed = JSON.parse(bodyJson) as Partial<HumanRequestAssetIntakeOperationBody>;
-    const response = parsed.response as Partial<HumanRequestResponseBody> | undefined;
-    const valid = parsed.intake !== null
-      && typeof parsed.intake === "object"
-      && (parsed.fact_prefix === "material" || parsed.fact_prefix === "result")
-      && (response?.decision === "provided"
-        || response?.decision === "declined"
-        || response?.decision === "deferred")
-      && response.facts !== null
-      && typeof response.facts === "object"
-      && !Array.isArray(response.facts)
-      && typeof response.note === "string";
-    if (!valid) throw new Error("invalid intake operation shape");
-    return parsed as HumanRequestAssetIntakeOperationBody;
-  } catch {
-    throw new ProductError("human_request_asset_intake_body_invalid");
   }
 }
 
@@ -5623,7 +4954,7 @@ async function unsealScopedAssetIntakeOperation(
 }
 
 async function unsealRecoveryPayload(
-  sealed: PendingHumanRequestAssetResponse["sealed_response"],
+  sealed: SealedRecoveryPayload,
   bindingJson: string,
 ): Promise<string> {
   if (await sha256Hex(bindingJson) !== sealed.binding_hash) {
@@ -5655,22 +4986,6 @@ async function unsealRecoveryPayload(
     throw new ProductError("human_request_recovery_body_invalid");
   }
   return bodyJson;
-}
-
-function humanRequestResponseBindingJson(
-  delivery: PendingHumanRequestAssetResponse,
-): string {
-  return JSON.stringify({
-    schema: delivery.schema,
-    request_ref: delivery.request_ref,
-    asset_job_ref: delivery.asset_job_ref,
-    asset_intake_write_slot: delivery.asset_intake_write_slot,
-    fact_prefix: delivery.fact_prefix,
-    accepted_asset: delivery.accepted_asset,
-    response_path: delivery.response_path,
-    response_idempotency_key: delivery.response_idempotency_key,
-    response_write_slot: delivery.response_write_slot,
-  });
 }
 
 function humanRequestResponseDeliveryBindingJson(
@@ -5823,7 +5138,7 @@ function seedPendingWrite(slot: string, key: string): void {
 type HumanRequestRecoveryManifestDescriptor = {
   kind: HumanRequestRecoveryManifestKind;
   requestRef: string;
-  sealed?: PendingHumanRequestAssetResponse["sealed_response"];
+  sealed?: SealedRecoveryPayload;
   pendingWrite?: { slot: string; key: string };
 };
 
@@ -5849,42 +5164,18 @@ function describeHumanRequestRecoveryManifest(
       },
     };
   }
-  if (schema === "meta-research/human-request-asset-response/v1") {
-    const response = parsePendingHumanRequestAssetResponse(serialized);
-    if (!response) {
-      throw new ProductError("human_request_asset_response_recovery_invalid");
+  const legacyKinds: Record<string, HumanRequestRecoveryManifestKind> = {
+    "meta-research/human-request-asset-response/v1": "asset-response",
+    "meta-research/human-request-asset-intake/v1": "asset-intake",
+    "meta-research/human-request-accepted-asset/v1": "accepted-asset",
+  };
+  const legacyKind = typeof schema === "string" ? legacyKinds[schema] : undefined;
+  if (legacyKind) {
+    const legacy = JSON.parse(serialized) as Record<string, unknown>;
+    if (typeof legacy.request_ref !== "string" || !legacy.request_ref) {
+      throw new ProductError("human_request_recovery_manifest_invalid");
     }
-    return {
-      kind: "asset-response",
-      requestRef: response.request_ref,
-      sealed: response.sealed_response,
-      pendingWrite: {
-        slot: response.response_write_slot,
-        key: response.response_idempotency_key,
-      },
-    };
-  }
-  if (schema === "meta-research/human-request-asset-intake/v1") {
-    const operation = parsePendingHumanRequestAssetIntakeOperation(serialized);
-    if (!operation) {
-      throw new ProductError("human_request_asset_intake_recovery_invalid");
-    }
-    return {
-      kind: "asset-intake",
-      requestRef: operation.request_ref,
-      sealed: operation.sealed_operation,
-      pendingWrite: {
-        slot: operation.asset_write_slot,
-        key: operation.asset_idempotency_key,
-      },
-    };
-  }
-  if (schema === "meta-research/human-request-accepted-asset/v1") {
-    const accepted = parsePendingAcceptedHumanRequestAsset(serialized);
-    if (!accepted) {
-      throw new ProductError("human_request_accepted_asset_recovery_invalid");
-    }
-    return { kind: "accepted-asset", requestRef: accepted.request_ref };
+    return { kind: legacyKind, requestRef: legacy.request_ref };
   }
   if (schema === "meta-research/scoped-asset-intake/v1") {
     const operation = parsePendingScopedAssetIntakeOperation(serialized);
@@ -5986,7 +5277,7 @@ async function replaceHumanRequestRecoveryRecord(
   requestRef: string,
   expectedSerialized: string,
   replacementSerialized: string,
-  sealed: PendingHumanRequestAssetResponse["sealed_response"],
+  sealed: SealedRecoveryPayload,
 ): Promise<void> {
   const manifestKey = humanRequestRecoveryManifestKey(kind, requestRef);
   const database = await openHumanRequestRecoveryDatabase();
@@ -6039,7 +5330,7 @@ async function deleteHumanRequestRecoveryRecord(
   kind: HumanRequestRecoveryManifestKind,
   requestRef: string,
   expectedSerialized: string,
-  sealed?: PendingHumanRequestAssetResponse["sealed_response"],
+  sealed?: SealedRecoveryPayload,
 ): Promise<void> {
   const manifestKey = humanRequestRecoveryManifestKey(kind, requestRef);
   const database = await openHumanRequestRecoveryDatabase();
@@ -6511,7 +5802,6 @@ export function followProjection(
     stream?.close();
   };
 }
-
 
 export type OutputLanguage = "zh" | "en";
 export type ResearchLibraryEntry = "questions" | "baselines" | "datasets" | "literature" | "human" | "environments";

@@ -1,11 +1,13 @@
 import { useId, type ReactNode } from "react";
 import "./spectrum.css";
+import { MetaTrace } from "./MetaTrace";
+import { useResearchMotion } from "./ResearchMotion";
 
 export const spectrumStages = [
-  { id: "idea", name: "Idea", label: "研究思路", description: "探索问题，形成假设", color: "#159987" },
-  { id: "plan", name: "Plan", label: "验证计划", description: "设计路径，定义验证", color: "#5383cc" },
-  { id: "bundle", name: "Bundle", label: "实验与证据", description: "开展实验，汇集证据", color: "#625fe7" },
-  { id: "reasoning", name: "Reasoning", label: "研究判断", description: "综合发现，形成判断", color: "#d58a56" },
+  { id: "idea", name: "Idea", label: "研究思路", description: "探索问题，形成假设", color: "#3ecfb2" },
+  { id: "plan", name: "Plan", label: "验证计划", description: "设计路径，定义验证", color: "#5a97f5" },
+  { id: "bundle", name: "Bundle", label: "实验与证据", description: "开展实验，汇集证据", color: "#9183f9" },
+  { id: "reasoning", name: "Reasoning", label: "研究判断", description: "综合发现，形成判断", color: "#f0a96c" },
 ] as const;
 
 export type SpectrumStage = typeof spectrumStages[number]["id"];
@@ -13,37 +15,31 @@ export function spectrumStage(value: string | null | undefined): SpectrumStage |
   return spectrumStages.find(stage => stage.id === value?.toLowerCase())?.id ?? null;
 }
 
-const curves = spectrumStages.map((_, index) => {
-  const center = 120 + index * 240;
-  const height = [78, 92, 102, 82][index];
-  const points = Array.from({ length: 193 }, (_, n) => {
-    const x = n * 5;
-    const y = 116 - height * Math.exp(-0.5 * ((x - center) / 76) ** 2);
-    return `${x},${y.toFixed(2)}`;
-  });
-  return { line: `M${points.join(" L")}`, fill: `M0,116 L${points.join(" L")} L960,116 Z`, center, peak: 116 - height };
-});
+const curves = [
+  "M0,72 C55,72 95,10 158,8 S240,72 370,72",
+  "M170,72 C230,72 275,5 335,3 S415,72 530,72",
+  "M390,72 C450,72 495,2 558,1 S635,72 740,72",
+  "M590,72 C648,72 685,9 745,7 S793,72 800,72",
+];
 
 /** A decorative spectrum, never a measurement or a completion percentage. */
 function SpectrumChart({ current }: { current: SpectrumStage | null }) {
   const id = useId().replace(/:/g, "");
-  return <svg className="spectrum-chart" viewBox="0 0 960 132" preserveAspectRatio="none" aria-hidden="true">
+  return <svg className="spectrum-chart" viewBox="0 0 800 76" preserveAspectRatio="none" aria-hidden="true" focusable="false">
     <defs>{spectrumStages.map(stage => <linearGradient key={stage.id} id={`${id}-${stage.id}`} x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stopColor={stage.color} stopOpacity={stage.id === current ? ".23" : ".1"} />
       <stop offset="1" stopColor={stage.color} stopOpacity=".015" />
     </linearGradient>)}</defs>
-    <g className="spectrum-grid">{[32, 74, 116].map(y => <path key={y} d={`M0 ${y}H960`} />)}{[0, 240, 480, 720, 960].map(x => <path key={x} d={`M${x} 16V122`} />)}</g>
+    <line x1="0" y1="72" x2="800" y2="72" stroke="#dce3ee" strokeWidth="1" />
     {spectrumStages.map((stage, index) => <g key={stage.id}>
-      <path d={curves[index].fill} fill={`url(#${id}-${stage.id})`} />
-      <path d={curves[index].line} stroke={stage.color} strokeOpacity={stage.id === current ? "1" : ".55"} strokeWidth={stage.id === current ? "2.2" : "1.4"} fill="none" vectorEffect="non-scaling-stroke" />
-      {stage.id === current && <g><path d={`M${curves[index].center} ${curves[index].peak + 9}V116`} stroke={stage.color} opacity=".4" strokeDasharray="3 5" />
-        <circle cx={curves[index].center} cy={curves[index].peak} r="8" fill={stage.color} opacity=".12" />
-        <circle cx={curves[index].center} cy={curves[index].peak} r="3.8" fill={stage.color} stroke="white" strokeWidth="2" /></g>}
+      <path d={`${curves[index]}Z`} fill={`url(#${id}-${stage.id})`} />
+      <path d={curves[index]} stroke={stage.color} strokeOpacity={stage.id === current ? ".8" : ".45"} strokeWidth="1.2" fill="none" vectorEffect="non-scaling-stroke" />
+      {stage.id === current && <path className="spectrum-flow" d={curves[index]} stroke={stage.color} strokeWidth="2.8" fill="none" strokeLinecap="round" vectorEffect="non-scaling-stroke" />}
     </g>)}
   </svg>;
 }
 
-export function SpectrumStages({ current, labels, onSelect, compact = false, stale = false, stageContent, selected, onResult }: {
+export function SpectrumStages({ current, labels, onSelect, compact = false, stale = false, stageContent, selected, onResult, running = false }: {
   current: SpectrumStage | null;
   labels?: Partial<Record<SpectrumStage, string>>;
   onSelect?: (stage: SpectrumStage) => void;
@@ -52,15 +48,17 @@ export function SpectrumStages({ current, labels, onSelect, compact = false, sta
   stageContent?: (stage: SpectrumStage) => ReactNode;
   selected?: SpectrumStage | null;
   onResult?: (stage: SpectrumStage) => void;
+  running?: boolean;
 }) {
-  return <section className={`research-spectrum${compact ? " is-compact" : ""}`} aria-label="研究光谱">
-    <div className="spectrum-caption"><span>RESEARCH SPECTRUM <i /> 研究光谱</span><small>四个阶段 · 随研究推进</small></div>
+  const motion = useResearchMotion<HTMLElement>(running && !stale);
+  return <section ref={motion.ref} data-spectrum-choice="D" data-motion-active={motion.active} className={`research-spectrum${compact ? " is-compact" : ""}`} aria-label="研究光谱">
+    <div className="spectrum-caption"><span>棱镜谱带 <i /> 研究光谱</span><small>四个阶段 · 随研究推进</small></div>
     <SpectrumChart current={current} />
     <nav className="spectrum-stages" aria-label="本轮阶段与历史结果">{spectrumStages.map((stage, index) => {
       const active = current === stage.id;
       const label = labels?.[stage.id] ?? (active ? stale ? "上次记录的阶段" : "当前阶段" : "查看阶段");
       const content = <><span className="spectrum-stage-top"><span className="spectrum-stage-number">0{index + 1}</span><span className="spectrum-stage-state"><i />{label}</span></span>
-        <span className="spectrum-stage-name">{stage.name}<span aria-hidden="true">↗</span></span>
+        <span className="spectrum-stage-name">{stage.name}{active ? <MetaTrace variant="spectrum" active={motion.active} /> : <span aria-hidden="true">↗</span>}</span>
         <span className="spectrum-stage-label">{stage.label}</span><span className="spectrum-stage-description">{stage.description}</span></>;
       const props = { className: "spectrum-stage", "data-stage": stage.id, "data-current": active, "aria-current": active ? "step" as const : undefined, "aria-label": `${stage.name} · ${stage.label}，${label}` };
       if (stageContent) return <div key={stage.id} {...props} className="spectrum-stage has-root-sessions" data-selected={selected === stage.id}>

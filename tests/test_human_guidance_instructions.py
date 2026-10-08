@@ -50,5 +50,9 @@ def test_system_instruction_profile_keeps_exact_historical_read_identity():
     assert canonical_hash(after) == document["after_profile_hash"]
     assert [key for key in before if before[key] != after[key]] == ["research_system_prompt_hash"]
     for kind in ("idea", "plan", "bundle", "reasoning", "target"):
-        assert root_capability_profile(kind).as_dict() == after
-        assert document["before_profile_hash"] in reviewed_historical_root_profile_hashes(root_capability_profile(kind).digest)
+        current = root_capability_profile(kind)
+        assert {key: value for key, value in current.as_dict().items() if key != "research_system_prompt_hash"} == {
+            key: value for key, value in after.items() if key != "research_system_prompt_hash"
+        }
+        assert document["before_profile_hash"] in reviewed_historical_root_profile_hashes(document["after_profile_hash"])
+        assert document["after_profile_hash"] in reviewed_historical_root_profile_hashes(current.digest)

@@ -19,6 +19,11 @@ def test_real_root_adapter_passes_human_request_instructions(tmp_path, root_kind
     assert len(instructions) == 1
     actual = tomllib.loads(instructions[0])["developer_instructions"]
     assert actual.startswith(RESEARCH_SYSTEM_PROMPT)
+    assert "delivery.reply_reader" in actual
+    assert "uploaded_readers" in actual
+    assert "linked_locators" in actual
+    assert "provided_material" in actual
+    assert "提交回应不自动登记" in actual
     language_instructions = actual[len(RESEARCH_SYSTEM_PROMPT):]
     assert "本回合输出语言：zh。" in language_instructions
     assert "直接使用中文" in language_instructions

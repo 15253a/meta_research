@@ -37,7 +37,7 @@ description: 实施或修订由 Bundle 启用的 Target，完成材料获取、�
 
 写 `outputs/result.json`，包含 `metrics` 及忠实表达研究的领域字段。Owner 从当前执行与已接纳记录接续 Target／Run 身份、Protocol、冻结输入和精确版本；这些已有信息无需转抄。`schema_ref` 和历史 `result_disposition` 字段可省略，结果无需总分类或统一 claim；提供身份断言时须与该权威记录一致。初始 `result_schema` 是表达指导，字段、嵌套和类型可随真实观察演化；Protocol 指标集合、来源、合法 JSON 与有限数值检查仍有效。实测零为 `0`，合同允许的未测量值为 `null`，类别、数组和对象保留真实 JSON 值；缺测原因写入结果或 `outputs/analysis`。
 
-保存具体实施／评价产物，出现多个实际 Run、分离或交替评价、无指标报告评价、待评价实施、复用已接纳 Run，或交接可复用 Dataset／Environment 候选时，读取[正式工作交接](references/formal-work.md)。以 `formal_runs` 声明真实生产者、实际采用关系和精确产物路径；系统携带的冻结输入只说明可用来源，真实采用、用途和科学含义由本次研究说明。需要独立选择文件、目录或一组不连续路径及其用途时，用 `retained_artifacts` 声明保留范围和角色。`evaluations: []` 表示尚未评价；空指标的已执行评价必须有真实评价记录及归属报告。一次工具调用或技术重试本身不构成新的科研 Run。
+保存具体实施／评价产物，出现多个实际 Run、分离或交替评价、无指标报告评价、待评价实施、复用已接纳 Run、正式工作声明反馈，或交接可复用 Dataset／Environment 候选时，读取[正式工作交接](references/formal-work.md)。以 `formal_runs` 声明真实生产者、实际采用关系和精确产物路径；系统携带的冻结输入只说明可用来源，真实采用、用途和科学含义由本次研究说明。需要独立选择文件、目录或一组不连续路径及其用途时，用 `retained_artifacts` 声明保留范围和角色。`evaluations: []` 表示尚未评价；空指标的已执行评价必须有真实评价记录及归属报告。一次工具调用或技术重试本身不构成新的科研 Run。
 
 `implementation/` 保存足以核查实际方法的说明、规程、推导、编码框架或代码。按研究价值、可复核性、复用和存储成本决定每个 Run／评价的保留产物与粒度；checkpoint 可有多个、部分或没有，不限于模型权重。`checkpoint_policy` 的 `required`／`forbidden` 是先前保存建议，不是产物有无的接纳门槛。把重要取舍和局限写入研究说明。
 

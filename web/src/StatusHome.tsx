@@ -3,6 +3,8 @@ import { ResearchIcon, SpectrumStages, spectrumStage } from "./Spectrum";
 import { fetchRootSessions, type RootSessions } from "./rootSessionsApi";
 import { canObserveActiveTarget, observedActiveTarget, TARGET_OBSERVATION_INTERVAL_MS } from "./activeTargetStatus";
 import "./status-home.css";
+import { ResearchMotionControl } from "./ResearchMotion";
+import { MetaTrace } from "./MetaTrace";
 
 type Health = { status: string; checks: { name: string; status: string; reason?: { code: string } }[] };
 export type RuntimeStatus = {
@@ -146,13 +148,15 @@ export function StatusHome() {
   const unhealthy = status?.health.checks.filter(check => check.status !== "ready") ?? [];
   return <div className="status-home">
     <header className="status-home-header">
-      <a href="/" aria-label="Meta Research 首页"><span className="lumen-logo" aria-hidden="true">MR</span><span><b>Meta Research</b><small>LUMEN WORKSPACE</small></span></a>
+      <a href="/" aria-label="Meta Research 首页"><span className="lumen-logo" aria-hidden="true"><MetaTrace variant="signature" /></span><span><b>Meta Research</b><small>LUMEN WORKSPACE</small></span></a>
       <nav aria-label="工作台导航"><a className="is-active" href="/" aria-current="page">工作台</a><a href="/?workspace=1">研究现场</a><a href="/?workspace=1&companion=1">研究助手 <span>↗</span></a></nav>
+      <ResearchMotionControl />
     </header>
     <main id="main-content">
       <div className="status-home-intro"><div><p className="home-eyebrow">从一个问题，到新的发现</p><h2>研究工作台<span> / Workspace</span></h2></div><p className="home-intro-note">思路、验证、证据与判断。<br />在同一条研究脉络里，继续探索。</p></div>
       <section className="status-home-current" aria-labelledby="current-task-title" data-testid="runtime-status">
-        <SpectrumStages current={spectrumStage(status?.foreground?.stage)} stale={error} />
+        <SpectrumStages current={spectrumStage(status?.foreground?.stage)} stale={error}
+          running={!error && status?.state === "running" && Boolean(status.current_task && ["active", "executing", "running"].includes(status.current_task.status))} />
         <div className="home-task-panel">
         <div className="home-task-copy">
         <div className="status-home-topline">

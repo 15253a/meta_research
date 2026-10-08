@@ -946,6 +946,8 @@ def build_production_runtime(
             for kind, provider in workspace_providers.items()},
         deepfetch_locator=getattr(deepfetch_provider, "research_workspace_path", None),
     )
+    human_collaboration.bind_reply_workspaces(root_workspaces)
+    human_collaboration.recover_response_deliveries()
     for provider in (*workspace_providers.values(), proposal_drafter, deepfetch_provider):
         bind_workspaces = getattr(provider, "bind_workspaces", None)
         if callable(bind_workspaces):
@@ -1096,6 +1098,10 @@ def build_production_runtime(
         harnesses=harnesses,
         finalizer=target_run_finalizer,
         database=database,
+        root_workspaces=root_workspaces,
+        advancement_engine=owners.advancement_engine,
+        protected_storage_roots=(data_root.objects, data_root.provider_homes,
+            data_root.run / 'harness-supervisor', data_root.database),
     )
     bundle_stage = BundleStageWorker(
         feed,

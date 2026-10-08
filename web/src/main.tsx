@@ -17,6 +17,7 @@ import { observedActiveTarget } from "./activeTargetStatus";
 import { observedTargetRetry, targetResearchFacts } from "./targetResearchFacts";
 import { BoundedDetails, PageWindow } from "./BoundedDetails";
 import { ResearchIcon, SpectrumStages, spectrumStage } from "./Spectrum";
+import { ResearchMotionProvider, ResearchMotionControl } from "./ResearchMotion";
 import { conversationContext, useWorkspaceStatus } from "./workspaceStatus";
 import {
   acknowledgeAssetIntake,
@@ -84,7 +85,8 @@ import {
   TelemetryAuthorizationCard,
 } from "./HumanCollaboration";
 import "./shell.css";
-import { ResearchOverview, ResearchTimeline, StageHistoryStrip, cycleOrdinalLabel, overviewQuestRef, useResearchOverview } from "./ResearchOverview";
+import { ResearchOverview, ResearchBrief, ResearchTimeline, StageHistoryStrip, cycleOrdinalLabel, overviewQuestRef, useResearchOverview } from "./ResearchOverview";
+import { MetaTrace } from "./MetaTrace";
 import { StageReadableOutput, TargetCommandOutput } from "./ReadableOutput";
 import { ExperimentLogs, ExperimentOutputViews } from "./ExperimentLogs";
 import { ExecutionElapsed, type ExecutionClockSample } from "./ExecutionElapsed";
@@ -4191,6 +4193,9 @@ function WorkspaceMain({
           <h1 id="workspace-title">{targetObservation?.status.current_task?.title ?? runtimeStatus.status?.current_task?.title ?? (liveContext.foreground ? "当前研究" : "当前没有运行中的阶段")}</h1>
           {targetActivity}
           <SpectrumStages compact current={rootConversations.currentStage} selected={rootConversations.selectedStage}
+            running={!liveContext.stale && !rootConversations.error && !rootConversations.data?.limited
+              && liveContext.foreground?.status === "active" && liveContext.foreground.grant_status === "active"
+              && Boolean(targetObservation || rootConversations.current?.is_executing)}
             onSelect={stage => rootConversations.selectStage(stage)} stale={liveContext.stale}
             stageContent={stage => <StageRootSessions model={rootConversations} stage={stage} />} />
           <p role="status">{liveContext.stale ? "运行状态正在重新读取，以下保留上次记录。" : "当前运行状态已载入。"}
@@ -4236,10 +4241,11 @@ function WorkspaceMain({
         ) : null}
       </section>
 
+      {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchBrief snapshot={snapshot} overview={overview.data} error={overview.error} rootConversations={rootConversations} /> : null}
       {snapshot && overviewQuestRef(snapshot) && !showingLiveOverview ? <ResearchTimeline snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} rootConversations={rootConversations} /> : null}
       {snapshot && foreground && !showingLiveOverview ? <>
         {historyOpen ? <>
-          <ResearchOverview snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} onOpenWriting={onBrowseWriting} connected={connected} />
+          <ResearchOverview snapshot={snapshot} overview={overview.data} error={overview.error} onRetry={overview.retry} onOpenWriting={onBrowseWriting} connected={connected} rootConversations={rootConversations} />
         </> : null}
         <div className="research-primary-actions">
           <ExperimentLogLauncher snapshot={snapshot} blocked={humanRequestModalOpen} paused={hidden} observationPointers={targetRootObservationPointers} rootConversations={rootConversations} />
@@ -5332,7 +5338,7 @@ function DetailedApp() {
       <div className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-companion-open={showCompanion} data-hc-background>
         <header className="lumen-header" data-shell-region="header">
           <a className="lumen-brand" aria-label="Meta-research 首页" href="/" style={{ color: "inherit", textDecoration: "none" }}>
-            <span className="lumen-logo" aria-hidden="true">MR</span>
+            <span className="lumen-logo" aria-hidden="true"><MetaTrace variant="signature" /></span>
             <div><b>Meta Research</b><small>Lumen workspace</small></div>
           </a>
           <div className="lumen-quest-context">
@@ -5347,6 +5353,7 @@ function DetailedApp() {
             {snapshot ? <code>状态 {snapshot.revision}</code> : null}
           </div>
           <RuntimeConditions questRef={overviewQuestRef(snapshot)} questionRef={runtimeConditionsQuestionRef(snapshot)} disabled={humanRequestSurfaceOpen || detailsScopeChanged} />
+          <ResearchMotionControl />
           <ForegroundResearchControlShortcut
             control={snapshot?.research_control}
             commands={snapshot?.human_collaboration?.commands.items}
@@ -5640,6 +5647,6 @@ function DetailedApp() {
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <OutputLanguageProvider><OutputLanguageControl floating /><App /></OutputLanguageProvider>
+    <ResearchMotionProvider><OutputLanguageProvider><OutputLanguageControl floating /><App /></OutputLanguageProvider></ResearchMotionProvider>
   </StrictMode>,
 );

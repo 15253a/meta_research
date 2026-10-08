@@ -343,6 +343,16 @@
   gap: 9px;
 }
 
+.quest-research-style {
+  grid-column: 1 / -1;
+}
+
+.quest-research-style > small {
+  color: var(--quest-muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
 .quest-config-card {
   padding: 0;
   background: transparent;

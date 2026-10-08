@@ -3010,7 +3010,7 @@ a:focus-visible,
 }
 .hc-dialog.hc-dialog-library {
   width: min(1040px, calc(100vw - 32px));
-  height: auto;
+  height: min(880px, calc(100dvh - 32px));
   max-height: calc(100dvh - 32px);
 }
 
@@ -3164,12 +3164,36 @@ a:focus-visible,
   padding: 24px clamp(20px, 3.5vw, 42px) 38px;
   background: #fff;
 }
+.hc-handoff {
+  margin-bottom: 26px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.hc-handoff > header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; }
+.hc-handoff h3 { margin: 0; font-size: 16px; }
+.hc-handoff header small { color: var(--ink-muted); font-size: 11px; }
+.hc-handoff h4 { margin: 16px 0 5px; font-size: 13px; }
+.hc-handoff p { margin: 5px 0; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+.hc-handoff-downloads { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.hc-handoff button {
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid #d7d5ec;
+  border-radius: 9px;
+  color: #514da8;
+  background: #f7f7ff;
+  font-size: 12px;
+  font-weight: 700;
+}
+.hc-handoff button:disabled { opacity: .55; cursor: default; }
+.hc-handoff button:focus-visible { outline: 2px solid var(--ultraviolet); outline-offset: 3px; }
 .hc-dialog-library .hc-request-workspace {
-  min-height: 390px;
-  flex: none;
+  min-height: 0;
+  flex: 1;
 }
 .hc-dialog-library .hc-request-core {
-  overflow: visible;
+  overflow: auto;
   padding: 26px 28px 24px;
 }
 .hc-dialog-library .hc-request-draft { min-height: 390px; }

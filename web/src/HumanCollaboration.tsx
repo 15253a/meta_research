@@ -8,32 +8,27 @@ import {
   type ReactNode,
 } from "react";
 import { useReplyStream } from "./chatReplyStream";
+import { MetaTrace } from "./MetaTrace";
 import {
-  acknowledgeAssetIntake,
   authorizeHumanCommand,
   confirmHumanCommand,
   convertAgentProposalToCommandDraft,
   convertAgentProposalToSoftConstraint,
   deliverPendingHumanRequestResponse,
   createHumanCommand,
-  deliverPendingHumanRequestAssetResponse,
+  downloadHumanRequestHandoff,
   executeHumanCommand,
   hydratePendingHumanRequestRecovery,
-  pendingAcceptedHumanRequestAssetRequestRef,
-  pendingAssetIntakeJobRef,
-  pendingHumanRequestAssetIntakeRequestRef,
-  pendingHumanRequestAssetResponse,
   pendingHumanRequestResponse,
+  hasLegacyHumanRequestMaterial,
   previewHumanCommand,
   ProductError,
-  reconcileOrphanedHumanRequestAssetRecovery,
+  readHumanRequestHandoff,
+  reconcileHumanRequestResponses,
   respondToHumanRequest,
   retryHumanRequest,
   reviseHumanCommand,
   sendCompanionMessage,
-  stagePendingAcceptedHumanRequestAssetResponse,
-  submitHumanRequestAssetIntake,
-  resumePendingHumanRequestAssetIntake,
   withdrawSoftConstraint,
   submitHumanGuidance,
   type GuidanceStrength,
@@ -47,8 +42,10 @@ import {
   type HumanCommandDraft,
   type HumanCapabilityCommandDraft,
   type HumanRequestImpactPreview,
+  type HumanRequestHandoff,
   type HumanRequestItem,
   type HumanRequestResponseBody,
+  type HumanReplyMaterial,
   type QuestionTreeItem,
   type ResearchControlAction,
   type ResearchControlProjection,
@@ -463,7 +460,7 @@ export function QuestCompanion({
       tabIndex={0}
     >
       <header className="lumen-companion-head">
-        <span className="lumen-orb" aria-hidden="true" />
+        <span className="lumen-orb" aria-hidden="true"><MetaTrace variant="assistant" /></span>
         <div>
           <b>研究助手</b>
           <small>{questionContext
@@ -2069,7 +2066,7 @@ export function HumanRequestSurface({
   useEffect(() => {
     if (collaboration?.human_requests.status !== "ready") return;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    void reconcileOrphanedHumanRequestAssetRecovery(currentRequestRefs)
+    void reconcileHumanRequestResponses()
       .then((changed) => {
         if (changed) onChanged();
       })
@@ -2360,6 +2357,7 @@ function HumanRequestView({
       </header>
       <div className="hc-request-workspace">
         <main className="hc-request-core">
+          <RequestHandoff key={`${request.request_ref}:${request.revision}`} request={request} onChanged={onChanged} />
           <RequestForm
             request={request}
             commands={collaboration?.commands.items ?? []}
@@ -2377,6 +2375,76 @@ function HumanRequestView({
         />
       </div>
     </>
+  );
+}
+
+function RequestHandoff({ request, onChanged }: { request: HumanRequestItem; onChanged: () => void }) {
+  const [handoff, setHandoff] = useState<HumanRequestHandoff | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [readAttempt, setReadAttempt] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    void readHumanRequestHandoff(request.request_ref, request.revision, controller.signal)
+      .then((value) => setHandoff(value))
+      .catch((caught) => {
+        if (!controller.signal.aborted) setError(reasonCode(caught));
+      });
+    return () => controller.abort();
+  }, [request.request_ref, request.revision, readAttempt]);
+  const download = async (format: "md" | "html" | "pdf") => {
+    if (!handoff || downloading) return;
+    setDownloading(format);
+    setError(null);
+    try {
+      const blob = await downloadHumanRequestHandoff(request.request_ref, request.revision, format);
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `human-request-${request.request_id}-r${request.revision}.${format}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
+    } catch (caught) {
+      setError(reasonCode(caught));
+    } finally {
+      setDownloading(null);
+    }
+  };
+  return (
+    <section className="hc-handoff" aria-label="求助交接材料">
+      <header><h3>求助交接材料</h3><small>请求修订 {request.revision}</small></header>
+      <div className="hc-handoff-downloads" aria-label="下载求助交接材料" aria-busy={downloading !== null}>
+        {([ ["md", "Markdown"], ["html", "HTML"], ["pdf", "PDF"] ] as const).map(([format, label]) => (
+          <button key={format} type="button" disabled={!handoff || downloading !== null} onClick={() => void download(format)}>
+            {downloading === format ? `正在下载 ${label}…` : `下载 ${label}`}
+          </button>
+        ))}
+      </div>
+      {error ? <div role="alert">
+        <p>{error === "request_failed:409"
+          ? "这张请求的修订无法确认，请重新读取后下载交接材料。"
+          : "交接材料暂时无法读取，请重试。"}</p>
+        <button type="button" onClick={() => {
+          setError(null);
+          setReadAttempt((attempt) => attempt + 1);
+          onChanged();
+        }}>重新读取请求</button>
+      </div> : null}
+      {!handoff && !error ? <p role="status">正在读取求助说明…</p> : null}
+      {handoff?.is_current === false ? (
+        <p>这是历史请求修订；正式提交前，请先确认当前请求。</p>
+      ) : null}
+      {handoff?.sections.map((section) => (
+        <section key={section.key}>
+          <h4>{section.title}</h4>
+          {section.paragraphs.map((paragraph, index) => (
+            <p key={index}>{renderAgentText(paragraph)}</p>
+          ))}
+        </section>
+      ))}
+    </section>
   );
 }
 
@@ -2668,67 +2736,71 @@ type SubmitResponse = (
 ) => Promise<void>;
 
 type HumanRequestMaterial = {
-  file: File | null;
+  files: File[];
   localPath: string;
-  factPrefix: "material" | "result";
-  evidenceKind: "library_fulltext" | "external_approval" | "offline_result";
 };
 
-const MAX_HUMAN_REQUEST_ASSET_BYTES = 64 * 1024 * 1024;
+const MAX_HUMAN_REPLY_BYTES = 64 * 1024 * 1024;
 
-async function acceptHumanRequestMaterial(
-  requestRef: string,
-  material: HumanRequestMaterial,
-  response: HumanRequestResponseBody,
-): Promise<"none" | "asset_staged" | "response_recorded"> {
-  const localPath = material.localPath.trim();
-  if (!material.file && !localPath) return "none";
-  if (!material.file && material.evidenceKind !== "library_fulltext") {
-    await respondToHumanRequest(requestRef, {
-      ...response,
-      linked_local_material: {
-        source_locator: material.localPath,
-      },
-    });
-    return "response_recorded";
+async function humanReplyMaterials(material: HumanRequestMaterial, note: string): Promise<HumanReplyMaterial[]> {
+  if (material.files.length > 99 || material.files.reduce((sum, file) => sum + file.size, 0) > MAX_HUMAN_REPLY_BYTES) {
+    throw new ProductError("human_response_material_too_large");
   }
-  if (pendingAssetIntakeJobRef()) {
-    throw new ProductError("asset_intake_recovery_required");
+  const names = new Set<string>();
+  for (const file of material.files) {
+    const path = file.webkitRelativePath || file.name;
+    if (path.length > 900 || names.has(path) || path.split("/")[0] === "reply.json"
+        || path.includes("\\") || path.includes(":")
+        || path.split("/").some((part) => !part || part === "." || part === ".."
+          || part === ".delivery.json" || part.startsWith(".delivery-"))) {
+      throw new ProductError("human_response_upload_path_invalid");
+    }
+    names.add(path);
   }
-  if (material.file && material.file.size > MAX_HUMAN_REQUEST_ASSET_BYTES) {
-    throw new ProductError("asset_content_too_large");
+  const materials: HumanReplyMaterial[] = [];
+  for (const file of material.files) {
+    materials.push({ kind: "upload", relative_path: file.webkitRelativePath || file.name,
+      media_type: file.type || "application/octet-stream",
+      content_base64: arrayBufferToBase64(await file.arrayBuffer()) });
   }
-  const displayName = material.file?.name
-    ?? localPath.split(/[\\/]/).filter(Boolean).at(-1)
-    ?? `${material.evidenceKind}-material`;
-  const result = await submitHumanRequestAssetIntake(
-    requestRef,
-    {
-      source_kind: material.file ? "file" : "local_path",
-      custody_mode: material.file ? "managed" : "linked_local",
-      display_name: displayName,
-      media_type: material.file?.type || "application/octet-stream",
-      ...(material.file
-        ? { content_base64: arrayBufferToBase64(await material.file.arrayBuffer()) }
-        : { source_locator: localPath }),
-      provenance: {
-        submitted_via: "human_request_response",
-        human_request_ref: requestRef,
-        evidence_kind: material.evidenceKind,
-      },
-      asynchronous: false,
-    },
-    response,
-    material.factPrefix,
-  );
-  if (result.status === "failed") {
-    acknowledgeAssetIntake(result.job_ref);
-    throw new ProductError(result.failure?.code ?? "asset_intake_failed");
+  if (material.localPath.trim()) {
+    materials.push({ kind: "linked_local", locator: material.localPath,
+      description: note || "Materials supplied for this exact HumanRequest." });
   }
-  if (result.status !== "accepted" || !result.asset) {
-    throw new ProductError("asset_intake_not_terminal");
-  }
-  return "asset_staged";
+  return materials;
+}
+
+function MaterialPicker({ files, setFiles, localPath, setLocalPath, disabled }: {
+  files: File[]; setFiles: (value: File[]) => void;
+  localPath: string; setLocalPath: (value: string) => void; disabled: boolean;
+}) {
+  const [selectionError, setSelectionError] = useState("");
+  return <>
+    <label className="hc-file-picker full">
+      浏览器文件 · 可多选
+      <input type="file" multiple aria-label="回应文件" disabled={disabled}
+        onChange={(event) => { setFiles(Array.from(event.target.files ?? [])); setSelectionError(""); }} />
+    </label>
+    <label className="hc-file-picker full">
+      浏览器文件夹
+      <input type="file" multiple aria-label="回应文件夹" disabled={disabled}
+        ref={(element) => { element?.setAttribute("webkitdirectory", ""); }}
+        onChange={(event) => {
+          const selected = Array.from(event.target.files ?? []);
+          setFiles(selected);
+          setSelectionError(selected.length ? "" : "文件夹没有可上传文件。请重新选择，或提供服务器可读的绝对路径。");
+        }} />
+    </label>
+    <small>{files.length ? `待送达 · ${files.map((file) => file.webkitRelativePath || file.name).join("、")}` : "尚未选择文件"}</small>
+    {files.length ? <button type="button" disabled={disabled} onClick={() => setFiles([])}>移除回应文件</button> : null}
+    {selectionError ? <p role="alert">{selectionError}</p> : null}
+    <label className="full">
+      服务器可读的绝对文件或目录路径 · 可选
+      <input aria-label="绝对本地文件或目录路径" value={localPath} disabled={disabled}
+        onChange={(event) => setLocalPath(event.target.value)} placeholder="例如 /data/research/result" />
+    </label>
+    <p>浏览器文件及文件夹上传到请求原根的工作区，保留相对目录。路径原件留在服务器原位置，说明填写在回应中。最多 99 个文件、总计 64 MiB；大型目录可使用原路径。</p>
+  </>;
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -2805,47 +2877,15 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         markResponseRecorded();
         return;
       }
-      const pendingDelivery = pendingHumanRequestAssetResponse(request.request_ref);
-      if (pendingDelivery) {
-        if (pendingDelivery.request_ref !== request.request_ref) {
-          throw new ProductError("human_request_asset_response_recovery_conflict");
-        }
-        await deliverPendingHumanRequestAssetResponse(request.request_ref);
-        markResponseRecorded();
-        return;
+      if (material) {
+        const materials = await humanReplyMaterials(material, note);
+        if (materials.length) response.materials = materials;
       }
-      const pendingIntakeRequestRef = pendingHumanRequestAssetIntakeRequestRef(
-        request.request_ref,
-      );
-      if (pendingIntakeRequestRef) {
-        if (pendingIntakeRequestRef !== request.request_ref) {
-          throw new ProductError("human_request_asset_intake_recovery_conflict");
-        }
-        await resumePendingHumanRequestAssetIntake(request.request_ref);
-        await deliverPendingHumanRequestAssetResponse(request.request_ref);
-        markResponseRecorded();
-        return;
+      if (decision === "provided" && hasLegacyHumanRequestMaterial(request.request_ref)
+          && !response.materials?.length) {
+        throw new ProductError("human_response_material_reselection_required");
       }
-      const pendingAcceptedRequestRef = pendingAcceptedHumanRequestAssetRequestRef(
-        request.request_ref,
-      );
-      if (pendingAcceptedRequestRef) {
-        if (pendingAcceptedRequestRef !== request.request_ref) {
-          throw new ProductError("human_request_accepted_asset_recovery_conflict");
-        }
-        await stagePendingAcceptedHumanRequestAssetResponse(request.request_ref, response);
-        await deliverPendingHumanRequestAssetResponse(request.request_ref);
-        markResponseRecorded();
-        return;
-      }
-      const materialResult = material
-        ? await acceptHumanRequestMaterial(request.request_ref, material, response)
-        : "none";
-      if (materialResult === "asset_staged") {
-        await deliverPendingHumanRequestAssetResponse(request.request_ref);
-      } else if (materialResult === "none") {
-        await respondToHumanRequest(request.request_ref, response);
-      }
+      await respondToHumanRequest(request.request_ref, response);
       markResponseRecorded();
     } catch (caught) {
       const code = reasonCode(caught);
@@ -2911,7 +2951,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
         <span aria-hidden="true">✓</span>
         <div>
           <h3>回应已提交</h3>
-          <p>系统正在核对回应；表单已关闭。只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
+          <p>回应已交回。上传材料通过原根工作台读取，路径原件保留在原位置；提交本身不自动入库。只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
         </div>
       </section>
     );
@@ -2919,6 +2959,7 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
 
   return (
     <>
+      {hasLegacyHumanRequestMaterial(request.request_ref) ? <p role="status">检测到旧版材料恢复记录。原入库回执保留；请重新选择文件或原路径后提交，旧记录不会自动重放。</p> : null}
       {request.kind === "library_reconnect" ? (
         <LibraryForm request={request} note={note} setNote={setNote} submit={submit} disabled={pending} />
       ) : null}
@@ -2929,8 +2970,6 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           setNote={setNote}
           submit={submit}
           disabled={pending}
-          factPrefix="material"
-          evidenceKind="external_approval"
         />
       ) : null}
       {request.kind === "offline_action" ? (
@@ -2940,8 +2979,6 @@ function RequestForm({ request, commands, authorizations, onChanged }: {
           setNote={setNote}
           submit={submit}
           disabled={pending}
-          factPrefix="result"
-          evidenceKind="offline_result"
         />
       ) : null}
       {request.kind === "capability_authorization" ? (
@@ -3028,7 +3065,7 @@ function LibraryForm({
 }) {
   const [mode, setMode] = useState<"none" | "oa" | "material">("none");
   const [localPath, setLocalPath] = useState("");
-  const [materialFile, setMaterialFile] = useState<File | null>(null);
+  const [materialFiles, setMaterialFiles] = useState<File[]>([]);
   const acquisitionPaperId = typeof request.target_assertion?.acquisition_paper_id === "string"
     ? request.target_assertion.acquisition_paper_id
     : null;
@@ -3061,40 +3098,14 @@ function LibraryForm({
       ) : null}
       {mode === "material" ? (
         <section className="hc-choice-panel">
-          <label className="hc-file-picker">
-            合法 PDF · 可选
-            <input
-              type="file"
-              accept="application/pdf,.pdf"
-              aria-label="合法全文 PDF"
-              disabled={disabled}
-              onChange={(event) => setMaterialFile(event.target.files?.[0] ?? null)}
-            />
-            <small>{materialFile ? `待接纳 · ${materialFile.name}` : "尚未选择 PDF"}</small>
-          </label>
-          <label>
-            本地文件或文件夹路径 · 可选
-            <input
-              value={localPath}
-              disabled={disabled}
-              onChange={(event) => setLocalPath(event.target.value)}
-              placeholder="例如 /data/papers/source.pdf"
-            />
-          </label>
-          <p>文件或本地路径会先安全保存并核对；核对通过后才会提交这个回应。</p>
-          {!acquisitionPaperId ? (
-            <p className="hc-preview-missing">
-              当前事项没有绑定到具体文献，暂时无法提交这份全文。
-            </p>
-          ) : null}
-          <button type="button" disabled={disabled || !acquisitionPaperId} onClick={() => void submit(
-            { acquisition_paper_id: acquisitionPaperId! },
+          <MaterialPicker files={materialFiles} setFiles={setMaterialFiles} localPath={localPath} setLocalPath={setLocalPath} disabled={disabled} />
+          <p>提交表示全文已送达请求原根工作台。原根按收到的 reader 读取材料；本次提交不自动入库。</p>
+          <button type="button" disabled={disabled} onClick={() => void submit(
+            { route: "provided_material", ...(acquisitionPaperId ? { acquisition_paper_id: acquisitionPaperId } : {}) },
             "provided",
             {
-              file: materialFile,
+              files: materialFiles,
               localPath,
-              factPrefix: "material",
-              evidenceKind: "library_fulltext",
             },
           )}>提交全文来源回应</button>
         </section>
@@ -3124,20 +3135,15 @@ function NaturalLanguageMaterialForm({
   setNote,
   submit,
   disabled,
-  factPrefix,
-  evidenceKind,
 }: {
   request: HumanRequestItem;
   note: string;
   setNote: (value: string) => void;
   submit: SubmitResponse;
   disabled: boolean;
-  factPrefix: "material" | "result";
-  evidenceKind: "external_approval" | "offline_result";
 }) {
   const [localPath, setLocalPath] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const condition = isRecord(request.target_assertion?.condition)
     ? request.target_assertion.condition
     : {};
@@ -3147,7 +3153,7 @@ function NaturalLanguageMaterialForm({
       <section className="hc-request-section">
         <header>
           <b>你的回应</b>
-          <small>自然语言、一个文件或一个绝对路径</small>
+          <small>自然语言、文件、文件夹或服务器原路径</small>
           {guidanceAssetRef ? (
             <a
               className="hc-protocol-download"
@@ -3169,53 +3175,16 @@ function NaturalLanguageMaterialForm({
               placeholder="写下结果、拒绝、限制或建议的替代路线。"
             />
           </label>
-          <label className="hc-file-picker full">
-            浏览器文件 · 可选
-            <input
-              ref={fileInputRef}
-              type="file"
-              aria-label="回应文件"
-              disabled={disabled || Boolean(localPath.trim())}
-              onChange={(event) => {
-                setFile(event.target.files?.[0] ?? null);
-                setLocalPath("");
-              }}
-            />
-            <small>{file ? `待接纳 · ${file.name}` : "尚未选择文件"}</small>
-            {file ? (
-              <button type="button" disabled={disabled} onClick={() => {
-                setFile(null);
-                if (fileInputRef.current) {
-                  fileInputRef.current.value = "";
-                  fileInputRef.current.focus();
-                }
-              }}>移除回应文件</button>
-            ) : null}
-          </label>
-          <label className="full">
-            绝对本地文件或目录路径 · 可选
-            <input
-              aria-label="绝对本地文件或目录路径"
-              value={localPath}
-              disabled={disabled || file !== null}
-              onChange={(event) => {
-                setLocalPath(event.target.value);
-                if (event.target.value) setFile(null);
-              }}
-              placeholder="例如 /data/research/result"
-            />
-          </label>
+          <MaterialPicker files={files} setFiles={setFiles} localPath={localPath} setLocalPath={setLocalPath} disabled={disabled} />
         </div>
-        <p className="hc-asset-boundary">提交只表示你的回应已被接纳；负责当前请求的 Agent 会解释其含义。</p>
+        <p className="hc-asset-boundary">提交表示回应和材料已送达请求原根工作台；提交本身不自动入库。负责当前请求的 Agent 会解释其含义。</p>
       </section>
       <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit(
         {},
         "provided",
         {
-          file,
+          files,
           localPath,
-          factPrefix,
-          evidenceKind,
         },
       )}>提交</button>
     </>

@@ -23,7 +23,7 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 按事实选 `affirmed | denied | uncertain | insufficient_evidence`。affirmed／denied 限定 claim；uncertain 说明有效证据为何未收敛；insufficient_evidence 保持 `claim=null` 并说明缺失。部分证据与仍缺其他证据可以同时存在。未测量、科学证据不足、访问阻塞和程序故障分别表述。
 
-用 `support_scope`、`limitations`、`causal_interpretation`、`research_synthesis` 和 notes 组织解释，短结论结合精确来源，不重复整个历史。区分事实未查清与风险受控、新认识与重复整理；反复无进展时重审缺口、策略或资源，而不是无理由生成新 Cycle。
+用 `support_scope`、`limitations`、`causal_interpretation`、`research_synthesis` 和 notes 组织解释，短结论结合实际采用的精确来源。冻结可用来源和已知历史身份由系统携带，父问题的引用用于关联各自影响判断，具体输出边界见语义契约。区分事实未查清与风险受控、新认识与重复整理；反复无进展时重审缺口、策略或资源，而不是无理由生成新 Cycle。
 
 聚焦阅读、历史召回和比较可委派独立子智能体，根抽查关键原文后综合。人类指导按真实内容影响判断，普通意见不自动成为授权或完成确认。完成条件：关键判断能追溯到实际来源，已有认识、局限和缺口明确，技术阻塞没有被写成科学结论。
 
@@ -34,6 +34,8 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 本轮 TargetCommit 身份从 context pack 的 `accepted_target_commit_closures` 读取，其中的闭包概要不代替候选正文；`predecessor_closure` 用于 `prior_accepted_bindings` 中的前序交接。需要核实实际内容时，对候选 binding 的精确 AssetVersion 调用 `research_memory.content.read`，将 `source_ref`、`version_ref` 都设为该版本引用。目录先省略 `entry_path` 并用 `offset=0, limit=1` 读取条目页，再选择所需正文。候选完整 `asset_binding`（含 RM receipt）可原样用于登记，无须读取大文件取得凭据。
 
 最后一个 Target 后 Bundle 若不再运行，由 Reasoning 承接。先发现或对账既有登记，再复用身份和原件；未知效果沿同一 `effect_id` reconcile。可委派明确资源范围的子智能体登记，根在交接前独立查回资源记录与用途关系；有数字材料时核实精确版本及原件，有真实数据派生时核实派生关系。无保留价值时说明判断；外部条件阻塞时记录未完成步骤和继续条件；暂存、未接纳材料仍在工作区。
+
+Cycle 业务完成且必要交接结束后，系统才按根系统提示清理不再需要的工作副本。提交本轮交接前，将后继需要的暂存材料沿既有 RM／RG 流程选中保管并读回精确版本；仍用于执行、恢复、待接纳或后续工作的内容继续保留，linked_local 外部原件和 RM 可读引用位置保持。ScientificOutcome 草稿或单个 Target 完成不代表本轮已可清理，业务完成由正式 Owner 交接确定。
 
 完成条件：值得保留且当前可登记的候选已登记并读回；空候选或无保留价值时说明判断，不制造资源记录；其余有真实取舍或具体阻塞说明，不把空 Dataset 身份当作已有版本，也不把登记当作新实验结果。
 
@@ -59,6 +61,6 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 最终 transition 恰为 `NextCycleProposal | CandidateCompletion` 一项。前者选择已接纳且 present／open 的 Question／Anchor，给出合法入口与精确 skip basis；等待外部条件时明确触发条件，并沿现有 HumanRequest／Owner 路径处理，不用重复 Cycle 轮询同一障碍。后者须有 Quest 整体目标和里程碑依据，并经人类明确确认及 Owner 接纳。
 
-提交前按语义契约核对引用数组，输出一份简短、完整闭合的 JSON。收到截断或引用错误反馈时，在同一会话回到精确来源修正后重新提交完整结果，不沿未闭合字符串继续重复引用或拼接多份结果。
+提交前按语义契约核对实际采用的引用及各问题影响，输出一份简短、完整闭合的 JSON。收到截断、引用或身份冲突反馈时，在同一会话回到指出的精确对象修正后重新提交完整结果，不沿未闭合字符串继续重复引用或拼接多份结果。
 
 完成条件：科学结果、沉积状态和唯一后继选择清楚，notes 进入正式闭包供下一轮使用；由 RM／RG／AR／AE 接纳链推进。未知结果先对账，必要输入或 currentness 故障保留具体阻塞；仅经公开 Owner 接口操作，不读写私有数据库、spool、seal key 或控制文件绕过边界。
