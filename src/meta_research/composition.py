@@ -136,6 +136,7 @@ from meta_research.writing_renderer import WritingRendererRegistry
 from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillProvider
 from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
 from meta_research.root_workspace import RootWorkspaces
+from meta_research.external_mcp import ExternalMcpRuntime
 
 
 @dataclass(frozen=True)
@@ -272,6 +273,7 @@ class ProductionRuntime:
     deepfetch: FirstQuestionDeepFetchWorker
     writing: WritingReportService
     harnesses: HarnessRuntime
+    external_mcp: ExternalMcpRuntime
     root_workspaces: RootWorkspaces
     target_run_authorities: TargetRunAuthorities
     target_run_runtime: TargetRunRuntime
@@ -289,6 +291,7 @@ class ProductionRuntime:
     timeline_summaries: object | None = None
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
+        self.external_mcp.configure_endpoint(base_url)
         for provider in self._resident_mcp_providers:
             configure = getattr(
                 provider, "configure_resident_mcp_endpoint", None
@@ -1169,6 +1172,7 @@ def build_production_runtime(
         ):
             provider_lifecycles.append(provider)
     runtime = ProductionRuntime(
+        external_mcp=ExternalMcpRuntime(data_root.root),
         data_root=data_root,
         owners=owners,
         authentication=Authentication(database),
