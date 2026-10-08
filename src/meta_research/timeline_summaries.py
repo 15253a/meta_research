@@ -28,7 +28,7 @@ MAX_SESSION_INPUT_BYTES = 240_000
 # Version the prose policy independently from scheduling instructions. Preserve
 # the original policy hash so a cadence-only update does not regenerate history.
 # Change this value when the factual summarization policy itself changes.
-SUMMARY_CONTENT_VERSION = 'research-recorder-clear-professional-20260924'
+SUMMARY_CONTENT_VERSION = 'research-recorder-evidence-kind-stage-gaps-20261008'
 
 
 def _scan_interval(value):
@@ -61,7 +61,7 @@ class TimelineSummaryStore:
                         CREATE TABLE IF NOT EXISTS nodes (
                             quest_ref TEXT NOT NULL, node_key TEXT NOT NULL,
                             source_hash TEXT NOT NULL, source_revision INTEGER NOT NULL,
-                            node_json TEXT NOT NULL, summary TEXT, summary_source_hash TEXT,
+                            node_json TEXT NOT NULL, summary TEXT, summary_kind TEXT NOT NULL DEFAULT 'process', summary_source_hash TEXT,
                             summary_source_revision INTEGER NOT NULL DEFAULT 0,
                             summary_sources_json TEXT NOT NULL DEFAULT '[]', updated_at REAL,
                             status TEXT NOT NULL, retry_at REAL NOT NULL DEFAULT 0,
@@ -79,6 +79,8 @@ class TimelineSummaryStore:
                     """)
                     if 'retry_at' not in {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}:
                         db.execute('ALTER TABLE jobs ADD COLUMN retry_at REAL NOT NULL DEFAULT 0')
+                    if 'summary_kind' not in {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}:
+                        db.execute("ALTER TABLE nodes ADD COLUMN summary_kind TEXT NOT NULL DEFAULT 'process'")
                     columns = {row['name'] for row in db.execute('PRAGMA table_info(quests)')}
                     if 'scan_interval_seconds' not in columns:
                         db.execute('ALTER TABLE quests ADD COLUMN scan_interval_seconds INTEGER NOT NULL DEFAULT 300')
@@ -215,10 +217,10 @@ class TimelineSummaryStore:
                 latest = current['source_hash'] == result['source_hash']
                 refs = set(result['source_refs'])
                 sources = [source for source in node['sources'] if source['ref'] in refs]
-                db.execute("""UPDATE nodes SET summary=?,summary_source_hash=?,summary_source_revision=?,
+                db.execute("""UPDATE nodes SET summary=?,summary_kind=?,summary_source_hash=?,summary_source_revision=?,
                     summary_sources_json=?,updated_at=?,status=?,retry_at=0,failures=0
                     WHERE quest_ref=? AND node_key=?""",
-                    (result['summary'], result['source_hash'], node['source_revision'], _json(sources), now,
+                    (result['summary'], result.get('summary_kind', 'process'), result['source_hash'], node['source_revision'], _json(sources), now,
                      'ready' if latest else 'pending', job['quest_ref'], node['node_key']))
             seconds = _scan_interval(next_scan_seconds)
             quest = db.execute('SELECT * FROM quests WHERE quest_ref=?', (job['quest_ref'],)).fetchone()
@@ -275,6 +277,7 @@ class TimelineSummaryStore:
                 result['nodes'].append({
                     **{key: node.get(key) for key in ('node_key','kind','question_ref','cycle_ref','stage','target_ref')},
                     'summary': row['summary'], 'status': row['status'], 'source_hash': row['source_hash'],
+                    'summary_kind': row['summary_kind'] if 'summary_kind' in row.keys() else 'process',
                     'summarized_source_hash': row['summary_source_hash'], 'updated_at': row['updated_at'],
                     'sources': json.loads(row['summary_sources_json']),
                 })
