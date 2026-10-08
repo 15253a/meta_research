@@ -12,6 +12,7 @@ from meta_research.bundle_protocol import (
     TERMINAL_EXTERNAL_OUTCOMES,
     BundleProtocolError,
     ExternalOperationReconciliation,
+    GoalWorkDisposition,
     HeldFixedBinding,
     ReceiptProof,
     RouteDisposition,
@@ -1803,6 +1804,24 @@ class BundleExhaustionOwnerProofVerifier:
                                 "a Bundle report.",
                             ),
                         )
+                    notice = self._agent_runtime.query_target_work_notice(
+                        target.target_ref
+                    )
+                    if entry is None and notice is not None:
+                        handoff = self._agent_runtime.read_target_run_handoff(
+                            notice.handoff_manifest_ref
+                        )
+                        if type(handoff.terminal) is GoalWorkDisposition:
+                            return BundleExhaustionEvaluation(
+                                status="rejected",
+                                feedback=(
+                                    "A durable goal-work disposition belongs to "
+                                    "the replan disposition, not exhaustion.",
+                                ),
+                            )
+                        raise OwnerConflict(
+                            "bundle_exhaustion_target_terminal_invalid"
+                        )
                     if entry is None:
                         return BundleExhaustionEvaluation(
                             status="rejected",
@@ -1818,9 +1837,6 @@ class BundleExhaustionOwnerProofVerifier:
                                 "A current Target route is still active.",
                             ),
                         )
-                    notice = self._agent_runtime.query_target_work_notice(
-                        target.target_ref
-                    )
                     if notice is None:
                         return BundleExhaustionEvaluation(
                             status="outcome_unknown",
@@ -1852,6 +1868,14 @@ class BundleExhaustionOwnerProofVerifier:
                             feedback=(
                                 "A durable semantic barrier belongs to the "
                                 "replan disposition, not exhaustion.",
+                            ),
+                        )
+                    if type(terminal) is GoalWorkDisposition:
+                        return BundleExhaustionEvaluation(
+                            status="rejected",
+                            feedback=(
+                                "A durable goal-work disposition belongs to "
+                                "the replan disposition, not exhaustion.",
                             ),
                         )
                     raise OwnerConflict(

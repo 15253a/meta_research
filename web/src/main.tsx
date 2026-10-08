@@ -1006,8 +1006,35 @@ function ReturnSummary({ snapshot }: { snapshot: PublicSnapshot }) {
         <small>Goal 对齐 · RG</small>
         <b>{quest.status === "ready" ? quest.goal : quest.reason?.code ?? "unavailable"}</b>
         <span>{quest.status === "ready"
-          ? `完成标准：${quest.completion_criteria} · ${quest.goal_revision_ref}`
+          ? `完成标准：${quest.completion_criteria} · 版本 ${quest.sequence ?? 0} · ${quest.goal_revision_ref}`
           : "不会从浏览器草案推断 Goal"}</span>
+        {quest.status === "ready" && quest.judgment ? <span>调整理由：{quest.judgment}</span> : null}
+        {quest.status === "ready" && quest.conditions?.enduring.length ? (
+          <details><summary>持续条件 · {quest.conditions.enduring.length}</summary>
+            <ul>{quest.conditions.enduring.map((condition) => (
+              <li key={condition.condition_ref}>{condition.source_text} · {condition.meaning}</li>
+            ))}</ul>
+          </details>
+        ) : null}
+        {quest.status === "ready" && quest.work?.intents.length ? (
+          <details><summary>工作安排 · {quest.work.intents.length}</summary>
+            <ul>{quest.work.intents.map((intent) => (
+              <li key={intent.intent_ref}>
+                {intent.decision.kind} · {intent.actual_status} · {intent.decision.reason}
+                {intent.decision.retention ? (
+                  <>
+                    {` · 保留 ${intent.decision.retention.kind}`}
+                    {intent.decision.retention.kind === "selected" ? (
+                      <ul>{intent.decision.retention.assets.map((asset) => (
+                        <li key={asset.version_ref}>{asset.version_ref} · {asset.meaning}</li>
+                      ))}</ul>
+                    ) : null}
+                  </>
+                ) : null}
+              </li>
+            ))}</ul>
+          </details>
+        ) : null}
       </article>
       <article>
         <small>关键变化 · accepted state</small>
@@ -5308,6 +5335,7 @@ function DetailedApp() {
         <QuestCompanion
           state={state}
           collaboration={snapshot?.human_collaboration}
+          goalAlignment={snapshot?.research_space.current_quest.guidance_alignment ?? []}
           researchControl={manualPanel ? undefined : snapshot?.research_control}
           questions={questionTreeItems}
           questionContext={questionTreeOpen && manualPanel === null

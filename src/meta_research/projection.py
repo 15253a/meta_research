@@ -933,6 +933,19 @@ def _query_current_quest_goal(
         "draft_hash": None,
         "goal": None,
         "completion_criteria": None,
+        "origin": None,
+        "sequence": None,
+        "parent_ref": None,
+        "criteria_review": None,
+        "judgment": None,
+        "following_direction": None,
+        "author": None,
+        "cause": None,
+        "receipt": None,
+        "conditions": None,
+        "work": None,
+        "guidance_alignment": [],
+        "history": None,
         "projection_digest": None,
     }
     if quest_ref is None:
@@ -971,6 +984,12 @@ def _query_current_quest_goal(
         or not isinstance(goal_document.get("completion_criteria"), str)
     ):
         raise OwnerConflict("quest_goal_projection_invalid")
+    view_query = getattr(research_graph, "query_quest_goal_view", None)
+    view = view_query(quest_ref) if callable(view_query) else None
+    if view is not None and (
+        not isinstance(view, dict) or view.get("current") != binding
+    ):
+        raise OwnerConflict("quest_goal_projection_invalid")
     return {
         "status": "ready",
         "quest_ref": quest_ref,
@@ -979,6 +998,19 @@ def _query_current_quest_goal(
         "draft_hash": binding["draft_hash"],
         "goal": goal_document["goal"],
         "completion_criteria": goal_document["completion_criteria"],
+        "origin": binding.get("origin", "initialization"),
+        "sequence": int(binding.get("sequence", 0)),
+        "parent_ref": binding.get("parent_ref"),
+        "criteria_review": binding.get("criteria_review"),
+        "judgment": binding.get("judgment"),
+        "following_direction": binding.get("following_direction"),
+        "author": binding.get("author"),
+        "cause": binding.get("cause"),
+        "receipt": binding.get("receipt"),
+        "conditions": None if view is None else view.get("conditions"),
+        "work": None if view is None else view.get("work"),
+        "guidance_alignment": [] if view is None else view.get("guidance_alignment", []),
+        "history": None if view is None else view.get("history"),
         "projection_digest": canonical_hash(binding),
         "reason": None,
     }

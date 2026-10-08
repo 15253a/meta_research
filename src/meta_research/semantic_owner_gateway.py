@@ -327,7 +327,12 @@ def create_semantic_owner_gateway(
     if human_collaboration is not None:
         from meta_research.human_research_context import human_research_context_operation
         from meta_research.human_guidance_operations import human_guidance_operations
+        from meta_research.quest_goal_operations import quest_goal_operations
         operations.extend(human_guidance_operations(human_collaboration))
+        operations.extend(quest_goal_operations(
+            research_graph=research_graph,
+            human_collaboration=human_collaboration,
+        ))
         operations.append(human_research_context_operation(
             agent_runtime=agent_runtime, human_collaboration=human_collaboration))
     from meta_research.question_relations import (
@@ -370,7 +375,8 @@ def create_semantic_owner_gateway(
         )
     from meta_research.research_content import research_content_operations
     operations.extend(research_content_operations(research_graph=research_graph,
-        research_memory=research_memory, agent_runtime=agent_runtime, human_collaboration=human_collaboration))
+        research_memory=research_memory, agent_runtime=agent_runtime,
+        human_collaboration=human_collaboration, target_run_agent=target_run_agent))
     from meta_research.creation_basis import creation_basis_operations
     operations.extend(creation_basis_operations(research_memory, agent_runtime, human_collaboration))
     return SemanticMcpGateway(tuple(operations))

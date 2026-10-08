@@ -8,6 +8,8 @@ AE 管阶段 request、epoch、BundleReport 与 StageCommit；RG 管 FormalPlan�
 
 子智能体在明确任务及所授权限内读取、分析、实施或整理，按文件／对象划分写入，返回结果、精确来源和自由格式反馈。整理已接纳材料可沿已授 Dataset／Environment 接口登记；未接纳 Target 中间产物仍留工作区，不提前进入 RM／RG 正式内容链。
 
+Quest 方向变化时，先用 `research_graph.quest_goal.read` 取得本操作冻结的 Goal／条件／工作切面，按共享指导合同作完整演化判断，再用 `research_graph.quest_goal.evolve` 提交；不确定效果仅用 `.reconcile` 对账原 effect。新工作使冻结切面 stale 时，交还并由新逻辑根操作取得新切面；不改写已接纳 FormalPlan 或旧调用。
+
 ## 正常流程
 
 1. 观察当前 Bundle 请求及运行绑定，读取精确 FormalPlan、内容 hash 和直接绑定它的 current receipt。

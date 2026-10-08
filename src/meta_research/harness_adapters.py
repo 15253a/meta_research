@@ -33,6 +33,7 @@ from meta_research.provider_supervisor import (
     ensure_transport_key,
     read_supervisor_request,
     read_verified_exit_receipt,
+    write_transport_envelope,
     write_supervisor_request,
 )
 from meta_research.root_capabilities import (
@@ -92,6 +93,7 @@ _MCP_TOKEN_ENV = "META_RESEARCH_MCP_TOKEN"
 _HARNESS_FAMILY_ENV = "META_RESEARCH_HARNESS_FAMILY"
 _HARNESS_WORKSPACE_ENV = "META_RESEARCH_HARNESS_WORKSPACE"
 _PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION_REF"
+_OWNER_INVOCATION_HASH_ENV = "META_RESEARCH_OWNER_INVOCATION_HASH"
 _HARNESS_EVIDENCE_SCOPE_ENV = "META_RESEARCH_HARNESS_EVIDENCE_SCOPE_REF"
 _HARNESS_OBSERVATION_SCOPE_ENV = "META_RESEARCH_HARNESS_OBSERVATION_SCOPE"
 HARNESS_PROVIDER_STREAM_MAX_BYTES = 64 * 1024 * 1024
@@ -169,6 +171,7 @@ class HarnessInvocation:
     entry_path: RootCapabilityEntryPath = "initial"
     authorized_operation_ids: tuple[str, ...] = ()
     external_mcp_access: ExternalMcpAccess | None = None
+    owner_invocation_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -378,6 +381,13 @@ class _NativeCliHarnessAdapter:
                 else str(self._workspace.resolve())
             ),
             _PROVIDER_OPERATION_ENV: invocation.provider_operation_ref,
+            **(
+                {}
+                if invocation.owner_invocation_hash is None
+                else {
+                    _OWNER_INVOCATION_HASH_ENV: invocation.owner_invocation_hash
+                }
+            ),
             _HARNESS_EVIDENCE_SCOPE_ENV: _harness_evidence_scope_ref(invocation),
             _HARNESS_OBSERVATION_SCOPE_ENV: canonical_json(
                 _target_root_observation_scope(invocation)
@@ -950,6 +960,13 @@ class _NativeCliHarnessAdapter:
                 invocation.target_workspace_ref is not None
                 and invocation.working_directory is None
             )
+            or (
+                invocation.owner_invocation_hash is not None
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", invocation.owner_invocation_hash
+                )
+                is None
+            )
         ):
             raise HarnessAdapterUnavailable("harness_invocation_invalid")
 
@@ -1279,6 +1296,32 @@ class HarnessSupervisorTransport:
             "environment_names": sorted(environment),
         }
         invocation_hash = canonical_hash(invocation)
+        owner_invocation_hash = environment.get(_OWNER_INVOCATION_HASH_ENV)
+        if owner_invocation_hash is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", owner_invocation_hash) is None:
+                raise OSError("owner invocation identity unavailable")
+            binding = {
+                "schema_ref": "meta-research/harness-operation-binding/v1",
+                "owner_invocation_hash": owner_invocation_hash,
+                "transport_invocation_hash": invocation_hash,
+                "provider_operation_ref": operation_ref,
+                "family": family,
+            }
+            binding_path = (
+                self._workspace
+                / "owner-invocation-bindings"
+                / owner_invocation_hash[:2]
+                / f"{owner_invocation_hash}.json"
+            )
+            binding_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                write_transport_envelope(
+                    binding_path,
+                    binding,
+                    self._transport_key,
+                )
+            except ProviderSupervisorError as error:
+                raise OSError("owner invocation binding unavailable") from error
         if self._raw_output_store is not None:
             try:
                 self._raw_output_store.bind_operation(
@@ -1545,7 +1588,7 @@ class HarnessSupervisorTransport:
             raise OSError("provider operation identity unavailable")
         # Keys used by the v1 native CLI transport. Values (including tokens)
         # are neither read from a live process nor retained in the spool.
-        environment_names = sorted((
+        legacy_environment_names = sorted((
             _MCP_TOKEN_ENV, _HARNESS_FAMILY_ENV, _HARNESS_WORKSPACE_ENV,
             _PROVIDER_OPERATION_ENV, _HARNESS_EVIDENCE_SCOPE_ENV,
             _HARNESS_OBSERVATION_SCOPE_ENV, "NO_PROXY", "no_proxy",
@@ -1562,15 +1605,25 @@ class HarnessSupervisorTransport:
                     continue
                 prompt = prompt_path.read_text(encoding="utf-8")
                 argv = json.loads((directory / "provider-argv.json").read_text(encoding="utf-8"))
-                invocation_hash = canonical_hash({
-                    "schema_ref": "meta-research/harness-provider-operation/v1",
-                    "family": family, "provider_operation_ref": operation_ref,
-                    "argv": argv, "prompt_hash": canonical_hash(prompt),
-                    "timeout_seconds": request.get("timeout_seconds"),
-                    "environment_names": environment_names,
-                })
-                if invocation_hash != directory.name:
+                candidate_environment_names = (
+                    legacy_environment_names,
+                    sorted((*legacy_environment_names, _OWNER_INVOCATION_HASH_ENV)),
+                )
+                invocation_hashes = {
+                    canonical_hash({
+                        "schema_ref": "meta-research/harness-provider-operation/v1",
+                        "family": family,
+                        "provider_operation_ref": operation_ref,
+                        "argv": argv,
+                        "prompt_hash": canonical_hash(prompt),
+                        "timeout_seconds": request.get("timeout_seconds"),
+                        "environment_names": environment_names,
+                    })
+                    for environment_names in candidate_environment_names
+                }
+                if directory.name not in invocation_hashes:
                     continue
+                invocation_hash = directory.name
                 self._verify_terminal_request(directory / "supervisor-request.json",
                     self._supervisor_request(directory, invocation_hash, family, request.get("timeout_seconds"),
                         Path(request["working_directory"]) if "working_directory" in request else None))

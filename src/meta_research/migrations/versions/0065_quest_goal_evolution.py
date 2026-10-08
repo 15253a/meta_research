@@ -161,6 +161,31 @@ def upgrade() -> None:
         ["cancel_goal_intent_ref"],
         unique=True,
     )
+    op.create_table(
+        "ar_target_goal_admission_blocks",
+        sa.Column("target_ref", sa.String(96), primary_key=True),
+        sa.Column("target_run_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("intent_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("state_revision", sa.Integer(), nullable=False),
+        sa.Column("created_at", sa.Float(), nullable=False),
+        sa.ForeignKeyConstraint(["target_ref"], ["rg_targets.target_ref"]),
+        sa.ForeignKeyConstraint(
+            ["intent_ref"], ["rg_goal_work_intents.intent_ref"]
+        ),
+        sa.CheckConstraint("state_revision >= 0"),
+    )
+    op.create_table(
+        "rm_target_note_intake_effects",
+        sa.Column("idempotency_key", sa.String(128), primary_key=True),
+        sa.Column("job_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("request_hash", sa.String(64), nullable=False),
+        sa.Column("binding_json", sa.Text(), nullable=False),
+        sa.Column("binding_hash", sa.String(64), nullable=False),
+        sa.Column("created_at", sa.Float(), nullable=False),
+        sa.ForeignKeyConstraint(["job_ref"], ["rm_asset_intakes.job_ref"]),
+        sa.CheckConstraint("length(request_hash) = 64"),
+        sa.CheckConstraint("length(binding_hash) = 64"),
+    )
 
     connection = op.get_bind()
     now = time.time()

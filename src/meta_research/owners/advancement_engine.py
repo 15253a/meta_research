@@ -463,6 +463,16 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
         self, cycle_ref: str
     ) -> StageRunRequest | None: ...
 
+    def query_goal_reasoning_reassessment(self) -> dict[str, object] | None: ...
+
+    def ensure_goal_reasoning_reassessment(
+        self,
+        *,
+        quest_ref: str,
+        goal_revision_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
     def commit_stage_disposition(
         self,
         *,
@@ -5038,6 +5048,253 @@ class SQLiteAdvancementEngine(
                     {"cycle_ref": cycle_ref},
                 ).first()
             return None if row is None else self._stage_request_from_row(row)
+
+    def query_goal_reasoning_reassessment(self) -> dict[str, object] | None:
+        verifier = self._reasoning_outcome_verifier
+        if verifier is None:
+            raise OwnerConflict("quest_goal_revision_verifier_unavailable")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT h.quest_ref,h.cycle_ref,h.question_ref,h.epoch,"
+                    "g.grant_ref,r.request_ref,r.context_pack_json,"
+                    "r.context_pack_hash,c.commit_ref,c.closure_json,"
+                    "c.closure_hash FROM ae_foreground_heads h JOIN "
+                    "ae_foreground_grants g ON g.quest_ref=h.quest_ref AND "
+                    "g.epoch=h.epoch JOIN ae_cycles y ON y.cycle_ref=h.cycle_ref "
+                    "JOIN ae_stage_run_requests r ON r.cycle_ref=h.cycle_ref AND "
+                    "r.stage='reasoning' AND r.epoch=h.epoch JOIN "
+                    "ae_stage_commits c ON c.request_ref=r.request_ref WHERE "
+                    "h.stage='reasoning' AND h.status='active' AND "
+                    "h.pending_operation_ref IS NULL AND g.status='active' AND "
+                    "y.status='ongoing' AND c.disposition='completed' ORDER BY "
+                    "h.updated_at,h.quest_ref"
+                )
+            ).all()
+        for row in rows:
+            try:
+                context_pack = decoded_object(row.context_pack_json)
+                closure = decoded_object(row.closure_json)
+            except (TypeError, ValueError) as error:
+                raise OwnerConflict("goal_reasoning_reassessment_invalid") from error
+            if (
+                not isinstance(context_pack, dict)
+                or canonical_hash(context_pack) != row.context_pack_hash
+                or not isinstance(closure, dict)
+                or canonical_hash(closure) != row.closure_hash
+                or closure.get("transition_kind") != "candidate_completion"
+            ):
+                raise OwnerConflict("goal_reasoning_reassessment_invalid")
+            research_context = context_pack.get("research_context")
+            if not isinstance(research_context, dict):
+                raise OwnerConflict("goal_reasoning_reassessment_invalid")
+            current = verifier.query_current_quest_goal_revision(row.quest_ref)
+            if current is None:
+                raise OwnerConflict("quest_goal_revision_unavailable")
+            verifier.verify_current_quest_goal_revision(current)
+            if research_context.get("goal_revision_ref") == current.get(
+                "goal_revision_ref"
+            ):
+                continue
+            return {
+                "quest_ref": row.quest_ref,
+                "cycle_ref": row.cycle_ref,
+                "source_epoch": int(row.epoch),
+                "source_request_ref": row.request_ref,
+                "source_commit_ref": row.commit_ref,
+                "goal_revision_ref": current["goal_revision_ref"],
+            }
+        return None
+
+    def ensure_goal_reasoning_reassessment(
+        self,
+        *,
+        quest_ref: str,
+        goal_revision_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        _validate_idempotency_key(idempotency_key)
+        if not quest_ref or not goal_revision_ref:
+            raise OwnerConflict("goal_reasoning_reassessment_invalid")
+        command_kind = "ensure_goal_reasoning_reassessment"
+        command = {
+            "command": command_kind,
+            "quest_ref": quest_ref,
+            "goal_revision_ref": goal_revision_ref,
+        }
+        command_hash = canonical_hash(command)
+        replay_ref = _query_ae_command(
+            self._database, idempotency_key, command_kind, command_hash
+        )
+        if replay_ref is not None:
+            return self._goal_reasoning_reassessment_result(
+                replay_ref,
+                goal_revision_ref=goal_revision_ref,
+                replayed=True,
+            )
+        verifier = self._reasoning_outcome_verifier
+        if verifier is None:
+            raise OwnerConflict("quest_goal_revision_verifier_unavailable")
+        current = verifier.query_current_quest_goal_revision(quest_ref)
+        if current is None or current.get("goal_revision_ref") != goal_revision_ref:
+            raise OwnerConflict("quest_goal_revision_stale")
+        verifier.verify_current_quest_goal_revision(current)
+        with self._database.fenced_write() as connection:
+            replay_ref = _ae_command_replay(
+                connection, idempotency_key, command_kind, command_hash
+            )
+            if replay_ref is not None:
+                result_ref = replay_ref
+            else:
+                verifier.verify_current_quest_goal_revision(current)
+                row = connection.execute(
+                    text(
+                        "SELECT h.*,g.grant_ref,r.request_ref,r.context_pack_json,"
+                        "r.context_pack_hash,c.commit_ref,c.closure_json,"
+                        "c.closure_hash,y.status AS cycle_status FROM "
+                        "ae_foreground_heads h JOIN ae_foreground_grants g ON "
+                        "g.quest_ref=h.quest_ref AND g.epoch=h.epoch JOIN "
+                        "ae_cycles y ON y.cycle_ref=h.cycle_ref JOIN "
+                        "ae_stage_run_requests r ON r.cycle_ref=h.cycle_ref AND "
+                        "r.stage='reasoning' AND r.epoch=h.epoch JOIN "
+                        "ae_stage_commits c ON c.request_ref=r.request_ref WHERE "
+                        "h.quest_ref=:quest_ref AND h.stage='reasoning' AND "
+                        "h.status='active' AND h.pending_operation_ref IS NULL "
+                        "AND g.status='active' AND y.status='ongoing' AND "
+                        "c.disposition='completed'"
+                    ),
+                    {"quest_ref": quest_ref},
+                ).first()
+                if row is None:
+                    raise OwnerConflict("goal_reasoning_reassessment_unavailable")
+                try:
+                    context_pack = decoded_object(row.context_pack_json)
+                    closure = decoded_object(row.closure_json)
+                except (TypeError, ValueError) as error:
+                    raise OwnerConflict(
+                        "goal_reasoning_reassessment_invalid"
+                    ) from error
+                research_context = (
+                    context_pack.get("research_context")
+                    if isinstance(context_pack, dict)
+                    else None
+                )
+                if (
+                    not isinstance(context_pack, dict)
+                    or canonical_hash(context_pack) != row.context_pack_hash
+                    or not isinstance(research_context, dict)
+                    or research_context.get("goal_revision_ref")
+                    == goal_revision_ref
+                    or not isinstance(closure, dict)
+                    or canonical_hash(closure) != row.closure_hash
+                    or closure.get("transition_kind") != "candidate_completion"
+                ):
+                    raise OwnerConflict("goal_reasoning_reassessment_invalid")
+                now = time.time()
+                next_epoch = int(row.epoch) + 1
+                grant_ref = new_ref("foreground_grant")
+                retired = connection.execute(
+                    text(
+                        "UPDATE ae_foreground_grants SET status='completed',"
+                        "revoked_at=COALESCE(revoked_at,:now) WHERE "
+                        "grant_ref=:grant_ref AND status='active'"
+                    ),
+                    {"grant_ref": row.grant_ref, "now": now},
+                )
+                if retired.rowcount != 1:
+                    raise OwnerConflict("goal_reasoning_reassessment_unavailable")
+                connection.execute(
+                    text(
+                        "INSERT INTO ae_foreground_grants (grant_ref,quest_ref,"
+                        "cycle_ref,question_ref,stage,epoch,status,"
+                        "predecessor_grant_ref,safe_point_ref,granted_at,revoked_at) "
+                        "VALUES (:grant_ref,:quest_ref,:cycle_ref,:question_ref,"
+                        "'reasoning',:epoch,'active',:predecessor,NULL,:now,NULL)"
+                    ),
+                    {
+                        "grant_ref": grant_ref,
+                        "quest_ref": quest_ref,
+                        "cycle_ref": row.cycle_ref,
+                        "question_ref": row.question_ref,
+                        "epoch": next_epoch,
+                        "predecessor": row.grant_ref,
+                        "now": now,
+                    },
+                )
+                advanced = connection.execute(
+                    text(
+                        "UPDATE ae_foreground_heads SET epoch=:epoch,updated_at=:now "
+                        "WHERE quest_ref=:quest_ref AND cycle_ref=:cycle_ref AND "
+                        "stage='reasoning' AND epoch=:source_epoch AND "
+                        "status='active' AND pending_operation_ref IS NULL"
+                    ),
+                    {
+                        "epoch": next_epoch,
+                        "now": now,
+                        "quest_ref": quest_ref,
+                        "cycle_ref": row.cycle_ref,
+                        "source_epoch": int(row.epoch),
+                    },
+                )
+                if advanced.rowcount != 1:
+                    raise OwnerConflict("goal_reasoning_reassessment_unavailable")
+                _record_ae_command(
+                    connection,
+                    idempotency_key,
+                    command_kind,
+                    command_hash,
+                    grant_ref,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE advancement_engine_state SET revision=revision+1 "
+                        "WHERE singleton='owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "advancement_engine.goal_reasoning_reassessment_admitted",
+                    {
+                        "quest_ref": quest_ref,
+                        "cycle_ref": row.cycle_ref,
+                        "source_epoch": int(row.epoch),
+                        "epoch": next_epoch,
+                        "goal_revision_ref": goal_revision_ref,
+                        "grant_ref": grant_ref,
+                    },
+                )
+                result_ref = grant_ref
+        return self._goal_reasoning_reassessment_result(
+            result_ref,
+            goal_revision_ref=goal_revision_ref,
+            replayed=False,
+        )
+
+    def _goal_reasoning_reassessment_result(
+        self, grant_ref: str, *, goal_revision_ref: str, replayed: bool
+    ) -> dict[str, object]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT g.*,p.epoch AS source_epoch FROM ae_foreground_grants "
+                    "g JOIN ae_foreground_grants p ON p.grant_ref="
+                    "g.predecessor_grant_ref WHERE g.grant_ref=:grant_ref AND "
+                    "g.stage='reasoning'"
+                ),
+                {"grant_ref": grant_ref},
+            ).first()
+        if row is None or int(row.epoch) != int(row.source_epoch) + 1:
+            raise OwnerConflict("goal_reasoning_reassessment_invalid")
+        return {
+            "status": "accepted",
+            "quest_ref": row.quest_ref,
+            "cycle_ref": row.cycle_ref,
+            "source_epoch": int(row.source_epoch),
+            "epoch": int(row.epoch),
+            "goal_revision_ref": goal_revision_ref,
+            "grant_ref": row.grant_ref,
+            "replayed": replayed,
+        }
 
     def _ensure_reasoning_route_closure(
         self,

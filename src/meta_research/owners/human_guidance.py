@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from sqlalchemy import text
 
@@ -13,6 +14,8 @@ from meta_research.owners.common import (
     OwnerConflict, canonical_hash, canonical_json, decoded_object, new_ref,
 )
 from meta_research.owners.human_collaboration_ladder import guidance_binding_from_row
+from meta_research.quest_goal import ResearchRoot
+from meta_research.runtime_conditions import read_runtime_conditions
 
 
 class HumanGuidanceMixin:
@@ -42,12 +45,16 @@ class HumanGuidanceMixin:
         self, operation: StageGuidanceOperation | TargetGuidanceOperation,
     ) -> FrozenGuidanceCut:
         identity = operation.identity
+        verifier = (
+            self._agent_runtime.verify_stage_guidance_operation
+            if isinstance(operation, StageGuidanceOperation)
+            else self._agent_runtime.verify_target_guidance_preparation
+        )
+        prepared_work = verifier(operation)
+        read_runtime_conditions(
+            Path(self._database.path).parent, prepared_work.quest_ref
+        )
         with self._database.fenced_write() as connection:
-            verifier = (
-                self._agent_runtime.verify_stage_guidance_operation
-                if isinstance(operation, StageGuidanceOperation)
-                else self._agent_runtime.verify_target_guidance_preparation
-            )
             work = verifier(operation)
             row = connection.execute(text(
                 "SELECT * FROM hc_guidance_snapshots WHERE root_kind=:root_kind "
@@ -58,6 +65,20 @@ class HumanGuidanceMixin:
                 if cut.binding.quest_ref != work.quest_ref:
                     raise OwnerConflict("guidance_snapshot_unbound")
                 return cut
+            author = ResearchRoot(
+                kind=operation.scope.root_kind,
+                run_ref=operation.scope.run_ref,
+                attempt_ref=operation.scope.attempt_ref,
+                root_session_ref=operation.scope.root_session_ref,
+                fence_ref=operation.scope.fence_ref,
+                runtime_binding_hash=operation.scope.runtime_binding_hash,
+                operation_ref=identity.operation_ref,
+            )
+            direction_cut = self._research_graph.freeze_quest_direction(
+                connection=connection,
+                quest_ref=work.quest_ref,
+                author=author,
+            )
             rows = connection.execute(text(
                 "SELECT * FROM hc_soft_constraints WHERE scope_ref=:scope_ref "
                 "AND status='active' ORDER BY constraint_ref, revision"
@@ -87,6 +108,7 @@ class HumanGuidanceMixin:
                     if isinstance(operation, StageGuidanceOperation)
                     else {"generation": operation.generation, "resume": operation.resume}),
                 "deliveries": [item.as_dict() for item in deliveries],
+                "direction_cut": direction_cut,
             }
             snapshot_hash = canonical_hash(payload)
             now = time.time()
@@ -116,7 +138,16 @@ class HumanGuidanceMixin:
             })
             return FrozenGuidanceCut(FrozenGuidanceBinding(
                 identity, work.quest_ref, snapshot_ref, snapshot_hash,
-            ), work.provenance_ref, tuple(deliveries))
+            ), work.provenance_ref, tuple(deliveries), direction_cut)
+
+    def authorize_quest_goal_operation(
+        self, *, scope: GuidanceRuntimeScope, binding: FrozenGuidanceBinding,
+        reconcile: bool = False,
+    ) -> FrozenGuidanceCut:
+        cut = self._authorize_guidance(scope, binding, reconcile=reconcile)
+        if cut.direction_cut is None:
+            raise OwnerConflict("goal_direction_cut_missing")
+        return cut
 
     def recover_operation_guidance(
         self, identity: GuidanceOperationIdentity,
@@ -302,12 +333,15 @@ def _cut(row) -> FrozenGuidanceCut:
     if (canonical_hash(payload) != row.snapshot_hash
             or payload["identity"] != vars(identity) or payload["quest_ref"] != row.quest_ref):
         raise OwnerConflict("guidance_snapshot_invalid")
+    direction_cut = payload.get("direction_cut")
+    if direction_cut is not None and not isinstance(direction_cut, dict):
+        raise OwnerConflict("guidance_snapshot_invalid")
     return FrozenGuidanceCut(FrozenGuidanceBinding(
         identity, row.quest_ref, row.snapshot_ref, row.snapshot_hash,
     ), payload["provenance_ref"], tuple(FrozenGuidanceDelivery(
         item["delivery_ref"], canonical_json(item["guide"]), item["needs_treatment"],
         None if item["prior_treatment"] is None else canonical_json(item["prior_treatment"]),
-    ) for item in payload["deliveries"]))
+    ) for item in payload["deliveries"]), direction_cut)
 
 
 def _delivery(cut, delivery_ref):

@@ -44,6 +44,7 @@ from meta_research.bundle_protocol import (
     CodeReviewScope,
     ContentBindingProof,
     FormalPlan,
+    GoalWorkDisposition,
     MonitorObservation,
     ReceiptProof,
     SemanticBarrier,
@@ -82,6 +83,7 @@ from meta_research.target_run_contract import (
     validate_target_frontier_entry,
     validate_target_run_activation_scope,
     validate_target_run_handoff_notice,
+    validate_goal_work_nonstart_notice,
     validate_technical_blocker_recovery,
 )
 from meta_research.control_contract import (
@@ -186,6 +188,10 @@ from meta_research.owners.common import (
     canonical_json,
     decoded_object,
     new_ref,
+)
+from meta_research.owners.quest_goals import (
+    query_goal_revision_in_transaction,
+    verify_goal_revision_ancestry_in_transaction,
 )
 from meta_research.owners.secret_detection import contains_secret
 from meta_research.owners.human_requests import (
@@ -3127,6 +3133,20 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     if frontier_row is None:
                         raise OwnerConflict("target_run_activation_integrity_invalid")
                     return _target_frontier_from_row(frontier_row, request)
+                admission_block = connection.execute(
+                    text(
+                        "SELECT intent_ref,target_run_ref FROM "
+                        "ar_target_goal_admission_blocks WHERE target_ref=:target_ref"
+                    ),
+                    {"target_ref": target_ref},
+                ).first()
+                if admission_block is not None:
+                    if admission_block.target_run_ref != launch.target_run_ref:
+                        raise OwnerConflict("target_run_admission_block_invalid")
+                    raise OwnerConflict(
+                        "target_run_admission_blocked",
+                        {"goal_intent_ref": admission_block.intent_ref},
+                    )
                 duplicate = connection.execute(
                     text(
                         "SELECT activation_ref FROM ar_target_run_activations "
@@ -4712,6 +4732,108 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             )
         return handoff
 
+    def publish_target_root_cancellation(
+        self,
+        *,
+        target_ref: str,
+    ) -> TargetWorkNotice:
+        """Publish one goal-directed, acknowledged cancellation as non-scientific work."""
+
+        if type(target_ref) is not str or not target_ref or len(target_ref) > 96:
+            raise OwnerConflict("target_root_cancel_invalid")
+        with self._database.read() as connection:
+            lifecycle = connection.execute(
+                text(
+                    "SELECT cancel_ref,cancel_goal_intent_ref FROM "
+                    "ar_target_root_lifecycles WHERE target_ref=:target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            if (
+                lifecycle is None
+                or lifecycle.cancel_ref is None
+                or lifecycle.cancel_goal_intent_ref is None
+            ):
+                raise OwnerConflict("target_root_cancel_not_requested")
+            terminal = _goal_work_disposition_from_intent(
+                connection,
+                intent_ref=lifecycle.cancel_goal_intent_ref,
+                disposition="cancelled",
+                terminal_fact_ref=lifecycle.cancel_ref,
+                require_current=False,
+            )
+        reader = self._target_root_completion_reader
+        history = None if reader is None else reader.query_handle_history(target_ref)
+        handles = getattr(history, "handle_history", None)
+        blockers = getattr(history, "recovered_blockers", None)
+        recovery_refs = getattr(history, "recovery_evidence_refs", None)
+        if (
+            type(handles) is not tuple
+            or not handles
+            or any(type(item) is not TargetWorkHandle for item in handles)
+            or type(blockers) is not tuple
+            or any(type(item) is not TechnicalBlocker for item in blockers)
+            or type(recovery_refs) is not tuple
+            or any(type(item) is not str for item in recovery_refs)
+        ):
+            raise OwnerConflict("target_root_cancel_integrity_invalid")
+        handoff = TargetRunHandoff(
+            handle_history=handles,
+            code_review_preflights=(),
+            stop_decisions=(),
+            recovered_blockers=blockers,
+            recovery_evidence_refs=recovery_refs,
+            terminal=terminal,
+        )
+        return self.publish_target_run_handoff(
+            handoff,
+            idempotency_key="target-goal-cancellation:"
+            + canonical_hash(
+                {
+                    "target_ref": target_ref,
+                    "cancel_ref": terminal.terminal_fact_ref,
+                    "intent_ref": terminal.goal_work_intent_ref,
+                }
+            ),
+        )
+
+    def publish_target_not_started(
+        self,
+        *,
+        intent_ref: str,
+    ) -> TargetWorkNotice:
+        """Publish one current goal decision that keeps an admitted launch unstarted."""
+
+        if type(intent_ref) is not str or not intent_ref or len(intent_ref) > 96:
+            raise OwnerConflict("goal_work_intent_invalid")
+        with self._database.read() as connection:
+            terminal = _goal_work_disposition_from_intent(
+                connection,
+                intent_ref=intent_ref,
+                disposition="not_started",
+                terminal_fact_ref=intent_ref,
+                require_current=True,
+            )
+        handoff = TargetRunHandoff(
+            handle_history=(),
+            code_review_preflights=(),
+            stop_decisions=(),
+            recovered_blockers=(),
+            recovery_evidence_refs=(),
+            terminal=terminal,
+        )
+        return self.publish_target_run_handoff(
+            handoff,
+            idempotency_key="target-goal-nonstart:"
+            + canonical_hash(
+                {
+                    "target_ref": terminal.target_ref,
+                    "target_run_ref": terminal.target_run_ref,
+                    "intent_ref": terminal.goal_work_intent_ref,
+                }
+            ),
+        )
+
     def publish_target_run_handoff(
         self,
         handoff: TargetRunHandoff,
@@ -4723,10 +4845,30 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
         _validate_stage_idempotency_key(idempotency_key)
         try:
             validate_target_run_handoff(handoff)
-            target_ref = handoff.handle_history[-1].target_ref
+            target_ref = (
+                handoff.terminal.target_ref
+                if type(handoff.terminal) is GoalWorkDisposition
+                else handoff.handle_history[-1].target_ref
+            )
         except (BundleProtocolError, IndexError, TypeError, ValueError) as error:
             raise OwnerConflict("target_run_handoff_invalid") from error
         root_completion = _is_target_root_completion_terminal(handoff.terminal)
+        goal_disposition = type(handoff.terminal) is GoalWorkDisposition
+        verified_goal_history = None
+        if goal_disposition and handoff.terminal.disposition == "cancelled":
+            reader = self._target_root_completion_reader
+            if reader is None:
+                raise OwnerConflict("target_root_handle_history_authority_unavailable")
+            try:
+                verified_goal_history = reader.query_handle_history(target_ref)
+            except Exception as error:
+                raise OwnerConflict(
+                    "target_root_cancel_publication_authority_invalid"
+                ) from error
+            if verified_goal_history is None:
+                raise OwnerConflict(
+                    "target_root_cancel_publication_authority_invalid"
+                )
         terminal_blocker_verified = False
         if type(handoff.terminal) is TechnicalBlocker:
             verifier = self._target_run_harness_verifier
@@ -4791,7 +4933,145 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         handoff=persisted_handoff,
                     )
                     return _target_notice_from_row(replay)
-                if root_completion:
+                if goal_disposition:
+                    terminal = cast(GoalWorkDisposition, handoff.terminal)
+                    verified_terminal = _goal_work_disposition_from_intent(
+                        connection,
+                        intent_ref=terminal.goal_work_intent_ref,
+                        disposition=terminal.disposition,
+                        terminal_fact_ref=terminal.terminal_fact_ref,
+                        require_current=terminal.disposition == "not_started",
+                    )
+                    if verified_terminal != terminal:
+                        raise OwnerConflict(
+                            "goal_work_disposition_authority_invalid"
+                        )
+                    launch = connection.execute(
+                        text(
+                            "SELECT * FROM ar_target_launches WHERE "
+                            "target_ref=:target_ref"
+                        ),
+                        {"target_ref": target_ref},
+                    ).first()
+                    if launch is None or launch.target_run_ref != terminal.target_run_ref:
+                        raise OwnerConflict("target_run_launch_not_admitted")
+                    request = _target_launch_request_from_row(launch)
+                    _target_launch_ack(launch, request)
+                    if terminal.disposition == "cancelled":
+                        lifecycle = connection.execute(
+                            text(
+                                "SELECT * FROM ar_target_root_lifecycles WHERE "
+                                "target_ref=:target_ref"
+                            ),
+                            {"target_ref": target_ref},
+                        ).first()
+                        frontier, request = _target_frontier_and_request_for_local_write(
+                            connection,
+                            target_ref,
+                        )
+                        handles = getattr(
+                            verified_goal_history, "handle_history", None
+                        )
+                        blockers = getattr(
+                            verified_goal_history, "recovered_blockers", None
+                        )
+                        recovery_refs = getattr(
+                            verified_goal_history, "recovery_evidence_refs", None
+                        )
+                        if (
+                            lifecycle is None
+                            or lifecycle.status != "running"
+                            or lifecycle.completion_ref is not None
+                            or lifecycle.cancel_ref != terminal.terminal_fact_ref
+                            or lifecycle.cancel_goal_intent_ref
+                            != terminal.goal_work_intent_ref
+                            or type(handles) is not tuple
+                            or not handles
+                            or type(blockers) is not tuple
+                            or type(recovery_refs) is not tuple
+                            or handoff.handle_history != handles
+                            or handoff.recovered_blockers != blockers
+                            or handoff.recovery_evidence_refs != recovery_refs
+                            or handoff.code_review_preflights
+                            or handoff.stop_decisions
+                            or frontier.current_handle != handles[-1]
+                        ):
+                            raise OwnerConflict(
+                                "target_root_cancel_publication_authority_invalid"
+                            )
+                        context = SimpleNamespace(
+                            request=request,
+                            frontier=frontier,
+                            monitor=SimpleNamespace(snapshot_required=0),
+                            candidate=None,
+                            formal_plan=None,
+                            handles=handles,
+                            preflights=(),
+                            review_scopes=(),
+                            stop_decisions=(),
+                            recovered_blockers=blockers,
+                            recovery_evidence_refs=recovery_refs,
+                        )
+                    else:
+                        activated = connection.execute(
+                            text(
+                                "SELECT 1 FROM ar_target_run_activations WHERE "
+                                "target_ref=:target_ref"
+                            ),
+                            {"target_ref": target_ref},
+                        ).first()
+                        lifecycle = connection.execute(
+                            text(
+                                "SELECT 1 FROM ar_target_root_lifecycles WHERE "
+                                "target_ref=:target_ref"
+                            ),
+                            {"target_ref": target_ref},
+                        ).first()
+                        frontier = connection.execute(
+                            text(
+                                "SELECT 1 FROM ar_target_frontier_entries WHERE "
+                                "target_ref=:target_ref"
+                            ),
+                            {"target_ref": target_ref},
+                        ).first()
+                        existing_block = connection.execute(
+                            text(
+                                "SELECT * FROM ar_target_goal_admission_blocks "
+                                "WHERE target_ref=:target_ref"
+                            ),
+                            {"target_ref": target_ref},
+                        ).first()
+                        if (
+                            activated is not None
+                            or lifecycle is not None
+                            or frontier is not None
+                            or (
+                                existing_block is not None
+                                and (
+                                    existing_block.intent_ref
+                                    != terminal.goal_work_intent_ref
+                                    or existing_block.target_run_ref
+                                    != terminal.target_run_ref
+                                    or int(existing_block.state_revision) != 0
+                                )
+                            )
+                        ):
+                            raise OwnerConflict("goal_work_intent_obsolete")
+                        context = SimpleNamespace(
+                            request=request,
+                            frontier=None,
+                            monitor=SimpleNamespace(snapshot_required=0),
+                            candidate=None,
+                            formal_plan=None,
+                            handles=(),
+                            preflights=(),
+                            review_scopes=(),
+                            stop_decisions=(),
+                            recovered_blockers=(),
+                            recovery_evidence_refs=(),
+                            admission_block=existing_block,
+                        )
+                elif root_completion:
                     final_handle = handoff.handle_history[-1]
                     graph_verifier = self._target_graph_verifier
                     if graph_verifier is None:
@@ -4857,9 +5137,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         target_ref,
                         verifier=self._target_run_harness_verifier,
                     )
-                if context.frontier.state != "running":
+                if context.frontier is not None and context.frontier.state != "running":
                     raise OwnerConflict("target_run_terminal")
-                if (not root_completion) and bool(
+                if (not root_completion) and (not goal_disposition) and bool(
                     context.monitor.snapshot_required
                 ) and not (
                     terminal_blocker_verified
@@ -4931,7 +5211,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                             "target_run_handoff_target_commit_invalid"
                         )
                     measurement_transition_verified = True
-                if not root_completion:
+                if not root_completion and not goal_disposition:
                     _validate_persisted_target_terminal(
                         handoff,
                         candidate=context.candidate,
@@ -4991,15 +5271,35 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 transition_ref = new_ref("target_terminal_transition")
                 notice_ref = new_ref("target_work_notice")
                 handoff_json, handoff_hash = _bundle_record_storage(handoff)
-                final_handle = handoff.handle_history[-1]
+                final_handle = (
+                    None if not handoff.handle_history else handoff.handle_history[-1]
+                )
+                notice_target_ref = (
+                    terminal.target_ref if goal_disposition else final_handle.target_ref
+                )
+                notice_target_run_ref = (
+                    terminal.target_run_ref
+                    if goal_disposition
+                    else final_handle.target_run_ref
+                )
+                notice_attempt_ref = (
+                    terminal.execution_attempt_ref
+                    if goal_disposition
+                    else final_handle.execution_attempt_ref
+                )
+                notice_fence_ref = (
+                    terminal.execution_fence_ref
+                    if goal_disposition
+                    else final_handle.execution_fence_ref
+                )
                 payload = {
                     "notice_ref": notice_ref,
                     "terminal_transition_ref": transition_ref,
                     "kind": kind,
-                    "target_ref": final_handle.target_ref,
-                    "target_run_ref": final_handle.target_run_ref,
-                    "execution_attempt_ref": final_handle.execution_attempt_ref,
-                    "execution_fence_ref": final_handle.execution_fence_ref,
+                    "target_ref": notice_target_ref,
+                    "target_run_ref": notice_target_run_ref,
+                    "execution_attempt_ref": notice_attempt_ref,
+                    "execution_fence_ref": notice_fence_ref,
                     "terminal_fact_ref": terminal_fact_ref,
                     "handoff_manifest_ref": manifest_ref,
                     "handoff_manifest_sha256": handoff_hash,
@@ -5011,10 +5311,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     sequence=sequence,
                     terminal_transition_ref=transition_ref,
                     kind=kind,
-                    target_ref=final_handle.target_ref,
-                    target_run_ref=final_handle.target_run_ref,
-                    execution_attempt_ref=final_handle.execution_attempt_ref,
-                    execution_fence_ref=final_handle.execution_fence_ref,
+                    target_ref=notice_target_ref,
+                    target_run_ref=notice_target_run_ref,
+                    execution_attempt_ref=notice_attempt_ref,
+                    execution_fence_ref=notice_fence_ref,
                     terminal_fact_ref=terminal_fact_ref,
                     handoff_manifest_ref=manifest_ref,
                     handoff_manifest_sha256=handoff_hash,
@@ -5022,36 +5322,45 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     pending_obligation_refs=obligations,
                     payload_sha256=canonical_hash(payload),
                 )
-                terminal_frontier = replace(
-                    context.frontier,
-                    state_revision=context.frontier.state_revision + 1,
-                    state="terminal",
-                    terminal_fact_ref=terminal_fact_ref,
+                terminal_frontier = (
+                    None
+                    if context.frontier is None
+                    else replace(
+                        context.frontier,
+                        state_revision=context.frontier.state_revision + 1,
+                        state="terminal",
+                        terminal_fact_ref=terminal_fact_ref,
+                    )
                 )
                 try:
-                    validate_target_run_handoff_notice(
-                        handoff,
-                        notice,
-                        terminal_frontier,
-                        terminal_frontier,
-                        initial_handle=context.handles[0],
-                        target_spec_binding=context.request.target_spec_binding,
-                        target_spec_acceptance_receipt=(
-                            context.request.target_spec_acceptance_receipt
-                        ),
-                        expected_review_scopes=context.review_scopes,
-                        expected_initial_implementation_revision_ref=(
-                            handoff.terminal.implementation_revision_ref
-                            if root_completion
-                            else context.candidate.implementation_revision_ref
-                        ),
-                        expected_initial_code_changed=(
-                            False
-                            if root_completion
-                            else context.candidate.code_changed
-                        ),
-                        semantic_barrier_fact_ref=semantic_fact_ref,
-                    )
+                    if goal_disposition and terminal.disposition == "not_started":
+                        validate_goal_work_nonstart_notice(handoff, notice)
+                    else:
+                        validate_target_run_handoff_notice(
+                            handoff,
+                            notice,
+                            terminal_frontier,
+                            terminal_frontier,
+                            initial_handle=context.handles[0],
+                            target_spec_binding=context.request.target_spec_binding,
+                            target_spec_acceptance_receipt=(
+                                context.request.target_spec_acceptance_receipt
+                            ),
+                            expected_review_scopes=context.review_scopes,
+                            expected_initial_implementation_revision_ref=(
+                                handoff.terminal.implementation_revision_ref
+                                if root_completion
+                                else "goal-work-disposition"
+                                if goal_disposition
+                                else context.candidate.implementation_revision_ref
+                            ),
+                            expected_initial_code_changed=(
+                                False
+                                if root_completion or goal_disposition
+                                else context.candidate.code_changed
+                            ),
+                            semantic_barrier_fact_ref=semantic_fact_ref,
+                        )
                 except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
                     raise OwnerConflict("target_run_handoff_invalid") from error
 
@@ -5112,24 +5421,41 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "published_at": now,
                     },
                 )
-                frontier_update = connection.execute(
-                    text(
-                        "UPDATE ar_target_frontier_entries SET state_revision = "
-                        ":state_revision, state = 'terminal', terminal_fact_ref = "
-                        ":terminal_fact_ref, updated_at = :updated_at WHERE "
-                        "target_ref = :target_ref AND state = 'running' AND "
-                        "state_revision = :previous_revision"
-                    ),
-                    {
-                        "state_revision": terminal_frontier.state_revision,
-                        "previous_revision": context.frontier.state_revision,
-                        "terminal_fact_ref": terminal_fact_ref,
-                        "updated_at": now,
-                        "target_ref": target_ref,
-                    },
-                )
-                if frontier_update.rowcount != 1:
-                    raise OwnerConflict("target_run_handoff_stale")
+                if terminal_frontier is None:
+                    if context.admission_block is None:
+                        connection.execute(
+                            text(
+                                "INSERT INTO ar_target_goal_admission_blocks "
+                                "(target_ref,target_run_ref,intent_ref,state_revision,"
+                                "created_at) VALUES (:target_ref,:target_run_ref,"
+                                ":intent_ref,0,:created_at)"
+                            ),
+                            {
+                                "target_ref": target_ref,
+                                "target_run_ref": terminal.target_run_ref,
+                                "intent_ref": terminal.goal_work_intent_ref,
+                                "created_at": now,
+                            },
+                        )
+                else:
+                    frontier_update = connection.execute(
+                        text(
+                            "UPDATE ar_target_frontier_entries SET state_revision = "
+                            ":state_revision, state = 'terminal', terminal_fact_ref = "
+                            ":terminal_fact_ref, updated_at = :updated_at WHERE "
+                            "target_ref = :target_ref AND state = 'running' AND "
+                            "state_revision = :previous_revision"
+                        ),
+                        {
+                            "state_revision": terminal_frontier.state_revision,
+                            "previous_revision": context.frontier.state_revision,
+                            "terminal_fact_ref": terminal_fact_ref,
+                            "updated_at": now,
+                            "target_ref": target_ref,
+                        },
+                    )
+                    if frontier_update.rowcount != 1:
+                        raise OwnerConflict("target_run_handoff_stale")
                 if root_completion:
                     completion_ref = getattr(
                         verified_root.completion,
@@ -5160,6 +5486,34 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                             "target_ref": target_ref,
                             "completion_ref": completion_ref,
                             "target_commit_ref": terminal_fact_ref,
+                        },
+                    )
+                elif goal_disposition and terminal.disposition == "cancelled":
+                    lifecycle_update = connection.execute(
+                        text(
+                            "UPDATE ar_target_root_lifecycles SET status='cancelled',"
+                            "cancelled_at=:updated_at,updated_at=:updated_at WHERE "
+                            "target_ref=:target_ref AND status='running' AND "
+                            "completion_ref IS NULL AND cancel_ref=:cancel_ref AND "
+                            "cancel_goal_intent_ref=:intent_ref"
+                        ),
+                        {
+                            "updated_at": now,
+                            "target_ref": target_ref,
+                            "cancel_ref": terminal.terminal_fact_ref,
+                            "intent_ref": terminal.goal_work_intent_ref,
+                        },
+                    )
+                    if lifecycle_update.rowcount != 1:
+                        raise OwnerConflict("target_root_cancel_conflict")
+                    self._feed.record(
+                        connection,
+                        "agent_runtime.target_root_cancelled",
+                        {
+                            "target_ref": target_ref,
+                            "cancel_ref": terminal.terminal_fact_ref,
+                            "goal_intent_ref": terminal.goal_work_intent_ref,
+                            "handoff_manifest_ref": manifest_ref,
                         },
                     )
                 generation = int(inbox.generation) + (
@@ -5617,6 +5971,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
     ) -> None:
         """Reopen every terminal/history fact through its issuing authority."""
 
+        if type(handoff.terminal) is GoalWorkDisposition:
+            self._verify_goal_work_disposition_handoff_readback(
+                connection,
+                row=row,
+                handoff=handoff,
+            )
+            return
         if _is_target_root_completion_terminal(handoff.terminal):
             self._verify_target_root_completion_handoff_readback(
                 connection,
@@ -5747,6 +6108,137 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             != (kind, fact_ref, reason, obligations)
         ):
             raise OwnerConflict("target_run_handoff_integrity_invalid")
+
+    def _verify_goal_work_disposition_handoff_readback(
+        self,
+        connection,
+        *,
+        row,
+        handoff: TargetRunHandoff,
+    ) -> None:
+        terminal = cast(GoalWorkDisposition, handoff.terminal)
+        try:
+            verified = _goal_work_disposition_from_intent(
+                connection,
+                intent_ref=terminal.goal_work_intent_ref,
+                disposition=terminal.disposition,
+                terminal_fact_ref=terminal.terminal_fact_ref,
+                require_current=False,
+            )
+            notice_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_work_notices WHERE manifest_ref="
+                    ":manifest_ref"
+                ),
+                {"manifest_ref": row.manifest_ref},
+            ).first()
+            notice = (
+                None if notice_row is None else _target_notice_from_row(notice_row)
+            )
+            inbox_row = connection.execute(
+                text(
+                    "SELECT entries.run_ref,entries.sequence FROM "
+                    "ar_bundle_inbox_entries entries JOIN ar_target_launches launches "
+                    "ON launches.target_ref=:target_ref JOIN "
+                    "ar_bundle_dispatch_decisions decisions ON "
+                    "decisions.decision_ref=launches.dispatch_decision_ref AND "
+                    "decisions.run_ref=entries.run_ref WHERE "
+                    "entries.notice_ref=:notice_ref"
+                ),
+                {
+                    "target_ref": terminal.target_ref,
+                    "notice_ref": None if notice is None else notice.notice_ref,
+                },
+            ).first()
+            if (
+                verified != terminal
+                or row.target_ref != terminal.target_ref
+                or notice is None
+                or notice.handoff_manifest_ref != row.manifest_ref
+                or notice.handoff_manifest_sha256 != row.handoff_hash
+                or inbox_row is None
+            ):
+                raise OwnerConflict("goal_work_disposition_integrity_invalid")
+            if terminal.disposition == "not_started":
+                block = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_goal_admission_blocks WHERE "
+                        "target_ref=:target_ref"
+                    ),
+                    {"target_ref": terminal.target_ref},
+                ).first()
+                activation = connection.execute(
+                    text(
+                        "SELECT 1 FROM ar_target_run_activations WHERE "
+                        "target_ref=:target_ref"
+                    ),
+                    {"target_ref": terminal.target_ref},
+                ).first()
+                frontier = connection.execute(
+                    text(
+                        "SELECT 1 FROM ar_target_frontier_entries WHERE "
+                        "target_ref=:target_ref"
+                    ),
+                    {"target_ref": terminal.target_ref},
+                ).first()
+                if (
+                    block is None
+                    or block.intent_ref != terminal.goal_work_intent_ref
+                    or block.target_run_ref != terminal.target_run_ref
+                    or int(block.state_revision) != 0
+                    or activation is not None
+                    or frontier is not None
+                ):
+                    raise OwnerConflict("goal_work_disposition_integrity_invalid")
+                validate_goal_work_nonstart_notice(handoff, notice)
+                return
+
+            lifecycle = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_root_lifecycles WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": terminal.target_ref},
+            ).first()
+            frontier, request = _target_frontier_and_request_for_local_write(
+                connection,
+                terminal.target_ref,
+            )
+            reader = self._target_root_completion_reader
+            history = None if reader is None else reader.query_handle_history(
+                terminal.target_ref
+            )
+            handles = getattr(history, "handle_history", None)
+            blockers = getattr(history, "recovered_blockers", None)
+            recovery_refs = getattr(history, "recovery_evidence_refs", None)
+            if (
+                lifecycle is None
+                or lifecycle.status != "cancelled"
+                or lifecycle.cancel_ref != terminal.terminal_fact_ref
+                or lifecycle.cancel_goal_intent_ref != terminal.goal_work_intent_ref
+                or frontier.state != "terminal"
+                or frontier.terminal_fact_ref != terminal.terminal_fact_ref
+                or handoff.handle_history != handles
+                or handoff.recovered_blockers != blockers
+                or handoff.recovery_evidence_refs != recovery_refs
+            ):
+                raise OwnerConflict("goal_work_disposition_integrity_invalid")
+            validate_target_run_handoff_notice(
+                handoff,
+                notice,
+                frontier,
+                frontier,
+                initial_handle=handles[0],
+                target_spec_binding=request.target_spec_binding,
+                target_spec_acceptance_receipt=request.target_spec_acceptance_receipt,
+                expected_review_scopes=(),
+                expected_initial_implementation_revision_ref="goal-work-disposition",
+                expected_initial_code_changed=False,
+            )
+        except Exception as error:
+            if isinstance(error, OwnerConflict) and error.code == "goal_work_disposition_integrity_invalid":
+                raise
+            raise OwnerConflict("goal_work_disposition_integrity_invalid") from error
 
     def _verify_target_root_completion_handoff_readback(
         self,
@@ -29030,6 +29522,213 @@ def _bundle_record_storage(value: object) -> tuple[str, str]:
     return document, digest
 
 
+def _compact_goal_disposition_reason(disposition: str, reason: str) -> str:
+    prefix = (
+        "Goal revision cancelled admitted Target work: "
+        if disposition == "cancelled"
+        else "Goal revision kept admitted Target work unstarted: "
+    )
+    compact = " ".join(reason.split())
+    value = prefix + compact
+    encoded = value.encode("utf-8")
+    if len(encoded) <= 2048:
+        return value
+    return encoded[:2045].decode("utf-8", errors="ignore").rstrip() + "…"
+
+
+def _goal_work_disposition_from_intent(
+    connection,
+    *,
+    intent_ref: str,
+    disposition: str,
+    terminal_fact_ref: str,
+    require_current: bool,
+) -> GoalWorkDisposition:
+    """Re-enter RG's immutable goal intent and derive framework custody facts."""
+
+    expected_kind = "stop" if disposition == "cancelled" else "do_not_start"
+    row = connection.execute(
+        text(
+            "SELECT i.*,r.quest_ref,h.current_revision_ref FROM "
+            "rg_goal_work_intents i JOIN rg_quest_goal_revisions r ON "
+            "r.revision_ref=i.revision_ref JOIN rg_quest_goal_heads h ON "
+            "h.quest_ref=r.quest_ref WHERE i.intent_ref=:intent_ref"
+        ),
+        {"intent_ref": intent_ref},
+    ).first()
+    if (
+        row is None
+        or row.decision_kind != expected_kind
+        or (require_current and row.revision_ref != row.current_revision_ref)
+    ):
+        raise OwnerConflict("goal_work_intent_obsolete")
+    try:
+        decision = decoded_object(row.decision_json)
+        stored_work = decoded_object(row.work_json)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("goal_work_intent_invalid") from error
+    if (
+        not isinstance(decision, dict)
+        or not isinstance(stored_work, dict)
+        or canonical_hash(decision) != row.decision_hash
+        or canonical_hash(stored_work) != row.work_hash
+        or decision.get("kind") != expected_kind
+        or decision.get("work") != stored_work
+        or stored_work.get("work_ref") != row.work_ref
+        or stored_work.get("kind") != "target"
+        or not isinstance(stored_work.get("target_ref"), str)
+        or not stored_work["target_ref"]
+        or not isinstance(stored_work.get("run_ref"), str)
+        or not stored_work["run_ref"]
+        or not isinstance(decision.get("reason"), str)
+        or not decision["reason"].strip()
+    ):
+        raise OwnerConflict("goal_work_intent_invalid")
+    goal = query_goal_revision_in_transaction(
+        connection,
+        quest_ref=row.quest_ref,
+        revision_ref=row.revision_ref,
+    )
+    if goal is None:
+        raise OwnerConflict("quest_goal_revision_invalid")
+    verify_goal_revision_ancestry_in_transaction(connection, goal)
+    receipt = goal.get("receipt")
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("status") != "accepted"
+        or receipt.get("issuer") != "research_graph"
+        or receipt.get("kind") != "quest_goal_evolution_accepted"
+        or receipt.get("subject_ref") != row.revision_ref
+        or not isinstance(receipt.get("receipt_ref"), str)
+        or not isinstance(receipt.get("payload_hash"), str)
+        or len(receipt["payload_hash"]) != 64
+    ):
+        raise OwnerConflict("quest_goal_revision_invalid")
+
+    target_ref = stored_work["target_ref"]
+    target_run_ref = stored_work["run_ref"]
+    attempt_ref: str | None = None
+    fence_ref: str | None = None
+    retention_kind: str | None = None
+    custody_refs: set[str] = set()
+    if disposition == "cancelled":
+        lifecycle = connection.execute(
+            text(
+                "SELECT * FROM ar_target_root_lifecycles WHERE "
+                "target_ref=:target_ref"
+            ),
+            {"target_ref": target_ref},
+        ).first()
+        if (
+            lifecycle is None
+            or lifecycle.target_run_ref != target_run_ref
+            or lifecycle.target_attempt_ref != stored_work.get("attempt_ref")
+            or lifecycle.cancel_ref != terminal_fact_ref
+            or lifecycle.cancel_goal_intent_ref != intent_ref
+        ):
+            raise OwnerConflict("goal_work_intent_obsolete")
+        attempt_ref = lifecycle.target_attempt_ref
+        fence_ref = lifecycle.target_fence_ref
+        retention = decision.get("retention")
+        if not isinstance(retention, dict):
+            raise OwnerConflict("goal_retention_invalid")
+        retention_kind = retention.get("kind")
+        if retention_kind in {"pending", "inspected_none"}:
+            workspace_ref = retention.get("workspace_ref")
+            if (
+                not isinstance(workspace_ref, str)
+                or not workspace_ref
+                or workspace_ref != stored_work.get("workspace_ref")
+            ):
+                raise OwnerConflict("goal_retention_workspace_invalid")
+            custody_refs.add(workspace_ref)
+        elif retention_kind == "selected":
+            assets = retention.get("assets")
+            if not isinstance(assets, list) or not assets:
+                raise OwnerConflict("goal_retention_invalid")
+            for asset in assets:
+                if not isinstance(asset, dict) or not isinstance(asset.get("receipt"), dict):
+                    raise OwnerConflict("goal_retained_asset_invalid")
+                roles = connection.execute(
+                    text(
+                        "SELECT * FROM rg_asset_roles WHERE quest_ref=:quest_ref "
+                        "AND version_ref=:version_ref AND asset_ref=:asset_ref "
+                        "ORDER BY role_ref"
+                    ),
+                    {
+                        "quest_ref": row.quest_ref,
+                        "version_ref": asset.get("version_ref"),
+                        "asset_ref": asset.get("asset_ref"),
+                    },
+                ).all()
+                valid_roles = []
+                for role in roles:
+                    bindings = {
+                        "version_ref": role.version_ref,
+                        "asset_ref": role.asset_ref,
+                        "asset_hash": role.asset_hash,
+                        "manifest_hash": role.manifest_hash,
+                        "asset_receipt_kind": role.asset_receipt_kind,
+                        "asset_receipt_ref": role.asset_receipt_ref,
+                        "asset_receipt_hash": role.asset_receipt_hash,
+                        "role": role.role,
+                        "quest_ref": role.quest_ref,
+                    }
+                    expected_role_hash = canonical_hash(
+                        {
+                            "schema_ref": "meta-research/owner-acceptance-receipt/v1",
+                            "issuer": "research_graph",
+                            "kind": "asset_role_acceptance",
+                            "subject_ref": role.role_ref,
+                            "bindings": bindings,
+                        }
+                    )
+                    if (
+                        role.asset_hash == asset.get("content_hash")
+                        and role.manifest_hash == asset.get("manifest_hash")
+                        and role.asset_receipt_ref == asset["receipt"].get("receipt_ref")
+                        and role.asset_receipt_hash == asset["receipt"].get("payload_hash")
+                        and role.receipt_hash == expected_role_hash
+                    ):
+                        valid_roles.append(role)
+                if not valid_roles:
+                    raise OwnerConflict("goal_retained_asset_invalid")
+                custody_refs.update(
+                    {
+                        asset["asset_ref"],
+                        asset["version_ref"],
+                        asset["receipt"]["receipt_ref"],
+                    }
+                )
+                for role in valid_roles:
+                    custody_refs.update({role.role_ref, role.receipt_ref})
+        else:
+            raise OwnerConflict("goal_retention_invalid")
+    elif (
+        stored_work.get("state") != "queued"
+        or stored_work.get("attempt_ref") is not None
+        or stored_work.get("lifecycle_generation") is not None
+        or stored_work.get("state_revision") != 0
+    ):
+        raise OwnerConflict("goal_work_intent_obsolete")
+
+    return GoalWorkDisposition(
+        disposition=disposition,
+        target_ref=target_ref,
+        target_run_ref=target_run_ref,
+        execution_attempt_ref=attempt_ref,
+        execution_fence_ref=fence_ref,
+        terminal_fact_ref=terminal_fact_ref,
+        goal_work_intent_ref=intent_ref,
+        goal_revision_ref=row.revision_ref,
+        goal_revision_receipt_ref=receipt["receipt_ref"],
+        goal_revision_receipt_hash=receipt["payload_hash"],
+        reason=_compact_goal_disposition_reason(disposition, decision["reason"]),
+        retention_kind=retention_kind,
+        custody_refs=tuple(sorted(custody_refs)),
+    )
+
+
 def _decode_bundle_value(value: object, annotation: object) -> object:
     if annotation is Any:
         return value
@@ -29136,14 +29835,14 @@ def _stored_owner_record(
 @dataclass(frozen=True)
 class _BundleReportTargetEvidence:
     target_ref: str
-    frontier: TargetFrontierEntry
+    frontier: TargetFrontierEntry | None
     notice: TargetWorkNotice
     handoff_manifest_ref: str
     handoff_manifest_hash: str
     semantic_barrier_fact_ref: str | None
     handoff: TargetRunHandoff
-    candidate: TargetCandidate
-    formal_plan: FormalPlan
+    candidate: TargetCandidate | None
+    formal_plan: FormalPlan | None
 
 
 @dataclass(frozen=True)
@@ -29227,9 +29926,6 @@ def _bundle_report_target_evidence(
             ),
             {"target_ref": target_ref},
         ).first()
-        if frontier_row is None:
-            missing.append(target_ref)
-            continue
         notice_row = connection.execute(
             text(
                 "SELECT * FROM ar_target_work_notices WHERE target_ref = "
@@ -29248,6 +29944,9 @@ def _bundle_report_target_evidence(
                 {"manifest_ref": notice_row.manifest_ref},
             ).first()
         )
+        if frontier_row is None and notice_row is None:
+            missing.append(target_ref)
+            continue
         if notice_row is None or manifest_row is None:
             raise OwnerConflict("bundle_report_handoff_missing")
         notice = _target_notice_from_row(notice_row)
@@ -29257,6 +29956,79 @@ def _bundle_report_target_evidence(
             TargetRunHandoff,
             "bundle_report_handoff_invalid",
         )
+        goal_disposition = type(handoff.terminal) is GoalWorkDisposition
+        if goal_disposition and handoff.terminal.disposition == "not_started":
+            terminal = cast(GoalWorkDisposition, handoff.terminal)
+            verified_terminal = _goal_work_disposition_from_intent(
+                connection,
+                intent_ref=terminal.goal_work_intent_ref,
+                disposition="not_started",
+                terminal_fact_ref=terminal.terminal_fact_ref,
+                require_current=False,
+            )
+            launch = connection.execute(
+                text(
+                    "SELECT target_run_ref FROM ar_target_launches WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            block = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_goal_admission_blocks WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            activation = connection.execute(
+                text(
+                    "SELECT 1 FROM ar_target_run_activations WHERE "
+                    "target_ref=:target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            if (
+                frontier_row is not None
+                or verified_terminal != terminal
+                or launch is None
+                or launch.target_run_ref != terminal.target_run_ref
+                or block is None
+                or block.intent_ref != terminal.goal_work_intent_ref
+                or block.target_run_ref != terminal.target_run_ref
+                or int(block.state_revision) != 0
+                or activation is not None
+            ):
+                raise OwnerConflict("bundle_report_handoff_invalid")
+            try:
+                handoff_hash = validate_goal_work_nonstart_notice(handoff, notice)
+            except (
+                BundleProtocolError,
+                TargetRunContractError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise OwnerConflict("bundle_report_handoff_invalid") from error
+            if (
+                manifest_row.target_ref != target_ref
+                or notice.handoff_manifest_ref != manifest_row.manifest_ref
+                or notice.handoff_manifest_sha256 != manifest_row.handoff_hash
+                or handoff_hash != manifest_row.handoff_hash
+            ):
+                raise OwnerConflict("bundle_report_handoff_invalid")
+            evidence.append(
+                _BundleReportTargetEvidence(
+                    target_ref=target_ref,
+                    frontier=None,
+                    notice=notice,
+                    handoff_manifest_ref=manifest_row.manifest_ref,
+                    handoff_manifest_hash=manifest_row.handoff_hash,
+                    semantic_barrier_fact_ref=manifest_row.semantic_barrier_fact_ref,
+                    handoff=handoff,
+                    candidate=None,
+                    formal_plan=None,
+                )
+            )
+            continue
         root_completion = _is_target_root_completion_terminal(handoff.terminal)
         if root_completion:
             final_handle = handoff.handle_history[-1]
@@ -29334,6 +30106,80 @@ def _bundle_report_target_evidence(
                 recovered_blockers=verified_root.recovered_blockers,
                 recovery_evidence_refs=verified_root.recovery_evidence_refs,
             )
+        elif goal_disposition:
+            terminal = cast(GoalWorkDisposition, handoff.terminal)
+            verified_terminal = _goal_work_disposition_from_intent(
+                connection,
+                intent_ref=terminal.goal_work_intent_ref,
+                disposition="cancelled",
+                terminal_fact_ref=terminal.terminal_fact_ref,
+                require_current=False,
+            )
+            lifecycle_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_root_lifecycles WHERE target_ref="
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            if lifecycle_row is None:
+                raise OwnerConflict("bundle_report_handoff_invalid")
+            initial_handle = _stored_bundle_record(
+                lifecycle_row.initial_handle_json,
+                lifecycle_row.initial_handle_hash,
+                TargetWorkHandle,
+                "bundle_report_handoff_invalid",
+            )
+            candidate = _stored_bundle_record(
+                lifecycle_row.candidate_json,
+                lifecycle_row.candidate_hash,
+                TargetCandidate,
+                "bundle_report_handoff_invalid",
+            )
+            formal_plan = _stored_bundle_record(
+                lifecycle_row.formal_plan_json,
+                lifecycle_row.formal_plan_hash,
+                FormalPlan,
+                "bundle_report_handoff_invalid",
+            )
+            frontier, request = _target_frontier_and_request_for_local_write(
+                connection, target_ref
+            )
+            try:
+                history = (
+                    None
+                    if target_root_completion_reader is None
+                    else target_root_completion_reader.query_handle_history(target_ref)
+                )
+            except Exception as error:
+                raise OwnerConflict("bundle_report_handoff_invalid") from error
+            handles = getattr(history, "handle_history", None)
+            blockers = getattr(history, "recovered_blockers", None)
+            recovery_refs = getattr(history, "recovery_evidence_refs", None)
+            if (
+                verified_terminal != terminal
+                or lifecycle_row.status != "cancelled"
+                or lifecycle_row.cancel_ref != terminal.terminal_fact_ref
+                or lifecycle_row.cancel_goal_intent_ref
+                != terminal.goal_work_intent_ref
+                or type(handles) is not tuple
+                or not handles
+                or initial_handle != handles[0]
+                or handoff.handle_history != handles
+                or handoff.recovered_blockers != blockers
+                or handoff.recovery_evidence_refs != recovery_refs
+                or handoff.code_review_preflights
+                or handoff.stop_decisions
+            ):
+                raise OwnerConflict("bundle_report_handoff_invalid")
+            context = SimpleNamespace(
+                request=request,
+                frontier=frontier,
+                candidate=candidate,
+                formal_plan=formal_plan,
+                handles=handles,
+                review_scopes=(),
+            )
         else:
             context = _target_handoff_context(
                 connection,
@@ -29356,14 +30202,18 @@ def _bundle_report_target_evidence(
                 ),
                 expected_review_scopes=context.review_scopes,
                 expected_initial_implementation_revision_ref=(
-                    context.candidate.implementation_revision_ref
+                    "goal-work-disposition"
+                    if goal_disposition
+                    else context.candidate.implementation_revision_ref
                 ),
-                expected_initial_code_changed=context.candidate.code_changed,
+                expected_initial_code_changed=(
+                    False if goal_disposition else context.candidate.code_changed
+                ),
                 semantic_barrier_fact_ref=manifest_row.semantic_barrier_fact_ref,
             )
         except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
             raise OwnerConflict("bundle_report_handoff_invalid") from error
-        if not root_completion:
+        if not root_completion and not goal_disposition:
             _validate_persisted_target_terminal(
                 handoff,
                 candidate=context.candidate,
@@ -29599,6 +30449,7 @@ def _prepare_bundle_report_material_in_snapshot(
         accepted: dict[str, AcceptedMeasurementClosure] = {}
         blockers: dict[str, str] = {}
         semantic_barriers: dict[str, SemanticBarrier] = {}
+        goal_dispositions: dict[str, GoalWorkDisposition] = {}
         accepted_labels: set[str] = set()
         blocker_labels: set[str] = set()
         additional_receipt_refs: set[str] = {
@@ -29612,8 +30463,13 @@ def _prepare_bundle_report_material_in_snapshot(
             label = label_by_target.get(item.target_ref)
             if (
                 label is None
-                or item.candidate != typed_candidates[label]
-                or item.formal_plan != plan
+                or (
+                    type(item.handoff.terminal) is not GoalWorkDisposition
+                    and (
+                        item.candidate != typed_candidates[label]
+                        or item.formal_plan != plan
+                    )
+                )
             ):
                 raise OwnerConflict("bundle_report_handoff_contract_drift")
             terminal = item.handoff.terminal
@@ -29625,6 +30481,11 @@ def _prepare_bundle_report_material_in_snapshot(
                 blocker_labels.add(label)
             elif type(terminal) is SemanticBarrier:
                 semantic_barriers[item.target_ref] = terminal
+            elif type(terminal) is GoalWorkDisposition:
+                goal_dispositions[item.target_ref] = terminal
+                additional_receipt_refs.add(
+                    terminal.goal_revision_receipt_ref
+                )
             else:
                 raise OwnerConflict("bundle_report_handoff_invalid")
             additional_receipt_refs.update(_bundle_receipt_proof_refs(item))
@@ -29668,6 +30529,7 @@ def _prepare_bundle_report_material_in_snapshot(
                 or missing_target_refs
                 or blockers
                 or semantic_barriers
+                or goal_dispositions
             ):
                 raise OwnerConflict("bundle_report_realized_incomplete")
         elif disposition == "blocked":
@@ -29678,7 +30540,37 @@ def _prepare_bundle_report_material_in_snapshot(
                 raise OwnerConflict("bundle_report_blocked_incomplete")
             report_kwargs["blocker_refs"] = tuple(sorted(blockers.values()))
         elif disposition == "replan_required":
-            if replan_decision is not None and not blockers:
+            if goal_dispositions:
+                if missing_target_refs or blockers or semantic_barriers:
+                    raise OwnerConflict("bundle_report_replan_incomplete")
+                semantic_reasons = {
+                    terminal.reason for terminal in goal_dispositions.values()
+                }
+                evidence_refs = {
+                    value
+                    for terminal in goal_dispositions.values()
+                    for value in (
+                        terminal.terminal_fact_ref,
+                        terminal.goal_work_intent_ref,
+                        terminal.goal_revision_ref,
+                        *terminal.custody_refs,
+                    )
+                }
+                if replan_decision is not None:
+                    additional_receipt_refs.add(
+                        replan_decision.receipt.receipt_ref
+                    )
+                    semantic_reasons.add(replan_decision.rationale)
+                    evidence_refs.add(replan_decision.decision_ref)
+                report_kwargs.update(
+                    {
+                        "semantic_change_required": tuple(
+                            sorted(semantic_reasons)
+                        ),
+                        "evidence_refs": tuple(sorted(evidence_refs)),
+                    }
+                )
+            elif replan_decision is not None and not blockers:
                 additional_receipt_refs.add(replan_decision.receipt.receipt_ref)
                 report_kwargs.update({
                     "semantic_change_required": (replan_decision.rationale,),
@@ -31588,7 +32480,12 @@ def _validate_persisted_target_terminal(
 
 
 def _target_terminal_notice_values(
-    terminal: AcceptedMeasurementClosure | TechnicalBlocker | SemanticBarrier,
+    terminal: (
+        AcceptedMeasurementClosure
+        | TechnicalBlocker
+        | SemanticBarrier
+        | GoalWorkDisposition
+    ),
     *,
     semantic_barrier_fact_ref: str | None,
 ) -> tuple[str, str, str, tuple[str, ...]]:
@@ -31612,6 +32509,13 @@ def _target_terminal_notice_values(
             semantic_barrier_fact_ref,
             terminal.reason,
             tuple(item.disposition_ref for item in terminal.route_dispositions),
+        )
+    if type(terminal) is GoalWorkDisposition:
+        return (
+            "semantic_change_required",
+            terminal.terminal_fact_ref,
+            terminal.reason,
+            terminal.custody_refs,
         )
     raise OwnerConflict("target_run_handoff_terminal_invalid")
 

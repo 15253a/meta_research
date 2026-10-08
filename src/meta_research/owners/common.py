@@ -793,6 +793,10 @@ class ReasoningOutcomeDecisionVerifier(Protocol):
         self, binding: dict[str, object]
     ) -> None: ...
 
+    def verify_current_quest_goal_revision(
+        self, binding: dict[str, object]
+    ) -> None: ...
+
     def query_reasoning_research_context(
         self, *, quest_ref: str, question_ref: str
     ) -> dict[str, object] | None: ...
