@@ -150,6 +150,9 @@ class ProtectedCreation:
 
     def seal(self):
         try:
+            outcome = self.runtime.request_stop()
+            if not outcome["descendants_ended"] or outcome["status"] not in {"completed", "stopped"}:
+                raise OwnerConflict("protected_creation_unknown_outcome")
             identity = self.operation.seal()
             self._terminal = True
             return identity
@@ -166,3 +169,45 @@ class ProtectedCreation:
             self.owner._creation_channels.pop(hashlib.sha256(self._token.encode()).hexdigest(), None)
             self.owner._creation_gateway.revoke_channel(self._token)
             self._token = None
+
+
+class ProtectedCreationRunner:
+    runtime_conditions = (
+        "This actual creation runtime is Linux x86_64 in a private filesystem. "
+        "Native parent and delegated children, shell, HOME, caches and outputs share that boundary. "
+        "External originals are unreadable as host paths; use the granted bounded material discover/read/copy tools. "
+        "Only explicit /bin/node and Python3.12 standard-library light programs are supplied. "
+        "Tk GUI, third-party Python scientific packages and implicit Node process.execPath self-spawn are unsupported. "
+        "An unsupported command fails here; there is no host execution fallback. "
+        "Keep edits and output in this operation's declared work directory."
+    )
+
+    def __init__(self, work, *, read_only_inputs=(), environment=None):
+        self.work = work
+        self.read_only_inputs = tuple(read_only_inputs)
+        self.environment = dict(environment or {})
+
+    def run_job(self, job_ref, argv, prompt, timeout_seconds, environment=None):
+        from meta_research.idea_skill import IdeaSkillUnavailable
+        from meta_research.protected_creation_runtime import NativeCreationCall, ProtectedCreationError
+        if job_ref != self.work.operation.operation_ref:
+            raise IdeaSkillUnavailable("creation_operation_identity_invalid")
+        slots = {}
+        for option in ("--output-schema", "--output-last-message"):
+            if argv.count(option) != 1:
+                raise IdeaSkillUnavailable("creation_native_handoff_invalid")
+            index = argv.index(option)
+            if index + 1 == len(argv):
+                raise IdeaSkillUnavailable("creation_native_handoff_invalid")
+            slots[option] = Path(argv[index + 1])
+        try:
+            return self.work.run(NativeCreationCall(tuple(argv), prompt, timeout_seconds,
+                {**self.environment, **(environment or {})},
+                (*self.read_only_inputs, slots["--output-schema"]), (slots["--output-last-message"],)))
+        except ProtectedCreationError as error:
+            raise IdeaSkillUnavailable(error.code) from error
+
+    def cancel_job(self, job_ref):
+        if job_ref != self.work.operation.operation_ref:
+            return {"status": "not_running", "descendants_ended": False}
+        return self.work.request_stop()

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import sysconfig
 import threading
+from typing import Literal
 
 
 _UID = 65534
@@ -152,10 +153,18 @@ while True:
 class NativeCreationCall:
     argv: tuple[str, ...]
     prompt: str
-    timeout_seconds: float
+    timeout_seconds: float | None
     environment: dict[str, str]
     read_only_inputs: tuple[Path, ...]
     output_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeEntry:
+    kind: Literal["elf", "node_wrapper"]
+    native: Path
+    files: tuple[Path, ...]
+    link_target: str | None = None
 
 
 class ProtectedCreationError(RuntimeError):
@@ -175,6 +184,7 @@ class ProtectedCreationRuntime:
         self._process: subprocess.Popen[str] | None = None
         self._receipt: Path | None = None
         self._stop_before_launch = False
+        self._entry_command = "/bin/codex"
 
     def run(self, call: NativeCreationCall) -> subprocess.CompletedProcess[str]:
         self._check_call(call)
@@ -279,20 +289,26 @@ class ProtectedCreationRuntime:
     @staticmethod
     def _check_call(call: NativeCreationCall) -> None:
         if (not call.argv or any(not isinstance(value, str) or "\0" in value for value in call.argv)
-            or not isinstance(call.prompt, str) or not isinstance(call.timeout_seconds, (int, float))
-            or not math.isfinite(call.timeout_seconds)
-            or call.timeout_seconds <= 0 or any(not isinstance(key, str) or not isinstance(value, str)
+            or not isinstance(call.prompt, str) or (call.timeout_seconds is not None
+                and (not isinstance(call.timeout_seconds, (int, float))
+                    or not math.isfinite(call.timeout_seconds) or call.timeout_seconds <= 0))
+            or any(not isinstance(key, str) or not isinstance(value, str)
                 or not key or "=" in key or "\0" in key + value for key, value in call.environment.items())):
             raise ProtectedCreationError("protected_creation_call_invalid")
 
     def _prepare_runtime(self) -> None:
-        native = _native_executable(self.executable)
-        fingerprint = _runtime_digest(native)
+        entry = _runtime_entry(self.executable)
+        native = entry.native
+        self._entry_command = str(self.executable) if entry.kind == "node_wrapper" else "/bin/codex"
+        identity = {"kind": entry.kind, "configured_entry": str(self.executable),
+            "entry_command": self._entry_command, "link_target": entry.link_target,
+            "native_sha256": _runtime_digest(native),
+            "entry_files": {str(path): _runtime_digest(path) for path in entry.files}}
         marker = self._control / "runtime.json"
         if marker.exists():
             with _regular_reader(marker) as stream:
                 manifest = json.load(stream)
-            if manifest.get("executable_sha256") != fingerprint:
+            if manifest.get("entry") != identity:
                 raise ProtectedCreationError("protected_creation_runtime_changed")
             for relative, digest in manifest.get("files", {}).items():
                 path = self.jail_root / relative
@@ -328,6 +344,16 @@ class ProtectedCreationRuntime:
                         copy(library, self.jail_root / str(library).lstrip("/"))
 
         copy(native, self.jail_root / "bin/codex", dependencies=True)
+        if entry.kind == "node_wrapper":
+            for source in entry.files:
+                copy(source, self.jail_root / str(source).lstrip("/"))
+            for source in (native, native.parent / "codex-code-mode-host", native.parent.parent / "codex-path/rg"):
+                copy(source, self.jail_root / str(source).lstrip("/"), dependencies=True)
+            if entry.link_target is not None:
+                target = self.jail_root / str(self.executable).lstrip("/")
+                _directory(target.parent, 0o755)
+                target.symlink_to(entry.link_target)
+            copy(Path("/usr/bin/env"), self.jail_root / "usr/bin/env", dependencies=True)
         if native.name == "codex":
             for source, target in ((native.parent / "codex-code-mode-host", "bin/codex-code-mode-host"),
                 (native.parent.parent / "codex-path/rg", "bin/rg")):
@@ -380,10 +406,10 @@ class ProtectedCreationRuntime:
             destination = self.jail_root / "home/creation/.codex" / name
             _write_private(destination, content)
             os.chown(destination, _UID, _UID)
-        _write_private(marker, json.dumps({"executable_sha256": fingerprint, "files": staged}).encode())
+        _write_private(marker, json.dumps({"entry": identity, "files": staged}).encode())
 
     def _prepare_call(self, call: NativeCreationCall) -> tuple[list[str], dict[str, str], list[tuple[Path, Path]], str]:
-        mappings = {str(self.executable): "/bin/codex", str(self.work_directory): "/workspace"}
+        mappings = {str(self.executable): self._entry_command, str(self.work_directory): "/workspace"}
         with _parent_descriptor(self.jail_root / "inputs" / "slot") as directory:
             for name in os.listdir(directory):
                 details = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -420,9 +446,9 @@ class ProtectedCreationRuntime:
             outputs.append((source, destination))
             mappings[str(destination)] = mapped
         arguments = [_mapped(value, mappings, self.work_directory) for value in call.argv]
-        if arguments[0] not in {"/bin/codex", self.executable.name, "codex"}:
+        if arguments[0] not in {self._entry_command, self.executable.name, "codex"}:
             raise ProtectedCreationError("protected_creation_executable_mismatch")
-        arguments[0] = "/bin/codex"
+        arguments[0] = self._entry_command
         environment = {key: _mapped(value, mappings, self.work_directory) for key, value in call.environment.items()}
         environment.update({"HOME": "/home/creation", "USERPROFILE": "/home/creation",
             "CODEX_HOME": "/home/creation/.codex", "CODEX_SQLITE_HOME": "/home/creation/.codex",
@@ -588,15 +614,34 @@ def _receipt_value(path: Path) -> dict[str, object]:
     return {}
 
 
-def _native_executable(executable: Path) -> Path:
+def _runtime_entry(executable: Path) -> _RuntimeEntry:
     source = executable.resolve(strict=True)
     with _regular_reader(source) as stream:
         if stream.read(4) == b"\x7fELF":
-            return source
+            return _RuntimeEntry("elf", source, ())
     if source.name == "codex.js" and source.parent.name == "bin" and source.parent.parent.name == "codex":
-        native = source.parent.parent.parent / "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
+        package = source.parent.parent
+        platform_package = package.parent / "codex-linux-x64"
+        vendor = platform_package / "vendor/x86_64-unknown-linux-musl"
+        native = vendor / "bin/codex"
         if native.is_file():
-            return _native_executable(native)
+            with _regular_reader(native) as stream:
+                if stream.read(4) != b"\x7fELF":
+                    raise ProtectedCreationError("protected_creation_executable_unsupported")
+            files = [source, package / "package.json", platform_package / "package.json"]
+            if any(not path.is_file() for path in files):
+                raise ProtectedCreationError("protected_creation_dependency_unavailable")
+            if (vendor / "codex-package.json").is_file():
+                files.append(vendor / "codex-package.json")
+            link_target = None
+            if executable != source:
+                if not executable.is_symlink():
+                    raise ProtectedCreationError("protected_creation_executable_unsupported")
+                link_target = str(executable.readlink())
+                linked = Path(os.path.normpath(executable.parent / link_target))
+                if linked != source:
+                    raise ProtectedCreationError("protected_creation_executable_unsupported")
+            return _RuntimeEntry("node_wrapper", native, tuple(files), link_target)
     raise ProtectedCreationError("protected_creation_executable_unsupported")
 
 

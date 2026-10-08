@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -43,6 +44,87 @@ def _call(script: str, *, arguments=(), inputs=(), outputs=(), environment=None,
         read_only_inputs=tuple(inputs),
         output_paths=tuple(outputs),
     )
+
+
+@pytest.fixture(scope="module")
+def wrapper_runtime(runtime, tmp_path_factory):
+    root = tmp_path_factory.mktemp("managed-wrapper")
+    modules = root / "installation/node_modules"
+    package = modules / "@openai/codex"
+    platform_package = modules / "@openai/codex-linux-x64"
+    vendor = platform_package / "vendor/x86_64-unknown-linux-musl"
+    (package / "bin").mkdir(parents=True)
+    (vendor / "bin").mkdir(parents=True)
+    (vendor / "codex-path").mkdir()
+    (modules / ".bin").mkdir()
+    wrapper = package / "bin/codex.js"
+    wrapper.write_text('''#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const require = createRequire(import.meta.url);
+const platformPackage = require.resolve("@openai/codex-linux-x64/package.json");
+const binary = path.join(path.dirname(platformPackage), "vendor/x86_64-unknown-linux-musl/bin/codex");
+console.log(JSON.stringify({entry:process.argv[1],root,arguments:process.argv.slice(2),
+    interpreter:process.execPath,path:process.env.PATH,
+    package:JSON.parse(readFileSync(path.join(root,"package.json"))).name,
+    vendorVersion:JSON.parse(readFileSync(platformPackage)).version}));
+const child = spawnSync(binary, process.argv.slice(2), {stdio:"inherit",
+    env:{...process.env,CODEX_MANAGED_PACKAGE_ROOT:root,CODEX_MANAGED_BY_NPM:"1"}});
+process.exit(child.status ?? 125);
+''', encoding="utf-8")
+    wrapper.chmod(0o755)
+    (package / "package.json").write_text(json.dumps({"name": "@openai/codex", "type": "module",
+        "version": "test", "bin": {"codex": "bin/codex.js"}}), encoding="utf-8")
+    (platform_package / "package.json").write_text(json.dumps({"name": "@openai/codex", "version": "test-linux-x64"}), encoding="utf-8")
+    for relative in ("bin/codex", "bin/codex-code-mode-host", "codex-path/rg"):
+        target = vendor / relative
+        shutil.copyfile("/bin/bash", target)
+        target.chmod(0o755)
+    entry = modules / ".bin/codex"
+    entry.symlink_to("../@openai/codex/bin/codex.js")
+    (package / "not-runtime-source.txt").write_text("must stay outside", encoding="utf-8")
+    result = ProtectedCreationRuntime(root / "jail", entry, runtime.credentials_home)
+    yield result
+    assert result.request_stop()["descendants_ended"] is True
+
+
+def test_managed_entry_executes_exact_wrapper_with_metadata_and_arguments(wrapper_runtime):
+    entry = wrapper_runtime.executable
+    package = entry.resolve().parent.parent
+    command = 'printf "%s\\n" "$1" "$CODEX_MANAGED_PACKAGE_ROOT" "$CODEX_MANAGED_BY_NPM"; /bin/cat'
+    arguments = (str(entry), "-c", command, "creation", "value with spaces")
+    completed = wrapper_runtime.run(NativeCreationCall(arguments, "stdin preserved\n", 15.0, {}, (), ()))
+    assert completed.returncode == 0
+    metadata, forwarded = completed.stdout.split("\n", 1)
+    assert json.loads(metadata) == {
+        "entry": str(entry), "root": str(package), "arguments": list(arguments[1:]),
+        "interpreter": "/bin/codex", "path": "/bin:/python/bin",
+        "package": "@openai/codex", "vendorVersion": "test-linux-x64",
+    }
+    assert forwarded == f"value with spaces\n{package}\n1\nstdin preserved\n"
+    staged = wrapper_runtime.jail_root / str(entry.resolve()).lstrip("/")
+    staged_entry = wrapper_runtime.jail_root / str(entry).lstrip("/")
+    assert staged.read_bytes() == entry.resolve().read_bytes()
+    assert staged.stat().st_ino != entry.resolve().stat().st_ino
+    assert staged.stat().st_nlink == 1
+    assert staged.stat().st_mode & 0o222 == 0
+    assert staged_entry.readlink() == entry.readlink()
+    assert not (wrapper_runtime.jail_root / str(package / "not-runtime-source.txt").lstrip("/")).exists()
+
+
+def test_managed_entry_metadata_changes_do_not_reuse_stale_cache(wrapper_runtime):
+    package = wrapper_runtime.executable.resolve().parent.parent / "package.json"
+    before = package.read_bytes()
+    try:
+        package.write_text('{"type":"commonjs"}', encoding="utf-8")
+        with pytest.raises(ProtectedCreationError, match="protected_creation_runtime_changed"):
+            wrapper_runtime.run(NativeCreationCall((str(wrapper_runtime.executable), "--version"), "", 15.0, {}, (), ()))
+    finally:
+        package.write_bytes(before)
 
 
 def test_unsupported_platform_never_launches(monkeypatch, tmp_path):
@@ -272,6 +354,9 @@ time.sleep(60)
 
 
 def test_timeout_seals_native_tree_and_returns_actual_stdout(runtime):
+    completed = runtime.run(_call("print('no configured deadline')", timeout=None))
+    assert completed.returncode == 0
+    assert completed.stdout == "no configured deadline\n"
     with pytest.raises(subprocess.TimeoutExpired) as failure:
         runtime.run(_call("import time; print('started', flush=True); time.sleep(60)", timeout=0.4))
     assert failure.value.output == "started\n"

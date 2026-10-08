@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from meta_research.protected_creation_runtime import NativeCreationCall
+from meta_research.owners.common import OwnerConflict
 from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
 from meta_research.work_material_contract import CREATION_MATERIAL_OPERATION_IDS
 from meta_research.web import create_app
@@ -34,6 +35,8 @@ def test_requested_copy_is_independent_bounded_and_replay_preserves_edits(tmp_pa
             roots.configure_creation_runtime(executable="/bin/bash", credentials_home=tmp_path / "credentials")
             gateway = runtime.harnesses._gateway
             work = roots.protected_creation(binding, human.creation_material_snapshot(anchor), operation_ref="native-copy")
+            with pytest.raises(OwnerConflict, match="protected_creation_unknown_outcome"):
+                work.seal()
             assert _native(work, "echo ready").returncode == 0
             access = work.channel()
             mcp_headers = {"Authorization": "Bearer " + access.token, "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,

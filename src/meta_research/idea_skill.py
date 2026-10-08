@@ -1346,6 +1346,7 @@ class CodexIdeaSkillAdapter:
                     *_operation_workspace_fields(invocation),
                 *({"guidance_binding"} if "guidance_binding" in invocation else ()),
                 *({"external_mcp"} if "external_mcp" in invocation else ()),
+                *({"provider_execution_binding"} if "provider_execution_binding" in invocation else ()),
                 }
                 if (
                     set(invocation) != expected_fields
@@ -1620,6 +1621,7 @@ class CodexIdeaSkillAdapter:
                 *_operation_workspace_fields(invocation),
                 *({"guidance_binding"} if "guidance_binding" in invocation else ()),
                 *({"external_mcp"} if "external_mcp" in invocation else ()),
+                *({"provider_execution_binding"} if "provider_execution_binding" in invocation else ()),
                 *transport_limits.as_dict(),
             }
             if (
@@ -2078,6 +2080,8 @@ class CodexIdeaSkillAdapter:
         run_ref: str | None = None,
         workspace_binding: WorkspaceBinding | None = None,
         guidance_binding: FrozenGuidanceBinding | None = None,
+        invocation_runner: object | None = None,
+        provider_execution_binding: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
@@ -2161,10 +2165,12 @@ class CodexIdeaSkillAdapter:
                     run_ref=run_ref,
                     guidance_binding=guidance_binding,
                     external_mcp_access=external_mcp_access,
+                    invocation_runner=invocation_runner,
+                    provider_execution_binding=provider_execution_binding,
                 )
             else:
                 prompt = compose_runtime_prompt(
-                    prompt, render_runtime_conditions(self._workspace, run_ref=run_ref)
+                    prompt, (getattr(invocation_runner, "runtime_conditions", None) or render_runtime_conditions(self._workspace, run_ref=run_ref))
                 )
                 _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
                 pre_turn_diagnostics = self._root_capability_diagnostics(
@@ -2193,6 +2199,7 @@ class CodexIdeaSkillAdapter:
                         transport_limits=transport_limits,
                         workspace_binding=workspace_binding,
                         external_mcp_access=external_mcp_access,
+                        invocation_runner=invocation_runner,
                     )
                     result = (*invoked, pre_turn_diagnostics)
             self._record_root_operation_diagnostics(
@@ -2240,7 +2247,10 @@ class CodexIdeaSkillAdapter:
         workspace_binding: WorkspaceBinding | None = None,
         guidance_binding: FrozenGuidanceBinding | None = None,
         external_mcp_access: ExternalMcpAccess | None = None,
+        invocation_runner: object | None = None,
+        provider_execution_binding: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], str | None, str, dict[str, object]]:
+        runner = self._runner if invocation_runner is None else invocation_runner
         directory.mkdir(parents=True, exist_ok=True)
         invocation_path = directory / "invocation.json"
         if invocation_path.exists():
@@ -2258,7 +2268,7 @@ class CodexIdeaSkillAdapter:
             prompt = persisted_prompt
         else:
             prompt = compose_runtime_prompt(
-                prompt, render_runtime_conditions(self._workspace, run_ref=run_ref)
+                prompt, (getattr(invocation_runner, "runtime_conditions", None) or render_runtime_conditions(self._workspace, run_ref=run_ref))
             )
         _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
         capability_profile = root_capability_profile(self._root_agent_kind)
@@ -2284,13 +2294,14 @@ class CodexIdeaSkillAdapter:
             "root_capability_profile_hash": capability_profile.digest,
             "mcp_url": mcp_url,
             "mcp_scope_binding_hash": mcp_scope_binding_hash,
+            **({} if provider_execution_binding is None else {"provider_execution_binding": provider_execution_binding}),
             **({} if external_mcp_access is None else {"external_mcp": external_mcp_access.binding()}),
             **({} if guidance_binding is None else {"guidance_binding": guidance_binding.as_dict()}),
             **transport_limits.as_dict(),
         }
         current_transport_mode = (
             "durable_supervisor"
-            if callable(getattr(self._runner, "run_durable_job", None))
+            if callable(getattr(runner, "run_durable_job", None))
             else "unreconciled_runner"
         )
         invocation = {
@@ -2380,6 +2391,7 @@ class CodexIdeaSkillAdapter:
                 transport_limits=transport_limits,
                 workspace_binding=workspace_binding,
                 external_mcp_access=external_mcp_access,
+                invocation_runner=invocation_runner,
             )
         except IdeaSkillUnavailable as error:
             if error.code in _SEALED_TRANSPORT_CONTRACT_FAILURES:
@@ -2422,7 +2434,9 @@ class CodexIdeaSkillAdapter:
         sandbox_read_root: Path | None = None,
         workspace_binding: WorkspaceBinding | None = None,
         external_mcp_access: ExternalMcpAccess | None = None,
+        invocation_runner: object | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
+        runner = self._runner if invocation_runner is None else invocation_runner
         working_directory = workspace_binding.directory if workspace_binding else self._agent_workspace.resolve()
         mcp_values = (mcp_url, mcp_token, mcp_scope_binding_hash)
         if any(value is not None for value in mcp_values) and (
@@ -2529,20 +2543,20 @@ class CodexIdeaSkillAdapter:
                 environment = {**(environment or {}), **external_mcp_access.environment()}
             if job_ref is None:
                 completed = (
-                    self._runner(
+                    runner(
                         argv,
                         prompt,
                         self._timeout_seconds,
                         environment,
                     )
                     if environment is not None
-                    else self._runner(argv, prompt, self._timeout_seconds)
+                    else runner(argv, prompt, self._timeout_seconds)
                 )
             else:
-                run_job = getattr(self._runner, "run_job", None)
+                run_job = getattr(runner, "run_job", None)
                 if not callable(run_job):
                     raise IdeaSkillUnavailable("codex_job_control_unavailable")
-                durable_job = getattr(self._runner, "run_durable_job", None)
+                durable_job = getattr(runner, "run_durable_job", None)
                 supervised = False
                 if callable(durable_job) and stdout_path is not None:
                     if invocation_hash is None:
@@ -2605,7 +2619,7 @@ class CodexIdeaSkillAdapter:
                     ]
                     if environment is not None:
                         durable_arguments.append(environment)
-                    if isinstance(self._runner, _CancellableProcessRunner):
+                    if isinstance(runner, _CancellableProcessRunner):
                         completed = durable_job(
                             *durable_arguments,
                             stdout_max_bytes=transport_limits.stream_max_bytes,
