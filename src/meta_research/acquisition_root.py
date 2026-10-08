@@ -102,6 +102,9 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
     ) -> None:
         self._root.bind_resident_mcp_authority(authority)
 
+    def bind_external_mcp(self, runtime) -> None:
+        self._root.bind_external_mcp(runtime)
+
     @property
     def research_workspace_root(self) -> Path:
         return self._root.research_workspace_root

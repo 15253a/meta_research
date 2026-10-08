@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meta_research.external_mcp import ExternalMcpError, parse_connection, parse_services
+
 from meta_research.snapshot_queries import SnapshotQueryCoordinator
 
 import asyncio
@@ -1022,7 +1024,7 @@ def create_app(
             "/auth/launch",
         }
         internal_route = path.startswith("/internal/")
-        mcp_route = path == "/mcp"
+        mcp_route = path in {"/mcp", "/mcp/external"}
         issued_session: AuthSession | None = None
         session_was_valid = False
 
@@ -1351,6 +1353,46 @@ def create_app(
         )
         _set_session_cookie(response, session)
         return response
+
+    @app.get("/api/v1/external-mcp")
+    def get_external_mcp():
+        return runtime.external_mcp.read_config().as_dict()
+
+    @app.put("/api/v1/external-mcp")
+    async def put_external_mcp(request: Request):
+        try:
+            value = await request.json()
+            if not isinstance(value, dict) or set(value) != {"services", "expected_revision"} or not isinstance(value["expected_revision"], str):
+                raise ExternalMcpError("external_mcp_config_invalid")
+            services = parse_services(value["services"])
+            saved = await asyncio.to_thread(runtime.external_mcp.save_config, services=services, expected_revision=value["expected_revision"])
+            return saved.as_dict()
+        except (ExternalMcpError, ValueError) as error:
+            code = str(getattr(error, "code", "external_mcp_config_invalid"))
+            return _error(409 if code == "external_mcp_config_stale" else 422, code)
+
+    @app.post("/api/v1/external-mcp/test-connection")
+    async def test_external_mcp_connection(request: Request):
+        try:
+            value = await request.json()
+            if not isinstance(value, dict) or set(value) != {"connection"}:
+                raise ExternalMcpError("external_mcp_connection_invalid")
+            connection = parse_connection(value["connection"])
+        except (ExternalMcpError, ValueError) as error:
+            return _error(422, str(getattr(error, "code", "external_mcp_connection_invalid")))
+        return await asyncio.to_thread(runtime.external_mcp.test_connection, connection)
+
+    @app.post("/mcp/external")
+    async def external_mcp(request: Request) -> Response:
+        authorization = request.headers.get("authorization", "")
+        token = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else None
+        try:
+            message = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            message = None
+        status, payload, session_id = await asyncio.to_thread(runtime.external_mcp.dispatch_http, token, message)
+        headers = {"Mcp-Session-Id": session_id} if session_id else None
+        return Response(status_code=status, headers=headers) if payload is None else JSONResponse(payload, status_code=status, headers=headers)
 
     @app.post("/mcp")
     async def semantic_mcp(request: Request) -> Response:

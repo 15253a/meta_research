@@ -70,6 +70,7 @@ async function workspace(page: Page, text = "GPU：GPU-test-1，80 GiB\n时间�
         compute: { status: "ready", snapshot_ref: "compute-initial", devices }, resource_envelope: { host_snapshot_ref: "compute-initial", selected_device_uuids: devices.map(device => device.uuid), devices } });
     }
     if (url.pathname === "/api/v1/preferences") return json({ output_language: "zh" });
+    if (url.pathname === "/api/v1/external-mcp") return json({ revision: "external-empty", services: [], root_kinds: [] });
     if (url.pathname === "/api/v1/snapshot") return json(state.snapshot);
     if (url.pathname === "/api/v1/events") return route.fulfill({ contentType: "text/event-stream", body: "event: snapshot.required\ndata: {}\n\n" });
     if (url.pathname.startsWith("/api/")) return route.abort();

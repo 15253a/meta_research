@@ -5922,3 +5922,21 @@ export function fetchResearchContent(questRef: string, reader: ResearchContentRe
 }
 export const submitResearchInput = (quest_ref: string, question_ref: string | null, text: string) =>
   writeJson<Record<string, unknown>>("/api/v1/research-inputs", "POST", { quest_ref, question_ref, text, asset_bindings: [] });
+
+export type ExternalMcpConnection = {
+  transport: "stdio"; command: string; arguments: string[]; environment: Record<string, string>; working_directory?: string;
+} | { transport: "streamable_http"; url: string; headers: Record<string, string> };
+export type ExternalMcpService = {
+  service_id: string; name: string; connection: ExternalMcpConnection;
+  allowed_root_kinds: string[]; research_instructions: string;
+};
+export type ExternalMcpConfiguration = { revision: string; services: ExternalMcpService[]; root_kinds: string[] };
+export type ExternalMcpConnectionTest = {
+  status: "ready" | "failed"; server_name?: string; tool_count?: number; reason_code?: string;
+};
+export const fetchExternalMcp = (signal?: AbortSignal) =>
+  readResearchJson<ExternalMcpConfiguration>("/api/v1/external-mcp", signal);
+export const saveExternalMcp = (services: ExternalMcpService[], expected_revision: string) =>
+  writeJson<ExternalMcpConfiguration>("/api/v1/external-mcp", "PUT", { services, expected_revision });
+export const testExternalMcpConnection = (connection: ExternalMcpConnection) =>
+  writeJson<ExternalMcpConnectionTest>("/api/v1/external-mcp/test-connection", "POST", { connection });
