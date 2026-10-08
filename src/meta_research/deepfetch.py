@@ -760,6 +760,7 @@ class CodexDeepFetchAdapter:
         self._root_operation_diagnostic_recorder: (
             RootOperationDiagnosticRecorder | None
         ) = None
+        self._sogou_discovery = None
         self._root_resident_mcp = RootResidentMcpChannels("deepfetch")
 
     def bind_resident_mcp_authority(
@@ -769,6 +770,11 @@ class CodexDeepFetchAdapter:
             self._root_resident_mcp.bind_authority(authority)
         except RootResidentMcpError as error:
             raise DeepFetchUnavailable(error.code) from error
+
+    def bind_sogou_discovery(self, discovery) -> None:
+        if self._sogou_discovery is not None and self._sogou_discovery is not discovery:
+            raise DeepFetchUnavailable("deepfetch_discovery_binding_conflict")
+        self._sogou_discovery = discovery
 
     def configure_resident_mcp_endpoint(self, base_url: str) -> None:
         try:
@@ -2260,6 +2266,7 @@ class CodexDeepFetchAdapter:
                 root_session_ref=request.root_session_ref, fence_ref=request.fence_ref,
                 capability_binding_hash=canonical_hash(request.runtime_binding.as_dict()),
                 phase=phase, job_ref=provider_job_ref,
+                excluded_operation_ids=("deepfetch.sogou.search", "deepfetch.sogou.open") if request.scope.get("literature_mode") == "provided_only" else (),
             )
             try:
                 if (
@@ -2465,6 +2472,10 @@ class CodexDeepFetchAdapter:
             checkpoint.final_envelope,
             acquisition_request_ids=checkpoint.acquisition_request_ids,
             acquisition_item_proofs=authoritative_acquisition_proofs,
+            discovery_observations=(
+                () if self._sogou_discovery is None
+                else tuple(self._sogou_discovery.receipts(request.run_ref + ":" + request.attempt_ref))
+            ),
         )
         web_evidence = {**web_evidence, "prototype": imported[6]}
         result = DeepFetchResult(
@@ -2622,6 +2633,8 @@ class CodexDeepFetchAdapter:
                 "Read relevant originals and use claim conditions, conflicts, gaps, and unfinished questions to guide search, acquisition, and independent Readers. "
                 "This initialization has no Quest. Keep imported results external. New evidence may qualify or contradict the old understanding.\n"
             )
+        if request.scope.get("literature_mode") == "provided_only":
+            route_contract = "provided_only 只使用已提供材料；不得调用 OpenAlex、搜狗或新增 Web 发现。\n"
         if request.scope.get("literature_mode") == "oa_only":
             route_contract = (
                 "本请求的 oa_only 是用户明确选择的主路线；跳过 "
@@ -2645,6 +2658,8 @@ class CodexDeepFetchAdapter:
             "不得声称创建 Quest/Question/Cycle、接纳 Evidence 或签发 receipt；"
             "不得把 Cookie、凭据、浏览器 profile、私有 manifest 或恢复状态写入"
             "公开目录。最终公开目录必须且只能包含 papers.json、summary.md、fulltext/。\n"
+            "OpenAlex、微信搜狗与原生 Web 是并列发现渠道。按问题组织中文等适当查询，不把搜狗仅作为 OpenAlex 空结果后备。\n"
+            "可发现模式使用 Meta MCP deepfetch.sogou.search(query) 与 deepfetch.sogou.open(candidate_ref)。先读取 references/sogou.md。保留实际 receipt，限制只影响该渠道；原生 Search/Open Gate 保持。\n"
             f"{_DEEPFETCH_COMPLETION_RULES}\n"
             f"deepfetch_skill_root={self._skill_root}\n"
             f"public_output_root={public_root}\n"
@@ -2766,6 +2781,7 @@ class CodexDeepFetchAdapter:
                 ),
                 phase=channel_phase,
                 job_ref=request.job_ref,
+                excluded_operation_ids=("deepfetch.sogou.search", "deepfetch.sogou.open") if request.scope.get("literature_mode") == "provided_only" else (),
             )
         except RootResidentMcpError as error:
             raise DeepFetchUnavailable(error.code) from error
@@ -4232,6 +4248,7 @@ def _import_v4_public_artifacts(
     *,
     acquisition_request_ids: tuple[str, ...],
     acquisition_item_proofs: tuple[dict[str, object], ...],
+    discovery_observations: tuple[dict[str, object], ...] = (),
 ) -> tuple[
     Literal["complete", "limited", "honest_empty"],
     str,
@@ -4285,6 +4302,14 @@ def _import_v4_public_artifacts(
         "missing_fulltexts",
         "limitations",
     }
+    from meta_research.skills.deepfetch_v4.scripts.ledger_contract import ContractError, parse_extensions, verify_host_receipts
+    try:
+        parse_extensions(ledger, historical_read=True)
+        verify_host_receipts(ledger, discovery_observations)
+    except ContractError as error:
+        raise DeepFetchUnavailable("deepfetch_discovery_provenance_invalid") from error
+    if isinstance(ledger, dict) and "discovery" in ledger:
+        top_keys.add("discovery")
     if not isinstance(ledger, dict) or set(ledger) != top_keys:
         raise DeepFetchUnavailable("deepfetch_papers_v4_invalid")
     if ledger.get("schema_version") != "deepfetch.papers.v4":
@@ -4441,6 +4466,8 @@ def _import_v4_public_artifacts(
         "evidence_locators",
         "notes",
     }
+    if "discovery" in ledger:
+        record_keys.add("provenance")
     for paper_id in paper_order:
         record = paper_records[paper_id]
         if not isinstance(record, dict) or set(record) != record_keys:
@@ -4469,7 +4496,11 @@ def _import_v4_public_artifacts(
         doi = identity.get("doi")
         arxiv_id = identity.get("arxiv_id")
         openalex_id = identity.get("openalex_id")
-        if source_urls:
+        if "provenance" in record:
+            from meta_research.skills.deepfetch_v4.scripts.ledger_contract import canonical_paper_url
+            paper_url = _validated_public_url(canonical_paper_url(record), "deepfetch_public_artifact_invalid")
+            source_kind = "arxiv" if "arxiv.org/" in paper_url else "doi" if "doi.org/" in paper_url else "web"
+        elif source_urls:
             paper_url = source_urls[0]
             source_kind = "web"
         elif isinstance(doi, str) and doi:
@@ -4674,6 +4705,13 @@ def _validated_result_ledger(
         "missing_fulltexts",
         "limitations",
     }
+    from meta_research.skills.deepfetch_v4.scripts.ledger_contract import ContractError, parse_extensions
+    try:
+        parse_extensions(value, historical_read=True)
+    except ContractError as error:
+        raise DeepFetchUnavailable("deepfetch_papers_v4_invalid") from error
+    if "discovery" in value:
+        required.add("discovery")
     paper_order = value.get("paper_order")
     papers = value.get("papers")
     if (

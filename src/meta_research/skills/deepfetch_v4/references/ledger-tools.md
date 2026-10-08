@@ -12,7 +12,9 @@ python3 "$DEEPFETCH_ROOT/scripts/papers.py" init \
   --intensity medium
 ```
 
-`upsert` 接受一项发现记录、数组、`{"papers": [...], "limitations": [...]}` 或完整 `deepfetch.openalex.v4` search／get 信封。工具移除雷达专属字段并写入元数据；主智能体仍须筛选实际保留条目，按[台账契约](papers-json.md)填写 `summary`、`evidence_level`、`basis`、`why_included`、`uncertainty`。`update-run` 保存单调递增的主动检索秒数、实际维度和停止理由。
+`upsert` 接受一项发现记录、数组、`{"papers": [...], "limitations": [...]}` 或完整 `deepfetch.openalex.v4` search／get 信封。新论文 intake 和扩展台账的 paper_id 定向更新必须带已核实原论文 version provenance。OpenAlex get 结果先经原论文核验、补 provenance，再提交。工具移除雷达专属字段并写入元数据；主智能体仍须筛选实际保留条目，按[台账契约](papers-json.md)填写 `summary`、`evidence_level`、`basis`、`why_included`、`uncertainty`。`update-run` 保存单调递增的主动检索秒数、实际维度和停止理由。
+
+用 `record-discovery --out-dir "$OUTPUT_DIR" --input "/absolute/discovery.json"` 提交恰含 receipts 与 unresolved_leads 数组的 JSON。先登记工具返回的全部原始回执，再用 upsert 的 provenance.discovery_refs 引用它们。不得改写宿主回执，宿主导入要求本次 run/attempt 全部实际观测回执与提交内容完全一致，遗漏搜索、卡片、打开或局部失败回执均拒绝。没有搜狗观测时不要求查询或命中。失败回执自动加入 limitations。原学术身份和确认版本控制合并，重复标题不合并。
 
 ## 全文与 Reader
 
@@ -20,7 +22,7 @@ python3 "$DEEPFETCH_ROOT/scripts/papers.py" init \
 
 ```bash
 python3 "$DEEPFETCH_ROOT/scripts/papers.py" register-fulltext \
-  --out-dir "$OUTPUT_DIR" --paper-id "openalex:W123" \
+  --out-dir "$OUTPUT_DIR" --paper-id "已返回的版本 paper_id" \
   --file "/absolute/provider/result.pdf"
 ```
 

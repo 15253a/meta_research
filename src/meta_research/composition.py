@@ -968,6 +968,9 @@ def build_production_runtime(
         human_collaboration=owners.human_collaboration,
         target_run_agent=target_run_agent,
     )
+    bind_sogou = getattr(deepfetch_provider, "bind_sogou_discovery", None)
+    if callable(bind_sogou):
+        bind_sogou(owners.agent_runtime.sogou_discovery)
     harness_operation_canceller = None
     target_raw_output_store = TargetRawOutputStore(
         data_root.run / "harness-supervisor"

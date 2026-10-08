@@ -264,7 +264,9 @@ def create_semantic_owner_gateway(
     if ae_snapshot is None or rm_snapshot is None:
         raise ValueError("semantic owner snapshot interface unavailable")
 
+    from meta_research.sogou_discovery import sogou_operations
     operations = [
+        *sogou_operations(agent_runtime),
         *workspace_operations(root_workspaces),
         *(
             _snapshot_operation(owner_name, query_snapshot)

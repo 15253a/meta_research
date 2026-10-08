@@ -10220,11 +10220,13 @@ def _proposal_ledger_evidence(
                 for locator in evidence_locators
             ]
         projected_papers[paper_ref] = {
+            **({"provenance": record["provenance"]} if "provenance" in record else {}),
             "identity": record["identity"],
             "pre_understanding": record["pre_understanding"],
             "reading": projected_reading,
         }
     return {
+        **({"discovery": ledger["discovery"]} if "discovery" in ledger else {}),
         "schema_ref": PROPOSAL_LEDGER_EVIDENCE_SCHEMA,
         "projection": "semantic_core",
         "source_schema_version": ledger.get("schema_version"),
@@ -10322,6 +10324,13 @@ def _validated_v4_ledger(value: object, *, expected_count: int) -> int:
     }
     if not isinstance(value, dict):
         raise OwnerConflict("literature_snapshot_payload_invalid")
+    from meta_research.skills.deepfetch_v4.scripts.ledger_contract import ContractError, parse_extensions
+    try:
+        parse_extensions(value, historical_read=True)
+    except ContractError as error:
+        raise OwnerConflict("literature_snapshot_payload_invalid") from error
+    if "discovery" in value:
+        required.add("discovery")
     paper_order = value.get("paper_order")
     papers = value.get("papers")
     if (
@@ -10608,6 +10617,19 @@ def _question_literature_records(
         ):
             raise OwnerConflict("question_literature_source_snapshot_invalid")
         fulltext_by_url[paper_url] = value
+    ledger = snapshot.get("papers_ledger")
+    version_refs = {}
+    if isinstance(ledger, dict) and "discovery" in ledger:
+        from meta_research.skills.deepfetch_v4.scripts.ledger_contract import ContractError, canonical_paper_url, parse_extensions
+        try:
+            parse_extensions(ledger)
+        except ContractError as error:
+            raise OwnerConflict("question_literature_source_snapshot_invalid") from error
+        for paper_id, record in ledger["papers"].items():
+            original = canonical_paper_url(record)
+            if original in version_refs:
+                raise OwnerConflict("question_literature_record_duplicate")
+            version_refs[original] = "paper:" + paper_id
     records: list[dict[str, object]] = []
     seen: set[str] = set()
     for paper in papers:
@@ -10615,7 +10637,9 @@ def _question_literature_records(
             raise OwnerConflict("question_literature_source_snapshot_invalid")
         doi = paper.get("doi")
         url = paper.get("url")
-        if isinstance(doi, str) and doi.strip():
+        if url in version_refs:
+            record_ref = version_refs[url]
+        elif isinstance(doi, str) and doi.strip():
             record_ref = f"doi:{doi.strip().lower()}"
         elif isinstance(url, str) and url.strip():
             record_ref = f"url:{canonical_hash(url.strip())[:32]}"
