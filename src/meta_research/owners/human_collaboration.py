@@ -1743,9 +1743,10 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
 
 
 from meta_research.human_research_input import HumanResearchInputMixin
+from meta_research.work_materials import WorkMaterialsMixin
 
 
-class SQLiteHumanCollaboration(HumanResearchInputMixin, HumanGuidanceMixin):
+class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, HumanGuidanceMixin):
     def __init__(
         self,
         database: Database,
@@ -8989,6 +8990,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin, HumanGuidanceMixin):
             view["question_ref"] = question.question_ref
         if cycle is not None:
             view["cycle_ref"] = cycle.cycle_ref
+        view["work_materials"] = self.query_work_materials("creation", initialization_id)
         return view
 
     def query_current_quest_creation(self) -> dict[str, object] | None:
@@ -9133,7 +9135,7 @@ class SQLiteHumanCollaboration(HumanResearchInputMixin, HumanGuidanceMixin):
     def query_manual_question_creation(
         self, context_ref: str
     ) -> dict[str, object]:
-        return self._manual_creation.query(context_ref)
+        return {**self._manual_creation.query(context_ref), "work_materials": self.query_work_materials("manual", context_ref)}
 
     def query_current_manual_question_creation(
         self, *, quest_ref: str, parent_question_ref: str

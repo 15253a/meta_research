@@ -506,6 +506,7 @@ class ProductionRuntime:
             try:
                 self.runtime_protection.close()
             finally:
+                self.root_workspaces.server_files.close()
                 self._database.close()
 
 

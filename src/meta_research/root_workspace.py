@@ -190,6 +190,30 @@ class RootWorkspaces:
     def _target_location(self, target_ref: str) -> WorkspaceLocation:
         return self._target_locations(target_ref)[0]
 
+    def current_material_receiver(self, quest_ref: str, question_ref: str | None = None):
+        foreground = self._ae.query_foreground(quest_ref)
+        if foreground is None or foreground["status"] in {"completed", "cancelled", "abandoned", "pruned"}:
+            raise OwnerConflict("material_receiver_unavailable")
+        if question_ref is not None and question_ref != foreground["question_ref"]:
+            raise OwnerConflict("material_receiver_question_mismatch")
+        requests = [request for request in self._ae.query_cycle_stage_requests(foreground["cycle_ref"])
+                    if request.stage == foreground["stage"]]
+        if not requests:
+            raise OwnerConflict("material_receiver_unavailable")
+        request = max(requests, key=lambda value: value.epoch)
+        run = getattr(self._ar, "query_" + request.stage + "_stage_run")(request.request_ref)
+        roots = []
+        if run is not None and run.status not in {"completed", "cancelled", "failed"}:
+            roots.append(self._runtime_location(run.run_ref).source())
+        if request.stage == "bundle" and run is not None:
+            for target in self._ar.list_bundle_target_root_work_refs(run.run_ref):
+                roots.append(self._target_location(target).source())
+        if not roots or any(root["quest_ref"] != quest_ref or root["cycle_ref"] != foreground["cycle_ref"] for root in roots):
+            raise OwnerConflict("material_receiver_unavailable")
+        return {"kind": "current", "quest_ref": quest_ref, "question_ref": foreground["question_ref"],
+                "cycle_ref": foreground["cycle_ref"], "grant_ref": foreground["grant_ref"], "epoch": foreground["epoch"],
+                "roots": sorted(roots, key=lambda root: root["workspace_ref"])}
+
     def bind_initialization(self, initialization_id: str, root_session_ref: str) -> WorkspaceBinding:
         creation = self._hc.query_quest_creation(initialization_id)
         session = creation.get("intent_session")

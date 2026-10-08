@@ -208,6 +208,23 @@ class QuestDraftV2Request(BaseModel):
     material_manifest: dict[str, object] | None = None
 
 
+class ServerSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    server: dict[str, object]
+    absolute_path: str = Field(min_length=1, max_length=16000)
+    kind: Literal["file", "directory"]
+    description: str = Field(default="", max_length=4000)
+    observation: dict[str, object]
+    availability: Literal["available"]
+
+
+class WorkMaterialSubmissionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    receiver: dict[str, object]
+    selections: list[ServerSelectionRequest] = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=4000)
+
+
 class CreationMaterialFileRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     relative_path: str = Field(min_length=1, max_length=4096)
@@ -1872,6 +1889,34 @@ def create_app(
         return await _await_bounded_asset_io(
             lambda: runtime.owners.human_collaboration.deliver_initialization_materials(initialization_id, delivery.model_dump(), _idempotency_key(request)),
             slots=asset_io_slots, timeout_code="quest_material_io_timeout")
+
+    @app.post("/api/v1/quest-initializations/{initialization_id}/material-references", status_code=201)
+    def register_creation_materials(initialization_id: str, request: Request, submission: WorkMaterialSubmissionRequest):
+        return runtime.owners.human_collaboration.register_work_materials(anchor_kind="creation", anchor_ref=initialization_id,
+            command=submission.model_dump(), idempotency_key=_idempotency_key(request))
+
+    @app.post("/api/v1/manual-question-creations/{context_ref}/material-references", status_code=201)
+    def register_manual_materials(context_ref: str, request: Request, submission: WorkMaterialSubmissionRequest):
+        return runtime.owners.human_collaboration.register_work_materials(anchor_kind="manual", anchor_ref=context_ref,
+            command=submission.model_dump(), idempotency_key=_idempotency_key(request))
+
+    @app.get("/api/v1/work-materials/receiver")
+    def current_material_receiver(quest_ref: str, question_ref: str | None = None):
+        return runtime.owners.human_collaboration.current_material_receiver(quest_ref, question_ref)
+
+    @app.get("/api/v1/work-materials/{reference_ref}")
+    def query_work_material(reference_ref: str):
+        return runtime.owners.human_collaboration.query_work_material(reference_ref)
+
+    @app.get("/api/v1/work-materials/{reference_ref}/discover")
+    def discover_work_material(reference_ref: str, request: Request, path: str = "", cursor: str | None = None, limit: int = 50):
+        return runtime.owners.human_collaboration.discover_work_materials(reference_ref=reference_ref, actor=request.state.session_token,
+            path=path, cursor=cursor, limit=limit)
+
+    @app.get("/api/v1/work-materials/{reference_ref}/read")
+    def read_work_material(reference_ref: str, request: Request, observation_ref: str, path: str = "", offset: int = 0, max_bytes: int = 65536):
+        return runtime.owners.human_collaboration.read_work_material(reference_ref=reference_ref, actor=request.state.session_token,
+            path=path, observation_ref=observation_ref, offset=offset, max_bytes=max_bytes)
 
     @app.post("/api/v1/quest-initializations/{initialization_id}/material-paths")
     async def deliver_creation_path(initialization_id: str, request: Request, delivery: CreationMaterialPathRequest):

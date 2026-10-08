@@ -38,8 +38,8 @@ def relative_parts(path: str) -> tuple[str, ...]:
 
 def observation(value: os.stat_result) -> dict[str, object]:
     kind = "file" if stat.S_ISREG(value.st_mode) else "directory" if stat.S_ISDIR(value.st_mode) else "unsupported"
-    result = {"device": value.st_dev, "inode": value.st_ino, "kind": kind,
-              "size": value.st_size, "modified_ns": value.st_mtime_ns, "changed_ns": value.st_ctime_ns}
+    result = {"device": str(value.st_dev), "inode": str(value.st_ino), "kind": kind,
+              "size": str(value.st_size), "modified_ns": str(value.st_mtime_ns), "changed_ns": str(value.st_ctime_ns)}
     return {**result, "observation_ref": canonical_hash(result)}
 
 
@@ -257,7 +257,7 @@ class ServerFiles:
                     raise OwnerConflict("material_source_changed")
         result = {"server": self.server, "path": path, "observation": before, "offset": offset,
                   "bytes": len(content), "next_offset": offset + len(content),
-                  "eof": offset + len(content) >= before["size"], "availability": "available"}
+                  "eof": offset + len(content) >= int(before["size"]), "availability": "available"}
         try:
             return {**result, "encoding": "utf-8", "text": content.decode("utf-8")}
         except UnicodeDecodeError:
