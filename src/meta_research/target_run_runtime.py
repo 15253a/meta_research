@@ -27,6 +27,7 @@ from meta_research.target_execution_contract import (
 from meta_research.harness import HarnessAdmissionError, HarnessRuntime
 from meta_research.context_presentation import bounded_text
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
+from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime_harness import (
     TARGET_ROOT_RECOVERY_PENDING_CODE,
     TARGET_ROOT_RECOVERY_READY_CODE,
@@ -89,9 +90,15 @@ class TargetRunRuntime:
         finalizer: TargetRunFinalizerInterface,
         harness_family: str = "codex",
         database: Database | None = None,
+        root_workspaces=None,
+        advancement_engine: AdvancementEngineInterface | None = None,
+        protected_storage_roots: tuple[Path, ...] = (),
     ) -> None:
         self._agent_runtime = agent_runtime
         self._database = database
+        self._root_workspaces = root_workspaces
+        self._advancement_engine = advancement_engine
+        self._protected_storage_roots = protected_storage_roots
         self._research_graph = research_graph
         self._target_graph = target_graph
         self._target_agent = target_agent
