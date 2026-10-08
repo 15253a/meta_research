@@ -68,3 +68,18 @@
 
 .experiment-log-source-note { flex:0 0 auto; margin:10px 16px 0; color:#a5b1c8; font-size:11px; line-height:1.6; }
 @media (max-width:600px) { .experiment-log-source-note { margin-inline:12px; } }
+
+.parallel-execution-logs { margin: 24px 0; min-width: 0; }
+.parallel-execution-logs > header h2 { margin: 0; font-size: 17px; }
+.parallel-execution-logs > header p, .parallel-log-source-note, .parallel-log-read-status { color: var(--muted, #8393ae); font-size: 12px; line-height: 1.7; }
+.parallel-log-source-note { margin: 8px 0 14px; }
+.parallel-execution-log-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); align-items: start; gap: 14px; min-width: 0; }
+.experiment-log-window.experiment-log-inline { position: relative; z-index: auto; right: auto; bottom: auto; width: 100%; height: 460px; box-shadow: none; }
+.experiment-log-inline .experiment-log-header small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.experiment-log-inline .experiment-log-toolbar { gap: 14px; }
+.experiment-log-inline .experiment-log-file-facts { flex-direction: column; }
+.experiment-log-inline .experiment-log-history { flex-wrap: wrap; }
+@media (max-width: 600px) {
+  .parallel-execution-log-grid { grid-template-columns: minmax(0, 1fr); }
+  .experiment-log-window.experiment-log-inline { height: 470px; }
+}
