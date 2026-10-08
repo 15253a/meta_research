@@ -35,8 +35,22 @@
 .runtime-conditions-dialog button:disabled { opacity: .45; cursor: default; }
 .runtime-conditions-dialog .runtime-conditions-error { color: #a82e3d; }
 .runtime-conditions-dialog .runtime-conditions-saved { color: #16745c; }
+.runtime-conditions-pre-quest { padding: 24px 24px 0; }
+.external-mcp-settings { display: grid; gap: 14px; margin: 0 24px 24px; padding-top: 18px; border-top: 1px solid #e0e5ee; }
+.external-mcp-settings h3 { margin: 0; font-size: 17px; }
+.runtime-conditions-dialog .external-mcp-settings form { padding: 0; }
+.external-mcp-service { display: grid; gap: 14px; min-width: 0; margin: 0; padding: 16px; border: 1px solid #d8deea; border-radius: 10px; }
+.external-mcp-service legend { padding: 0 6px; }
+.external-mcp-service input:not([type=checkbox]) { box-sizing: border-box; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #cbd3e2; border-radius: 9px; font: inherit; }
+.runtime-conditions-dialog .external-mcp-service textarea { min-height: 78px; padding: 10px 12px; }
+.external-mcp-roots { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.runtime-conditions-dialog .external-mcp-roots label { display: flex; align-items: center; gap: 8px; }
+.external-mcp-root-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 @media (max-width: 600px) {
   .runtime-conditions-entry { padding: 7px 10px; font-size: 12px; }
   .runtime-conditions-dialog form { padding: 18px; gap: 14px; }
   .runtime-conditions-fields, .runtime-conditions-device-list { grid-template-columns: 1fr; }
+  .external-mcp-settings { margin: 0 18px 18px; }
+  .runtime-conditions-pre-quest { padding: 18px 18px 0; }
+  .external-mcp-roots { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
