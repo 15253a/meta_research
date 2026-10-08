@@ -16215,7 +16215,8 @@ class SQLiteResearchGraph(BaselineIdentityQueries, ResearchEnvironmentOwnerMixin
                     raise error
         except OwnerConflict as error:
             if error.code not in {"target_root_commit_domain_invalid",
-                                   "target_measurement_result_content_invalid"}:
+                                   "target_measurement_result_content_invalid",
+                                   "target_formal_work_inventory_invalid"}:
                 raise
             return reject_candidate(error)
         request_hash = _target_root_commit_request_hash(

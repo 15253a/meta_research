@@ -21,7 +21,7 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 按事实选 `affirmed | denied | uncertain | insufficient_evidence`。affirmed／denied 限定 claim；uncertain 说明有效证据为何未收敛；insufficient_evidence 保持 `claim=null` 并说明缺失。部分证据与仍缺其他证据可以同时存在。未测量、科学证据不足、访问阻塞和程序故障分别表述。
 
-用 `support_scope`、`limitations`、`causal_interpretation`、`research_synthesis` 和 notes 组织解释，短结论结合精确来源，不重复整个历史。区分事实未查清与风险受控、新认识与重复整理；反复无进展时重审缺口、策略或资源，而不是无理由生成新 Cycle。
+用 `support_scope`、`limitations`、`causal_interpretation`、`research_synthesis` 和 notes 组织解释，短结论结合实际采用的精确来源。冻结可用来源和已知历史身份由系统携带，父问题的引用用于关联各自影响判断，具体输出边界见语义契约。区分事实未查清与风险受控、新认识与重复整理；反复无进展时重审缺口、策略或资源，而不是无理由生成新 Cycle。
 
 聚焦阅读、历史召回和比较可委派独立子智能体，根抽查关键原文后综合。人类指导按真实内容影响判断，普通意见不自动成为授权或完成确认。完成条件：关键判断能追溯到实际来源，已有认识、局限和缺口明确，技术阻塞没有被写成科学结论。
 
@@ -57,6 +57,6 @@ description: 综合本轮工作与研究历史，交接当前认识和证据，�
 
 最终 transition 恰为 `NextCycleProposal | CandidateCompletion` 一项。前者选择已接纳且 present／open 的 Question／Anchor，给出合法入口与精确 skip basis；等待外部条件时明确触发条件，并沿现有 HumanRequest／Owner 路径处理，不用重复 Cycle 轮询同一障碍。后者须有 Quest 整体目标和里程碑依据，并经人类明确确认及 Owner 接纳。
 
-提交前按语义契约核对引用数组，输出一份简短、完整闭合的 JSON。收到截断或引用错误反馈时，在同一会话回到精确来源修正后重新提交完整结果，不沿未闭合字符串继续重复引用或拼接多份结果。
+提交前按语义契约核对实际采用的引用及各问题影响，输出一份简短、完整闭合的 JSON。收到截断、引用或身份冲突反馈时，在同一会话回到指出的精确对象修正后重新提交完整结果，不沿未闭合字符串继续重复引用或拼接多份结果。
 
 完成条件：科学结果、沉积状态和唯一后继选择清楚，notes 进入正式闭包供下一轮使用；由 RM／RG／AR／AE 接纳链推进。未知结果先对账，必要输入或 currentness 故障保留具体阻塞；仅经公开 Owner 接口操作，不读写私有数据库、spool、seal key 或控制文件绕过边界。

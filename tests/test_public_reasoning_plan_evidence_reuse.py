@@ -351,6 +351,125 @@ def _finish_plan_and_skipped_bundle(runtime) -> None:
     raise AssertionError("No-gap Bundle did not skip")
 
 
+class _ScientificContentOnlyReasoningSkill(_MetricReuseReasoningSkill):
+    def _output(self, request: ReasoningSkillRequest) -> dict[str, object]:
+        output = super()._output(request)
+        outcome = output["scientific_outcome"]
+        # Only the metric is adopted; the other available assets remain available.
+        outcome["evidence"] = outcome["evidence"][:1]
+        causal = outcome["causal_interpretation"]
+        for field in (
+            "target_commit_refs", "changed_axis_fact_refs",
+            "held_fixed_fact_refs", "provenance_refs",
+        ):
+            causal.pop(field)
+        outcome["research_synthesis"]["current_question"].pop(
+            "prior_accepted_outcome_refs"
+        )
+        return output
+
+
+class _RepairConflictingSourceReasoningSkill(_ScientificContentOnlyReasoningSkill):
+    def _output(self, request: ReasoningSkillRequest) -> dict[str, object]:
+        output = super()._output(request)
+        if request.predecessor_candidate_ref is None:
+            output["scientific_outcome"]["causal_interpretation"][
+                "target_commit_refs"
+            ] = ["target-commit:wrong-version"]
+        return output
+
+
+def test_conflicting_system_source_is_rejected_with_feedback_then_repaired_on_same_root(
+    tmp_path: Path,
+) -> None:
+    authority = _EvidenceReuseAuthority()
+    provider = _RepairConflictingSourceReasoningSkill()
+    runtime = _runtime(tmp_path / "reasoning-metadata-repair", authority, provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        _install_fixture_plan_evidence(runtime, authority, quest_ref=str(quest["quest_ref"]))
+        _finish_idea_stage(runtime)
+        _finish_plan_and_skipped_bundle(runtime)
+        for _step in range(4):
+            runtime.reasoning_stage.process_once()
+        rejected = runtime.reasoning_stage.query_current()
+        rejection = rejected["run"]["completion_rejection"]
+        assert rejection is not None
+        assert "target_commit_refs" in str(rejection["feedback"])
+        assert "target-commit:wrong-version" in str(rejection["feedback"])
+        assert rejected["reasoning_acceptance"]["status"] == "not_attempted"
+        root_ref = rejected["run"]["root_session_ref"]
+        for _step in range(12):
+            current = runtime.reasoning_stage.query_current()
+            if current["reasoning_acceptance"]["status"] == "accepted":
+                break
+            assert runtime.reasoning_stage.process_once(), current
+        assert current["reasoning_acceptance"]["status"] == "accepted"
+        assert current["run"]["root_session_ref"] == root_ref
+        assert provider.requests[-1].predecessor_candidate_ref == rejection["candidate_ref"]
+    finally:
+        runtime.close()
+
+
+def test_scientific_content_only_is_bound_persisted_and_read_without_adopting_all_sources(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "reasoning-system-metadata"
+    authority = _EvidenceReuseAuthority()
+    provider = _ScientificContentOnlyReasoningSkill()
+    runtime = _runtime(data_root, authority, provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        _install_fixture_plan_evidence(runtime, authority, quest_ref=str(quest["quest_ref"]))
+        _finish_idea_stage(runtime)
+        _finish_plan_and_skipped_bundle(runtime)
+        for _step in range(12):
+            current = runtime.reasoning_stage.query_current()
+            if current["reasoning_acceptance"]["status"] == "accepted":
+                break
+            assert runtime.reasoning_stage.process_once(), current
+        assert current["reasoning_acceptance"]["status"] == "accepted"
+        request = provider.requests[0]
+        assert request.context_pack["research_context"]["schema_ref"] == (
+            "meta-research/reasoning-research-context/v3"
+        )
+        outcome_ref = str(current["reasoning_acceptance"]["outcome_ref"])
+        readback = runtime.owners.research_graph.read_question_scientific_outcome(
+            quest_ref=request.quest_ref, question_ref=request.question_ref,
+            outcome_ref=outcome_ref,
+        )
+        scientific = readback
+        for field in (
+            "target_commit_refs", "changed_axis_fact_refs",
+            "held_fixed_fact_refs", "provenance_refs",
+        ):
+            assert scientific["causal_interpretation"][field] == (
+                request.context_pack["research_context"]["causal_context"][field]
+            )
+        assert scientific["evidence"] == [{
+            "kind": "MetricResult", "ref": "metric_result_fixture", "finding": "supporting",
+        }]
+        assert scientific["research_synthesis"]["current_question"][
+            "prior_accepted_outcome_refs"
+        ] == []
+        assert scientific["claim"] == "The accepted reused metric supports the bounded claim."
+        assert current["reasoning_acceptance"]["content"]["receipt"]["issuer"] == "research_memory"
+        assert current["reasoning_acceptance"]["domain"]["receipt"]["issuer"] == "research_graph"
+    finally:
+        runtime.close()
+    restored_authority = _EvidenceReuseAuthority()
+    restored_authority.quest_ref = authority.quest_ref
+    restored_authority.catalog = authority.catalog
+    restored = _runtime(data_root, restored_authority, _ScientificContentOnlyReasoningSkill())
+    try:
+        assert restored.owners.research_graph.read_question_scientific_outcome(
+            quest_ref=request.quest_ref, question_ref=request.question_ref,
+            outcome_ref=outcome_ref,
+        ) == readback
+    finally:
+        restored.close()
+
+
 def test_completed_plan_reuse_metric_is_frozen_for_reasoning_and_restart(
     tmp_path: Path,
 ) -> None:

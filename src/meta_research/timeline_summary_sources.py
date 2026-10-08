@@ -301,8 +301,8 @@ class TimelineSummarySourceReader:
                 content["accepted_result"] = {"commit_ref": transition.target_commit_ref,
                     "manifest_ref": manifest.manifest_ref, "result_document": manifest.result_document.as_dict(),
                     "result_document_hash": manifest.result_document_hash, "research_notes": notes}
-                sources.extend([{"ref": transition.target_commit_ref, "label": "Accepted TargetCommit"},
-                                {"ref": manifest.manifest_ref, "label": "Accepted Target result"}])
+                sources.extend([{"ref": transition.target_commit_ref, "label": "Accepted Target completion (engineering acceptance)"},
+                                {"ref": manifest.manifest_ref, "label": "Recorded Target result (not a scientific conclusion)"}])
                 sources.extend({"ref": note["version_ref"], "label": "Accepted research note excerpt"} for note in notes)
         except Exception as error:
             content["gaps"].append(_gap(error, "timeline_target_result_unavailable"))

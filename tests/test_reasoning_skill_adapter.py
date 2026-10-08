@@ -686,6 +686,79 @@ def _fake_codex(path: Path) -> Path:
     return path
 
 
+def test_current_reasoning_provider_authors_judgments_without_copying_metadata(
+    tmp_path: Path,
+) -> None:
+    from jsonschema import Draft202012Validator
+
+    context = json.loads(json.dumps(_request().context_pack))
+    research = context["research_context"]
+    research["schema_ref"] = "meta-research/reasoning-research-context/v3"
+    research["causal_context"]["target_commit_refs"] = [
+        "target-commit:one", "target-commit:two"
+    ]
+    graph = research["graph_binding"]
+    graph["active_question_refs"] = ["question:1", "question:parent:one", "question:parent:two"]
+    graph["parent_question_bindings"] = [
+        {"question_ref": ref, "parent_question_ref": None, "question_receipt_ref": f"receipt:{ref}"}
+        for ref in ("question:parent:one", "question:parent:two")
+    ]
+    graph["prior_current_question_outcomes"] = [{
+        "cycle_ref": "cycle:prior", "request_ref": "request:prior",
+        "outcome_ref": "scientific-outcome:prior", "disposition": "uncertain",
+        "outcome_receipt_ref": "receipt:prior",
+    }]
+    model_output = _stage_output()
+    outcome = model_output["scientific_outcome"]
+    outcome["notes"] = ""
+    for field in ("target_commit_refs", "changed_axis_fact_refs", "held_fixed_fact_refs", "provenance_refs"):
+        outcome["causal_interpretation"].pop(field)
+    outcome["causal_interpretation"]["sufficiency_rationale"] = "The adopted literature supports association; the available TargetCommits were not adopted."
+    outcome["causal_interpretation"]["confounders"] = ["The selected literature contains no controlled intervention."]
+    outcome["research_synthesis"]["current_question"].pop("prior_accepted_outcome_refs")
+    outcome["research_synthesis"]["parent_questions"] = [
+        {"question_ref": "question:parent:two", "impact": "no_material", "statement": "The bounded finding does not address its intervention."},
+        {"question_ref": "question:parent:one", "impact": "material", "statement": "The accepted literature supplies relevant context."},
+    ]
+    request = replace(_request(), context_pack=context, context_pack_hash=canonical_hash(context))
+
+    # This is the response format actually compiled for the provider boundary.
+    schema = _compile_codex_output_schema(_reasoning_primary_output_schema(request))
+    Draft202012Validator(schema).validate({"provider_output": model_output})
+
+    runner = _SequenceRunner([
+        model_output,
+        {"schema_ref": REASONING_REVIEW_SCHEMA_REF, "final_output": model_output},
+    ])
+    adapter = CodexReasoningSkillAdapter(
+        tmp_path / "reasoning-metadata-provider",
+        executable=str(_fake_codex(tmp_path / "codex-metadata")),
+        process_runner=runner,
+    )
+    adapter.bind_full_conformance_authority(_FullConformanceAuthority())
+    adapter.configure_resident_mcp_endpoint("http://semantic-mcp.invalid")
+    request = replace(request, runtime_binding=adapter.runtime_binding())
+    draft = adapter.generate_draft(request)
+    result = adapter.review_draft(replace(request, native_session_ref=draft.primary_session_ref), draft)
+    validate_reasoning_skill_result(request, result)
+    final = result.outcome_document()["scientific_outcome"]
+    assert final["causal_interpretation"]["target_commit_refs"] == ["target-commit:one", "target-commit:two"]
+    assert final["research_synthesis"]["current_question"]["prior_accepted_outcome_refs"] == ["scientific-outcome:prior"]
+    assert final["research_synthesis"]["parent_questions"] == [
+        {"question_ref": "question:parent:one", "impact": "material", "statement": "The accepted literature supplies relevant context."},
+        {"question_ref": "question:parent:two", "impact": "no_material", "statement": "The bounded finding does not address its intervention."},
+    ]
+    assert final["evidence"] == [{"kind": "LiteratureRecord", "ref": "literature-record:1", "finding": "supporting"}]
+    assert final["causal_interpretation"]["attribution_basis_refs"] == ["literature-record:1"]
+    for _argv, _prompt, actual_schema in runner.calls:
+        wire_output = (
+            {"provider_output": model_output}
+            if set(actual_schema["properties"]) == {"provider_output"}
+            else {"schema_ref": REASONING_REVIEW_SCHEMA_REF, "final_output": model_output}
+        )
+        Draft202012Validator(actual_schema).validate(wire_output)
+
+
 def _durable_reasoning_codex(
     path: Path,
     output: dict[str, object],
@@ -745,6 +818,7 @@ def test_production_adapter_uses_one_session_and_scoped_resident_mcp(
         tmp_path / "provider",
         executable=str(_fake_codex(tmp_path / "codex")),
         process_runner=runner,
+        model_ref="gpt-6-sol",
     )
     adapter.bind_full_conformance_authority(authority)
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8765")
